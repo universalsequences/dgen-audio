@@ -57,7 +57,7 @@ public func topo(_ g: Graph) -> [NodeID] {
 }
 
 // corresponds to one kernel (metal backends) or for loop (in C backend)
-public struct Block {
+public struct Block: Equatable {
     public enum Kind { case simd, scalar }
     public var kind: Kind
     public var nodes: [NodeID] = []
@@ -85,7 +85,7 @@ func wouldExceedNodeLimit(_ block: Block, maxNodesPerBlock: Int) -> Bool {
 
 // partitions sorted nodes & set of scalar ndoes, into blocks (of kind: simd or scalar)
 // cannot exceed maxNodesPerBlock (due to buffer limits on metal kernels)
-public func blocks(sorted: [NodeID], scalar: Set<NodeID>, g: Graph, maxNodesPerBlock: Int = Int.max) -> [Block] {
+public func determineBlocks(sorted: [NodeID], scalar: Set<NodeID>, g: Graph, maxNodesPerBlock: Int = Int.max) -> [Block] {
     var b: [Block] = []
 
     for n in sorted {
@@ -138,12 +138,17 @@ public func blocks(sorted: [NodeID], scalar: Set<NodeID>, g: Graph, maxNodesPerB
 public func crossBlockNodes(_ blks: [Block], _ g: Graph, block: Block) -> Set<NodeID> {
     // node -> block idx map
     var nodeBlock = [NodeID: Int]()
-    for (idx, b) in blks.enumerated() { b.nodes.forEach { nodeBlock[$0] = idx } }
+    let idx = blks.firstIndex{b in return b == block}
+    block.nodes.forEach { nodeBlock[$0] = idx }
 
     var need: Set<NodeID> = []
-    for nID in block.nodes {
-        g.nodes[nID]!.inputs.forEach {
-            if nodeBlock[$0]! != nID { need.insert($0) }  // producer in diff block
+    for b in blocks {
+        for nID in b.nodes {
+            g.nodes[nID]!.inputs.forEach {
+                if let nodeBlockIdx = nodeBlock[$0] {
+                    if nodeBlockIdx != nID { need.insert($0) }  // producer in diff block
+                }
+            }
         }
     }
     return need
@@ -216,3 +221,52 @@ func sortBlocksByDependencies(_ blks: [Block], _ g: Graph) -> [Int] {
     return result
 }
 
+
+func emitBlock (ctx: IRContext, block: Block, blocks: [Block], g: Graph, debug: Bool=false) -> [UOp]  {
+    var emittedNodes: Set<NodeID> = []
+
+    var uops: [UOp] = []
+    for nodeId in block.nodes {
+        if let node = g.nodes[nodeId] {
+            var indentLevel = 0
+
+            for uop in node.op.emit(ctx: ctx, g: g, nodeId: nodeId) {
+                emittedNodes.insert(nodeId)
+                uops.append(uop)
+            }
+        }
+    }
+
+    let cross = crossBlockNodes(blocks, g, block: block);
+    for nodeId in cross {
+        if (emittedNodes.contains(nodeId)) {
+            if let lz = ctx.values[nodeId] {
+                switch lz {
+                case .variable(let a,_):
+                    uops.insert(UOp(op: .defineGlobal(a), value: .global(a)), at: 0)
+                default:
+                    break
+                }
+            }
+        }
+    }
+
+
+    if (debug) {
+        var indentLevel = 0
+        for uop in uops {
+          switch uop.op {
+                case .beginIf:
+                    print("\(String(repeating: "  ", count: indentLevel))\(uop.prettyDescription())")
+                    indentLevel += 1
+                case .endIf:
+                    indentLevel = max(0, indentLevel - 1)
+                    print("\(String(repeating: "  ", count: indentLevel))\(uop.prettyDescription())")
+                default:
+                    print("\(String(repeating: "  ", count: indentLevel))\(uop.prettyDescription())")
+                }
+        }   
+    }
+
+    return uops
+}

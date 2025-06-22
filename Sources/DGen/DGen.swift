@@ -1,18 +1,9 @@
 import Foundation;
 
-public typealias NodeID = Int;
-public typealias VarID = Int;
-public typealias CellID = Int;
-
-public enum Lazy {
-    case constant(Float)
-    case variable(VarID, NodeID?)
-}
-
 public class IRContext {
     private var varIdx = 0
 
-    // map of node -> variable
+    // map of nodeId -> Lazy value (variable or constant)
     public var values: [NodeID: Lazy] = [:]
 
     public func useConstant(src: NodeID, value: Float) -> Lazy {

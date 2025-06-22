@@ -12,6 +12,21 @@ public final class IRBuilder {
     return Expr(lazy, ctx: ctx, nodeId: nodeId, builder: self)
   }
 
+  func values(_ inputs: [Lazy], count: Int) -> (Expr, Expr) {
+    guard inputs.count == count else { fatalError("expected \(count) values") }
+    return (value(inputs[0]), value(inputs[1]))
+  }
+
+  func values(_ inputs: [Lazy], count: Int) -> (Expr, Expr, Expr) {
+    guard inputs.count == count else { fatalError("expected \(count) values") }
+    return (value(inputs[0]), value(inputs[1]), value(inputs[2]))
+  }
+
+  func values(_ inputs: [Lazy], count: Int) -> (Expr, Expr, Expr, Expr) {
+    guard inputs.count == count else { fatalError("expected \(count) values") }
+    return (value(inputs[0]), value(inputs[1]), value(inputs[2]), value(inputs[3]))
+  }
+
   public func constant(_ v: Float) -> Expr {
     let l = ctx.useConstant(src: nodeId, value: v)
     return value(l)
@@ -28,10 +43,19 @@ public final class IRBuilder {
     ctx.values[nodeId] = val.lazy
   }
 
-  public func store(_ cell: CellID, _ val: Expr) {
+  public func store(_ cell: CellID, _ val: Expr) -> Expr {
     let thunk = u_store(cell, val.lazy)
     let uop = thunk(ctx,nil )
     ops.append(uop)
+    return value(uop.value)
+  }
+
+  public func gswitch(_ cond: Expr, _ then: Expr, _ els: Expr) -> Expr {
+    let thunk = u_switch(cond.lazy
+                        , then.lazy, els.lazy);
+    let uop = thunk(ctx,nil )
+    ops.append(uop)
+    return value(uop.value)
   }
 
   func mutate(_ target: Expr, to newValue: Expr) {
