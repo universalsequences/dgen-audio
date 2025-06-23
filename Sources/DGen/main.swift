@@ -25,10 +25,19 @@ sortedBlockIds.forEach{ sortedBlocks.append(blocks[$0]) }
 
 var ctx = IRContext()
 
+public struct BlockUOps {
+    public let ops: [UOp]
+    public let kind: Kind
+}
+
+var uopBlocks: [BlockUOps] = []
+
 for blockIdx in sortedBlockIds {
     let block = blocks[blockIdx]
     print("")
     print("\(ANSI.bold)block ----- #\(blockIdx) --- \(block.kind)\(ANSI.reset)")
 
-    _ = emitBlock(ctx: ctx, block: block, blocks: sortedBlocks, g: g, debug: true)
+    uopBlocks.append(BlockUOps(ops: emitBlockUOps(ctx: ctx, block: block, blocks: sortedBlocks, g: g, debug: true), kind: block.kind))
 }
+
+lowerUOpBlocks(uopBlocks, target: Device.C, ctx: ctx)

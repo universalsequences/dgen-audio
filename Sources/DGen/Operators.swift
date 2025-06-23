@@ -1,15 +1,17 @@
 public typealias NodeID = Int;
 public typealias VarID = Int;
+public typealias ConstantID = Int;
 public typealias CellID = Int;
 
 public enum Lazy: Hashable {
-    case constant(Float)
+    case constant(ConstantID, Float)
     case global(VarID)
     case variable(VarID, NodeID?)
+    case empty
 
      public static func == (lhs: Lazy, rhs: Lazy) -> Bool {
         switch (lhs, rhs) {
-        case let (.constant(a), .constant(b)):
+        case let (.constant(v1, a), .constant(v2, b)):
             return a.bitPattern == b.bitPattern
         case let (.variable(a1, b1), .variable(a2, b2)):
             return a1 == a2 && b1 == b2
@@ -20,9 +22,11 @@ public enum Lazy: Hashable {
 
     public func hash(into hasher: inout Hasher) {
         switch self {
-        case let .constant(v):
+        case .empty:
+            hasher.combine(-1)
+        case let .constant(v,a):
             hasher.combine(0)
-            hasher.combine(v.bitPattern)  // Avoid precision-based float issues
+            hasher.combine(a.bitPattern)  // Avoid precision-based float issues
         case let .variable(v, node):
             hasher.combine(1)
             hasher.combine(v)
@@ -49,11 +53,17 @@ public enum Op {
     case gswitch(Lazy, Lazy, Lazy)
     case endIf
     case defineGlobal(VarID)
+    case defineConstant(ConstantID, Float)
+    case defineMemory(Int)
+    case loadGlobal(VarID)
+    case begin_loop(Int)
+    case end_loop
 }
 
 public struct UOp {
     public let op: Op;
     public let value: Lazy;
+    public var kind: Kind? = nil;
 }
 
 func binaryOp(
@@ -110,9 +120,20 @@ func u_accum(_ cellId: CellID, incr: Expr, reset: Expr, min: Expr, max: Expr) ->
     return {b in
         let acc = b.load(cellId, b.nodeId)
         let newVal = acc + incr
-        b.if(reset > b.constant(0)) {
-            _ = b.store(cellId, min)
-            b.mutate(newVal, to: min)
+        var skip = true
+        switch reset.lazy {
+        case let .constant(_, value):
+            if (value == 0) {
+                skip = true
+            }
+        default:
+            break
+        }
+        if (!skip) {
+            b.if(reset > b.constant(0)) {
+                _ = b.store(cellId, min)
+                b.mutate(newVal, to: min)
+            }
         }
 
         _ = b.store(cellId, newVal)

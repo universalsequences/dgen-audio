@@ -39,13 +39,24 @@ extension UOp {
             opStr = "\(ANSI.magenta)beginIf\(ANSI.reset)(\(cond))"
         case let .defineGlobal(cond):
             opStr = "\(ANSI.magenta)defineGlobal\(ANSI.reset)(\(cond))"
+        case let .loadGlobal(cond):
+            opStr = "\(ANSI.magenta)loadGlobal\(ANSI.reset)(\(cond))"
         case .endIf:
             opStr = "\(ANSI.magenta)endIf\(ANSI.reset)"
         case let .gswitch(a, b, t):
             opStr = "\(ANSI.green)switch\(ANSI.reset)(\(a), \(b), \(t))"
         case let .latch(a, b):
             opStr = "\(ANSI.green)latch\(ANSI.reset)(\(a), \(b))"
+        case let .begin_loop(a):
+            opStr = "\(ANSI.green)begin_loop\(ANSI.reset)(\(a))"
+        case let .defineConstant(constantId, value):
+            opStr = "\(ANSI.green)defineConstant\(ANSI.reset)(\(constantId),\(value))"
+        case let .defineMemory(length):
+            opStr = "\(ANSI.green)defineMemory\(ANSI.reset)(\(length))"
+        case .end_loop:
+            opStr = "\(ANSI.green)end_loop\(ANSI.reset)"
         }
+
 
         return "\(ANSI.bold)UOp\(ANSI.reset)(op: \(opStr), value: \(value))"
     }

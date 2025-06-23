@@ -1,0 +1,11 @@
+#+title: Notes
+
+* Target IR
+** C
+- each block goes into its own for loop inside the same process function
+- thus, the TargetIR can output this so its really simple
+- also lowering into one singular ~ScheduleItem~  + these for loops
+- SIMD / Scalar can set the loops differently
+- TargetIR can do things like "ADD_SIMD"
+** Metal
+- each block goes in its own kernel, thus they should all be in their own ~ScheduleItem~

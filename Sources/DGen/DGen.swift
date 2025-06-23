@@ -2,13 +2,22 @@ import Foundation;
 
 public class IRContext {
     private var varIdx = 0
+    private var constantIdx = 0
+
+    public var globals: Set<VarID> = []
 
     // map of nodeId -> Lazy value (variable or constant)
     public var values: [NodeID: Lazy] = [:]
+    public var constants: [ConstantID: Float] = [:]
 
-    public func useConstant(src: NodeID, value: Float) -> Lazy {
-        let constant = Lazy.constant(value)
-        self.values[src] = constant
+    public func useConstant(src: NodeID?, value: Float) -> Lazy {
+        let constantId = self.constantIdx + 1
+        self.constantIdx = constantId;
+        self.constants[constantId] = value
+        let constant = Lazy.constant(constantId, value)
+        if let srcId = src {
+            self.values[srcId] = constant
+        }
         return constant
     }
     

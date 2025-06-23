@@ -15,6 +15,9 @@ public func scalarNodes(_ g: Graph) -> Set<NodeID> {
         case .accum(let c):
             writes[c, default: []].append($0.id)
             scalar.insert($0.id)
+        case .latch(let c):
+            writes[c, default: []].append($0.id)
+            scalar.insert($0.id)
         case .phasor(let c):
             writes[c, default: []].append($0.id)
             scalar.insert($0.id)
@@ -56,9 +59,10 @@ public func topo(_ g: Graph) -> [NodeID] {
     return out.reversed()
 }
 
+public enum Kind { case simd, scalar }
+
 // corresponds to one kernel (metal backends) or for loop (in C backend)
 public struct Block: Equatable {
-    public enum Kind { case simd, scalar }
     public var kind: Kind
     public var nodes: [NodeID] = []
 
@@ -67,7 +71,7 @@ public struct Block: Equatable {
     }
 }
 
-func getBlockIndexWithDependency(nodeID: NodeID, g: Graph, blocks: [Block], kind: Block.Kind) -> Int? {
+func getBlockIndexWithDependency(nodeID: NodeID, g: Graph, blocks: [Block], kind: Kind) -> Int? {
     guard let node = g.nodes[nodeID] else { return nil }
 
     return blocks.firstIndex { block in
@@ -89,7 +93,7 @@ public func determineBlocks(sorted: [NodeID], scalar: Set<NodeID>, g: Graph, max
     var b: [Block] = []
 
     for n in sorted {
-        let k: Block.Kind = scalar.contains(n) ? .scalar : .simd
+        let k: Kind = scalar.contains(n) ? .scalar : .simd
 
         if k == .scalar {
             let scalarBlockIdx = getBlockIndexWithDependency(nodeID: n, g: g, blocks: b, kind: .scalar)
@@ -135,7 +139,7 @@ public func determineBlocks(sorted: [NodeID], scalar: Set<NodeID>, g: Graph, max
 
 // ─── 3. decide which nodes need cross-block scratch buffers ─────
 // in the case of metal, these are transmitted via buffers
-public func crossBlockNodes(_ blks: [Block], _ g: Graph, block: Block) -> Set<NodeID> {
+public func findNodesWithOutboundDependencies(_ blks: [Block], _ g: Graph, block: Block) -> Set<NodeID> {
     // node -> block idx map
     var nodeBlock = [NodeID: Int]()
     let idx = blks.firstIndex{b in return b == block}
@@ -153,6 +157,23 @@ public func crossBlockNodes(_ blks: [Block], _ g: Graph, block: Block) -> Set<No
     }
     return need
 }
+
+public func findNodesAsInboundDependencies(_ blks: [Block], _ g: Graph, block: Block) -> Set<NodeID> {
+    // find which block each node is defined in
+    var nodeBlock = [NodeID: Int]()
+    for (idx, b) in blks.enumerated() { b.nodes.forEach { nodeBlock[$0] = idx } }
+
+    var need: Set<NodeID> = []
+    // go thru each node in this block and if its defined in some other block, add it here
+    for nID in block.nodes {
+        g.nodes[nID]!.inputs.forEach {
+            if nodeBlock[$0]! != nID { need.insert($0) }  // producer in diff block
+        }
+    }
+    return need
+}
+
+
 
 // ─── decide which forward values from other blocks are needed for backward pass ─────
 public func crossBlockForwardValues(_ blks: [Block], _ g: Graph, block: Block) -> Set<NodeID> {
@@ -222,7 +243,7 @@ func sortBlocksByDependencies(_ blks: [Block], _ g: Graph) -> [Int] {
 }
 
 
-func emitBlock (ctx: IRContext, block: Block, blocks: [Block], g: Graph, debug: Bool=false) -> [UOp]  {
+func emitBlockUOps (ctx: IRContext, block: Block, blocks: [Block], g: Graph, debug: Bool=false) -> [UOp]  {
     var emittedNodes: Set<NodeID> = []
 
     var uops: [UOp] = []
@@ -237,13 +258,13 @@ func emitBlock (ctx: IRContext, block: Block, blocks: [Block], g: Graph, debug: 
         }
     }
 
-    let cross = crossBlockNodes(blocks, g, block: block);
-    for nodeId in cross {
+    let outbound = findNodesWithOutboundDependencies(blocks, g, block: block);
+    for nodeId in outbound {
         if (emittedNodes.contains(nodeId)) {
             if let lz = ctx.values[nodeId] {
                 switch lz {
                 case .variable(let a,_):
-                    uops.insert(UOp(op: .defineGlobal(a), value: .global(a)), at: 0)
+                    ctx.globals.insert(a)
                 default:
                     break
                 }
@@ -251,6 +272,17 @@ func emitBlock (ctx: IRContext, block: Block, blocks: [Block], g: Graph, debug: 
         }
     }
 
+    let inbound = findNodesAsInboundDependencies(blocks, g, block: block);
+    for nodeId in inbound {
+        if let lz = ctx.values[nodeId] {
+            switch lz {
+            case .variable(let a,_):
+                uops.insert(UOp(op: .loadGlobal(a), value: .global(a)), at: 0)
+            default:
+                break
+            }
+        }
+    }
 
     if (debug) {
         var indentLevel = 0
