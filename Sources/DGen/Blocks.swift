@@ -264,6 +264,7 @@ func emitBlockUOps (ctx: IRContext, block: Block, blocks: [Block], g: Graph, deb
             if let lz = ctx.values[nodeId] {
                 switch lz {
                 case .variable(let a,_):
+                    uops.insert(UOp(op: .defineGlobal(a), value: .global(a)), at: 0)
                     ctx.globals.insert(a)
                 default:
                     break

@@ -9,6 +9,7 @@ public class IRContext {
     // map of nodeId -> Lazy value (variable or constant)
     public var values: [NodeID: Lazy] = [:]
     public var constants: [ConstantID: Float] = [:]
+    public var variables: [VarID: NodeID] = [:]
 
     public func useConstant(src: NodeID?, value: Float) -> Lazy {
         let constantId = self.constantIdx + 1
@@ -27,6 +28,7 @@ public class IRContext {
         let variable = Lazy.variable(varId, src)
         if let srcNodeId = src, trackInValues {
             self.values[srcNodeId] = variable 
+            self.variables[varId] = srcNodeId
         }
         return variable
     }
@@ -41,6 +43,46 @@ public final class Graph {
 
     @discardableResult public func n(_ op: LazyOp, _ ins: NodeID...) -> NodeID {
         let id = next; next += 1; nodes[id] = Node(id: id, op: op, inputs: ins); return id
+    }
+}
+
+public extension Lazy {
+    var varId: VarID? {
+        switch self {
+        case let .variable(id, _):
+            return id
+        default:
+            return nil
+        }
+    }
+}
+
+public extension Op {
+    var operands: [Lazy] {
+        switch self {
+        case let .add(a, b):
+            return [a, b]
+        case let .mul(a, b):
+            return [a, b]
+        case let .sub(a, b):
+            return [a, b]
+        case let .div(a, b):
+            return [a, b]
+        case let .gt(a, b):
+            return [a, b]
+        case let .lt(a, b):
+            return [a, b]
+        case let .store(a, b):
+            return [b]
+        case let .load(a):
+            return []
+        case let .beginIf(a):
+            return [a]
+        case let .mutate(a, b):
+            return [a, b]
+        default:
+            return []
+        }
     }
 }
 

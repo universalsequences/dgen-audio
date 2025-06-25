@@ -26,7 +26,7 @@ sortedBlockIds.forEach{ sortedBlocks.append(blocks[$0]) }
 var ctx = IRContext()
 
 public struct BlockUOps {
-    public let ops: [UOp]
+    public var ops: [UOp]
     public let kind: Kind
 }
 
@@ -40,4 +40,4 @@ for blockIdx in sortedBlockIds {
     uopBlocks.append(BlockUOps(ops: emitBlockUOps(ctx: ctx, block: block, blocks: sortedBlocks, g: g, debug: true), kind: block.kind))
 }
 
-lowerUOpBlocks(uopBlocks, target: Device.C, ctx: ctx)
+lowerUOpBlocks(&uopBlocks, renderer: MetalRenderer(), ctx: ctx)

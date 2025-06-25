@@ -9,3 +9,8 @@
 - TargetIR can do things like "ADD_SIMD"
 ** Metal
 - each block goes in its own kernel, thus they should all be in their own ~ScheduleItem~
+* Items
+- Renderer class with sub-classes for each device (i.e. ~MetalRenderer~  ), implement ~cg~ functions there
+- more ops: switch
+- fully renderer c file
+- compilation
