@@ -40,4 +40,4 @@ for blockIdx in sortedBlockIds {
     uopBlocks.append(BlockUOps(ops: emitBlockUOps(ctx: ctx, block: block, blocks: sortedBlocks, g: g, debug: true), kind: block.kind))
 }
 
-lowerUOpBlocks(&uopBlocks, renderer: MetalRenderer(), ctx: ctx)
+lowerUOpBlocks(&uopBlocks, renderer: MetalRenderer(), ctx: ctx, frameCount: 44100)

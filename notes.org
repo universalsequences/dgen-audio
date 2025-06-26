@@ -14,3 +14,5 @@
 - more ops: switch
 - fully renderer c file
 - compilation
+* Thoughts <2025-06-25 Wed>
+- use range and endRange to deal with Scalar metal kernels

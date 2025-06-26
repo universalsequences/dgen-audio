@@ -47,14 +47,18 @@ extension UOp {
             opStr = "\(ANSI.green)switch\(ANSI.reset)(\(a), \(b), \(t))"
         case let .latch(a, b):
             opStr = "\(ANSI.green)latch\(ANSI.reset)(\(a), \(b))"
-        case let .begin_loop(a):
-            opStr = "\(ANSI.green)begin_loop\(ANSI.reset)(\(a))"
+        case let .beginLoop(a,b):
+            opStr = "\(ANSI.green)begin_loop\(ANSI.reset)(\(a), \(b))"
         case let .defineConstant(constantId, value):
             opStr = "\(ANSI.green)defineConstant\(ANSI.reset)(\(constantId),\(value))"
         case let .defineMemory(length):
             opStr = "\(ANSI.green)defineMemory\(ANSI.reset)(\(length))"
-        case .end_loop:
-            opStr = "\(ANSI.green)end_loop\(ANSI.reset)"
+        case .endLoop:
+            opStr = "\(ANSI.green)endLoop\(ANSI.reset)"
+        case let .beginRange(a,b):
+            opStr = "\(ANSI.green)beginRange\(ANSI.reset)(\(a), \(b))"
+        case .endRange:
+            opStr = "\(ANSI.green)endRange\(ANSI.reset)"
         }
 
 

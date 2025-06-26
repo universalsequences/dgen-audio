@@ -14,7 +14,7 @@ public class ScheduleItem {
     }
 }
 
-func lowerUOpBlocks(_ uopBlocks: inout [BlockUOps], renderer: Renderer, ctx: IRContext) {
+func lowerUOpBlocks(_ uopBlocks: inout [BlockUOps], renderer: Renderer, ctx: IRContext, frameCount: Int) {
     var scheduleItems: [ScheduleItem] = []
     if renderer is CRenderer {
         let scheduleItem = ScheduleItem(kind: .scalar); // C renderer is always scalar
@@ -27,12 +27,12 @@ func lowerUOpBlocks(_ uopBlocks: inout [BlockUOps], renderer: Renderer, ctx: IRC
         var defineGlobals: [UOp] = []
         for i in 0..<uopBlocks.count {
             uopBlocks[i].ops.removeAll(where: { uop in
-                if case .defineGlobal = uop.op {
-                    defineGlobals.append(uop)
-                    return true
-                }
-                return false
-            })
+                                                if case .defineGlobal = uop.op {
+                                                    defineGlobals.append(uop)
+                                                    return true
+                                                }
+                                                return false
+                                            })
         }
         scheduleItem.ops.append(contentsOf: defineGlobals)
     }
@@ -44,55 +44,70 @@ func lowerUOpBlocks(_ uopBlocks: inout [BlockUOps], renderer: Renderer, ctx: IRC
         }
         let scheduleItem = scheduleItems[scheduleItems.count - 1]
         if renderer is CRenderer {
-            scheduleItem.ops.append(UOp(op: .begin_loop(block.kind == Kind.scalar ? 1 : 4), value: .empty))
+            scheduleItem.ops.append(UOp(op: .beginLoop(128, block.kind == Kind.scalar ? 1 : 4), value: .empty))
+        } else if renderer is MetalRenderer {
+            switch block.kind {
+            case .scalar:
+                scheduleItem.ops.append(UOp(op: .beginRange(0, 1), value: .empty))
+                scheduleItem.ops.append(UOp(op: .beginLoop(frameCount, 1), value: .empty))
+            default:
+                break
+            }           
         }
         for uop in block.ops {
             scheduleItem.ops.append(UOp(op: uop.op, value: uop.value, kind: block.kind))
         }
-        if renderer is CRenderer {
-            scheduleItem.ops.append(UOp(op: .end_loop, value: .empty))
+        if renderer is MetalRenderer {
+            if (block.kind == .scalar) {
+                scheduleItem.ops.append(UOp(op: .endRange, value: .empty))
+                scheduleItem.ops.append(UOp(op: .endLoop, value: .empty))
+            }
+        } else {
+            scheduleItem.ops.append(UOp(op: .endLoop, value: .empty))
         }
     }
 
-    let body = renderer.render(scheduleItems: scheduleItems, ctx: ctx)
-    print("\(String(repeating: "####\n", count: 10))Generated \(renderer is CRenderer ? "C" : "Metal") Code:\(String(repeating:"\n", count: 4))")
-    print(body)
+    for i in 0..<scheduleItems.count {
+        let body = renderer.render(name: "kernel_\(i)", scheduleItem: scheduleItems[i], ctx: ctx)
+        print("Generated \(renderer is CRenderer ? "C" : "Metal") (\(scheduleItems[i].kind)) Code:\(String(repeating:"\n", count: 1))")
+        print(body)
+    }
 }
 
 func varId(_ lazy: Lazy) -> VarID {
     switch lazy {
     case let .variable(varid,_):
-          return varid
+        return varid
     default:
         fatalError("var id missing")
     }
 }
 
 open class Renderer {
-    open func render(scheduleItems: [ScheduleItem], ctx: IRContext) -> String {
+    open func prepareSchedule(_ scheduleItems: inout [ScheduleItem], _ blocks: [BlockUOps], _ ctx: IRContext, _ frameCount: Int) {}
+
+    open func render(name: String, scheduleItem: ScheduleItem, ctx: IRContext) -> String {
         fatalError("must be implemented by subclass")
     }
 }
 
 class CRenderer: Renderer {
-    override func render(scheduleItems: [ScheduleItem], ctx: IRContext) -> String {
+    override func render(name: String, scheduleItem: ScheduleItem, ctx: IRContext) -> String {
         var body = ""
-        for scheduleItem in scheduleItems {
-            var indent = 0
-            for uop in scheduleItem.ops {
-                var diff = 0
-                switch uop.op {
-                case .beginIf, .begin_loop:
-                    diff = 1
-                case .endIf, .end_loop:
-                    indent -= 1
-                default:
-                    break
-                }
-
-                body += "\(String(repeating: "  ", count: indent))\(cg(uop, ctx))\n"
-                indent += diff
+        var indent = 0
+        for uop in scheduleItem.ops {
+            var diff = 0
+            switch uop.op {
+            case .beginIf, .beginLoop:
+                diff = 1
+            case .endIf, .endLoop:
+                indent -= 1
+            default:
+                break
             }
+
+            body += "\(String(repeating: "  ", count: indent))\(cg(uop, ctx))\n"
+            indent += diff
         }
         return body
     }
@@ -139,10 +154,10 @@ class CRenderer: Renderer {
             return "\(g(a)) = \(g(b));"
         case .endIf:
             return "}"
-        case .end_loop:
+        case .endLoop:
             return "}"
-        case let .begin_loop(iter):
-            return "for (int i=0; i < 128; i+=\(iter)) {"
+        case let .beginLoop(iters,step):
+            return "for (int i=0; i < \(iters); i+=\(step)) {"
         case let .loadGlobal(id):
             if uop.kind == .simd {
                 return "float32x4_t simd\(id) = vld1q_f32(t\(id) + i);  "
@@ -185,76 +200,58 @@ class CRenderer: Renderer {
 class MetalRenderer: Renderer {
     let memoryVarID = -1 // Virtual ID for the global memory buffer
 
-    override func render(scheduleItems: [ScheduleItem], ctx: IRContext) -> String {
+    override func render(name: String, scheduleItem: ScheduleItem, ctx: IRContext) -> String {
         var kernels = ""
-        for (i, scheduleItem) in scheduleItems.enumerated() {
-            var (inputs, outputs) = analyzeDependencies(scheduleItem: scheduleItem, ctx: ctx)
+        var (inputs, outputs) = analyzeDependencies(scheduleItem: scheduleItem, ctx: ctx)
 
-            let hasMemoryOps = scheduleItem.ops.contains { uop in
-                if case .load = uop.op { return true }
-                if case .store = uop.op { return true }
-                return false
-            }
-
-            if hasMemoryOps {
-                if !inputs.contains(memoryVarID) { inputs.append(memoryVarID) }
-                if !outputs.contains(memoryVarID) { outputs.append(memoryVarID) }
-            }
-
-            let allBuffers = Set(inputs + outputs)
-
-            var parameters: [String] = []
-            for (i, bufferId) in allBuffers.sorted().enumerated() {
-                let bufferName = bufferId == memoryVarID ? "memory" : "t\(bufferId)"
-                parameters.append("    device float *\(bufferName) [[buffer(\(i))]]")
-            }
-
-            parameters.append("    uint id [[thread_position_in_grid]]")
-
-            kernels += "kernel void kernel_\(i)(\n"
-            kernels += parameters.joined(separator: ",\n")
-            kernels += "\n) {\n"
-            
-            var indent = 1
-
-            if scheduleItem.kind == .scalar {
-                kernels += "\(String(repeating: "  ", count: indent))if (id != 0) { return; }\n\n"
-                kernels += "\(String(repeating: "  ", count: indent))for (int i = 0; i < 128; ++i) {\n"
-                indent += 1
-            }
-
-            for uop in scheduleItem.ops {
-                var diff = 0
-                switch uop.op {
-                case .beginIf, .begin_loop:
-                    diff = 1
-                case .endIf, .end_loop:
-                    indent -= 1
-                default:
-                    break
-                }
-
-                kernels += "\(String(repeating: "  ", count: indent))\(cg(uop, ctx, scheduleItem.kind))\n"
-                indent += diff
-            }
-
-            if scheduleItem.kind == .scalar {
-                indent -= 1
-                kernels += "\(String(repeating: "  ", count: indent))}\n"
-            }
-            kernels += "}\n\n"
+        let hasMemoryOps = scheduleItem.ops.contains { uop in
+            if case .load = uop.op { return true }
+            if case .store = uop.op { return true }
+            return false
         }
+
+        if hasMemoryOps {
+            if !inputs.contains(memoryVarID) { inputs.append(memoryVarID) }
+            if !outputs.contains(memoryVarID) { outputs.append(memoryVarID) }
+        }
+
+        let allBuffers = Set(inputs + outputs)
+
+        var parameters: [String] = []
+        for (i, bufferId) in allBuffers.sorted().enumerated() {
+            let bufferName = bufferId == memoryVarID ? "memory" : "t\(bufferId)"
+            parameters.append("    device float *\(bufferName) [[buffer(\(i))]]")
+        }
+
+        parameters.append("    uint id [[thread_position_in_grid]]")
+
+        kernels += "kernel void \(name)(\n"
+        kernels += parameters.joined(separator: ",\n")
+        kernels += "\n) {\n"
+        
+        var indent = 1
+
+       
+        for uop in scheduleItem.ops {
+            var diff = 0
+            switch uop.op {
+            case .beginIf, .beginLoop, .beginRange:
+                diff = 1
+            case .endIf, .endLoop, .endRange:
+                indent -= 1
+            default:
+                break
+            }
+
+            kernels += "\(String(repeating: "  ", count: indent))\(cg(uop, ctx, scheduleItem.kind))\n"
+            indent += diff
+        }
+
+        kernels += "}\n\n"
         return kernels
     }
 
-
-
-
-
-
     func analyzeDependencies(scheduleItem: ScheduleItem, ctx: IRContext) -> (inputs: [VarID], outputs: [VarID]) {
-        print("***\n\n")
-        print("Analyze dependencies ops=\(scheduleItem.ops)")
         var inputs: Set<VarID> = []
         var outputs: Set<VarID> = []
         var defined: Set<VarID> = []
@@ -262,7 +259,6 @@ class MetalRenderer: Renderer {
         for uop in scheduleItem.ops {
             switch uop.op {
             case let .defineGlobal(varId):
-                print("inserting varid for global **********************************************")
                 outputs.insert(varId)
             case let .loadGlobal(varId):
                 inputs.insert(varId)
@@ -270,29 +266,6 @@ class MetalRenderer: Renderer {
                 break
             }
         }
-
-        /*
-        for uop in scheduleItem.ops {
-            // All variables assigned to are outputs
-            if let assignedVar = uop.value.varId, ctx.globals.contains(assignedVar) {
-                outputs.insert(assignedVar)
-            }
-
-            // Analyze operands to find inputs
-            for operand in uop.op.operands {
-                if let operandVar = operand.varId, ctx.globals.contains(operandVar) && !defined.contains(operandVar) {
-                    inputs.insert(operandVar)
-                }
-            }
-
-            if let assignedVar = uop.value.varId {
-                defined.insert(assignedVar)
-            }
-        }
-        */
-
-        // An output can't also be an input in the same kernel
-//        inputs.subtract(outputs)
 
         return (inputs: Array(inputs), outputs: Array(outputs))
     }
@@ -329,6 +302,14 @@ class MetalRenderer: Renderer {
             return "if (\(g(cond))) {"
         case let .mutate(a,b):
             return "\(g(a)) = \(g(b));"
+        case let .beginLoop(iters,step):
+            return "for (int i=0; i < \(iters); i+=\(step)) {"
+        case .endLoop:
+            return "}"
+        case let .beginRange(start,end):
+            return "if (id >= \(start) && id < \(end)) {"
+        case .endRange:
+            return "}"
         case .endIf:
             return "}"
         default:

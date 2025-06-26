@@ -56,8 +56,10 @@ public enum Op {
     case defineConstant(ConstantID, Float)
     case defineMemory(Int)
     case loadGlobal(VarID)
-    case begin_loop(Int)
-    case end_loop
+    case beginLoop(Int,Int)
+    case endLoop
+    case beginRange(Int,Int)
+    case endRange
 }
 
 public struct UOp {
