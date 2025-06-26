@@ -15,6 +15,8 @@ let cond = g.n(.lt, ph2, g.n(.constant(0.3)));
 let latched = g.n(.latch(2), ph1, cond)
 
 let mult = g.n(.mul, latched, ph1)
+
+let out = g.n(.output(0), mult)
     
 let sorted = topo(g)
 let scalar = scalarNodes(g)
@@ -40,4 +42,23 @@ for blockIdx in sortedBlockIds {
     uopBlocks.append(BlockUOps(ops: emitBlockUOps(ctx: ctx, block: block, blocks: sortedBlocks, g: g, debug: true), kind: block.kind))
 }
 
-lowerUOpBlocks(&uopBlocks, renderer: MetalRenderer(), ctx: ctx, frameCount: 44100)
+let kernels = lowerUOpBlocks(&uopBlocks, renderer: CRenderer(), ctx: ctx, frameCount: 128)
+
+for kernel in kernels {
+    print("Kernel \(kernel.name):")
+    for buffer in kernel.buffers {
+        print("- buffer: \(buffer)")
+    }
+    print(kernel.source)
+    let source = kernel.source
+
+    let compiled = CCompiledKernel(source: source)
+    try compiled.compileAndLoad()
+
+    var outputs = [Float](repeating: 0, count: 128)
+    var inputs = [Float](repeating: 1, count: 128)
+
+    compiled.run(outputs: &outputs, inputs: inputs, frameCount: 128)
+
+    print(outputs)
+}

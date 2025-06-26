@@ -50,6 +50,13 @@ public final class IRBuilder {
     return value(uop.value)
   }
 
+  public func output(_ channelNumber: ChannelNumber, _ val: Expr) -> Expr {
+    let thunk = u_output(channelNumber, val.lazy)
+    let uop = thunk(ctx,nil )
+    ops.append(uop)
+    return value(uop.value)
+  }
+
   public func gswitch(_ cond: Expr, _ then: Expr, _ els: Expr) -> Expr {
     let thunk = u_switch(cond.lazy
                         , then.lazy, els.lazy);

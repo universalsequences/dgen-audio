@@ -2,6 +2,7 @@ public typealias NodeID = Int;
 public typealias VarID = Int;
 public typealias ConstantID = Int;
 public typealias CellID = Int;
+public typealias ChannelNumber = Int
 
 public enum Lazy: Hashable {
     case constant(ConstantID, Float)
@@ -60,6 +61,7 @@ public enum Op {
     case endLoop
     case beginRange(Int,Int)
     case endRange
+    case output(ChannelNumber, Lazy)
 }
 
 public struct UOp {
@@ -108,6 +110,12 @@ func u_load(_ cellId: CellID) -> (IRContext, NodeID?) -> UOp {
 func u_store(_ cellId: CellID, _ value: Lazy) -> (IRContext, NodeID?) -> UOp {
     return { ctx, _ in
         return UOp(op: .store(cellId, value), value: ctx.useVariable(src: nil))
+    }
+}
+
+func u_output(_ channelNumber: ChannelNumber, _ value: Lazy) -> (IRContext, NodeID?) -> UOp {
+    return { ctx, _ in
+        return UOp(op: .output(channelNumber, value), value: ctx.useVariable(src: nil))
     }
 }
 
@@ -186,6 +194,7 @@ public enum LazyOp {
     case phasor(CellID)
     case accum(CellID)
     case constant(Float)
+    case output(Int)
 
     func emit(_ thunk: (IRContext, NodeID) -> UOp, into ops: inout [UOp], ctx: IRContext, nodeId: NodeID) -> Lazy {
         let uop = thunk(ctx, nodeId)
@@ -250,6 +259,9 @@ public enum LazyOp {
                guard inputs.count == 2 else { fatalError("phasor requires 2 inputs") }
                let (freq, reset) = b.values(inputs, count: 2)
                b.use(val: u_phasor(cellId, freq: freq, reset: reset)(b))
+           case .output(let outputNumber):
+               guard inputs.count == 1 else { fatalError("output requires 1 inputs") }
+               b.use(val: b.output(outputNumber, b.value(inputs[0])))
         }
         ops.append(contentsOf: b.ops)
         return ops

@@ -5,6 +5,14 @@ public enum Device {
     case Metal
 }
 
+public struct CompiledKernel {
+    public let name: String
+    public let source: String
+    public let kind: Kind
+    public let buffers: [String]  // names of inputs/outputs
+    public let threadGroupSize: Int  // for Metal
+}
+
 public class ScheduleItem {
     public var ops: [UOp] = []
     public let kind: Kind
@@ -14,67 +22,18 @@ public class ScheduleItem {
     }
 }
 
-func lowerUOpBlocks(_ uopBlocks: inout [BlockUOps], renderer: Renderer, ctx: IRContext, frameCount: Int) {
+func lowerUOpBlocks(
+  _ uopBlocks: inout [BlockUOps],
+  renderer: Renderer,
+  ctx: IRContext,
+  frameCount: Int
+) -> [CompiledKernel] {
     var scheduleItems: [ScheduleItem] = []
-    if renderer is CRenderer {
-        let scheduleItem = ScheduleItem(kind: .scalar); // C renderer is always scalar
-        scheduleItems.append(scheduleItem);
-        for (constantId, constant) in ctx.constants {
-            scheduleItem.ops.append(UOp(op: .defineConstant(constantId, constant), value: .empty))
-        }
-        scheduleItem.ops.append(UOp(op: .defineMemory(512), value: .empty))
-
-        var defineGlobals: [UOp] = []
-        for i in 0..<uopBlocks.count {
-            uopBlocks[i].ops.removeAll(where: { uop in
-                                                if case .defineGlobal = uop.op {
-                                                    defineGlobals.append(uop)
-                                                    return true
-                                                }
-                                                return false
-                                            })
-        }
-        scheduleItem.ops.append(contentsOf: defineGlobals)
-    }
-
-    for block in uopBlocks {
-        if renderer is MetalRenderer {
-            let scheduleItem = ScheduleItem(kind: block.kind)
-            scheduleItems.append(scheduleItem)
-        }
-        let scheduleItem = scheduleItems[scheduleItems.count - 1]
-        if renderer is CRenderer {
-            scheduleItem.ops.append(UOp(op: .beginLoop(128, block.kind == Kind.scalar ? 1 : 4), value: .empty))
-        } else if renderer is MetalRenderer {
-            switch block.kind {
-            case .scalar:
-                scheduleItem.ops.append(UOp(op: .beginRange(0, 1), value: .empty))
-                scheduleItem.ops.append(UOp(op: .beginLoop(frameCount, 1), value: .empty))
-            default:
-                break
-            }           
-        }
-        for uop in block.ops {
-            scheduleItem.ops.append(UOp(op: uop.op, value: uop.value, kind: block.kind))
-        }
-        if renderer is MetalRenderer {
-            if (block.kind == .scalar) {
-                scheduleItem.ops.append(UOp(op: .endRange, value: .empty))
-                scheduleItem.ops.append(UOp(op: .endLoop, value: .empty))
-            }
-        } else {
-            scheduleItem.ops.append(UOp(op: .endLoop, value: .empty))
-        }
-    }
-
-    for i in 0..<scheduleItems.count {
-        let body = renderer.render(name: "kernel_\(i)", scheduleItem: scheduleItems[i], ctx: ctx)
-        print("Generated \(renderer is CRenderer ? "C" : "Metal") (\(scheduleItems[i].kind)) Code:\(String(repeating:"\n", count: 1))")
-        print(body)
-    }
+    renderer.prepareSchedule(&scheduleItems, uopBlocks, ctx, frameCount)
+    return renderer.compile(scheduleItems: scheduleItems, ctx: ctx)
 }
 
-func varId(_ lazy: Lazy) -> VarID {
+func extractVarId(_ lazy: Lazy) -> VarID {
     switch lazy {
     case let .variable(varid,_):
         return varid
@@ -83,18 +42,119 @@ func varId(_ lazy: Lazy) -> VarID {
     }
 }
 
+protocol UOpEmitter {
+    func emit(_ uop: UOp, ctx: IRContext) -> String
+    func emitLazy(_ lazy: Lazy, ctx: IRContext, kind: Kind?, isOut: Bool) -> String
+}
+
 open class Renderer {
     open func prepareSchedule(_ scheduleItems: inout [ScheduleItem], _ blocks: [BlockUOps], _ ctx: IRContext, _ frameCount: Int) {}
 
+    open func compile(
+      scheduleItems: [ScheduleItem],
+      ctx: IRContext
+    ) -> [CompiledKernel] {
+        fatalError("must implement")
+    }
+    
     open func render(name: String, scheduleItem: ScheduleItem, ctx: IRContext) -> String {
         fatalError("must be implemented by subclass")
     }
 }
 
 class CRenderer: Renderer {
+
+    override func compile(
+      scheduleItems: [ScheduleItem],
+      ctx: IRContext
+    ) -> [CompiledKernel] {
+        return scheduleItems.enumerated().map { (i, scheduleItem) in
+            let source = render(name: "kernel_\(i)", scheduleItem: scheduleItem, ctx: ctx)
+
+            // For C, the "buffers" are just the global arrays used
+            var buffers: [String] = []
+
+            for uop in scheduleItem.ops {
+                switch uop.op {
+                case let .defineGlobal(varId):
+                    buffers.append("t\(varId)")
+                case .defineMemory:
+                    buffers.append("memory")
+                default:
+                    break
+                }
+            }
+
+            return CompiledKernel(
+       name: "kernel_\(i)",
+       source: source,
+       kind: scheduleItem.kind,
+       buffers: buffers,
+       threadGroupSize: 1 // C execution is scalar for now
+     )
+        }
+    }
+    
+    override func prepareSchedule(
+      _ scheduleItems: inout [ScheduleItem],
+      _ uopBlocks: [BlockUOps],
+      _ ctx: IRContext,
+      _ frameCount: Int
+    ) {
+        let scheduleItem = ScheduleItem(kind: .scalar)
+        scheduleItems.append(scheduleItem)
+
+        // Extract defineGlobal from all blocks
+        for block in uopBlocks {
+            scheduleItem.ops.append(UOp(op: .beginLoop(128, block.kind == .scalar ? 1 : 4), value: .empty))
+            for uop in block.ops {
+                switch uop.op {
+                case .defineGlobal:
+                    break
+                default: 
+                    scheduleItem.ops.append(UOp(op: uop.op, value: uop.value, kind: block.kind))
+                }
+            }
+            scheduleItem.ops.append(UOp(op: .endLoop, value: .empty))
+        }
+
+        // Append all UOps inside a single loop
+        scheduleItem.ops.append(UOp(op: .beginLoop(128, 1), value: .empty))
+
+        scheduleItem.ops.append(UOp(op: .endLoop, value: .empty))
+    }
+    
     override func render(name: String, scheduleItem: ScheduleItem, ctx: IRContext) -> String {
-        var body = ""
-        var indent = 0
+        var code: [String] = []
+
+        // C includes and function signature
+        code.append("""
+                      #include <arm_neon.h>
+                      #include <stdint.h>
+
+                      """)
+
+        // Declare globals
+        let sortedGlobals = ctx.globals.sorted()
+        for varId in sortedGlobals {
+            code.append("float t\(varId)[128] __attribute__((aligned(16)));")
+        }
+
+     
+
+        // Declare memory if needed
+        code.append("float memory[512] __attribute__((aligned(16)));")
+
+        code.append("void process(float *outputs, float *inputs, int frameCount) {")
+
+   // Define constants and memory
+        for (constantId, constant) in ctx.constants {
+            let uop = UOp(op: .defineConstant(constantId, constant), value: .empty)
+            code.append("  \(emit(uop, ctx: ctx))")
+        }
+
+        // Emit ops
+        var indent = 1
         for uop in scheduleItem.ops {
             var diff = 0
             switch uop.op {
@@ -106,99 +166,170 @@ class CRenderer: Renderer {
                 break
             }
 
-            body += "\(String(repeating: "  ", count: indent))\(cg(uop, ctx))\n"
+            let line = emit(uop, ctx: ctx)
+            let indentStr = String(repeating: "  ", count: indent)
+            code.append("\(indentStr)\(line)")
             indent += diff
         }
-        return body
+
+        // Close process function
+        code.append("}")
+
+        return code.joined(separator: "\n")
     }
 
-    func cg(_ uop: UOp, _ ctx: IRContext) -> String {
-        let assign: (String) -> String = {gen in
-            return self.cgAssign(uop, gen, ctx);
-        }
-        let g: (Lazy) -> String = {a in
-            return self.cg(a,ctx, uop.kind, isOut: false)
-        }
 
-        var body = ""
+    func emit(_ uop: UOp, ctx: IRContext) -> String {
+        let g = { self.emitLazy($0, ctx: ctx, kind: uop.kind, isOut: false) }
+
         switch uop.op {
-        case let .defineConstant(constantId, value):
-            return "float32x4_t c\(constantId )= vdupq_n_f32(\(value)f); "
+        case let .defineConstant(constantId, val):
+            return "float32x4_t c\(constantId) = vdupq_n_f32(\(val)f);"
         case let .defineGlobal(varId):
             return "float t\(varId)[128] __attribute__((aligned(16)));"
         case let .defineMemory(length):
             return "float memory[\(length)] __attribute__((aligned(16)));"
-        case let .add(a,b):
-            body = uop.kind == .scalar ? "\(g(a)) + \(g(b))" :
-              "vaddq_f32(\(g(a)), \(g(b)))"
-        case let .mul(a,b):
-            body = uop.kind == .scalar ? "\(g(a)) * \(g(b))" :
-              "vmulq_f32(\(g(a)), \(g(b)))"
-        case let .sub(a,b):
-            body = "\(g(a)) - \(g(b))"
-        case let .div(a,b):
-            body = "\(g(a)) / \(g(b))"
-        case let .gt(a,b):
-            body = "\(g(a)) > \(g(b))"
-        case let .lt(a,b):
-            body = uop.kind == .simd ?
+
+        case let .add(a, b):
+            let expr = uop.kind == .simd ? "vaddq_f32(\(g(a)), \(g(b)))" : "\(g(a)) + \(g(b))"
+            return emitAssign(uop, expr, ctx)
+
+        case let .mul(a, b):
+            let expr = uop.kind == .simd ? "vmulq_f32(\(g(a)), \(g(b)))" : "\(g(a)) * \(g(b))"
+            return emitAssign(uop, expr, ctx)
+
+        case let .sub(a, b): return emitAssign(uop, "\(g(a)) - \(g(b))", ctx)
+        case let .div(a, b): return emitAssign(uop, "\(g(a)) / \(g(b))", ctx)
+
+        case let .gt(a, b): return emitAssign(uop, "\(g(a)) > \(g(b))", ctx)
+        case let .lt(a, b):
+            let expr = uop.kind == .simd ?
               "vcvtq_f32_u32(vcltq_f32(\(g(a)), \(g(b))))" :
               "\(g(a)) < \(g(b))"
-        case let .store(cell,val):
-            return "memory[\(cell)] = \(g(val));"
-        case let .load(cell):
-            body = "memory[\(cell)]"
-        case let .beginIf(cond):
-            return "if (\(g(cond))) {"
-        case let .mutate(a,b):
-            return "\(g(a)) = \(g(b));"
-        case .endIf:
-            return "}"
-        case .endLoop:
-            return "}"
-        case let .beginLoop(iters,step):
-            return "for (int i=0; i < \(iters); i+=\(step)) {"
+            return emitAssign(uop, expr, ctx)
+
+        case let .store(cell, val): return "memory[\(cell)] = \(g(val));"
+        case let .load(cell): return emitAssign(uop, "memory[\(cell)]", ctx)
+
+        case let .beginIf(cond): return "if (\(g(cond))) {"
+        case .endIf: return "}"
+
+        case let .mutate(a, b): return "\(emitLazy(a, ctx: ctx, kind: uop.kind, isOut: true)) = \(g(b));"
+
+        case let .output(channel, val):
+            print("value to output = \(val)")
+                if uop.kind == .simd {
+                    let ptr = "outputs + \(channel) * 128 + i"
+                    return "vst1q_f32(\(ptr), \(g(val)));"
+                } else {
+                    let addr = "outputs[\(channel) * 128 + i]"
+                    return "\(addr) = \(g(val));"
+                }
+            
+
+        case let .beginLoop(iters, step): return "for (int i = 0; i < \(iters); i += \(step)) {"
+        case .endLoop: return "}"
+
         case let .loadGlobal(id):
-            if uop.kind == .simd {
-                return "float32x4_t simd\(id) = vld1q_f32(t\(id) + i);  "
-            }
-            return "/* \(uop.prettyDescription()) */";
+            return uop.kind == .simd
+              ? "float32x4_t simd\(id) = vld1q_f32(t\(id) + i);"
+              : "/* \(uop.prettyDescription()) */"
+
         default:
-            return "/* \(uop.prettyDescription()) */";
+            return "/* \(uop.prettyDescription()) */"
         }
-        return assign(body)
     }
 
-    func cg(_ lazy: Lazy, _ ctx: IRContext, _ kind: Kind? = nil, isOut: Bool) -> String {
+    func emitLazy(_ lazy: Lazy, ctx: IRContext, kind: Kind?, isOut: Bool) -> String {
         switch lazy {
-        case let .constant(constantId, x):
-            return kind == Kind.simd ? "c\(constantId)" : "\(x)";
-        case let .variable(id,_):
-            return ctx.globals.contains(id) ? "\(!isOut && kind == .simd ? "simd\(id)" : kind == .simd ? " t\(id) + i" : "t\(id)[i]")" : "t\(id)";
+        case let .constant(constantId, val):
+            return kind == .simd ? "c\(constantId)" : "\(val)"
+        case let .variable(id, _):
+            if ctx.globals.contains(id) {
+                if kind == .simd {
+                    return isOut ? "t\(id) + i" : "simd\(id)"
+                } else {
+                    return "t\(id)[i]"
+                }
+            } else {
+                return "t\(id)"
+            }
         default:
-            return "";
+            return "/* unknown lazy */"
         }
     }
 
-    func cgAssign(_ uop: UOp, _ gen: String, _ ctx: IRContext) -> String {
-        let variable = cg(uop.value, ctx, uop.kind, isOut: true);
-        switch (uop.kind) {
-        case .simd:
-            if (ctx.globals.contains(varId(uop.value))) {
-                return "vst1q_f32(\(variable), \(gen));"
-            }
-            return "float32x4_t \(variable) = \(gen);"
-        default:
-            if (ctx.globals.contains(varId(uop.value))) {
-                return "\(variable) = \(gen);"
-            }
-            return "float \(variable) = \(gen);"
+    func emitAssign(_ uop: UOp, _ expr: String, _ ctx: IRContext) -> String {
+        let lhs = emitLazy(uop.value, ctx: ctx, kind: uop.kind, isOut: true)
+        let isGlobal = ctx.globals.contains(extractVarId(uop.value))
+
+        if uop.kind == .simd {
+            return isGlobal
+              ? "vst1q_f32(\(lhs), \(expr));"
+              : "float32x4_t \(lhs) = \(expr);"
+        } else {
+            return isGlobal
+              ? "\(lhs) = \(expr);"
+              : "float \(lhs) = \(expr);"
         }
     }
 }
 
-class MetalRenderer: Renderer {
+class MetalRenderer: Renderer, UOpEmitter {
     let memoryVarID = -1 // Virtual ID for the global memory buffer
+
+    override func compile(
+      scheduleItems: [ScheduleItem],
+      ctx: IRContext
+    ) -> [CompiledKernel] {
+        return scheduleItems.enumerated().map { (i, scheduleItem) in
+            let source = render(name: "kernel_\(i)", scheduleItem: scheduleItem, ctx: ctx)
+            let buffers = analyzeDependencies(scheduleItem: scheduleItem, ctx: ctx).inputs +
+              analyzeDependencies(scheduleItem: scheduleItem, ctx: ctx).outputs
+            return CompiledKernel(
+              name: "kernel_\(i)",
+              source: source,
+              kind: scheduleItem.kind,
+              buffers: buffers.map { $0 == -1 ? "memory" : "t\($0)" },
+              threadGroupSize: scheduleItem.kind == .simd ? 128 : 1
+            )
+        }
+    }
+    
+    override func prepareSchedule(
+      _ scheduleItems: inout [ScheduleItem],
+      _ uopBlocks: [BlockUOps],
+      _ ctx: IRContext,
+      _ frameCount: Int
+    ) {
+        for block in uopBlocks {
+            let scheduleItem = ScheduleItem(kind: block.kind)
+
+            // Optional: extract defineGlobals early (or leave in place if your IR handles it)
+            for uop in block.ops {
+                if case .defineGlobal = uop.op {
+                    scheduleItem.ops.append(uop)
+                }
+            }
+
+            if block.kind == .scalar {
+                scheduleItem.ops.append(UOp(op: .beginRange(0, 1), value: .empty))
+                scheduleItem.ops.append(UOp(op: .beginLoop(frameCount, 1), value: .empty))
+            }
+
+            for uop in block.ops {
+                if case .defineGlobal = uop.op { continue }
+                scheduleItem.ops.append(uop)
+            }
+
+            if block.kind == .scalar {
+                scheduleItem.ops.append(UOp(op: .endLoop, value: .empty))
+                scheduleItem.ops.append(UOp(op: .endRange, value: .empty))
+            }
+
+            scheduleItems.append(scheduleItem)
+        }
+    }
 
     override func render(name: String, scheduleItem: ScheduleItem, ctx: IRContext) -> String {
         var kernels = ""
@@ -231,7 +362,7 @@ class MetalRenderer: Renderer {
         
         var indent = 1
 
-       
+        
         for uop in scheduleItem.ops {
             var diff = 0
             switch uop.op {
@@ -243,7 +374,7 @@ class MetalRenderer: Renderer {
                 break
             }
 
-            kernels += "\(String(repeating: "  ", count: indent))\(cg(uop, ctx, scheduleItem.kind))\n"
+            kernels += "\(String(repeating: "  ", count: indent))\(emit(uop, ctx: ctx))\n"
             indent += diff
         }
 
@@ -254,93 +385,69 @@ class MetalRenderer: Renderer {
     func analyzeDependencies(scheduleItem: ScheduleItem, ctx: IRContext) -> (inputs: [VarID], outputs: [VarID]) {
         var inputs: Set<VarID> = []
         var outputs: Set<VarID> = []
-        var defined: Set<VarID> = []
 
         for uop in scheduleItem.ops {
             switch uop.op {
-            case let .defineGlobal(varId):
-                outputs.insert(varId)
-            case let .loadGlobal(varId):
-                inputs.insert(varId)
-            default:
-                break
+            case let .defineGlobal(varId): outputs.insert(varId)
+            case let .loadGlobal(varId): inputs.insert(varId)
+            default: break
             }
         }
 
         return (inputs: Array(inputs), outputs: Array(outputs))
     }
 
-    func cg(_ uop: UOp, _ ctx: IRContext, _ scheduleKind: Kind) -> String {
-        let assign: (String) -> String = {gen in
-            return self.cgAssign(uop, gen, ctx, scheduleKind);
-        }
-        let g: (Lazy) -> String = {a in
-            return self.cg(a,ctx, uop.kind, isOut: false, scheduleKind: scheduleKind)
-        }
+    func emit(_ uop: UOp, ctx: IRContext) -> String {
+        let g = { self.emitLazy($0, ctx: ctx, kind: uop.kind, isOut: false) }
 
-        var body = ""
         switch uop.op {
-        case .defineMemory(_):
-            return ""
-        case let .add(a,b):
-            body = "\(g(a)) + \(g(b))"
-        case let .mul(a,b):
-            body = "\(g(a)) * \(g(b))"
-        case let .sub(a,b):
-            body = "\(g(a)) - \(g(b))"
-        case let .div(a,b):
-            body = "\(g(a)) / \(g(b))"
-        case let .gt(a,b):
-            body = "\(g(a)) > \(g(b))"
-        case let .lt(a,b):
-            body = "\(g(a)) < \(g(b))"
-        case let .store(cell,val):
-            return "memory[\(cell)] = \(g(val));"
-        case let .load(cell):
-            body = "memory[\(cell)]"
-        case let .beginIf(cond):
-            return "if (\(g(cond))) {"
-        case let .mutate(a,b):
-            return "\(g(a)) = \(g(b));"
-        case let .beginLoop(iters,step):
-            return "for (int i=0; i < \(iters); i+=\(step)) {"
-        case .endLoop:
-            return "}"
-        case let .beginRange(start,end):
-            return "if (id >= \(start) && id < \(end)) {"
-        case .endRange:
-            return "}"
-        case .endIf:
-            return "}"
+        case .defineMemory: return ""
+
+        case let .add(a, b): return emitAssign(uop, "\(g(a)) + \(g(b))", ctx)
+        case let .mul(a, b): return emitAssign(uop, "\(g(a)) * \(g(b))", ctx)
+        case let .sub(a, b): return emitAssign(uop, "\(g(a)) - \(g(b))", ctx)
+        case let .div(a, b): return emitAssign(uop, "\(g(a)) / \(g(b))", ctx)
+
+        case let .gt(a, b): return emitAssign(uop, "\(g(a)) > \(g(b))", ctx)
+        case let .lt(a, b): return emitAssign(uop, "\(g(a)) < \(g(b))", ctx)
+
+        case let .load(cell): return emitAssign(uop, "memory[\(cell)]", ctx)
+        case let .store(cell, val): return "memory[\(cell)] = \(g(val));"
+
+        case let .mutate(a, b): return "\(emitLazy(a, ctx: ctx, kind: uop.kind, isOut: true)) = \(g(b));"
+        case let .beginIf(cond): return "if (\(g(cond))) {"
+        case .endIf: return "}"
+
+        case let .beginLoop(iters, step): return "for (int i = 0; i < \(iters); i += \(step)) {"
+        case .endLoop: return "}"
+
+        case let .beginRange(start, end): return "if (id >= \(start) && id < \(end)) {"
+        case .endRange: return "}"
+
         default:
-            return "/* \(uop.prettyDescription()) */";
+            return "/* \(uop.prettyDescription()) */"
         }
-        return assign(body)
     }
 
-    func cg(_ lazy: Lazy, _ ctx: IRContext, _ kind: Kind? = nil, isOut: Bool, scheduleKind: Kind) -> String {
+    func emitLazy(_ lazy: Lazy, ctx: IRContext, kind: Kind?, isOut: Bool) -> String {
         switch lazy {
-        case let .constant(_, x):
-            return "\(x)"
-        case let .variable(id,_):
+        case let .constant(_, val): return "\(val)"
+        case let .variable(id, _):
             if ctx.globals.contains(id) {
-                let index = scheduleKind == .simd ? "id" : "i"
-                return "t\(id)[\(index)]"
+                let idx = (kind == .simd) ? "id" : "i"
+                return "t\(id)[\(idx)]"
+            } else {
+                return "t\(id)"
             }
-            return "t\(id)"
-        default:
-            return "";
+        default: return "/* unknown lazy */"
         }
     }
 
-    func cgAssign(_ uop: UOp, _ gen: String, _ ctx: IRContext, _ scheduleKind: Kind) -> String {
-        let variable = cg(uop.value, ctx, uop.kind, isOut: true, scheduleKind: scheduleKind);
-        let type = "float"
-
-        if ctx.globals.contains(varId(uop.value)) {
-            return "\(variable) = \(gen);"
+    func emitAssign(_ uop: UOp, _ expr: String, _ ctx: IRContext) -> String {
+        let lhs = emitLazy(uop.value, ctx: ctx, kind: uop.kind, isOut: true)
+        if ctx.globals.contains(extractVarId(uop.value)) {
+            return "\(lhs) = \(expr);"
         }
-        
-        return "\(type) \(variable) = \(gen);"
+        return "float \(lhs) = \(expr);"
     }
 }

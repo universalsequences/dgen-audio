@@ -59,6 +59,8 @@ extension UOp {
             opStr = "\(ANSI.green)beginRange\(ANSI.reset)(\(a), \(b))"
         case .endRange:
             opStr = "\(ANSI.green)endRange\(ANSI.reset)"
+        case let .output(a,b):
+            opStr = "\(ANSI.green)output\(ANSI.reset)(\(a), \(b))"
         }
 
 

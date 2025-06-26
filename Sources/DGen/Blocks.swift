@@ -1,4 +1,16 @@
 
+public enum Kind { case simd, scalar }
+
+// corresponds to one kernel (metal backends) or for loop (in C backend)
+public struct Block: Equatable {
+    public var kind: Kind
+    public var nodes: [NodeID] = []
+
+    public init(kind: Kind) {
+        self.kind = kind
+    }
+}
+
 public func scalarNodes(_ g: Graph) -> Set<NodeID> {
     var reads = [Int: [NodeID]](), writes = [Int: [NodeID]]()
     var scalar: Set<NodeID> = []
@@ -57,18 +69,6 @@ public func topo(_ g: Graph) -> [NodeID] {
         g.nodes[n]!.inputs.forEach { indeg[$0]! -= 1; if indeg[$0] == 0 { q.append($0) } }
     }
     return out.reversed()
-}
-
-public enum Kind { case simd, scalar }
-
-// corresponds to one kernel (metal backends) or for loop (in C backend)
-public struct Block: Equatable {
-    public var kind: Kind
-    public var nodes: [NodeID] = []
-
-    public init(kind: Kind) {
-        self.kind = kind
-    }
 }
 
 func getBlockIndexWithDependency(nodeID: NodeID, g: Graph, blocks: [Block], kind: Kind) -> Int? {
@@ -137,6 +137,32 @@ public func determineBlocks(sorted: [NodeID], scalar: Set<NodeID>, g: Graph, max
     return b
 }
 
+extension LazyOp {
+    var isOutput: Bool {
+        if case .output = self { return true }
+        return false
+    }
+}
+
+public func findOutputNodeNeeds(_ blks: [Block], _ g: Graph) -> Set<NodeID> {
+    var outputNodeNeeds: Set<NodeID> = []
+    for b in blks {
+        for nID in b.nodes {
+            if let n = g.nodes[nID] {
+                switch n.op {
+                case .output:
+                    n.inputs.forEach {
+                        outputNodeNeeds.insert($0)
+                    }
+                default:
+                    break
+                }
+            }
+        }
+    }
+    return outputNodeNeeds
+}
+
 // ─── 3. decide which nodes need cross-block scratch buffers ─────
 // in the case of metal, these are transmitted via buffers
 public func findNodesWithOutboundDependencies(_ blks: [Block], _ g: Graph, block: Block) -> Set<NodeID> {
@@ -144,13 +170,15 @@ public func findNodesWithOutboundDependencies(_ blks: [Block], _ g: Graph, block
     var nodeBlock = [NodeID: Int]()
     let idx = blks.firstIndex{b in return b == block}
     block.nodes.forEach { nodeBlock[$0] = idx }
+    
+    let outputNodeNeeds = findOutputNodeNeeds(blks, g)
 
     var need: Set<NodeID> = []
     for b in blocks {
         for nID in b.nodes {
             g.nodes[nID]!.inputs.forEach {
                 if let nodeBlockIdx = nodeBlock[$0] {
-                    if nodeBlockIdx != nID { need.insert($0) }  // producer in diff block
+                    if (nodeBlockIdx != nID && !outputNodeNeeds.contains($0)) { need.insert($0) }  // producer in diff block
                 }
             }
         }
@@ -159,6 +187,8 @@ public func findNodesWithOutboundDependencies(_ blks: [Block], _ g: Graph, block
 }
 
 public func findNodesAsInboundDependencies(_ blks: [Block], _ g: Graph, block: Block) -> Set<NodeID> {
+    let outputNodeNeeds = findOutputNodeNeeds(blks, g)
+
     // find which block each node is defined in
     var nodeBlock = [NodeID: Int]()
     for (idx, b) in blks.enumerated() { b.nodes.forEach { nodeBlock[$0] = idx } }
@@ -167,7 +197,7 @@ public func findNodesAsInboundDependencies(_ blks: [Block], _ g: Graph, block: B
     // go thru each node in this block and if its defined in some other block, add it here
     for nID in block.nodes {
         g.nodes[nID]!.inputs.forEach {
-            if nodeBlock[$0]! != nID { need.insert($0) }  // producer in diff block
+            if (nodeBlock[$0]! != nID && !outputNodeNeeds.contains($0)) { need.insert($0) }  // producer in diff block
         }
     }
     return need
@@ -272,7 +302,7 @@ func emitBlockUOps (ctx: IRContext, block: Block, blocks: [Block], g: Graph, deb
             }
         }
     }
-
+   
     let inbound = findNodesAsInboundDependencies(blocks, g, block: block);
     for nodeId in inbound {
         if let lz = ctx.values[nodeId] {
