@@ -95,6 +95,22 @@ public func determineBlocks(sorted: [NodeID], scalar: Set<NodeID>, g: Graph, max
     for n in sorted {
         let k: Kind = scalar.contains(n) ? .scalar : .simd
 
+        var foundOutput = false
+        if let node = g.nodes[n] {
+            switch node.op {
+            case .output:
+                b[b.count-1].nodes.append(n)
+                foundOutput = true
+                break
+            default:
+                break
+            }
+        }
+
+        if (foundOutput) {
+            break
+        }
+
         if k == .scalar {
             let scalarBlockIdx = getBlockIndexWithDependency(nodeID: n, g: g, blocks: b, kind: .scalar)
             let simdBlockIdx = getBlockIndexWithDependency(nodeID: n, g: g, blocks: b, kind: .simd)
@@ -144,19 +160,17 @@ extension LazyOp {
     }
 }
 
-public func findOutputNodeNeeds(_ blks: [Block], _ g: Graph) -> Set<NodeID> {
+public func findOutputNodeNeeds(_ b: Block, _ g: Graph) -> Set<NodeID> {
     var outputNodeNeeds: Set<NodeID> = []
-    for b in blks {
-        for nID in b.nodes {
-            if let n = g.nodes[nID] {
-                switch n.op {
-                case .output:
-                    n.inputs.forEach {
-                        outputNodeNeeds.insert($0)
-                    }
-                default:
-                    break
+    for nID in b.nodes {
+        if let n = g.nodes[nID] {
+            switch n.op {
+            case .output:
+                n.inputs.forEach {
+                    outputNodeNeeds.insert($0)
                 }
+            default:
+                break
             }
         }
     }
@@ -171,7 +185,7 @@ public func findNodesWithOutboundDependencies(_ blks: [Block], _ g: Graph, block
     let idx = blks.firstIndex{b in return b == block}
     block.nodes.forEach { nodeBlock[$0] = idx }
     
-    let outputNodeNeeds = findOutputNodeNeeds(blks, g)
+    let outputNodeNeeds = findOutputNodeNeeds(block, g)
 
     var need: Set<NodeID> = []
     for b in blocks {
@@ -187,7 +201,7 @@ public func findNodesWithOutboundDependencies(_ blks: [Block], _ g: Graph, block
 }
 
 public func findNodesAsInboundDependencies(_ blks: [Block], _ g: Graph, block: Block) -> Set<NodeID> {
-    let outputNodeNeeds = findOutputNodeNeeds(blks, g)
+    let outputNodeNeeds = findOutputNodeNeeds(block, g)
 
     // find which block each node is defined in
     var nodeBlock = [NodeID: Int]()
@@ -283,7 +297,9 @@ func emitBlockUOps (ctx: IRContext, block: Block, blocks: [Block], g: Graph, deb
 
             for uop in node.op.emit(ctx: ctx, g: g, nodeId: nodeId) {
                 emittedNodes.insert(nodeId)
-                uops.append(uop)
+                var typedUOp = uop
+                typedUOp.kind = block.kind
+                uops.append(typedUOp)
             }
         }
     }
@@ -294,7 +310,9 @@ func emitBlockUOps (ctx: IRContext, block: Block, blocks: [Block], g: Graph, deb
             if let lz = ctx.values[nodeId] {
                 switch lz {
                 case .variable(let a,_):
-                    uops.insert(UOp(op: .defineGlobal(a), value: .global(a)), at: 0)
+                    var defineGlobalUOp = UOp(op: .defineGlobal(a), value: .global(a))
+                    defineGlobalUOp.kind = block.kind
+                    uops.insert(defineGlobalUOp, at: 0)
                     ctx.globals.insert(a)
                 default:
                     break
@@ -308,7 +326,9 @@ func emitBlockUOps (ctx: IRContext, block: Block, blocks: [Block], g: Graph, deb
         if let lz = ctx.values[nodeId] {
             switch lz {
             case .variable(let a,_):
-                uops.insert(UOp(op: .loadGlobal(a), value: .global(a)), at: 0)
+                var loadGlobalUOp = UOp(op: .loadGlobal(a), value: .global(a))
+                loadGlobalUOp.kind = block.kind
+                uops.insert(loadGlobalUOp, at: 0)
             default:
                 break
             }

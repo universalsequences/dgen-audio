@@ -313,18 +313,30 @@ class MetalRenderer: Renderer, UOpEmitter {
             }
 
             if block.kind == .scalar {
-                scheduleItem.ops.append(UOp(op: .beginRange(0, 1), value: .empty))
-                scheduleItem.ops.append(UOp(op: .beginLoop(frameCount, 1), value: .empty))
+                var beginRange = UOp(op: .beginRange(0, 1), value: .empty)
+                beginRange.kind = block.kind
+                scheduleItem.ops.append(beginRange)
+                
+                var beginLoop = UOp(op: .beginLoop(frameCount, 1), value: .empty)
+                beginLoop.kind = block.kind
+                scheduleItem.ops.append(beginLoop)
             }
 
             for uop in block.ops {
                 if case .defineGlobal = uop.op { continue }
-                scheduleItem.ops.append(uop)
+                var typedUOp = uop
+                typedUOp.kind = block.kind
+                scheduleItem.ops.append(typedUOp)
             }
 
             if block.kind == .scalar {
-                scheduleItem.ops.append(UOp(op: .endLoop, value: .empty))
-                scheduleItem.ops.append(UOp(op: .endRange, value: .empty))
+                var endLoop = UOp(op: .endLoop, value: .empty)
+                endLoop.kind = block.kind
+                scheduleItem.ops.append(endLoop)
+                
+                var endRange = UOp(op: .endRange, value: .empty)
+                endRange.kind = block.kind
+                scheduleItem.ops.append(endRange)
             }
 
             scheduleItems.append(scheduleItem)

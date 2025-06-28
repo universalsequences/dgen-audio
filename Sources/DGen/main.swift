@@ -1,6 +1,6 @@
 let g = Graph()
 
-let freq1 = g.n(.mul, g.n(.constant(440)), g.n(.constant(0.5)))
+let freq1 = g.n(.mul, g.n(.constant(90)), g.n(.constant(2.5)))
 let freq2 = g.n(.mul, g.n(.constant(2)), g.n(.constant(3.5)))
 let ph1 = g.n(.phasor(0),
   freq1,
@@ -10,7 +10,7 @@ let ph2 = g.n(.phasor(1),
   freq2,
   g.n(.constant(0)));
 
-let cond = g.n(.lt, ph2, g.n(.constant(0.3)));
+let cond = g.n(.lt, ph2, g.n(.constant(0.1)));
 
 let latched = g.n(.latch(2), ph1, cond)
 
@@ -42,23 +42,48 @@ for blockIdx in sortedBlockIds {
     uopBlocks.append(BlockUOps(ops: emitBlockUOps(ctx: ctx, block: block, blocks: sortedBlocks, g: g, debug: true), kind: block.kind))
 }
 
-let kernels = lowerUOpBlocks(&uopBlocks, renderer: CRenderer(), ctx: ctx, frameCount: 128)
+// Choose target device
+let targetDevice: Device = .Metal  // Change to .C for C backend
+
+let renderer: Renderer = targetDevice == .Metal ? MetalRenderer() : CRenderer()
+let kernels = lowerUOpBlocks(&uopBlocks, renderer: renderer, ctx: ctx, frameCount: 128)
+
+print("\n🎯 Using \(targetDevice) backend")
+print("📊 Generated \(kernels.count) kernel(s)")
 
 for kernel in kernels {
-    print("Kernel \(kernel.name):")
+    print("\nKernel \(kernel.name):")
     for buffer in kernel.buffers {
         print("- buffer: \(buffer)")
     }
-    print(kernel.source)
-    let source = kernel.source
+    print("- threadGroupSize: \(kernel.threadGroupSize)")
+    if targetDevice == .Metal {
+        print("Metal source:")
+        print(kernel.source)
+    } else {
+        print(kernel.source)
+    }
+}
 
+let runtime: CompiledKernelRuntime
+if targetDevice == .Metal {
+    runtime = try MetalCompiledKernel(kernels: kernels)
+} else {
+    // For C backend, use the first kernel (existing behavior)
+    let source = kernels.first?.source ?? ""
     let compiled = CCompiledKernel(source: source)
     try compiled.compileAndLoad()
+    runtime = compiled
+}
 
-    var outputs = [Float](repeating: 0, count: 128)
-    var inputs = [Float](repeating: 1, count: 128)
+try runtime.runAndPlay(durationSeconds: 2.0, sampleRate: 44100.0, channels: 1)
 
-    compiled.run(outputs: &outputs, inputs: inputs, frameCount: 128)
-
-    print(outputs)
+// Test buffer readback for Metal
+if let metalRuntime = runtime as? MetalCompiledKernel {
+    print("\n📈 Buffer readback test:")
+    for bufferName in Set(kernels.flatMap { $0.buffers }) {
+        if let bufferData = metalRuntime.readBuffer(named: bufferName) {
+            print("Buffer \(bufferName): [\(bufferData.prefix(5).map { String(format: "%.3f", $0) }.joined(separator: ", "))...]")
+        }
+    }
 }
