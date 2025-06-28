@@ -4,8 +4,8 @@ import Metal
 
 
 public protocol CompiledKernelRuntime {
-    func run(outputs: UnsafeMutablePointer<Float>, inputs: UnsafePointer<Float>, frameCount: Int)
-    func runAndPlay(durationSeconds: Double , sampleRate: Double , channels: Int ) throws
+    func run(outputs: UnsafeMutablePointer<Float>, inputs: UnsafePointer<Float>, frameCount: Int, volumeScale: Float)
+    func runAndPlay(durationSeconds: Double , sampleRate: Double , channels: Int, volumeScale: Float ) throws
 }
 
 public class CCompiledKernel: CompiledKernelRuntime {
@@ -51,14 +51,21 @@ public class CCompiledKernel: CompiledKernelRuntime {
         processFn = unsafeBitCast(sym, to: (@convention(c) (UnsafeMutablePointer<Float>, UnsafePointer<Float>, Int32) -> Void).self)
     }
 
-    public func run(outputs: UnsafeMutablePointer<Float>, inputs: UnsafePointer<Float>, frameCount: Int) {
+    public func run(outputs: UnsafeMutablePointer<Float>, inputs: UnsafePointer<Float>, frameCount: Int, volumeScale: Float = 1.0) {
         guard let fn = processFn else {
             fatalError("Kernel not compiled/loaded")
         }
         fn(outputs, inputs, Int32(frameCount))
+        
+        // Apply volume scaling
+        if volumeScale != 1.0 {
+            for i in 0..<frameCount {
+                outputs[i] *= volumeScale
+            }
+        }
     }
 
-    public func runAndPlay(durationSeconds: Double, sampleRate: Double, channels: Int) throws {
+    public func runAndPlay(durationSeconds: Double, sampleRate: Double, channels: Int, volumeScale: Float = 1.0) throws {
         guard let fn = processFn else {
             fatalError("Kernel not compiled/loaded")
         }
@@ -73,7 +80,7 @@ public class CCompiledKernel: CompiledKernelRuntime {
                 let outBuffer = bufferList[0].mData!.assumingMemoryBound(to: Float.self)
                 let silentInput = [Float](repeating: 0, count: Int(frameCount))
                 silentInput.withUnsafeBufferPointer { input in
-                    fn(outBuffer, input.baseAddress!, Int32(frameCount))
+                    self.run(outputs: outBuffer, inputs: input.baseAddress!, frameCount: Int(frameCount), volumeScale: volumeScale)
                 }
             } else {
                 let interleaved = UnsafeMutablePointer<Float>.allocate(capacity: Int(frameCount) * channels)
@@ -81,7 +88,7 @@ public class CCompiledKernel: CompiledKernelRuntime {
 
                 let silentInput = [Float](repeating: 0, count: Int(frameCount))
                 silentInput.withUnsafeBufferPointer { input in
-                    fn(interleaved, input.baseAddress!, Int32(frameCount))
+                    self.run(outputs: interleaved, inputs: input.baseAddress!, frameCount: Int(frameCount), volumeScale: volumeScale)
                 }
 
                 for ch in 0..<channels {
@@ -159,11 +166,18 @@ public class MetalCompiledKernel: CompiledKernelRuntime {
             guard let buffer = device.makeBuffer(length: bufferSize, options: .storageModeShared) else {
                 throw NSError(domain: "MetalError", code: 4, userInfo: [NSLocalizedDescriptionKey: "Failed to create buffer \(bufferName)"])
             }
+            
+            // Initialize buffer contents to zero
+            let bufferContents = buffer.contents().assumingMemoryBound(to: Float.self)
+            for i in 0..<(bufferSize / MemoryLayout<Float>.size) {
+                bufferContents[i] = 0.0
+            }
+            
             bufferPool[bufferName] = buffer
         }
     }
     
-    public func run(outputs: UnsafeMutablePointer<Float>, inputs: UnsafePointer<Float>, frameCount: Int) {
+    public func run(outputs: UnsafeMutablePointer<Float>, inputs: UnsafePointer<Float>, frameCount: Int, volumeScale: Float = 1.0) {
         guard let commandBuffer = commandQueue.makeCommandBuffer() else { return }
         
         // Execute kernels in sequence
@@ -194,20 +208,31 @@ public class MetalCompiledKernel: CompiledKernelRuntime {
         commandBuffer.waitUntilCompleted()
         
         // Copy results back to outputs
-        copyResultsToOutputs(outputs: outputs, frameCount: frameCount)
+        copyResultsToOutputs(outputs: outputs, frameCount: frameCount, volumeScale: volumeScale)
     }
     
-    private func copyResultsToOutputs(outputs: UnsafeMutablePointer<Float>, frameCount: Int) {
+    private func copyResultsToOutputs(outputs: UnsafeMutablePointer<Float>, frameCount: Int, volumeScale: Float) {
         // Find output buffers and copy their contents
+        
+        // First check for dedicated "outputs" buffer
+        if let outputBuffer = bufferPool["outputs"] {
+            let bufferContents = outputBuffer.contents().assumingMemoryBound(to: Float.self)
+            for i in 0..<min(frameCount, 128) {
+                outputs[i] = bufferContents[i] * volumeScale
+            }
+            return
+        }
+        
+        // Fallback to other buffers if no dedicated outputs buffer
         for kernel in kernels {
             for bufferName in kernel.buffers {
                 // Check if this buffer contains output data
                 if bufferName.hasPrefix("t") || bufferName == "memory" {
                     if let buffer = bufferPool[bufferName] {
                         let bufferContents = buffer.contents().assumingMemoryBound(to: Float.self)
-                        // Copy the relevant portion to outputs
+                        // Copy the relevant portion to outputs with volume scaling
                         for i in 0..<min(frameCount, 128) {
-                            outputs[i] = bufferContents[i]
+                            outputs[i] = bufferContents[i] * volumeScale
                         }
                         break // Take first matching buffer as output
                     }
@@ -216,7 +241,7 @@ public class MetalCompiledKernel: CompiledKernelRuntime {
         }
     }
     
-    public func runAndPlay(durationSeconds: Double, sampleRate: Double, channels: Int) throws {
+    public func runAndPlay(durationSeconds: Double, sampleRate: Double, channels: Int, volumeScale: Float = 1.0) throws {
         let format = AVAudioFormat(standardFormatWithSampleRate: sampleRate, channels: AVAudioChannelCount(channels))!
         let engine = AVAudioEngine()
         
@@ -227,7 +252,7 @@ public class MetalCompiledKernel: CompiledKernelRuntime {
                 let outBuffer = bufferList[0].mData!.assumingMemoryBound(to: Float.self)
                 let silentInput = [Float](repeating: 0, count: Int(frameCount))
                 silentInput.withUnsafeBufferPointer { input in
-                    self.run(outputs: outBuffer, inputs: input.baseAddress!, frameCount: Int(frameCount))
+                    self.run(outputs: outBuffer, inputs: input.baseAddress!, frameCount: Int(frameCount), volumeScale: volumeScale)
                 }
             } else {
                 let interleaved = UnsafeMutablePointer<Float>.allocate(capacity: Int(frameCount) * channels)
@@ -235,7 +260,7 @@ public class MetalCompiledKernel: CompiledKernelRuntime {
                 
                 let silentInput = [Float](repeating: 0, count: Int(frameCount))
                 silentInput.withUnsafeBufferPointer { input in
-                    self.run(outputs: interleaved, inputs: input.baseAddress!, frameCount: Int(frameCount))
+                    self.run(outputs: interleaved, inputs: input.baseAddress!, frameCount: Int(frameCount), volumeScale: volumeScale)
                 }
                 
                 for ch in 0..<channels {

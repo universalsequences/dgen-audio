@@ -1,16 +1,16 @@
-enum ANSI {
-    static let reset = "\u{001B}[0m"
-    static let bold = "\u{001B}[1m"
+public enum ANSI {
+    public static let reset = "\u{001B}[0m"
+    public static let bold = "\u{001B}[1m"
 
-    static let red     = "\u{001B}[38;5;196m" // bright red
-    static let green   = "\u{001B}[38;5;46m"  // neon green
-    static let yellow  = "\u{001B}[38;5;226m" // bright yellow
-    static let blue    = "\u{001B}[38;5;39m"  // electric blue
-    static let magenta = "\u{001B}[38;5;201m" // hot pink
-    static let cyan    = "\u{001B}[38;5;51m"  // aqua blue
-    static let orange  = "\u{001B}[38;5;208m" // deep orange
-    static let gray    = "\u{001B}[38;5;245m" // soft gray
-    static let white   = "\u{001B}[38;5;15m"  // bright white
+    public static let red     = "\u{001B}[38;5;196m" // bright red
+    public static let green   = "\u{001B}[38;5;46m"  // neon green
+    public static let yellow  = "\u{001B}[38;5;226m" // bright yellow
+    public static let blue    = "\u{001B}[38;5;39m"  // electric blue
+    public static let magenta = "\u{001B}[38;5;201m" // hot pink
+    public static let cyan    = "\u{001B}[38;5;51m"  // aqua blue
+    public static let orange  = "\u{001B}[38;5;208m" // deep orange
+    public static let gray    = "\u{001B}[38;5;245m" // soft gray
+    public static let white   = "\u{001B}[38;5;15m"  // bright white
 }
 
 extension UOp {

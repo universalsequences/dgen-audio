@@ -1,8 +1,10 @@
-import Foundation;
+import Foundation
 
 public class IRContext {
     private var varIdx = 0
     private var constantIdx = 0
+    
+    public init() {}
 
     public var globals: Set<VarID> = []
 

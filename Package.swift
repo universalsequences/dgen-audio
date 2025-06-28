@@ -7,18 +7,28 @@ let package = Package(
         .macOS(.v10_15)
     ],
     products: [
-        .executable(name: "dgen", targets: ["DGen"]),
+        .executable(name: "dgen", targets: ["DGenApp"]),
+        .library(name: "DGen", targets: ["DGen"]),
     ],
     targets: [
-                .executableTarget(
+        .target(
             name: "DGen",
-            path: "Sources/DGen",
             linkerSettings: [
                 .linkedFramework("Cocoa"),
                 .linkedFramework("Metal"),
                 .linkedFramework("MetalKit"),
                 .linkedFramework("QuartzCore")
             ]
+        ),
+        .executableTarget(
+            name: "DGenApp",
+            dependencies: ["DGen"],
+            path: "Sources/DGenApp"
+        ),
+        .testTarget(
+            name: "DGenTests",
+            dependencies: ["DGen"],
+            path: "Tests/DGenTests"
         ),
     ]
 )

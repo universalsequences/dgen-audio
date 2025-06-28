@@ -188,7 +188,7 @@ public func findNodesWithOutboundDependencies(_ blks: [Block], _ g: Graph, block
     let outputNodeNeeds = findOutputNodeNeeds(block, g)
 
     var need: Set<NodeID> = []
-    for b in blocks {
+    for b in blks {
         for nID in b.nodes {
             g.nodes[nID]!.inputs.forEach {
                 if let nodeBlockIdx = nodeBlock[$0] {
@@ -245,7 +245,7 @@ public func crossBlockForwardValues(_ blks: [Block], _ g: Graph, block: Block) -
 }
 
 // Sort blocks by dependencies to determine execution order
-func sortBlocksByDependencies(_ blks: [Block], _ g: Graph) -> [Int] {
+public func sortBlocksByDependencies(_ blks: [Block], _ g: Graph) -> [Int] {
     var blockDependencies: [Int: Set<Int>] = [:]
 
     for (blockIdx, block) in blks.enumerated() {
@@ -287,7 +287,7 @@ func sortBlocksByDependencies(_ blks: [Block], _ g: Graph) -> [Int] {
 }
 
 
-func emitBlockUOps (ctx: IRContext, block: Block, blocks: [Block], g: Graph, debug: Bool=false) -> [UOp]  {
+public func emitBlockUOps (ctx: IRContext, block: Block, blocks: [Block], g: Graph, debug: Bool=false) -> [UOp]  {
     var emittedNodes: Set<NodeID> = []
 
     var uops: [UOp] = []

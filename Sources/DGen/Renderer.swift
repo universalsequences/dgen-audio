@@ -1,5 +1,15 @@
 // the beauty is this doesn't need to even know if its forward or backward
 
+public struct BlockUOps {
+    public var ops: [UOp]
+    public let kind: Kind
+    
+    public init(ops: [UOp], kind: Kind) {
+        self.ops = ops
+        self.kind = kind
+    }
+}
+
 public enum Device {
     case C
     case Metal
@@ -22,7 +32,7 @@ public class ScheduleItem {
     }
 }
 
-func lowerUOpBlocks(
+public func lowerUOpBlocks(
   _ uopBlocks: inout [BlockUOps],
   renderer: Renderer,
   ctx: IRContext,
@@ -62,9 +72,11 @@ open class Renderer {
     }
 }
 
-class CRenderer: Renderer {
+public class CRenderer: Renderer {
+    
+    public override init() {}
 
-    override func compile(
+    public override func compile(
       scheduleItems: [ScheduleItem],
       ctx: IRContext
     ) -> [CompiledKernel] {
@@ -95,7 +107,7 @@ class CRenderer: Renderer {
         }
     }
     
-    override func prepareSchedule(
+    public override func prepareSchedule(
       _ scheduleItems: inout [ScheduleItem],
       _ uopBlocks: [BlockUOps],
       _ ctx: IRContext,
@@ -124,7 +136,7 @@ class CRenderer: Renderer {
         scheduleItem.ops.append(UOp(op: .endLoop, value: .empty))
     }
     
-    override func render(name: String, scheduleItem: ScheduleItem, ctx: IRContext) -> String {
+    public override func render(name: String, scheduleItem: ScheduleItem, ctx: IRContext) -> String {
         var code: [String] = []
 
         // C includes and function signature
@@ -275,28 +287,43 @@ class CRenderer: Renderer {
     }
 }
 
-class MetalRenderer: Renderer, UOpEmitter {
+public class MetalRenderer: Renderer, UOpEmitter {
     let memoryVarID = -1 // Virtual ID for the global memory buffer
 
-    override func compile(
+    public override init() {}
+
+    public override func compile(
       scheduleItems: [ScheduleItem],
       ctx: IRContext
     ) -> [CompiledKernel] {
         return scheduleItems.enumerated().map { (i, scheduleItem) in
             let source = render(name: "kernel_\(i)", scheduleItem: scheduleItem, ctx: ctx)
-            let buffers = analyzeDependencies(scheduleItem: scheduleItem, ctx: ctx).inputs +
-              analyzeDependencies(scheduleItem: scheduleItem, ctx: ctx).outputs
+            let deps = analyzeDependencies(scheduleItem: scheduleItem, ctx: ctx)
+            var buffers = deps.inputs + deps.outputs
+            
+            // Check if this kernel has output operations
+            let hasOutputOps = scheduleItem.ops.contains { uop in
+                if case .output = uop.op { return true }
+                return false
+            }
+            
+            var bufferNames: [String] = []
+            if hasOutputOps {
+                bufferNames.append("outputs")
+            }
+            bufferNames.append(contentsOf: buffers.map { $0 == -1 ? "memory" : "t\($0)" })
+            
             return CompiledKernel(
               name: "kernel_\(i)",
               source: source,
               kind: scheduleItem.kind,
-              buffers: buffers.map { $0 == -1 ? "memory" : "t\($0)" },
+              buffers: bufferNames,
               threadGroupSize: scheduleItem.kind == .simd ? 128 : 1
             )
         }
     }
     
-    override func prepareSchedule(
+    public override func prepareSchedule(
       _ scheduleItems: inout [ScheduleItem],
       _ uopBlocks: [BlockUOps],
       _ ctx: IRContext,
@@ -343,27 +370,31 @@ class MetalRenderer: Renderer, UOpEmitter {
         }
     }
 
-    override func render(name: String, scheduleItem: ScheduleItem, ctx: IRContext) -> String {
+    public override func render(name: String, scheduleItem: ScheduleItem, ctx: IRContext) -> String {
         var kernels = ""
         var (inputs, outputs) = analyzeDependencies(scheduleItem: scheduleItem, ctx: ctx)
 
-        let hasMemoryOps = scheduleItem.ops.contains { uop in
-            if case .load = uop.op { return true }
-            if case .store = uop.op { return true }
+        let hasOutputOps = scheduleItem.ops.contains { uop in
+            if case .output = uop.op { return true }
             return false
-        }
-
-        if hasMemoryOps {
-            if !inputs.contains(memoryVarID) { inputs.append(memoryVarID) }
-            if !outputs.contains(memoryVarID) { outputs.append(memoryVarID) }
         }
 
         let allBuffers = Set(inputs + outputs)
 
         var parameters: [String] = []
-        for (i, bufferId) in allBuffers.sorted().enumerated() {
+        var bufferIndex = 0
+        
+        // Add outputs buffer first if needed
+        if hasOutputOps {
+            parameters.append("    device float *outputs [[buffer(\(bufferIndex))]]")
+            bufferIndex += 1
+        }
+        
+        // Add other buffers
+        for bufferId in allBuffers.sorted() {
             let bufferName = bufferId == memoryVarID ? "memory" : "t\(bufferId)"
-            parameters.append("    device float *\(bufferName) [[buffer(\(i))]]")
+            parameters.append("    device float *\(bufferName) [[buffer(\(bufferIndex))]]")
+            bufferIndex += 1
         }
 
         parameters.append("    uint id [[thread_position_in_grid]]")
@@ -397,13 +428,27 @@ class MetalRenderer: Renderer, UOpEmitter {
     func analyzeDependencies(scheduleItem: ScheduleItem, ctx: IRContext) -> (inputs: [VarID], outputs: [VarID]) {
         var inputs: Set<VarID> = []
         var outputs: Set<VarID> = []
+        var needsMemory = false
 
         for uop in scheduleItem.ops {
             switch uop.op {
-            case let .defineGlobal(varId): outputs.insert(varId)
-            case let .loadGlobal(varId): inputs.insert(varId)
-            default: break
+            case let .defineGlobal(varId): 
+                outputs.insert(varId)
+            case let .loadGlobal(varId): 
+                inputs.insert(varId)
+            case .load, .store:
+                needsMemory = true
+            case .defineMemory:
+                needsMemory = true
+            default: 
+                break
             }
+        }
+
+        // Add memory buffer if needed
+        if needsMemory {
+            inputs.insert(memoryVarID)
+            outputs.insert(memoryVarID)
         }
 
         return (inputs: Array(inputs), outputs: Array(outputs))
@@ -435,6 +480,11 @@ class MetalRenderer: Renderer, UOpEmitter {
 
         case let .beginRange(start, end): return "if (id >= \(start) && id < \(end)) {"
         case .endRange: return "}"
+
+        case let .output(channel, val):
+            // Store output value to a device buffer that can be read back
+            let idx = (uop.kind == .simd) ? "id" : "i"
+            return "outputs[\(channel) * 128 + \(idx)] = \(g(val));"
 
         default:
             return "/* \(uop.prettyDescription()) */"

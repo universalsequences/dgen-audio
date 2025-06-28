@@ -1,3 +1,5 @@
+import DGen
+
 let g = Graph()
 
 let freq1 = g.n(.mul, g.n(.constant(90)), g.n(.constant(2.5)))
@@ -26,11 +28,6 @@ var sortedBlocks: [Block] = [];
 sortedBlockIds.forEach{ sortedBlocks.append(blocks[$0]) }
 
 var ctx = IRContext()
-
-public struct BlockUOps {
-    public var ops: [UOp]
-    public let kind: Kind
-}
 
 var uopBlocks: [BlockUOps] = []
 
@@ -76,7 +73,7 @@ if targetDevice == .Metal {
     runtime = compiled
 }
 
-try runtime.runAndPlay(durationSeconds: 2.0, sampleRate: 44100.0, channels: 1)
+try runtime.runAndPlay(durationSeconds: 2.0, sampleRate: 44100.0, channels: 1, volumeScale: 0.1)
 
 // Test buffer readback for Metal
 if let metalRuntime = runtime as? MetalCompiledKernel {
