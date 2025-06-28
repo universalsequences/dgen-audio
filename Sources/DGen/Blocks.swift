@@ -1,4 +1,3 @@
-
 public enum Kind { case simd, scalar }
 
 // corresponds to one kernel (metal backends) or for loop (in C backend)
@@ -59,17 +58,125 @@ public func scalarNodes(_ g: Graph) -> Set<NodeID> {
 }
 
 // ───────────── 2. topo-sort, split into blocks ──────────────────
-public func topo(_ g: Graph) -> [NodeID] {
+public func topo(_ g: Graph, debug: Bool = false) -> [NodeID] {
     var indeg = [NodeID: Int](); g.nodes.keys.forEach { indeg[$0] = 0 }
     g.nodes.values.forEach { n in n.inputs.forEach { indeg[$0]! += 1 } }
     var q = indeg.filter { $0.value == 0 }.map { $0.key }
     var out: [NodeID] = []
+    let totalNodes = g.nodes.count
+    
+    if debug {
+        print("\n🔍 Topological Sort Analysis:")
+        print("Total nodes: \(totalNodes)")
+        print("Initial zero in-degree nodes: \(q.count)")
+        
+        let isolatedNodes = q.filter { nodeID in
+            let node = g.nodes[nodeID]!
+            return node.inputs.isEmpty && !g.nodes.values.contains { $0.inputs.contains(nodeID) }
+        }
+        
+        if !isolatedNodes.isEmpty {
+            print("⚠️  Isolated nodes detected (no inputs/outputs): \(isolatedNodes)")
+        }
+    }
+    
     while let n = q.first {
         q.removeFirst(); out.append(n)
-        g.nodes[n]!.inputs.forEach { indeg[$0]! -= 1; if indeg[$0] == 0 { q.append($0) } }
+        let node = g.nodes[n]!
+        
+        if debug && !node.inputs.isEmpty {
+            print("Processing node \(n) with inputs: \(node.inputs)")
+        }
+        
+        node.inputs.forEach { 
+            indeg[$0]! -= 1
+            if indeg[$0] == 0 { 
+                q.append($0)
+                if debug {
+                    print("  → Node \(n) enables node \($0)")
+                }
+            }
+        }
     }
+    
+    // Check for disconnected components
+    let processedNodes = out.count
+    let remainingNodes = indeg.filter { $0.value > 0 }
+    
+    if debug {
+        print("Processed \(processedNodes) out of \(totalNodes) nodes")
+        
+        if !remainingNodes.isEmpty {
+            print("❌ Unprocessed nodes (possible cycles): \(remainingNodes.keys.sorted())")
+            
+            // Analyze remaining nodes to identify strongly connected components
+            var components: [[NodeID]] = []
+            var unvisited = Set(remainingNodes.keys)
+            
+            func findComponent(start: NodeID) -> [NodeID] {
+                var component: [NodeID] = []
+                var stack = [start]
+                var visited = Set<NodeID>()
+                
+                while let current = stack.popLast() {
+                    if visited.insert(current).inserted {
+                        component.append(current)
+                        if let node = g.nodes[current] {
+                            for input in node.inputs {
+                                if unvisited.contains(input) && !visited.contains(input) {
+                                    stack.append(input)
+                                }
+                            }
+                        }
+                    }
+                }
+                return component
+            }
+            
+            while let start = unvisited.first {
+                let component = findComponent(start: start)
+                components.append(component)
+                component.forEach { unvisited.remove($0) }
+            }
+            
+            print("Strongly connected components: \(components)")
+        } else {
+            print("✅ All nodes processed successfully")
+        }
+        
+        // Check for disconnected subgraphs
+        var reachableFromStart = Set<NodeID>()
+        
+        // Find all nodes reachable from nodes with no inputs (start nodes)
+        let startNodes = g.nodes.filter { $0.value.inputs.isEmpty }.map { $0.key }
+        if debug {
+            print("Start nodes (no inputs): \(startNodes)")
+        }
+        
+        func markReachable(from nodeID: NodeID) {
+            if reachableFromStart.insert(nodeID).inserted {
+                // Find all nodes that depend on this node
+                for (otherNodeID, otherNode) in g.nodes {
+                    if otherNode.inputs.contains(nodeID) {
+                        markReachable(from: otherNodeID)
+                    }
+                }
+            }
+        }
+        
+        for startNode in startNodes {
+            markReachable(from: startNode)
+        }
+        
+        let unreachableNodes = Set(g.nodes.keys).subtracting(reachableFromStart)
+        if !unreachableNodes.isEmpty {
+            print("⚠️  Unreachable nodes (disconnected): \(Array(unreachableNodes).sorted())")
+        }
+    }
+    
     return out.reversed()
 }
+
 
 func getBlockIndexWithDependency(nodeID: NodeID, g: Graph, blocks: [Block], kind: Kind) -> Int? {
     guard let node = g.nodes[nodeID] else { return nil }
@@ -89,26 +196,35 @@ func wouldExceedNodeLimit(_ block: Block, maxNodesPerBlock: Int) -> Bool {
 
 // partitions sorted nodes & set of scalar ndoes, into blocks (of kind: simd or scalar)
 // cannot exceed maxNodesPerBlock (due to buffer limits on metal kernels)
-public func determineBlocks(sorted: [NodeID], scalar: Set<NodeID>, g: Graph, maxNodesPerBlock: Int = Int.max) -> [Block] {
+public func determineBlocks(sorted: [NodeID], scalar: Set<NodeID>, g: Graph, maxNodesPerBlock: Int = Int.max, debug: Bool = false) -> [Block] {
     var b: [Block] = []
 
     for n in sorted {
         let k: Kind = scalar.contains(n) ? .scalar : .simd
 
-        var foundOutput = false
+        // Special case: output nodes go in same block as their dependency
         if let node = g.nodes[n] {
-            switch node.op {
-            case .output:
-                b[b.count-1].nodes.append(n)
-                foundOutput = true
-                break
-            default:
-                break
+            if case .output = node.op {
+                var targetBlockIdx = -1
+                for inputID in node.inputs {
+                    for (blockIdx, block) in b.enumerated() {
+                        if block.nodes.contains(inputID) {
+                            targetBlockIdx = blockIdx
+                            break
+                        }
+                    }
+                    if targetBlockIdx != -1 { break }
+                }
+                
+                if targetBlockIdx != -1 && !wouldExceedNodeLimit(b[targetBlockIdx], maxNodesPerBlock: maxNodesPerBlock) {
+                    b[targetBlockIdx].nodes.append(n)
+                } else {
+                    // If we can't find the dependency or block is full, create new block
+                    b.append(Block(kind: k))
+                    b[b.count - 1].nodes.append(n)
+                }
+                continue
             }
-        }
-
-        if (foundOutput) {
-            break
         }
 
         if k == .scalar {
@@ -159,6 +275,7 @@ extension LazyOp {
         return false
     }
 }
+
 
 public func findOutputNodeNeeds(_ b: Block, _ g: Graph) -> Set<NodeID> {
     var outputNodeNeeds: Set<NodeID> = []
@@ -245,12 +362,13 @@ public func crossBlockForwardValues(_ blks: [Block], _ g: Graph, block: Block) -
 }
 
 // Sort blocks by dependencies to determine execution order
-public func sortBlocksByDependencies(_ blks: [Block], _ g: Graph) -> [Int] {
+public func sortBlocksByDependencies(_ blks: [Block], _ g: Graph, debug: Bool = false) -> [Int] {
+    // Build dependency map
     var blockDependencies: [Int: Set<Int>] = [:]
-
+    
     for (blockIdx, block) in blks.enumerated() {
         blockDependencies[blockIdx] = Set<Int>()
-
+        
         for nodeID in block.nodes {
             let node = g.nodes[nodeID]!
             for inputID in node.inputs {
@@ -271,16 +389,20 @@ public func sortBlocksByDependencies(_ blks: [Block], _ g: Graph) -> [Int] {
     func visitBlock(_ blockIdx: Int) {
         if visited.contains(blockIdx) { return }
         visited.insert(blockIdx)
-
+        
         for depIdx in blockDependencies[blockIdx] ?? [] {
             visitBlock(depIdx)
         }
-
+        
         result.append(blockIdx)
     }
 
     for blockIdx in blks.indices {
         visitBlock(blockIdx)
+    }
+
+    if debug {
+        print("\n🎯 Final execution order: \(result)")
     }
 
     return result
