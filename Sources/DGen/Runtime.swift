@@ -210,8 +210,9 @@ public class MetalCompiledKernel: CompiledKernelRuntime {
             }
             
             // Configure thread groups
-            let threadsPerGroup = MTLSize(width: kernel.threadGroupSize, height: 1, depth: 1)
-            let numThreadGroups = MTLSize(width: (frameCount + kernel.threadGroupSize - 1) / kernel.threadGroupSize, height: 1, depth: 1)
+            let threadGroupSize = kernel.threadGroupSize ?? min(frameCount, 128) // Default to 128 or frameCount, whichever is smaller
+            let threadsPerGroup = MTLSize(width: threadGroupSize, height: 1, depth: 1)
+            let numThreadGroups = MTLSize(width: (frameCount + threadGroupSize - 1) / threadGroupSize, height: 1, depth: 1)
             
             computeEncoder.dispatchThreadgroups(numThreadGroups, threadsPerThreadgroup: threadsPerGroup)
             computeEncoder.endEncoding()
@@ -304,6 +305,14 @@ public class MetalCompiledKernel: CompiledKernelRuntime {
     // Helper method to read buffer contents for backpropagation
     public func readBuffer(named: String) -> [Float]? {
         guard let buffer = bufferPool[named] else { return nil }
+        
+        // Special handling for frameCount buffer which stores Int32
+        if named == "frameCount" {
+            let intContents = buffer.contents().assumingMemoryBound(to: Int32.self)
+            let intValue = intContents[0]
+            return [Float(intValue)] // Return frameCount as a single-element Float array
+        }
+        
         let bufferContents = buffer.contents().assumingMemoryBound(to: Float.self)
         let count = named == "memory" ? 512 : 128
         return Array(UnsafeBufferPointer(start: bufferContents, count: count))
@@ -313,9 +322,20 @@ public class MetalCompiledKernel: CompiledKernelRuntime {
     public func debugBufferStates() {
         print("=== METAL BUFFER DEBUG ===")
         for (name, buffer) in bufferPool.sorted(by: { $0.key < $1.key }) {
-            let bufferContents = buffer.contents().assumingMemoryBound(to: Float.self)
-            let count = name == "memory" ? 512 : 128
-            let values = Array(UnsafeBufferPointer(start: bufferContents, count: count))
+            let values: [Float]
+            let count: Int
+            
+            // Special handling for frameCount buffer which stores Int32
+            if name == "frameCount" {
+                let intContents = buffer.contents().assumingMemoryBound(to: Int32.self)
+                let intValue = intContents[0]
+                values = [Float(intValue)]
+                count = 1
+            } else {
+                let bufferContents = buffer.contents().assumingMemoryBound(to: Float.self)
+                count = name == "memory" ? 512 : 128
+                values = Array(UnsafeBufferPointer(start: bufferContents, count: count))
+            }
             
             // Show first 10 and last 10 values for large buffers
             if count > 20 {

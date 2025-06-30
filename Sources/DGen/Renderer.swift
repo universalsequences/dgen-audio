@@ -20,7 +20,7 @@ public struct CompiledKernel {
     public let source: String
     public let kind: Kind
     public let buffers: [String]  // names of inputs/outputs
-    public let threadGroupSize: Int  // for Metal
+    public let threadGroupSize: Int?  // for Metal: nil means runtime-determined, 1 for scalar
 }
 
 public class ScheduleItem {
@@ -333,7 +333,7 @@ public class MetalRenderer: Renderer, UOpEmitter {
               source: source,
               kind: scheduleItem.kind,
               buffers: bufferNames,
-              threadGroupSize: scheduleItem.kind == .simd ? 128 : 1
+              threadGroupSize: scheduleItem.kind == .scalar ? 1 : nil
             )
         }
     }
@@ -361,14 +361,19 @@ public class MetalRenderer: Renderer, UOpEmitter {
             }
 
             if block.kind == .scalar {
-                
-                var beginRange = UOp(op: .beginRange(0, 1), value: .empty)
+                // Scalar kernels: only thread 0 executes, then loops through frameCount
+                var beginRange = UOp(op: .beginRange(.constant(0, 0), .constant(0, 1)), value: .empty)
                 beginRange.kind = block.kind
                 scheduleItem.ops.append(beginRange)
                 
                 var beginLoop = UOp(op: .beginLoop(frameCountUOp, 1), value: .empty)
                 beginLoop.kind = block.kind
                 scheduleItem.ops.append(beginLoop)
+            } else {
+                // SIMD kernels: each thread processes one frame, bound by frameCount
+                var beginRange = UOp(op: .beginRange(.constant(0, 0), frameCountUOp), value: .empty)
+                beginRange.kind = block.kind
+                scheduleItem.ops.append(beginRange)
             }
 
             for uop in block.ops {
@@ -377,15 +382,13 @@ public class MetalRenderer: Renderer, UOpEmitter {
                 typedUOp.kind = block.kind
                 scheduleItem.ops.append(typedUOp)
             }
-
+            
+            // Close the range/loop blocks
             if block.kind == .scalar {
-                var endLoop = UOp(op: .endLoop, value: .empty)
-                endLoop.kind = block.kind
-                scheduleItem.ops.append(endLoop)
-                
-                var endRange = UOp(op: .endRange, value: .empty)
-                endRange.kind = block.kind
-                scheduleItem.ops.append(endRange)
+                scheduleItem.ops.append(UOp(op: .endLoop, value: .empty))
+                scheduleItem.ops.append(UOp(op: .endRange, value: .empty))
+            } else {
+                scheduleItem.ops.append(UOp(op: .endRange, value: .empty))
             }
 
             scheduleItems.append(scheduleItem)
@@ -506,7 +509,7 @@ public class MetalRenderer: Renderer, UOpEmitter {
         
         case .frameCount: return "/* frameCount available as function parameter */"
 
-        case let .beginRange(start, end): return "if (id >= \(start) && id < \(end)) {"
+        case let .beginRange(start, end): return "if (id >= \(g(start)) && id < \(g(end))) {"
         case .endRange: return "}"
 
         case let .output(channel, val):

@@ -56,7 +56,6 @@ final class PhasorTests: XCTestCase {
     }
     
     func testUnconnectedPhasorNode() throws {
-        print("test unconnected")
         // Create a graph with a connected phasor AND an unconnected phasor
         let g = Graph()
         let freq = g.n(.constant(1.0))  // 1Hz frequency

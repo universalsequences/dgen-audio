@@ -4,41 +4,15 @@ public typealias ConstantID = Int;
 public typealias CellID = Int;
 public typealias ChannelNumber = Int
 
-public enum Lazy: Hashable {
+public enum Lazy {
     case constant(ConstantID, Float)
     case global(VarID)
     case variable(VarID, NodeID?)
     case empty
-
-     public static func == (lhs: Lazy, rhs: Lazy) -> Bool {
-        switch (lhs, rhs) {
-        case let (.constant(v1, a), .constant(v2, b)):
-            return a.bitPattern == b.bitPattern
-        case let (.variable(a1, b1), .variable(a2, b2)):
-            return a1 == a2 && b1 == b2
-        default:
-            return false
-        }
-    }
-
-    public func hash(into hasher: inout Hasher) {
-        switch self {
-        case .empty:
-            hasher.combine(-1)
-        case let .constant(v,a):
-            hasher.combine(0)
-            hasher.combine(a.bitPattern)  // Avoid precision-based float issues
-        case let .variable(v, node):
-            hasher.combine(1)
-            hasher.combine(v)
-            hasher.combine(node)
-        case let .global(v):
-            hasher.combine(v)
-        }
-    }
 }
 
-// IR
+// IR (intermediate representation) is called UOp and consists of an
+// operator (Op) and value (the variable it's result is bound to)
 public enum Op {
     case load(CellID)
     case store(CellID, Lazy)
@@ -59,7 +33,7 @@ public enum Op {
     case loadGlobal(VarID)
     case beginLoop(Lazy, Int)
     case endLoop
-    case beginRange(Int,Int)
+    case beginRange(Lazy, Lazy)
     case endRange
     case output(ChannelNumber, Lazy)
     case frameCount
