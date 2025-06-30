@@ -162,7 +162,8 @@ public class MetalCompiledKernel: CompiledKernelRuntime {
         
         // Create MTLBuffers for each unique buffer
         for bufferName in allBufferNames {
-            let bufferSize = 128 * MemoryLayout<Float>.size // Match C implementation
+            // Memory buffer needs to be larger to match C implementation (512 floats)
+            let bufferSize = bufferName == "memory" ? 512 * MemoryLayout<Float>.size : 128 * MemoryLayout<Float>.size
             guard let buffer = device.makeBuffer(length: bufferSize, options: .storageModeShared) else {
                 throw NSError(domain: "MetalError", code: 4, userInfo: [NSLocalizedDescriptionKey: "Failed to create buffer \(bufferName)"])
             }
@@ -175,9 +176,21 @@ public class MetalCompiledKernel: CompiledKernelRuntime {
             
             bufferPool[bufferName] = buffer
         }
+        
+        // Create frameCount buffer for scalar kernels
+        guard let frameCountBuffer = device.makeBuffer(length: MemoryLayout<Int32>.size, options: .storageModeShared) else {
+            throw NSError(domain: "MetalError", code: 4, userInfo: [NSLocalizedDescriptionKey: "Failed to create frameCount buffer"])
+        }
+        bufferPool["frameCount"] = frameCountBuffer
     }
     
     public func run(outputs: UnsafeMutablePointer<Float>, inputs: UnsafePointer<Float>, frameCount: Int, volumeScale: Float = 1.0) {
+        // Update frameCount buffer with current frameCount value
+        if let frameCountBuffer = bufferPool["frameCount"] {
+            let frameCountPtr = frameCountBuffer.contents().assumingMemoryBound(to: Int32.self)
+            frameCountPtr[0] = Int32(frameCount)
+        }
+        
         guard let commandBuffer = commandQueue.makeCommandBuffer() else { return }
         
         // Execute kernels in sequence
@@ -248,6 +261,11 @@ public class MetalCompiledKernel: CompiledKernelRuntime {
         let sourceNode = AVAudioSourceNode(format: format) { _, _, frameCount, audioBufferList -> OSStatus in
             let bufferList = UnsafeMutableAudioBufferListPointer(audioBufferList)
             
+            // Debug: Check if frameCount matches what we compiled for
+            if frameCount != 128 {
+                print("⚠️  Metal runAndPlay: AVAudioEngine requested frameCount=\(frameCount), but kernels compiled for 128!")
+            }
+            
             if channels == 1 {
                 let outBuffer = bufferList[0].mData!.assumingMemoryBound(to: Float.self)
                 let silentInput = [Float](repeating: 0, count: Int(frameCount))
@@ -287,6 +305,33 @@ public class MetalCompiledKernel: CompiledKernelRuntime {
     public func readBuffer(named: String) -> [Float]? {
         guard let buffer = bufferPool[named] else { return nil }
         let bufferContents = buffer.contents().assumingMemoryBound(to: Float.self)
-        return Array(UnsafeBufferPointer(start: bufferContents, count: 128))
+        let count = named == "memory" ? 512 : 128
+        return Array(UnsafeBufferPointer(start: bufferContents, count: count))
+    }
+    
+    // Debug method to print intermediate buffer states
+    public func debugBufferStates() {
+        print("=== METAL BUFFER DEBUG ===")
+        for (name, buffer) in bufferPool.sorted(by: { $0.key < $1.key }) {
+            let bufferContents = buffer.contents().assumingMemoryBound(to: Float.self)
+            let count = name == "memory" ? 512 : 128
+            let values = Array(UnsafeBufferPointer(start: bufferContents, count: count))
+            
+            // Show first 10 and last 10 values for large buffers
+            if count > 20 {
+                let first10 = Array(values.prefix(10))
+                let last10 = Array(values.suffix(10))
+                print("\(name): [\(first10.map { String(format: "%.3f", $0) }.joined(separator: ", "))...] (length: \(count))")
+                if name == "memory" {
+                    // Show specific memory indices used in kernels
+                    print("  memory[0]: \(String(format: "%.6f", values[0]))")
+                    print("  memory[1]: \(String(format: "%.6f", values[1]))")  
+                    print("  memory[2]: \(String(format: "%.6f", values[2]))")
+                }
+            } else {
+                print("\(name): [\(values.map { String(format: "%.3f", $0) }.joined(separator: ", "))]")
+            }
+        }
+        print("=========================")
     }
 }

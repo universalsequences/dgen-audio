@@ -116,9 +116,13 @@ public class CRenderer: Renderer {
         let scheduleItem = ScheduleItem(kind: .scalar)
         scheduleItems.append(scheduleItem)
 
+        // Add frameCount UOp that will render to function parameter
+        scheduleItem.ops.append(UOp(op: .frameCount, value: .empty))
+        let frameCountUOp = Lazy.variable(-1, nil) // Special variable ID for frameCount
+
         // Extract defineGlobal from all blocks
         for block in uopBlocks {
-            scheduleItem.ops.append(UOp(op: .beginLoop(128, block.kind == .scalar ? 1 : 4), value: .empty))
+            scheduleItem.ops.append(UOp(op: .beginLoop(frameCountUOp, block.kind == .scalar ? 1 : 4), value: .empty))
             for uop in block.ops {
                 switch uop.op {
                 case .defineGlobal:
@@ -131,7 +135,7 @@ public class CRenderer: Renderer {
         }
 
         // Append all UOps inside a single loop
-        scheduleItem.ops.append(UOp(op: .beginLoop(128, 1), value: .empty))
+        scheduleItem.ops.append(UOp(op: .beginLoop(frameCountUOp, 1), value: .empty))
 
         scheduleItem.ops.append(UOp(op: .endLoop, value: .empty))
     }
@@ -149,13 +153,13 @@ public class CRenderer: Renderer {
         // Declare globals
         let sortedGlobals = ctx.globals.sorted()
         for varId in sortedGlobals {
-            code.append("float t\(varId)[128] __attribute__((aligned(16)));")
+            code.append("float t\(varId)[128] __attribute__((aligned(16))) = {0};")
         }
 
      
 
         // Declare memory if needed
-        code.append("float memory[512] __attribute__((aligned(16)));")
+        code.append("float memory[512] __attribute__((aligned(16))) = {0};")
 
         code.append("void process(float *outputs, float *inputs, int frameCount) {")
 
@@ -231,16 +235,18 @@ public class CRenderer: Renderer {
         case let .output(channel, val):
             print("value to output = \(val)")
                 if uop.kind == .simd {
-                    let ptr = "outputs + \(channel) * 128 + i"
+                    let ptr = "outputs + \(channel) * frameCount + i"
                     return "vst1q_f32(\(ptr), \(g(val)));"
                 } else {
-                    let addr = "outputs[\(channel) * 128 + i]"
+                    let addr = "outputs[\(channel) * frameCount + i]"
                     return "\(addr) = \(g(val));"
                 }
             
 
-        case let .beginLoop(iters, step): return "for (int i = 0; i < \(iters); i += \(step)) {"
+        case let .beginLoop(iters, step): return "for (int i = 0; i < \(g(iters)); i += \(step)) {"
         case .endLoop: return "}"
+        
+        case .frameCount: return "/* frameCount available as function parameter */"
 
         case let .loadGlobal(id):
             return uop.kind == .simd
@@ -257,7 +263,9 @@ public class CRenderer: Renderer {
         case let .constant(constantId, val):
             return kind == .simd ? "c\(constantId)" : "\(val)"
         case let .variable(id, _):
-            if ctx.globals.contains(id) {
+            if id == -1 { // Special case for frameCount
+                return "frameCount"
+            } else if ctx.globals.contains(id) {
                 if kind == .simd {
                     return isOut ? "t\(id) + i" : "simd\(id)"
                 } else {
@@ -299,7 +307,7 @@ public class MetalRenderer: Renderer, UOpEmitter {
         return scheduleItems.enumerated().map { (i, scheduleItem) in
             let source = render(name: "kernel_\(i)", scheduleItem: scheduleItem, ctx: ctx)
             let deps = analyzeDependencies(scheduleItem: scheduleItem, ctx: ctx)
-            var buffers = deps.inputs + deps.outputs
+            let allBuffers = Set(deps.inputs + deps.outputs)
             
             // Check if this kernel has output operations
             let hasOutputOps = scheduleItem.ops.contains { uop in
@@ -311,7 +319,14 @@ public class MetalRenderer: Renderer, UOpEmitter {
             if hasOutputOps {
                 bufferNames.append("outputs")
             }
-            bufferNames.append(contentsOf: buffers.map { $0 == -1 ? "memory" : "t\($0)" })
+            // Use same sorted order as render() method
+            for bufferId in allBuffers.sorted() {
+                let bufferName = bufferId == memoryVarID ? "memory" : "t\(bufferId)"
+                bufferNames.append(bufferName)
+            }
+            
+            // Add frameCount buffer for all Metal kernels (needed for output operations)
+            bufferNames.append("frameCount")
             
             return CompiledKernel(
               name: "kernel_\(i)",
@@ -329,8 +344,14 @@ public class MetalRenderer: Renderer, UOpEmitter {
       _ ctx: IRContext,
       _ frameCount: Int
     ) {
+        // Define frameCount UOp for Metal kernels
+        let frameCountUOp = Lazy.variable(-1, nil) // Special variable ID for frameCount
+        
         for block in uopBlocks {
             let scheduleItem = ScheduleItem(kind: block.kind)
+
+            // Add frameCount UOp for all Metal kernels (needed for output operations)
+            scheduleItem.ops.append(UOp(op: .frameCount, value: .empty))
 
             // Optional: extract defineGlobals early (or leave in place if your IR handles it)
             for uop in block.ops {
@@ -340,11 +361,12 @@ public class MetalRenderer: Renderer, UOpEmitter {
             }
 
             if block.kind == .scalar {
+                
                 var beginRange = UOp(op: .beginRange(0, 1), value: .empty)
                 beginRange.kind = block.kind
                 scheduleItem.ops.append(beginRange)
                 
-                var beginLoop = UOp(op: .beginLoop(frameCount, 1), value: .empty)
+                var beginLoop = UOp(op: .beginLoop(frameCountUOp, 1), value: .empty)
                 beginLoop.kind = block.kind
                 scheduleItem.ops.append(beginLoop)
             }
@@ -397,6 +419,10 @@ public class MetalRenderer: Renderer, UOpEmitter {
             bufferIndex += 1
         }
 
+        // Add frameCount parameter for all Metal kernels (needed for output operations)
+        parameters.append("    constant int &frameCount [[buffer(\(bufferIndex))]]")
+        bufferIndex += 1
+        
         parameters.append("    uint id [[thread_position_in_grid]]")
 
         kernels += "kernel void \(name)(\n"
@@ -475,8 +501,10 @@ public class MetalRenderer: Renderer, UOpEmitter {
         case let .beginIf(cond): return "if (\(g(cond))) {"
         case .endIf: return "}"
 
-        case let .beginLoop(iters, step): return "for (int i = 0; i < \(iters); i += \(step)) {"
+        case let .beginLoop(iters, step): return "for (int i = 0; i < \(g(iters)); i += \(step)) {"
         case .endLoop: return "}"
+        
+        case .frameCount: return "/* frameCount available as function parameter */"
 
         case let .beginRange(start, end): return "if (id >= \(start) && id < \(end)) {"
         case .endRange: return "}"
@@ -484,7 +512,7 @@ public class MetalRenderer: Renderer, UOpEmitter {
         case let .output(channel, val):
             // Store output value to a device buffer that can be read back
             let idx = (uop.kind == .simd) ? "id" : "i"
-            return "outputs[\(channel) * 128 + \(idx)] = \(g(val));"
+            return "outputs[\(channel) * frameCount + \(idx)] = \(g(val));"
 
         default:
             return "/* \(uop.prettyDescription()) */"
@@ -495,7 +523,9 @@ public class MetalRenderer: Renderer, UOpEmitter {
         switch lazy {
         case let .constant(_, val): return "\(val)"
         case let .variable(id, _):
-            if ctx.globals.contains(id) {
+            if id == -1 { // Special case for frameCount
+                return "frameCount"
+            } else if ctx.globals.contains(id) {
                 let idx = (kind == .simd) ? "id" : "i"
                 return "t\(id)[\(idx)]"
             } else {

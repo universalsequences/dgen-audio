@@ -61,6 +61,8 @@ extension UOp {
             opStr = "\(ANSI.green)endRange\(ANSI.reset)"
         case let .output(a,b):
             opStr = "\(ANSI.green)output\(ANSI.reset)(\(a), \(b))"
+        case .frameCount:
+            opStr = "\(ANSI.magenta)frameCount\(ANSI.reset)"
         }
 
 

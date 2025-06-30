@@ -57,11 +57,12 @@ public enum Op {
     case defineConstant(ConstantID, Float)
     case defineMemory(Int)
     case loadGlobal(VarID)
-    case beginLoop(Int,Int)
+    case beginLoop(Lazy, Int)
     case endLoop
     case beginRange(Int,Int)
     case endRange
     case output(ChannelNumber, Lazy)
+    case frameCount
 }
 
 public struct UOp {
