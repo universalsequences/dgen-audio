@@ -157,6 +157,9 @@ public class GraphTestFramework {
             allOutputs.append(contentsOf: outputs)
         }
         
+        // Clean up runtime resources to ensure test isolation
+        runtime.cleanup()
+        
         return (allOutputs, kernels)
     }
     

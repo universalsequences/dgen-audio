@@ -6,6 +6,7 @@ import Metal
 public protocol CompiledKernelRuntime {
     func run(outputs: UnsafeMutablePointer<Float>, inputs: UnsafePointer<Float>, frameCount: Int, volumeScale: Float)
     func runAndPlay(durationSeconds: Double , sampleRate: Double , channels: Int, volumeScale: Float ) throws
+    func cleanup()
 }
 
 public class CCompiledKernel: CompiledKernelRuntime {
@@ -109,6 +110,18 @@ public class CCompiledKernel: CompiledKernelRuntime {
         print("🟢 Playing for \(durationSeconds) seconds...")
         Thread.sleep(forTimeInterval: durationSeconds)
         engine.stop()
+    }
+    
+    public func cleanup() {
+        if let handle = dylibHandle {
+            dlclose(handle)
+            dylibHandle = nil
+            processFn = nil
+        }
+    }
+    
+    deinit {
+        cleanup()
     }
 }
 
@@ -351,5 +364,33 @@ public class MetalCompiledKernel: CompiledKernelRuntime {
             }
         }
         print("=========================")
+    }
+    
+    public func cleanup() {
+        // Reset all buffers to zero
+        for (name, buffer) in bufferPool {
+            if name == "frameCount" {
+                // Special handling for frameCount buffer
+                let intContents = buffer.contents().assumingMemoryBound(to: Int32.self)
+                intContents[0] = 0
+            } else {
+                // Zero out float buffers
+                let bufferSize = name == "memory" ? 512 : 2048
+                memset(buffer.contents(), 0, bufferSize * MemoryLayout<Float>.size)
+            }
+        }
+        
+        // Clear function references
+        functions.removeAll()
+        
+        // Ensure all GPU work is complete by creating and waiting for a command buffer
+        if let commandBuffer = commandQueue.makeCommandBuffer() {
+            commandBuffer.commit()
+            commandBuffer.waitUntilCompleted()
+        }
+    }
+    
+    deinit {
+        cleanup()
     }
 }
