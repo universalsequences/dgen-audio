@@ -117,8 +117,8 @@ public class MetalCompiledKernel: CompiledKernelRuntime {
     private let device: MTLDevice
     private let library: MTLLibrary
     private let commandQueue: MTLCommandQueue
-    private var bufferPool: [String: MTLBuffer] = [:]
-    private var functions: [MTLFunction] = []
+    private var bufferPool: [String: MTLBuffer] = [:] // shared source of buffers used by all kernels
+    private var functions: [MTLFunction] = [] // one per kernel
     
     public init(kernels: [CompiledKernel]) throws {
         self.kernels = kernels
@@ -161,9 +161,12 @@ public class MetalCompiledKernel: CompiledKernelRuntime {
         let allBufferNames = Set(kernels.flatMap { $0.buffers })
         
         // Create MTLBuffers for each unique buffer
+        // Use larger buffer size to handle varying frameCount from AVAudioEngine
+        let maxFrameCount = 2048  // Handle up to 2048 frames per callback
         for bufferName in allBufferNames {
-            // Memory buffer needs to be larger to match C implementation (512 floats)
-            let bufferSize = bufferName == "memory" ? 512 * MemoryLayout<Float>.size : 128 * MemoryLayout<Float>.size
+            // Memory buffer needs extra space, others need maxFrameCount
+            let elementCount = bufferName == "memory" ? 512 : maxFrameCount
+            let bufferSize = elementCount * MemoryLayout<Float>.size
             guard let buffer = device.makeBuffer(length: bufferSize, options: .storageModeShared) else {
                 throw NSError(domain: "MetalError", code: 4, userInfo: [NSLocalizedDescriptionKey: "Failed to create buffer \(bufferName)"])
             }
@@ -262,11 +265,6 @@ public class MetalCompiledKernel: CompiledKernelRuntime {
         let sourceNode = AVAudioSourceNode(format: format) { _, _, frameCount, audioBufferList -> OSStatus in
             let bufferList = UnsafeMutableAudioBufferListPointer(audioBufferList)
             
-            // Debug: Check if frameCount matches what we compiled for
-            if frameCount != 128 {
-                print("⚠️  Metal runAndPlay: AVAudioEngine requested frameCount=\(frameCount), but kernels compiled for 128!")
-            }
-            
             if channels == 1 {
                 let outBuffer = bufferList[0].mData!.assumingMemoryBound(to: Float.self)
                 let silentInput = [Float](repeating: 0, count: Int(frameCount))
@@ -314,7 +312,7 @@ public class MetalCompiledKernel: CompiledKernelRuntime {
         }
         
         let bufferContents = buffer.contents().assumingMemoryBound(to: Float.self)
-        let count = named == "memory" ? 512 : 128
+        let count = named == "memory" ? 512 : 2048  // Match the allocated size
         return Array(UnsafeBufferPointer(start: bufferContents, count: count))
     }
     
@@ -333,7 +331,7 @@ public class MetalCompiledKernel: CompiledKernelRuntime {
                 count = 1
             } else {
                 let bufferContents = buffer.contents().assumingMemoryBound(to: Float.self)
-                count = name == "memory" ? 512 : 128
+                count = name == "memory" ? 512 : 2048  // Match the allocated size
                 values = Array(UnsafeBufferPointer(start: bufferContents, count: count))
             }
             

@@ -170,19 +170,7 @@ public enum LazyOp {
     case accum(CellID)
     case constant(Float)
     case output(Int)
-
-    func emit(_ thunk: (IRContext, NodeID) -> UOp, into ops: inout [UOp], ctx: IRContext, nodeId: NodeID) -> Lazy {
-        let uop = thunk(ctx, nodeId)
-        ops.append(uop)
-        return uop.value
-    }
-
-    func emitAll(_ thunks: ((IRContext, NodeID) -> UOp)..., into ops: inout [UOp], ctx: IRContext, nodeId: NodeID) {
-        for thunk in thunks {
-            _ = emit(thunk, into: &ops, ctx: ctx, nodeId: nodeId)
-        }
-    }
-
+    
     public func emit(ctx: IRContext, g: Graph, nodeId: NodeID) -> [UOp] {
         guard let node = g.nodes[nodeId] else { return [] }
 
