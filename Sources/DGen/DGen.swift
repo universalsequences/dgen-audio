@@ -436,7 +436,7 @@ public final class Graph {
     /// - delayTimeInSamples: delay time in samples (0 to MAX_DELAY)
     /// Implements a circular buffer with linear interpolation for fractional delay times
     public func delay(_ input: NodeID, _ delayTimeInSamples: NodeID) -> NodeID {
-        let MAX_DELAY = 2000  //88000
+        let MAX_DELAY = 88000
         let bufferBase = alloc(vectorWidth: MAX_DELAY)  // Allocate proper buffer space
         let writePosCellId = alloc()
 
