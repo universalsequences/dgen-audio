@@ -853,6 +853,8 @@ public class MetalRenderer: Renderer, UOpEmitter {
                 bufferNames.append("segmentBase")
             }
 
+            print("BUFFER NAMES=\(bufferNames)")
+
             return CompiledKernel(
                 name: kernelName,
                 source: source,
@@ -971,6 +973,9 @@ public class MetalRenderer: Renderer, UOpEmitter {
         }
 
         parameters.append("    uint id [[thread_position_in_grid]]")
+        if needsSegmenting {
+            parameters.append("    uint tid [[thread_index_in_threadgroup]]")
+        }
 
         kernels += "kernel void \(name)(\n"
         kernels += parameters.joined(separator: ",\n")
@@ -1016,7 +1021,7 @@ public class MetalRenderer: Renderer, UOpEmitter {
                 outputs.insert(varId)
             case let .loadGlobal(varId):
                 inputs.insert(varId)
-            case .load, .store:
+            case .load, .store, .delay1:
                 needsMemory = true
             case .defineMemory:
                 needsMemory = true

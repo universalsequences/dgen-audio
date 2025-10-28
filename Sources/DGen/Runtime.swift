@@ -553,8 +553,8 @@ public class MetalCompiledKernel: CompiledKernelRuntime {
         // Use larger buffer size to handle varying frameCount from AVAudioEngine
         let maxFrameCount = 2048  // Handle up to 2048 frames per callback
         for bufferName in allBufferNames {
-            // Memory buffer needs extra space, others need maxFrameCount
-            let elementCount = bufferName == "memory" ? 512 : maxFrameCount
+            // Memory buffer size comes from getMemorySize(), others need maxFrameCount
+            let elementCount = bufferName == "memory" ? getMemorySize() : maxFrameCount
             let bufferSize = elementCount * MemoryLayout<Float>.size
             guard let buffer = device.makeBuffer(length: bufferSize, options: .storageModeShared)
             else {
@@ -829,7 +829,7 @@ public class MetalCompiledKernel: CompiledKernelRuntime {
         }
 
         let bufferContents = buffer.contents().assumingMemoryBound(to: Float.self)
-        let count = named == "memory" ? 512 : 2048  // Match the allocated size
+        let count = buffer.length / MemoryLayout<Float>.size  // Use actual buffer size
         return Array(UnsafeBufferPointer(start: bufferContents, count: count))
     }
 
@@ -848,7 +848,7 @@ public class MetalCompiledKernel: CompiledKernelRuntime {
                 count = 1
             } else {
                 let bufferContents = buffer.contents().assumingMemoryBound(to: Float.self)
-                count = name == "memory" ? 512 : 2048  // Match the allocated size
+                count = buffer.length / MemoryLayout<Float>.size  // Use actual buffer size
                 values = Array(UnsafeBufferPointer(start: bufferContents, count: count))
             }
 
@@ -923,12 +923,9 @@ public class MetalCompiledKernel: CompiledKernelRuntime {
         outputs: UnsafeMutablePointer<Float>, inputs: UnsafePointer<Float>,
         memory: UnsafeMutableRawPointer, frameCount: Int
     ) {
-        // Metal implementation would need significant changes to support external memory
-        // For now, fall back to the existing run method which uses internal buffers
+        // Metal uses its own internal persistent memory buffer in bufferPool["memory"]
+        // No need to copy external memory - just use the existing run() implementation
         run(outputs: outputs, inputs: inputs, frameCount: frameCount, volumeScale: 1.0)
-        print(
-            "⚠️ MetalCompiledKernel.runWithMemory not fully implemented - falling back to internal buffers"
-        )
     }
 
     deinit {
