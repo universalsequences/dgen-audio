@@ -3,6 +3,8 @@ import Foundation
 public class IRContext {
     private var varIdx = 0
     private var constantIdx = 0
+    // Reuse constant IDs for identical values to reduce duplicate vdupq constants
+    private var constantIdByValue: [Float: ConstantID] = [:]
 
     public init() {}
 
@@ -13,15 +15,22 @@ public class IRContext {
     public var gradients: [NodeID: Lazy] = [:]
     public var constants: [ConstantID: Float] = [:]
     public var variables: [VarID: NodeID] = [:]
+    public var tapeIndex: [NodeID: Int] = [:]
 
     public func useConstant(src: NodeID?, value: Float) -> Lazy {
+        if let existing = constantIdByValue[value] {
+            let constant = Lazy.constant(existing, value)
+            if let srcId = src { self.values[srcId] = constant }
+            return constant
+        }
+
         let constantId = self.constantIdx + 1
         self.constantIdx = constantId
         self.constants[constantId] = value
+        constantIdByValue[value] = constantId
+
         let constant = Lazy.constant(constantId, value)
-        if let srcId = src {
-            self.values[srcId] = constant
-        }
+        if let srcId = src { self.values[srcId] = constant }
         return constant
     }
 
@@ -53,6 +62,8 @@ public final class Graph {
     private var next = 0
     public var nodes: [NodeID: Node] = [:]
     private var nextCellId = 0
+    public var nextTensorId = 0
+    public var tensors: [TensorID: Tensor] = [:]
 
     public init() {}
 
@@ -139,6 +150,10 @@ public final class Graph {
         }
 
         return roots
+    }
+
+    public func seq(a: NodeID, b: NodeID) -> NodeID {
+        return n(.seq, a, b)
     }
 
     // Higher-level compound operations

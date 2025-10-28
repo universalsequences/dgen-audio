@@ -40,6 +40,7 @@ let cRuntime = CCompiledKernel(
   cellAllocations: cResult.cellAllocations,
   memorySize: cResult.totalMemorySlots
 )
+try cRuntime.compileAndLoad()
 let cURL = URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
   .appendingPathComponent("biquad_c.wav")
 try cRuntime.writeWAV(to: cURL, seconds: seconds, sampleRate: sampleRate, volumeScale: 0.1)

@@ -1,5 +1,7 @@
 // the beauty is this doesn't need to even know if its forward or backward
 
+import Foundation
+
 public struct BlockUOps {
     public var ops: [UOp]
     public let kind: Kind
@@ -39,12 +41,26 @@ public func lowerUOpBlocks(
     ctx: IRContext,
     frameCount: Int,
     graph: Graph,
-    totalMemorySlots: Int
-) -> [CompiledKernel] {
+    totalMemorySlots: Int,
+    name: String = "kernel"
+) throws -> [CompiledKernel] {
     var scheduleItems: [ScheduleItem] = []
     renderer.prepareSchedule(&scheduleItems, uopBlocks, ctx, frameCount)
+    // For C backend, ensure we have at least one output op. If not, fail compilation.
+    if renderer is CRenderer {
+        let hasOutput = scheduleItems.contains { schedule in
+            schedule.ops.contains { uop in
+                if case .output = uop.op { return true }
+                return false
+            }
+        }
+        if !hasOutput {
+            throw DGenError.compilationFailed("no output node")
+        }
+    }
     return renderer.compile(
-        scheduleItems: scheduleItems, ctx: ctx, graph: graph, totalMemorySlots: totalMemorySlots)
+        scheduleItems: scheduleItems, ctx: ctx, graph: graph, totalMemorySlots: totalMemorySlots,
+        name: name)
 }
 
 func extractVarId(_ lazy: Lazy) -> VarID {
@@ -73,7 +89,8 @@ open class Renderer {
         scheduleItems: [ScheduleItem],
         ctx: IRContext,
         graph: Graph,
-        totalMemorySlots: Int
+        totalMemorySlots: Int,
+        name: String = "kernel"
     ) -> [CompiledKernel] {
         fatalError("must implement")
     }
@@ -88,17 +105,23 @@ open class Renderer {
 
 public class CRenderer: Renderer {
 
+    // MC support parameters supplied by CompilationPipeline.Options
+    public var voiceCount: Int = 1
+    public var voiceCellIdOpt: Int? = nil
+
     public override init() {}
 
     public override func compile(
         scheduleItems: [ScheduleItem],
         ctx: IRContext,
         graph: Graph,
-        totalMemorySlots: Int
+        totalMemorySlots: Int,
+        name: String = "kernel"
     ) -> [CompiledKernel] {
         return scheduleItems.enumerated().map { (i, scheduleItem) in
+            let kernelName = scheduleItems.count > 1 ? "\(name)_\(i)" : name
             let source = render(
-                name: "kernel_\(i)", scheduleItem: scheduleItem, ctx: ctx, graph: graph,
+                name: kernelName, scheduleItem: scheduleItem, ctx: ctx, graph: graph,
                 totalMemorySlots: totalMemorySlots)
 
             // For C, the "buffers" are just the global arrays used
@@ -115,13 +138,16 @@ public class CRenderer: Renderer {
                 }
             }
 
+            // Ensure memory size covers special cells (e.g., voice cell) as well
+            let extra = (self.voiceCellIdOpt ?? -1) + 1
+            let computedMem = max(totalMemorySlots, max(1024, extra))
             return CompiledKernel(
-                name: "kernel_\(i)",
+                name: kernelName,
                 source: source,
                 kind: scheduleItem.kind,
                 buffers: buffers,
                 threadGroupSize: 1,  // C execution is scalar for now
-                memorySize: max(totalMemorySlots, 1024)  // Match memory size calculation from render method
+                memorySize: computedMem  // Ensure at least enough for voiceCellId
             )
         }
     }
@@ -139,25 +165,31 @@ public class CRenderer: Renderer {
         scheduleItem.ops.append(UOp(op: .frameCount, value: .empty))
         let frameCountUOp = Lazy.variable(-1, nil)  // Special variable ID for frameCount
 
-        // Extract defineGlobal from all blocks
+        // Merge adjacent blocks of the same kind into a single loop to reduce passes
+        var currentKind: Kind? = nil
         for block in uopBlocks {
-            scheduleItem.ops.append(
-                UOp(op: .beginLoop(frameCountUOp, block.kind == .scalar ? 1 : 4), value: .empty))
-            for uop in block.ops {
-                switch uop.op {
-                case .defineGlobal:
-                    break
-                default:
-                    scheduleItem.ops.append(UOp(op: uop.op, value: uop.value, kind: block.kind))
+            if currentKind != block.kind {
+                // Close previous loop if open
+                if currentKind != nil {
+                    scheduleItem.ops.append(UOp(op: .endLoop, value: .empty))
                 }
+                // Open new loop for this kind
+                scheduleItem.ops.append(
+                    UOp(op: .beginLoop(frameCountUOp, block.kind == .scalar ? 1 : 4), value: .empty)
+                )
+                currentKind = block.kind
             }
-            scheduleItem.ops.append(UOp(op: .endLoop, value: .empty))
+
+            for uop in block.ops {
+                if case .defineGlobal = uop.op { continue }
+                scheduleItem.ops.append(UOp(op: uop.op, value: uop.value, kind: block.kind))
+            }
         }
 
-        // Append all UOps inside a single loop
-        scheduleItem.ops.append(UOp(op: .beginLoop(frameCountUOp, 1), value: .empty))
-
-        scheduleItem.ops.append(UOp(op: .endLoop, value: .empty))
+        // Close any open loop
+        if currentKind != nil {
+            scheduleItem.ops.append(UOp(op: .endLoop, value: .empty))
+        }
     }
 
     public override func render(
@@ -165,6 +197,14 @@ public class CRenderer: Renderer {
         totalMemorySlots: Int
     ) -> String {
         var code: [String] = []
+
+        // Generate a unique UUID for this kernel
+        let kernelUUID = UUID().uuidString
+
+        // Sanitize kernel name to be a valid C identifier
+        // Replace invalid characters with underscores
+        let sanitizedName = name.replacingOccurrences(
+            of: "[^a-zA-Z0-9_]", with: "_", options: .regularExpression)
 
         // C includes and function signature
         code.append(
@@ -174,19 +214,35 @@ public class CRenderer: Renderer {
             #include <stdio.h>
             #include <math.h>
             #include <Accelerate/Accelerate.h>
+            #include <mach/mach_time.h>
+
+            // Enable profiling only when DGEN_PROFILE is defined by build flags
 
             float32x4_t vfmodq_f32(float32x4_t a, float32x4_t b) {
-              float32x4_t div = vdivq_f32(a, b);
-              float32x4_t div_trunc = vrndq_f32(div);  // truncates toward zero
-              return vsubq_f32(a, vmulq_f32(b, div_trunc));
+              // a - floor(a / b) * b  (faster and correct for positive ranges)
+              float32x4_t q = vdivq_f32(a, b);
+              float32x4_t q_floor = vrndmq_f32(q);  // floor
+              return vsubq_f32(a, vmulq_f32(b, q_floor));
             }
+
+            // Timing instrumentation for \(name) [\(kernelUUID)]
+            #ifdef DGEN_PROFILE
+            static uint64_t kernel_invocation_count_\(sanitizedName) = 0;
+            static uint64_t kernel_max_time_nanos_\(sanitizedName) = 0;
+            static mach_timebase_info_data_t timebase_info_\(sanitizedName);
+            static int timebase_initialized_\(sanitizedName) = 0;
+            #endif
 
             """)
 
         // Declare globals
         let sortedGlobals = ctx.globals.sorted()
+        code.append("const int VOICE_COUNT = \(voiceCount);")
+        code.append("const int SCRATCH_STRIDE = 512;")
         for varId in sortedGlobals {
-            code.append("float t\(varId)[128] __attribute__((aligned(16))) = {0};")
+            code.append(
+                "float t\(varId)_g[VOICE_COUNT * SCRATCH_STRIDE] __attribute__((aligned(64))) = {0};"
+            )
         }
 
         // Memory is now passed as parameter - calculate required size for external allocation
@@ -204,7 +260,24 @@ public class CRenderer: Renderer {
             """)
 
         code.append(
-            "void process(float *const *in, float *const *out, int nframes, void *state) {")
+            "void process(float * restrict const *in, float * restrict const *out, int nframes, void * restrict state) {"
+        )
+
+        // Add timing instrumentation at start of function
+        code.append(
+            """
+              #ifdef DGEN_PROFILE
+              // Initialize timebase info once
+              if (!timebase_initialized_\(sanitizedName)) {
+                mach_timebase_info(&timebase_info_\(sanitizedName));
+                timebase_initialized_\(sanitizedName) = 1;
+              }
+
+              // Start timing
+              uint64_t start_time = mach_absolute_time();
+              #endif
+
+            """)
 
         // Use audiograph parameters directly - no mapping needed
         code.append("  int frameCount = nframes;  // Use audiograph frame count parameter")
@@ -217,6 +290,17 @@ public class CRenderer: Renderer {
 
         // Cast state parameter to float pointer for use in function
         code.append("  float *memory = (float*)state;")
+        // Determine voice index and compute base offset for scratch arrays
+        code.append("  int voiceIndex = 0;")
+        if let voiceCellId = voiceCellIdOpt {
+            code.append("  voiceIndex = (int)memory[\(voiceCellId)];")
+        }
+        code.append("  if (voiceIndex < 0) voiceIndex = 0;")
+        code.append("  if (voiceIndex >= VOICE_COUNT) voiceIndex = VOICE_COUNT - 1;")
+        code.append("  int _scratchBase = voiceIndex * SCRATCH_STRIDE;")
+        for varId in sortedGlobals {
+            code.append("  float *t\(varId) = t\(varId)_g + _scratchBase;")
+        }
 
         // Emit ops
         var indent = 1
@@ -237,6 +321,31 @@ public class CRenderer: Renderer {
             indent += diff
         }
 
+        // Add timing instrumentation before closing function
+        code.append(
+            """
+              #ifdef DGEN_PROFILE
+              // End timing and update stats
+              uint64_t end_time = mach_absolute_time();
+              uint64_t elapsed_abs = end_time - start_time;
+              uint64_t elapsed_nanos = elapsed_abs * timebase_info_\(sanitizedName).numer / timebase_info_\(sanitizedName).denom;
+
+              if (elapsed_nanos > kernel_max_time_nanos_\(sanitizedName)) {
+                kernel_max_time_nanos_\(sanitizedName) = elapsed_nanos;
+              }
+
+              kernel_invocation_count_\(sanitizedName)++;
+
+              // Print every 2048 invocations
+              if (kernel_invocation_count_\(sanitizedName) % 2048 == 0) {
+                double max_time_ms = kernel_max_time_nanos_\(sanitizedName) / 1000000.0;
+                printf("⏱️  \(name) [\(kernelUUID)] invocation %llu - Max time: %.3f ms\\n",
+                       kernel_invocation_count_\(sanitizedName), max_time_ms);
+                kernel_max_time_nanos_\(sanitizedName) = 0;  // Reset for next interval
+              }
+              #endif
+            """)
+
         // Close process function
         code.append("}")
 
@@ -250,7 +359,7 @@ public class CRenderer: Renderer {
         case let .defineConstant(constantId, val):
             return "float32x4_t c\(constantId) = vdupq_n_f32(\(val)f);"
         case let .defineGlobal(varId):
-            return "float t\(varId)[128] __attribute__((aligned(16)));"
+            return "/* t\(varId) declared globally */"
         case let .defineMemory(length):
             return "float memory[\(length)] __attribute__((aligned(16)));"
 
@@ -267,17 +376,100 @@ public class CRenderer: Renderer {
             return emitAssign(uop, expr, ctx)
 
         case let .div(a, b):
-            let expr = uop.kind == .simd ? "vdivq_f32(\(g(a)), \(g(b)))" : "\(g(a)) / \(g(b))"
-            return emitAssign(uop, expr, ctx)
+            // Strength-reduce division by constant to multiply by reciprocal
+            switch b {
+            case let .constant(_, val):
+                if uop.kind == .simd {
+                    let expr = "vmulq_f32(\(g(a)), vdupq_n_f32(\(1.0/val)f))"
+                    return emitAssign(uop, expr, ctx)
+                } else {
+                    let expr = "(\(g(a)) * \(1.0/val)f)"
+                    return emitAssign(uop, expr, ctx)
+                }
+            default:
+                let expr = uop.kind == .simd ? "vdivq_f32(\(g(a)), \(g(b)))" : "\(g(a)) / \(g(b))"
+                return emitAssign(uop, expr, ctx)
+            }
 
         case let .mod(a, b):
-            let expr =
-                uop.kind == .simd ? "vfmodq_f32(\(g(a)), \(g(b)))" : "fmodf(\(g(a)), \(g(b)))"
-            return emitAssign(uop, expr, ctx)
+            // Fast modulo for constant denominator: a - floor(a / b) * b
+            switch b {
+            case let .constant(_, val):
+                if uop.kind == .simd {
+                    if val == 1.0 {
+                        let expr = "vsubq_f32(\(g(a)), vrndmq_f32(\(g(a))))"
+                        return emitAssign(uop, expr, ctx)
+                    } else {
+                        let expr =
+                            "vsubq_f32(\(g(a)), vmulq_f32(vdupq_n_f32(\(val)f), vrndmq_f32(vmulq_f32(\(g(a)), vdupq_n_f32(\(1.0/val)f)))))"
+                        return emitAssign(uop, expr, ctx)
+                    }
+                } else {
+                    if val == 1.0 {
+                        let expr = "(\(g(a)) - floorf(\(g(a))))"
+                        return emitAssign(uop, expr, ctx)
+                    } else {
+                        let expr = "(\(g(a)) - floorf(\(g(a)) / \(val)f) * \(val)f)"
+                        return emitAssign(uop, expr, ctx)
+                    }
+                }
+            default:
+                let expr =
+                    uop.kind == .simd ? "vfmodq_f32(\(g(a)), \(g(b)))" : "fmodf(\(g(a)), \(g(b)))"
+                return emitAssign(uop, expr, ctx)
+            }
 
         case let .pow(a, b):
-            let expr = uop.kind == .simd ? "vpowf(\(g(a)), \(g(b)))" : "powf(\(g(a)), \(g(b)))"
-            return emitAssign(uop, expr, ctx)
+            // Specialize common exponents to avoid expensive powf
+            switch b {
+            case let .constant(_, val):
+                if val == 1.0 {
+                    return emitAssign(uop, uop.kind == .simd ? "\(g(a))" : "\(g(a))", ctx)
+                } else if val == 2.0 {
+                    let expr =
+                        uop.kind == .simd ? "vmulq_f32(\(g(a)), \(g(a)))" : "(\(g(a)) * \(g(a)))"
+                    return emitAssign(uop, expr, ctx)
+                } else if val == 3.0 {
+                    if uop.kind == .simd {
+                        let expr = "vmulq_f32(vmulq_f32(\(g(a)), \(g(a))), \(g(a)))"
+                        return emitAssign(uop, expr, ctx)
+                    } else {
+                        let expr = "(\(g(a)) * \(g(a)) * \(g(a)))"
+                        return emitAssign(uop, expr, ctx)
+                    }
+                } else if val == 4.0 {
+                    if uop.kind == .simd {
+                        let t2 = "vmulq_f32(\(g(a)), \(g(a)))"
+                        let expr = "vmulq_f32(\(t2), \(t2))"
+                        return emitAssign(uop, expr, ctx)
+                    } else {
+                        let expr = "({ float _t=\(g(a))*\(g(a)); _t*_t; })"
+                        return emitAssign(uop, expr, ctx)
+                    }
+                } else if val == 0.5 {
+                    let expr = uop.kind == .simd ? "vsqrtf(\(g(a)))" : "sqrtf(\(g(a)))"
+                    return emitAssign(uop, expr, ctx)
+                } else if val == 0.0 {
+                    let expr = uop.kind == .simd ? "vdupq_n_f32(1.0f)" : "1.0f"
+                    return emitAssign(uop, expr, ctx)
+                }
+                // Fallback
+                let expr = uop.kind == .simd ? "vpowf(\(g(a)), \(g(b)))" : "powf(\(g(a)), \(g(b)))"
+                return emitAssign(uop, expr, ctx)
+            default:
+                // If base is constant, emit exp(b * log(base)) which is faster than generic pow
+                if case let .constant(_, baseVal) = a {
+                    if uop.kind == .simd {
+                        let expr = "vexpf(vmulq_f32(\(g(b)), vdupq_n_f32(logf(\(baseVal)f))))"
+                        return emitAssign(uop, expr, ctx)
+                    } else {
+                        let expr = "expf((\(g(b))) * logf(\(baseVal)f))"
+                        return emitAssign(uop, expr, ctx)
+                    }
+                }
+                let expr = uop.kind == .simd ? "vpowf(\(g(a)), \(g(b)))" : "powf(\(g(a)), \(g(b)))"
+                return emitAssign(uop, expr, ctx)
+            }
 
         case let .min(a, b):
             let expr = uop.kind == .simd ? "vminq_f32(\(g(a)), \(g(b)))" : "fminf(\(g(a)), \(g(b)))"
@@ -413,11 +605,22 @@ public class CRenderer: Renderer {
                 : "\(g(a)) < \(g(b))"
             return emitAssign(uop, expr, ctx)
         case let .eq(a, b):
-            let expr =
-                uop.kind == .simd
-                ? "vbslq_f32(vceqq_f32(\(g(a)), \(g(b))), vdupq_n_f32(1.0f), vdupq_n_f32(0.0f))"
-                : "\(g(a)) == \(g(b))"
-            return emitAssign(uop, expr, ctx)
+            // Constant-fold equality when both operands are constants
+            switch (a, b) {
+            case let (.constant(_, av), .constant(_, bv)):
+                if uop.kind == .simd {
+                    let expr = (av == bv) ? "vdupq_n_f32(1.0f)" : "vdupq_n_f32(0.0f)"
+                    return emitAssign(uop, expr, ctx)
+                } else {
+                    return emitAssign(uop, (av == bv) ? "1.0f" : "0.0f", ctx)
+                }
+            default:
+                let expr =
+                    uop.kind == .simd
+                    ? "vbslq_f32(vceqq_f32(\(g(a)), \(g(b))), vdupq_n_f32(1.0f), vdupq_n_f32(0.0f))"
+                    : "\(g(a)) == \(g(b))"
+                return emitAssign(uop, expr, ctx)
+            }
 
         case let .gswitch(cond, a, b):
             if uop.kind == .simd {
@@ -439,6 +642,16 @@ public class CRenderer: Renderer {
                 // Scalar: read previous then write current
                 let assign = emitAssign(uop, "memory[\(cell)]", ctx)
                 return "\(assign) memory[\(cell)] = \(g(curr));"
+            }
+        case let .concatShift(a, b, shift):
+            if uop.kind == .simd {
+                // this op is only relevant in vectorized block
+                let expr = "vextq_f32(\(g(a)), \(g(b)), \(shift))"
+                return emitAssign(uop, expr, ctx)
+            } else {
+                // scalar version is simple identity (i.e. a no-op).
+                let expr = "\(g(a))"
+                return emitAssign(uop, expr, ctx)
             }
         case let .selector(mode, options):
             if uop.kind == .simd {
@@ -482,7 +695,13 @@ public class CRenderer: Renderer {
             } else {
                 return emitAssign(uop, "memory[\(cell)]", ctx)
             }
-
+        case let .loadTape(offset):
+            if uop.kind == .simd {
+                // SIMD: load 4 consecutive frames from tape starting at [offset + i]
+                return emitAssign(uop, "vld1q_f32(&tape[\(offset) + i])", ctx)
+            } else {
+                return emitAssign(uop, "tape[\(offset) + i]", ctx)
+            }
         case let .beginIf(cond): return "if (\(g(cond))) {"
         case .endIf: return "}"
 
@@ -585,9 +804,6 @@ public class CRenderer: Renderer {
 
 public class MetalRenderer: Renderer, UOpEmitter {
     let memoryVarID = -1  // Virtual ID for the global memory buffer
-    private var loadVarToCell: [VarID: Int] = [:]
-    // Track the order of vector history store bases within a kernel
-    private var vectorStoreOrder: [Int] = []
 
     public override init() {}
 
@@ -595,11 +811,13 @@ public class MetalRenderer: Renderer, UOpEmitter {
         scheduleItems: [ScheduleItem],
         ctx: IRContext,
         graph: Graph,
-        totalMemorySlots: Int
+        totalMemorySlots: Int,
+        name: String = "kernel"
     ) -> [CompiledKernel] {
         return scheduleItems.enumerated().map { (i, scheduleItem) in
+            let kernelName = scheduleItems.count > 1 ? "\(name)_\(i)" : name
             let source = render(
-                name: "kernel_\(i)", scheduleItem: scheduleItem, ctx: ctx, graph: graph,
+                name: kernelName, scheduleItem: scheduleItem, ctx: ctx, graph: graph,
                 totalMemorySlots: totalMemorySlots)
             let deps = analyzeDependencies(scheduleItem: scheduleItem, ctx: ctx)
             let allBuffers = Set(deps.inputs + deps.outputs)
@@ -636,7 +854,7 @@ public class MetalRenderer: Renderer, UOpEmitter {
             }
 
             return CompiledKernel(
-                name: "kernel_\(i)",
+                name: kernelName,
                 source: source,
                 kind: scheduleItem.kind,
                 buffers: bufferNames,
@@ -709,7 +927,7 @@ public class MetalRenderer: Renderer, UOpEmitter {
         totalMemorySlots: Int
     ) -> String {
         var kernels = ""
-        let (inputs, outputs) = analyzeDependencies(scheduleItem: scheduleItem, ctx: ctx)
+        var (inputs, outputs) = analyzeDependencies(scheduleItem: scheduleItem, ctx: ctx)
 
         let hasOutputOps = scheduleItem.ops.contains { uop in
             if case .output = uop.op { return true }
@@ -752,19 +970,11 @@ public class MetalRenderer: Renderer, UOpEmitter {
             bufferIndex += 1
         }
 
-        // Thread indices
         parameters.append("    uint id [[thread_position_in_grid]]")
-        if needsSegmenting {
-            parameters.append("    uint tid [[thread_index_in_threadgroup]]")
-        }
 
         kernels += "kernel void \(name)(\n"
         kernels += parameters.joined(separator: ",\n")
         kernels += "\n) {\n"
-
-        // Mark kernel context for emit()
-        self.loadVarToCell.removeAll()
-        self.vectorStoreOrder.removeAll()
 
         var indent = 1
 
@@ -790,7 +1000,6 @@ public class MetalRenderer: Renderer, UOpEmitter {
         }
 
         kernels += "}\n\n"
-        // Reset kernel context
         return kernels
     }
 
@@ -808,9 +1017,6 @@ public class MetalRenderer: Renderer, UOpEmitter {
             case let .loadGlobal(varId):
                 inputs.insert(varId)
             case .load, .store:
-                needsMemory = true
-            case .delay1:
-                // delay1 reads (and now also persists) memory state
                 needsMemory = true
             case .defineMemory:
                 needsMemory = true
@@ -837,9 +1043,46 @@ public class MetalRenderer: Renderer, UOpEmitter {
         case let .add(a, b): return emitAssign(uop, "\(g(a)) + \(g(b))", ctx)
         case let .mul(a, b): return emitAssign(uop, "\(g(a)) * \(g(b))", ctx)
         case let .sub(a, b): return emitAssign(uop, "\(g(a)) - \(g(b))", ctx)
-        case let .div(a, b): return emitAssign(uop, "\(g(a)) / \(g(b))", ctx)
-        case let .mod(a, b): return emitAssign(uop, "\(g(a)) % \(g(b))", ctx)
-        case let .pow(a, b): return emitAssign(uop, "metal::pow(\(g(a)), \(g(b)))", ctx)
+        case let .div(a, b):
+            // Strength-reduce division by constant to multiply by reciprocal
+            switch b {
+            case let .constant(_, val):
+                return emitAssign(uop, "(\(g(a)) * \(1.0/val))", ctx)
+            default:
+                return emitAssign(uop, "\(g(a)) / \(g(b))", ctx)
+            }
+        case let .mod(a, b):
+            // Fast modulo for constant denominator: a - floor(a / b) * b
+            switch b {
+            case let .constant(_, val):
+                if val == 1.0 {
+                    return emitAssign(uop, "(\(g(a)) - floor(\(g(a))))", ctx)
+                } else {
+                    return emitAssign(uop, "(\(g(a)) - floor(\(g(a)) / \(val)) * \(val))", ctx)
+                }
+            default:
+                return emitAssign(uop, "fmod(\(g(a)), \(g(b)))", ctx)
+            }
+        case let .pow(a, b):
+            // Specialize common exponents to avoid expensive pow
+            switch b {
+            case let .constant(_, val):
+                if val == 1.0 { return emitAssign(uop, "\(g(a))", ctx) }
+                if val == 2.0 { return emitAssign(uop, "(\(g(a)) * \(g(a)))", ctx) }
+                if val == 3.0 { return emitAssign(uop, "(\(g(a)) * \(g(a)) * \(g(a)))", ctx) }
+                if val == 4.0 {
+                    return emitAssign(uop, "({ float _t=\(g(a))*\(g(a)); _t*_t; })", ctx)
+                }
+                if val == 0.5 { return emitAssign(uop, "metal::sqrt(\(g(a)))", ctx) }
+                if val == 0.0 { return emitAssign(uop, "1.0", ctx) }
+                return emitAssign(uop, "metal::pow(\(g(a)), \(g(b)))", ctx)
+            default:
+                // If base is constant: exp(b * log(base))
+                if case let .constant(_, baseVal) = a {
+                    return emitAssign(uop, "metal::exp(\(g(b)) * metal::log(\(baseVal)))", ctx)
+                }
+                return emitAssign(uop, "metal::pow(\(g(a)), \(g(b)))", ctx)
+            }
         case let .min(a, b): return emitAssign(uop, "metal::min(\(g(a)), \(g(b)))", ctx)
         case let .max(a, b): return emitAssign(uop, "metal::max(\(g(a)), \(g(b)))", ctx)
 
@@ -857,12 +1100,11 @@ public class MetalRenderer: Renderer, UOpEmitter {
         case let .cos(a): return emitAssign(uop, "metal::cos(\(g(a)))", ctx)
         case let .tan(a): return emitAssign(uop, "metal::tan(\(g(a)))", ctx)
         case let .tanh(a): return emitAssign(uop, "metal::tanh(\(g(a)))", ctx)
-        case let .round(a): return emitAssign(uop, "metal::round\(g(a)))", ctx)
         case let .exp(a): return emitAssign(uop, "metal::exp(\(g(a)))", ctx)
         case let .log(a): return emitAssign(uop, "metal::log(\(g(a)))", ctx)
         case let .log10(a): return emitAssign(uop, "metal::log10(\(g(a)))", ctx)
-        case let .sqrt(a): return emitAssign(uop, "sqrt(\(g(a)))", ctx)
-        case let .atan2(y, x): return emitAssign(uop, "atan2(\(g(y)), \(g(x)))", ctx)
+        case let .sqrt(a): return emitAssign(uop, "metal::sqrt(\(g(a)))", ctx)
+        case let .atan2(y, x): return emitAssign(uop, "metal::atan2(\(g(y)), \(g(x)))", ctx)
 
         case let .gt(a, b): return emitAssign(uop, "\(g(a)) > \(g(b))", ctx)
         case let .gte(a, b): return emitAssign(uop, "\(g(a)) >= \(g(b))", ctx)
@@ -872,7 +1114,6 @@ public class MetalRenderer: Renderer, UOpEmitter {
         case let .gswitch(cond, a, b):
             let expr = "metal::select(\(g(b)), \(g(a)), \(g(cond)) > 0.0)"
             return emitAssign(uop, expr, ctx)
-
         case let .delay1(cell, a):
             // Metal thread-per-sample delay-by-1 using threadgroup neighbor exchange.
             // Also persists the last 4 current values to memory[cell..cell+3] at the end of the segment.
@@ -911,9 +1152,10 @@ public class MetalRenderer: Renderer, UOpEmitter {
             return emitAssign(uop, expr, ctx)
 
         case let .load(cell): return emitAssign(uop, "memory[\(cell)]", ctx)
-        case let .store(cell, val):
-            // Regular store for Metal (scalar or per-thread value)
-            return "memory[\(cell)] = \(g(val));"
+        case let .loadTape(offset):
+            let idx = (uop.kind == .simd) ? "id" : "i"
+            return emitAssign(uop, "tape[\(offset) + \(idx)]", ctx)
+        case let .store(cell, val): return "memory[\(cell)] = \(g(val));"
 
         case let .mutate(a, b):
             return "\(emitLazy(a, ctx: ctx, kind: uop.kind, isOut: true)) = \(g(b));"
@@ -925,15 +1167,13 @@ public class MetalRenderer: Renderer, UOpEmitter {
 
         case .frameCount: return "/* frameCount available as function parameter */"
 
-        case let .beginRange(_, end):
-            let endS = g(end)
-            return "if (id < uint(\(endS))) {"
+        case let .beginRange(start, end): return "if (id >= \(g(start)) && id < \(g(end))) {"
         case .endRange: return "}"
+
         case let .output(channel, val):
             // Store output value to a device buffer that can be read back
             let idx = (uop.kind == .simd) ? "id" : "i"
             return "outputs[\(channel) * frameCount + \(idx)] = \(g(val));"
-
         case .input(_):
             return ""
         case let .loadGlobal(id):
@@ -967,6 +1207,8 @@ public class MetalRenderer: Renderer, UOpEmitter {
     }
 
     func emitAssign(_ uop: UOp, _ expr: String, _ ctx: IRContext) -> String {
+        // TODO (backpropagation) - if this value is needed in the tape of the backprop and we're in forward pass we must store it
+
         let lhs = emitLazy(uop.value, ctx: ctx, kind: uop.kind, isOut: true)
         let isGlobal = ctx.globals.contains(extractVarId(uop.value))
 

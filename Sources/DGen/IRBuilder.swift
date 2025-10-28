@@ -59,6 +59,13 @@ public final class IRBuilder {
     return value(uop.value)
   }
 
+  public func concatShift(_ a: Expr, _ b: Expr, _ shift: Int) -> Expr {
+    let thunk = u_concatShift(a.lazy, b.lazy, shift)
+    let uop = thunk(ctx, nil)
+    ops.append(uop)
+    return value(uop.value)
+  }
+
   public func output(_ channelNumber: ChannelNumber, _ val: Expr) -> Expr {
     let thunk = u_output(channelNumber, val.lazy)
     let uop = thunk(ctx, nil)
@@ -111,6 +118,32 @@ public final class IRBuilder {
   func storeGrad(_ cellId: CellID, _ val: Expr) -> Expr {
     let dest = ctx.useVariable(src: nil)
     let uop = UOp(op: .storeGrad(cellId, val.lazy), value: dest)
+    ops.append(uop)
+    return value(dest)
+  }
+
+  // Read a forward intermediate value for a given nodeId from the tape (intermediates buffer)
+  // Uses ctx.tapeIndex to find the per-node offset; returns an Expr referencing that value.
+  func tapeValue(_ nodeId: NodeID) -> Expr {
+    if let lazy = ctx.values[nodeId] {
+      if case .constant(_, _) = lazy {
+        return value(lazy)
+      }
+    }
+
+    guard let offset = ctx.tapeIndex[nodeId] else {
+      fatalError("tapeIndex missing for nodeId \(nodeId)")
+    }
+    let dest = ctx.useVariable(src: self.nodeId)
+    let uop = UOp(op: .loadTape(offset), value: dest)
+    ops.append(uop)
+    return value(dest)
+  }
+
+  public func mse(_ a: Expr, _ b: Expr) -> Expr {
+    // Emit dedicated MSE UOp: (a - b)^2 per-sample
+    let dest = ctx.useVariable(src: nodeId)
+    let uop = UOp(op: .mse(a.lazy, b.lazy), value: dest)
     ops.append(uop)
     return value(dest)
   }

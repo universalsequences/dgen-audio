@@ -14,7 +14,7 @@ public enum ANSI {
 }
 
 extension UOp {
-    func prettyDescription() -> String {
+    public func prettyDescription() -> String {
         let opStr: String
         switch op {
         case let .add(a, b):
@@ -39,8 +39,8 @@ extension UOp {
             opStr = "\(ANSI.cyan)memoryRead\(ANSI.reset)(\(base), \(offset))"
         case let .memoryWrite(base, offset, value):
             opStr = "\(ANSI.cyan)memoryWrite\(ANSI.reset)(\(base), \(offset), \(value))"
-        case let .delay1(a, b):
-            opStr = "\(ANSI.cyan)delay1\(ANSI.reset)(\(a), \(b))"
+        case let .concatShift(a, b, c):
+            opStr = "\(ANSI.cyan)concatShift\(ANSI.reset)(\(a), \(b), \(c))"
         case let .sin(a):
             opStr = "\(ANSI.green)sin\(ANSI.reset)(\(a))"
         case let .cos(a):
@@ -55,6 +55,8 @@ extension UOp {
             opStr = "\(ANSI.green)log\(ANSI.reset)(\(a))"
         case let .log10(a):
             opStr = "\(ANSI.green)log10\(ANSI.reset)(\(a))"
+        case let .delay1(a, b):
+            opStr = "\(ANSI.cyan)delay1\(ANSI.reset)(\(a), \(b))"
         case let .sqrt(a):
             opStr = "\(ANSI.green)sqrt\(ANSI.reset)(\(a))"
         case let .pow(base, exponent):
@@ -119,6 +121,10 @@ extension UOp {
             opStr = "\(ANSI.magenta)loadGrad\(ANSI.reset)(\(a))"
         case let .storeGrad(a, b):
             opStr = "\(ANSI.magenta)storeGrad\(ANSI.reset)(\(a), \(b))"
+        case let .loadTape(a):
+            opStr = "\(ANSI.magenta)loadTape\(ANSI.reset)(\(a))"
+        case let .mse(a, b):
+            opStr = "\(ANSI.green)mse\(ANSI.reset)(\(a), \(b))"
         case .frameIndex:
             opStr = "\(ANSI.magenta)frameIndex\(ANSI.reset)"
         }

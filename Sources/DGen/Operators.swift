@@ -4,76 +4,6 @@ public typealias ConstantID = Int
 public typealias CellID = Int
 public typealias ChannelNumber = Int
 
-public enum Lazy {
-    case constant(ConstantID, Float)
-    case global(VarID)
-    case variable(VarID, NodeID?)
-    case empty
-}
-
-// IR (intermediate representation) is called UOp and consists of an
-// operator (Op) and value (the variable it's result is bound to)
-public enum Op {
-    case load(CellID)
-    case store(CellID, Lazy)
-    case delay1(CellID, Lazy)
-    case loadGrad(CellID)
-    case storeGrad(CellID, Lazy)
-    case mutate(Lazy, Lazy)
-    case add(Lazy, Lazy)
-    case sub(Lazy, Lazy)
-    case mul(Lazy, Lazy)
-    case div(Lazy, Lazy)
-    case abs(Lazy)
-    case sign(Lazy)
-    case sin(Lazy)
-    case cos(Lazy)
-    case tan(Lazy)
-    case tanh(Lazy)
-    case exp(Lazy)
-    case log(Lazy)
-    case log10(Lazy)
-    case sqrt(Lazy)
-    case pow(Lazy, Lazy)
-    case atan2(Lazy, Lazy)
-    case mod(Lazy, Lazy)
-    case gt(Lazy, Lazy)
-    case gte(Lazy, Lazy)
-    case lte(Lazy, Lazy)
-    case lt(Lazy, Lazy)
-    case eq(Lazy, Lazy)
-    case min(Lazy, Lazy)
-    case max(Lazy, Lazy)
-    case floor(Lazy)
-    case ceil(Lazy)
-    case round(Lazy)
-    case memoryRead(CellID, Lazy)
-    case memoryWrite(CellID, Lazy, Lazy)
-    case latch(Lazy, Lazy)
-    case beginIf(Lazy)
-    case gswitch(Lazy, Lazy, Lazy)
-    case selector(Lazy, [Lazy])  // selector(mode, options[])
-    case endIf
-    case defineGlobal(VarID)
-    case defineConstant(ConstantID, Float)
-    case defineMemory(Int)
-    case loadGlobal(VarID)
-    case beginLoop(Lazy, Int)
-    case endLoop
-    case beginRange(Lazy, Lazy)
-    case endRange
-    case output(ChannelNumber, Lazy)
-    case input(ChannelNumber)
-    case frameCount
-    case frameIndex
-}
-
-public struct UOp {
-    public let op: Op
-    public let value: Lazy
-    public var kind: Kind? = nil
-}
-
 func binaryOp(
     _ opConstructor: @escaping (Lazy, Lazy) -> Op
 ) -> (Lazy, Lazy) -> (IRContext, NodeID?) -> UOp {
@@ -135,6 +65,12 @@ func u_delay1(_ cell: CellID, _ a: Lazy) -> (IRContext, NodeID?) -> UOp {
     }
 }
 
+func u_concatShift(_ a: Lazy, _ b: Lazy, _ shift: Int) -> (IRContext, NodeID?) -> UOp {
+    return { ctx, _ in
+        return UOp(op: .concatShift(a, b, shift), value: ctx.useVariable(src: nil))
+    }
+}
+
 func u_floor(_ value: Lazy) -> (IRContext, NodeID?) -> UOp {
     return { ctx, nodeId in
         let dest = ctx.useVariable(src: nodeId)
@@ -169,12 +105,32 @@ let u_pow = binaryOp(Op.pow)
 let u_min = binaryOp(Op.min)
 let u_max = binaryOp(Op.max)
 
-// writes current value to cell and returns delayed by 1 sample
 func u_historyWrite(cellId: CellID, _ curr: Expr) -> (IRBuilder) -> Expr {
     return { b in
-        // delay1 now encapsulates both: returns x[i-1] and persists current to cell
+        //let prev = b.load(cellId)
+        //let shifted = b.concatShift(prev, curr, 3)  // note: in scalar just use identity
+        //_ = b.store(cellId, curr)
+        //return shifted
+
         let prev = b.delay1(cellId, curr)
         return prev
+
+        /** Alternate solution to this operation, but unfortunately doesn't work currently for complex patches
+            * It might be that for scalar blocks, we need to do let prev = b.load(cellId); let shifted = prev; _ = b.store(cellId, curr); return prev (i.e. no shift)
+
+        //delay1 now encapsulates both: returns x[i-1] and persists current to cell
+        // ALT SOLUTION ->
+
+         */
+    }
+}
+
+func u_click(_ cellId: CellID) -> (IRBuilder) -> Expr {
+    return { b in
+        let trig = b.load(cellId, b.nodeId)
+        let zero = b.constant(0.0)
+        _ = b.store(cellId, zero)
+        return trig
     }
 }
 
@@ -251,6 +207,7 @@ public enum LazyOp {
         lte,
         lt, eq,
         gswitch, mix, pow, floor, ceil, round, mod, min, max
+    case mse  // mean squared error per-sample: (a-b)^2
     case selector  // selector(mode, options[])
     case memoryRead(CellID)
     case memoryWrite(CellID)
@@ -258,6 +215,7 @@ public enum LazyOp {
     case historyReadWrite(CellID)
     case param(CellID)
     case latch(CellID)
+    case click(CellID)
     case historyRead(CellID)
     case phasor(CellID)
     case accum(CellID)
@@ -424,6 +382,13 @@ public enum LazyOp {
                     operator: "atan2", expected: 2, actual: inputs.count)
             }
             b.use(val: b.atan2(b.value(inputs[0]), b.value(inputs[1])))
+        case .mse:
+            guard inputs.count == 2 else {
+                throw DGenError.insufficientInputs(
+                    operator: "mse", expected: 2, actual: inputs.count)
+            }
+            let (a, b2) = b.values(inputs, count: 2)
+            b.use(val: b.mse(a, b2))
         case .gt:
             guard inputs.count == 2 else {
                 throw DGenError.insufficientInputs(
@@ -513,6 +478,12 @@ public enum LazyOp {
             }
             let (incr, reset, min, max) = b.values(inputs, count: 4)
             b.use(val: u_accum(cellId, incr: incr, reset: reset, min: min, max: max)(b))
+        case .click(let cellId):
+            guard inputs.count == 0 else {
+                throw DGenError.insufficientInputs(
+                    operator: "click", expected: 4, actual: inputs.count)
+            }
+            b.use(val: u_click(cellId)(b))
         case .phasor(let cellId):
             guard inputs.count == 2 else {
                 throw DGenError.insufficientInputs(
@@ -569,29 +540,38 @@ public enum LazyOp {
         case .constant(_):
             // Constants have no gradients to propagate
             return BackwardsEmitResult(ops: [], dependencies: deps)
+        case .click:
+            break
         case .add:
             // d(x+y)/dx = 1, d(x+y)/dy = 1
             guard node.inputs.count == 2 else { fatalError("add requires 2 inputs") }
             ctx.gradients[node.inputs[0]] = gradOutput
             ctx.gradients[node.inputs[1]] = gradOutput
         case .sub:
-            // d(x+y)/dx = 1, d(x+y)/dy = 1
-            guard node.inputs.count == 2 else { fatalError("add requires 2 inputs") }
+            // z = x - y  =>  dz/dx = 1, dz/dy = -1
+            guard node.inputs.count == 2 else { fatalError("sub requires 2 inputs") }
             ctx.gradients[node.inputs[0]] = gradOutput
-            ctx.gradients[node.inputs[1]] = gradOutput
+            // negate grad for second input
+            let b = IRBuilder(ctx: ctx, nodeId: nodeId)
+            let negGrad = (b.constant(0.0) - b.value(gradOutput)).lazy
+            ctx.gradients[node.inputs[1]] = negGrad
         case .mod:
-            // TODO  - implement
-            print("need back")
-        case .param(_):
-            // TODO  - implement
-            print("need back")
+            // z = fmod(a, b) ≈ a - b*trunc(a/b). Treat trunc grad as 0 almost everywhere.
+            // -> dz/da ≈ 1, dz/db ≈ 0 (stable choice for DSP wrapping)
+            guard node.inputs.count == 2 else { fatalError("mod requires 2 inputs") }
+            ctx.gradients[node.inputs[0]] = gradOutput
+            ctx.gradients[node.inputs[1]] = ctx.useConstant(src: nil, value: 0.0)
+        case .param(let cellId):
+            // Accumulate gradient for this parameter into gradient memory
+            let b = IRBuilder(ctx: ctx, nodeId: nodeId)
+            _ = b.storeGrad(cellId, b.value(gradOutput))
         case .min:
             // d(min(x,y))/dx = (x <= y) ? 1 : 0, d(min(x,y))/dy = (y < x) ? 1 : 0
             guard inputs.count == 2 else { fatalError("min requires 2 inputs") }
-            let x = b.value(inputs[0])
-            let y = b.value(inputs[1])
-            let xIsMin = b.value(inputs[0]) <= b.value(inputs[1])
-            let yIsMin = b.value(inputs[1]) < b.value(inputs[0])
+            let x = b.tapeValue(node.inputs[0])
+            let y = b.tapeValue(node.inputs[1])
+            let xIsMin = x <= y
+            let yIsMin = y < x
             let gradX = b.gswitch(xIsMin, b.value(gradOutput), b.constant(0.0))
             let gradY = b.gswitch(yIsMin, b.value(gradOutput), b.constant(0.0))
             ctx.gradients[node.inputs[0]] = gradX.lazy
@@ -601,10 +581,10 @@ public enum LazyOp {
         case .max:
             // d(max(x,y))/dx = (x >= y) ? 1 : 0, d(max(x,y))/dy = (y > x) ? 1 : 0
             guard inputs.count == 2 else { fatalError("max requires 2 inputs") }
-            let x = b.value(inputs[0])
-            let y = b.value(inputs[1])
-            let xIsMax = b.value(inputs[0]) >= b.value(inputs[1])
-            let yIsMax = b.value(inputs[1]) > b.value(inputs[0])
+            let x = b.tapeValue(node.inputs[0])
+            let y = b.tapeValue(node.inputs[1])
+            let xIsMax = x >= y
+            let yIsMax = y > x
             let gradX = b.gswitch(xIsMax, b.value(gradOutput), b.constant(0.0))
             let gradY = b.gswitch(yIsMax, b.value(gradOutput), b.constant(0.0))
             ctx.gradients[node.inputs[0]] = gradX.lazy
@@ -614,18 +594,21 @@ public enum LazyOp {
         case .mul:
             // d(x*y)/dx = y, d(x*y)/dy = x
             guard inputs.count == 2 else { fatalError("mul \(node.id) requires 2 inputs") }
-            let gradX = b.value(gradOutput) * b.value(inputs[1])
-            let gradY = b.value(gradOutput) * b.value(inputs[0])
+            let rhs = b.tapeValue(node.inputs[1])
+            let lhs = b.tapeValue(node.inputs[0])
+            let gradX = b.value(gradOutput) * rhs
+            let gradY = b.value(gradOutput) * lhs
             ctx.gradients[node.inputs[0]] = gradX.lazy
             ctx.gradients[node.inputs[1]] = gradY.lazy
             deps.append(node.inputs[0])
             deps.append(node.inputs[1])
         case .div:
-            // TODO - this is copied from div but needs to be implemented correctly
-            // d(x*y)/dx = y, d(x*y)/dy = x
+            // z = x / y  =>  dz/dx = 1/y, dz/dy = -x / y^2
             guard inputs.count == 2 else { fatalError("div \(node.id) requires 2 inputs") }
-            let gradX = b.value(gradOutput) * b.value(inputs[1])
-            let gradY = b.value(gradOutput) * b.value(inputs[0])
+            let x = b.tapeValue(node.inputs[0])
+            let y = b.tapeValue(node.inputs[1])
+            let gradX = b.value(gradOutput) / y
+            let gradY = (b.constant(0.0) - b.value(gradOutput)) * (x / (y * y))
             ctx.gradients[node.inputs[0]] = gradX.lazy
             ctx.gradients[node.inputs[1]] = gradY.lazy
             deps.append(node.inputs[0])
@@ -633,7 +616,7 @@ public enum LazyOp {
         case .abs:
             // d(abs(x))/dx = sign(x), but zero at x=0
             guard inputs.count == 1 else { fatalError("abs requires 1 input") }
-            let input = b.value(inputs[0])
+            let input = b.tapeValue(node.inputs[0])
             let grad = b.value(gradOutput) * b.sign(input)
             ctx.gradients[node.inputs[0]] = grad.lazy
             deps.append(node.inputs[0])
@@ -645,59 +628,68 @@ public enum LazyOp {
         case .sin:
             // d(sin(x))/dx = cos(x)
             guard inputs.count == 1 else { fatalError("sin requires 1 input") }
-            let input = b.value(inputs[0])
+            let input = b.tapeValue(node.inputs[0])
             let grad = b.value(gradOutput) * b.cos(input)
             ctx.gradients[node.inputs[0]] = grad.lazy
             deps.append(node.inputs[0])
         case .cos:
             // d(cos(x))/dx = -sin(x)
             guard inputs.count == 1 else { fatalError("cos requires 1 input") }
-            let input = b.value(inputs[0])
+            let input = b.tapeValue(node.inputs[0])
             let grad = b.value(gradOutput) * (b.constant(0.0) - b.sin(input))
             ctx.gradients[node.inputs[0]] = grad.lazy
             deps.append(node.inputs[0])
         case .tan:
             // d(tan(x))/dx = sec²(x) = 1/cos²(x)
             guard inputs.count == 1 else { fatalError("tan requires 1 input") }
-            let input = b.value(inputs[0])
+            let input = b.tapeValue(node.inputs[0])
             let cosInput = b.cos(input)
             let sec2 = b.constant(1.0) / (cosInput * cosInput)
             let grad = b.value(gradOutput) * sec2
             ctx.gradients[node.inputs[0]] = grad.lazy
             deps.append(node.inputs[0])
         case .tanh:
-            // TODO - implement
-            //
-            break
+            // d(tanh(x))/dx = 1 - tanh(x)^2
+            guard inputs.count == 1 else { fatalError("tanh requires 1 input") }
+            let input = b.tapeValue(node.inputs[0])
+            let t = b.tanh(input)
+            let grad = b.value(gradOutput) * (b.constant(1.0) - t * t)
+            ctx.gradients[node.inputs[0]] = grad.lazy
+            deps.append(node.inputs[0])
         case .exp:
             // d(exp(x))/dx = exp(x)
             guard inputs.count == 1 else { fatalError("exp requires 1 input") }
-            let input = b.value(inputs[0])
+            let input = b.tapeValue(node.inputs[0])
             let grad = b.value(gradOutput) * b.exp(input)
             ctx.gradients[node.inputs[0]] = grad.lazy
             deps.append(node.inputs[0])
         case .log:
             // d(log(x))/dx = 1/x
             guard inputs.count == 1 else { fatalError("log requires 1 input") }
-            let input = b.value(inputs[0])
+            let input = b.tapeValue(node.inputs[0])
             let grad = b.value(gradOutput) / input
             ctx.gradients[node.inputs[0]] = grad.lazy
             deps.append(node.inputs[0])
         case .log10:
-            // TODO: implement diff
-            break
+            // d(log10(x))/dx = 1 / (x * ln(10))
+            guard inputs.count == 1 else { fatalError("log10 requires 1 input") }
+            let input = b.tapeValue(node.inputs[0])
+            let ln10 = b.constant(2.302585092994046)  // natural log of 10
+            let grad = b.value(gradOutput) / (input * ln10)
+            ctx.gradients[node.inputs[0]] = grad.lazy
+            deps.append(node.inputs[0])
         case .sqrt:
             // d(sqrt(x))/dx = 1/(2*sqrt(x))
             guard inputs.count == 1 else { fatalError("sqrt requires 1 input") }
-            let input = b.value(inputs[0])
+            let input = b.tapeValue(node.inputs[0])
             let grad = b.value(gradOutput) / (b.constant(2.0) * b.sqrt(input))
             ctx.gradients[node.inputs[0]] = grad.lazy
             deps.append(node.inputs[0])
         case .pow:
             // d(x^y)/dx = y * x^(y-1), d(x^y)/dy = x^y * ln(x)
             guard inputs.count == 2 else { fatalError("pow requires 2 inputs") }
-            let base = b.value(inputs[0])
-            let exponent = b.value(inputs[1])
+            let base = b.tapeValue(node.inputs[0])
+            let exponent = b.tapeValue(node.inputs[1])
             let result = b.pow(base, exponent)
 
             // Gradient w.r.t. base: y * x^(y-1)
@@ -712,13 +704,26 @@ public enum LazyOp {
         case .atan2:
             // d(atan2(y,x))/dy = x/(x²+y²), d(atan2(y,x))/dx = -y/(x²+y²)
             guard inputs.count == 2 else { fatalError("atan2 requires 2 inputs") }
-            let y = b.value(inputs[0])
-            let x = b.value(inputs[1])
+            let y = b.tapeValue(node.inputs[0])
+            let x = b.tapeValue(node.inputs[1])
             let denom = x * x + y * y
             let gradY = b.value(gradOutput) * (x / denom)
             let gradX = b.value(gradOutput) * (b.constant(0.0) - y / denom)
             ctx.gradients[node.inputs[0]] = gradY.lazy
             ctx.gradients[node.inputs[1]] = gradX.lazy
+            deps.append(node.inputs[0])
+            deps.append(node.inputs[1])
+        case .mse:
+            // loss = (a - b)^2; grads: d/da = 2*(a-b)*go, d/db = -2*(a-b)*go
+            guard inputs.count == 2 else { fatalError("mse requires 2 inputs") }
+            let a = b.tapeValue(node.inputs[0])
+            let c = b.tapeValue(node.inputs[1])
+            let diff = a - c
+            let two = b.constant(2.0)
+            let gradA = b.value(gradOutput) * two * diff
+            let gradB = b.value(gradOutput) * (b.constant(0.0) - two * diff)
+            ctx.gradients[node.inputs[0]] = gradA.lazy
+            ctx.gradients[node.inputs[1]] = gradB.lazy
             deps.append(node.inputs[0])
             deps.append(node.inputs[1])
         case .floor:
@@ -767,7 +772,7 @@ public enum LazyOp {
         case .gswitch:
             // gswitch(cond, x, y) = cond ? x : y
             guard inputs.count == 3 else { fatalError("gswitch requires 3 inputs") }
-            let cond = b.value(inputs[0])
+            let cond = b.tapeValue(node.inputs[0])
             let gradX = b.gswitch(cond, b.value(gradOutput), b.constant(0.0))
             let gradY = b.gswitch(cond, b.constant(0.0), b.value(gradOutput))
             ctx.gradients[node.inputs[0]] = ctx.useConstant(src: nil, value: 0.0)
@@ -783,10 +788,10 @@ public enum LazyOp {
             ctx.gradients[node.inputs[0]] = ctx.useConstant(src: nil, value: 0.0)
 
             // For each option, gradient is non-zero only if it was selected
-            let mode = b.value(inputs[0])
+            let mode = b.tapeValue(node.inputs[0])
             for i in 1..<node.inputs.count {
                 let optionIndex = b.constant(Float(i - 1))
-                let isSelected = b.value(inputs[0]) == optionIndex
+                let isSelected = mode == optionIndex
                 let gradOption = b.gswitch(isSelected, b.value(gradOutput), b.constant(0.0))
                 ctx.gradients[node.inputs[i]] = gradOption.lazy
                 deps.append(node.inputs[i])
@@ -795,9 +800,9 @@ public enum LazyOp {
         case .mix:
             // mix(x, y, t) = x * (1-t) + y * t
             guard inputs.count == 3 else { fatalError("mix requires 3 inputs") }
-            let x = b.value(inputs[0])
-            let y = b.value(inputs[1])
-            let t = b.value(inputs[2])
+            let x = b.tapeValue(node.inputs[0])
+            let y = b.tapeValue(node.inputs[1])
+            let t = b.tapeValue(node.inputs[2])
 
             // d/dx = (1-t)
             let gradX = b.value(gradOutput) * (b.constant(1.0) - t)
@@ -814,7 +819,17 @@ public enum LazyOp {
             deps.append(node.inputs[1])
             deps.append(node.inputs[2])
         case .historyReadWrite(let cellId):
-            print("Yo")
+            // Combined history read/write (not in feedback loop):
+            // Forward returns prev and persists curr. Backward must:
+            //   1) send gradOutput to previous timestep via storeGrad(cellId, gradOutput)
+            //   2) pass grad to input as gradOutput + gradFromFuture (like historyWrite)
+            guard inputs.count == 1 else { fatalError("historyReadWrite requires 1 input") }
+            // Gradient arriving from future reads
+            let gradFromFuture = b.loadGrad(cellId)
+            let totalGrad = b.value(gradOutput) + gradFromFuture
+            ctx.gradients[node.inputs[0]] = totalGrad.lazy
+            // Store gradient for the previous timestep
+            _ = b.storeGrad(cellId, b.value(gradOutput))
         case .historyWrite(let cellId):
             // Pass gradient through to input, plus any gradient from future reads
             guard inputs.count == 1 else { fatalError("history write requires 1 input") }
@@ -832,7 +847,7 @@ public enum LazyOp {
         case .latch(_):
             // Gradient flows through value input only when condition was true
             guard inputs.count == 2 else { fatalError("latch requires 2 inputs") }
-            let cond = b.value(inputs[1])
+            let cond = b.tapeValue(node.inputs[1])
             let gradValue = b.gswitch(cond > b.constant(0), b.value(gradOutput), b.constant(0.0))
             ctx.gradients[node.inputs[0]] = gradValue.lazy
             ctx.gradients[node.inputs[1]] = ctx.useConstant(src: nil, value: 0.0)
@@ -841,7 +856,7 @@ public enum LazyOp {
 
         case .accum(let cellId):
             let b = IRBuilder(ctx: ctx, nodeId: nodeId)
-            let reset = b.value(inputs[1])
+            let reset = b.tapeValue(node.inputs[1])
 
             // Gradient for increment (blocked by reset)
             let gradIncr = b.gswitch(reset > b.constant(0), b.constant(0.0), b.value(gradOutput))

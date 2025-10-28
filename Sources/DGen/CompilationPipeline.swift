@@ -36,6 +36,7 @@ public struct CompilationResult {
     public let totalMemorySlots: Int
 
     public let cellAllocations: CellAllocations
+    public let voiceCellId: Int?
 }
 
 /// Backend type for compilation
@@ -53,17 +54,23 @@ public struct CompilationPipeline {
         public let debug: Bool
         public let printBlockStructure: Bool
         public let forceScalar: Bool
+        public let voiceCount: Int
+        public let voiceCellId: Int?
 
         public init(
             frameCount: Int = 128,
             debug: Bool = false,
             printBlockStructure: Bool = false,
-            forceScalar: Bool = false
+            forceScalar: Bool = false,
+            voiceCount: Int = 1,
+            voiceCellId: Int? = nil
         ) {
             self.frameCount = frameCount
             self.debug = debug
             self.printBlockStructure = printBlockStructure
             self.forceScalar = forceScalar
+            self.voiceCount = voiceCount
+            self.voiceCellId = voiceCellId
         }
     }
 
@@ -71,7 +78,8 @@ public struct CompilationPipeline {
     public static func compile(
         graph: Graph,
         backend: Backend,
-        options: Options = Options()
+        options: Options = Options(),
+        name: String = "kernel"
     ) throws -> CompilationResult {
         // Step 1: Topological sort that respects scalar corridors
         let feedbackClusters = findFeedbackLoops(graph)
@@ -97,9 +105,6 @@ public struct CompilationPipeline {
                     for inputId in node.inputs {
                         finalScalarSet.insert(inputId)
                     }
-                    print(
-                        "🔗 Seq node \(node.id) has scalar input, marking all inputs as scalar: \(node.inputs)"
-                    )
                 }
             }
         }
@@ -113,18 +118,17 @@ public struct CompilationPipeline {
         )
 
         // Since we're using corridor-aware topological sort, blocks are already properly ordered
-        // and nodes within blocks are already in correct topological order
-        let finalBlocks = blocks
+        // Fuse adjacent blocks of the same kind to reduce cross-block communication
+        let fusedBlocks = fuseBlocks(blocks)
+        let finalBlocks = fusedBlocks
         let finalBlockIndices = Array(0..<finalBlocks.count)
 
         // Step 5: Convert blocks to UOp blocks
         let context = IRContext()
         var uopBlocks = [BlockUOps]()
 
+        print("\(ANSI.red)DEBUG=\(options.debug)\(String(repeating: "*", count: 32))\(ANSI.reset)")
         for blockIdx in finalBlockIndices {
-            if options.debug {
-                print("block \(blockIdx)")
-            }
             let block = finalBlocks[blockIdx]
             let ops = try emitBlockUOps(
                 ctx: context,
@@ -136,18 +140,35 @@ public struct CompilationPipeline {
             uopBlocks.append(BlockUOps(ops: ops, kind: block.kind))
         }
 
+        // Remove empty UOp blocks prior to vector memory remap and lowering
+        uopBlocks.removeAll { $0.ops.isEmpty }
+
+        // Step 7: Lower UOp blocks to compiled kernels
+        // Ensure a dedicated voice cell exists when voiceCount > 1
+        var voiceCellIdFinal: Int? = options.voiceCellId
+        print("VOICE CELL ID option=\(options.voiceCellId)")
+        if options.voiceCount > 1 && voiceCellIdFinal == nil {
+            voiceCellIdFinal = graph.alloc()  // Reserve a cell for voice index
+        }
+
+        print("\(ANSI.red)VOICE CELLID FINAL=\(voiceCellIdFinal)\(ANSI.reset)")
+
         // Step 6: Fix memory slot conflicts for vector operations
         let cellAllocations = remapVectorMemorySlots(&uopBlocks)
 
-        // Step 7: Lower UOp blocks to compiled kernels
-        let renderer: Renderer = createRenderer(for: backend)
-        let kernels = lowerUOpBlocks(
+        let renderer: Renderer = createRenderer(for: backend, options: options)
+        if let cr = renderer as? CRenderer {
+            cr.voiceCount = options.voiceCount
+            cr.voiceCellIdOpt = voiceCellIdFinal
+        }
+        let kernels = try lowerUOpBlocks(
             &uopBlocks,
             renderer: renderer,
             ctx: context,
             frameCount: options.frameCount,
             graph: graph,
-            totalMemorySlots: cellAllocations.totalMemorySlots
+            totalMemorySlots: cellAllocations.totalMemorySlots,
+            name: name
         )
 
         // Use the scalar node set we calculated earlier
@@ -164,15 +185,19 @@ public struct CompilationPipeline {
             kernels: kernels,
             backend: backend,
             totalMemorySlots: cellAllocations.totalMemorySlots,
-            cellAllocations: cellAllocations
+            cellAllocations: cellAllocations,
+            voiceCellId: voiceCellIdFinal
         )
     }
 
     /// Create a renderer for the specified backend
-    private static func createRenderer(for backend: Backend) -> Renderer {
+    private static func createRenderer(for backend: Backend, options: Options) -> Renderer {
         switch backend {
         case .c:
-            return CRenderer()
+            let r = CRenderer()
+            r.voiceCount = options.voiceCount
+            r.voiceCellIdOpt = options.voiceCellId
+            return r
         case .metal:
             return MetalRenderer()
         }
@@ -261,21 +286,20 @@ func remapVectorMemorySlots(_ uopBlocks: inout [BlockUOps]) -> CellAllocations {
                     memoryUsage[cellId] = block.kind
                 } else if memoryUsage[cellId] != block.kind {
                     // Cell used in both scalar and vector - this is a problem
-                    print("⚠️  Memory cell \(cellId) used in both scalar and vector modes")
                 }
             case let .store(cellId, _):
                 allCellIds.insert(cellId)
                 if memoryUsage[cellId] == nil {
                     memoryUsage[cellId] = block.kind
                 } else if memoryUsage[cellId] != block.kind {
-                    print("⚠️  Memory cell \(cellId) used in both scalar and vector modes")
                 }
             case let .delay1(cellId, _):
+                // delay1 also consumes and persists state in memory
                 allCellIds.insert(cellId)
                 if memoryUsage[cellId] == nil {
                     memoryUsage[cellId] = block.kind
                 } else if memoryUsage[cellId] != block.kind {
-                    print("⚠️  Memory cell \(cellId) used in both scalar and vector modes")
+                    // Mixed use not supported yet; keep original behavior (no forced upgrade)
                 }
             default:
                 break
@@ -288,17 +312,12 @@ func remapVectorMemorySlots(_ uopBlocks: inout [BlockUOps]) -> CellAllocations {
     var nextAvailableSlot = (allCellIds.max() ?? -1) + 1
 
     // Reserve space for vector operations (each vector cell needs 4 slots)
-    // Deterministic remapping order: sort by original cellId so C and Metal builds match
-    for cellId in Array(memoryUsage.keys).sorted() {
-        let kind = memoryUsage[cellId]!
+    for (cellId, kind) in memoryUsage {
         if kind == .simd {
             // Find a safe starting position (aligned to 4 and not conflicting)
-            let alignedSlot = ((nextAvailableSlot + 3) / 4) * 4  // Align to 4-slot boundary
+            let alignedSlot = ((nextAvailableSlot + 3) / 4) * 4  // Align to 4-byte boundary
             cellRemapping[cellId] = alignedSlot
             nextAvailableSlot = alignedSlot + 4
-            print(
-                "🔧 Remapping vector cell \(cellId) -> \(alignedSlot) (uses slots \(alignedSlot)-\(alignedSlot+3))"
-            )
         } else {
             // Scalar operations keep their original slots
             cellRemapping[cellId] = cellId
@@ -327,10 +346,10 @@ func remapVectorMemorySlots(_ uopBlocks: inout [BlockUOps]) -> CellAllocations {
                         kind: uop.kind
                     )
                 }
-            case let .delay1(cellId, val):
+            case let .delay1(cellId, a):
                 if let newCellId = cellRemapping[cellId] {
                     uopBlocks[blockIndex].ops[uopIndex] = UOp(
-                        op: .delay1(newCellId, val),
+                        op: .delay1(newCellId, a),
                         value: uop.value,
                         kind: uop.kind
                     )
@@ -340,8 +359,6 @@ func remapVectorMemorySlots(_ uopBlocks: inout [BlockUOps]) -> CellAllocations {
             }
         }
     }
-
-    print("✅ Memory remapping complete. Total memory slots needed: \(nextAvailableSlot)")
 
     let cellAllocations = CellAllocations(
         totalMemorySlots: nextAvailableSlot, cellMappings: cellRemapping, cellKinds: memoryUsage)
@@ -398,10 +415,6 @@ func combineHistoryOpsNotInFeedback(
             {
                 // Replace the historyRead node with historyReadWrite using the write's inputs
                 if let readNode = graph.nodes[readNodeId] {
-                    print(
-                        "🔄 Combining history pair for cell \(cellId): read node \(readNodeId) + write node \(writeInfo.nodeId) -> historyReadWrite at node \(readNodeId)"
-                    )
-
                     // Create new node with historyReadWrite operation at the read node's ID
                     let newNode = Node(
                         id: readNodeId,

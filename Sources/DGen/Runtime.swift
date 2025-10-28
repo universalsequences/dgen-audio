@@ -26,115 +26,9 @@ public protocol CompiledKernelRuntime {
     func allocateNodeMemory() -> UnsafeMutableRawPointer?
     func deallocateNodeMemory(_ memory: UnsafeMutableRawPointer)
     func runWithMemory(
-        outputs: UnsafeMutablePointer<Float>, inputs: UnsafePointer<Float>, 
+        outputs: UnsafeMutablePointer<Float>, inputs: UnsafePointer<Float>,
         memory: UnsafeMutableRawPointer, frameCount: Int
     )
-}
-
-// MARK: - Offline rendering to WAV (shared helper)
-
-extension CompiledKernelRuntime {
-    // Render 'seconds' of audio to a mono 32-bit float WAV file using 128-frame blocks
-    public func writeWAV(to url: URL, seconds: Double, sampleRate: Double, volumeScale: Float = 1.0) throws {
-        let totalFrames = Int(seconds * sampleRate)
-        let block = MIN_FRAME_COUNT
-        var pcm = [Float](repeating: 0, count: totalFrames)
-        var zeroIn = [Float](repeating: 0, count: block)
-
-        var rendered = 0
-        var blockIndex = 0
-        while rendered < totalFrames {
-            let n = min(block, totalFrames - rendered)
-            pcm.withUnsafeMutableBufferPointer { outPtr in
-                zeroIn.withUnsafeBufferPointer { inPtr in
-                    self.run(
-                        outputs: outPtr.baseAddress!.advanced(by: rendered),
-                        inputs: inPtr.baseAddress!,
-                        frameCount: n,
-                        volumeScale: volumeScale
-                    )
-                }
-            }
-            // Debug: dump memory after each run call to verify accumulation
-            if blockIndex < 5 {
-            if let c = self as? CCompiledKernel {
-                c.debugPrintMemory(tag: "block_\(blockIndex)")
-            } else if let m = self as? MetalCompiledKernel {
-                m.debugPrintMemory(tag: "block_\(blockIndex)")
-            }
-            }
-            rendered += n
-            blockIndex += 1
-        }
-
-        // Write 32-bit float WAV (mono)
-        let bytesPerSample = 4
-        let numChannels = 1
-        let byteRate = Int(sampleRate) * numChannels * bytesPerSample
-        let blockAlign = numChannels * bytesPerSample
-        let dataBytes = totalFrames * numChannels * bytesPerSample
-        let riffSize = 36 + dataBytes
-
-        var data = Data()
-        func append(_ s: String) { data.append(s.data(using: .ascii)!) }
-        func appendUInt32(_ v: UInt32) {
-            var le = v.littleEndian
-            withUnsafeBytes(of: &le) { data.append(contentsOf: $0) }
-        }
-        func appendUInt16(_ v: UInt16) {
-            var le = v.littleEndian
-            withUnsafeBytes(of: &le) { data.append(contentsOf: $0) }
-        }
-
-        append("RIFF")
-        appendUInt32(UInt32(riffSize))
-        append("WAVE")
-        append("fmt ")
-        appendUInt32(16)                     // PCM fmt chunk size
-        appendUInt16(3)                      // AudioFormat 3 = IEEE float
-        appendUInt16(UInt16(numChannels))
-        appendUInt32(UInt32(sampleRate))
-        appendUInt32(UInt32(byteRate))
-        appendUInt16(UInt16(blockAlign))
-        appendUInt16(32)                     // bits per sample
-        append("data")
-        appendUInt32(UInt32(dataBytes))
-
-        // Samples
-        pcm.withUnsafeBytes { raw in
-            data.append(contentsOf: raw.bindMemory(to: UInt8.self))
-        }
-
-        try data.write(to: url, options: .atomic)
-    }
-}
-
-// MARK: - Debug helpers to inspect runtime memory after each block
-
-extension CCompiledKernel {
-    func debugPrintMemory(tag: String = "") {
-        guard let mem = nodeMemory else { print("[C] 🧠 no nodeMemory"); return }
-        let p = mem.assumingMemoryBound(to: Float.self)
-        let total = max(0, cellAllocations.totalMemorySlots)
-        let limit = min(total, 32)
-        var parts: [String] = []
-        parts.reserveCapacity(limit)
-        for i in 0..<limit { parts.append(String(format: "%.6f", p[i])) }
-        print("[C] 🧠 memory after \(tag): [\(parts.joined(separator: ", "))]")
-    }
-}
-
-extension MetalCompiledKernel {
-    func debugPrintMemory(tag: String = "") {
-        guard let buf = bufferPool["memory"] else { print("[Metal] 🧠 no memory buffer"); return }
-        let total = max(kernels.first?.memorySize ?? 0, cellAllocations.totalMemorySlots)
-        let limit = min(total, 32)
-        let ptr = buf.contents().assumingMemoryBound(to: Float.self)
-        var parts: [String] = []
-        parts.reserveCapacity(limit)
-        for i in 0..<limit { parts.append(String(format: "%.6f", ptr[i])) }
-        print("[Metal] 🧠 memory after \(tag): [\(parts.joined(separator: ", "))]")
-    }
 }
 
 public class CCompiledKernel: CompiledKernelRuntime {
@@ -145,12 +39,19 @@ public class CCompiledKernel: CompiledKernelRuntime {
     var outputBuffer: [Float] = []
     var scratchBuffer: [Float] = []
     var inputAccumulator: [Float] = []
-    public var ringRenderer: AudioRingRenderer?
 
     public let cellAllocations: CellAllocations
     private let memorySize: Int
     private var dylibHandle: UnsafeMutableRawPointer? = nil
-    private var nodeMemory: UnsafeMutableRawPointer? = nil
+    private var dylibFileURL: URL? = nil
+    private var duplicateHandles: [UnsafeMutableRawPointer] = []
+    private var duplicateProcessFns:
+        [(
+            @convention(c) (
+                UnsafePointer<UnsafeMutablePointer<Float>?>?,
+                UnsafePointer<UnsafeMutablePointer<Float>?>?, Int32, UnsafeMutableRawPointer?
+            ) -> Void
+        )] = []
     // Match audiograph's actual KernelFn signature (based on Swift binding)
     private var processFn:
         (
@@ -161,6 +62,8 @@ public class CCompiledKernel: CompiledKernelRuntime {
         )?
 
     private var setParamValueFn: (@convention(c) (Int32, Float) -> Void)?
+
+    public var voiceCellId: Int? = nil
 
     public init(source: String, cellAllocations: CellAllocations, memorySize: Int = 1024) {
         self.source = source
@@ -180,10 +83,26 @@ public class CCompiledKernel: CompiledKernelRuntime {
         let compile = Process()
         compile.launchPath = "/usr/bin/clang"
         let arguments = [
-            "-O3", "-march=armv8-a", "-fPIC", "-shared",
+            // Optimization and CPU tuning
+            "-Ofast",
+            "-mcpu=native",
+            "-flto=thin",
+            // Floating point fast math (ok for DSP if acceptable)
+            "-ffast-math",
+            "-fno-math-errno",
+            "-fno-trapping-math",
+            "-ffp-contract=fast",
+            // Vectorizer hints (mostly enabled by -Ofast, but explicit here)
+            "-fvectorize",
+            "-fslp-vectorize",
+            "-funroll-loops",
+            // Dylib and platform flags
+            "-fPIC", "-shared",
             "-framework", "Accelerate",
-            "-std=c11",  // Ensure C11 standard, not C++
-            "-x", "c",  // Explicitly treat as C source, not C++
+            // Language & input
+            "-std=c11",  // Ensure C11 standard
+            "-x", "c",  // Explicitly treat as C source
+            // Output
             "-o", dylibFile.path, cFile.path,
         ]
 
@@ -217,6 +136,7 @@ public class CCompiledKernel: CompiledKernelRuntime {
         }
 
         dylibHandle = dlopen(dylibFile.path, RTLD_NOW)
+        dylibFileURL = dylibFile
         guard let handle = dylibHandle else {
             let error = String(cString: dlerror())
             print("❌ DYLIB LOADING FAILED: \(error)")
@@ -224,25 +144,10 @@ public class CCompiledKernel: CompiledKernelRuntime {
                 domain: "DLError", code: 2,
                 userInfo: [NSLocalizedDescriptionKey: "Failed to load .dylib: \(error)"])
         }
-        print("🔍 Looking for symbols in dylib...")
-        print("🔍 Available symbols:")
         // List some symbols to debug what's actually in the dylib
         let processSymAddr = dlsym(handle, symbolName)
         let constantKernelSymAddr = dlsym(handle, "constant_kernel")
         let setParamSymAddr = dlsym(handle, setParamValueSymbolName)
-        print("🔍   process symbol: \(processSymAddr == nil ? "NOT FOUND" : "\(processSymAddr!)")")
-        print(
-            "🔍   constant_kernel symbol: \(constantKernelSymAddr == nil ? "NOT FOUND" : "\(constantKernelSymAddr!)")"
-        )
-        print(
-            "🔍   setParamValue symbol: \(setParamSymAddr == nil ? "NOT FOUND" : "\(setParamSymAddr!)")"
-        )
-
-        // PRODUCTION: Use the real DGen-generated process function
-        print("✅ Using real DGen-generated process function")
-
-        // CRITICAL: Log the raw symbol address before casting
-        print("🔍 RAW SYMBOL ADDRESS: \(processSymAddr!)")
 
         processFn = unsafeBitCast(
             processSymAddr!,
@@ -254,9 +159,6 @@ public class CCompiledKernel: CompiledKernelRuntime {
 
         // CRITICAL: Log the function pointer after casting
         let functionPointer = unsafeBitCast(processFn!, to: UnsafeRawPointer.self)
-        print("🔍 FUNCTION POINTER AFTER CAST: \(functionPointer)")
-
-        print("✅ Real DGen process function loaded successfully")
 
         guard let paramSym = dlsym(handle, setParamValueSymbolName) else {
             let error = String(cString: dlerror())
@@ -274,46 +176,13 @@ public class CCompiledKernel: CompiledKernelRuntime {
             paramSym,
             to: (@convention(c) (Int32, Float) -> Void)
                 .self)
-
-        // Allocate persistent node memory once here based on effective size
-        if nodeMemory == nil {
-            let slots = max(self.memorySize, self.cellAllocations.totalMemorySlots)
-            let byteSize = max(1, slots) * MemoryLayout<Float>.size
-            nodeMemory = malloc(byteSize)
-            if let mem = nodeMemory { memset(mem, 0, byteSize) }
-            print("🧠 Allocated C node memory: \(slots) floats")
-        }
     }
 
     public func run(
         outputs: UnsafeMutablePointer<Float>, inputs: UnsafePointer<Float>, frameCount: Int,
         volumeScale: Float = 1.0
     ) {
-        if processFn == nil {
-            // Attempt to compile and load on-demand (allocates node memory once)
-            do { try compileAndLoad() } catch {
-                print("❌ Failed to compile/load kernel on-demand: \(error)")
-                return
-            }
-        }
-        guard let process = processFn else {
-            print("⚠️ Process function not loaded")
-            return
-        }
-        guard let statePtr = nodeMemory else {
-            print("⚠️ No node memory allocated")
-            return
-        }
-
-        // Create channel arrays (mono) for C signature
-        let outputChannels: [UnsafeMutablePointer<Float>?] = [outputs]
-        let inputChannels: [UnsafeMutablePointer<Float>?] = [UnsafeMutablePointer(mutating: inputs)]
-
-        outputChannels.withUnsafeBufferPointer { outPtr in
-            inputChannels.withUnsafeBufferPointer { inPtr in
-                process(inPtr.baseAddress, outPtr.baseAddress, Int32(frameCount), statePtr)
-            }
-        }
+        fatalError("run() deprecated - use runWithMemory() instead for per-node memory management")
     }
 
     public func setParamValue(cellId: CellID, value: Float) {
@@ -331,31 +200,97 @@ public class CCompiledKernel: CompiledKernelRuntime {
         volumeScale: Float = 1.0,
         levelCallback: AudioLevelCallback? = nil
     ) throws -> AVAudioNode {
-        if processFn == nil { try compileAndLoad() }
+        fatalError(
+            "runAndPlay() is deprecated - use AudioGraphManager multi-graph processing instead")
 
-        // Shared ring renderer that always requests 128-frame blocks
-        let zero = [Float](repeating: 0, count: MIN_FRAME_COUNT)
-        let ring = AudioRingRenderer(channels: channels, levelCallback: levelCallback) {
-            out, frames in
-            zero.withUnsafeBufferPointer { inPtr in
-                self.run(
-                    outputs: out, inputs: inPtr.baseAddress!, frameCount: frames,
-                    volumeScale: volumeScale)
-            }
-            // Debug: print memory head every 100 blocks
-            if let mem = self.nodeMemory {
-                let p = mem.assumingMemoryBound(to: Float.self)
-                let head = (0..<min(8, self.cellAllocations.totalMemorySlots)).map { String(format: "%.6f", p[$0]) }.joined(separator: ", ")
-                print("🧠 C state head: [\(head)]")
-            }
+        guard processFn != nil else { fatalError("Kernel not compiled/loaded") }
+
+        //------------------------------------------------------------------
+        // 1 · Ask the OS for 128-frame I/O buffers (best-effort request)
+        //------------------------------------------------------------------
+
+        //------------------------------------------------------------------
+        // 2 · Prepare one 128-frame scratch buffer we’ll reuse every callback
+        //------------------------------------------------------------------
+        let blockSize = MIN_FRAME_COUNT
+        let silentInput = [Float](repeating: 0, count: blockSize)
+
+        var interleavedScratch: UnsafeMutablePointer<Float>? = nil
+        if channels > 1 {
+            interleavedScratch = UnsafeMutablePointer<Float>
+                .allocate(capacity: blockSize * channels)
         }
-        // Retain ring renderer for the lifetime of playback
-        self.ringRenderer = ring
-        let sourceNode = ring.makeSourceNode(sampleRate: sampleRate)
+
+        //------------------------------------------------------------------
+        // 3 · Render callback — handles ANY frameCount Core Audio gives us
+        //------------------------------------------------------------------
+        let format = AVAudioFormat(
+            standardFormatWithSampleRate: sampleRate,
+            channels: AVAudioChannelCount(channels))!
+
+        let sourceNode = AVAudioSourceNode(format: format) { _, _, frameCount, abl -> OSStatus in
+            let buffers = UnsafeMutableAudioBufferListPointer(abl)
+            let intFrameCount = Int(frameCount)
+
+            // Ensure scratch/output buffers exist
+            if self.scratchBuffer.count < blockSize * channels {
+                self.scratchBuffer = [Float](repeating: 0, count: blockSize * channels)
+            }
+            if self.outputBuffer.count < intFrameCount * channels {
+                self.outputBuffer.reserveCapacity(4096 * channels)
+            }
+
+            //------------------------------------------------------------------
+            // 1. Generate as many 256-frame blocks as needed to fill demand
+            //------------------------------------------------------------------
+            while self.outputBuffer.count < intFrameCount * channels {
+                self.scratchBuffer.withUnsafeMutableBufferPointer { scratch in
+                    silentInput.withUnsafeBufferPointer { zero in
+                        self.run(
+                            outputs: scratch.baseAddress!,
+                            inputs: zero.baseAddress!,
+                            frameCount: blockSize,
+                            volumeScale: volumeScale
+                        )
+                    }
+                }
+
+                self.outputBuffer.append(contentsOf: self.scratchBuffer[0..<blockSize * channels])
+            }
+
+            //------------------------------------------------------------------
+            // 2. Copy outputBuffer → Core Audio non-interleaved output
+            //------------------------------------------------------------------
+            for ch in 0..<channels {
+                let dst = buffers[ch].mData!.assumingMemoryBound(to: Float.self)
+                for frame in 0..<intFrameCount {
+                    dst[frame] = self.outputBuffer[frame * channels + ch]
+                }
+            }
+
+            //------------------------------------------------------------------
+            // 3. Remove used frames
+            //------------------------------------------------------------------
+            self.outputBuffer.removeFirst(intFrameCount * channels)
+
+            //------------------------------------------------------------------
+            // 4. Level callback
+            //------------------------------------------------------------------
+            if let cb = levelCallback {
+                let mono = buffers[0].mData!.assumingMemoryBound(to: Float.self)
+                cb(mono, intFrameCount)
+            }
+
+            return noErr
+        }
+
+        //------------------------------------------------------------------
+        // 4 · Spin the engine
+        //------------------------------------------------------------------
         engine.attach(sourceNode)
-        engine.connect(
-            sourceNode, to: engine.mainMixerNode, format: sourceNode.outputFormat(forBus: 0))
+        engine.connect(sourceNode, to: engine.mainMixerNode, format: format)
         try engine.start()
+
         return sourceNode
     }
 
@@ -374,11 +309,9 @@ public class CCompiledKernel: CompiledKernelRuntime {
             dylibHandle = nil
             processFn = nil
         }
-
-        if let mem = nodeMemory {
-            free(mem)
-            nodeMemory = nil
-        }
+        for h in duplicateHandles { dlclose(h) }
+        duplicateHandles.removeAll()
+        duplicateProcessFns.removeAll()
 
         // Clear ring buffers to prevent audio artifacts when loading new graphs
         outputBuffer.removeAll()
@@ -445,6 +378,103 @@ public class CCompiledKernel: CompiledKernelRuntime {
         return processFn
     }
 
+    /// Return per-voice process functions by duplicating the .dylib to unique paths and dlopen'ing
+    public func getProcessFunctions(count: Int) throws -> [(
+        @convention(c) (
+            UnsafePointer<UnsafeMutablePointer<Float>?>?,
+            UnsafePointer<UnsafeMutablePointer<Float>?>?, Int32, UnsafeMutableRawPointer?
+        ) -> Void
+    )] {
+        let t0 = CFAbsoluteTimeGetCurrent()
+        guard count > 0 else { return [] }
+        guard let primary = processFn else {
+            throw NSError(
+                domain: "DLError", code: 5,
+                userInfo: [NSLocalizedDescriptionKey: "Kernel not compiled/loaded"])
+        }
+        if count == 1 {
+            let elapsed = (CFAbsoluteTimeGetCurrent() - t0) * 1000.0
+            print(
+                "getProcessFunctions(count=1): total=\(String(format: "%.3f", elapsed))ms (no copies)"
+            )
+            return [primary]
+        }
+
+        // If we already have enough duplicates, just return cached array
+        if duplicateProcessFns.count >= count - 1 {
+            let elapsed = (CFAbsoluteTimeGetCurrent() - t0) * 1000.0
+            print(
+                "getProcessFunctions(count=\(count)): using cached copies, total=\(String(format: "%.3f", elapsed))ms"
+            )
+            return [primary] + Array(duplicateProcessFns.prefix(count - 1))
+        }
+
+        // Create additional copies
+        guard let baseURL = dylibFileURL else {
+            throw NSError(
+                domain: "DLError", code: 6,
+                userInfo: [NSLocalizedDescriptionKey: "No dylib path recorded"])
+        }
+        let fm = FileManager.default
+        let tmpDir = FileManager.default.temporaryDirectory
+        let baseName = baseURL.deletingPathExtension().lastPathComponent
+        let startIndex = duplicateProcessFns.count
+        let needed = (count - 1) - startIndex
+
+        var copyMs: Double = 0
+        var dlopenMs: Double = 0
+        var dlsymMs: Double = 0
+
+        for i in startIndex..<(count - 1) {
+            let copyURL = tmpDir.appendingPathComponent("\(baseName)_copy_\(i).dylib")
+
+            // Copy original dylib
+            let c0 = CFAbsoluteTimeGetCurrent()
+            if fm.fileExists(atPath: copyURL.path) {
+                try? fm.removeItem(at: copyURL)
+            }
+            try fm.copyItem(at: baseURL, to: copyURL)
+            copyMs += (CFAbsoluteTimeGetCurrent() - c0) * 1000.0
+
+            // Load
+            let l0 = CFAbsoluteTimeGetCurrent()
+            guard let handle = dlopen(copyURL.path, RTLD_NOW) else {
+                let err = String(cString: dlerror())
+                throw NSError(
+                    domain: "DLError", code: 7,
+                    userInfo: [NSLocalizedDescriptionKey: "dlopen failed: \(err)"])
+            }
+            dlopenMs += (CFAbsoluteTimeGetCurrent() - l0) * 1000.0
+
+            // Symbol
+            let s0 = CFAbsoluteTimeGetCurrent()
+            guard let sym = dlsym(handle, symbolName) else {
+                let err = String(cString: dlerror())
+                dlclose(handle)
+                throw NSError(
+                    domain: "DLError", code: 8,
+                    userInfo: [NSLocalizedDescriptionKey: "dlsym failed: \(err)"])
+            }
+            dlsymMs += (CFAbsoluteTimeGetCurrent() - s0) * 1000.0
+
+            let fn = unsafeBitCast(
+                sym,
+                to: (@convention(c) (
+                    UnsafePointer<UnsafeMutablePointer<Float>?>?,
+                    UnsafePointer<UnsafeMutablePointer<Float>?>?, Int32, UnsafeMutableRawPointer?
+                ) -> Void).self)
+            duplicateHandles.append(handle)
+            duplicateProcessFns.append(fn)
+        }
+
+        let totalMs = (CFAbsoluteTimeGetCurrent() - t0) * 1000.0
+        print(
+            "getProcessFunctions(count=\(count)): newCopies=\(needed), copy=\(String(format: "%.3f", copyMs))ms, dlopen=\(String(format: "%.3f", dlopenMs))ms, dlsym=\(String(format: "%.3f", dlsymMs))ms, total=\(String(format: "%.3f", totalMs))ms, dylib=\(baseURL.lastPathComponent)"
+        )
+
+        return [primary] + Array(duplicateProcessFns.prefix(count - 1))
+    }
+
     // Get the already-loaded function pointer as raw symbol for audiograph
     public func getRawSymbolPointer() -> UnsafeRawPointer? {
         guard let fn = processFn else {
@@ -468,7 +498,6 @@ public class MetalCompiledKernel: CompiledKernelRuntime {
     public let cellAllocations: CellAllocations
     private let device: MTLDevice
     private let library: MTLLibrary
-    public var ringRenderer: AudioRingRenderer?
     private let commandQueue: MTLCommandQueue
     private var bufferPool: [String: MTLBuffer] = [:]  // shared source of buffers used by all kernels
     private var functions: [MTLFunction] = []  // one per kernel
@@ -524,9 +553,8 @@ public class MetalCompiledKernel: CompiledKernelRuntime {
         // Use larger buffer size to handle varying frameCount from AVAudioEngine
         let maxFrameCount = 2048  // Handle up to 2048 frames per callback
         for bufferName in allBufferNames {
-            // Memory buffer uses effective size, others use maxFrameCount
-            let effectiveMem = max(kernels.first?.memorySize ?? 1024, cellAllocations.totalMemorySlots)
-            let elementCount = bufferName == "memory" ? effectiveMem : maxFrameCount
+            // Memory buffer needs extra space, others need maxFrameCount
+            let elementCount = bufferName == "memory" ? 512 : maxFrameCount
             let bufferSize = elementCount * MemoryLayout<Float>.size
             guard let buffer = device.makeBuffer(length: bufferSize, options: .storageModeShared)
             else {
@@ -544,7 +572,7 @@ public class MetalCompiledKernel: CompiledKernelRuntime {
             bufferPool[bufferName] = buffer
         }
 
-        // Create frameCount buffer for kernels
+        // Create frameCount buffer for scalar kernels
         guard
             let frameCountBuffer = device.makeBuffer(
                 length: MemoryLayout<Int32>.size, options: .storageModeShared)
@@ -654,7 +682,7 @@ public class MetalCompiledKernel: CompiledKernelRuntime {
         // First check for dedicated "outputs" buffer
         if let outputBuffer = bufferPool["outputs"] {
             let bufferContents = outputBuffer.contents().assumingMemoryBound(to: Float.self)
-            for i in 0..<frameCount {
+            for i in 0..<min(frameCount, MIN_FRAME_COUNT) {
                 outputs[i] = bufferContents[i] * volumeScale
             }
             return
@@ -668,7 +696,7 @@ public class MetalCompiledKernel: CompiledKernelRuntime {
                     if let buffer = bufferPool[bufferName] {
                         let bufferContents = buffer.contents().assumingMemoryBound(to: Float.self)
                         // Copy the relevant portion to outputs with volume scaling
-                        for i in 0..<frameCount {
+                        for i in 0..<min(frameCount, MIN_FRAME_COUNT) {
                             outputs[i] = bufferContents[i] * volumeScale
                         }
                         break  // Take first matching buffer as output
@@ -685,24 +713,91 @@ public class MetalCompiledKernel: CompiledKernelRuntime {
         volumeScale: Float = 1.0,
         levelCallback: AudioLevelCallback? = nil
     ) throws -> AVAudioNode {
-        // Ring-buffered audio callback using fixed-size 128-frame blocks
-        let zero = [Float](repeating: 0, count: MIN_FRAME_COUNT)
-        let ring = AudioRingRenderer(channels: channels, levelCallback: levelCallback) {
-            out, frames in
-            zero.withUnsafeBufferPointer { inPtr in
-                self.run(
-                    outputs: out, inputs: inPtr.baseAddress!, frameCount: frames,
-                    volumeScale: volumeScale)
-            }
+        //------------------------------------------------------------------
+        // 1 ‧ Audio engine / format
+        //------------------------------------------------------------------
+        let format = AVAudioFormat(
+            standardFormatWithSampleRate: sampleRate,
+            channels: AVAudioChannelCount(channels))!
+
+        //------------------------------------------------------------------
+        // 2 ‧ One reusable 128-sample scratch buffer
+        //------------------------------------------------------------------
+        let blockSize = 128  // what the Metal kernel expects
+        let silentInput = [Float](repeating: 0, count: blockSize)
+
+        var interleavedScratch: UnsafeMutablePointer<Float>? = nil
+        if channels > 1 {
+            interleavedScratch = UnsafeMutablePointer<Float>
+                .allocate(capacity: blockSize * channels)
         }
-        self.ringRenderer = ring
-        let sourceNode = ring.makeSourceNode(sampleRate: sampleRate)
-        print("attaching source node to engine")
+
+        //------------------------------------------------------------------
+        // 3 ‧ Source node — handles ANY host frameCount, feeds kernel in 128s
+        //------------------------------------------------------------------
+        let sourceNode = AVAudioSourceNode(format: format) { _, _, frameCount, abl -> OSStatus in
+            let buffers = UnsafeMutableAudioBufferListPointer(abl)
+
+            var done = 0
+            while done < Int(frameCount) {
+
+                let n = min(blockSize, Int(frameCount) - done)  // ≤ 128
+
+                // ----------------------------------------------------------
+                // MONO
+                // ----------------------------------------------------------
+                if channels == 1 {
+                    let dst = buffers[0].mData!
+                        .assumingMemoryBound(to: Float.self)
+                        .advanced(by: done)
+
+                    silentInput.withUnsafeBufferPointer { zero in
+                        self.run(
+                            outputs: dst,
+                            inputs: zero.baseAddress!,
+                            frameCount: n,
+                            volumeScale: volumeScale)
+                    }
+
+                    // Call level callback after volume scaling if provided
+                    levelCallback?(dst, n)
+
+                    // ----------------------------------------------------------
+                    // MULTICHANNEL (Metal kernel returns interleaved)
+                    // ----------------------------------------------------------
+                } else if let scratch = interleavedScratch {
+                    silentInput.withUnsafeBufferPointer { zero in
+                        self.run(
+                            outputs: scratch,
+                            inputs: zero.baseAddress!,
+                            frameCount: n,
+                            volumeScale: volumeScale)
+                    }
+
+                    // Call level callback with first channel after volume scaling if provided
+                    levelCallback?(scratch, n)
+
+                    // De-interleave into Core Audio’s non-interleaved buffers
+                    for ch in 0..<channels {
+                        let dst = buffers[ch].mData!
+                            .assumingMemoryBound(to: Float.self)
+                            .advanced(by: done)
+                        for i in 0..<n {
+                            dst[i] = scratch[i * channels + ch]
+                        }
+                    }
+                }
+
+                done += n
+            }
+            return noErr
+        }
+
+        //------------------------------------------------------------------
+        // 4 ‧ Spin the engine
+        //------------------------------------------------------------------
         engine.attach(sourceNode)
-        engine.connect(
-            sourceNode, to: engine.mainMixerNode, format: sourceNode.outputFormat(forBus: 0))
-        print("connecting to engine main mixer node... ()")
-        print("engine starting...")
+        engine.connect(sourceNode, to: engine.mainMixerNode, format: format)
         try engine.start()
         return sourceNode
 
@@ -838,5 +933,85 @@ public class MetalCompiledKernel: CompiledKernelRuntime {
 
     deinit {
         cleanup()
+    }
+}
+
+extension CompiledKernelRuntime {
+    // Render 'seconds' of audio to a mono 32-bit float WAV file using 128-frame blocks
+    public func writeWAV(to url: URL, seconds: Double, sampleRate: Double, volumeScale: Float = 1.0)
+        throws
+    {
+        let totalFrames = Int(seconds * sampleRate)
+        let block = MIN_FRAME_COUNT
+        var pcm = [Float](repeating: 0, count: totalFrames)
+        var zeroIn = [Float](repeating: 0, count: block)
+
+        // Allocate memory for the kernel
+        guard let memory = allocateNodeMemory() else {
+            throw NSError(
+                domain: "RuntimeError", code: 1,
+                userInfo: [NSLocalizedDescriptionKey: "Failed to allocate node memory"])
+        }
+        defer { deallocateNodeMemory(memory) }
+
+        print("Allocated node memory")
+
+        var rendered = 0
+        var blockIndex = 0
+        while rendered < totalFrames {
+            let n = min(block, totalFrames - rendered)
+            pcm.withUnsafeMutableBufferPointer { outPtr in
+                zeroIn.withUnsafeBufferPointer { inPtr in
+                    self.runWithMemory(
+                        outputs: outPtr.baseAddress!.advanced(by: rendered),
+                        inputs: inPtr.baseAddress!,
+                        memory: memory,
+                        frameCount: n
+                    )
+                }
+            }
+            rendered += n
+            blockIndex += 1
+        }
+
+        // Write 32-bit float WAV (mono)
+        let bytesPerSample = 4
+        let numChannels = 1
+        let byteRate = Int(sampleRate) * numChannels * bytesPerSample
+        let blockAlign = numChannels * bytesPerSample
+        let dataBytes = totalFrames * numChannels * bytesPerSample
+        let riffSize = 36 + dataBytes
+
+        var data = Data()
+        func append(_ s: String) { data.append(s.data(using: .ascii)!) }
+        func appendUInt32(_ v: UInt32) {
+            var le = v.littleEndian
+            withUnsafeBytes(of: &le) { data.append(contentsOf: $0) }
+        }
+        func appendUInt16(_ v: UInt16) {
+            var le = v.littleEndian
+            withUnsafeBytes(of: &le) { data.append(contentsOf: $0) }
+        }
+
+        append("RIFF")
+        appendUInt32(UInt32(riffSize))
+        append("WAVE")
+        append("fmt ")
+        appendUInt32(16)  // PCM fmt chunk size
+        appendUInt16(3)  // AudioFormat 3 = IEEE float
+        appendUInt16(UInt16(numChannels))
+        appendUInt32(UInt32(sampleRate))
+        appendUInt32(UInt32(byteRate))
+        appendUInt16(UInt16(blockAlign))
+        appendUInt16(32)  // bits per sample
+        append("data")
+        appendUInt32(UInt32(dataBytes))
+
+        // Samples
+        pcm.withUnsafeBytes { raw in
+            data.append(contentsOf: raw.bindMemory(to: UInt8.self))
+        }
+
+        try data.write(to: url, options: .atomic)
     }
 }

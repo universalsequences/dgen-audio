@@ -526,6 +526,9 @@ public func determineBlocksSimple(
         blocks.append(current)
     }
 
+    // Remove empty blocks (can arise from special placement of outputs or limits)
+    blocks.removeAll { $0.nodes.isEmpty }
+
     if debug {
         print("📦 Created \(blocks.count) blocks with simplified logic")
         for (i, block) in blocks.enumerated() {
@@ -534,6 +537,21 @@ public func determineBlocksSimple(
     }
 
     return blocks
+}
+
+/// Fuse adjacent blocks of the same kind to reduce cross-block traffic
+/// and improve loop fusion opportunities in later stages.
+public func fuseBlocks(_ blocks: [Block]) -> [Block] {
+    var fused: [Block] = []
+    for b in blocks {
+        if b.nodes.isEmpty { continue }
+        if let lastIdx = fused.indices.last, fused[lastIdx].kind == b.kind {
+            fused[lastIdx].nodes.append(contentsOf: b.nodes)
+        } else {
+            fused.append(b)
+        }
+    }
+    return fused
 }
 
 extension LazyOp {
@@ -562,36 +580,34 @@ public func findOutputNodeNeeds(_ b: Block, _ g: Graph) -> Set<NodeID> {
 
 // ─── 3. decide which nodes need cross-block scratch buffers ─────
 // in the case of metal, these are transmitted via buffers
-public func findNodesWithOutboundDependencies(_ blks: [Block], _ g: Graph, block: Block) -> Set<
-    NodeID
-> {
-    // node -> block idx map
+public func findNodesWithOutboundDependencies(_ blks: [Block], _ g: Graph, block: Block) -> Set<NodeID> {
+    // Map node -> block index
     var nodeBlock = [NodeID: Int]()
-    let idx = blks.firstIndex { b in return b == block }
-    //block.nodes.forEach { nodeBlock[$0] = idx }
-    for (idx, b) in blks.enumerated() { b.nodes.forEach { nodeBlock[$0] = idx } }
+    for (bidx, b) in blks.enumerated() { b.nodes.forEach { nodeBlock[$0] = bidx } }
 
-    let outputNodeNeeds = findOutputNodeNeeds(block, g)
+    guard let thisIdx = blks.firstIndex(of: block) else { return [] }
+
+    // Compute contiguous-kind groups to enable within-group fusion
+    var groupForBlock = Array(repeating: 0, count: blks.count)
+    var group = 0
+    for i in 0..<blks.count {
+        if i > 0 && blks[i].kind != blks[i-1].kind { group += 1 }
+        groupForBlock[i] = group
+    }
+    let thisGroup = groupForBlock[thisIdx]
 
     var need: Set<NodeID> = []
-    for (i, b) in blks.enumerated() {
-        if i == idx {
-            continue
-        }
+    for (consumerIdx, b) in blks.enumerated() {
+        // Only consider consumers in other groups; within-group we can keep values in registers
+        if groupForBlock[consumerIdx] == thisGroup { continue }
         for nID in b.nodes {
-            g.nodes[nID]!.allDependencies.forEach {
-                if let nodeBlockIdx = nodeBlock[$0] {
-                    if nodeBlockIdx == idx && !outputNodeNeeds.contains($0) {
-                        // Check if this is a seq node - if so, we need to make its last input available as global
-                        if let depNode = g.nodes[$0], case .seq = depNode.op {
-                            // For seq nodes, the actual value comes from the last input
-                            if let lastInput = depNode.inputs.last {
-                                need.insert(lastInput)
-                            }
-                        } else {
-                            need.insert($0)
-                        }
-                    }  // producer in diff block
+            g.nodes[nID]!.allDependencies.forEach { dep in
+                if let producerIdx = nodeBlock[dep], producerIdx == thisIdx {
+                    if let depNode = g.nodes[dep], case .seq = depNode.op {
+                        if let lastInput = depNode.inputs.last { need.insert(lastInput) }
+                    } else {
+                        need.insert(dep)
+                    }
                 }
             }
         }
@@ -599,24 +615,29 @@ public func findNodesWithOutboundDependencies(_ blks: [Block], _ g: Graph, block
     return need
 }
 
-public func findNodesAsInboundDependencies(_ blks: [Block], _ g: Graph, block: Block) -> Set<NodeID>
-{
-    let outputNodeNeeds = findOutputNodeNeeds(block, g)
+public func findNodesAsInboundDependencies(_ blks: [Block], _ g: Graph, block: Block) -> Set<NodeID> {
+    guard let thisIdx = blks.firstIndex(of: block) else { return [] }
 
-    let blockNumber = blks.firstIndex(of: block)
-
-    // find which block each node is defined in
+    // Map node -> block index
     var nodeBlock = [NodeID: Int]()
-    for (idx, b) in blks.enumerated() { b.nodes.forEach { nodeBlock[$0] = idx } }
+    for (bidx, b) in blks.enumerated() { b.nodes.forEach { nodeBlock[$0] = bidx } }
+
+    // Compute contiguous-kind groups
+    var groupForBlock = Array(repeating: 0, count: blks.count)
+    var group = 0
+    for i in 0..<blks.count {
+        if i > 0 && blks[i].kind != blks[i-1].kind { group += 1 }
+        groupForBlock[i] = group
+    }
+    let thisGroup = groupForBlock[thisIdx]
 
     var need: Set<NodeID> = []
-    // go thru each node in this block and if its defined in some other block, add it here
+    // Collect only dependencies produced in a different group
     for nID in block.nodes {
-        // for each input of a node from **this** block, check if it was produced somewhere else
-        g.nodes[nID]!.allDependencies.forEach {
-            if nodeBlock[$0]! != blockNumber && !outputNodeNeeds.contains($0) {
-                need.insert($0)
-            }  // producer in diff block
+        g.nodes[nID]!.allDependencies.forEach { dep in
+            if let prodIdx = nodeBlock[dep] {
+                if groupForBlock[prodIdx] != thisGroup { need.insert(dep) }
+            }
         }
     }
     return need
