@@ -79,7 +79,8 @@ final class BasicCompilationTests: XCTestCase {
 
         let mRuntime = try MetalCompiledKernel(
             kernels: mResult.kernels,
-            cellAllocations: mResult.cellAllocations
+            cellAllocations: mResult.cellAllocations,
+            context: mResult.context
         )
 
         var outC = [Float](repeating: 0, count: frameCount)
@@ -152,7 +153,8 @@ final class BasicCompilationTests: XCTestCase {
 
         let mRuntime = try MetalCompiledKernel(
             kernels: mResult.kernels,
-            cellAllocations: mResult.cellAllocations
+            cellAllocations: mResult.cellAllocations,
+            context: mResult.context
         )
 
         var outC = [Float](repeating: 0, count: frameCount)

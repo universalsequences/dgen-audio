@@ -986,16 +986,6 @@ public class MetalRenderer: Renderer, UOpEmitter {
             bufferIndex += 1
         }
 
-        if bufferRequirements.needsGrad {
-            parameters.append("    device float *gradients [[buffer(\(bufferIndex))]]")
-            bufferIndex += 1
-        }
-
-        if bufferRequirements.needsGradMemory {
-            parameters.append("    device float *grad_memory [[buffer(\(bufferIndex))]]")
-            bufferIndex += 1
-        }
-
         // Add frameCount parameter for all Metal kernels (needed for output operations)
         parameters.append("    constant int &frameCount [[buffer(\(bufferIndex))]]")
         bufferIndex += 1
@@ -1005,6 +995,16 @@ public class MetalRenderer: Renderer, UOpEmitter {
             parameters.append("    constant int &segmentLen [[buffer(\(bufferIndex))]]")
             bufferIndex += 1
             parameters.append("    constant int &segmentBase [[buffer(\(bufferIndex))]]")
+            bufferIndex += 1
+        }
+
+        if bufferRequirements.needsGradMemory {
+            parameters.append("    device float *grad_memory [[buffer(\(bufferIndex))]]")
+            bufferIndex += 1
+        }
+
+        if bufferRequirements.needsGrad {
+            parameters.append("    device float *gradients [[buffer(\(bufferIndex))]]")
             bufferIndex += 1
         }
 
@@ -1060,7 +1060,7 @@ public class MetalRenderer: Renderer, UOpEmitter {
                 outputs.insert(varId)
             case let .loadGlobal(varId):
                 inputs.insert(varId)
-            case .load, .store, .delay1:
+            case .load, .store, .delay1, .updateDFTBuffer, .computeDFTBin:
                 needsMemory = true
             case .defineMemory:
                 needsMemory = true
@@ -1139,6 +1139,51 @@ public class MetalRenderer: Renderer, UOpEmitter {
             return emitAssign(uop, "memory[\(base) + (int)\(g(offset))]", ctx)
         case let .memoryWrite(base, offset, value):
             return "memory[\(base) + (int)\(g(offset))] = \(g(value));"
+
+        case let .updateDFTBuffer(bufferCell, signal, windowSize):
+            // Update circular buffer with new sample
+            // Buffer layout: [sample0, sample1, ..., sample(windowSize-1), writePosition]
+            let code = """
+            ({
+                const int WIN_SIZE = \(windowSize);
+                int writePos = ((int)memory[\(bufferCell) + WIN_SIZE]) % WIN_SIZE;
+                memory[\(bufferCell) + writePos] = \(g(signal));
+                memory[\(bufferCell) + WIN_SIZE] = memory[\(bufferCell) + WIN_SIZE] + 1.0;
+                0.0;  // Return dummy value
+            })
+            """
+            return emitAssign(uop, code, ctx)
+
+        case let .computeDFTBin(bufferCell, windowSize, binIndex):
+            // Compute DFT magnitude at a specific frequency bin (doesn't update buffer)
+            let code = """
+            ({
+                const int WIN_SIZE = \(windowSize);
+                const int BIN_INDEX = \(binIndex);
+
+                // Get write position to determine where oldest sample is
+                int writePos = ((int)memory[\(bufferCell) + WIN_SIZE]) % WIN_SIZE;
+
+                // Compute DFT for this bin, reading from circular buffer in chronological order
+                float real = 0.0, imag = 0.0;
+                for (int n = 0; n < WIN_SIZE; n++) {
+                    // Read from circular buffer starting at writePos (oldest sample)
+                    int bufferIndex = (writePos + n) % WIN_SIZE;
+                    float sample = memory[\(bufferCell) + bufferIndex];
+
+                    float angle = -2.0 * M_PI_F * (float)BIN_INDEX * (float)n / (float)WIN_SIZE;
+                    float cosAngle = metal::cos(angle);
+                    float sinAngle = metal::sin(angle);
+
+                    real += sample * cosAngle;
+                    imag += sample * sinAngle;
+                }
+
+                // Return magnitude
+                metal::sqrt(real * real + imag * imag);
+            })
+            """
+            return emitAssign(uop, code, ctx)
 
         case let .sin(a): return emitAssign(uop, "metal::sin(\(g(a)))", ctx)
         case let .cos(a): return emitAssign(uop, "metal::cos(\(g(a)))", ctx)

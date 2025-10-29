@@ -558,7 +558,7 @@ public class MetalCompiledKernel: CompiledKernelRuntime {
                 ? getMemorySize()
                 : bufferName == "t"
                     ? maxFrameCount * context.globals.count
-                    : bufferName == "gradient"
+                    : bufferName == "gradients"
                         ? maxFrameCount * context.gradients.count : maxFrameCount
 
     }
@@ -603,26 +603,49 @@ public class MetalCompiledKernel: CompiledKernelRuntime {
     }
 
     public func resetGradientBuffers(numFrames: Int) {
-        guard let buffer = bufferPool["gradients"] else { return }
+        guard let buffer = bufferPool["gradients"] else {
+            print("   [DEBUG] No gradients buffer found!")
+            return
+        }
 
         let elementCount = getElementCount("gradients")
         let bufferSize = elementCount * MemoryLayout<Float>.size
-        guard context.seedGradients.count > 0 else { return }
+        guard context.seedGradients.count > 0 else {
+            print("   [DEBUG] No seed gradients to reset!")
+            return
+        }
 
-        let seedId = context.seedGradients[0]
         // Initialize buffer contents to zero
         let bufferContents = buffer.contents().assumingMemoryBound(to: Float.self)
         for i in 0..<(bufferSize / MemoryLayout<Float>.size) {
             bufferContents[i] = 0.0
         }
 
-        for i in (numFrames * seedId)..<(numFrames * (seedId + 1)) {
-            bufferContents[i] = 1.0
+        // Set all seed gradients to 1.0 (typically loss nodes)
+        // Each seed gets a region of numFrames values set to 1.0
+        print("   [DEBUG] Seeding gradients for \(context.seedGradients.count) seeds: \(context.seedGradients)")
+        for seedId in context.seedGradients {
+            let startIdx = numFrames * seedId
+            let endIdx = numFrames * (seedId + 1)
+            print("   [DEBUG] Setting gradId=\(seedId) range [\(startIdx)..<\(endIdx)] to 1.0")
+            for i in startIdx..<endIdx {
+                bufferContents[i] = 1.0
+            }
+
+            // Verify it was set
+            let firstVal = bufferContents[startIdx]
+            let lastVal = bufferContents[endIdx - 1]
+            print("   [DEBUG] Verification: gradients[\(startIdx)]=\(firstVal), gradients[\(endIdx-1)]=\(lastVal)")
         }
     }
 
     public func setParamValue(cellId: CellID, value: Float) {
         // TODO - implement
+    }
+
+    /// Get a buffer by name (used by training API)
+    public func getBuffer(name: String) -> MTLBuffer? {
+        return bufferPool[name]
     }
 
     public func run(
@@ -641,6 +664,9 @@ public class MetalCompiledKernel: CompiledKernelRuntime {
 
         // Execute kernels in sequence
         for (index, kernel) in kernels.enumerated() {
+            if firstDebug {
+                print("   [DEBUG] Executing kernel \(index): \(kernel.name)")
+            }
             guard let computeEncoder = commandBuffer.makeComputeCommandEncoder() else { continue }
 
             let function = functions[index]
@@ -740,7 +766,8 @@ public class MetalCompiledKernel: CompiledKernelRuntime {
         // First check for dedicated "outputs" buffer
         if let outputBuffer = bufferPool["outputs"] {
             let bufferContents = outputBuffer.contents().assumingMemoryBound(to: Float.self)
-            for i in 0..<min(frameCount, MIN_FRAME_COUNT) {
+            // Copy all frameCount frames (not limited to MIN_FRAME_COUNT)
+            for i in 0..<frameCount {
                 outputs[i] = bufferContents[i] * volumeScale
             }
             return
@@ -753,8 +780,8 @@ public class MetalCompiledKernel: CompiledKernelRuntime {
                 if bufferName.hasPrefix("t") || bufferName == "memory" {
                     if let buffer = bufferPool[bufferName] {
                         let bufferContents = buffer.contents().assumingMemoryBound(to: Float.self)
-                        // Copy the relevant portion to outputs with volume scaling
-                        for i in 0..<min(frameCount, MIN_FRAME_COUNT) {
+                        // Copy all frameCount frames (not limited to MIN_FRAME_COUNT)
+                        for i in 0..<frameCount {
                             outputs[i] = bufferContents[i] * volumeScale
                         }
                         break  // Take first matching buffer as output
@@ -982,7 +1009,8 @@ public class MetalCompiledKernel: CompiledKernelRuntime {
         memory: UnsafeMutableRawPointer, frameCount: Int
     ) {
         // Metal uses its own internal persistent memory buffer in bufferPool["memory"]
-        // No need to copy external memory - just use the existing run() implementation
+        // The buffer is zero-initialized when the runtime is created
+        // Note: State persists across multiple calls - create a new runtime for fresh state
         run(outputs: outputs, inputs: inputs, frameCount: frameCount, volumeScale: 1.0)
     }
 

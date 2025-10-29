@@ -135,6 +135,56 @@ func u_click(_ cellId: CellID) -> (IRBuilder) -> Expr {
     }
 }
 
+func u_mse(_ a: Expr, _ b: Expr) -> (IRBuilder) -> Expr {
+    return { builder in
+        // MSE = (a - b)^2
+        let diff = a - b
+        let squared = diff * diff
+        return squared
+    }
+}
+
+func u_updateDFTBuffer(_ bufferCell: CellID, _ signal: Expr, _ windowSize: Int) -> (IRBuilder) -> Expr {
+    return { b in
+        let dest = b.ctx.useVariable(src: b.nodeId)
+        let uop = UOp(op: .updateDFTBuffer(bufferCell, signal.lazy, windowSize), value: dest)
+        b.ops.append(uop)
+        return b.value(dest)
+    }
+}
+
+func u_computeDFTBin(_ bufferCell: CellID, _ windowSize: Int, _ binIndex: Int) -> (IRBuilder) -> Expr {
+    return { b in
+        let dest = b.ctx.useVariable(src: b.nodeId)
+        let uop = UOp(op: .computeDFTBin(bufferCell, windowSize, binIndex), value: dest)
+        b.ops.append(uop)
+        return b.value(dest)
+    }
+}
+
+func u_spectralLoss(_ buf1Cell: CellID, _ buf2Cell: CellID, _ sig1: Expr, _ sig2: Expr, _ windowSize: Int) -> (IRBuilder) -> Expr {
+    return { b in
+        // Update buffers once per frame
+        _ = u_updateDFTBuffer(buf1Cell, sig1, windowSize)(b)
+        _ = u_updateDFTBuffer(buf2Cell, sig2, windowSize)(b)
+
+        // Compute spectral loss as: sum over bins of (mag1 - mag2)^2 / numBins
+        let numBins = windowSize / 2 + 1  // Nyquist
+        let numBinsFloat = b.constant(Float(numBins))
+
+        var totalError = b.constant(0.0)
+        for binIndex in 0..<numBins {
+            let mag1 = u_computeDFTBin(buf1Cell, windowSize, binIndex)(b)
+            let mag2 = u_computeDFTBin(buf2Cell, windowSize, binIndex)(b)
+            let diff = mag1 - mag2
+            let squared = diff * diff
+            totalError = totalError + squared
+        }
+
+        return totalError / numBinsFloat
+    }
+}
+
 func u_accum(_ cellId: CellID, incr: Expr, reset: Expr, min: Expr, max: Expr) -> (IRBuilder) -> Expr
 {
     return { b in
@@ -209,6 +259,7 @@ public enum LazyOp {
         lt, eq,
         gswitch, mix, pow, floor, ceil, round, mod, min, max
     case mse  // mean squared error per-sample: (a-b)^2
+    case spectralLoss(CellID, CellID, Int)  // spectralLoss(buf1, buf2, windowSize) - DFT-based frequency domain MSE
     case selector  // selector(mode, options[])
     case memoryRead(CellID)
     case memoryWrite(CellID)
@@ -389,7 +440,15 @@ public enum LazyOp {
                     operator: "mse", expected: 2, actual: inputs.count)
             }
             let (a, b2) = b.values(inputs, count: 2)
-            b.use(val: b.mse(a, b2))
+            b.use(val: u_mse(a, b2)(b))
+        case let .spectralLoss(buf1Cell, buf2Cell, windowSize):
+            // Spectral loss implemented as composite using DFT
+            guard inputs.count == 2 else {
+                throw DGenError.insufficientInputs(
+                    operator: "spectralLoss", expected: 2, actual: inputs.count)
+            }
+            let (sig1, sig2) = b.values(inputs, count: 2)
+            b.use(val: u_spectralLoss(buf1Cell, buf2Cell, sig1, sig2, windowSize)(b))
         case .gt:
             guard inputs.count == 2 else {
                 throw DGenError.insufficientInputs(
@@ -716,6 +775,14 @@ public enum LazyOp {
             let gradB = b.value(gradOutput) * (b.constant(0.0) - two * diff)
             b.grad(node.inputs[0], value: gradA.lazy)
             b.grad(node.inputs[1], value: gradB.lazy)
+        case .spectralLoss:
+            // TODO: Implement backward pass for spectralLoss
+            // Since spectralLoss is now composite (uses DFT), gradients should flow through
+            // But DFT doesn't have gradients yet, so still zero for now
+            guard inputs.count == 2 else { fatalError("spectralLoss requires 2 inputs") }
+            let zeroGrad = ctx.useConstant(src: nil, value: 0.0)
+            b.grad(node.inputs[0], value: zeroGrad)
+            b.grad(node.inputs[1], value: zeroGrad)
         case .floor:
             // d(floor(x))/dx = 0 (floor is not differentiable, but we set to 0)
             guard inputs.count == 1 else { fatalError("floor requires 1 input") }

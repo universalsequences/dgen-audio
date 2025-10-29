@@ -145,13 +145,6 @@ public final class IRBuilder {
     fatalError("no tape")
   }
 
-  public func mse(_ a: Expr, _ b: Expr) -> Expr {
-    // Emit dedicated MSE UOp: (a - b)^2 per-sample
-    let dest = ctx.useVariable(src: nodeId)
-    let uop = UOp(op: .mse(a.lazy, b.lazy), value: dest)
-    ops.append(uop)
-    return value(dest)
-  }
 
   public func abs(_ val: Expr) -> Expr {
     if case .constant(_, let absConst) = val.lazy {

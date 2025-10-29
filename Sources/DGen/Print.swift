@@ -129,6 +129,12 @@ extension UOp {
             opStr = "\(ANSI.magenta)loadTape\(ANSI.reset)(\(a))"
         case let .mse(a, b):
             opStr = "\(ANSI.green)mse\(ANSI.reset)(\(a), \(b))"
+        case let .updateDFTBuffer(bufferCell, signal, windowSize):
+            opStr = "\(ANSI.green)updateDFTBuffer\(ANSI.reset)(\(bufferCell), \(signal), \(windowSize))"
+        case let .computeDFTBin(bufferCell, windowSize, binIndex):
+            opStr = "\(ANSI.green)computeDFTBin\(ANSI.reset)(\(bufferCell), \(windowSize), \(binIndex))"
+        case let .spectralLoss(buf1, buf2, sig1, sig2, windowSize):
+            opStr = "\(ANSI.green)spectralLoss\(ANSI.reset)(\(buf1), \(buf2), \(sig1), \(sig2), \(windowSize))"
         case .frameIndex:
             opStr = "\(ANSI.magenta)frameIndex\(ANSI.reset)"
         }

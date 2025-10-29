@@ -614,6 +614,7 @@ public func findNodesWithOutboundDependencies(_ blks: [Block], _ g: Graph, block
     guard let thisIdx = blks.firstIndex(of: block) else { return [] }
 
     // Compute contiguous-kind groups to enable within-group fusion
+    /*
     var groupForBlock = Array(repeating: 0, count: blks.count)
     var group = 0
     for i in 0..<blks.count {
@@ -621,11 +622,13 @@ public func findNodesWithOutboundDependencies(_ blks: [Block], _ g: Graph, block
         groupForBlock[i] = group
     }
     let thisGroup = groupForBlock[thisIdx]
+     */
 
     var need: Set<NodeID> = []
     for (consumerIdx, b) in blks.enumerated() {
+        if thisIdx == consumerIdx { continue }
         // Only consider consumers in other groups; within-group we can keep values in registers
-        if groupForBlock[consumerIdx] == thisGroup { continue }
+        //if groupForBlock[consumerIdx] == thisGroup { continue }
         for nID in b.nodes {
             g.nodes[nID]!.allDependencies.forEach { dep in
                 if let producerIdx = nodeBlock[dep], producerIdx == thisIdx {
@@ -657,6 +660,7 @@ public func findNodesAsInboundDependencies(_ blks: [Block], _ g: Graph, block: B
     //for (bidx, b) in blks.enumerated() { b.nodes.forEach { nodeBlock[$0] = bidx } }
 
     // Compute contiguous-kind groups
+    /*
     var groupForBlock = Array(repeating: 0, count: blks.count)
     var group = 0
     for i in 0..<blks.count {
@@ -664,60 +668,18 @@ public func findNodesAsInboundDependencies(_ blks: [Block], _ g: Graph, block: B
         groupForBlock[i] = group
     }
     let thisGroup = groupForBlock[thisIdx]
+     */
 
     var need: Set<NodeID> = []
     // Collect only dependencies produced in a different group
     for nID in block.nodes {
         g.nodes[nID]!.allDependencies.forEach { dep in
             if let prodIdx = nodeBlock[dep] {
-                if groupForBlock[prodIdx] != thisGroup { need.insert(dep) }
+                if prodIdx != thisIdx { need.insert(dep) }
             }
         }
     }
     return need
-}
-
-public func countNeededBuffersForBlock(
-    ctx: IRContext, block: Block, blocks: [Block], g: Graph
-) -> Int {
-    var emittedNodes: Set<NodeID> = []
-
-    for nodeId in block.nodes {
-        if let node = g.nodes[nodeId] {
-            emittedNodes.insert(nodeId)
-
-        }
-    }
-
-    var bufferCounts = 0
-    let outbound = findNodesWithOutboundDependencies(blocks, g, block: block)
-    for nodeId in outbound {
-        if emittedNodes.contains(nodeId) {
-            if let lz = ctx.values[nodeId] {
-                switch lz {
-                case .variable(let a, _):
-                    bufferCounts += 1
-                default:
-                    break
-                }
-            }
-        }
-    }
-
-    let inbound = findNodesAsInboundDependencies(blocks, g, block: block)
-
-    for nodeId in inbound {
-        if let lz = ctx.values[nodeId] {
-            switch lz {
-            case .variable(let a, _):
-                bufferCounts += 1
-            default:
-                break
-            }
-        }
-    }
-
-    return bufferCounts
 }
 
 public func emitBlockUOps(
@@ -753,6 +715,7 @@ public func emitBlockUOps(
     }
 
     let outbound = findNodesWithOutboundDependencies(blocks, g, block: block)
+    print("NODES WITH OUTBOUND=\(outbound)")
     for nodeId in outbound {
         if emittedNodes.contains(nodeId) {
             if let lz = ctx.values[nodeId] {

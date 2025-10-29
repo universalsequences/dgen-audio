@@ -18,6 +18,9 @@ public enum Op {
   case accumulateGrad(GradID, Lazy)
   case loadGrad(GradID)
   case mse(Lazy, Lazy)
+  case updateDFTBuffer(CellID, Lazy, Int)  // (bufferCell, signal, windowSize) - updates circular buffer with new sample
+  case computeDFTBin(CellID, Int, Int)  // (bufferCell, windowSize, binIndex) - computes DFT magnitude at frequency bin
+  case spectralLoss(CellID, CellID, Lazy, Lazy, Int)  // (buf1, buf2, signal1, signal2, windowSize) - computes DFT-based frequency domain MSE
   case mutate(Lazy, Lazy)
   case add(Lazy, Lazy)
   case sub(Lazy, Lazy)
