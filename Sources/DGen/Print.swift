@@ -119,7 +119,9 @@ extension UOp {
             opStr = "\(ANSI.magenta)frameCount\(ANSI.reset)"
         case let .loadGrad(a):
             opStr = "\(ANSI.magenta)loadGrad\(ANSI.reset)(\(a))"
-        case let .storeGrad(a, b):
+        case let .loadGradMemory(a):
+            opStr = "\(ANSI.magenta)loadGrad\(ANSI.reset)(\(a))"
+        case let .storeGradMemory(a, b):
             opStr = "\(ANSI.magenta)storeGrad\(ANSI.reset)(\(a), \(b))"
         case let .accumulateGrad(a, b):
             opStr = "\(ANSI.magenta)accumulateGrad\(ANSI.reset)(\(a), \(b))"

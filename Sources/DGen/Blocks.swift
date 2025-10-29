@@ -587,7 +587,13 @@ public func findNodesWithOutboundDependencies(_ blks: [Block], _ g: Graph, block
 > {
     // Map node -> block index
     var nodeBlock = [NodeID: Int]()
-    for (bidx, b) in blks.enumerated() { b.nodes.forEach { nodeBlock[$0] = bidx } }
+    for (bidx, b) in blks.enumerated() {
+        b.nodes.forEach { nid in
+            if nodeBlock[nid] == nil {
+                nodeBlock[nid] = bidx
+            }
+        }
+    }
 
     guard let thisIdx = blks.firstIndex(of: block) else { return [] }
 
@@ -625,7 +631,14 @@ public func findNodesAsInboundDependencies(_ blks: [Block], _ g: Graph, block: B
 
     // Map node -> block index
     var nodeBlock = [NodeID: Int]()
-    for (bidx, b) in blks.enumerated() { b.nodes.forEach { nodeBlock[$0] = bidx } }
+    for (bidx, b) in blks.enumerated() {
+        b.nodes.forEach { nid in
+            if nodeBlock[nid] == nil {
+                nodeBlock[nid] = bidx
+            }
+        }
+    }
+    //for (bidx, b) in blks.enumerated() { b.nodes.forEach { nodeBlock[$0] = bidx } }
 
     // Compute contiguous-kind groups
     var groupForBlock = Array(repeating: 0, count: blks.count)
@@ -654,14 +667,28 @@ public func emitBlockUOps(
     var emittedNodes: Set<NodeID> = []
 
     var uops: [UOp] = []
+    // NO this needs
     for nodeId in block.nodes {
         if let node = g.nodes[nodeId] {
-            for uop in try node.op.emit(ctx: ctx, g: g, nodeId: nodeId) {
-                emittedNodes.insert(nodeId)
+            if case .forward = block.direction {
+                for uop in try node.op.emit(ctx: ctx, g: g, nodeId: nodeId) {
+                    emittedNodes.insert(nodeId)
 
-                var typedUOp = uop
-                typedUOp.kind = block.kind
-                uops.append(typedUOp)
+                    var typedUOp = uop
+                    typedUOp.kind = block.kind
+                    uops.append(typedUOp)
+                }
+            } else {
+                let back = node.op.emitBackward(ctx: ctx, g: g, nodeId: nodeId)
+                // should be even better
+                // ideally we could just ask inside emitBackward (is there a grad for nodeId if not use 1 cuz its the start)
+                for uop in back {
+                    emittedNodes.insert(nodeId)
+
+                    var typedUOp = uop
+                    typedUOp.kind = block.kind
+                    uops.append(typedUOp)
+                }
             }
         }
     }

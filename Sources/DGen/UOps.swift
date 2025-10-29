@@ -13,9 +13,10 @@ public enum Op {
   case store(CellID, Lazy)
   case concatShift(Lazy, Lazy, Int)  // used in vectorized history
   case delay1(CellID, Lazy)
-  case loadGrad(CellID)
-  case storeGrad(CellID, Lazy)
+  case loadGradMemory(CellID)
+  case storeGradMemory(CellID, Lazy)
   case accumulateGrad(GradID, Lazy)
+  case loadGrad(GradID)
   case mse(Lazy, Lazy)
   case mutate(Lazy, Lazy)
   case add(Lazy, Lazy)

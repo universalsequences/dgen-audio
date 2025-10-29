@@ -523,11 +523,17 @@ public enum LazyOp {
         return ops
     }
 
-    func emitBackward(ctx: IRContext, g: Graph, nodeId: NodeID, gradOutput: Lazy)
+    func emitBackward(ctx: IRContext, g: Graph, nodeId: NodeID)
         -> [UOp]
     {
         guard let node = g.nodes[nodeId] else {
             return []
+        }
+
+        // default gradOutput of 1 (i.e. seed)
+        var gradOutput = ctx.useConstant(src: nil, value: 1.0)
+        if let gradCellId = ctx.gradients[nodeId] {
+            // if grad cell exists turn this into "loadGrad" -- loadGrad must be "fetch this grad from this cell"
         }
 
         // Collect operands
@@ -563,8 +569,7 @@ public enum LazyOp {
             b.grad(node.inputs[1], value: ctx.useConstant(src: nil, value: 0.0))
         case .param(let cellId):
             // Accumulate gradient for this parameter into gradient memory
-            let b = IRBuilder(ctx: ctx, nodeId: nodeId)
-            _ = b.storeGrad(cellId, b.value(gradOutput))
+            _ = b.storeGradMemory(cellId, b.value(gradOutput))
         case .min:
             // d(min(x,y))/dx = (x <= y) ? 1 : 0, d(min(x,y))/dy = (y < x) ? 1 : 0
             guard inputs.count == 2 else { fatalError("min requires 2 inputs") }
@@ -791,24 +796,24 @@ public enum LazyOp {
             //   2) pass grad to input as gradOutput + gradFromFuture (like historyWrite)
             guard inputs.count == 1 else { fatalError("historyReadWrite requires 1 input") }
             // Gradient arriving from future reads
-            let gradFromFuture = b.loadGrad(cellId)
+            let gradFromFuture = b.loadGradMemory(cellId)
             let totalGrad = b.value(gradOutput) + gradFromFuture
             b.grad(node.inputs[0], value: totalGrad.lazy)
             // Store gradient for the previous timestep
-            _ = b.storeGrad(cellId, b.value(gradOutput))
+            _ = b.storeGradMemory(cellId, b.value(gradOutput))
         case .historyWrite(let cellId):
             // Pass gradient through to input, plus any gradient from future reads
             guard inputs.count == 1 else { fatalError("history write requires 1 input") }
 
             // Load gradient that was stored by historyRead in the future
-            let gradFromFuture = b.loadGrad(cellId)
+            let gradFromFuture = b.loadGradMemory(cellId)
             let totalGrad = b.value(gradOutput) + gradFromFuture
             b.grad(node.inputs[0], value: totalGrad.lazy)
 
         case .historyRead(let cellId):
             // Store gradient for the corresponding historyWrite in the past
             guard inputs.count == 0 else { fatalError("history read requires 0 inputs") }
-            _ = b.storeGrad(cellId, b.value(gradOutput))
+            _ = b.storeGradMemory(cellId, b.value(gradOutput))
 
         case .latch(_):
             // Gradient flows through value input only when condition was true
@@ -819,7 +824,6 @@ public enum LazyOp {
             b.grad(node.inputs[1], value: ctx.useConstant(src: nil, value: 0.0))
 
         case .accum(let cellId):
-            let b = IRBuilder(ctx: ctx, nodeId: nodeId)
             let reset = b.tapeValue(node.inputs[1])
 
             // Gradient for increment (blocked by reset)
@@ -827,13 +831,13 @@ public enum LazyOp {
 
             // handle temporal gradient flow:
             // The gradient also flows to the previous accumulated value
-            let gradFromFuture = b.loadGrad(cellId)
+            let gradFromFuture = b.loadGradMemory(cellId)
 
             // The total gradient flowing backward through time
             let gradToPrev = b.value(gradOutput) + gradFromFuture
 
             // Store for previous timestep's accum
-            _ = b.storeGrad(cellId, gradToPrev)
+            _ = b.storeGradMemory(cellId, gradToPrev)
 
             b.grad(node.inputs[0], value: gradIncr.lazy)
             b.grad(node.inputs[1], value: ctx.useConstant(src: nil, value: 0.0))
@@ -841,7 +845,6 @@ public enum LazyOp {
             b.grad(node.inputs[3], value: ctx.useConstant(src: nil, value: 0.0))
 
         case .phasor(let cellId):
-            let b = IRBuilder(ctx: ctx, nodeId: nodeId)
             let sampleRate = b.constant(44100.0)
             let currentTime = b.frameIndex(nodeId)
 
@@ -849,9 +852,9 @@ public enum LazyOp {
             let gradFreq = b.value(gradOutput) * currentTime / sampleRate
 
             // Accumulate in gradient memory at cellId (cell is not used for anything else)
-            let prevGradFreq = b.loadGrad(cellId)  // First time: 0
+            let prevGradFreq = b.loadGradMemory(cellId)  // First time: 0
             let totalGradFreq = prevGradFreq + gradFreq
-            _ = b.storeGrad(cellId, totalGradFreq)
+            _ = b.storeGradMemory(cellId, totalGradFreq)
 
             b.grad(node.inputs[0], value: totalGradFreq.lazy)
         case .output(_):

@@ -822,20 +822,10 @@ public class MetalRenderer: Renderer, UOpEmitter {
             let deps = analyzeDependencies(scheduleItem: scheduleItem, ctx: ctx)
             let allBuffers = Set(deps.inputs + deps.outputs)
 
-            // Check if this kernel has output operations
-            let hasOutputOps = scheduleItem.ops.contains { uop in
-                if case .output = uop.op { return true }
-                return false
-            }
-
-            // Detect whether this kernel needs segmented dispatch (for delay/barrier semantics)
-            let needsSegmenting: Bool = scheduleItem.ops.contains { uop in
-                if case .delay1 = uop.op { return true }
-                return false
-            }
+            let bufferRequirements = analyzeRequiredBuffers(scheduleItem: scheduleItem)
 
             var bufferNames: [String] = []
-            if hasOutputOps {
+            if bufferRequirements.hasOutputOps {
                 bufferNames.append("outputs")
             }
             // Use same sorted order as render() method
@@ -848,12 +838,18 @@ public class MetalRenderer: Renderer, UOpEmitter {
             bufferNames.append("frameCount")
 
             // Add segment buffers if this kernel needs segmented execution
-            if needsSegmenting {
+            if bufferRequirements.needsSegmenting {
                 bufferNames.append("segmentLen")
                 bufferNames.append("segmentBase")
             }
 
-            print("BUFFER NAMES=\(bufferNames)")
+            if bufferRequirements.needsGradMemory {
+                bufferNames.append("grad_memory")
+            }
+
+            if bufferRequirements.needsGrad {
+                bufferNames.append("gradients")
+            }
 
             return CompiledKernel(
                 name: kernelName,
@@ -941,8 +937,9 @@ public class MetalRenderer: Renderer, UOpEmitter {
         var parameters: [String] = []
         var bufferIndex = 0
 
+        let bufferRequirements = analyzeRequiredBuffers(scheduleItem: scheduleItem)
         // Add outputs buffer first if needed
-        if hasOutputOps {
+        if bufferRequirements.hasOutputOps {
             parameters.append("    device float *outputs [[buffer(\(bufferIndex))]]")
             bufferIndex += 1
         }
@@ -954,18 +951,22 @@ public class MetalRenderer: Renderer, UOpEmitter {
             bufferIndex += 1
         }
 
+        if bufferRequirements.needsGrad {
+            parameters.append("    device float *gradients [[buffer(\(bufferIndex))]]")
+            bufferIndex += 1
+        }
+
+        if bufferRequirements.needsGradMemory {
+            parameters.append("    device float *grad_memory [[buffer(\(bufferIndex))]]")
+            bufferIndex += 1
+        }
+
         // Add frameCount parameter for all Metal kernels (needed for output operations)
         parameters.append("    constant int &frameCount [[buffer(\(bufferIndex))]]")
         bufferIndex += 1
 
-        // Detect whether this kernel needs segmented dispatch (for delay/barrier semantics)
-        let needsSegmenting: Bool = scheduleItem.ops.contains { uop in
-            if case .delay1 = uop.op { return true }
-            return false
-        }
-
         // If segmented, add segmentLen and segmentBase buffers
-        if needsSegmenting {
+        if bufferRequirements.needsSegmenting {
             parameters.append("    constant int &segmentLen [[buffer(\(bufferIndex))]]")
             bufferIndex += 1
             parameters.append("    constant int &segmentBase [[buffer(\(bufferIndex))]]")
@@ -973,7 +974,7 @@ public class MetalRenderer: Renderer, UOpEmitter {
         }
 
         parameters.append("    uint id [[thread_position_in_grid]]")
-        if needsSegmenting {
+        if bufferRequirements.needsSegmenting {
             parameters.append("    uint tid [[thread_index_in_threadgroup]]")
         }
 
@@ -984,7 +985,7 @@ public class MetalRenderer: Renderer, UOpEmitter {
         var indent = 1
 
         // If segmented, declare threadgroup scratch buffers for delay/store helpers
-        if needsSegmenting {
+        if bufferRequirements.needsSegmenting {
             kernels += "  threadgroup float __dgen_delay_tmp[128];\n"
             kernels += "  threadgroup float __dgen_store_tmp[128];\n"
         }
@@ -1157,12 +1158,15 @@ public class MetalRenderer: Renderer, UOpEmitter {
             return emitAssign(uop, expr, ctx)
 
         case let .load(cell): return emitAssign(uop, "memory[\(cell)]", ctx)
+        case let .loadGrad(gradId): return emitAssign(uop, "gradients[\(gradId)]", ctx)
+        case let .loadGradMemory(cellId): return emitAssign(uop, "grad_memory[\(cellId)]", ctx)
+        case let .frameIndex: return emitAssign(uop, "i", ctx)
         case let .loadTape(offset):
             let idx = (uop.kind == .simd) ? "id" : "i"
             return emitAssign(uop, "tape[\(offset) + \(idx)]", ctx)
         case let .store(cell, val): return "memory[\(cell)] = \(g(val));"
-        case let .storeGrad(cell, val): return "grad_memory\(cell)] += \(g(val));"
-        case let .accumulateGrad(gradId, val): return "gradients\(gradId)] += \(g(val));"
+        case let .storeGradMemory(cell, val): return "grad_memory[\(cell)] = \(g(val));"
+        case let .accumulateGrad(gradId, val): return "gradients[\(gradId)] += \(g(val));"
         case let .mutate(a, b):
             return "\(emitLazy(a, ctx: ctx, kind: uop.kind, isOut: true)) = \(g(b));"
         case let .beginIf(cond): return "if (\(g(cond))) {"
@@ -1170,8 +1174,6 @@ public class MetalRenderer: Renderer, UOpEmitter {
 
         case let .beginLoop(iters, step): return "for (int i = 0; i < \(g(iters)); i += \(step)) {"
         case .endLoop: return "}"
-
-        case .frameCount: return "/* frameCount available as function parameter */"
 
         case let .beginRange(start, end): return "if (id >= \(g(start)) && id < \(g(end))) {"
         case .endRange: return "}"
@@ -1223,4 +1225,48 @@ public class MetalRenderer: Renderer, UOpEmitter {
         }
         return "float \(lhs) = \(expr);"
     }
+}
+
+struct RequiredBuffers {
+    let hasOutputOps: Bool
+    let needsSegmenting: Bool
+    let needsGradMemory: Bool
+    let needsGrad: Bool
+}
+
+func analyzeRequiredBuffers(scheduleItem: ScheduleItem) -> RequiredBuffers {
+    // Check if this kernel has output operations
+    let hasOutputOps = scheduleItem.ops.contains { uop in
+        if case .output = uop.op { return true }
+        return false
+    }
+
+    // Detect whether this kernel needs segmented dispatch (for delay/barrier semantics)
+    let needsSegmenting: Bool = scheduleItem.ops.contains { uop in
+        if case .delay1 = uop.op { return true }
+        return false
+    }
+
+    let needsGradMemory: Bool = scheduleItem.ops.contains { uop in
+        if case .loadGradMemory = uop.op {
+            return true
+        } else if case .storeGradMemory = uop.op {
+            return true
+        }
+        return false
+    }
+
+    let needsGrad: Bool = scheduleItem.ops.contains { uop in
+        if case .loadGrad = uop.op {
+            return true
+        } else if case .accumulateGrad = uop.op {
+            return true
+        }
+        return false
+    }
+
+    return RequiredBuffers(
+        hasOutputOps: hasOutputOps, needsSegmenting: needsSegmenting,
+        needsGradMemory: needsGradMemory, needsGrad: needsGrad
+    )
 }

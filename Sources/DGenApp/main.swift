@@ -8,7 +8,9 @@ let g = Graph()
 let freq = g.n(.constant(500.0))
 let reset = g.n(.constant(0.0))
 let phase = g.n(.phasor(g.alloc()), freq, reset)
+_ = g.n(.output(0), g.n(.mul, phase, g.n(.constant(0.5))))
 
+/*
 let phase2 = g.n(
   .pow, g.triangle(g.n(.phasor(g.alloc()), g.n(.constant(2.3)), reset), g.n(.constant(0.91))),
   g.n(.constant(2.0)))
@@ -27,6 +29,7 @@ let delayed = g.delay(
   g.n(.add, g.n(.constant(200)), g.n(.mul, phase2, g.n(.constant(120)))))
 let c = g.n(.historyWrite(cell), delayed)
 _ = g.n(.output(0), g.n(.mul, delayed, g.n(.constant(0.5))))
+*/
 
 let seconds: Double = 10.0
 let sampleRate: Double = 44100
@@ -51,7 +54,7 @@ print("Wrote C WAV to \(cURL.path)")
 // Compile and render with Metal backend to WAV
 let mResult = try CompilationPipeline.compile(
   graph: g, backend: .metal,
-  options: .init(frameCount: 128, debug: false, forceScalar: false, backwards: true))
+  options: .init(frameCount: 128, debug: true, forceScalar: false, backwards: true))
 for kernel in mResult.kernels {
   print(kernel.source)
 

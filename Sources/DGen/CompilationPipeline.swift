@@ -126,12 +126,15 @@ public struct CompilationPipeline {
         var finalBlocks = fusedBlocks.compactMap { $0 }
 
         if options.backwards {
+            var backwardsBlocks: [Block] = []
             for block in fusedBlocks.reversed() {
                 var backwardsBlock = Block(kind: block.kind)
                 backwardsBlock.nodes = block.nodes.reversed()
                 backwardsBlock.direction = .backwards
-                finalBlocks.append(backwardsBlock)
+                backwardsBlocks.append(backwardsBlock)
             }
+            print("backwards blocks=\(backwardsBlocks)")
+            finalBlocks += backwardsBlocks
         }
 
         let finalBlockIndices = Array(0..<finalBlocks.count)
