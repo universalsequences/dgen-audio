@@ -501,10 +501,16 @@ public class MetalCompiledKernel: CompiledKernelRuntime {
     private let commandQueue: MTLCommandQueue
     private var bufferPool: [String: MTLBuffer] = [:]  // shared source of buffers used by all kernels
     private var functions: [MTLFunction] = []  // one per kernel
+    private var context: IRContext
+    private let maxFrameCount = 2048  // Handle up to 2048 frames per callback
+    private var firstDebug = true
 
-    public init(kernels: [CompiledKernel], cellAllocations: CellAllocations) throws {
+    public init(kernels: [CompiledKernel], cellAllocations: CellAllocations, context: IRContext)
+        throws
+    {
         self.kernels = kernels
         self.cellAllocations = cellAllocations
+        self.context = context
 
         guard let device = MTLCreateSystemDefaultDevice() else {
             throw NSError(
@@ -545,16 +551,28 @@ public class MetalCompiledKernel: CompiledKernelRuntime {
         try initializeBuffers()
     }
 
+    private func getElementCount(_ bufferName: String) -> Int {
+        return bufferName == "frameCount"
+            ? 1
+            : bufferName == "memory" || bufferName == "grad_memory"
+                ? getMemorySize()
+                : bufferName == "t"
+                    ? maxFrameCount * context.globals.count
+                    : bufferName == "gradient"
+                        ? maxFrameCount * context.gradients.count : maxFrameCount
+
+    }
+
     private func initializeBuffers() throws {
         // Collect all unique buffer names across kernels
         let allBufferNames = Set(kernels.flatMap { $0.buffers })
 
         // Create MTLBuffers for each unique buffer
         // Use larger buffer size to handle varying frameCount from AVAudioEngine
-        let maxFrameCount = 2048  // Handle up to 2048 frames per callback
         for bufferName in allBufferNames {
             // Memory buffer size comes from getMemorySize(), others need maxFrameCount
-            let elementCount = bufferName == "memory" ? getMemorySize() : maxFrameCount
+            let elementCount = getElementCount(bufferName)
+
             let bufferSize = elementCount * MemoryLayout<Float>.size
             guard let buffer = device.makeBuffer(length: bufferSize, options: .storageModeShared)
             else {
@@ -562,13 +580,13 @@ public class MetalCompiledKernel: CompiledKernelRuntime {
                     domain: "MetalError", code: 4,
                     userInfo: [NSLocalizedDescriptionKey: "Failed to create buffer \(bufferName)"])
             }
+            print("name=\(bufferName) buffer size = \(bufferSize)")
 
             // Initialize buffer contents to zero
             let bufferContents = buffer.contents().assumingMemoryBound(to: Float.self)
             for i in 0..<(bufferSize / MemoryLayout<Float>.size) {
                 bufferContents[i] = 0.0
             }
-
             bufferPool[bufferName] = buffer
         }
 
@@ -582,6 +600,25 @@ public class MetalCompiledKernel: CompiledKernelRuntime {
                 userInfo: [NSLocalizedDescriptionKey: "Failed to create frameCount buffer"])
         }
         bufferPool["frameCount"] = frameCountBuffer
+    }
+
+    public func resetGradientBuffers(numFrames: Int) {
+        guard let buffer = bufferPool["gradients"] else { return }
+
+        let elementCount = getElementCount("gradients")
+        let bufferSize = elementCount * MemoryLayout<Float>.size
+        guard context.seedGradients.count > 0 else { return }
+
+        let seedId = context.seedGradients[0]
+        // Initialize buffer contents to zero
+        let bufferContents = buffer.contents().assumingMemoryBound(to: Float.self)
+        for i in 0..<(bufferSize / MemoryLayout<Float>.size) {
+            bufferContents[i] = 0.0
+        }
+
+        for i in (numFrames * seedId)..<(numFrames * (seedId + 1)) {
+            bufferContents[i] = 1.0
+        }
     }
 
     public func setParamValue(cellId: CellID, value: Float) {
@@ -600,6 +637,8 @@ public class MetalCompiledKernel: CompiledKernelRuntime {
 
         guard let commandBuffer = commandQueue.makeCommandBuffer() else { return }
 
+        //resetGradientBuffers(numFrames: frameCount)
+
         // Execute kernels in sequence
         for (index, kernel) in kernels.enumerated() {
             guard let computeEncoder = commandBuffer.makeComputeCommandEncoder() else { continue }
@@ -614,6 +653,7 @@ public class MetalCompiledKernel: CompiledKernelRuntime {
             let isSegmented = kernel.buffers.contains("segmentLen")
             let segmentCapacity = MIN_FRAME_COUNT
 
+            // isSegments is true when we use delay1 which requires dividing up a simd kernel into batches of 4
             if isSegmented {
                 // We'll reuse the same encoder for multiple segment dispatches
                 var base = 0
@@ -633,11 +673,22 @@ public class MetalCompiledKernel: CompiledKernelRuntime {
 
                     // Bind buffers with per-segment offsets
                     for (bufferIndex, bufferName) in kernel.buffers.enumerated() {
+                        if firstDebug {
+                            print(
+                                "kernel[\(index) setting buffer=\(bufferName) index=\(bufferIndex)]"
+                            )
+                        }
+
                         guard let buffer = bufferPool[bufferName] else { continue }
+                        computeEncoder.setBuffer(buffer, offset: 0, index: bufferIndex)
+
+                        /*
                         // Offset per-frame buffers (t*, outputs); never offset memory or frameCount/segmentLen
                         let needsOffset = (bufferName.hasPrefix("t") || bufferName == "outputs")
                         let byteOffset = needsOffset ? base * MemoryLayout<Float>.size : 0
                         computeEncoder.setBuffer(buffer, offset: byteOffset, index: bufferIndex)
+
+                         */
                     }
 
                     let threadsPerGroup = MTLSize(width: thisLen, height: 1, depth: 1)
@@ -651,11 +702,18 @@ public class MetalCompiledKernel: CompiledKernelRuntime {
                 // Non-segmented kernel: single dispatch as before
                 for (bufferIndex, bufferName) in kernel.buffers.enumerated() {
                     if let buffer = bufferPool[bufferName] {
+                        if firstDebug {
+                            print(
+                                "kernel[\(index) setting buffer=\(bufferName) index=\(bufferIndex)]"
+                            )
+                        }
                         computeEncoder.setBuffer(buffer, offset: 0, index: bufferIndex)
                     }
                 }
 
-                let threadGroupSize = kernel.threadGroupSize ?? min(frameCount, MIN_FRAME_COUNT)
+                let threadGroupSize =
+                    kernel.kind == .scalar
+                    ? 1 : kernel.threadGroupSize ?? min(frameCount, MIN_FRAME_COUNT)
                 let threadsPerGroup = MTLSize(width: threadGroupSize, height: 1, depth: 1)
                 let numThreadGroups = MTLSize(
                     width: (frameCount + threadGroupSize - 1) / threadGroupSize, height: 1, depth: 1
@@ -667,6 +725,7 @@ public class MetalCompiledKernel: CompiledKernelRuntime {
             }
         }
 
+        firstDebug = false
         commandBuffer.commit()
         commandBuffer.waitUntilCompleted()
 
@@ -678,7 +737,6 @@ public class MetalCompiledKernel: CompiledKernelRuntime {
         outputs: UnsafeMutablePointer<Float>, frameCount: Int, volumeScale: Float
     ) {
         // Find output buffers and copy their contents
-
         // First check for dedicated "outputs" buffer
         if let outputBuffer = bufferPool["outputs"] {
             let bufferContents = outputBuffer.contents().assumingMemoryBound(to: Float.self)

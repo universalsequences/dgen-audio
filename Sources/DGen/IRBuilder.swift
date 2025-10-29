@@ -121,6 +121,13 @@ public final class IRBuilder {
     return value(dest)
   }
 
+  func loadGrad(_ gradId: GradID) -> Expr {
+    let dest = ctx.useVariable(src: nil)
+    let uop = UOp(op: .loadGrad(gradId), value: dest)
+    ops.append(uop)
+    return value(dest)
+  }
+
   func storeGradMemory(_ cellId: CellID, _ val: Expr) -> Expr {
     let dest = ctx.useVariable(src: nil)
     let uop = UOp(op: .storeGradMemory(cellId, val.lazy), value: dest)

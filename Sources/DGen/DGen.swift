@@ -17,6 +17,14 @@ public class IRContext {
     public var constants: [ConstantID: Float] = [:]
     public var variables: [VarID: NodeID] = [:]
     public var tapeIndex: [NodeID: Int] = [:]
+    public var seedGradients: [GradID] = []
+
+    public func getGlobalId(_ varId: VarID) -> Int {
+        if let index = globals.firstIndex(of: varId) {
+            return globals.distance(from: globals.startIndex, to: index)
+        }
+        return 0
+    }
 
     public func useConstant(src: NodeID?, value: Float) -> Lazy {
         if let existing = constantIdByValue[value] {
@@ -35,12 +43,16 @@ public class IRContext {
         return constant
     }
 
-    public func useGradient(src: NodeID) -> GradID {
+    public func useGradient(src: NodeID, seed: Bool = false) -> GradID {
         if let gradId = self.gradients[src] {
             return gradId
         }
         let gradId = self.gradIdx + 1
         self.gradIdx = gradId
+        self.gradients[src] = gradId
+        if seed {
+            self.seedGradients.append(gradId)
+        }
         return gradId
     }
 

@@ -556,6 +556,22 @@ public func fuseBlocks(_ blocks: [Block]) -> [Block] {
     return fused
 }
 
+public func splitBlocksIfNeeded(_ blocks: [Block], backend: Backend) -> [Block] {
+    if case .c = backend {
+        return blocks
+    }
+
+    var split: [Block] = []
+    for b in blocks {
+        if b.kind == .simd {
+            // only split simd since scalar blocks must be executed together
+        } else {
+            split.append(b)
+        }
+    }
+    return split
+}
+
 extension LazyOp {
     var isOutput: Bool {
         if case .output = self { return true }
@@ -659,6 +675,49 @@ public func findNodesAsInboundDependencies(_ blks: [Block], _ g: Graph, block: B
         }
     }
     return need
+}
+
+public func countNeededBuffersForBlock(
+    ctx: IRContext, block: Block, blocks: [Block], g: Graph
+) -> Int {
+    var emittedNodes: Set<NodeID> = []
+
+    for nodeId in block.nodes {
+        if let node = g.nodes[nodeId] {
+            emittedNodes.insert(nodeId)
+
+        }
+    }
+
+    var bufferCounts = 0
+    let outbound = findNodesWithOutboundDependencies(blocks, g, block: block)
+    for nodeId in outbound {
+        if emittedNodes.contains(nodeId) {
+            if let lz = ctx.values[nodeId] {
+                switch lz {
+                case .variable(let a, _):
+                    bufferCounts += 1
+                default:
+                    break
+                }
+            }
+        }
+    }
+
+    let inbound = findNodesAsInboundDependencies(blocks, g, block: block)
+
+    for nodeId in inbound {
+        if let lz = ctx.values[nodeId] {
+            switch lz {
+            case .variable(let a, _):
+                bufferCounts += 1
+            default:
+                break
+            }
+        }
+    }
+
+    return bufferCounts
 }
 
 public func emitBlockUOps(

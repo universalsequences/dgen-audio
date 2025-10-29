@@ -122,7 +122,10 @@ public struct CompilationPipeline {
 
         // Since we're using corridor-aware topological sort, blocks are already properly ordered
         // Fuse adjacent blocks of the same kind to reduce cross-block communication
+
+        // rather than having a different buffer for each value we could have one giant array and significantly reduce the number of cross-chain-blocks needed
         let fusedBlocks = fuseBlocks(blocks)
+        //let splitBlocks = splitBlocksIfNeeded(blocks, backend)
         var finalBlocks = fusedBlocks.compactMap { $0 }
 
         if options.backwards {
@@ -198,7 +201,7 @@ public struct CompilationPipeline {
             backend: backend,
             totalMemorySlots: cellAllocations.totalMemorySlots,
             cellAllocations: cellAllocations,
-            voiceCellId: voiceCellIdFinal
+            voiceCellId: voiceCellIdFinal,
         )
     }
 

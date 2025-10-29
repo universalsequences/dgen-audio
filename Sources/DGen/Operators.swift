@@ -530,16 +530,20 @@ public enum LazyOp {
             return []
         }
 
-        // default gradOutput of 1 (i.e. seed)
+        var ops: [UOp] = []
+        let b = IRBuilder(ctx: ctx, nodeId: nodeId)
+
+        // we'll assume that gradient seeds are set to 1 before running an epoch, and everything else is 0
         var gradOutput = ctx.useConstant(src: nil, value: 1.0)
         if let gradCellId = ctx.gradients[nodeId] {
-            // if grad cell exists turn this into "loadGrad" -- loadGrad must be "fetch this grad from this cell"
+            gradOutput = b.loadGrad(gradCellId).lazy
+        } else {
+            let gradCellId = ctx.useGradient(src: nodeId, seed: true)
+            gradOutput = b.loadGrad(gradCellId).lazy
         }
 
         // Collect operands
         let inputs: [Lazy] = node.inputs.compactMap { ctx.values[$0] }
-        var ops: [UOp] = []
-        let b = IRBuilder(ctx: ctx, nodeId: nodeId)
 
         switch self {
         case .constant(_):
@@ -548,6 +552,7 @@ public enum LazyOp {
             // constant is a leaf so it'd be at the very end anyway so probably fine
             return []
         case .click:
+            // TODO - implement backprop for click
             break
         case .add:
             // d(x+y)/dx = 1, d(x+y)/dy = 1
@@ -567,9 +572,10 @@ public enum LazyOp {
             guard node.inputs.count == 2 else { fatalError("mod requires 2 inputs") }
             b.grad(node.inputs[0], value: gradOutput)
             b.grad(node.inputs[1], value: ctx.useConstant(src: nil, value: 0.0))
-        case .param(let cellId):
-            // Accumulate gradient for this parameter into gradient memory
-            _ = b.storeGradMemory(cellId, b.value(gradOutput))
+        case .param(_):
+            // the canonical gradient for the param already lives in gradients, in the row for that param’s gradId.
+            // There’s nothing left to push. It’s a leaf.
+            break
         case .min:
             // d(min(x,y))/dx = (x <= y) ? 1 : 0, d(min(x,y))/dy = (y < x) ? 1 : 0
             guard inputs.count == 2 else { fatalError("min requires 2 inputs") }
@@ -599,6 +605,8 @@ public enum LazyOp {
             let lhs = b.tapeValue(node.inputs[0])
             let gradX = b.value(gradOutput) * rhs
             let gradY = b.value(gradOutput) * lhs
+            print(
+                "GRAD CALLED FOR MUL with inputs[0]=\(node.inputs[0]) inputs[1]=\(node.inputs[1])")
             b.grad(node.inputs[0], value: gradX.lazy)
             b.grad(node.inputs[1], value: gradY.lazy)
         case .div:

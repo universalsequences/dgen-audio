@@ -80,6 +80,7 @@ protocol UOpEmitter {
 }
 
 open class Renderer {
+
     open func prepareSchedule(
         _ scheduleItems: inout [ScheduleItem], _ blocks: [BlockUOps], _ ctx: IRContext,
         _ frameCount: Int
@@ -109,7 +110,8 @@ public class CRenderer: Renderer {
     public var voiceCount: Int = 1
     public var voiceCellIdOpt: Int? = nil
 
-    public override init() {}
+    public override init() {
+    }
 
     public override func compile(
         scheduleItems: [ScheduleItem],
@@ -804,8 +806,10 @@ public class CRenderer: Renderer {
 
 public class MetalRenderer: Renderer, UOpEmitter {
     let memoryVarID = -1  // Virtual ID for the global memory buffer
+    var needsSegmenting = false
 
-    public override init() {}
+    public override init() {
+    }
 
     public override func compile(
         scheduleItems: [ScheduleItem],
@@ -828,11 +832,28 @@ public class MetalRenderer: Renderer, UOpEmitter {
             if bufferRequirements.hasOutputOps {
                 bufferNames.append("outputs")
             }
+
+            var hasMemory = false
+            var hasCrossKernelBuffers = false
             // Use same sorted order as render() method
             for bufferId in allBuffers.sorted() {
-                let bufferName = bufferId == memoryVarID ? "memory" : "t\(bufferId)"
-                bufferNames.append(bufferName)
+                if bufferId == memoryVarID {
+                    hasMemory = true
+                } else {
+                    hasCrossKernelBuffers = true
+                }
             }
+
+            // ordering must match
+            if hasMemory {
+                bufferNames.append("memory")
+            }
+
+            if hasCrossKernelBuffers {
+                bufferNames.append("t")
+            }
+
+            print("ORDERED BUFFER NAMES=\(bufferNames)")
 
             // Add frameCount buffer for all Metal kernels (needed for output operations)
             bufferNames.append("frameCount")
@@ -944,10 +965,24 @@ public class MetalRenderer: Renderer, UOpEmitter {
             bufferIndex += 1
         }
 
+        var hasMemory = false
+        var hasCrossKernelBuffers = false
         // Add other buffers
         for bufferId in allBuffers.sorted() {
-            let bufferName = bufferId == memoryVarID ? "memory" : "t\(bufferId)"
-            parameters.append("    device float *\(bufferName) [[buffer(\(bufferIndex))]]")
+            if bufferId == memoryVarID {
+                hasMemory = true
+            } else {
+                hasCrossKernelBuffers = true
+            }
+        }
+
+        if hasMemory {
+            parameters.append("    device float *memory [[buffer(\(bufferIndex))]]")
+            bufferIndex += 1
+        }
+
+        if hasCrossKernelBuffers {
+            parameters.append("    device float *t [[buffer(\(bufferIndex))]]")
             bufferIndex += 1
         }
 
@@ -990,6 +1025,8 @@ public class MetalRenderer: Renderer, UOpEmitter {
             kernels += "  threadgroup float __dgen_store_tmp[128];\n"
         }
 
+        self.needsSegmenting = bufferRequirements.needsSegmenting
+
         for uop in scheduleItem.ops {
             var diff = 0
             switch uop.op {
@@ -1001,7 +1038,8 @@ public class MetalRenderer: Renderer, UOpEmitter {
                 break
             }
 
-            kernels += "\(String(repeating: "  ", count: indent))\(emit(uop, ctx: ctx))\n"
+            kernels +=
+                "\(String(repeating: "  ", count: indent))\(emit(uop, ctx: ctx))\n"
             indent += diff
         }
 
@@ -1158,7 +1196,6 @@ public class MetalRenderer: Renderer, UOpEmitter {
             return emitAssign(uop, expr, ctx)
 
         case let .load(cell): return emitAssign(uop, "memory[\(cell)]", ctx)
-        case let .loadGrad(gradId): return emitAssign(uop, "gradients[\(gradId)]", ctx)
         case let .loadGradMemory(cellId): return emitAssign(uop, "grad_memory[\(cellId)]", ctx)
         case let .frameIndex: return emitAssign(uop, "i", ctx)
         case let .loadTape(offset):
@@ -1166,7 +1203,12 @@ public class MetalRenderer: Renderer, UOpEmitter {
             return emitAssign(uop, "tape[\(offset) + \(idx)]", ctx)
         case let .store(cell, val): return "memory[\(cell)] = \(g(val));"
         case let .storeGradMemory(cell, val): return "grad_memory[\(cell)] = \(g(val));"
-        case let .accumulateGrad(gradId, val): return "gradients[\(gradId)] += \(g(val));"
+        case let .loadGrad(gradId):
+            return emitAssign(
+                uop, "gradients[frameCount * \(gradId) + \(uop.kind == .scalar ? "i" : "id")]", ctx)
+        case let .accumulateGrad(gradId, val):
+            return
+                "gradients[frameCount*\(gradId)+\(uop.kind == .scalar ? "i" : "id")] += \(g(val));"
         case let .mutate(a, b):
             return "\(emitLazy(a, ctx: ctx, kind: uop.kind, isOut: true)) = \(g(b));"
         case let .beginIf(cond): return "if (\(g(cond))) {"
@@ -1202,14 +1244,16 @@ public class MetalRenderer: Renderer, UOpEmitter {
                 return "frameCount"
             } else if ctx.globals.contains(id) {
                 let idx = (kind == .simd) ? "id" : "i"
-                return "t\(id)[\(idx)]"
+                return
+                    "t[\(ctx.getGlobalId(id))*frameCount + \(needsSegmenting ? "segmentBase + " : "") \(idx)]"
             } else {
                 return "t\(id)"
             }
         case let .global(id):
             // Global variables are accessed through global buffers
             let idx = (kind == .simd) ? "id" : "i"
-            return "t\(id)[\(idx)]"
+            return
+                "t[\(ctx.getGlobalId(id))*frameCount + \(needsSegmenting ? "segmentBase + " : "")\(idx)]"
         default: return "/* unknown lazy */"
         }
     }
