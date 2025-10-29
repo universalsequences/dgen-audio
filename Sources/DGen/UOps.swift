@@ -2,6 +2,7 @@ public enum Lazy {
   case constant(ConstantID, Float)
   case global(VarID)
   case variable(VarID, NodeID?)
+  case gradient(GradID)
   case empty
 }
 
@@ -14,6 +15,7 @@ public enum Op {
   case delay1(CellID, Lazy)
   case loadGrad(CellID)
   case storeGrad(CellID, Lazy)
+  case accumulateGrad(GradID, Lazy)
   case mse(Lazy, Lazy)
   case mutate(Lazy, Lazy)
   case add(Lazy, Lazy)

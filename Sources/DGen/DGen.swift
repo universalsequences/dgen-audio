@@ -2,6 +2,7 @@ import Foundation
 
 public class IRContext {
     private var varIdx = 0
+    private var gradIdx = 0
     private var constantIdx = 0
     // Reuse constant IDs for identical values to reduce duplicate vdupq constants
     private var constantIdByValue: [Float: ConstantID] = [:]
@@ -12,7 +13,7 @@ public class IRContext {
 
     // map of nodeId -> Lazy value (variable or constant)
     public var values: [NodeID: Lazy] = [:]
-    public var gradients: [NodeID: Lazy] = [:]
+    public var gradients: [NodeID: GradID] = [:]
     public var constants: [ConstantID: Float] = [:]
     public var variables: [VarID: NodeID] = [:]
     public var tapeIndex: [NodeID: Int] = [:]
@@ -32,6 +33,15 @@ public class IRContext {
         let constant = Lazy.constant(constantId, value)
         if let srcId = src { self.values[srcId] = constant }
         return constant
+    }
+
+    public func useGradient(src: NodeID) -> GradID {
+        if let gradId = self.gradients[src] {
+            return gradId
+        }
+        let gradId = self.gradIdx + 1
+        self.gradIdx = gradId
+        return gradId
     }
 
     public func useVariable(src: NodeID?, trackInValues: Bool = true) -> Lazy {

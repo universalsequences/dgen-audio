@@ -1161,7 +1161,8 @@ public class MetalRenderer: Renderer, UOpEmitter {
             let idx = (uop.kind == .simd) ? "id" : "i"
             return emitAssign(uop, "tape[\(offset) + \(idx)]", ctx)
         case let .store(cell, val): return "memory[\(cell)] = \(g(val));"
-
+        case let .storeGrad(cell, val): return "grad_memory\(cell)] += \(g(val));"
+        case let .accumulateGrad(gradId, val): return "gradients\(gradId)] += \(g(val));"
         case let .mutate(a, b):
             return "\(emitLazy(a, ctx: ctx, kind: uop.kind, isOut: true)) = \(g(b));"
         case let .beginIf(cond): return "if (\(g(cond))) {"

@@ -1,9 +1,11 @@
 public enum Kind { case simd, scalar }
+public enum Direction { case forward, backwards }
 
 // corresponds to one kernel (metal backends) or for loop (in C backend)
 public struct Block: Equatable {
     public var kind: Kind
     public var nodes: [NodeID] = []
+    public var direction: Direction = .forward
 
     public init(kind: Kind) {
         self.kind = kind
@@ -580,7 +582,9 @@ public func findOutputNodeNeeds(_ b: Block, _ g: Graph) -> Set<NodeID> {
 
 // ─── 3. decide which nodes need cross-block scratch buffers ─────
 // in the case of metal, these are transmitted via buffers
-public func findNodesWithOutboundDependencies(_ blks: [Block], _ g: Graph, block: Block) -> Set<NodeID> {
+public func findNodesWithOutboundDependencies(_ blks: [Block], _ g: Graph, block: Block) -> Set<
+    NodeID
+> {
     // Map node -> block index
     var nodeBlock = [NodeID: Int]()
     for (bidx, b) in blks.enumerated() { b.nodes.forEach { nodeBlock[$0] = bidx } }
@@ -591,7 +595,7 @@ public func findNodesWithOutboundDependencies(_ blks: [Block], _ g: Graph, block
     var groupForBlock = Array(repeating: 0, count: blks.count)
     var group = 0
     for i in 0..<blks.count {
-        if i > 0 && blks[i].kind != blks[i-1].kind { group += 1 }
+        if i > 0 && blks[i].kind != blks[i - 1].kind { group += 1 }
         groupForBlock[i] = group
     }
     let thisGroup = groupForBlock[thisIdx]
@@ -615,7 +619,8 @@ public func findNodesWithOutboundDependencies(_ blks: [Block], _ g: Graph, block
     return need
 }
 
-public func findNodesAsInboundDependencies(_ blks: [Block], _ g: Graph, block: Block) -> Set<NodeID> {
+public func findNodesAsInboundDependencies(_ blks: [Block], _ g: Graph, block: Block) -> Set<NodeID>
+{
     guard let thisIdx = blks.firstIndex(of: block) else { return [] }
 
     // Map node -> block index
@@ -626,7 +631,7 @@ public func findNodesAsInboundDependencies(_ blks: [Block], _ g: Graph, block: B
     var groupForBlock = Array(repeating: 0, count: blks.count)
     var group = 0
     for i in 0..<blks.count {
-        if i > 0 && blks[i].kind != blks[i-1].kind { group += 1 }
+        if i > 0 && blks[i].kind != blks[i - 1].kind { group += 1 }
         groupForBlock[i] = group
     }
     let thisGroup = groupForBlock[thisIdx]
@@ -643,15 +648,6 @@ public func findNodesAsInboundDependencies(_ blks: [Block], _ g: Graph, block: B
     return need
 }
 
-// ─── decide which forward values from other blocks are needed for backward pass ─────
-
-// TODO - implement back prop emitBlocks
-// Back props blocks needs to understand its dependencies, i.e. what values that come from other blocks' buffers
-// are required
-// Ideally this would be emitted directly from the emitBackward() so that we get a list of uops along with
-// what their dependencies are
-//
-
 public func emitBlockUOps(
     ctx: IRContext, block: Block, blocks: [Block], g: Graph, debug: Bool = false
 ) throws -> [UOp] {
@@ -659,8 +655,7 @@ public func emitBlockUOps(
 
     var uops: [UOp] = []
     for nodeId in block.nodes {
-        if var node = g.nodes[nodeId] {
-            var indentLevel = 0
+        if let node = g.nodes[nodeId] {
             for uop in try node.op.emit(ctx: ctx, g: g, nodeId: nodeId) {
                 emittedNodes.insert(nodeId)
 

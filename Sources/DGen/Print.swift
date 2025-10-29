@@ -121,6 +121,8 @@ extension UOp {
             opStr = "\(ANSI.magenta)loadGrad\(ANSI.reset)(\(a))"
         case let .storeGrad(a, b):
             opStr = "\(ANSI.magenta)storeGrad\(ANSI.reset)(\(a), \(b))"
+        case let .accumulateGrad(a, b):
+            opStr = "\(ANSI.magenta)accumulateGrad\(ANSI.reset)(\(a), \(b))"
         case let .loadTape(a):
             opStr = "\(ANSI.magenta)loadTape\(ANSI.reset)(\(a))"
         case let .mse(a, b):

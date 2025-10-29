@@ -56,12 +56,14 @@ public struct CompilationPipeline {
         public let forceScalar: Bool
         public let voiceCount: Int
         public let voiceCellId: Int?
+        public let backwards: Bool
 
         public init(
             frameCount: Int = 128,
             debug: Bool = false,
             printBlockStructure: Bool = false,
             forceScalar: Bool = false,
+            backwards: Bool = false,
             voiceCount: Int = 1,
             voiceCellId: Int? = nil
         ) {
@@ -71,6 +73,7 @@ public struct CompilationPipeline {
             self.forceScalar = forceScalar
             self.voiceCount = voiceCount
             self.voiceCellId = voiceCellId
+            self.backwards = backwards
         }
     }
 
@@ -120,14 +123,23 @@ public struct CompilationPipeline {
         // Since we're using corridor-aware topological sort, blocks are already properly ordered
         // Fuse adjacent blocks of the same kind to reduce cross-block communication
         let fusedBlocks = fuseBlocks(blocks)
-        let finalBlocks = fusedBlocks
+        var finalBlocks = fusedBlocks.compactMap { $0 }
+
+        if options.backwards {
+            for block in fusedBlocks.reversed() {
+                var backwardsBlock = Block(kind: block.kind)
+                backwardsBlock.nodes = block.nodes.reversed()
+                backwardsBlock.direction = .backwards
+                finalBlocks.append(backwardsBlock)
+            }
+        }
+
         let finalBlockIndices = Array(0..<finalBlocks.count)
 
         // Step 5: Convert blocks to UOp blocks
         let context = IRContext()
         var uopBlocks = [BlockUOps]()
 
-        print("\(ANSI.red)DEBUG=\(options.debug)\(String(repeating: "*", count: 32))\(ANSI.reset)")
         for blockIdx in finalBlockIndices {
             let block = finalBlocks[blockIdx]
             let ops = try emitBlockUOps(
@@ -146,12 +158,9 @@ public struct CompilationPipeline {
         // Step 7: Lower UOp blocks to compiled kernels
         // Ensure a dedicated voice cell exists when voiceCount > 1
         var voiceCellIdFinal: Int? = options.voiceCellId
-        print("VOICE CELL ID option=\(options.voiceCellId)")
         if options.voiceCount > 1 && voiceCellIdFinal == nil {
             voiceCellIdFinal = graph.alloc()  // Reserve a cell for voice index
         }
-
-        print("\(ANSI.red)VOICE CELLID FINAL=\(voiceCellIdFinal)\(ANSI.reset)")
 
         // Step 6: Fix memory slot conflicts for vector operations
         let cellAllocations = remapVectorMemorySlots(&uopBlocks)
@@ -229,41 +238,6 @@ extension CompilationResult {
     /// Check if compilation produced any kernels
     public var hasKernels: Bool {
         !kernels.isEmpty
-    }
-}
-
-// MARK: - Simplified API
-
-extension CompilationPipeline {
-    /// Compile a graph and return just the kernels (for backward compatibility)
-    public static func compileToKernels(
-        graph: Graph,
-        backend: Backend,
-        frameCount: Int = 128,
-        debug: Bool = false,
-        forceScalar: Bool = false
-    ) throws -> [CompiledKernel] {
-        let result = try compile(
-            graph: graph,
-            backend: backend,
-            options: Options(frameCount: frameCount, debug: debug, forceScalar: forceScalar)
-        )
-        return result.kernels
-    }
-
-    /// Compile a graph and return just the source code
-    public static func compileToSource(
-        graph: Graph,
-        backend: Backend,
-        frameCount: Int = 128,
-        forceScalar: Bool = false
-    ) throws -> String {
-        let result = try compile(
-            graph: graph,
-            backend: backend,
-            options: Options(frameCount: frameCount, forceScalar: forceScalar)
-        )
-        return result.source
     }
 }
 

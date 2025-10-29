@@ -14,6 +14,12 @@ public final class IRBuilder {
     return Expr(lazy, ctx: ctx, nodeId: nodeId, builder: self)
   }
 
+  public func grad(_ nodeId: NodeID, value: Lazy) {
+    let gradId = ctx.useGradient(src: nodeId)
+    let uop = UOp(op: .accumulateGrad(gradId, value), value: value)
+    ops.append(uop)
+  }
+
   func values(_ inputs: [Lazy], count: Int) -> (Expr, Expr) {
     guard inputs.count == count else { fatalError("expected \(count) values") }
     return (value(inputs[0]), value(inputs[1]))
@@ -126,18 +132,10 @@ public final class IRBuilder {
   // Uses ctx.tapeIndex to find the per-node offset; returns an Expr referencing that value.
   func tapeValue(_ nodeId: NodeID) -> Expr {
     if let lazy = ctx.values[nodeId] {
-      if case .constant(_, _) = lazy {
-        return value(lazy)
-      }
+      return value(lazy)
     }
 
-    guard let offset = ctx.tapeIndex[nodeId] else {
-      fatalError("tapeIndex missing for nodeId \(nodeId)")
-    }
-    let dest = ctx.useVariable(src: self.nodeId)
-    let uop = UOp(op: .loadTape(offset), value: dest)
-    ops.append(uop)
-    return value(dest)
+    fatalError("no tape")
   }
 
   public func mse(_ a: Expr, _ b: Expr) -> Expr {

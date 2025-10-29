@@ -31,6 +31,7 @@ _ = g.n(.output(0), g.n(.mul, delayed, g.n(.constant(0.5))))
 let seconds: Double = 10.0
 let sampleRate: Double = 44100
 
+/*
 // Compile and render with C backend to WAV
 let cResult = try CompilationPipeline.compile(
   graph: g, backend: .c, options: .init(frameCount: 128, debug: true))
@@ -45,10 +46,12 @@ let cURL = URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
   .appendingPathComponent("biquad_c.wav")
 try cRuntime.writeWAV(to: cURL, seconds: seconds, sampleRate: sampleRate, volumeScale: 0.1)
 print("Wrote C WAV to \(cURL.path)")
+ */
 
 // Compile and render with Metal backend to WAV
 let mResult = try CompilationPipeline.compile(
-  graph: g, backend: .metal, options: .init(frameCount: 128, debug: false))
+  graph: g, backend: .metal,
+  options: .init(frameCount: 128, debug: false, forceScalar: false, backwards: true))
 for kernel in mResult.kernels {
   print(kernel.source)
 
