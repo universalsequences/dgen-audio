@@ -62,9 +62,10 @@ public struct Adam: Optimizer {
 
     private var m: [Float] = []  // First moment
     private var v: [Float] = []  // Second moment
-    private var t: Int = 0       // Timestep
+    private var t: Int = 0  // Timestep
 
-    public init(lr: Float = 0.001, beta1: Float = 0.9, beta2: Float = 0.999, epsilon: Float = 1e-8) {
+    public init(lr: Float = 0.001, beta1: Float = 0.9, beta2: Float = 0.999, epsilon: Float = 1e-8)
+    {
         self.learningRate = lr
         self.beta1 = beta1
         self.beta2 = beta2
@@ -147,7 +148,8 @@ public class TrainingContext {
 
         // Verify we have seed gradients (loss nodes)
         guard !context.seedGradients.isEmpty else {
-            fatalError("""
+            fatalError(
+                """
                 No seed gradients found!
 
                 You must either:
@@ -182,7 +184,9 @@ public class TrainingContext {
         for param in parameters {
             guard param.gradId != nil else {
                 let name = param.name ?? "unnamed"
-                fatalError("Parameter '\(name)' (node \(param.nodeId)) has no gradient. Did you set backwards: true?")
+                fatalError(
+                    "Parameter '\(name)' (node \(param.nodeId)) has no gradient. Did you set backwards: true?"
+                )
             }
         }
     }
@@ -200,17 +204,14 @@ public class TrainingContext {
         // DEBUG: Check if seed gradient is still 1.0 after backward pass
         if let firstSeed = context?.seedGradients.first {
             let seedIdx = frameCount * firstSeed
-            print("   [DEBUG] After backward pass, seed gradient[\(seedIdx)] = \(gradPtr[seedIdx])")
 
             // Check all gradIds to see where gradients are
-            print("   [DEBUG] Checking all gradient IDs:")
             for gradId in 0...7 {
                 let idx = frameCount * gradId
                 var sum: Float = 0.0
                 for i in 0..<min(4, frameCount) {
                     sum += gradPtr[idx + i]
                 }
-                print("      gradId=\(gradId): first4_sum=\(sum), [0]=\(gradPtr[idx])")
             }
         }
 
@@ -230,12 +231,6 @@ public class TrainingContext {
             // Use mean instead of sum (average over frames)
             let meanGrad = totalGrad / Float(frameCount)
 
-            // Debug first extraction
-            if context?.seedGradients.isEmpty == false {
-                let name = param.name ?? "param\(param.nodeId)"
-                print("   [DEBUG] Extracting \(name): gradId=\(gradId), baseIndex=\(baseIndex), totalGrad=\(totalGrad), meanGrad=\(meanGrad)")
-            }
-
             return meanGrad
         }
     }
@@ -249,14 +244,23 @@ public class TrainingContext {
 
         runtime.resetGradientBuffers(numFrames: frameCount)
 
-        // DEBUG: Verify seed gradients were set
-        if let firstSeed = context?.seedGradients.first {
-            let gradPtr = runtime.getGradientsBuffer()
-            let checkIdx = frameCount * firstSeed
-            print("   [DEBUG] After reset, checking gradients[\(checkIdx)] = \(gradPtr[checkIdx])")
-        }
-
         optimizer.zeroGrad()
+
+        // Reset runtime memory for the next forward pass, but preserve parameter values.
+        // We operate on the host-side memory pointer that will be copied into the Metal
+        // memory buffer inside runWithMemory().
+        if let mem = self.memory, let runtime = self.runtime, let cellAlloc = self.cellAllocations {
+            // Zero all memory
+            let memorySize = runtime.getMemorySize()
+            memset(mem, 0, memorySize * MemoryLayout<Float>.size)
+
+            // Restore parameter values into their physical cells
+            let memPtr = mem.assumingMemoryBound(to: Float.self)
+            for param in parameters {
+                let physicalCell = cellAlloc.cellMappings[param.cellId] ?? param.cellId
+                memPtr[physicalCell] = param.value
+            }
+        }
     }
 
     /// Update parameters using gradients and optimizer
@@ -264,31 +268,28 @@ public class TrainingContext {
         // Extract gradients from gradient buffer
         let gradients = extractGradients()
 
-        // Debug: Print gradients
-        if gradients.contains(where: { $0 != 0.0 }) {
-            print("   [DEBUG] Gradients: \(gradients.map { String(format: "%.6f", $0) })")
-        } else {
-            print("   [DEBUG] WARNING: All gradients are zero!")
-        }
-
         // Update parameters via optimizer
         optimizer.step(parameters: &parameters, gradients: gradients)
 
-        // Write updated values back to memory
-        // For Metal, we need to write to the GPU's memory buffer directly
-        guard let runtime = runtime, let cellAllocations = cellAllocations else {
+        // Write updated values back to host memory that is passed to runWithMemory.
+        // runWithMemory will copy this host memory into the Metal buffer at call time.
+        guard let mem = self.memory, let cellAlloc = self.cellAllocations else {
             fatalError("Memory not initialized")
         }
-
-        // Get the actual GPU memory buffer (not the external pointer)
-        guard let memBuffer = runtime.getBuffer(name: "memory") else {
-            fatalError("No memory buffer found")
+        let memPtr = mem.assumingMemoryBound(to: Float.self)
+        for param in parameters {
+            let physicalCell = cellAlloc.cellMappings[param.cellId] ?? param.cellId
+            memPtr[physicalCell] = param.value
         }
 
-        let memPtr = memBuffer.contents().assumingMemoryBound(to: Float.self)
-        for param in parameters {
-            let physicalCell = cellAllocations.cellMappings[param.cellId] ?? param.cellId
-            memPtr[physicalCell] = param.value
+        // Also mirror into the Metal buffer now so any debug reads of `memory` buffer
+        // reflect the latest parameter values before the next runWithMemory call.
+        if let rt = self.runtime, let memBuffer = rt.getBuffer(name: "memory") {
+            let gpuMemPtr = memBuffer.contents().assumingMemoryBound(to: Float.self)
+            for param in parameters {
+                let physicalCell = cellAlloc.cellMappings[param.cellId] ?? param.cellId
+                gpuMemPtr[physicalCell] = param.value
+            }
         }
     }
 

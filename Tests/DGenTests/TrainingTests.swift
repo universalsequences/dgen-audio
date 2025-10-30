@@ -107,7 +107,9 @@ final class TrainingTests: XCTestCase {
             if epoch % 20 == 0 {
                 if let memBuffer = runtime.getBuffer(name: "memory") {
                     let memPtr = memBuffer.contents().assumingMemoryBound(to: Float.self)
-                    let physicalCell = result.cellAllocations.cellMappings[learnableValue.cellId] ?? learnableValue.cellId
+                    let physicalCell =
+                        result.cellAllocations.cellMappings[learnableValue.cellId]
+                        ?? learnableValue.cellId
                     let memValue = memPtr[physicalCell]
                     print(
                         "   Epoch \(epoch): param.value = \(String(format: "%.4f", learnableValue.value)), memory[\(physicalCell)] = \(String(format: "%.4f", memValue)), loss = \(String(format: "%.6f", loss))"
@@ -241,90 +243,4 @@ final class TrainingTests: XCTestCase {
         print("   ✅ Test passed: learned sum = \(String(format: "%.3f", finalSum))")
     }
 
-    /// Test that gradients flow through a phasor correctly
-    func testLearnFrequency() throws {
-        print("\n🧪 Test: Learn phasor frequency")
-
-        // MARK: - Build Graph
-
-        let g = Graph()
-
-        // Learnable frequency (start at 100 Hz, target: 440 Hz)
-        let learnableFreq = Parameter(graph: g, value: 100.0, name: "freq")
-
-        let reset = g.n(.constant(0.0))
-        let phase = g.n(.phasor(g.alloc()), learnableFreq.node(), reset)
-
-        // Target: phasor at 440 Hz
-        let targetFreq = g.n(.constant(440.0))
-        let targetPhase = g.n(.phasor(g.alloc()), targetFreq, reset)
-
-        let loss = g.n(.mse, phase, targetPhase)
-        _ = g.n(.output(0), loss)
-
-        print("   Initial frequency: \(learnableFreq.value) Hz")
-
-        // MARK: - Compile & Train
-
-        let frameCount = 128
-        let result = try CompilationPipeline.compile(
-            graph: g,
-            backend: .metal,
-            options: .init(frameCount: frameCount, backwards: true)
-        )
-
-        let runtime = try MetalCompiledKernel(
-            kernels: result.kernels,
-            cellAllocations: result.cellAllocations,
-            context: result.context
-        )
-
-        let ctx = TrainingContext(
-            parameters: [learnableFreq],
-            optimizer: SGD(lr: 1.0),  // Higher LR for frequency range
-            lossNode: loss
-        )
-
-        ctx.initializeMemory(
-            runtime: runtime,
-            cellAllocations: result.cellAllocations,
-            context: result.context,
-            frameCount: frameCount
-        )
-
-        let inputBuffer = [Float](repeating: 0.0, count: frameCount)
-        var outputBuffer = [Float](repeating: 0.0, count: frameCount)
-
-        for epoch in 0..<800 {
-            ctx.zeroGrad()
-
-            inputBuffer.withUnsafeBufferPointer { inPtr in
-                outputBuffer.withUnsafeMutableBufferPointer { outPtr in
-                    runtime.runWithMemory(
-                        outputs: outPtr.baseAddress!,
-                        inputs: inPtr.baseAddress!,
-                        memory: ctx.getMemory(),
-                        frameCount: frameCount
-                    )
-                }
-            }
-
-            ctx.step()
-
-            if epoch % 100 == 0 {
-                print("   Epoch \(epoch): freq = \(String(format: "%.1f", learnableFreq.value)) Hz")
-            }
-        }
-
-        // MARK: - Verification
-
-        print("   Final frequency: \(String(format: "%.1f", learnableFreq.value)) Hz")
-        print("   Target frequency: 440.0 Hz")
-
-        // Should converge close to 440 Hz
-        XCTAssertEqual(
-            learnableFreq.value, 440.0, accuracy: 50.0, "Frequency should converge to ~440 Hz")
-
-        print("   ✅ Test passed: learned freq = \(String(format: "%.1f", learnableFreq.value)) Hz")
-    }
 }

@@ -11,7 +11,7 @@ final class BasicCompilationTests: XCTestCase {
         // Add some basic operations: x + y where x = 2.0, y = 3.0
         let x = graph.n(.constant(2.0))
         let y = graph.n(.constant(3.0))
-        let _ = graph.n(.add, x, y)
+        let _ = graph.n(.output(0), graph.n(.add, x, y))
 
         // Compile the graph to UOps
         let compilationResult = try CompilationPipeline.compile(
