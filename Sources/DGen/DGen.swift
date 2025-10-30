@@ -98,12 +98,7 @@ public final class Graph {
     }
 
     @discardableResult public func n(_ op: LazyOp, _ ins: [NodeID]) -> NodeID {
-        // Special expansion for spectralLoss: compute from tape windows (no ring writes)
-        if case let .spectralLoss(_, _, windowSize) = op, ins.count == 2 {
-            let sig1 = ins[0]
-            let sig2 = ins[1]
-            return n(.spectralLossTape(windowSize), sig1, sig2)
-        }
+        // No special spectralLoss expansion (use Graph.spectralLoss API)
 
         let id = next
         next += 1
@@ -187,6 +182,12 @@ public final class Graph {
     }
 
     // Higher-level compound operations
+
+    /// Spectral loss: compute DFT-based magnitude MSE between two signals over a window
+    /// Uses tape-based compute; no ring buffers are required.
+    public func spectralLoss(_ sig1: NodeID, _ sig2: NodeID, windowSize: Int) -> NodeID {
+        return n(.spectralLossTape(windowSize), sig1, sig2)
+    }
 
     /// Delta: returns the difference between current and previous input value
     /// delta(input) = input - history(input)

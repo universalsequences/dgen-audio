@@ -290,41 +290,7 @@ func remapVectorMemorySlots(_ uopBlocks: inout [BlockUOps]) -> CellAllocations {
             case let .scalarMemoryWrite(cellId, _, _):
                 allCellIds.insert(cellId)
                 memoryUsage[cellId] = .scalar
-            case let .spectralLoss(buf1Cell, buf2Cell, windowSize, _):
-                // spectralLoss uses two ring buffers of size (windowSize + 1)
-                let bufferSize = windowSize + 1
-                // Reserve range for buf1
-                for i in 0..<bufferSize {
-                    let cellId = buf1Cell + CellID(i)
-                    allCellIds.insert(cellId)
-                    // Force scalar to keep ring buffers at original slots
-                    memoryUsage[cellId] = .scalar
-                }
-                // Reserve range for buf2
-                for i in 0..<bufferSize {
-                    let cellId = buf2Cell + CellID(i)
-                    allCellIds.insert(cellId)
-                    memoryUsage[cellId] = .scalar
-                }
-            case let .spectralLossBackward(buf1Cell, buf2Cell, windowSize, _, _, _, _):
-                // spectralLossBackward also uses ring buffers in grad_memory (same size)
-                let bufferSize = windowSize + 1
-                // Reserve range for buf1
-                for i in 0..<bufferSize {
-                    let cellId = buf1Cell + CellID(i)
-                    allCellIds.insert(cellId)
-                    if memoryUsage[cellId] == nil {
-                        memoryUsage[cellId] = block.kind
-                    }
-                }
-                // Reserve range for buf2
-                for i in 0..<bufferSize {
-                    let cellId = buf2Cell + CellID(i)
-                    allCellIds.insert(cellId)
-                    if memoryUsage[cellId] == nil {
-                        memoryUsage[cellId] = block.kind
-                    }
-                }
+            // Removed ring-only spectral reservations
             default:
                 break
             }
@@ -402,14 +368,7 @@ func remapVectorMemorySlots(_ uopBlocks: inout [BlockUOps]) -> CellAllocations {
                         kind: uop.kind
                     )
                 }
-            case let .spectralLoss(buf1Cell, buf2Cell, windowSize, _):
-                // spectralLoss buffers are NOT remapped - they use consecutive cells already reserved
-                // No remapping needed
-                break
-            case let .spectralLossBackward(buf1Cell, buf2Cell, windowSize, _, _, _, _):
-                // spectralLossBackward buffers are NOT remapped - they use consecutive cells already reserved
-                // No remapping needed
-                break
+            // No remapping needed for tape-based spectral ops
             default:
                 break
             }

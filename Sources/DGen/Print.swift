@@ -131,20 +131,7 @@ extension UOp {
             opStr = "\(ANSI.magenta)loadTape\(ANSI.reset)(\(a))"
         case let .mse(a, b):
             opStr = "\(ANSI.green)mse\(ANSI.reset)(\(a), \(b))"
-        case let .updateDFTBuffer(bufferCell, signal, windowSize):
-            opStr = "\(ANSI.green)updateDFTBuffer\(ANSI.reset)(\(bufferCell), \(signal), \(windowSize))"
-        case let .computeDFTBin(bufferCell, windowSize, binIndex):
-            opStr = "\(ANSI.green)computeDFTBin\(ANSI.reset)(\(bufferCell), \(windowSize), \(binIndex))"
-        case let .computeDFTBinFull(bufferCell, windowSize, binIndex, realDest, imagDest, magDest):
-            opStr = "\(ANSI.green)computeDFTBinFull\(ANSI.reset)(\(bufferCell), \(windowSize), \(binIndex) -> \(realDest), \(imagDest), \(magDest))"
-        case let .updateDFTBufferGrad(bufferCell, signal, windowSize):
-            opStr = "\(ANSI.magenta)updateDFTBufferGrad\(ANSI.reset)(\(bufferCell), \(signal), \(windowSize))"
-        case let .computeDFTBinFullGrad(bufferCell, windowSize, binIndex, realDest, imagDest, magDest):
-            opStr = "\(ANSI.magenta)computeDFTBinFullGrad\(ANSI.reset)(\(bufferCell), \(windowSize), \(binIndex) -> \(realDest), \(imagDest), \(magDest))"
-        case let .spectralLoss(buf1, buf2, windowSize, writePos):
-            opStr = "\(ANSI.green)spectralLoss\(ANSI.reset)(buf1=\(buf1), buf2=\(buf2), win=\(windowSize), writePos=\(writePos))"
-        case let .spectralLossBackward(buf1, buf2, windowSize, writePos, upstreamGrad, grad1Dest, grad2Dest):
-            opStr = "\(ANSI.magenta)spectralLossBackward\(ANSI.reset)(buf1=\(buf1), buf2=\(buf2), win=\(windowSize), writePos=\(writePos), upGrad=\(upstreamGrad) -> \(grad1Dest), \(grad2Dest))"
+        // removed ring-only spectral printouts
         case let .spectralLossTape(sig1, sig2, windowSize):
             opStr = "\(ANSI.green)spectralLossTape\(ANSI.reset)(sig1=\(sig1), sig2=\(sig2), win=\(windowSize))"
         case let .spectralLossTapeBackward(windowSize, sig1, sig2, upstreamGrad, grad1Dest, grad2Dest):

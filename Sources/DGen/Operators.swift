@@ -144,91 +144,6 @@ func u_mse(_ a: Expr, _ b: Expr) -> (IRBuilder) -> Expr {
     }
 }
 
-func u_updateDFTBuffer(_ bufferCell: CellID, _ signal: Expr, _ windowSize: Int) -> (IRBuilder) -> Expr {
-    return { b in
-        let dest = b.ctx.useVariable(src: b.nodeId)
-        let uop = UOp(op: .updateDFTBuffer(bufferCell, signal.lazy, windowSize), value: dest)
-        b.ops.append(uop)
-        return b.value(dest)
-    }
-}
-
-func u_computeDFTBin(_ bufferCell: CellID, _ windowSize: Int, _ binIndex: Int) -> (IRBuilder) -> Expr {
-    return { b in
-        let dest = b.ctx.useVariable(src: b.nodeId)
-        let uop = UOp(op: .computeDFTBin(bufferCell, windowSize, binIndex), value: dest)
-        b.ops.append(uop)
-        return b.value(dest)
-    }
-}
-
-/// Compute full DFT bin: returns (real, imag, magnitude)
-/// Used in backward pass to compute gradients
-func u_computeDFTBinFull(_ bufferCell: CellID, _ windowSize: Int, _ binIndex: Int) -> (IRBuilder) -> (Expr, Expr, Expr) {
-    return { b in
-        let realDest = b.ctx.useVariable(src: b.nodeId)
-        let imagDest = b.ctx.useVariable(src: b.nodeId)
-        let magDest = b.ctx.useVariable(src: b.nodeId)
-
-        // Extract VarIDs from Lazy.variable
-        guard case .variable(let realVarId, _) = realDest else { fatalError("Expected variable") }
-        guard case .variable(let imagVarId, _) = imagDest else { fatalError("Expected variable") }
-        guard case .variable(let magVarId, _) = magDest else { fatalError("Expected variable") }
-
-        let uop = UOp(op: .computeDFTBinFull(bufferCell, windowSize, binIndex, realVarId, imagVarId, magVarId), value: magDest)
-        b.ops.append(uop)
-
-        return (b.value(realDest), b.value(imagDest), b.value(magDest))
-    }
-}
-
-/// Update DFT circular buffer in grad_memory during backward pass
-func u_updateDFTBufferGrad(_ bufferCell: CellID, _ signal: Expr, _ windowSize: Int) -> (IRBuilder) -> Expr {
-    return { b in
-        let dest = b.ctx.useVariable(src: b.nodeId)
-        let uop = UOp(op: .updateDFTBufferGrad(bufferCell, signal.lazy, windowSize), value: dest)
-        b.ops.append(uop)
-        return b.value(dest)
-    }
-}
-
-/// Compute full DFT bin from grad_memory (for backward pass)
-func u_computeDFTBinFullGrad(_ bufferCell: CellID, _ windowSize: Int, _ binIndex: Int) -> (IRBuilder) -> (Expr, Expr, Expr) {
-    return { b in
-        let realDest = b.ctx.useVariable(src: b.nodeId)
-        let imagDest = b.ctx.useVariable(src: b.nodeId)
-        let magDest = b.ctx.useVariable(src: b.nodeId)
-
-        // Extract VarIDs
-        guard case .variable(let realVarId, _) = realDest else { fatalError("Expected variable") }
-        guard case .variable(let imagVarId, _) = imagDest else { fatalError("Expected variable") }
-        guard case .variable(let magVarId, _) = magDest else { fatalError("Expected variable") }
-
-        // For backward pass, we compute DFT from grad_memory instead of memory
-        // This requires special Metal code generation
-        // For now, create a placeholder - we'll need a new UOp for this
-
-        // Actually, let's just inline the computation here
-        let writePos = b.loadGradMemory(bufferCell + CellID(windowSize))
-
-        // Compute DFT by iterating over buffer in chronological order
-        var real = b.constant(0.0)
-        var imag = b.constant(0.0)
-
-        let pi = b.constant(Float.pi)
-        let two = b.constant(2.0)
-        let k = b.constant(Float(binIndex))
-        let N = b.constant(Float(windowSize))
-
-        // This won't work - we need dynamic indexing which requires a UOp
-        // Let me create a proper UOp instead
-
-        let uop = UOp(op: .computeDFTBinFullGrad(bufferCell, windowSize, binIndex, realVarId, imagVarId, magVarId), value: magDest)
-        b.ops.append(uop)
-
-        return (b.value(realDest), b.value(imagDest), b.value(magDest))
-    }
-}
 
 /// Compute gradient of DFT magnitude with respect to a sample at given position
 /// Formula: ∂mag/∂sample[n] = (real * cos(angle) + imag * sin(angle)) / mag
@@ -266,31 +181,6 @@ func u_dftMagnitudeGradient(
     }
 }
 
-func u_spectralLoss(_ buf1Cell: CellID, _ buf2Cell: CellID, _ writePos: Expr, _ windowSize: Int) -> (IRBuilder) -> Expr {
-    return { b in
-        let dest = b.ctx.useVariable(src: b.nodeId)
-        let uop = UOp(op: .spectralLoss(buf1Cell, buf2Cell, windowSize, writePos.lazy), value: dest)
-        b.ops.append(uop)
-        return b.value(dest)
-    }
-}
-
-// Compute spectral loss backward gradients using a Metal runtime loop over bins
-// Reads signal values from tape and builds grad_memory buffers, then computes DFT
-func u_spectralLossBackward(_ buf1Cell: CellID, _ buf2Cell: CellID, _ windowSize: Int, _ writePos: Expr, _ upstreamGrad: Expr) -> (IRBuilder) -> (Expr, Expr) {
-    return { b in
-        let grad1Dest = b.ctx.useVariable(src: b.nodeId)
-        let grad2Dest = b.ctx.useVariable(src: b.nodeId)
-
-        guard case .variable(let grad1VarId, _) = grad1Dest else { fatalError("Expected variable") }
-        guard case .variable(let grad2VarId, _) = grad2Dest else { fatalError("Expected variable") }
-
-        let uop = UOp(op: .spectralLossBackward(buf1Cell, buf2Cell, windowSize, writePos.lazy, upstreamGrad.lazy, grad1VarId, grad2VarId), value: grad1Dest)
-        b.ops.append(uop)
-
-        return (b.value(grad1Dest), b.value(grad2Dest))
-    }
-}
 
 func u_accum(_ cellId: CellID, incr: Expr, reset: Expr, min: Expr, max: Expr) -> (IRBuilder) -> Expr
 {
@@ -366,7 +256,6 @@ public enum LazyOp {
         lt, eq,
         gswitch, mix, pow, floor, ceil, round, mod, min, max
     case mse  // mean squared error per-sample: (a-b)^2
-    case spectralLoss(CellID, CellID, Int)  // spectralLoss(buf1, buf2, windowSize)
     case spectralLossTape(Int)              // spectralLoss from tape windows
     case selector  // selector(mode, options[])
     case memoryRead(CellID)
@@ -560,14 +449,7 @@ public enum LazyOp {
             }
             let (a, b2) = b.values(inputs, count: 2)
             b.use(val: u_mse(a, b2)(b))
-        case let .spectralLoss(buf1Cell, buf2Cell, windowSize):
-            // Default forward lowering: tape-based compute
-            guard inputs.count == 2 else {
-                throw DGenError.insufficientInputs(
-                    operator: "spectralLoss", expected: 2, actual: inputs.count)
-            }
-            let (sig1, sig2) = b.values(inputs, count: 2)
-            b.use(val: u_spectralLossTape(sig1, sig2, windowSize)(b))
+        
         case let .spectralLossTape(windowSize):
             guard inputs.count == 2 else {
                 throw DGenError.insufficientInputs(
@@ -901,16 +783,7 @@ public enum LazyOp {
             let gradB = b.value(gradOutput) * (b.constant(0.0) - two * diff)
             b.grad(node.inputs[0], value: gradA.lazy)
             b.grad(node.inputs[1], value: gradB.lazy)
-        case let .spectralLoss(_, _, windowSize):
-            // Backward pass: compute gradients using tape windows
-            guard inputs.count == 2 else { fatalError("spectralLoss requires 2 inputs") }
-            let sig1 = b.tapeValue(node.inputs[0])
-            let sig2 = b.tapeValue(node.inputs[1])
-            let (grad1, grad2) = u_spectralLossTapeBackward(
-                windowSize, sig1, sig2, b.value(gradOutput)
-            )(b)
-            b.grad(node.inputs[0], value: grad1.lazy)
-            b.grad(node.inputs[1], value: grad2.lazy)
+        
         case let .spectralLossTape(windowSize):
             guard inputs.count == 2 else { fatalError("spectralLossTape requires 2 inputs") }
             let sig1 = b.tapeValue(node.inputs[0])

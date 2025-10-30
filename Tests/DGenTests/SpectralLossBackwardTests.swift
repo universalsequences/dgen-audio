@@ -28,11 +28,9 @@ final class SpectralLossBackwardTests: XCTestCase {
         let sig1 = g.n(.sin, g.n(.mul, phase1, twoPi))
         let sig2 = g.n(.sin, g.n(.mul, phase2, twoPi))
 
-        // Compute spectral loss
+        // Compute spectral loss (tape-based)
         let windowSize = 64
-        let buf1 = g.alloc(vectorWidth: windowSize + 1)
-        let buf2 = g.alloc(vectorWidth: windowSize + 1)
-        let loss = g.n(.spectralLoss(buf1, buf2, windowSize), sig1, sig2)
+        let loss = g.spectralLoss(sig1, sig2, windowSize: windowSize)
 
         _ = g.n(.output(0), loss)
 
@@ -173,9 +171,7 @@ final class SpectralLossBackwardTests: XCTestCase {
 
         // Compute spectral loss
         let windowSize = 64
-        let buf1 = g.alloc(vectorWidth: windowSize + 1)
-        let buf2 = g.alloc(vectorWidth: windowSize + 1)
-        let loss = g.n(.spectralLoss(buf1, buf2, windowSize), sig1, sig2)
+        let loss = g.spectralLoss(sig1, sig2, windowSize: windowSize)
 
         let outputNode = g.n(.output(0), loss)
 
@@ -197,8 +193,6 @@ final class SpectralLossBackwardTests: XCTestCase {
         }
         print("     output: node \(outputNode) (\(g.nodes[outputNode]?.op ?? .add))")
         print("   Buffer cells:")
-        print("     buf1: cell \(buf1)")
-        print("     buf2: cell \(buf2)")
 
         // Compile with backwards pass enabled
         let frameCount = 128
@@ -295,34 +289,6 @@ final class SpectralLossBackwardTests: XCTestCase {
             lossHistory.append(currentLoss)
 
             // Debug: print first few frames to see if loss varies
-            if iteration == 0 {
-                // Check memory buffer ring buffer states (use physical/remapped cells)
-                let physicalBuf1 = result.cellAllocations.cellMappings[buf1] ?? buf1
-                let physicalBuf2 = result.cellAllocations.cellMappings[buf2] ?? buf2
-                print("   [DEBUG] Memory buf1 (physical cell \(physicalBuf1)):")
-                print(
-                    "      First 3 samples: \(memoryPtr[Int(physicalBuf1)]), \(memoryPtr[Int(physicalBuf1)+1]), \(memoryPtr[Int(physicalBuf1)+2])"
-                )
-                print("      writePos: \(memoryPtr[Int(physicalBuf1)+64])")
-                print("   [DEBUG] Memory buf2 (physical cell \(physicalBuf2)):")
-                print(
-                    "      First 3 samples: \(memoryPtr[Int(physicalBuf2)]), \(memoryPtr[Int(physicalBuf2)+1]), \(memoryPtr[Int(physicalBuf2)+2])"
-                )
-                print("      writePos: \(memoryPtr[Int(physicalBuf2)+64])")
-
-                if let tape = runtime.readBuffer(named: "t") {
-                    let lossTapeSlot = 7
-                    print(
-                        "   [DEBUG LOSS] Tape slot \(lossTapeSlot): first 5 = \(tape[(lossTapeSlot*frameCount)..<(lossTapeSlot*frameCount+5)].map { String(format: "%.2f", $0) }.joined(separator: ", "))"
-                    )
-                }
-                print(
-                    "   [DEBUG LOSS] First 10 frames: \(outputBuffer.prefix(10).map { String(format: "%.2f", $0) }.joined(separator: ", "))"
-                )
-                print(
-                    "   [DEBUG LOSS] Last 10 frames: \(outputBuffer.suffix(10).map { String(format: "%.2f", $0) }.joined(separator: ", "))"
-                )
-            }
 
             // Read gradient for frequency parameter
             guard let gradients = runtime.readBuffer(named: "gradients") else {
@@ -409,30 +375,6 @@ final class SpectralLossBackwardTests: XCTestCase {
                         }
                     }
 
-                    // Map cell IDs to physical cells
-                    let physicalBuf1 = result.cellAllocations.cellMappings[buf1] ?? buf1
-                    let physicalBuf2 = result.cellAllocations.cellMappings[buf2] ?? buf2
-
-                    print("   [DEBUG]   buf1 (cell \(buf1) -> physical \(physicalBuf1)):")
-                    // Print first 10 samples and write position
-                    for i in 0..<min(10, windowSize) {
-                        let val = gradMemory[Int(physicalBuf1) + i]
-                        print(
-                            "   [DEBUG]     gradMem[\(Int(physicalBuf1) + i)] = \(String(format: "%.6f", val))"
-                        )
-                    }
-                    let writePos1 = gradMemory[Int(physicalBuf1) + windowSize]
-                    print("   [DEBUG]     writePos = \(writePos1)")
-
-                    print("   [DEBUG]   buf2 (cell \(buf2) -> physical \(physicalBuf2)):")
-                    for i in 0..<min(10, windowSize) {
-                        let val = gradMemory[Int(physicalBuf2) + i]
-                        print(
-                            "   [DEBUG]     gradMem[\(Int(physicalBuf2) + i)] = \(String(format: "%.6f", val))"
-                        )
-                    }
-                    let writePos2 = gradMemory[Int(physicalBuf2) + windowSize]
-                    print("   [DEBUG]     writePos = \(writePos2)")
                 } else {
                     print("   [DEBUG] grad_memory buffer not found!")
                 }
@@ -471,7 +413,7 @@ final class SpectralLossBackwardTests: XCTestCase {
         )
 
         for kernel in result.kernels {
-            //print(kernel.source)
+            print(kernel.source)
         }
 
         // Verify learning happened
@@ -513,7 +455,7 @@ final class SpectralLossBackwardTests: XCTestCase {
         let windowSize = 64
         let buf1 = g.alloc(vectorWidth: windowSize + 1)
         let buf2 = g.alloc(vectorWidth: windowSize + 1)
-        let loss = g.n(.spectralLoss(buf1, buf2, windowSize), sig1, sig2)
+        let loss = g.spectralLoss(sig1, sig2, windowSize: windowSize)
 
         let outputNode = g.n(.output(0), loss)
 
@@ -599,8 +541,8 @@ final class SpectralLossBackwardTests: XCTestCase {
             let currentLoss = outputBuffer[frameCount - 1]
             lossHistory.append(currentLoss)
 
-        // For tape-based compute, no ring/grad_memory inspection is required
-        XCTAssertTrue(currentLoss.isFinite, "Loss should be a finite value")
+            // For tape-based compute, no ring/grad_memory inspection is required
+            XCTAssertTrue(currentLoss.isFinite, "Loss should be a finite value")
 
         }
 

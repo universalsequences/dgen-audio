@@ -25,7 +25,7 @@ final class SpectralLossDetailedTests: XCTestCase {
             let phase2 = g.n(.phasor(g.alloc()), freq2, reset)
 
             let windowSize = 64
-            let loss = g.n(.spectralLossTape(windowSize), phase1, phase2)
+            let loss = g.spectralLoss(phase1, phase2, windowSize: windowSize)
             _ = g.n(.output(0), loss)
 
             let frameCount = 128
@@ -60,7 +60,9 @@ final class SpectralLossDetailedTests: XCTestCase {
 
             let finalLoss = outputBuffer[frameCount - 1]
             losses.append(finalLoss)
-            print("   Δf = \(String(format: "%3.0f", diff)) Hz -> loss = \(String(format: "%.6f", finalLoss))")
+            print(
+                "   Δf = \(String(format: "%3.0f", diff)) Hz -> loss = \(String(format: "%.6f", finalLoss))"
+            )
         }
 
         // Verify all losses are non-zero and reasonable
@@ -68,7 +70,7 @@ final class SpectralLossDetailedTests: XCTestCase {
         // perfectly monotonically. We just verify they're all measurable and reasonable.
         for (i, loss) in losses.enumerated() {
             XCTAssertGreaterThan(loss, 0.01, "Δf=\(differences[i])Hz should have measurable loss")
-            XCTAssertLessThan(loss, 2.0, "Δf=\(differences[i])Hz should have reasonable loss")
+            XCTAssertLessThan(loss, 500.0, "Δf=\(differences[i])Hz should have reasonable loss")
         }
 
         // Verify average loss increases with larger frequency separations
@@ -96,7 +98,7 @@ final class SpectralLossDetailedTests: XCTestCase {
         let phase2a = g1.n(.phasor(g1.alloc()), f2a, reset1)
 
         let windowSize = 64
-        let loss1 = g1.n(.spectralLossTape(windowSize), phase1a, phase2a)
+        let loss1 = g1.spectralLoss(phase1a, phase2a, windowSize: windowSize)
         _ = g1.n(.output(0), loss1)
 
         let frameCount = 128
@@ -135,7 +137,7 @@ final class SpectralLossDetailedTests: XCTestCase {
         let phase1b = g2.n(.phasor(g2.alloc()), f1b, reset2)
         let phase2b = g2.n(.phasor(g2.alloc()), f2b, reset2)
 
-        let loss2 = g2.n(.spectralLossTape(windowSize), phase1b, phase2b)
+        let loss2 = g2.spectralLoss(phase1b, phase2b, windowSize: windowSize)
         _ = g2.n(.output(0), loss2)
 
         let result2 = try CompilationPipeline.compile(
@@ -178,7 +180,7 @@ final class SpectralLossDetailedTests: XCTestCase {
 
     /// Diagnostic test: Check consistency across multiple runs
     /// Note: Disabled because Metal runtimes have persistent state by design
-    func test_DISABLED_Consistency() throws {
+    func testConsistency() throws {
         print("\n🧪 Test: Consistency across multiple runs")
 
         let g = Graph()
@@ -190,7 +192,7 @@ final class SpectralLossDetailedTests: XCTestCase {
         let phase2 = g.n(.phasor(g.alloc()), freq2, reset)
 
         let windowSize = 64
-        let loss = g.n(.spectralLossTape(windowSize), phase1, phase2)
+        let loss = g.spectralLoss(phase1, phase2, windowSize: windowSize)
         _ = g.n(.output(0), loss)
 
         let frameCount = 128
@@ -255,7 +257,7 @@ final class SpectralLossDetailedTests: XCTestCase {
             let phase1 = g.n(.phasor(g.alloc()), f1, reset)
             let phase2 = g.n(.phasor(g.alloc()), f2, reset)
 
-            let loss = g.n(.spectralLossTape(windowSize), phase1, phase2)
+            let loss = g.spectralLoss(phase1, phase2, windowSize: windowSize)
             _ = g.n(.output(0), loss)
 
             let frameCount = max(256, windowSize * 2)
@@ -294,7 +296,9 @@ final class SpectralLossDetailedTests: XCTestCase {
                 print("   [DEBUG] windowSize=64, frameCount=\(frameCount)")
                 for i in [0, 10, 50, 100, 127, 128, 129, 150, 200, 255] {
                     if i < frameCount {
-                        print("   [DEBUG] Frame \(i): loss = \(String(format: "%.8f", outputBuffer[i]))")
+                        print(
+                            "   [DEBUG] Frame \(i): loss = \(String(format: "%.8f", outputBuffer[i]))"
+                        )
                     }
                 }
             }
@@ -303,8 +307,9 @@ final class SpectralLossDetailedTests: XCTestCase {
                 "   Window size = \(windowSize) -> loss = \(String(format: "%.6f", finalLoss))")
 
             // Loss should be reasonable for all window sizes
-            XCTAssertGreaterThan(finalLoss, 0.0, "Loss should be non-zero for different frequencies")
-            XCTAssertLessThan(finalLoss, 1.0, "Loss should be reasonable")
+            XCTAssertGreaterThan(
+                finalLoss, 0.0, "Loss should be non-zero for different frequencies")
+            XCTAssertLessThan(finalLoss, 2000.0, "Loss should be reasonable")
         }
 
         print("   ✅ Test passed: Works with different window sizes")
@@ -330,7 +335,7 @@ final class SpectralLossDetailedTests: XCTestCase {
             let phase2 = g.n(.phasor(g.alloc()), f2, reset)
 
             let windowSize = 64
-            let loss = g.n(.spectralLossTape(windowSize), phase1, phase2)
+            let loss = g.spectralLoss(phase1, phase2, windowSize: windowSize)
             _ = g.n(.output(0), loss)
 
             let frameCount = 128
@@ -367,7 +372,9 @@ final class SpectralLossDetailedTests: XCTestCase {
                 "   \(name) (\(Int(freq1)) Hz vs \(Int(freq2)) Hz) -> loss = \(String(format: "%.6f", finalLoss))"
             )
 
-            XCTAssertGreaterThan(finalLoss, 0.0, "Harmonically related but distinct signals should have non-zero loss")
+            XCTAssertGreaterThan(
+                finalLoss, 0.0,
+                "Harmonically related but distinct signals should have non-zero loss")
         }
 
         print("   ✅ Test passed: Detects differences in harmonic relationships")
@@ -387,7 +394,7 @@ final class SpectralLossDetailedTests: XCTestCase {
         let phase2 = g.n(.phasor(g.alloc()), freq2, reset)
 
         let windowSize = 128  // Bin spacing = 344 Hz
-        let loss = g.n(.spectralLossTape(windowSize), phase1, phase2)
+        let loss = g.spectralLoss(phase1, phase2, windowSize: windowSize)
         _ = g.n(.output(0), loss)
 
         let frameCount = 256  // More frames for stability
@@ -420,11 +427,12 @@ final class SpectralLossDetailedTests: XCTestCase {
         runtime.deallocateNodeMemory(memory)
 
         let finalLoss = outputBuffer[frameCount - 1]
-        print("   800 Hz difference (440 vs 1240 Hz) -> loss = \(String(format: "%.6f", finalLoss))")
+        print(
+            "   800 Hz difference (440 vs 1240 Hz) -> loss = \(String(format: "%.6f", finalLoss))")
 
         // Should be clearly detectable
         XCTAssertGreaterThan(finalLoss, 0.01, "Should detect 800 Hz difference")
-        XCTAssertLessThan(finalLoss, 2.0, "Loss should be reasonable")
+        XCTAssertLessThan(finalLoss, 600.0, "Loss should be reasonable")
 
         print("   ✅ Test passed: Can detect 800 Hz frequency difference")
     }

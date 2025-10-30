@@ -18,13 +18,7 @@ public enum Op {
   case accumulateGrad(GradID, Lazy)
   case loadGrad(GradID)
   case mse(Lazy, Lazy)
-  case updateDFTBuffer(CellID, Lazy, Int)  // (bufferCell, signal, windowSize) - updates circular buffer with new sample in memory
-  case updateDFTBufferGrad(CellID, Lazy, Int)  // (bufferCell, signal, windowSize) - updates circular buffer with new sample in grad_memory
-  case computeDFTBin(CellID, Int, Int)  // (bufferCell, windowSize, binIndex) - computes DFT magnitude at frequency bin
-  case computeDFTBinFull(CellID, Int, Int, VarID, VarID, VarID)  // (bufferCell, windowSize, binIndex, realDest, imagDest, magDest) - computes real, imag, and magnitude
-  case computeDFTBinFullGrad(CellID, Int, Int, VarID, VarID, VarID)  // Same as computeDFTBinFull but reads from grad_memory
-  case spectralLoss(CellID, CellID, Int, Lazy)  // (buf1, buf2, windowSize, writePos) - computes DFT-based frequency domain MSE from ring buffers
-  case spectralLossBackward(CellID, CellID, Int, Lazy, Lazy, VarID, VarID)  // (buf1, buf2, windowSize, writePos, upstreamGrad, grad1Dest, grad2Dest)
+  // Removed ring-only spectral UOps (updateDFTBuffer/computeDFT*/ring spectralLoss)
   // Tape-based compute variants (read windows directly from tape)
   case spectralLossTape(Lazy, Lazy, Int)  // (sig1, sig2, windowSize)
   case spectralLossTapeBackward(Int, Lazy, Lazy, Lazy, VarID, VarID)  // (windowSize, sig1, sig2, upstreamGrad, grad1Dest, grad2Dest)
