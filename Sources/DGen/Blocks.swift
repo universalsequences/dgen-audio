@@ -598,7 +598,8 @@ public func findOutputNodeNeeds(_ b: Block, _ g: Graph) -> Set<NodeID> {
 
 // ─── 3. decide which nodes need cross-block scratch buffers ─────
 // in the case of metal, these are transmitted via buffers
-public func findNodesWithOutboundDependencies(_ blks: [Block], _ g: Graph, block: Block) -> [NodeID] {
+public func findNodesWithOutboundDependencies(_ blks: [Block], _ g: Graph, block: Block) -> [NodeID]
+{
     // Map node -> block index
     var nodeBlock = [NodeID: Int]()
     for (bidx, b) in blks.enumerated() {
@@ -712,7 +713,6 @@ public func emitBlockUOps(
     }
 
     let outbound = findNodesWithOutboundDependencies(blocks, g, block: block)
-    print("NODES WITH OUTBOUND=\(outbound)")
     for nodeId in outbound {
         if emittedNodes.contains(nodeId) {
             if let lz = ctx.values[nodeId] {

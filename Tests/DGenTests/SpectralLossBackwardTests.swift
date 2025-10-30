@@ -422,9 +422,16 @@ final class SpectralLossBackwardTests: XCTestCase {
             let newFreq = currentFreq - learningRate * meanGrad
             memoryPtr[Int(physicalCell)] = newFreq
 
-            // Print progress every 10 iterations
-            if iteration % 10 == 0 || iteration == numIterations - 1 {
+            // Print progress for first 10 iterations, then every 10
+            if iteration <= 10 || iteration % 10 == 0 || iteration == numIterations - 1 {
                 print("   Iteration \(iteration): freq=\(String(format: "%.2f", currentFreq)) Hz, loss=\(String(format: "%.6f", currentLoss)), grad=\(String(format: "%.6f", meanGrad))")
+
+                // Debug to see loss values across frames
+                if iteration <= 10 {
+                    let minLoss = outputBuffer.min() ?? 0
+                    let maxLoss = outputBuffer.max() ?? 0
+                    print("      Loss range across frames: [\(String(format: "%.3f", minLoss)) ... \(String(format: "%.3f", maxLoss))]")
+                }
             }
         }
 
