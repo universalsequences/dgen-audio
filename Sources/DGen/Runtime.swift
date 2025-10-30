@@ -603,6 +603,7 @@ public class MetalCompiledKernel: CompiledKernelRuntime {
     }
 
     public func resetGradientBuffers(numFrames: Int) {
+        // Reset gradients buffer
         guard let buffer = bufferPool["gradients"] else {
             print("   [DEBUG] No gradients buffer found!")
             return
@@ -636,6 +637,16 @@ public class MetalCompiledKernel: CompiledKernelRuntime {
             let firstVal = bufferContents[startIdx]
             let lastVal = bufferContents[endIdx - 1]
             print("   [DEBUG] Verification: gradients[\(startIdx)]=\(firstVal), gradients[\(endIdx-1)]=\(lastVal)")
+        }
+
+        // Reset grad_memory buffer (used for spectralLoss ring buffers and phasor gradient accumulation)
+        if let gradMemBuffer = bufferPool["grad_memory"] {
+            let gradMemSize = getElementCount("grad_memory")
+            let gradMemBufferSize = gradMemSize * MemoryLayout<Float>.size
+            let gradMemContents = gradMemBuffer.contents().assumingMemoryBound(to: Float.self)
+            for i in 0..<(gradMemBufferSize / MemoryLayout<Float>.size) {
+                gradMemContents[i] = 0.0
+            }
         }
     }
 
@@ -1008,9 +1019,15 @@ public class MetalCompiledKernel: CompiledKernelRuntime {
         outputs: UnsafeMutablePointer<Float>, inputs: UnsafePointer<Float>,
         memory: UnsafeMutableRawPointer, frameCount: Int
     ) {
-        // Metal uses its own internal persistent memory buffer in bufferPool["memory"]
-        // The buffer is zero-initialized when the runtime is created
-        // Note: State persists across multiple calls - create a new runtime for fresh state
+        // Copy the passed-in memory to Metal's internal buffer before running
+        if let metalMemoryBuffer = bufferPool["memory"] {
+            let memorySize = getMemorySize()
+            let byteSize = memorySize * MemoryLayout<Float>.size
+            let sourcePtr = memory.assumingMemoryBound(to: UInt8.self)
+            let destPtr = metalMemoryBuffer.contents()
+            memcpy(destPtr, sourcePtr, byteSize)
+        }
+
         run(outputs: outputs, inputs: inputs, frameCount: frameCount, volumeScale: 1.0)
     }
 

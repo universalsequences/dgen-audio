@@ -598,9 +598,7 @@ public func findOutputNodeNeeds(_ b: Block, _ g: Graph) -> Set<NodeID> {
 
 // ─── 3. decide which nodes need cross-block scratch buffers ─────
 // in the case of metal, these are transmitted via buffers
-public func findNodesWithOutboundDependencies(_ blks: [Block], _ g: Graph, block: Block) -> Set<
-    NodeID
-> {
+public func findNodesWithOutboundDependencies(_ blks: [Block], _ g: Graph, block: Block) -> [NodeID] {
     // Map node -> block index
     var nodeBlock = [NodeID: Int]()
     for (bidx, b) in blks.enumerated() {
@@ -641,11 +639,10 @@ public func findNodesWithOutboundDependencies(_ blks: [Block], _ g: Graph, block
             }
         }
     }
-    return need
+    return need.sorted()  // Return sorted array for stable ordering
 }
 
-public func findNodesAsInboundDependencies(_ blks: [Block], _ g: Graph, block: Block) -> Set<NodeID>
-{
+public func findNodesAsInboundDependencies(_ blks: [Block], _ g: Graph, block: Block) -> [NodeID] {
     guard let thisIdx = blks.firstIndex(of: block) else { return [] }
 
     // Map node -> block index
@@ -679,7 +676,7 @@ public func findNodesAsInboundDependencies(_ blks: [Block], _ g: Graph, block: B
             }
         }
     }
-    return need
+    return need.sorted()  // Return sorted array for stable ordering
 }
 
 public func emitBlockUOps(
@@ -724,7 +721,10 @@ public func emitBlockUOps(
                     var defineGlobalUOp = UOp(op: .defineGlobal(a), value: .global(a))
                     defineGlobalUOp.kind = block.kind
                     uops.insert(defineGlobalUOp, at: 0)
-                    ctx.globals.insert(a)
+                    // Only append if not already in globals to maintain stable ordering
+                    if !ctx.globals.contains(a) {
+                        ctx.globals.append(a)
+                    }
                 default:
                     break
                 }

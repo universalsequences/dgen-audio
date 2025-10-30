@@ -162,26 +162,136 @@ func u_computeDFTBin(_ bufferCell: CellID, _ windowSize: Int, _ binIndex: Int) -
     }
 }
 
+/// Compute full DFT bin: returns (real, imag, magnitude)
+/// Used in backward pass to compute gradients
+func u_computeDFTBinFull(_ bufferCell: CellID, _ windowSize: Int, _ binIndex: Int) -> (IRBuilder) -> (Expr, Expr, Expr) {
+    return { b in
+        let realDest = b.ctx.useVariable(src: b.nodeId)
+        let imagDest = b.ctx.useVariable(src: b.nodeId)
+        let magDest = b.ctx.useVariable(src: b.nodeId)
+
+        // Extract VarIDs from Lazy.variable
+        guard case .variable(let realVarId, _) = realDest else { fatalError("Expected variable") }
+        guard case .variable(let imagVarId, _) = imagDest else { fatalError("Expected variable") }
+        guard case .variable(let magVarId, _) = magDest else { fatalError("Expected variable") }
+
+        let uop = UOp(op: .computeDFTBinFull(bufferCell, windowSize, binIndex, realVarId, imagVarId, magVarId), value: magDest)
+        b.ops.append(uop)
+
+        return (b.value(realDest), b.value(imagDest), b.value(magDest))
+    }
+}
+
+/// Update DFT circular buffer in grad_memory during backward pass
+func u_updateDFTBufferGrad(_ bufferCell: CellID, _ signal: Expr, _ windowSize: Int) -> (IRBuilder) -> Expr {
+    return { b in
+        let dest = b.ctx.useVariable(src: b.nodeId)
+        let uop = UOp(op: .updateDFTBufferGrad(bufferCell, signal.lazy, windowSize), value: dest)
+        b.ops.append(uop)
+        return b.value(dest)
+    }
+}
+
+/// Compute full DFT bin from grad_memory (for backward pass)
+func u_computeDFTBinFullGrad(_ bufferCell: CellID, _ windowSize: Int, _ binIndex: Int) -> (IRBuilder) -> (Expr, Expr, Expr) {
+    return { b in
+        let realDest = b.ctx.useVariable(src: b.nodeId)
+        let imagDest = b.ctx.useVariable(src: b.nodeId)
+        let magDest = b.ctx.useVariable(src: b.nodeId)
+
+        // Extract VarIDs
+        guard case .variable(let realVarId, _) = realDest else { fatalError("Expected variable") }
+        guard case .variable(let imagVarId, _) = imagDest else { fatalError("Expected variable") }
+        guard case .variable(let magVarId, _) = magDest else { fatalError("Expected variable") }
+
+        // For backward pass, we compute DFT from grad_memory instead of memory
+        // This requires special Metal code generation
+        // For now, create a placeholder - we'll need a new UOp for this
+
+        // Actually, let's just inline the computation here
+        let writePos = b.loadGradMemory(bufferCell + CellID(windowSize))
+
+        // Compute DFT by iterating over buffer in chronological order
+        var real = b.constant(0.0)
+        var imag = b.constant(0.0)
+
+        let pi = b.constant(Float.pi)
+        let two = b.constant(2.0)
+        let k = b.constant(Float(binIndex))
+        let N = b.constant(Float(windowSize))
+
+        // This won't work - we need dynamic indexing which requires a UOp
+        // Let me create a proper UOp instead
+
+        let uop = UOp(op: .computeDFTBinFullGrad(bufferCell, windowSize, binIndex, realVarId, imagVarId, magVarId), value: magDest)
+        b.ops.append(uop)
+
+        return (b.value(realDest), b.value(imagDest), b.value(magDest))
+    }
+}
+
+/// Compute gradient of DFT magnitude with respect to a sample at given position
+/// Formula: ∂mag/∂sample[n] = (real * cos(angle) + imag * sin(angle)) / mag
+/// where angle = 2π * binIndex * samplePos / windowSize
+func u_dftMagnitudeGradient(
+    _ real: Expr, _ imag: Expr, _ mag: Expr,
+    _ windowSize: Int, _ binIndex: Int, _ samplePos: Int
+) -> (IRBuilder) -> Expr {
+    return { b in
+        // Compute angle = 2π * binIndex * samplePos / windowSize
+        let pi = b.constant(Float.pi)
+        let two = b.constant(2.0)
+        let k = b.constant(Float(binIndex))
+        let n = b.constant(Float(samplePos))
+        let N = b.constant(Float(windowSize))
+
+        let angle = (two * pi * k * n) / N
+
+        // cos and sin of angle (negated for DFT convention)
+        let negAngle = b.constant(0.0) - angle
+        let cosAngle = b.cos(negAngle)
+        let sinAngle = b.sin(negAngle)
+
+        // Gradient: (real * cos + imag * sin) / mag
+        // Note: real, imag, mag are already Expr, not Lazy
+        let realPart = real * cosAngle
+        let imagPart = imag * sinAngle
+        let numerator = realPart + imagPart
+
+        // Avoid division by zero
+        let epsilon = b.constant(1e-8)
+        let safeMag = mag + epsilon
+
+        return numerator / safeMag
+    }
+}
+
 func u_spectralLoss(_ buf1Cell: CellID, _ buf2Cell: CellID, _ sig1: Expr, _ sig2: Expr, _ windowSize: Int) -> (IRBuilder) -> Expr {
     return { b in
-        // Update buffers once per frame
-        _ = u_updateDFTBuffer(buf1Cell, sig1, windowSize)(b)
-        _ = u_updateDFTBuffer(buf2Cell, sig2, windowSize)(b)
+        // Generate a single UOp that does the entire computation with Metal runtime loops
+        // This avoids massive code generation from compile-time unrolling
+        let dest = b.ctx.useVariable(src: b.nodeId)
+        let uop = UOp(op: .spectralLoss(buf1Cell, buf2Cell, sig1.lazy, sig2.lazy, windowSize), value: dest)
+        b.ops.append(uop)
+        return b.value(dest)
+    }
+}
 
-        // Compute spectral loss as: sum over bins of (mag1 - mag2)^2 / numBins
-        let numBins = windowSize / 2 + 1  // Nyquist
-        let numBinsFloat = b.constant(Float(numBins))
+// Compute spectral loss backward gradients using a Metal runtime loop over bins
+// Reads signal values from tape and builds grad_memory buffers, then computes DFT
+func u_spectralLossBackward(_ buf1Cell: CellID, _ buf2Cell: CellID, _ windowSize: Int, _ sig1: Expr, _ sig2: Expr, _ upstreamGrad: Expr) -> (IRBuilder) -> (Expr, Expr) {
+    return { b in
+        let grad1Dest = b.ctx.useVariable(src: b.nodeId)
+        let grad2Dest = b.ctx.useVariable(src: b.nodeId)
 
-        var totalError = b.constant(0.0)
-        for binIndex in 0..<numBins {
-            let mag1 = u_computeDFTBin(buf1Cell, windowSize, binIndex)(b)
-            let mag2 = u_computeDFTBin(buf2Cell, windowSize, binIndex)(b)
-            let diff = mag1 - mag2
-            let squared = diff * diff
-            totalError = totalError + squared
-        }
+        guard case .variable(let grad1VarId, _) = grad1Dest else { fatalError("Expected variable") }
+        guard case .variable(let grad2VarId, _) = grad2Dest else { fatalError("Expected variable") }
 
-        return totalError / numBinsFloat
+        // Note: sig1 and sig2 are the signal values from tape (via tapeValue)
+        let uop = UOp(op: .spectralLossBackward(buf1Cell, buf2Cell, windowSize, sig1.lazy, sig2.lazy, upstreamGrad.lazy, grad1VarId, grad2VarId), value: grad1Dest)
+        b.ops.append(uop)
+
+        return (b.value(grad1Dest), b.value(grad2Dest))
     }
 }
 
@@ -775,14 +885,19 @@ public enum LazyOp {
             let gradB = b.value(gradOutput) * (b.constant(0.0) - two * diff)
             b.grad(node.inputs[0], value: gradA.lazy)
             b.grad(node.inputs[1], value: gradB.lazy)
-        case .spectralLoss:
-            // TODO: Implement backward pass for spectralLoss
-            // Since spectralLoss is now composite (uses DFT), gradients should flow through
-            // But DFT doesn't have gradients yet, so still zero for now
+        case let .spectralLoss(buf1Cell, buf2Cell, windowSize):
+            // Backward pass: compute gradients using runtime Metal loop (not compile-time unrolling)
             guard inputs.count == 2 else { fatalError("spectralLoss requires 2 inputs") }
-            let zeroGrad = ctx.useConstant(src: nil, value: 0.0)
-            b.grad(node.inputs[0], value: zeroGrad)
-            b.grad(node.inputs[1], value: zeroGrad)
+
+            // Get signal values from tape (stored per-frame during forward pass)
+            let sig1 = b.tapeValue(node.inputs[0])
+            let sig2 = b.tapeValue(node.inputs[1])
+
+            // Use new UOp that stores signals in grad_memory and computes gradients in a Metal runtime loop
+            let (grad1, grad2) = u_spectralLossBackward(buf1Cell, buf2Cell, windowSize, sig1, sig2, b.value(gradOutput))(b)
+
+            b.grad(node.inputs[0], value: grad1.lazy)
+            b.grad(node.inputs[1], value: grad2.lazy)
         case .floor:
             // d(floor(x))/dx = 0 (floor is not differentiable, but we set to 0)
             guard inputs.count == 1 else { fatalError("floor requires 1 input") }
@@ -924,14 +1039,11 @@ public enum LazyOp {
             let currentTime = b.frameIndex(nodeId)
 
             // Compute this timestep's frequency gradient
+            // d(phase)/d(freq) = time / sampleRate (since phase accumulates as: phase += freq/sampleRate)
             let gradFreq = b.value(gradOutput) * currentTime / sampleRate
 
-            // Accumulate in gradient memory at cellId (cell is not used for anything else)
-            let prevGradFreq = b.loadGradMemory(cellId)  // First time: 0
-            let totalGradFreq = prevGradFreq + gradFreq
-            _ = b.storeGradMemory(cellId, totalGradFreq)
-
-            b.grad(node.inputs[0], value: totalGradFreq.lazy)
+            // Write gradient directly (no accumulation needed - test will sum across frames)
+            b.grad(node.inputs[0], value: gradFreq.lazy)
         case .output(_):
             // Output just passes gradient through to its input
             guard inputs.count == 1 else { fatalError("output requires 1 input") }

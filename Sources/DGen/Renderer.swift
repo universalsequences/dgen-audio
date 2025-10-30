@@ -1060,7 +1060,7 @@ public class MetalRenderer: Renderer, UOpEmitter {
                 outputs.insert(varId)
             case let .loadGlobal(varId):
                 inputs.insert(varId)
-            case .load, .store, .delay1, .updateDFTBuffer, .computeDFTBin:
+            case .load, .store, .delay1, .updateDFTBuffer, .computeDFTBin, .computeDFTBinFull, .spectralLoss:
                 needsMemory = true
             case .defineMemory:
                 needsMemory = true
@@ -1154,6 +1154,19 @@ public class MetalRenderer: Renderer, UOpEmitter {
             """
             return emitAssign(uop, code, ctx)
 
+        case let .updateDFTBufferGrad(bufferCell, signal, windowSize):
+            // Update circular buffer with new sample in grad_memory (for backward pass)
+            let code = """
+            ({
+                const int WIN_SIZE = \(windowSize);
+                int writePos = ((int)grad_memory[\(bufferCell) + WIN_SIZE]) % WIN_SIZE;
+                grad_memory[\(bufferCell) + writePos] = \(g(signal));
+                grad_memory[\(bufferCell) + WIN_SIZE] = grad_memory[\(bufferCell) + WIN_SIZE] + 1.0;
+                0.0;  // Return dummy value
+            })
+            """
+            return emitAssign(uop, code, ctx)
+
         case let .computeDFTBin(bufferCell, windowSize, binIndex):
             // Compute DFT magnitude at a specific frequency bin (doesn't update buffer)
             let code = """
@@ -1184,6 +1197,208 @@ public class MetalRenderer: Renderer, UOpEmitter {
             })
             """
             return emitAssign(uop, code, ctx)
+
+        case let .computeDFTBinFull(bufferCell, windowSize, binIndex, realDest, imagDest, magDest):
+            // Compute DFT and store real, imag, and magnitude separately
+            // Used in backward pass for gradient computation
+            let realVar = "t\(realDest)"
+            let imagVar = "t\(imagDest)"
+            let magVar = "t\(magDest)"
+
+            // Generate inline code without block scope
+            // Use unique suffix based on destination varId to avoid redefinition
+            let suffix = magDest  // Use destination varId as unique suffix
+            let code = """
+                const int WIN_SIZE_\(suffix) = \(windowSize);
+                const int BIN_INDEX_\(suffix) = \(binIndex);
+                int writePos_\(suffix) = ((int)memory[\(bufferCell) + WIN_SIZE_\(suffix)]) % WIN_SIZE_\(suffix);
+                float real_\(suffix) = 0.0, imag_\(suffix) = 0.0;
+                for (int n_\(suffix) = 0; n_\(suffix) < WIN_SIZE_\(suffix); n_\(suffix)++) {
+                    int bufferIndex_\(suffix) = (writePos_\(suffix) + n_\(suffix)) % WIN_SIZE_\(suffix);
+                    float sample_\(suffix) = memory[\(bufferCell) + bufferIndex_\(suffix)];
+                    float angle_\(suffix) = -2.0 * M_PI_F * (float)BIN_INDEX_\(suffix) * (float)n_\(suffix) / (float)WIN_SIZE_\(suffix);
+                    real_\(suffix) += sample_\(suffix) * metal::cos(angle_\(suffix));
+                    imag_\(suffix) += sample_\(suffix) * metal::sin(angle_\(suffix));
+                }
+                float \(realVar) = real_\(suffix);
+                float \(imagVar) = imag_\(suffix);
+                float \(magVar) = metal::sqrt(real_\(suffix) * real_\(suffix) + imag_\(suffix) * imag_\(suffix));
+            """
+            return code
+
+        case let .computeDFTBinFullGrad(bufferCell, windowSize, binIndex, realDest, imagDest, magDest):
+            // Same as computeDFTBinFull but reads from grad_memory instead of memory
+            let realVar = "t\(realDest)"
+            let imagVar = "t\(imagDest)"
+            let magVar = "t\(magDest)"
+
+            let suffix = magDest
+            let code = """
+                const int WIN_SIZE_\(suffix) = \(windowSize);
+                const int BIN_INDEX_\(suffix) = \(binIndex);
+                int writePos_\(suffix) = ((int)grad_memory[\(bufferCell) + WIN_SIZE_\(suffix)]) % WIN_SIZE_\(suffix);
+                float real_\(suffix) = 0.0, imag_\(suffix) = 0.0;
+                for (int n_\(suffix) = 0; n_\(suffix) < WIN_SIZE_\(suffix); n_\(suffix)++) {
+                    int bufferIndex_\(suffix) = (writePos_\(suffix) + n_\(suffix)) % WIN_SIZE_\(suffix);
+                    float sample_\(suffix) = grad_memory[\(bufferCell) + bufferIndex_\(suffix)];
+                    float angle_\(suffix) = -2.0 * M_PI_F * (float)BIN_INDEX_\(suffix) * (float)n_\(suffix) / (float)WIN_SIZE_\(suffix);
+                    real_\(suffix) += sample_\(suffix) * metal::cos(angle_\(suffix));
+                    imag_\(suffix) += sample_\(suffix) * metal::sin(angle_\(suffix));
+                }
+                float \(realVar) = real_\(suffix);
+                float \(imagVar) = imag_\(suffix);
+                float \(magVar) = metal::sqrt(real_\(suffix) * real_\(suffix) + imag_\(suffix) * imag_\(suffix));
+            """
+            return code
+
+        case let .spectralLoss(buf1Cell, buf2Cell, sig1, sig2, windowSize):
+            // Forward pass: update buffers and compute spectral loss with runtime loop
+            let numBins = windowSize / 2 + 1
+
+            let code = """
+            ({
+                // Update memory buffers with incoming signals
+                const int WIN_SIZE = \(windowSize);
+
+                // Save current write positions before updating
+                int oldWritePos1 = ((int)memory[\(buf1Cell) + WIN_SIZE]) % WIN_SIZE;
+                int oldWritePos2 = ((int)memory[\(buf2Cell) + WIN_SIZE]) % WIN_SIZE;
+
+                // Write new samples
+                memory[\(buf1Cell) + oldWritePos1] = \(g(sig1));
+                memory[\(buf1Cell) + WIN_SIZE] = memory[\(buf1Cell) + WIN_SIZE] + 1.0;
+                memory[\(buf2Cell) + oldWritePos2] = \(g(sig2));
+                memory[\(buf2Cell) + WIN_SIZE] = memory[\(buf2Cell) + WIN_SIZE] + 1.0;
+
+                // For DFT, read starting from the oldest sample (current writePos after increment)
+                int readPos1 = ((int)memory[\(buf1Cell) + WIN_SIZE]) % WIN_SIZE;
+                int readPos2 = ((int)memory[\(buf2Cell) + WIN_SIZE]) % WIN_SIZE;
+
+                // Compute spectral loss by looping over frequency bins
+                float totalError = 0.0;
+                const int NUM_BINS = \(numBins);
+
+                for (int binIndex = 0; binIndex < NUM_BINS; binIndex++) {
+                    // Compute DFT for buf1
+                    float real1 = 0.0, imag1 = 0.0;
+                    for (int n = 0; n < WIN_SIZE; n++) {
+                        int bufferIndex = (readPos1 + n) % WIN_SIZE;
+                        float sample = memory[\(buf1Cell) + bufferIndex];
+                        float angle = -2.0 * M_PI_F * (float)binIndex * (float)n / (float)WIN_SIZE;
+                        real1 += sample * metal::cos(angle);
+                        imag1 += sample * metal::sin(angle);
+                    }
+                    float mag1 = metal::sqrt(real1 * real1 + imag1 * imag1);
+
+                    // Compute DFT for buf2
+                    float real2 = 0.0, imag2 = 0.0;
+                    for (int n = 0; n < WIN_SIZE; n++) {
+                        int bufferIndex = (readPos2 + n) % WIN_SIZE;
+                        float sample = memory[\(buf2Cell) + bufferIndex];
+                        float angle = -2.0 * M_PI_F * (float)binIndex * (float)n / (float)WIN_SIZE;
+                        real2 += sample * metal::cos(angle);
+                        imag2 += sample * metal::sin(angle);
+                    }
+                    float mag2 = metal::sqrt(real2 * real2 + imag2 * imag2);
+
+                    // Accumulate squared error
+                    float diff = mag1 - mag2;
+                    totalError += diff * diff;
+                }
+
+                // Return total error (not averaged, to match typical MSE scale expectations)
+                totalError;
+            })
+            """
+            return emitAssign(uop, code, ctx)
+
+        case let .spectralLossBackward(buf1Cell, buf2Cell, windowSize, sig1, sig2, upstreamGrad, grad1Dest, grad2Dest):
+            // Generate Metal code that:
+            // 1. Updates grad_memory circular buffers with incoming signals from tape
+            // 2. Computes DFT from grad_memory buffers (in runtime loop over bins)
+            // 3. Computes gradients wrt both input signals
+            let grad1Var = "t\(grad1Dest)"
+            let grad2Var = "t\(grad2Dest)"
+            let numBins = windowSize / 2 + 1
+
+            let code = """
+                // Update grad_memory buffers with current signals (from tape)
+                const int WIN_SIZE = \(windowSize);
+
+                // Save current write positions before updating
+                int oldWritePos1 = ((int)grad_memory[\(buf1Cell) + WIN_SIZE]) % WIN_SIZE;
+                int oldWritePos2 = ((int)grad_memory[\(buf2Cell) + WIN_SIZE]) % WIN_SIZE;
+
+                // Write new samples
+                grad_memory[\(buf1Cell) + oldWritePos1] = \(g(sig1));
+                grad_memory[\(buf1Cell) + WIN_SIZE] = grad_memory[\(buf1Cell) + WIN_SIZE] + 1.0;
+                grad_memory[\(buf2Cell) + oldWritePos2] = \(g(sig2));
+                grad_memory[\(buf2Cell) + WIN_SIZE] = grad_memory[\(buf2Cell) + WIN_SIZE] + 1.0;
+
+                // For DFT, read starting from the oldest sample (current writePos after increment)
+                int readPos1 = ((int)grad_memory[\(buf1Cell) + WIN_SIZE]) % WIN_SIZE;
+                int readPos2 = ((int)grad_memory[\(buf2Cell) + WIN_SIZE]) % WIN_SIZE;
+
+                // Compute gradients by looping over frequency bins
+                float \(grad1Var) = 0.0;
+                float \(grad2Var) = 0.0;
+                const int NUM_BINS = \(numBins);
+
+                for (int binIndex = 0; binIndex < NUM_BINS; binIndex++) {
+                    // Compute DFT for buf1 from grad_memory
+                    float real1 = 0.0, imag1 = 0.0;
+                    for (int n = 0; n < WIN_SIZE; n++) {
+                        int bufferIndex = (readPos1 + n) % WIN_SIZE;
+                        float sample = grad_memory[\(buf1Cell) + bufferIndex];
+                        float angle = -2.0 * M_PI_F * (float)binIndex * (float)n / (float)WIN_SIZE;
+                        real1 += sample * metal::cos(angle);
+                        imag1 += sample * metal::sin(angle);
+                    }
+                    float mag1 = metal::sqrt(real1 * real1 + imag1 * imag1);
+
+                    // Compute DFT for buf2 from grad_memory
+                    float real2 = 0.0, imag2 = 0.0;
+                    for (int n = 0; n < WIN_SIZE; n++) {
+                        int bufferIndex = (readPos2 + n) % WIN_SIZE;
+                        float sample = grad_memory[\(buf2Cell) + bufferIndex];
+                        float angle = -2.0 * M_PI_F * (float)binIndex * (float)n / (float)WIN_SIZE;
+                        real2 += sample * metal::cos(angle);
+                        imag2 += sample * metal::sin(angle);
+                    }
+                    float mag2 = metal::sqrt(real2 * real2 + imag2 * imag2);
+
+                    // Gradient from MSE: 2*(mag1 - mag2)
+                    float magDiff = mag1 - mag2;
+                    float lossGrad = 2.0 * magDiff;
+
+                    // Gradient of magnitude wrt current sample (chronologically last sample in buffer)
+                    int samplePos = WIN_SIZE - 1;
+                    float angle1 = -2.0 * M_PI_F * (float)binIndex * (float)samplePos / (float)WIN_SIZE;
+                    float cos1 = metal::cos(angle1);
+                    float sin1 = metal::sin(angle1);
+                    float sampleGrad1 = (real1 * cos1 + imag1 * sin1) / (mag1 + 1e-8);
+
+                    float angle2 = -2.0 * M_PI_F * (float)binIndex * (float)samplePos / (float)WIN_SIZE;
+                    float cos2 = metal::cos(angle2);
+                    float sin2 = metal::sin(angle2);
+                    float sampleGrad2 = (real2 * cos2 + imag2 * sin2) / (mag2 + 1e-8);
+
+                    // Accumulate gradients
+                    // ∂loss/∂mag1 = 2*(mag1-mag2), ∂loss/∂mag2 = -2*(mag1-mag2)
+                    // lossGrad already contains 2*(mag1-mag2), so grad2 needs negative
+                    \(grad1Var) += lossGrad * sampleGrad1;
+                    \(grad2Var) += (-lossGrad) * sampleGrad2;  // Negative lossGrad for ∂loss/∂mag2
+                }
+
+                // Scale gradients by window size since each sample contributes to multiple frames
+                \(grad1Var) *= (float)WIN_SIZE;
+                \(grad2Var) *= (float)WIN_SIZE;
+
+                // Apply upstream gradient
+                \(grad1Var) *= \(g(upstreamGrad));
+                \(grad2Var) *= \(g(upstreamGrad));
+            """
+            return code
 
         case let .sin(a): return emitAssign(uop, "metal::sin(\(g(a)))", ctx)
         case let .cos(a): return emitAssign(uop, "metal::cos(\(g(a)))", ctx)
@@ -1288,17 +1503,19 @@ public class MetalRenderer: Renderer, UOpEmitter {
             if id == -1 {  // Special case for frameCount
                 return "frameCount"
             } else if ctx.globals.contains(id) {
+                let tapeSlot = ctx.getGlobalId(id)
                 let idx = (kind == .simd) ? "id" : "i"
                 return
-                    "t[\(ctx.getGlobalId(id))*frameCount + \(needsSegmenting ? "segmentBase + " : "") \(idx)]"
+                    "t[\(tapeSlot)*frameCount + \(needsSegmenting ? "segmentBase + " : "") \(idx)]"
             } else {
                 return "t\(id)"
             }
         case let .global(id):
             // Global variables are accessed through global buffers
+            let tapeSlot = ctx.getGlobalId(id)
             let idx = (kind == .simd) ? "id" : "i"
             return
-                "t[\(ctx.getGlobalId(id))*frameCount + \(needsSegmenting ? "segmentBase + " : "")\(idx)]"
+                "t[\(tapeSlot)*frameCount + \(needsSegmenting ? "segmentBase + " : "")\(idx)]"
         default: return "/* unknown lazy */"
         }
     }
@@ -1340,6 +1557,12 @@ func analyzeRequiredBuffers(scheduleItem: ScheduleItem) -> RequiredBuffers {
         if case .loadGradMemory = uop.op {
             return true
         } else if case .storeGradMemory = uop.op {
+            return true
+        } else if case .updateDFTBufferGrad = uop.op {
+            return true
+        } else if case .computeDFTBinFullGrad = uop.op {
+            return true
+        } else if case .spectralLossBackward = uop.op {
             return true
         }
         return false

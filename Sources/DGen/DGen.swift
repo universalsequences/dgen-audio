@@ -9,7 +9,8 @@ public class IRContext {
 
     public init() {}
 
-    public var globals: Set<VarID> = []
+    // Use Array instead of Set to maintain stable ordering for tape slot assignment
+    public var globals: [VarID] = []
 
     // map of nodeId -> Lazy value (variable or constant)
     public var values: [NodeID: Lazy] = [:]
@@ -21,7 +22,7 @@ public class IRContext {
 
     public func getGlobalId(_ varId: VarID) -> Int {
         if let index = globals.firstIndex(of: varId) {
-            return globals.distance(from: globals.startIndex, to: index)
+            return index
         }
         return 0
     }
