@@ -624,11 +624,11 @@ public class MetalCompiledKernel: CompiledKernelRuntime {
 
         // Set all seed gradients to 1.0 (typically loss nodes)
         // Each seed gets a region of numFrames values set to 1.0
-        print("   [DEBUG] Seeding gradients for \(context.seedGradients.count) seeds: \(context.seedGradients)")
+        //print("   [DEBUG] Seeding gradients for \(context.seedGradients.count) seeds: \(context.seedGradients)")
         for seedId in context.seedGradients {
             let startIdx = numFrames * seedId
             let endIdx = numFrames * (seedId + 1)
-            print("   [DEBUG] Setting gradId=\(seedId) range [\(startIdx)..<\(endIdx)] to 1.0")
+            //   print("   [DEBUG] Setting gradId=\(seedId) range [\(startIdx)..<\(endIdx)] to 1.0")
             for i in startIdx..<endIdx {
                 bufferContents[i] = 1.0
             }
@@ -636,7 +636,7 @@ public class MetalCompiledKernel: CompiledKernelRuntime {
             // Verify it was set
             let firstVal = bufferContents[startIdx]
             let lastVal = bufferContents[endIdx - 1]
-            print("   [DEBUG] Verification: gradients[\(startIdx)]=\(firstVal), gradients[\(endIdx-1)]=\(lastVal)")
+            //print("   [DEBUG] Verification: gradients[\(startIdx)]=\(firstVal), gradients[\(endIdx-1)]=\(lastVal)")
         }
 
         // Reset grad_memory buffer (used for spectralLoss ring buffers and phasor gradient accumulation)
@@ -711,9 +711,9 @@ public class MetalCompiledKernel: CompiledKernelRuntime {
                     // Bind buffers with per-segment offsets
                     for (bufferIndex, bufferName) in kernel.buffers.enumerated() {
                         if firstDebug {
-                            print(
-                                "kernel[\(index) setting buffer=\(bufferName) index=\(bufferIndex)]"
-                            )
+                            //print(
+                            //    "kernel[\(index) setting buffer=\(bufferName) index=\(bufferIndex)]"
+                            //)
                         }
 
                         guard let buffer = bufferPool[bufferName] else { continue }
@@ -740,9 +740,9 @@ public class MetalCompiledKernel: CompiledKernelRuntime {
                 for (bufferIndex, bufferName) in kernel.buffers.enumerated() {
                     if let buffer = bufferPool[bufferName] {
                         if firstDebug {
-                            print(
-                                "kernel[\(index) setting buffer=\(bufferName) index=\(bufferIndex)]"
-                            )
+                            //print(
+                            //    "kernel[\(index) setting buffer=\(bufferName) index=\(bufferIndex)]"
+                            //)
                         }
                         computeEncoder.setBuffer(buffer, offset: 0, index: bufferIndex)
                     }

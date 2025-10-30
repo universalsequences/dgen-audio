@@ -250,6 +250,8 @@ public func scalarNodes(_ g: Graph, feedbackClusters: [[NodeID]]) -> Set<NodeID>
             scalar.insert($0.id)  // Latch operations need to be scalar (stateful)
         case .phasor(_):
             scalar.insert($0.id)  // Phasor operations need to be scalar (stateful)
+        case .scalarMemoryWrite(_):
+            scalar.insert($0.id)  // Force scalar writes for ring-buffer semantics
         //case .seq:
         //    scalar.insert($0.id)  // Seq operations need to be scalar (ordering dependent)
         default: break

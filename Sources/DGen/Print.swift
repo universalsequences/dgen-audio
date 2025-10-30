@@ -39,6 +39,8 @@ extension UOp {
             opStr = "\(ANSI.cyan)memoryRead\(ANSI.reset)(\(base), \(offset))"
         case let .memoryWrite(base, offset, value):
             opStr = "\(ANSI.cyan)memoryWrite\(ANSI.reset)(\(base), \(offset), \(value))"
+        case let .scalarMemoryWrite(base, offset, value):
+            opStr = "\(ANSI.cyan)scalarMemoryWrite\(ANSI.reset)(\(base), \(offset), \(value))"
         case let .concatShift(a, b, c):
             opStr = "\(ANSI.cyan)concatShift\(ANSI.reset)(\(a), \(b), \(c))"
         case let .sin(a):
@@ -139,10 +141,14 @@ extension UOp {
             opStr = "\(ANSI.magenta)updateDFTBufferGrad\(ANSI.reset)(\(bufferCell), \(signal), \(windowSize))"
         case let .computeDFTBinFullGrad(bufferCell, windowSize, binIndex, realDest, imagDest, magDest):
             opStr = "\(ANSI.magenta)computeDFTBinFullGrad\(ANSI.reset)(\(bufferCell), \(windowSize), \(binIndex) -> \(realDest), \(imagDest), \(magDest))"
-        case let .spectralLoss(buf1, buf2, sig1, sig2, windowSize):
-            opStr = "\(ANSI.green)spectralLoss\(ANSI.reset)(\(buf1), \(buf2), \(sig1), \(sig2), \(windowSize))"
-        case let .spectralLossBackward(buf1, buf2, windowSize, sig1, sig2, upstreamGrad, grad1Dest, grad2Dest):
-            opStr = "\(ANSI.magenta)spectralLossBackward\(ANSI.reset)(\(buf1), \(buf2), \(windowSize), \(sig1), \(sig2), \(upstreamGrad) -> \(grad1Dest), \(grad2Dest))"
+        case let .spectralLoss(buf1, buf2, windowSize, writePos):
+            opStr = "\(ANSI.green)spectralLoss\(ANSI.reset)(buf1=\(buf1), buf2=\(buf2), win=\(windowSize), writePos=\(writePos))"
+        case let .spectralLossBackward(buf1, buf2, windowSize, writePos, upstreamGrad, grad1Dest, grad2Dest):
+            opStr = "\(ANSI.magenta)spectralLossBackward\(ANSI.reset)(buf1=\(buf1), buf2=\(buf2), win=\(windowSize), writePos=\(writePos), upGrad=\(upstreamGrad) -> \(grad1Dest), \(grad2Dest))"
+        case let .spectralLossTape(sig1, sig2, windowSize):
+            opStr = "\(ANSI.green)spectralLossTape\(ANSI.reset)(sig1=\(sig1), sig2=\(sig2), win=\(windowSize))"
+        case let .spectralLossTapeBackward(windowSize, sig1, sig2, upstreamGrad, grad1Dest, grad2Dest):
+            opStr = "\(ANSI.magenta)spectralLossTapeBackward\(ANSI.reset)(win=\(windowSize), sig1=\(sig1), sig2=\(sig2), upGrad=\(upstreamGrad) -> \(grad1Dest), \(grad2Dest))"
         case .frameIndex:
             opStr = "\(ANSI.magenta)frameIndex\(ANSI.reset)"
         }

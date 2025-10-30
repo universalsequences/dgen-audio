@@ -281,26 +281,32 @@ func remapVectorMemorySlots(_ uopBlocks: inout [BlockUOps]) -> CellAllocations {
                 } else if memoryUsage[cellId] != block.kind {
                     // Mixed use not supported yet; keep original behavior (no forced upgrade)
                 }
-            case let .spectralLoss(buf1Cell, buf2Cell, _, _, windowSize):
+            case let .memoryRead(cellId, _):
+                allCellIds.insert(cellId)
+                if memoryUsage[cellId] == nil { memoryUsage[cellId] = block.kind }
+            case let .memoryWrite(cellId, _, _):
+                allCellIds.insert(cellId)
+                if memoryUsage[cellId] == nil { memoryUsage[cellId] = block.kind }
+            case let .scalarMemoryWrite(cellId, _, _):
+                allCellIds.insert(cellId)
+                memoryUsage[cellId] = .scalar
+            case let .spectralLoss(buf1Cell, buf2Cell, windowSize, _):
                 // spectralLoss uses two ring buffers of size (windowSize + 1)
                 let bufferSize = windowSize + 1
                 // Reserve range for buf1
                 for i in 0..<bufferSize {
                     let cellId = buf1Cell + CellID(i)
                     allCellIds.insert(cellId)
-                    if memoryUsage[cellId] == nil {
-                        memoryUsage[cellId] = block.kind
-                    }
+                    // Force scalar to keep ring buffers at original slots
+                    memoryUsage[cellId] = .scalar
                 }
                 // Reserve range for buf2
                 for i in 0..<bufferSize {
                     let cellId = buf2Cell + CellID(i)
                     allCellIds.insert(cellId)
-                    if memoryUsage[cellId] == nil {
-                        memoryUsage[cellId] = block.kind
-                    }
+                    memoryUsage[cellId] = .scalar
                 }
-            case let .spectralLossBackward(buf1Cell, buf2Cell, windowSize, _, _, _, _, _):
+            case let .spectralLossBackward(buf1Cell, buf2Cell, windowSize, _, _, _, _):
                 // spectralLossBackward also uses ring buffers in grad_memory (same size)
                 let bufferSize = windowSize + 1
                 // Reserve range for buf1
@@ -372,11 +378,35 @@ func remapVectorMemorySlots(_ uopBlocks: inout [BlockUOps]) -> CellAllocations {
                         kind: uop.kind
                     )
                 }
-            case let .spectralLoss(buf1Cell, buf2Cell, sig1, sig2, windowSize):
+            case let .memoryRead(cellId, offset):
+                if let newCellId = cellRemapping[cellId] {
+                    uopBlocks[blockIndex].ops[uopIndex] = UOp(
+                        op: .memoryRead(newCellId, offset),
+                        value: uop.value,
+                        kind: uop.kind
+                    )
+                }
+            case let .memoryWrite(cellId, offset, value):
+                if let newCellId = cellRemapping[cellId] {
+                    uopBlocks[blockIndex].ops[uopIndex] = UOp(
+                        op: .memoryWrite(newCellId, offset, value),
+                        value: uop.value,
+                        kind: uop.kind
+                    )
+                }
+            case let .scalarMemoryWrite(cellId, offset, value):
+                if let newCellId = cellRemapping[cellId] {
+                    uopBlocks[blockIndex].ops[uopIndex] = UOp(
+                        op: .scalarMemoryWrite(newCellId, offset, value),
+                        value: uop.value,
+                        kind: uop.kind
+                    )
+                }
+            case let .spectralLoss(buf1Cell, buf2Cell, windowSize, _):
                 // spectralLoss buffers are NOT remapped - they use consecutive cells already reserved
                 // No remapping needed
                 break
-            case let .spectralLossBackward(buf1Cell, buf2Cell, windowSize, sig1, sig2, upstreamGrad, grad1Dest, grad2Dest):
+            case let .spectralLossBackward(buf1Cell, buf2Cell, windowSize, _, _, _, _):
                 // spectralLossBackward buffers are NOT remapped - they use consecutive cells already reserved
                 // No remapping needed
                 break

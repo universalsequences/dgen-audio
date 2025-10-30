@@ -266,12 +266,10 @@ func u_dftMagnitudeGradient(
     }
 }
 
-func u_spectralLoss(_ buf1Cell: CellID, _ buf2Cell: CellID, _ sig1: Expr, _ sig2: Expr, _ windowSize: Int) -> (IRBuilder) -> Expr {
+func u_spectralLoss(_ buf1Cell: CellID, _ buf2Cell: CellID, _ writePos: Expr, _ windowSize: Int) -> (IRBuilder) -> Expr {
     return { b in
-        // Generate a single UOp that does the entire computation with Metal runtime loops
-        // This avoids massive code generation from compile-time unrolling
         let dest = b.ctx.useVariable(src: b.nodeId)
-        let uop = UOp(op: .spectralLoss(buf1Cell, buf2Cell, sig1.lazy, sig2.lazy, windowSize), value: dest)
+        let uop = UOp(op: .spectralLoss(buf1Cell, buf2Cell, windowSize, writePos.lazy), value: dest)
         b.ops.append(uop)
         return b.value(dest)
     }
@@ -279,7 +277,7 @@ func u_spectralLoss(_ buf1Cell: CellID, _ buf2Cell: CellID, _ sig1: Expr, _ sig2
 
 // Compute spectral loss backward gradients using a Metal runtime loop over bins
 // Reads signal values from tape and builds grad_memory buffers, then computes DFT
-func u_spectralLossBackward(_ buf1Cell: CellID, _ buf2Cell: CellID, _ windowSize: Int, _ sig1: Expr, _ sig2: Expr, _ upstreamGrad: Expr) -> (IRBuilder) -> (Expr, Expr) {
+func u_spectralLossBackward(_ buf1Cell: CellID, _ buf2Cell: CellID, _ windowSize: Int, _ writePos: Expr, _ upstreamGrad: Expr) -> (IRBuilder) -> (Expr, Expr) {
     return { b in
         let grad1Dest = b.ctx.useVariable(src: b.nodeId)
         let grad2Dest = b.ctx.useVariable(src: b.nodeId)
@@ -287,8 +285,7 @@ func u_spectralLossBackward(_ buf1Cell: CellID, _ buf2Cell: CellID, _ windowSize
         guard case .variable(let grad1VarId, _) = grad1Dest else { fatalError("Expected variable") }
         guard case .variable(let grad2VarId, _) = grad2Dest else { fatalError("Expected variable") }
 
-        // Note: sig1 and sig2 are the signal values from tape (via tapeValue)
-        let uop = UOp(op: .spectralLossBackward(buf1Cell, buf2Cell, windowSize, sig1.lazy, sig2.lazy, upstreamGrad.lazy, grad1VarId, grad2VarId), value: grad1Dest)
+        let uop = UOp(op: .spectralLossBackward(buf1Cell, buf2Cell, windowSize, writePos.lazy, upstreamGrad.lazy, grad1VarId, grad2VarId), value: grad1Dest)
         b.ops.append(uop)
 
         return (b.value(grad1Dest), b.value(grad2Dest))
@@ -369,10 +366,12 @@ public enum LazyOp {
         lt, eq,
         gswitch, mix, pow, floor, ceil, round, mod, min, max
     case mse  // mean squared error per-sample: (a-b)^2
-    case spectralLoss(CellID, CellID, Int)  // spectralLoss(buf1, buf2, windowSize) - DFT-based frequency domain MSE
+    case spectralLoss(CellID, CellID, Int)  // spectralLoss(buf1, buf2, windowSize)
+    case spectralLossTape(Int)              // spectralLoss from tape windows
     case selector  // selector(mode, options[])
     case memoryRead(CellID)
     case memoryWrite(CellID)
+    case scalarMemoryWrite(CellID)
     case historyWrite(CellID)
     case historyReadWrite(CellID)
     case param(CellID)
@@ -538,6 +537,16 @@ public enum LazyOp {
                     operator: "memoryWrite", expected: 2, actual: inputs.count)
             }
             b.use(val: b.memoryWrite(cellId, b.value(inputs[0]), b.value(inputs[1])))
+        case .scalarMemoryWrite(let cellId):
+            guard inputs.count == 2 else {
+                throw DGenError.insufficientInputs(
+                    operator: "scalarMemoryWrite", expected: 2, actual: inputs.count)
+            }
+            // Force a scalar memory write by emitting a dedicated UOp
+            let dest = ctx.useVariable(src: node.id)
+            let uop = UOp(op: .scalarMemoryWrite(cellId, b.value(inputs[0]).lazy, b.value(inputs[1]).lazy), value: dest)
+            b.ops.append(uop)
+            b.use(val: b.value(dest))
         case .atan2:
             guard inputs.count == 2 else {
                 throw DGenError.insufficientInputs(
@@ -552,13 +561,20 @@ public enum LazyOp {
             let (a, b2) = b.values(inputs, count: 2)
             b.use(val: u_mse(a, b2)(b))
         case let .spectralLoss(buf1Cell, buf2Cell, windowSize):
-            // Spectral loss implemented as composite using DFT
+            // Default forward lowering: tape-based compute
             guard inputs.count == 2 else {
                 throw DGenError.insufficientInputs(
                     operator: "spectralLoss", expected: 2, actual: inputs.count)
             }
             let (sig1, sig2) = b.values(inputs, count: 2)
-            b.use(val: u_spectralLoss(buf1Cell, buf2Cell, sig1, sig2, windowSize)(b))
+            b.use(val: u_spectralLossTape(sig1, sig2, windowSize)(b))
+        case let .spectralLossTape(windowSize):
+            guard inputs.count == 2 else {
+                throw DGenError.insufficientInputs(
+                    operator: "spectralLossTape", expected: 2, actual: inputs.count)
+            }
+            let (sig1, sig2) = b.values(inputs, count: 2)
+            b.use(val: u_spectralLossTape(sig1, sig2, windowSize)(b))
         case .gt:
             guard inputs.count == 2 else {
                 throw DGenError.insufficientInputs(
@@ -885,17 +901,23 @@ public enum LazyOp {
             let gradB = b.value(gradOutput) * (b.constant(0.0) - two * diff)
             b.grad(node.inputs[0], value: gradA.lazy)
             b.grad(node.inputs[1], value: gradB.lazy)
-        case let .spectralLoss(buf1Cell, buf2Cell, windowSize):
-            // Backward pass: compute gradients using runtime Metal loop (not compile-time unrolling)
+        case let .spectralLoss(_, _, windowSize):
+            // Backward pass: compute gradients using tape windows
             guard inputs.count == 2 else { fatalError("spectralLoss requires 2 inputs") }
-
-            // Get signal values from tape (stored per-frame during forward pass)
             let sig1 = b.tapeValue(node.inputs[0])
             let sig2 = b.tapeValue(node.inputs[1])
-
-            // Use new UOp that stores signals in grad_memory and computes gradients in a Metal runtime loop
-            let (grad1, grad2) = u_spectralLossBackward(buf1Cell, buf2Cell, windowSize, sig1, sig2, b.value(gradOutput))(b)
-
+            let (grad1, grad2) = u_spectralLossTapeBackward(
+                windowSize, sig1, sig2, b.value(gradOutput)
+            )(b)
+            b.grad(node.inputs[0], value: grad1.lazy)
+            b.grad(node.inputs[1], value: grad2.lazy)
+        case let .spectralLossTape(windowSize):
+            guard inputs.count == 2 else { fatalError("spectralLossTape requires 2 inputs") }
+            let sig1 = b.tapeValue(node.inputs[0])
+            let sig2 = b.tapeValue(node.inputs[1])
+            let (grad1, grad2) = u_spectralLossTapeBackward(
+                windowSize, sig1, sig2, b.value(gradOutput)
+            )(b)
             b.grad(node.inputs[0], value: grad1.lazy)
             b.grad(node.inputs[1], value: grad2.lazy)
         case .floor:
@@ -927,6 +949,12 @@ public enum LazyOp {
             let zeroGrad = ctx.useConstant(src: nil, value: 0.0)
             b.grad(node.inputs[0], value: zeroGrad)
             // Gradient for value flows through
+            b.grad(node.inputs[1], value: gradOutput)
+        case .scalarMemoryWrite(_):
+            // Same gradient semantics as memoryWrite
+            guard inputs.count == 2 else { fatalError("scalarMemoryWrite requires 2 inputs") }
+            let zeroGrad = ctx.useConstant(src: nil, value: 0.0)
+            b.grad(node.inputs[0], value: zeroGrad)
             b.grad(node.inputs[1], value: gradOutput)
         case .gt, .gte, .lte, .lt, .eq:
             // Comparisons have zero gradient (non-differentiable)
@@ -1066,5 +1094,30 @@ public enum LazyOp {
 
         ops.append(contentsOf: b.ops)
         return ops
+    }
+}
+// Tape-based spectral loss forward op
+func u_spectralLossTape(_ sig1: Expr, _ sig2: Expr, _ windowSize: Int) -> (IRBuilder) -> Expr {
+    return { b in
+        let dest = b.ctx.useVariable(src: b.nodeId)
+        let uop = UOp(op: .spectralLossTape(sig1.lazy, sig2.lazy, windowSize), value: dest)
+        b.ops.append(uop)
+        return b.value(dest)
+    }
+}
+
+// Tape-based spectral loss backward op
+func u_spectralLossTapeBackward(_ windowSize: Int, _ sig1: Expr, _ sig2: Expr, _ upstreamGrad: Expr) -> (IRBuilder) -> (Expr, Expr) {
+    return { b in
+        let grad1Dest = b.ctx.useVariable(src: b.nodeId)
+        let grad2Dest = b.ctx.useVariable(src: b.nodeId)
+
+        guard case .variable(let grad1VarId, _) = grad1Dest else { fatalError("Expected variable") }
+        guard case .variable(let grad2VarId, _) = grad2Dest else { fatalError("Expected variable") }
+
+        let uop = UOp(op: .spectralLossTapeBackward(windowSize, sig1.lazy, sig2.lazy, upstreamGrad.lazy, grad1VarId, grad2VarId), value: grad1Dest)
+        b.ops.append(uop)
+
+        return (b.value(grad1Dest), b.value(grad2Dest))
     }
 }

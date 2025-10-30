@@ -23,8 +23,11 @@ public enum Op {
   case computeDFTBin(CellID, Int, Int)  // (bufferCell, windowSize, binIndex) - computes DFT magnitude at frequency bin
   case computeDFTBinFull(CellID, Int, Int, VarID, VarID, VarID)  // (bufferCell, windowSize, binIndex, realDest, imagDest, magDest) - computes real, imag, and magnitude
   case computeDFTBinFullGrad(CellID, Int, Int, VarID, VarID, VarID)  // Same as computeDFTBinFull but reads from grad_memory
-  case spectralLoss(CellID, CellID, Lazy, Lazy, Int)  // (buf1, buf2, signal1, signal2, windowSize) - computes DFT-based frequency domain MSE
-  case spectralLossBackward(CellID, CellID, Int, Lazy, Lazy, Lazy, VarID, VarID)  // (buf1, buf2, windowSize, sig1, sig2, upstreamGrad, grad1Dest, grad2Dest) - stores signals in grad_memory and computes gradients
+  case spectralLoss(CellID, CellID, Int, Lazy)  // (buf1, buf2, windowSize, writePos) - computes DFT-based frequency domain MSE from ring buffers
+  case spectralLossBackward(CellID, CellID, Int, Lazy, Lazy, VarID, VarID)  // (buf1, buf2, windowSize, writePos, upstreamGrad, grad1Dest, grad2Dest)
+  // Tape-based compute variants (read windows directly from tape)
+  case spectralLossTape(Lazy, Lazy, Int)  // (sig1, sig2, windowSize)
+  case spectralLossTapeBackward(Int, Lazy, Lazy, Lazy, VarID, VarID)  // (windowSize, sig1, sig2, upstreamGrad, grad1Dest, grad2Dest)
   case mutate(Lazy, Lazy)
   case add(Lazy, Lazy)
   case sub(Lazy, Lazy)
@@ -55,6 +58,7 @@ public enum Op {
   case round(Lazy)
   case memoryRead(CellID, Lazy)
   case memoryWrite(CellID, Lazy, Lazy)
+  case scalarMemoryWrite(CellID, Lazy, Lazy)
   case latch(Lazy, Lazy)
   case beginIf(Lazy)
   case gswitch(Lazy, Lazy, Lazy)
