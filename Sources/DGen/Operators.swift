@@ -108,21 +108,7 @@ let u_max = binaryOp(Op.max)
 
 func u_historyWrite(cellId: CellID, _ curr: Expr) -> (IRBuilder) -> Expr {
     return { b in
-        //let prev = b.load(cellId)
-        //let shifted = b.concatShift(prev, curr, 3)  // note: in scalar just use identity
-        //_ = b.store(cellId, curr)
-        //return shifted
-
-        let prev = b.delay1(cellId, curr)
-        return prev
-
-        /** Alternate solution to this operation, but unfortunately doesn't work currently for complex patches
-            * It might be that for scalar blocks, we need to do let prev = b.load(cellId); let shifted = prev; _ = b.store(cellId, curr); return prev (i.e. no shift)
-
-        //delay1 now encapsulates both: returns x[i-1] and persists current to cell
-        // ALT SOLUTION ->
-
-         */
+        return b.delay1(cellId, curr)
     }
 }
 
@@ -143,7 +129,6 @@ func u_mse(_ a: Expr, _ b: Expr) -> (IRBuilder) -> Expr {
         return squared
     }
 }
-
 
 /// Compute gradient of DFT magnitude with respect to a sample at given position
 /// Formula: ∂mag/∂sample[n] = (real * cos(angle) + imag * sin(angle)) / mag
@@ -180,7 +165,6 @@ func u_dftMagnitudeGradient(
         return numerator / safeMag
     }
 }
-
 
 func u_accum(_ cellId: CellID, incr: Expr, reset: Expr, min: Expr, max: Expr) -> (IRBuilder) -> Expr
 {
@@ -256,7 +240,7 @@ public enum LazyOp {
         lt, eq,
         gswitch, mix, pow, floor, ceil, round, mod, min, max
     case mse  // mean squared error per-sample: (a-b)^2
-    case spectralLossTape(Int)              // spectralLoss from tape windows
+    case spectralLossTape(Int)  // spectralLoss from tape windows
     case selector  // selector(mode, options[])
     case memoryRead(CellID)
     case memoryWrite(CellID)
@@ -433,7 +417,9 @@ public enum LazyOp {
             }
             // Force a scalar memory write by emitting a dedicated UOp
             let dest = ctx.useVariable(src: node.id)
-            let uop = UOp(op: .scalarMemoryWrite(cellId, b.value(inputs[0]).lazy, b.value(inputs[1]).lazy), value: dest)
+            let uop = UOp(
+                op: .scalarMemoryWrite(cellId, b.value(inputs[0]).lazy, b.value(inputs[1]).lazy),
+                value: dest)
             b.ops.append(uop)
             b.use(val: b.value(dest))
         case .atan2:
@@ -449,7 +435,7 @@ public enum LazyOp {
             }
             let (a, b2) = b.values(inputs, count: 2)
             b.use(val: u_mse(a, b2)(b))
-        
+
         case let .spectralLossTape(windowSize):
             guard inputs.count == 2 else {
                 throw DGenError.insufficientInputs(
@@ -783,7 +769,7 @@ public enum LazyOp {
             let gradB = b.value(gradOutput) * (b.constant(0.0) - two * diff)
             b.grad(node.inputs[0], value: gradA.lazy)
             b.grad(node.inputs[1], value: gradB.lazy)
-        
+
         case let .spectralLossTape(windowSize):
             guard inputs.count == 2 else { fatalError("spectralLossTape requires 2 inputs") }
             let sig1 = b.tapeValue(node.inputs[0])
@@ -980,7 +966,9 @@ func u_spectralLossTape(_ sig1: Expr, _ sig2: Expr, _ windowSize: Int) -> (IRBui
 }
 
 // Tape-based spectral loss backward op
-func u_spectralLossTapeBackward(_ windowSize: Int, _ sig1: Expr, _ sig2: Expr, _ upstreamGrad: Expr) -> (IRBuilder) -> (Expr, Expr) {
+func u_spectralLossTapeBackward(_ windowSize: Int, _ sig1: Expr, _ sig2: Expr, _ upstreamGrad: Expr)
+    -> (IRBuilder) -> (Expr, Expr)
+{
     return { b in
         let grad1Dest = b.ctx.useVariable(src: b.nodeId)
         let grad2Dest = b.ctx.useVariable(src: b.nodeId)
@@ -988,7 +976,10 @@ func u_spectralLossTapeBackward(_ windowSize: Int, _ sig1: Expr, _ sig2: Expr, _
         guard case .variable(let grad1VarId, _) = grad1Dest else { fatalError("Expected variable") }
         guard case .variable(let grad2VarId, _) = grad2Dest else { fatalError("Expected variable") }
 
-        let uop = UOp(op: .spectralLossTapeBackward(windowSize, sig1.lazy, sig2.lazy, upstreamGrad.lazy, grad1VarId, grad2VarId), value: grad1Dest)
+        let uop = UOp(
+            op: .spectralLossTapeBackward(
+                windowSize, sig1.lazy, sig2.lazy, upstreamGrad.lazy, grad1VarId, grad2VarId),
+            value: grad1Dest)
         b.ops.append(uop)
 
         return (b.value(grad1Dest), b.value(grad2Dest))

@@ -226,195 +226,66 @@ final class SpectralLossBackwardTests: XCTestCase {
             context: result.context
         )
 
-        // Set up parameter gradId from context
-        freqParam.gradId = result.context.gradients[freqParam.nodeId]
-        guard let paramGradId = freqParam.gradId else {
-            XCTFail("Parameter gradId not found in context")
-            return
-        }
+        // Training context using optimizer (replaces manual gradient descent)
+        let ctx = TrainingContext(
+            parameters: [freqParam],
+            optimizer: SGD(lr: 5.0),  // match manual learning rate used previously
+            lossNode: loss
+        )
+        ctx.initializeMemory(
+            runtime: runtime,
+            cellAllocations: result.cellAllocations,
+            context: result.context,
+            frameCount: frameCount
+        )
 
-        print("   Parameter nodeId: \(freqParam.nodeId), gradId: \(paramGradId)")
-
-        // Initialize parameter value in memory
-        let memory = runtime.allocateNodeMemory()!
-        let memoryPtr = memory.assumingMemoryBound(to: Float.self)
-
-        // Map cell ID to physical cell (handle allocation mapping)
-        let physicalCell = result.cellAllocations.cellMappings[freqParam.cellId] ?? freqParam.cellId
-        memoryPtr[Int(physicalCell)] = freqParam.value
-        print("   Set memory[\(physicalCell)] = \(freqParam.value)")
-
-        // Check initial memory state for phasor cells
-        print("   Initial memory state:")
-        print("     memory[1] (phase1 cell) = \(memoryPtr[1])")
-        print("     memory[2] (phase2 cell) = \(memoryPtr[2])")
-        print("     memory[4] (freq param cell) = \(memoryPtr[4])")
-
+        // Buffers
         let inputBuffer = [Float](repeating: 0.0, count: frameCount)
         var outputBuffer = [Float](repeating: 0.0, count: frameCount)
 
-        // Training loop
-        let learningRate: Float = 5.0
+        // Training loop using TrainingContext
         let numIterations = 500
         var lossHistory: [Float] = []
-
         for iteration in 0..<numIterations {
-            // Reset memory except for parameter values
-            // Save current parameter value
-            let currentParamValue = memoryPtr[Int(physicalCell)]
+            // Zero gradients and reset memory (preserving params)
+            ctx.zeroGrad()
 
-            // Zero out all memory
-            let memorySize = runtime.getMemorySize()
-            memset(memory, 0, memorySize * MemoryLayout<Float>.size)
-
-            // Restore parameter value
-            memoryPtr[Int(physicalCell)] = currentParamValue
-
-            // Reset gradients
-            runtime.resetGradientBuffers(numFrames: frameCount)
-
-            // Forward and backward pass
+            // Forward + backward pass
             inputBuffer.withUnsafeBufferPointer { inPtr in
                 outputBuffer.withUnsafeMutableBufferPointer { outPtr in
                     runtime.runWithMemory(
                         outputs: outPtr.baseAddress!,
                         inputs: inPtr.baseAddress!,
-                        memory: memory,
+                        memory: ctx.getMemory(),
                         frameCount: frameCount
                     )
                 }
             }
 
+            // Optimizer step updates params and syncs memory
+            ctx.step()
+
+            // Spectral loss is written to the output; use last frame's value as scalar loss
             let currentLoss = outputBuffer[frameCount - 1]
             lossHistory.append(currentLoss)
 
-            // Debug: print first few frames to see if loss varies
-
-            // Read gradient for frequency parameter
-            guard let gradients = runtime.readBuffer(named: "gradients") else {
-                XCTFail("Gradients buffer not found")
-                return
-            }
-
-            // Extract gradient (sum across all frames)
-            var totalGrad: Float = 0.0
-            let baseIndex = frameCount * paramGradId
-            for i in 0..<frameCount {
-                totalGrad += gradients[baseIndex + i]
-            }
-            let meanGrad = totalGrad / Float(frameCount)
-
-            // Debug first iteration
-            if iteration == 0 {
-                print("   [DEBUG] First iteration gradient check:")
-                print("   [DEBUG]   paramGradId=\(paramGradId), baseIndex=\(baseIndex)")
-                print("   [DEBUG]   First 5 gradient values at baseIndex:")
-                for i in 0..<min(5, frameCount) {
-                    print(
-                        "   [DEBUG]     gradients[\(baseIndex + i)] = \(gradients[baseIndex + i])")
-                }
-
-                // Scan entire gradients buffer and map to nodes
-                print("   [DEBUG] Scanning all gradIds:")
-                print("   [DEBUG] Context gradient mappings: \(result.context.gradients)")
-
-                // Find which nodeId each gradId belongs to
-                var gradIdToNode: [Int: NodeID] = [:]
-                for (nodeId, gradId) in result.context.gradients {
-                    gradIdToNode[gradId] = nodeId
-                }
-
-                for gradId in 0..<8 {
-                    let idx = frameCount * gradId
-                    var sum: Float = 0.0
-                    var nonZeroCount = 0
-                    for i in 0..<frameCount {
-                        sum += gradients[idx + i]
-                        if abs(gradients[idx + i]) > 0.0001 {
-                            nonZeroCount += 1
-                        }
-                    }
-                    let nodeInfo = gradIdToNode[gradId].map { "node \($0)" } ?? "unmapped"
-                    print(
-                        "   [DEBUG]   gradId=\(gradId) (\(nodeInfo)): sum=\(sum), nonZero=\(nonZeroCount), first=\(gradients[idx])"
-                    )
-                }
-
-                // Check tape buffer contents (spectralLossBackward reads from slots 1 and 2)
-                if let tape = runtime.readBuffer(named: "t") {
-                    print("   [DEBUG] Tape buffer check:")
-                    print("   [DEBUG]   Tape slot 0: first 5 values")
-                    for i in 0..<min(5, frameCount) {
-                        print(
-                            "   [DEBUG]     t[0*\(frameCount) + \(i)] = \(tape[0*frameCount + i])")
-                    }
-                    print("   [DEBUG]   Tape slot 1: first 5 values")
-                    for i in 0..<min(5, frameCount) {
-                        print(
-                            "   [DEBUG]     t[1*\(frameCount) + \(i)] = \(tape[1*frameCount + i])")
-                    }
-                    print("   [DEBUG]   Tape slot 2: first 5 values")
-                    for i in 0..<min(5, frameCount) {
-                        print(
-                            "   [DEBUG]     t[2*\(frameCount) + \(i)] = \(tape[2*frameCount + i])")
-                    }
-                    print("   [DEBUG]   Tape slot 3 (kernel_0 writes here): first 5 values")
-                    for i in 0..<min(5, frameCount) {
-                        print(
-                            "   [DEBUG]     t[3*\(frameCount) + \(i)] = \(tape[3*frameCount + i])")
-                    }
-                }
-
-                // Check grad_memory buffer contents
-                if let gradMemory = runtime.readBuffer(named: "grad_memory") {
-                    print("   [DEBUG] grad_memory buffer has \(gradMemory.count) values")
-
-                    for i in 0..<gradMemory.count {
-                        if gradMemory[i] > 0 {
-                            print("gradMemory[\(i)]=\(gradMemory[i])")
-                        }
-                    }
-
-                } else {
-                    print("   [DEBUG] grad_memory buffer not found!")
-                }
-            }
-
-            // Update parameter using gradient descent
-            let currentFreq = memoryPtr[Int(physicalCell)]
-            let newFreq = currentFreq - learningRate * meanGrad
-            memoryPtr[Int(physicalCell)] = newFreq
-
-            // Print progress for first 10 iterations, then every 10
-            if iteration <= 10 || iteration % 10 == 0 || iteration == numIterations - 1 {
+            if iteration % 100 == 0 || iteration <= 10 {
                 print(
-                    "   Iteration \(iteration): freq=\(String(format: "%.2f", currentFreq)) Hz, loss=\(String(format: "%.6f", currentLoss)), grad=\(String(format: "%.6f", meanGrad))"
+                    "   Iteration \(iteration): freq=\(String(format: "%.2f", freqParam.value)) Hz, loss=\(String(format: "%.6f", currentLoss))"
                 )
-
-                // Debug to see loss values across frames
-                if iteration <= 10 {
-                    let minLoss = outputBuffer.min() ?? 0
-                    let maxLoss = outputBuffer.max() ?? 0
-                    print(
-                        "      Loss range across frames: [\(String(format: "%.3f", minLoss)) ... \(String(format: "%.3f", maxLoss))]"
-                    )
-                }
             }
         }
 
-        let finalFreq = memoryPtr[Int(physicalCell)]
-        let finalLoss = lossHistory.last!
-        let initialLoss = lossHistory.first!
+        // Results
+        let finalFreq = freqParam.value
+        let finalLoss = lossHistory.last ?? .infinity
+        let initialLoss = lossHistory.first ?? .infinity
 
         print("   Final frequency: \(String(format: "%.2f", finalFreq)) Hz")
         print("   Final loss: \(String(format: "%.6f", finalLoss))")
         print(
-            "   Loss reduction: \(String(format: "%.1f", (initialLoss - finalLoss) / initialLoss * 100))%"
+            "   Loss reduction: \(String(format: "%.1f", (initialLoss - finalLoss) / max(initialLoss, .ulpOfOne) * 100))%"
         )
-
-        for kernel in result.kernels {
-            print(kernel.source)
-        }
 
         // Verify learning happened
         XCTAssertLessThan(finalLoss, initialLoss * 0.5, "Loss should decrease by at least 50%")
@@ -423,8 +294,6 @@ final class SpectralLossBackwardTests: XCTestCase {
             abs(finalFreq - 440.0), 50.0, "Frequency should be within 50 Hz of target")
 
         print("   ✅ PASS: Successfully learned target frequency!")
-
-        runtime.deallocateNodeMemory(memory)
     }
 
     /// Test that spectral loss pipeline runs without inspecting ring buffers
