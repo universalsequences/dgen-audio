@@ -1390,9 +1390,7 @@ public class MetalRenderer: Renderer, UOpEmitter {
                     \(grad2Var) += (-lossGrad) * sampleGrad2;  // Negative lossGrad for ∂loss/∂mag2
                 }
 
-                // Scale gradients by window size since each sample contributes to multiple frames
-                \(grad1Var) *= (float)WIN_SIZE;
-                \(grad2Var) *= (float)WIN_SIZE;
+                // Note: No scaling needed - each sample contributes to one frame's loss
 
                 // Apply upstream gradient
                 \(grad1Var) *= \(g(upstreamGrad));

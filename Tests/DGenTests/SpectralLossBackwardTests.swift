@@ -304,8 +304,12 @@ final class SpectralLossBackwardTests: XCTestCase {
                 // Check memory buffer ring buffer states (use physical/remapped cells)
                 let physicalBuf1 = result.cellAllocations.cellMappings[buf1] ?? buf1
                 let physicalBuf2 = result.cellAllocations.cellMappings[buf2] ?? buf2
-                print("   [DEBUG] Memory buf1 (physical cell \(physicalBuf1)): \(memoryPtr[Int(physicalBuf1)]), \(memoryPtr[Int(physicalBuf1)+1]), \(memoryPtr[Int(physicalBuf1)+2]), writePos=\(memoryPtr[Int(physicalBuf1)+64])")
-                print("   [DEBUG] Memory buf2 (physical cell \(physicalBuf2)): \(memoryPtr[Int(physicalBuf2)]), \(memoryPtr[Int(physicalBuf2)+1]), \(memoryPtr[Int(physicalBuf2)+2]), writePos=\(memoryPtr[Int(physicalBuf2)+64])")
+                print("   [DEBUG] Memory buf1 (physical cell \(physicalBuf1)):")
+                print("      First 3 samples: \(memoryPtr[Int(physicalBuf1)]), \(memoryPtr[Int(physicalBuf1)+1]), \(memoryPtr[Int(physicalBuf1)+2])")
+                print("      writePos: \(memoryPtr[Int(physicalBuf1)+64])")
+                print("   [DEBUG] Memory buf2 (physical cell \(physicalBuf2)):")
+                print("      First 3 samples: \(memoryPtr[Int(physicalBuf2)]), \(memoryPtr[Int(physicalBuf2)+1]), \(memoryPtr[Int(physicalBuf2)+2])")
+                print("      writePos: \(memoryPtr[Int(physicalBuf2)+64])")
 
                 if let tape = runtime.readBuffer(named: "t") {
                     let lossTapeSlot = 7

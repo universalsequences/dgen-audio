@@ -373,26 +373,21 @@ func remapVectorMemorySlots(_ uopBlocks: inout [BlockUOps]) -> CellAllocations {
                     )
                 }
             case let .spectralLoss(buf1Cell, buf2Cell, sig1, sig2, windowSize):
-                let newBuf1 = cellRemapping[buf1Cell] ?? buf1Cell
-                let newBuf2 = cellRemapping[buf2Cell] ?? buf2Cell
-                uopBlocks[blockIndex].ops[uopIndex] = UOp(
-                    op: .spectralLoss(newBuf1, newBuf2, sig1, sig2, windowSize),
-                    value: uop.value,
-                    kind: uop.kind
-                )
+                // spectralLoss buffers are NOT remapped - they use consecutive cells already reserved
+                // No remapping needed
+                break
             case let .spectralLossBackward(buf1Cell, buf2Cell, windowSize, sig1, sig2, upstreamGrad, grad1Dest, grad2Dest):
-                let newBuf1 = cellRemapping[buf1Cell] ?? buf1Cell
-                let newBuf2 = cellRemapping[buf2Cell] ?? buf2Cell
-                uopBlocks[blockIndex].ops[uopIndex] = UOp(
-                    op: .spectralLossBackward(newBuf1, newBuf2, windowSize, sig1, sig2, upstreamGrad, grad1Dest, grad2Dest),
-                    value: uop.value,
-                    kind: uop.kind
-                )
+                // spectralLossBackward buffers are NOT remapped - they use consecutive cells already reserved
+                // No remapping needed
+                break
             default:
                 break
             }
         }
     }
+
+    print("[REMAP DEBUG] Cell remapping for cells 3, 68: \(cellRemapping[3] ?? -1), \(cellRemapping[68] ?? -1)")
+    print("[REMAP DEBUG] nextAvailableSlot=\(nextAvailableSlot)")
 
     let cellAllocations = CellAllocations(
         totalMemorySlots: nextAvailableSlot, cellMappings: cellRemapping, cellKinds: memoryUsage)
