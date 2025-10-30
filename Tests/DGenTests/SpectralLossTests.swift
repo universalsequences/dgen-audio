@@ -21,13 +21,9 @@ final class SpectralLossTests: XCTestCase {
         let phase1 = g.n(.phasor(g.alloc()), freq1, reset)
         let phase2 = g.n(.phasor(g.alloc()), freq2, reset)
 
-        // Allocate buffer cells for spectralLoss (need windowSize + 1 cells each)
+        // Compute spectral loss (tape-based compute)
         let windowSize = 64
-        let buf1 = g.alloc(vectorWidth: windowSize + 1)  // Allocate 65 contiguous cells
-        let buf2 = g.alloc(vectorWidth: windowSize + 1)  // Allocate 65 contiguous cells
-
-        // Compute spectral loss
-        let loss = g.n(.spectralLoss(buf1, buf2, windowSize), phase1, phase2)
+        let loss = g.n(.spectralLossTape(windowSize), phase1, phase2)
 
         // Output the loss
         _ = g.n(.output(0), loss)
@@ -116,13 +112,9 @@ final class SpectralLossTests: XCTestCase {
         let phase1 = g.n(.phasor(g.alloc()), freq1, reset)
         let phase2 = g.n(.phasor(g.alloc()), freq2, reset)
 
-        // Allocate buffer cells for spectralLoss
+        // Compute spectral loss (tape-based compute)
         let windowSize = 64
-        let buf1 = g.alloc(vectorWidth: windowSize + 1)
-        let buf2 = g.alloc(vectorWidth: windowSize + 1)
-
-        // Compute spectral loss
-        let loss = g.n(.spectralLoss(buf1, buf2, windowSize), phase1, phase2)
+        let loss = g.n(.spectralLossTape(windowSize), phase1, phase2)
 
         // Output the loss
         _ = g.n(.output(0), loss)
@@ -203,10 +195,7 @@ final class SpectralLossTests: XCTestCase {
         let phase2 = g.n(.phasor(g.alloc()), freq, reset)
 
         let windowSize = 64
-        let buf1 = g.alloc(vectorWidth: windowSize + 1)
-        let buf2 = g.alloc(vectorWidth: windowSize + 1)
-
-        let loss = g.n(.spectralLoss(buf1, buf2, windowSize), phase1, phase2)
+        let loss = g.n(.spectralLossTape(windowSize), phase1, phase2)
         _ = g.n(.output(0), loss)
 
         print("   Both frequencies: 440 Hz")

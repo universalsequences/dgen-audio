@@ -25,10 +25,7 @@ final class SpectralLossDetailedTests: XCTestCase {
             let phase2 = g.n(.phasor(g.alloc()), freq2, reset)
 
             let windowSize = 64
-            let buf1 = g.alloc(vectorWidth: windowSize + 1)
-            let buf2 = g.alloc(vectorWidth: windowSize + 1)
-
-            let loss = g.n(.spectralLoss(buf1, buf2, windowSize), phase1, phase2)
+            let loss = g.n(.spectralLossTape(windowSize), phase1, phase2)
             _ = g.n(.output(0), loss)
 
             let frameCount = 128
@@ -99,9 +96,7 @@ final class SpectralLossDetailedTests: XCTestCase {
         let phase2a = g1.n(.phasor(g1.alloc()), f2a, reset1)
 
         let windowSize = 64
-        let buf1a = g1.alloc(vectorWidth: windowSize + 1)
-        let buf2a = g1.alloc(vectorWidth: windowSize + 1)
-        let loss1 = g1.n(.spectralLoss(buf1a, buf2a, windowSize), phase1a, phase2a)
+        let loss1 = g1.n(.spectralLossTape(windowSize), phase1a, phase2a)
         _ = g1.n(.output(0), loss1)
 
         let frameCount = 128
@@ -140,9 +135,7 @@ final class SpectralLossDetailedTests: XCTestCase {
         let phase1b = g2.n(.phasor(g2.alloc()), f1b, reset2)
         let phase2b = g2.n(.phasor(g2.alloc()), f2b, reset2)
 
-        let buf1b = g2.alloc(vectorWidth: windowSize + 1)
-        let buf2b = g2.alloc(vectorWidth: windowSize + 1)
-        let loss2 = g2.n(.spectralLoss(buf1b, buf2b, windowSize), phase1b, phase2b)
+        let loss2 = g2.n(.spectralLossTape(windowSize), phase1b, phase2b)
         _ = g2.n(.output(0), loss2)
 
         let result2 = try CompilationPipeline.compile(
@@ -197,10 +190,7 @@ final class SpectralLossDetailedTests: XCTestCase {
         let phase2 = g.n(.phasor(g.alloc()), freq2, reset)
 
         let windowSize = 64
-        let buf1 = g.alloc(vectorWidth: windowSize + 1)
-        let buf2 = g.alloc(vectorWidth: windowSize + 1)
-
-        let loss = g.n(.spectralLoss(buf1, buf2, windowSize), phase1, phase2)
+        let loss = g.n(.spectralLossTape(windowSize), phase1, phase2)
         _ = g.n(.output(0), loss)
 
         let frameCount = 128
@@ -265,10 +255,7 @@ final class SpectralLossDetailedTests: XCTestCase {
             let phase1 = g.n(.phasor(g.alloc()), f1, reset)
             let phase2 = g.n(.phasor(g.alloc()), f2, reset)
 
-            let buf1 = g.alloc(vectorWidth: windowSize + 1)
-            let buf2 = g.alloc(vectorWidth: windowSize + 1)
-
-            let loss = g.n(.spectralLoss(buf1, buf2, windowSize), phase1, phase2)
+            let loss = g.n(.spectralLossTape(windowSize), phase1, phase2)
             _ = g.n(.output(0), loss)
 
             let frameCount = max(256, windowSize * 2)
@@ -343,10 +330,7 @@ final class SpectralLossDetailedTests: XCTestCase {
             let phase2 = g.n(.phasor(g.alloc()), f2, reset)
 
             let windowSize = 64
-            let buf1 = g.alloc(vectorWidth: windowSize + 1)
-            let buf2 = g.alloc(vectorWidth: windowSize + 1)
-
-            let loss = g.n(.spectralLoss(buf1, buf2, windowSize), phase1, phase2)
+            let loss = g.n(.spectralLossTape(windowSize), phase1, phase2)
             _ = g.n(.output(0), loss)
 
             let frameCount = 128
@@ -403,10 +387,7 @@ final class SpectralLossDetailedTests: XCTestCase {
         let phase2 = g.n(.phasor(g.alloc()), freq2, reset)
 
         let windowSize = 128  // Bin spacing = 344 Hz
-        let buf1 = g.alloc(vectorWidth: windowSize + 1)
-        let buf2 = g.alloc(vectorWidth: windowSize + 1)
-
-        let loss = g.n(.spectralLoss(buf1, buf2, windowSize), phase1, phase2)
+        let loss = g.n(.spectralLossTape(windowSize), phase1, phase2)
         _ = g.n(.output(0), loss)
 
         let frameCount = 256  // More frames for stability

@@ -98,31 +98,11 @@ public final class Graph {
     }
 
     @discardableResult public func n(_ op: LazyOp, _ ins: [NodeID]) -> NodeID {
-        // Special expansion for spectralLoss: build SEQ(accum+writes, compute) pattern
-        if case let .spectralLoss(buf1Cell, buf2Cell, windowSize) = op, ins.count == 2 {
-            print("spectral loss")
-            // Inputs are sig1, sig2. Build scalar writePos and memory writes, then compute.
+        // Special expansion for spectralLoss: compute from tape windows (no ring writes)
+        if case let .spectralLoss(_, _, windowSize) = op, ins.count == 2 {
             let sig1 = ins[0]
             let sig2 = ins[1]
-
-            // Accumulator for write position (0..windowSize-1)
-            let writePosCellId = alloc()
-            let one = n(.constant(1.0))
-            let zero = n(.constant(0.0))
-            let maxWin = n(.constant(Float(windowSize)))
-            let writePos = n(.floor, n(.accum(writePosCellId), one, zero, zero, maxWin))
-
-            // Perform writes into both buffers at current writePos (force scalar)
-            let write1 = n(.scalarMemoryWrite(buf1Cell), writePos, sig1)
-            let write2 = n(.scalarMemoryWrite(buf2Cell), writePos, sig2)
-
-            // Compute loss using tape windows (per-frame) via dedicated op
-            let compute = n(.spectralLossTape(windowSize), sig1, sig2)
-
-            // Ensure ordering: both writes happen before compute
-            let seqWrites = n(.seq, write1, write2)
-            print("running n seq")
-            return n(.seq, seqWrites, compute)
+            return n(.spectralLossTape(windowSize), sig1, sig2)
         }
 
         let id = next
