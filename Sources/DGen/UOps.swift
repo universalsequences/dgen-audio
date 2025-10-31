@@ -6,6 +6,11 @@ public enum Lazy {
   case empty
 }
 
+public enum CastType {
+  case int
+  case float
+}
+
 // IR (intermediate representation) is called UOp and consists of an
 // operator (Op) and value (the variable it's result is bound to)
 public enum Op {
@@ -65,6 +70,7 @@ public enum Op {
   case defineMemory(Int)
   case loadGlobal(VarID)
   case beginLoop(Lazy, Int)
+  case beginForLoop(Lazy, Lazy)  // (loopVariable, count) - step is always 1
   case endLoop
   case beginRange(Lazy, Lazy)
   case endRange
@@ -72,7 +78,10 @@ public enum Op {
   case input(ChannelNumber)
   case frameCount
   case frameIndex
-  case loadTape(Int)  // load forward intermediate from tape at offset + frameIndex
+  case threadIndex
+  case loadTape(Lazy, Lazy)
+  case cast(Lazy, CastType)
+  case declareVar(Lazy)  // Declares and initializes a variable: float t = value;
 }
 
 public struct UOp {

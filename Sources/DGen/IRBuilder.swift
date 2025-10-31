@@ -309,6 +309,57 @@ public final class IRBuilder {
     ops.append(uop)
     return value(dest)
   }
+
+  // MARK: - New IRBuilder Abstractions
+
+  public func float(_ value: Float) -> MutableVar {
+    let constLazy = ctx.useConstant(src: nodeId, value: value)
+    let dest = ctx.useVariable(src: nodeId)
+    let uop = UOp(op: .declareVar(constLazy), value: dest)
+    ops.append(uop)
+    return MutableVar(dest, ctx: ctx, nodeId: nodeId, builder: self)
+  }
+
+  public func integer(_ value: Int) -> MutableVar {
+    let constLazy = ctx.useConstant(src: nodeId, value: Float(value))
+    let dest = ctx.useVariable(src: nodeId)
+    let uop = UOp(op: .declareVar(constLazy), value: dest)
+    ops.append(uop)
+    return MutableVar(dest, ctx: ctx, nodeId: nodeId, builder: self)
+  }
+
+  public func loop(_ count: Int, body: (Expr) -> Void) {
+    let loopVar = ctx.useVariable(src: nodeId)
+    let countLazy = ctx.useConstant(src: nodeId, value: Float(count))
+    ops.append(UOp(op: .beginForLoop(loopVar, countLazy), value: loopVar))
+    body(value(loopVar))
+    ops.append(UOp(op: .endLoop, value: ctx.useVariable(src: nil)))
+  }
+
+  public func threadIndex() -> Expr {
+    let dest = ctx.useVariable(src: nodeId)
+    let uop = UOp(op: .threadIndex, value: dest)
+    ops.append(uop)
+    return value(dest)
+  }
+
+  public func tapeLoad(_ signal: Expr, at offset: Expr) -> Expr {
+    let dest = ctx.useVariable(src: nodeId)
+    let uop = UOp(op: .loadTape(signal.lazy, offset.lazy), value: dest)
+    ops.append(uop)
+    return value(dest)
+  }
+
+  public var pi: Expr {
+    return constant(Float.pi)
+  }
+
+  public func cast(_ expr: Expr, to type: CastType) -> Expr {
+    let dest = ctx.useVariable(src: nodeId)
+    let uop = UOp(op: .cast(expr.lazy, type), value: dest)
+    ops.append(uop)
+    return value(dest)
+  }
 }
 
 public struct Expr {
@@ -434,4 +485,29 @@ public struct Expr {
     return Expr(uop.value, ctx: lhs.ctx, nodeId: lhs.nodeId, builder: lhs.builder)
   }
 
+}
+
+public struct MutableVar {
+  public let lazy: Lazy
+  private unowned let builder: IRBuilder
+  private let ctx: IRContext
+  private let nodeId: NodeID
+
+  init(_ lazy: Lazy, ctx: IRContext, nodeId: NodeID, builder: IRBuilder) {
+    self.lazy = lazy
+    self.ctx = ctx
+    self.nodeId = nodeId
+    self.builder = builder
+  }
+
+  public var value: Expr {
+    return Expr(lazy, ctx: ctx, nodeId: nodeId, builder: builder)
+  }
+
+  public func accumulate(_ expr: Expr) {
+    // Emit: self = self + expr
+    let sum = value + expr
+    let uop = UOp(op: .mutate(lazy, sum.lazy), value: lazy)
+    builder.ops.append(uop)
+  }
 }

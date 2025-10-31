@@ -228,6 +228,66 @@ func u_mix(_ x: Expr, _ y: Expr, lerp: Expr) -> (IRBuilder) -> Expr {
     }
 }
 
+/// Computes spectral loss: measures how different two signals are in frequency space.
+///
+/// Uses a sliding window DFT (Discrete Fourier Transform) to convert time-domain samples into
+/// frequency magnitudes. For each frequency bin k, computes real/imaginary components via:
+///   real_k = Σ sample[n] * cos(-2π*k*n/windowSize)
+///   imag_k = Σ sample[n] * sin(-2π*k*n/windowSize)
+/// Then returns Σ(mag1_k - mag2_k)² across all bins, where mag = sqrt(real² + imag²).
+///
+/// Better than MSE for audio: invariant to small time shifts, captures perceptual differences.
+func u_spectralLoss(sig1: Expr, sig2: Expr, windowSize: Int) -> (IRBuilder) -> Expr {
+    return { b in
+        let numBins = windowSize / 2 + 1
+        let totalError = b.float(0.0)
+
+        // For each frequency bin
+        b.loop(numBins) { binIndex in
+            // DFT accumulators (real and imaginary parts)
+            let real1 = b.float(0.0)
+            let real2 = b.float(0.0)
+            let imag1 = b.float(0.0)
+            let imag2 = b.float(0.0)
+
+            // Sum over window samples
+            b.loop(windowSize) { n in
+                let idx = b.threadIndex()
+                let winSize = b.constant(Float(windowSize))
+                let j = idx - (winSize - b.constant(1.0)) + b.cast(n, to: .float)
+
+                // Load samples from tape with bounds checking
+                let s1 = b.tapeLoad(sig1, at: j)
+                let s2 = b.tapeLoad(sig2, at: j)
+
+                // DFT basis: e^(-2πi*k*n/N) = cos(angle) - i*sin(angle)
+                let binIndexFloat = b.cast(binIndex, to: .float)
+                let nFloat = b.cast(n, to: .float)
+                let angle = b.constant(-2.0) * b.pi * binIndexFloat * nFloat / winSize
+
+                let c = b.cos(angle)
+                let s = b.sin(angle)
+
+                // Accumulate DFT: Real(X[k]) += x[n]*cos, Imag(X[k]) += x[n]*sin
+                real1.accumulate(s1 * c)
+                imag1.accumulate(s1 * s)
+                real2.accumulate(s2 * c)
+                imag2.accumulate(s2 * s)
+            }
+
+            // Magnitude: |X[k]| = sqrt(Real² + Imag²)
+            let mag1 = b.sqrt(real1.value * real1.value + imag1.value * imag1.value)
+            let mag2 = b.sqrt(real2.value * real2.value + imag2.value * imag2.value)
+
+            // Accumulate squared error for this bin
+            let diff = mag1 - mag2
+            totalError.accumulate(diff * diff)
+        }
+
+        return totalError.value
+    }
+}
+
 public struct BackwardsEmitResult {
     let ops: [UOp]
     let dependencies: [NodeID]
@@ -442,7 +502,7 @@ public enum LazyOp {
                     operator: "spectralLossTape", expected: 2, actual: inputs.count)
             }
             let (sig1, sig2) = b.values(inputs, count: 2)
-            b.use(val: u_spectralLossTape(sig1, sig2, windowSize)(b))
+            b.use(val: u_spectralLoss(sig1: sig1, sig2: sig2, windowSize: windowSize)(b))
         case .gt:
             guard inputs.count == 2 else {
                 throw DGenError.insufficientInputs(
@@ -786,7 +846,7 @@ public enum LazyOp {
             )(b)
             b.grad(node.inputs[0], value: gradExpr1.lazy)
             b.grad(node.inputs[1], value: gradExpr2.lazy)
-            case .floor:
+        case .floor:
             // d(floor(x))/dx = 0 (floor is not differentiable, but we set to 0)
             guard inputs.count == 1 else { fatalError("floor requires 1 input") }
             let zeroGrad = ctx.useConstant(src: nil, value: 0.0)
@@ -938,18 +998,18 @@ public enum LazyOp {
 
             // Write gradient directly (no accumulation needed - test will sum across frames)
             b.grad(node.inputs[0], value: gradFreq.lazy)
-            // NOTE ON GRADIENT SCALE VS frameCount
-            // ------------------------------------------------------------
-            // The phasor’s backward pass produces a gradient proportional
-            // to the current frame index (time). Even though Training.swift
-            // averages gradients across frames, the mean of i/sampleRate over
-            // i = 0..(frameCount-1) grows with the time horizon (~O(frameCount)).
-            // As a result, increasing frameCount increases the effective
-            // gradient scale for frequency parameters, requiring a smaller
-            // learning rate to maintain stability. This is independent of the
-            // particular loss (e.g., spectral loss) and comes from the time-
-            // weighted nature of d(phase)/d(freq).
-            case .output(_):
+        // NOTE ON GRADIENT SCALE VS frameCount
+        // ------------------------------------------------------------
+        // The phasor’s backward pass produces a gradient proportional
+        // to the current frame index (time). Even though Training.swift
+        // averages gradients across frames, the mean of i/sampleRate over
+        // i = 0..(frameCount-1) grows with the time horizon (~O(frameCount)).
+        // As a result, increasing frameCount increases the effective
+        // gradient scale for frequency parameters, requiring a smaller
+        // learning rate to maintain stability. This is independent of the
+        // particular loss (e.g., spectral loss) and comes from the time-
+        // weighted nature of d(phase)/d(freq).
+        case .output(_):
             // Output just passes gradient through to its input
             guard inputs.count == 1 else { fatalError("output requires 1 input") }
             b.grad(node.inputs[0], value: gradOutput)
@@ -971,15 +1031,6 @@ public enum LazyOp {
 
         ops.append(contentsOf: b.ops)
         return ops
-    }
-}
-// Tape-based spectral loss forward op
-func u_spectralLossTape(_ sig1: Expr, _ sig2: Expr, _ windowSize: Int) -> (IRBuilder) -> Expr {
-    return { b in
-        let dest = b.ctx.useVariable(src: b.nodeId)
-        let uop = UOp(op: .spectralLossTape(sig1.lazy, sig2.lazy, windowSize), value: dest)
-        b.ops.append(uop)
-        return b.value(dest)
     }
 }
 

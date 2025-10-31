@@ -386,7 +386,7 @@ final class SpectralLossBackwardTests: XCTestCase {
         let targetFrequency: Float = 300.0
         let targetLFOFrequency: Float = 10.0
 
-        // Learnable frequency parameter (start at 777 Hz, target is 300 Hz)
+        // Learnable frequency parameter (start at 300 Hz, target is 237 Hz)
         let freqParam = Parameter(graph: g, value: 237.0, name: "frequency")
         let freq = freqParam.node()
 
@@ -437,8 +437,8 @@ final class SpectralLossBackwardTests: XCTestCase {
         let spectralLoss = g.spectralLoss(leaky1, leaky2, windowSize: windowSize)
         let l2Loss = g.n(.mse, leaky1, leaky2)
         let loss = g.n(
-            .add, g.n(.mul, g.n(.constant(100.0)), spectralLoss),
-            g.n(.mul, g.n(.constant(0.003)), l2Loss))
+            .add, g.n(.mul, g.n(.constant(1.0)), spectralLoss),
+            g.n(.mul, g.n(.constant(0.1)), l2Loss))
 
         _ = g.n(.output(0), loss)
 
@@ -469,7 +469,7 @@ final class SpectralLossBackwardTests: XCTestCase {
         // Training context using optimizer (replaces manual gradient descent)
         let ctx = TrainingContext(
             parameters: [freqParam, lfoFreqParam],
-            optimizer: SGD(lr: 0.03),
+            optimizer: SGD(lr: 2.3),
             lossNode: loss
         )
         ctx.initializeMemory(

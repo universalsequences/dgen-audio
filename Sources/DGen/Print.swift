@@ -103,6 +103,8 @@ extension UOp {
             opStr = "\(ANSI.green)latch\(ANSI.reset)(\(a), \(b))"
         case let .beginLoop(a, b):
             opStr = "\(ANSI.green)begin_loop\(ANSI.reset)(\(a), \(b))"
+        case let .beginForLoop(loopVar, count):
+            opStr = "\(ANSI.green)beginForLoop\(ANSI.reset)(\(loopVar), \(count))"
         case let .defineConstant(constantId, value):
             opStr = "\(ANSI.green)defineConstant\(ANSI.reset)(\(constantId),\(value))"
         case let .defineMemory(length):
@@ -127,8 +129,8 @@ extension UOp {
             opStr = "\(ANSI.magenta)storeGrad\(ANSI.reset)(\(a), \(b))"
         case let .accumulateGrad(a, b):
             opStr = "\(ANSI.magenta)accumulateGrad\(ANSI.reset)(\(a), \(b))"
-        case let .loadTape(a):
-            opStr = "\(ANSI.magenta)loadTape\(ANSI.reset)(\(a))"
+        case let .loadTape(val, offset):
+            opStr = "\(ANSI.magenta)loadTape\(ANSI.reset)(\(val), \(offset))"
         case let .mse(a, b):
             opStr = "\(ANSI.green)mse\(ANSI.reset)(\(a), \(b))"
         // removed ring-only spectral printouts
@@ -138,6 +140,13 @@ extension UOp {
             opStr = "\(ANSI.magenta)spectralLossTapeBackward\(ANSI.reset)(win=\(windowSize), sig1=\(sig1), sig2=\(sig2), upGrad=\(upstreamGrad), gradIds=\(gradId1),\(gradId2) -> \(grad1Dest), \(grad2Dest))"
         case .frameIndex:
             opStr = "\(ANSI.magenta)frameIndex\(ANSI.reset)"
+        case .threadIndex:
+            opStr = "\(ANSI.magenta)threadIndex\(ANSI.reset)"
+        case let .cast(expr, castType):
+            let typeStr = castType == .int ? "int" : "float"
+            opStr = "\(ANSI.green)cast\(ANSI.reset)(\(expr), \(typeStr))"
+        case let .declareVar(value):
+            opStr = "\(ANSI.cyan)declareVar\(ANSI.reset)(\(value))"
         }
 
         return "\(ANSI.bold)UOp\(ANSI.reset)(op: \(opStr), value: \(value))"
