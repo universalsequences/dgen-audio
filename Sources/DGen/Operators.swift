@@ -772,14 +772,21 @@ public enum LazyOp {
 
         case let .spectralLossTape(windowSize):
             guard inputs.count == 2 else { fatalError("spectralLossTape requires 2 inputs") }
+            // We distribute the gradient across the entire analysis window by
+            // writing directly into the gradients buffer for each sample j in
+            // the window. To do that, we pass the gradIds for both inputs into
+            // the specialized backward op so the renderer can index gradients.
             let sig1 = b.tapeValue(node.inputs[0])
             let sig2 = b.tapeValue(node.inputs[1])
-            let (grad1, grad2) = u_spectralLossTapeBackward(
-                windowSize, sig1, sig2, b.value(gradOutput)
+            // Pass gradIds (not used by the non-scatter path, but available for future)
+            let gradId1 = b.ctx.useGradient(src: node.inputs[0])
+            let gradId2 = b.ctx.useGradient(src: node.inputs[1])
+            let (gradExpr1, gradExpr2) = u_spectralLossTapeBackward(
+                windowSize, sig1, sig2, b.value(gradOutput), gradId1, gradId2
             )(b)
-            b.grad(node.inputs[0], value: grad1.lazy)
-            b.grad(node.inputs[1], value: grad2.lazy)
-        case .floor:
+            b.grad(node.inputs[0], value: gradExpr1.lazy)
+            b.grad(node.inputs[1], value: gradExpr2.lazy)
+            case .floor:
             // d(floor(x))/dx = 0 (floor is not differentiable, but we set to 0)
             guard inputs.count == 1 else { fatalError("floor requires 1 input") }
             let zeroGrad = ctx.useConstant(src: nil, value: 0.0)
@@ -931,7 +938,18 @@ public enum LazyOp {
 
             // Write gradient directly (no accumulation needed - test will sum across frames)
             b.grad(node.inputs[0], value: gradFreq.lazy)
-        case .output(_):
+            // NOTE ON GRADIENT SCALE VS frameCount
+            // ------------------------------------------------------------
+            // The phasor’s backward pass produces a gradient proportional
+            // to the current frame index (time). Even though Training.swift
+            // averages gradients across frames, the mean of i/sampleRate over
+            // i = 0..(frameCount-1) grows with the time horizon (~O(frameCount)).
+            // As a result, increasing frameCount increases the effective
+            // gradient scale for frequency parameters, requiring a smaller
+            // learning rate to maintain stability. This is independent of the
+            // particular loss (e.g., spectral loss) and comes from the time-
+            // weighted nature of d(phase)/d(freq).
+            case .output(_):
             // Output just passes gradient through to its input
             guard inputs.count == 1 else { fatalError("output requires 1 input") }
             b.grad(node.inputs[0], value: gradOutput)
@@ -966,22 +984,28 @@ func u_spectralLossTape(_ sig1: Expr, _ sig2: Expr, _ windowSize: Int) -> (IRBui
 }
 
 // Tape-based spectral loss backward op
-func u_spectralLossTapeBackward(_ windowSize: Int, _ sig1: Expr, _ sig2: Expr, _ upstreamGrad: Expr)
-    -> (IRBuilder) -> (Expr, Expr)
-{
+func u_spectralLossTapeBackward(
+    _ windowSize: Int,
+    _ sig1: Expr,
+    _ sig2: Expr,
+    _ upstreamGrad: Expr,
+    _ gradId1: GradID,
+    _ gradId2: GradID
+) -> (IRBuilder) -> (Expr, Expr) {
     return { b in
+        // Allocate dummy locals for API symmetry; renderer will write directly
+        // to gradients[] for each j in the window.
         let grad1Dest = b.ctx.useVariable(src: b.nodeId)
         let grad2Dest = b.ctx.useVariable(src: b.nodeId)
-
         guard case .variable(let grad1VarId, _) = grad1Dest else { fatalError("Expected variable") }
         guard case .variable(let grad2VarId, _) = grad2Dest else { fatalError("Expected variable") }
 
         let uop = UOp(
             op: .spectralLossTapeBackward(
-                windowSize, sig1.lazy, sig2.lazy, upstreamGrad.lazy, grad1VarId, grad2VarId),
+                windowSize, sig1.lazy, sig2.lazy, upstreamGrad.lazy,
+                grad1VarId, grad2VarId, gradId1, gradId2),
             value: grad1Dest)
         b.ops.append(uop)
-
         return (b.value(grad1Dest), b.value(grad2Dest))
     }
 }

@@ -21,7 +21,9 @@ public enum Op {
   // Removed ring-only spectral UOps (updateDFTBuffer/computeDFT*/ring spectralLoss)
   // Tape-based compute variants (read windows directly from tape)
   case spectralLossTape(Lazy, Lazy, Int)  // (sig1, sig2, windowSize)
-  case spectralLossTapeBackward(Int, Lazy, Lazy, Lazy, VarID, VarID)  // (windowSize, sig1, sig2, upstreamGrad, grad1Dest, grad2Dest)
+  // Backward: now writes directly into gradients buffer for each sample j in the window
+  // (windowSize, sig1, sig2, upstreamGrad, grad1Dest, grad2Dest, gradId1, gradId2)
+  case spectralLossTapeBackward(Int, Lazy, Lazy, Lazy, VarID, VarID, GradID, GradID)
   case mutate(Lazy, Lazy)
   case add(Lazy, Lazy)
   case sub(Lazy, Lazy)

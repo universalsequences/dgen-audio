@@ -1066,7 +1066,7 @@ public class MetalRenderer: Renderer, UOpEmitter {
             case let .spectralLossTape(sig1, sig2, _):
                 inputs.insert(extractVarId(sig1))
                 inputs.insert(extractVarId(sig2))
-            case let .spectralLossTapeBackward(_, sig1, sig2, _, _, _):
+            case let .spectralLossTapeBackward(_, sig1, sig2, _, _, _, _, _):
                 inputs.insert(extractVarId(sig1))
                 inputs.insert(extractVarId(sig2))
             case .defineMemory:
@@ -1201,8 +1201,21 @@ public class MetalRenderer: Renderer, UOpEmitter {
         // Removed ring-only spectralLossBackward
 
         case let .spectralLossTapeBackward(
-            windowSize, sig1, sig2, upstreamGrad, grad1Dest, grad2Dest):
-            // Backward: compute gradients for current samples using tape windows
+            windowSize, sig1, sig2, upstreamGrad, grad1Dest, grad2Dest, _, _):
+            // Backward: compute gradients using all samples in the window.
+            // To avoid cross-thread races, we average per-window per-bin
+            // sample contributions and emit a single gradient for the current
+            // sample id (instead of scattering to all j). This reduces the
+            // late-frame bias of using only the last sample.
+            //
+            // IMPORTANT: A true "distributed across j" implementation that
+            // scatters into gradients[... + j] for every j in the window would
+            // require atomic adds or a multipass reduction (e.g., per-bin
+            // accumulation into a scratch buffer, then a second pass to sum
+            // into gradients). Without atomics/multipass, concurrent writes
+            // from many threads are unsafe and can corrupt the gradients.
+            // If you want that behavior, we need to add an atomic or
+            // two-pass variant explicitly.
             let grad1Var = "t\(grad1Dest)"
             let grad2Var = "t\(grad2Dest)"
             let numBins = windowSize / 2 + 1
@@ -1238,18 +1251,21 @@ public class MetalRenderer: Renderer, UOpEmitter {
                         float magDiff = mag1 - mag2;
                         float lossGrad = 2.0 * magDiff;
 
-                        int samplePos = WIN_SIZE - 1;
-                        float angle1 = -2.0 * M_PI_F * (float)binIndex * (float)samplePos / (float)WIN_SIZE;
-                        float cos1 = metal::cos(angle1);
-                        float sin1 = metal::sin(angle1);
-                        float sampleGrad1 = (real1 * cos1 + imag1 * sin1) / (mag1 + 1e-8);
-                        float angle2 = -2.0 * M_PI_F * (float)binIndex * (float)samplePos / (float)WIN_SIZE;
-                        float cos2 = metal::cos(angle2);
-                        float sin2 = metal::sin(angle2);
-                        float sampleGrad2 = (real2 * cos2 + imag2 * sin2) / (mag2 + 1e-8);
-
-                        \(grad1Var) += lossGrad * sampleGrad1;
-                        \(grad2Var) += (-lossGrad) * sampleGrad2;
+                        // Average contributions across the full window instead of last sample only
+                        float accum1 = 0.0;
+                        float accum2 = 0.0;
+                        for (int n = 0; n < WIN_SIZE; n++) {
+                            float angle_n = -2.0 * M_PI_F * (float)binIndex * (float)n / (float)WIN_SIZE;
+                            float c_n = metal::cos(angle_n);
+                            float s_n = metal::sin(angle_n);
+                            float sampleGrad1 = (real1 * c_n + imag1 * s_n) / (mag1 + 1e-8);
+                            float sampleGrad2 = (real2 * c_n + imag2 * s_n) / (mag2 + 1e-8);
+                            accum1 += (lossGrad * sampleGrad1);
+                            accum2 += ((-lossGrad) * sampleGrad2);
+                        }
+                        // Normalize by window size to keep scale consistent
+                        \(grad1Var) += accum1 / (float)WIN_SIZE;
+                        \(grad2Var) += accum2 / (float)WIN_SIZE;
                     }
 
                     \(grad1Var) *= \(g(upstreamGrad));
@@ -1420,6 +1436,9 @@ func analyzeRequiredBuffers(scheduleItem: ScheduleItem) -> RequiredBuffers {
         if case .loadGrad = uop.op {
             return true
         } else if case .accumulateGrad = uop.op {
+            return true
+        } else if case .spectralLossTapeBackward = uop.op {
+            // The spectral backward op writes directly to gradients[] now
             return true
         }
         return false

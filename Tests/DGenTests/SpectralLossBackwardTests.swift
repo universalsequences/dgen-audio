@@ -443,7 +443,7 @@ final class SpectralLossBackwardTests: XCTestCase {
         _ = g.n(.output(0), loss)
 
         // Compile with backwards pass enabled
-        let frameCount = 512 * 4
+        let frameCount = 512 * 8
         let result = try CompilationPipeline.compile(
             graph: g,
             backend: .metal,
@@ -469,7 +469,7 @@ final class SpectralLossBackwardTests: XCTestCase {
         // Training context using optimizer (replaces manual gradient descent)
         let ctx = TrainingContext(
             parameters: [freqParam, lfoFreqParam],
-            optimizer: SGD(lr: 0.07),
+            optimizer: SGD(lr: 0.03),
             lossNode: loss
         )
         ctx.initializeMemory(

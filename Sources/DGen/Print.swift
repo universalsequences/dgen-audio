@@ -134,8 +134,8 @@ extension UOp {
         // removed ring-only spectral printouts
         case let .spectralLossTape(sig1, sig2, windowSize):
             opStr = "\(ANSI.green)spectralLossTape\(ANSI.reset)(sig1=\(sig1), sig2=\(sig2), win=\(windowSize))"
-        case let .spectralLossTapeBackward(windowSize, sig1, sig2, upstreamGrad, grad1Dest, grad2Dest):
-            opStr = "\(ANSI.magenta)spectralLossTapeBackward\(ANSI.reset)(win=\(windowSize), sig1=\(sig1), sig2=\(sig2), upGrad=\(upstreamGrad) -> \(grad1Dest), \(grad2Dest))"
+        case let .spectralLossTapeBackward(windowSize, sig1, sig2, upstreamGrad, grad1Dest, grad2Dest, gradId1, gradId2):
+            opStr = "\(ANSI.magenta)spectralLossTapeBackward\(ANSI.reset)(win=\(windowSize), sig1=\(sig1), sig2=\(sig2), upGrad=\(upstreamGrad), gradIds=\(gradId1),\(gradId2) -> \(grad1Dest), \(grad2Dest))"
         case .frameIndex:
             opStr = "\(ANSI.magenta)frameIndex\(ANSI.reset)"
         }
