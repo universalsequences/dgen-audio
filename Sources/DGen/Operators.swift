@@ -300,7 +300,9 @@ public enum LazyOp {
         lt, eq,
         gswitch, mix, pow, floor, ceil, round, mod, min, max
     case mse  // mean squared error per-sample: (a-b)^2
-    case spectralLossTape(Int)  // spectralLoss from tape windows
+    case spectralLossTape(Int)  // DEPRECATED: old single-pass spectral loss
+    case spectralLossPass1(Int, CellID)  // Pass 1: compute loss & store DFT contributions
+    case spectralLossPass2(Int, CellID)  // Pass 2: reduce contributions to gradients (no-op in forward)
     case selector  // selector(mode, options[])
     case memoryRead(CellID)
     case memoryWrite(CellID)
@@ -503,6 +505,25 @@ public enum LazyOp {
             }
             let (sig1, sig2) = b.values(inputs, count: 2)
             b.use(val: u_spectralLoss(sig1: sig1, sig2: sig2, windowSize: windowSize)(b))
+
+        case let .spectralLossPass1(windowSize, scratchCell):
+            guard inputs.count == 2 else {
+                throw DGenError.insufficientInputs(
+                    operator: "spectralLossPass1", expected: 2, actual: inputs.count)
+            }
+            let (sig1, sig2) = b.values(inputs, count: 2)
+            // Forward: compute spectral loss normally (Pass1 does the actual work)
+            b.use(val: u_spectralLoss(sig1: sig1, sig2: sig2, windowSize: windowSize)(b))
+
+        case let .spectralLossPass2(windowSize, scratchCell):
+            guard inputs.count == 1 else {
+                throw DGenError.insufficientInputs(
+                    operator: "spectralLossPass2", expected: 1, actual: inputs.count)
+            }
+            // Forward: no-op, just forward the value from Pass1
+            let pass1Result = b.value(inputs[0])
+            b.use(val: pass1Result)
+
         case .gt:
             guard inputs.count == 2 else {
                 throw DGenError.insufficientInputs(
@@ -846,6 +867,40 @@ public enum LazyOp {
             )(b)
             b.grad(node.inputs[0], value: gradExpr1.lazy)
             b.grad(node.inputs[1], value: gradExpr2.lazy)
+
+        case let .spectralLossPass1(windowSize, scratchCell):
+            guard inputs.count == 2 else { fatalError("spectralLossPass1 requires 2 inputs") }
+            let sig1 = b.tapeValue(node.inputs[0])
+            let sig2 = b.tapeValue(node.inputs[1])
+
+            // Pass A: Accumulate per-window gradient contributions to memory
+            u_spectralLossBackwardPass1(
+                windowSize, scratchCell, sig1, sig2, b.value(gradOutput)
+            )(b)
+
+            // No gradient propagation here - Pass2 will handle it
+
+        case let .spectralLossPass2(windowSize, scratchCell):
+            guard inputs.count == 1 else { fatalError("spectralLossPass2 requires 1 input") }
+
+            // Pass B: Reduce from memory to gradients
+            // Get the original signal inputs from Pass1's node
+            let pass1Node = g.nodes[node.inputs[0]]!
+            guard pass1Node.inputs.count == 2 else { fatalError("Expected Pass1 to have 2 inputs") }
+
+            let sig1 = b.tapeValue(pass1Node.inputs[0])
+            let sig2 = b.tapeValue(pass1Node.inputs[1])
+            let gradId1 = b.ctx.useGradient(src: pass1Node.inputs[0])
+            let gradId2 = b.ctx.useGradient(src: pass1Node.inputs[1])
+
+            let (grad1, grad2) = u_spectralLossBackwardPass2(
+                windowSize, scratchCell, sig1, sig2, b.value(gradOutput), gradId1, gradId2
+            )(b)
+
+            // Propagate gradients to original signals
+            b.grad(pass1Node.inputs[0], value: grad1.lazy)
+            b.grad(pass1Node.inputs[1], value: grad2.lazy)
+
         case .floor:
             // d(floor(x))/dx = 0 (floor is not differentiable, but we set to 0)
             guard inputs.count == 1 else { fatalError("floor requires 1 input") }
@@ -1128,5 +1183,130 @@ func u_spectralLossTapeBackward(
         let grad2 = totalGrad2.value * upstreamGrad
 
         return (grad1, grad2)
+    }
+}
+
+// Two-pass spectral loss backward functions
+
+/// Pass A: Accumulate per-window gradient contributions to memory.
+/// Each thread i (window end) computes DFT for its window and stores per-sample contributions.
+func u_spectralLossBackwardPass1(
+    _ windowSize: Int,
+    _ scratchCell: CellID,
+    _ sig1: Expr,
+    _ sig2: Expr,
+    _ upstreamGrad: Expr
+) -> (IRBuilder) -> Void {
+    return { b in
+        let numBins = windowSize / 2 + 1
+        let i = b.threadIndex()  // Current frame (window end)
+
+        // For each frequency bin
+        b.loop(numBins) { binIndex in
+            // DFT accumulators (real and imaginary parts)
+            let real1 = b.float(0.0)
+            let imag1 = b.float(0.0)
+            let real2 = b.float(0.0)
+            let imag2 = b.float(0.0)
+
+            // Compute DFT over window samples
+            b.loop(windowSize) { n in
+                let winSize = b.constant(Float(windowSize))
+                let j = i - (winSize - b.constant(1.0)) + b.cast(n, to: .float)
+
+                // Load samples from tape with bounds checking
+                let s1 = b.tapeLoad(sig1, at: j)
+                let s2 = b.tapeLoad(sig2, at: j)
+
+                // DFT basis: e^(-2πi*k*n/N) = cos(angle) - i*sin(angle)
+                let binIndexFloat = b.cast(binIndex, to: .float)
+                let nFloat = b.cast(n, to: .float)
+                let angle = b.constant(-2.0) * b.pi * binIndexFloat * nFloat / winSize
+                let c = b.cos(angle)
+                let s = b.sin(angle)
+
+                // Accumulate DFT: Real(X[k]) += x[n]*cos, Imag(X[k]) += x[n]*sin
+                real1.accumulate(s1 * c)
+                imag1.accumulate(s1 * s)
+                real2.accumulate(s2 * c)
+                imag2.accumulate(s2 * s)
+            }
+
+            // Magnitude: |X[k]| = sqrt(Real² + Imag²)
+            let mag1 = b.sqrt(real1.value * real1.value + imag1.value * imag1.value)
+            let mag2 = b.sqrt(real2.value * real2.value + imag2.value * imag2.value)
+
+            // Loss gradient for this bin: d/d(mag1) of (mag1-mag2)²
+            let magDiff = mag1 - mag2
+            let lossGrad = b.constant(2.0) * magDiff
+
+            // For each window offset, compute and store contribution
+            b.loop(windowSize) { n in
+                let binIndexFloat = b.cast(binIndex, to: .float)
+                let nFloat = b.cast(n, to: .float)
+                let winSize = b.constant(Float(windowSize))
+                let angle_n = b.constant(-2.0) * b.pi * binIndexFloat * nFloat / winSize
+                let c_n = b.cos(angle_n)
+                let s_n = b.sin(angle_n)
+
+                // ∂mag/∂s[n] = (real*cos + imag*sin) / mag
+                let eps = b.constant(1e-8)
+                let sampleGrad1 = (real1.value * c_n + imag1.value * s_n) / (mag1 + eps)
+                let sampleGrad2 = (real2.value * c_n + imag2.value * s_n) / (mag2 + eps)
+
+                // Chain rule: ∂L/∂s = (∂L/∂mag) * (∂mag/∂s) * upstreamGrad
+                let contrib1 = lossGrad * sampleGrad1 * upstreamGrad
+                let contrib2 = (b.constant(0.0) - lossGrad) * sampleGrad2 * upstreamGrad
+
+                // Write to memory: memory[scratchCell + (i * windowSize * 2) + (n * 2) + component]
+                let winSizeConst = b.constant(Float(windowSize))
+                let offset1 = i * winSizeConst * b.constant(2.0) + b.cast(n, to: .float) * b.constant(2.0)
+                let offset2 = offset1 + b.constant(1.0)
+
+                _ = b.memoryWrite(scratchCell, b.cast(offset1, to: .int), contrib1)
+                _ = b.memoryWrite(scratchCell, b.cast(offset2, to: .int), contrib2)
+            }
+        }
+    }
+}
+
+/// Pass B: Reduce from memory to gradients.
+/// Each thread j (sample index) gathers contributions from all windows that include sample j.
+func u_spectralLossBackwardPass2(
+    _ windowSize: Int,
+    _ scratchCell: CellID,
+    _ sig1: Expr,
+    _ sig2: Expr,
+    _ upstreamGrad: Expr,
+    _ gradId1: GradID,
+    _ gradId2: GradID
+) -> (IRBuilder) -> (Expr, Expr) {
+    return { b in
+        let j = b.threadIndex()  // Sample index
+        let grad1 = b.float(0.0)
+        let grad2 = b.float(0.0)
+
+        // Gather from all windows that include sample j
+        // Windows ending at i ∈ [j .. j+(windowSize-1)]
+        b.loop(windowSize) { offsetFromJ in
+            let windowEnd = j + b.cast(offsetFromJ, to: .float)  // i
+
+            // Window offset: n = j - i + (windowSize - 1)
+            let winSize = b.constant(Float(windowSize))
+            let n = j - windowEnd + (winSize - b.constant(1.0))
+
+            // Memory offset: memory[scratchCell + (i * windowSize * 2) + (n * 2) + component]
+            let offset1 = windowEnd * winSize * b.constant(2.0) + n * b.constant(2.0)
+            let offset2 = offset1 + b.constant(1.0)
+
+            // Read contributions from memory
+            let contrib1 = b.memoryRead(scratchCell, b.cast(offset1, to: .int))
+            let contrib2 = b.memoryRead(scratchCell, b.cast(offset2, to: .int))
+
+            grad1.accumulate(contrib1)
+            grad2.accumulate(contrib2)
+        }
+
+        return (grad1.value, grad2.value)
     }
 }

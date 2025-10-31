@@ -124,7 +124,7 @@ public struct CompilationPipeline {
         // Fuse adjacent blocks of the same kind to reduce cross-block communication
 
         // rather than having a different buffer for each value we could have one giant array and significantly reduce the number of cross-chain-blocks needed
-        let fusedBlocks = fuseBlocks(blocks)
+        let fusedBlocks = fuseBlocks(blocks, graph)
         //let splitBlocks = splitBlocksIfNeeded(blocks, backend)
         var finalBlocks = fusedBlocks.compactMap { $0 }
 

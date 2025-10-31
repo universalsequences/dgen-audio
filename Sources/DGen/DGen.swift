@@ -182,11 +182,28 @@ public final class Graph {
     }
 
     // Higher-level compound operations
+    public func spectralLoss(_ sig1: NodeID, _ sig2: NodeID, windowSize: Int) -> NodeID {
+        return n(.spectralLossTape(windowSize), sig1, sig2)
+
+    }
 
     /// Spectral loss: compute DFT-based magnitude MSE between two signals over a window
     /// Uses tape-based compute; no ring buffers are required.
-    public func spectralLoss(_ sig1: NodeID, _ sig2: NodeID, windowSize: Int) -> NodeID {
-        return n(.spectralLossTape(windowSize), sig1, sig2)
+    public func spectralLoss2(_ sig1: NodeID, _ sig2: NodeID, windowSize: Int) -> NodeID {
+        // Allocate scratch memory for two-pass backward gradient distribution
+        // Conservative max: 4096 frames * windowSize * 2 (for sig1 and sig2 contributions)
+        let maxFrameCount = 4096
+        let scratchSize = maxFrameCount * windowSize * 2
+        let scratchCell = alloc(vectorWidth: scratchSize)
+
+        // Create Pass1: computes spectral loss and stores DFT contributions (for backward)
+        let pass1 = n(.spectralLossPass1(windowSize, scratchCell), sig1, sig2)
+
+        // Create Pass2: no-op in forward, reduces contributions to gradients in backward
+        // Depends on pass1 to ensure correct kernel ordering
+        let pass2 = n(.spectralLossPass2(windowSize, scratchCell), pass1)
+
+        return pass2  // Return Pass2 result (forwards Pass1's loss value)
     }
 
     /// Delta: returns the difference between current and previous input value

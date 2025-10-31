@@ -177,6 +177,7 @@ public class MetalCompiledKernel: CompiledKernelRuntime {
     outputs: UnsafeMutablePointer<Float>, inputs: UnsafePointer<Float>, frameCount: Int,
     volumeScale: Float = 1.0
   ) {
+    print("RUN")
     // Update frameCount buffer with current frameCount value
     if let frameCountBuffer = bufferPool["frameCount"] {
       let frameCountPtr = frameCountBuffer.contents().assumingMemoryBound(to: Int32.self)
@@ -276,12 +277,15 @@ public class MetalCompiledKernel: CompiledKernelRuntime {
       }
     }
 
+    print("commiting")
     firstDebug = false
     commandBuffer.commit()
     commandBuffer.waitUntilCompleted()
+    print("finished")
 
     // Copy results back to outputs
     copyResultsToOutputs(outputs: outputs, frameCount: frameCount, volumeScale: volumeScale)
+    print("wrote")
   }
 
   private func copyResultsToOutputs(

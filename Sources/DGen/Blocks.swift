@@ -507,8 +507,45 @@ public func determineBlocksSimple(
 
         // Regular node handling - group consecutive nodes of same kind together
         if let current = currentBlock {
+            // Check if this node must be separated from nodes in the current block
+            var mustSeparate = false
+
+            // Spectral loss two-pass: Pass1 and Pass2 must be in different blocks
+            // to ensure memory writes in Pass1 complete before Pass2 reads
+            if let node = g.nodes[nodeId] {
+                let isPass1 = { () -> Bool in
+                    if case .spectralLossPass1 = node.op { return true }
+                    return false
+                }()
+                let isPass2 = { () -> Bool in
+                    if case .spectralLossPass2 = node.op { return true }
+                    return false
+                }()
+
+                // Check if current block contains the opposite pass
+                for existingNodeId in current.nodes {
+                    if let existingNode = g.nodes[existingNodeId] {
+                        let hasPass1 = { () -> Bool in
+                            if case .spectralLossPass1 = existingNode.op { return true }
+                            return false
+                        }()
+                        let hasPass2 = { () -> Bool in
+                            if case .spectralLossPass2 = existingNode.op { return true }
+                            return false
+                        }()
+
+                        // If trying to add Pass2 to a block with Pass1, or vice versa, separate
+                        if (isPass1 && hasPass2) || (isPass2 && hasPass1) {
+                            mustSeparate = true
+                            break
+                        }
+                    }
+                }
+            }
+
             if current.kind == kind
                 && !wouldExceedNodeLimit(current, maxNodesPerBlock: maxNodesPerBlock)
+                && !mustSeparate
             {
                 // Add to current block
                 currentBlock!.nodes.append(nodeId)
@@ -545,12 +582,44 @@ public func determineBlocksSimple(
 
 /// Fuse adjacent blocks of the same kind to reduce cross-block traffic
 /// and improve loop fusion opportunities in later stages.
-public func fuseBlocks(_ blocks: [Block]) -> [Block] {
+public func fuseBlocks(_ blocks: [Block], _ g: Graph) -> [Block] {
     var fused: [Block] = []
     for b in blocks {
         if b.nodes.isEmpty { continue }
         if let lastIdx = fused.indices.last, fused[lastIdx].kind == b.kind {
-            fused[lastIdx].nodes.append(contentsOf: b.nodes)
+            // Check if we should prevent fusion due to spectral loss two-pass
+            var canFuse = true
+
+            // Check if either block contains spectralLossPass1 or Pass2
+            var lastBlockHasPass1 = false
+            var lastBlockHasPass2 = false
+            var currentBlockHasPass1 = false
+            var currentBlockHasPass2 = false
+
+            for nodeId in fused[lastIdx].nodes {
+                if let node = g.nodes[nodeId] {
+                    if case .spectralLossPass1 = node.op { lastBlockHasPass1 = true }
+                    if case .spectralLossPass2 = node.op { lastBlockHasPass2 = true }
+                }
+            }
+
+            for nodeId in b.nodes {
+                if let node = g.nodes[nodeId] {
+                    if case .spectralLossPass1 = node.op { currentBlockHasPass1 = true }
+                    if case .spectralLossPass2 = node.op { currentBlockHasPass2 = true }
+                }
+            }
+
+            // Don't fuse if one block has Pass1 and the other has Pass2
+            if (lastBlockHasPass1 && currentBlockHasPass2) || (lastBlockHasPass2 && currentBlockHasPass1) {
+                canFuse = false
+            }
+
+            if canFuse {
+                fused[lastIdx].nodes.append(contentsOf: b.nodes)
+            } else {
+                fused.append(b)
+            }
         } else {
             fused.append(b)
         }
