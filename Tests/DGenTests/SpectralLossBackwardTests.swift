@@ -379,17 +379,18 @@ final class SpectralLossBackwardTests: XCTestCase {
     }
 
     func testLearnFrequencyAndAmp() throws {
-        print("\n🧪 Test: Spectral Loss Learning - Frequency Matching")
+        print("\n🧪 Test: Spectral Loss Learning - Frequency Matching and LFOs matching")
 
         let g = Graph()
 
         let targetFrequency: Float = 300.0
         let targetLFOFrequency: Float = 10.0
+
         // Learnable frequency parameter (start at 777 Hz, target is 300 Hz)
-        let freqParam = Parameter(graph: g, value: 177.0, name: "frequency")
+        let freqParam = Parameter(graph: g, value: 237.0, name: "frequency")
         let freq = freqParam.node()
 
-        let lfoFreqParam = Parameter(graph: g, value: 3.5, name: "lfo-frequency")
+        let lfoFreqParam = Parameter(graph: g, value: 8.5, name: "lfo-frequency")
         let lfoFreq = lfoFreqParam.node()
 
         // Target frequency (constant 440 Hz)
@@ -412,11 +413,29 @@ final class SpectralLossBackwardTests: XCTestCase {
         let sig1 = g.n(.mul, sine1, lfo_phase1)
         let sig2 = g.n(.mul, sine2, lfo_phase2)
 
+        func smoothLeak(_ sig1: NodeID) -> NodeID {
+            let one = g.n(.constant(1.0))
+            let half = g.n(.constant(0.5))
+            let alpha = g.n(.constant(0.01))  // leak
+            let beta = g.n(.constant(8.0))  // sharpness
+
+            let bx = g.n(.mul, beta, sig1)
+            let s = g.n(.mul, half, g.n(.add, one, g.n(.tanh, bx)))  // 0.5*(1+tanh(beta*x))
+            let oneMinusAlpha = g.n(.sub, one, alpha)
+            let gate = g.n(.add, alpha, g.n(.mul, oneMinusAlpha, s))  // α + (1-α)*s
+            let smoothLeaky = g.n(.mul, gate, sig1)
+            return smoothLeaky
+        }
+
+        // smooth the signals to help with vanishing gradients
+        let leaky1 = smoothLeak(sig1)
+        let leaky2 = smoothLeak(sig2)
+
         // Convert phase to sine wave (phasor outputs 0-1, multiply by 2π and take sin)
         // Compute spectral loss
         let windowSize = 64
-        let spectralLoss = g.spectralLoss(sig1, sig2, windowSize: windowSize)
-        let l2Loss = g.n(.mse, sig1, sig2)
+        let spectralLoss = g.spectralLoss(leaky1, leaky2, windowSize: windowSize)
+        let l2Loss = g.n(.mse, leaky1, leaky2)
         let loss = g.n(
             .add, g.n(.mul, g.n(.constant(100.0)), spectralLoss),
             g.n(.mul, g.n(.constant(0.003)), l2Loss))
@@ -424,28 +443,33 @@ final class SpectralLossBackwardTests: XCTestCase {
         _ = g.n(.output(0), loss)
 
         // Compile with backwards pass enabled
-        let frameCount = 128
+        let frameCount = 512 * 4
         let result = try CompilationPipeline.compile(
             graph: g,
             backend: .metal,
             options: .init(frameCount: frameCount, debug: true, backwards: true)
         )
 
+        for kernel in result.kernels {
+            print(kernel.source)
+        }
+
         print("   ✅ Compiled with backwards=true")
-        print("   Initial frequency: 777 Hz")
+        print("   Initial frequency: 227 Hz")
         print("   Target frequency: 300 Hz")
 
         // Create runtime
         let runtime = try MetalCompiledKernel(
             kernels: result.kernels,
             cellAllocations: result.cellAllocations,
-            context: result.context
+            context: result.context,
+            frameCount: frameCount
         )
 
         // Training context using optimizer (replaces manual gradient descent)
         let ctx = TrainingContext(
             parameters: [freqParam, lfoFreqParam],
-            optimizer: SGD(lr: 77.7),  // match manual learning rate used previously
+            optimizer: SGD(lr: 0.07),
             lossNode: loss
         )
         ctx.initializeMemory(
@@ -460,7 +484,7 @@ final class SpectralLossBackwardTests: XCTestCase {
         var outputBuffer = [Float](repeating: 0.0, count: frameCount)
 
         // Training loop using TrainingContext
-        let numIterations = 600
+        let numIterations = 120
         var lossHistory: [Float] = []
         for iteration in 0..<numIterations {
             // Zero gradients and reset memory (preserving params)
@@ -486,8 +510,10 @@ final class SpectralLossBackwardTests: XCTestCase {
             lossHistory.append(currentLoss)
 
             if iteration % 10 == 0 || iteration <= 10 {
+                let freqGrad = freqParam.grad ?? 0.0
+                let lfoGrad = lfoFreqParam.grad ?? 0.0
                 print(
-                    "   Iteration \(iteration): freq=\(String(format: "%.2f", freqParam.value)) Hz, lfoFreq=\(String(format: "%.2f", lfoFreqParam.value)) Hz loss=\(String(format: "%.6f", currentLoss))"
+                    "   Iteration \(iteration): freq=\(String(format: "%.2f", freqParam.value)) Hz (grad: \(String(format: "%.6f", freqGrad))), lfoFreq=\(String(format: "%.2f", lfoFreqParam.value)) Hz (grad: \(String(format: "%.6f", lfoGrad))), loss=\(String(format: "%.6f", currentLoss))"
                 )
             }
         }

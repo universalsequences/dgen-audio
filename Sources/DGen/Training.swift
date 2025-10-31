@@ -13,11 +13,15 @@ public class Parameter {
     // Internal: set by TrainingContext after compilation
     var gradId: GradID?
 
+    // Gradient value (updated after each backward pass)
+    public var grad: Float?
+
     public init(graph: Graph, value: Float, name: String? = nil) {
         self.cellId = graph.alloc()
         self.value = value
         self.name = name
         self.nodeId = graph.n(.param(cellId))
+        self.grad = 0.0
     }
 
     public func node() -> NodeID {
@@ -244,6 +248,11 @@ public class TrainingContext {
 
         runtime.resetGradientBuffers(numFrames: frameCount)
 
+        // Zero parameter gradients
+        for param in parameters {
+            param.grad = 0.0
+        }
+
         optimizer.zeroGrad()
 
         // Reset runtime memory for the next forward pass, but preserve parameter values.
@@ -267,6 +276,11 @@ public class TrainingContext {
     public func step() {
         // Extract gradients from gradient buffer
         let gradients = extractGradients()
+
+        // Store gradients in parameters for access via param.grad
+        for (i, param) in parameters.enumerated() {
+            param.grad = gradients[i]
+        }
 
         // Update parameters via optimizer
         optimizer.step(parameters: &parameters, gradients: gradients)
