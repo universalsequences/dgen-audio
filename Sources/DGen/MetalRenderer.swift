@@ -396,7 +396,12 @@ public class MetalRenderer: Renderer, UOpEmitter {
 
     case let .spectralLossTapeBackward(
       windowSize, sig1, sig2, upstreamGrad, grad1Dest, grad2Dest, _, _):
-      // Backward: compute gradients using all samples in the window.
+      // DEPRECATED: This direct Metal emission is no longer used.
+      // The abstraction-based implementation in u_spectralLossTapeBackward
+      // (Operators.swift) now compiles via normal UOp emission instead.
+      // Kept here for reference and potential rollback.
+      //
+      // Original approach: compute gradients using all samples in the window.
       // To avoid cross-thread races, we average per-window per-bin
       // sample contributions and emit a single gradient for the current
       // sample id (instead of scattering to all j). This reduces the

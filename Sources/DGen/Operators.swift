@@ -1035,6 +1035,11 @@ public enum LazyOp {
 }
 
 // Tape-based spectral loss backward op
+/// Backward pass for spectral loss: computes gradients w.r.t. both input signals.
+///
+/// Uses window-averaging to avoid race conditions: instead of scattering gradient
+/// contributions to all samples j in the window, averages contributions and assigns
+/// to the current sample. This is safe but creates late-frame bias.
 func u_spectralLossTapeBackward(
     _ windowSize: Int,
     _ sig1: Expr,
@@ -1044,19 +1049,84 @@ func u_spectralLossTapeBackward(
     _ gradId2: GradID
 ) -> (IRBuilder) -> (Expr, Expr) {
     return { b in
-        // Allocate dummy locals for API symmetry; renderer will write directly
-        // to gradients[] for each j in the window.
-        let grad1Dest = b.ctx.useVariable(src: b.nodeId)
-        let grad2Dest = b.ctx.useVariable(src: b.nodeId)
-        guard case .variable(let grad1VarId, _) = grad1Dest else { fatalError("Expected variable") }
-        guard case .variable(let grad2VarId, _) = grad2Dest else { fatalError("Expected variable") }
+        let numBins = windowSize / 2 + 1
 
-        let uop = UOp(
-            op: .spectralLossTapeBackward(
-                windowSize, sig1.lazy, sig2.lazy, upstreamGrad.lazy,
-                grad1VarId, grad2VarId, gradId1, gradId2),
-            value: grad1Dest)
-        b.ops.append(uop)
-        return (b.value(grad1Dest), b.value(grad2Dest))
+        // Accumulate total gradients for current sample
+        let totalGrad1 = b.float(0.0)
+        let totalGrad2 = b.float(0.0)
+
+        // For each frequency bin
+        b.loop(numBins) { binIndex in
+            // DFT accumulators (real and imaginary parts)
+            let real1 = b.float(0.0)
+            let imag1 = b.float(0.0)
+            let real2 = b.float(0.0)
+            let imag2 = b.float(0.0)
+
+            // Compute DFT over window samples
+            b.loop(windowSize) { n in
+                let idx = b.threadIndex()
+                let winSize = b.constant(Float(windowSize))
+                let j = idx - (winSize - b.constant(1.0)) + b.cast(n, to: .float)
+
+                // Load samples from tape with bounds checking
+                let s1 = b.tapeLoad(sig1, at: j)
+                let s2 = b.tapeLoad(sig2, at: j)
+
+                // DFT basis: e^(-2πi*k*n/N) = cos(angle) - i*sin(angle)
+                let binIndexFloat = b.cast(binIndex, to: .float)
+                let nFloat = b.cast(n, to: .float)
+                let angle = b.constant(-2.0) * b.pi * binIndexFloat * nFloat / winSize
+                let c = b.cos(angle)
+                let s = b.sin(angle)
+
+                // Accumulate DFT: Real(X[k]) += x[n]*cos, Imag(X[k]) += x[n]*sin
+                real1.accumulate(s1 * c)
+                imag1.accumulate(s1 * s)
+                real2.accumulate(s2 * c)
+                imag2.accumulate(s2 * s)
+            }
+
+            // Magnitude: |X[k]| = sqrt(Real² + Imag²)
+            let mag1 = b.sqrt(real1.value * real1.value + imag1.value * imag1.value)
+            let mag2 = b.sqrt(real2.value * real2.value + imag2.value * imag2.value)
+
+            // Loss gradient for this bin: d/d(mag1) of (mag1-mag2)²
+            let magDiff = mag1 - mag2
+            let lossGrad = b.constant(2.0) * magDiff
+
+            // Average gradient contributions across window (to avoid scatter races)
+            let accum1 = b.float(0.0)
+            let accum2 = b.float(0.0)
+
+            b.loop(windowSize) { n in
+                let binIndexFloat = b.cast(binIndex, to: .float)
+                let nFloat = b.cast(n, to: .float)
+                let winSize = b.constant(Float(windowSize))
+                let angle_n = b.constant(-2.0) * b.pi * binIndexFloat * nFloat / winSize
+                let c_n = b.cos(angle_n)
+                let s_n = b.sin(angle_n)
+
+                // ∂mag/∂s[n] = (real*cos + imag*sin) / mag
+                let eps = b.constant(1e-8)
+                let sampleGrad1 = (real1.value * c_n + imag1.value * s_n) / (mag1 + eps)
+                let sampleGrad2 = (real2.value * c_n + imag2.value * s_n) / (mag2 + eps)
+
+                // Chain rule: ∂L/∂s = (∂L/∂mag) * (∂mag/∂s)
+                accum1.accumulate(lossGrad * sampleGrad1)
+                accum2.accumulate((b.constant(0.0) - lossGrad) * sampleGrad2)
+            }
+
+            // Normalize by window size to keep scale consistent
+            let winSizeConst = b.constant(Float(windowSize))
+            totalGrad1.accumulate(accum1.value / winSizeConst)
+            totalGrad2.accumulate(accum2.value / winSizeConst)
+        }
+
+        // Multiply by upstream gradient from loss
+        let grad1 = totalGrad1.value * upstreamGrad
+        let grad2 = totalGrad2.value * upstreamGrad
+
+        return (grad1, grad2)
     }
 }
