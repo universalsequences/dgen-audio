@@ -4,6 +4,9 @@ public class IRContext {
     private var varIdx = 0
     private var gradIdx = 0
     private var constantIdx = 0
+
+    // Maximum gradient ID allocated (for buffer sizing)
+    public var maxGradId: Int { return gradIdx }
     // Reuse constant IDs for identical values to reduce duplicate vdupq constants
     private var constantIdByValue: [Float: ConstantID] = [:]
 
@@ -88,6 +91,9 @@ public final class Graph {
     public var nextTensorId = 0
     public var tensors: [TensorID: Tensor] = [:]
 
+    /// Track allocation sizes for memory cells (especially large buffers like spectral scratch)
+    public var cellAllocationSizes: [CellID: Int] = [:]
+
     public init() {}
 
     /// Returns the total number of allocated memory cells
@@ -144,6 +150,8 @@ public final class Graph {
     public func alloc(vectorWidth: Int = 1) -> CellID {
         let cellId = nextCellId
         nextCellId += vectorWidth
+        // Track allocation size for later memory layout calculations
+        cellAllocationSizes[cellId] = vectorWidth
         return cellId
     }
 
@@ -182,14 +190,14 @@ public final class Graph {
     }
 
     // Higher-level compound operations
-    public func spectralLoss(_ sig1: NodeID, _ sig2: NodeID, windowSize: Int) -> NodeID {
+    public func spectralLoss2(_ sig1: NodeID, _ sig2: NodeID, windowSize: Int) -> NodeID {
         return n(.spectralLossTape(windowSize), sig1, sig2)
 
     }
 
     /// Spectral loss: compute DFT-based magnitude MSE between two signals over a window
     /// Uses tape-based compute; no ring buffers are required.
-    public func spectralLoss2(_ sig1: NodeID, _ sig2: NodeID, windowSize: Int) -> NodeID {
+    public func spectralLoss(_ sig1: NodeID, _ sig2: NodeID, windowSize: Int) -> NodeID {
         // Allocate scratch memory for two-pass backward gradient distribution
         // Conservative max: 4096 frames * windowSize * 2 (for sig1 and sig2 contributions)
         let maxFrameCount = 4096

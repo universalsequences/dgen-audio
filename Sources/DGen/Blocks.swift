@@ -455,6 +455,8 @@ public func determineBlocksSimple(
 ) -> [Block] {
     var blocks: [Block] = []
     var currentBlock: Block? = nil
+    var currentBlockHasPass1 = false  // Track spectral loss passes in current block
+    var currentBlockHasPass2 = false
 
     for nodeId in sorted {
         let isScalar = scalar.contains(nodeId)
@@ -511,54 +513,45 @@ public func determineBlocksSimple(
             var mustSeparate = false
 
             // Spectral loss two-pass: Pass1 and Pass2 must be in different blocks
-            // to ensure memory writes in Pass1 complete before Pass2 reads
+            // Check using tracked flags instead of scanning all nodes (O(1) instead of O(n))
+            var nodeIsPass1 = false
+            var nodeIsPass2 = false
             if let node = g.nodes[nodeId] {
-                let isPass1 = { () -> Bool in
-                    if case .spectralLossPass1 = node.op { return true }
-                    return false
-                }()
-                let isPass2 = { () -> Bool in
-                    if case .spectralLossPass2 = node.op { return true }
-                    return false
-                }()
+                if case .spectralLossPass1 = node.op { nodeIsPass1 = true }
+                if case .spectralLossPass2 = node.op { nodeIsPass2 = true }
+            }
 
-                // Check if current block contains the opposite pass
-                for existingNodeId in current.nodes {
-                    if let existingNode = g.nodes[existingNodeId] {
-                        let hasPass1 = { () -> Bool in
-                            if case .spectralLossPass1 = existingNode.op { return true }
-                            return false
-                        }()
-                        let hasPass2 = { () -> Bool in
-                            if case .spectralLossPass2 = existingNode.op { return true }
-                            return false
-                        }()
-
-                        // If trying to add Pass2 to a block with Pass1, or vice versa, separate
-                        if (isPass1 && hasPass2) || (isPass2 && hasPass1) {
-                            mustSeparate = true
-                            break
-                        }
-                    }
-                }
+            // Don't allow Pass1 and Pass2 in the same block
+            if (nodeIsPass1 && currentBlockHasPass2) || (nodeIsPass2 && currentBlockHasPass1) {
+                mustSeparate = true
             }
 
             if current.kind == kind
                 && !wouldExceedNodeLimit(current, maxNodesPerBlock: maxNodesPerBlock)
                 && !mustSeparate
             {
-                // Add to current block
+                // Add to current block and update flags
                 currentBlock!.nodes.append(nodeId)
+                if nodeIsPass1 { currentBlockHasPass1 = true }
+                if nodeIsPass2 { currentBlockHasPass2 = true }
             } else {
                 // Finish current block and start new one
                 blocks.append(current)
                 currentBlock = Block(kind: kind)
                 currentBlock!.nodes.append(nodeId)
+                // Reset flags for new block
+                currentBlockHasPass1 = nodeIsPass1
+                currentBlockHasPass2 = nodeIsPass2
             }
         } else {
             // Start first block
             currentBlock = Block(kind: kind)
             currentBlock!.nodes.append(nodeId)
+            // Set flags for first node
+            if let node = g.nodes[nodeId] {
+                if case .spectralLossPass1 = node.op { currentBlockHasPass1 = true }
+                if case .spectralLossPass2 = node.op { currentBlockHasPass2 = true }
+            }
         }
     }
 
@@ -583,48 +576,100 @@ public func determineBlocksSimple(
 /// Fuse adjacent blocks of the same kind to reduce cross-block traffic
 /// and improve loop fusion opportunities in later stages.
 public func fuseBlocks(_ blocks: [Block], _ g: Graph) -> [Block] {
-    var fused: [Block] = []
+    // Pre-compute which blocks contain Pass1/Pass2 to avoid O(n²) scanning
+    var blockHasPass1: [Bool] = []
+    var blockHasPass2: [Bool] = []
+
     for b in blocks {
+        var hasPass1 = false
+        var hasPass2 = false
+        for nodeId in b.nodes {
+            if let node = g.nodes[nodeId] {
+                if case .spectralLossPass1 = node.op { hasPass1 = true }
+                if case .spectralLossPass2 = node.op { hasPass2 = true }
+                if hasPass1 && hasPass2 { break }  // Early exit
+            }
+        }
+        blockHasPass1.append(hasPass1)
+        blockHasPass2.append(hasPass2)
+    }
+
+    var fused: [Block] = []
+    var fusedHasPass1: [Bool] = []
+    var fusedHasPass2: [Bool] = []
+
+    for (idx, b) in blocks.enumerated() {
         if b.nodes.isEmpty { continue }
         if let lastIdx = fused.indices.last, fused[lastIdx].kind == b.kind {
             // Check if we should prevent fusion due to spectral loss two-pass
-            var canFuse = true
-
-            // Check if either block contains spectralLossPass1 or Pass2
-            var lastBlockHasPass1 = false
-            var lastBlockHasPass2 = false
-            var currentBlockHasPass1 = false
-            var currentBlockHasPass2 = false
-
-            for nodeId in fused[lastIdx].nodes {
-                if let node = g.nodes[nodeId] {
-                    if case .spectralLossPass1 = node.op { lastBlockHasPass1 = true }
-                    if case .spectralLossPass2 = node.op { lastBlockHasPass2 = true }
-                }
-            }
-
-            for nodeId in b.nodes {
-                if let node = g.nodes[nodeId] {
-                    if case .spectralLossPass1 = node.op { currentBlockHasPass1 = true }
-                    if case .spectralLossPass2 = node.op { currentBlockHasPass2 = true }
-                }
-            }
-
-            // Don't fuse if one block has Pass1 and the other has Pass2
-            if (lastBlockHasPass1 && currentBlockHasPass2) || (lastBlockHasPass2 && currentBlockHasPass1) {
-                canFuse = false
-            }
+            let canFuse =
+                !((fusedHasPass1[lastIdx] && blockHasPass2[idx])
+                || (fusedHasPass2[lastIdx] && blockHasPass1[idx]))
 
             if canFuse {
                 fused[lastIdx].nodes.append(contentsOf: b.nodes)
+                // Update flags
+                fusedHasPass1[lastIdx] = fusedHasPass1[lastIdx] || blockHasPass1[idx]
+                fusedHasPass2[lastIdx] = fusedHasPass2[lastIdx] || blockHasPass2[idx]
             } else {
                 fused.append(b)
+                fusedHasPass1.append(blockHasPass1[idx])
+                fusedHasPass2.append(blockHasPass2[idx])
             }
         } else {
             fused.append(b)
+            fusedHasPass1.append(blockHasPass1[idx])
+            fusedHasPass2.append(blockHasPass2[idx])
         }
     }
     return fused
+}
+
+/// Isolate spectralLossPass1 and spectralLossPass2 into their own blocks
+/// to ensure they execute as separate kernels without any fused operations.
+/// Preserves ordering of other nodes.
+public func isolateSpectralPasses(_ blocks: [Block], _ g: Graph) -> [Block] {
+    var result: [Block] = []
+
+    for block in blocks {
+        var currentNodes: [NodeID] = []
+
+        for nodeId in block.nodes {
+            let isSpectralPass = { () -> Bool in
+                guard let node = g.nodes[nodeId] else { return false }
+                if case .spectralLossPass1 = node.op { return true }
+                if case .spectralLossPass2 = node.op { return true }
+                return false
+            }()
+
+            if isSpectralPass {
+                // Flush any accumulated nodes before the spectral pass
+                if !currentNodes.isEmpty {
+                    var newBlock = Block(kind: block.kind)
+                    newBlock.nodes = currentNodes
+                    result.append(newBlock)
+                    currentNodes = []
+                }
+
+                // Add spectral pass in its own block
+                var spectralBlock = Block(kind: block.kind)
+                spectralBlock.nodes = [nodeId]
+                result.append(spectralBlock)
+            } else {
+                // Accumulate non-spectral nodes
+                currentNodes.append(nodeId)
+            }
+        }
+
+        // Flush any remaining nodes after the last spectral pass
+        if !currentNodes.isEmpty {
+            var newBlock = Block(kind: block.kind)
+            newBlock.nodes = currentNodes
+            result.append(newBlock)
+        }
+    }
+
+    return result
 }
 
 public func splitBlocksIfNeeded(_ blocks: [Block], backend: Backend) -> [Block] {

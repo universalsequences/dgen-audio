@@ -73,7 +73,8 @@ public class MetalCompiledKernel: CompiledKernelRuntime {
         : bufferName == "t"
           ? maxFrameCount * context.globals.count
           : bufferName == "gradients"
-            ? maxFrameCount * context.gradients.count : maxFrameCount
+            // Use maxGradId + 1 to ensure we have enough slots (gradIds start at 1)
+            ? 2 * maxFrameCount * (context.maxGradId + 1) : maxFrameCount
 
   }
 
@@ -177,14 +178,22 @@ public class MetalCompiledKernel: CompiledKernelRuntime {
     outputs: UnsafeMutablePointer<Float>, inputs: UnsafePointer<Float>, frameCount: Int,
     volumeScale: Float = 1.0
   ) {
-    print("RUN")
     // Update frameCount buffer with current frameCount value
     if let frameCountBuffer = bufferPool["frameCount"] {
       let frameCountPtr = frameCountBuffer.contents().assumingMemoryBound(to: Int32.self)
       frameCountPtr[0] = Int32(frameCount)
     }
 
-    guard let commandBuffer = commandQueue.makeCommandBuffer() else { return }
+    guard var commandBuffer = commandQueue.makeCommandBuffer() else { return }
+
+    var pending = 0
+
+    func flush() {
+      commandBuffer.commit()
+      commandBuffer.waitUntilScheduled()
+      commandBuffer = commandQueue.makeCommandBuffer()!
+      pending = 0
+    }
 
     //resetGradientBuffers(numFrames: frameCount)
 
@@ -255,37 +264,48 @@ public class MetalCompiledKernel: CompiledKernelRuntime {
         for (bufferIndex, bufferName) in kernel.buffers.enumerated() {
           if let buffer = bufferPool[bufferName] {
             if firstDebug {
-              //print(
-              //    "kernel[\(index) setting buffer=\(bufferName) index=\(bufferIndex)]"
+              // print(
+              //   "kernel[\(index) setting buffer=\(bufferName) index=\(bufferIndex)]"
               //)
             }
             computeEncoder.setBuffer(buffer, offset: 0, index: bufferIndex)
           }
         }
 
-        let threadGroupSize =
-          kernel.kind == .scalar
-          ? 1 : kernel.threadGroupSize ?? min(frameCount, MIN_FRAME_COUNT)
-        let threadsPerGroup = MTLSize(width: threadGroupSize, height: 1, depth: 1)
-        let numThreadGroups = MTLSize(
-          width: (frameCount + threadGroupSize - 1) / threadGroupSize, height: 1, depth: 1
-        )
+        let tgMax = pipelineState.maxTotalThreadsPerThreadgroup
 
-        computeEncoder.dispatchThreadgroups(
-          numThreadGroups, threadsPerThreadgroup: threadsPerGroup)
+        if kernel.kind == .scalar {
+          // exactly one thread
+          let threads = MTLSize(width: 1, height: 1, depth: 1)
+          let tpg = MTLSize(width: 1, height: 1, depth: 1)
+          computeEncoder.dispatchThreads(threads, threadsPerThreadgroup: tpg)
+        } else {
+          // 1D over frames
+          let tpgW = min(kernel.threadGroupSize ?? 64, tgMax)  // pick a sane default, clamp to device cap
+          // Round up total threads to a multiple of tpgW
+          let total = MTLSize(width: frameCount, height: 1, depth: 1)
+          let tpg = MTLSize(width: tpgW, height: 1, depth: 1)
+          computeEncoder.dispatchThreads(total, threadsPerThreadgroup: tpg)
+        }
         computeEncoder.endEncoding()
+        /*
+        pending += 1
+        if pending == 5 {
+          print("FLUSHING at kernel=\(index)")
+          flush()
+          print("finished flush")
+        }  // tune 4 to taste
+
+         */
       }
     }
 
-    print("commiting")
     firstDebug = false
     commandBuffer.commit()
     commandBuffer.waitUntilCompleted()
-    print("finished")
 
     // Copy results back to outputs
     copyResultsToOutputs(outputs: outputs, frameCount: frameCount, volumeScale: volumeScale)
-    print("wrote")
   }
 
   private func copyResultsToOutputs(
@@ -515,8 +535,8 @@ public class MetalCompiledKernel: CompiledKernelRuntime {
   // MARK: - New Memory Management Methods
 
   public func getMemorySize() -> Int {
-    // For Metal, memory size is determined by the first kernel
-    return kernels.first?.memorySize ?? 1024
+    // Memory size comes from cell allocations computed during compilation
+    return cellAllocations.totalMemorySlots
   }
 
   public func allocateNodeMemory() -> UnsafeMutableRawPointer? {

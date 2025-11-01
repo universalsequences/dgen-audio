@@ -576,7 +576,21 @@ public class MetalRenderer: Renderer, UOpEmitter {
       // Declares and initializes a variable: float t = value;
       return emitAssign(uop, g(value), ctx)
 
-    case let .beginRange(start, end): return "if (id >= \(g(start)) && id < \(g(end))) {"
+    case let .beginRange(start, end):
+
+      var startInt: Int = 0
+      if case let .constant(_, val) = start {
+        startInt = Int(val)
+      }
+      var endInt: Int = 0
+      if case let .constant(_, val) = end {
+        endInt = Int(val)
+      } else if case let .variable(id, _) = end {
+        if id == -1 {  // Special case for frameCount
+          return "if (id >= \(startInt) && id < frameCount) {"
+        }
+      }
+      return "if (id >= \(startInt) && id < \(endInt)) {"
     case .endRange: return "}"
 
     case let .output(channel, val):

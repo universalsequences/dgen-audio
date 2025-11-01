@@ -125,18 +125,21 @@ public struct CompilationPipeline {
 
         // rather than having a different buffer for each value we could have one giant array and significantly reduce the number of cross-chain-blocks needed
         let fusedBlocks = fuseBlocks(blocks, graph)
+
+        // Isolate spectralLossPass1 and Pass2 into their own kernels to avoid dependency issues
+        let isolatedBlocks = isolateSpectralPasses(fusedBlocks, graph)
+
         //let splitBlocks = splitBlocksIfNeeded(blocks, backend)
-        var finalBlocks = fusedBlocks.compactMap { $0 }
+        var finalBlocks = isolatedBlocks.compactMap { $0 }
 
         if options.backwards {
             var backwardsBlocks: [Block] = []
-            for block in fusedBlocks.reversed() {
+            for block in finalBlocks.reversed() {
                 var backwardsBlock = Block(kind: block.kind)
                 backwardsBlock.nodes = block.nodes.reversed()
                 backwardsBlock.direction = .backwards
                 backwardsBlocks.append(backwardsBlock)
             }
-            print("backwards blocks=\(backwardsBlocks)")
             finalBlocks += backwardsBlocks
         }
 
@@ -169,7 +172,7 @@ public struct CompilationPipeline {
         }
 
         // Step 6: Fix memory slot conflicts for vector operations
-        let cellAllocations = remapVectorMemorySlots(&uopBlocks)
+        let cellAllocations = remapVectorMemorySlots(&uopBlocks, cellSizes: graph.cellAllocationSizes)
 
         let renderer: Renderer = createRenderer(for: backend, options: options)
         if let cr = renderer as? CRenderer {
@@ -251,66 +254,89 @@ extension CompilationResult {
 
 /// Remap memory slots to avoid conflicts between scalar and vector operations
 /// Returns the total number of memory slots needed after remapping
-func remapVectorMemorySlots(_ uopBlocks: inout [BlockUOps]) -> CellAllocations {
+func remapVectorMemorySlots(_ uopBlocks: inout [BlockUOps], cellSizes: [CellID: Int]) -> CellAllocations {
     // Collect all memory operations and their execution modes
     var memoryUsage: [CellID: Kind] = [:]
     var allCellIds: Set<CellID> = []
+    var cellUsedInMultipleModes: Set<CellID> = []
+
+    // Helper to register a cell's usage and detect multi-mode access
+    func registerCell(_ cellId: CellID, kind: Kind, forceScalar: Bool = false) {
+        allCellIds.insert(cellId)
+
+        if forceScalar {
+            // scalarMemoryWrite forces scalar mode
+            memoryUsage[cellId] = .scalar
+            return
+        }
+
+        if let existingKind = memoryUsage[cellId] {
+            if existingKind != kind {
+                // Cell used in multiple execution modes
+                cellUsedInMultipleModes.insert(cellId)
+                // Upgrade to SIMD if any block uses it as SIMD
+                // (SIMD needs 4x space, scalar can still access first element)
+                if kind == .simd || existingKind == .simd {
+                    memoryUsage[cellId] = .simd
+                }
+            }
+        } else {
+            memoryUsage[cellId] = kind
+        }
+    }
 
     // First pass: identify which memory cells are used in which execution modes
     for block in uopBlocks {
         for uop in block.ops {
             switch uop.op {
             case let .load(cellId):
-                allCellIds.insert(cellId)
-                if memoryUsage[cellId] == nil {
-                    memoryUsage[cellId] = block.kind
-                } else if memoryUsage[cellId] != block.kind {
-                    // Cell used in both scalar and vector - this is a problem
-                }
+                registerCell(cellId, kind: block.kind)
             case let .store(cellId, _):
-                allCellIds.insert(cellId)
-                if memoryUsage[cellId] == nil {
-                    memoryUsage[cellId] = block.kind
-                } else if memoryUsage[cellId] != block.kind {
-                }
+                registerCell(cellId, kind: block.kind)
             case let .delay1(cellId, _):
-                // delay1 also consumes and persists state in memory
-                allCellIds.insert(cellId)
-                if memoryUsage[cellId] == nil {
-                    memoryUsage[cellId] = block.kind
-                } else if memoryUsage[cellId] != block.kind {
-                    // Mixed use not supported yet; keep original behavior (no forced upgrade)
-                }
+                registerCell(cellId, kind: block.kind)
             case let .memoryRead(cellId, _):
-                allCellIds.insert(cellId)
-                if memoryUsage[cellId] == nil { memoryUsage[cellId] = block.kind }
+                registerCell(cellId, kind: block.kind)
             case let .memoryWrite(cellId, _, _):
-                allCellIds.insert(cellId)
-                if memoryUsage[cellId] == nil { memoryUsage[cellId] = block.kind }
+                registerCell(cellId, kind: block.kind)
             case let .scalarMemoryWrite(cellId, _, _):
-                allCellIds.insert(cellId)
-                memoryUsage[cellId] = .scalar
-            // Removed ring-only spectral reservations
+                registerCell(cellId, kind: block.kind, forceScalar: true)
             default:
                 break
             }
         }
     }
 
+    // Log cells used in multiple modes
+    if !cellUsedInMultipleModes.isEmpty {
+        print("[REMAP DEBUG] Cells used in multiple execution modes (upgraded to SIMD): \(cellUsedInMultipleModes)")
+    }
+
     // Second pass: create a remapping for vector cells
     var cellRemapping: [CellID: CellID] = [:]
     var nextAvailableSlot = (allCellIds.max() ?? -1) + 1
 
-    // Reserve space for vector operations (each vector cell needs 4 slots)
+    // Reserve space for vector operations and large buffers
     for (cellId, kind) in memoryUsage {
+        // Check if this cell has a custom allocation size (like spectral scratch buffer)
+        let allocSize = cellSizes[cellId] ?? 1
+
         if kind == .simd {
             // Find a safe starting position (aligned to 4 and not conflicting)
             let alignedSlot = ((nextAvailableSlot + 3) / 4) * 4  // Align to 4-byte boundary
             cellRemapping[cellId] = alignedSlot
-            nextAvailableSlot = alignedSlot + 4
+            // Reserve space for the full allocation size (e.g., spectral scratch needs windowSize * frameCount * 2)
+            nextAvailableSlot = alignedSlot + max(4, allocSize)
         } else {
-            // Scalar operations keep their original slots
-            cellRemapping[cellId] = cellId
+            // Scalar operations: use allocation size if specified, otherwise keep original slot
+            if allocSize > 1 {
+                // Large scalar buffer (shouldn't happen for spectral, but handle it)
+                cellRemapping[cellId] = nextAvailableSlot
+                nextAvailableSlot += allocSize
+            } else {
+                // Single scalar cell keeps its original slot
+                cellRemapping[cellId] = cellId
+            }
         }
     }
 
@@ -375,8 +401,11 @@ func remapVectorMemorySlots(_ uopBlocks: inout [BlockUOps]) -> CellAllocations {
         }
     }
 
-    print("[REMAP DEBUG] Cell remapping for cells 3, 68: \(cellRemapping[3] ?? -1), \(cellRemapping[68] ?? -1)")
-    print("[REMAP DEBUG] nextAvailableSlot=\(nextAvailableSlot)")
+    print("[REMAP DEBUG] Cell allocation sizes: \(cellSizes)")
+    print(
+        "[REMAP DEBUG] Cell remapping for cells 3, 68: \(cellRemapping[3] ?? -1), \(cellRemapping[68] ?? -1)"
+    )
+    print("[REMAP DEBUG] Total memory slots needed: \(nextAvailableSlot)")
 
     let cellAllocations = CellAllocations(
         totalMemorySlots: nextAvailableSlot, cellMappings: cellRemapping, cellKinds: memoryUsage)

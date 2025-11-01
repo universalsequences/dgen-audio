@@ -197,7 +197,7 @@ final class SpectralLossBackwardTests: XCTestCase {
         // Training context using optimizer (replaces manual gradient descent)
         let ctx = TrainingContext(
             parameters: [freqParam],
-            optimizer: SGD(lr: 5.0),  // match manual learning rate used previously
+            optimizer: SGD(lr: 12.0),  // match manual learning rate used previously
             lossNode: loss
         )
         ctx.initializeMemory(
@@ -327,7 +327,7 @@ final class SpectralLossBackwardTests: XCTestCase {
         var outputBuffer = [Float](repeating: 0.0, count: frameCount)
 
         // Training loop using TrainingContext
-        let numIterations = 600
+        let numIterations = 2000
         var lossHistory: [Float] = []
         for iteration in 0..<numIterations {
             // Zero gradients and reset memory (preserving params)
@@ -387,7 +387,7 @@ final class SpectralLossBackwardTests: XCTestCase {
         let targetLFOFrequency: Float = 10.0
 
         // Learnable frequency parameter (start at 300 Hz, target is 237 Hz)
-        let freqParam = Parameter(graph: g, value: 237.0, name: "frequency")
+        let freqParam = Parameter(graph: g, value: 287.0, name: "frequency")
         let freq = freqParam.node()
 
         let lfoFreqParam = Parameter(graph: g, value: 8.5, name: "lfo-frequency")
@@ -437,13 +437,13 @@ final class SpectralLossBackwardTests: XCTestCase {
         let spectralLoss = g.spectralLoss(leaky1, leaky2, windowSize: windowSize)
         let l2Loss = g.n(.mse, leaky1, leaky2)
         let loss = g.n(
-            .add, g.n(.mul, g.n(.constant(1.0)), spectralLoss),
+            .add, g.n(.mul, g.n(.constant(20.0)), spectralLoss),
             g.n(.mul, g.n(.constant(0.1)), l2Loss))
 
         _ = g.n(.output(0), loss)
 
         // Compile with backwards pass enabled
-        let frameCount = 512 * 8
+        let frameCount = 512 * 2
         let result = try CompilationPipeline.compile(
             graph: g,
             backend: .metal,
@@ -469,7 +469,7 @@ final class SpectralLossBackwardTests: XCTestCase {
         // Training context using optimizer (replaces manual gradient descent)
         let ctx = TrainingContext(
             parameters: [freqParam, lfoFreqParam],
-            optimizer: SGD(lr: 2.3),
+            optimizer: SGD(lr: 55.3),
             lossNode: loss
         )
         ctx.initializeMemory(
@@ -484,7 +484,7 @@ final class SpectralLossBackwardTests: XCTestCase {
         var outputBuffer = [Float](repeating: 0.0, count: frameCount)
 
         // Training loop using TrainingContext
-        let numIterations = 120
+        let numIterations = 1200
         var lossHistory: [Float] = []
         for iteration in 0..<numIterations {
             // Zero gradients and reset memory (preserving params)

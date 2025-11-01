@@ -872,34 +872,36 @@ public enum LazyOp {
             guard inputs.count == 2 else { fatalError("spectralLossPass1 requires 2 inputs") }
             let sig1 = b.tapeValue(node.inputs[0])
             let sig2 = b.tapeValue(node.inputs[1])
+            let gradId1 = b.ctx.useGradient(src: node.inputs[0])
+            let gradId2 = b.ctx.useGradient(src: node.inputs[1])
 
-            // Pass A: Accumulate per-window gradient contributions to memory
-            u_spectralLossBackwardPass1(
-                windowSize, scratchCell, sig1, sig2, b.value(gradOutput)
+            // Pass B: Reduce from memory to gradients (READ)
+            // This runs SECOND in backward (after Pass2), so memory has been written
+            let (grad1, grad2) = u_spectralLossBackwardPass2(
+                windowSize, scratchCell, sig1, sig2, b.value(gradOutput), gradId1, gradId2
             )(b)
 
-            // No gradient propagation here - Pass2 will handle it
+            // Propagate gradients to original signals
+            b.grad(node.inputs[0], value: grad1.lazy)
+            b.grad(node.inputs[1], value: grad2.lazy)
 
         case let .spectralLossPass2(windowSize, scratchCell):
             guard inputs.count == 1 else { fatalError("spectralLossPass2 requires 1 input") }
 
-            // Pass B: Reduce from memory to gradients
             // Get the original signal inputs from Pass1's node
             let pass1Node = g.nodes[node.inputs[0]]!
             guard pass1Node.inputs.count == 2 else { fatalError("Expected Pass1 to have 2 inputs") }
 
             let sig1 = b.tapeValue(pass1Node.inputs[0])
             let sig2 = b.tapeValue(pass1Node.inputs[1])
-            let gradId1 = b.ctx.useGradient(src: pass1Node.inputs[0])
-            let gradId2 = b.ctx.useGradient(src: pass1Node.inputs[1])
 
-            let (grad1, grad2) = u_spectralLossBackwardPass2(
-                windowSize, scratchCell, sig1, sig2, b.value(gradOutput), gradId1, gradId2
+            // Pass A: Accumulate per-window gradient contributions to memory (WRITE)
+            // This runs FIRST in backward (before Pass1), writing data that Pass1 will read
+            u_spectralLossBackwardPass1(
+                windowSize, scratchCell, sig1, sig2, b.value(gradOutput)
             )(b)
 
-            // Propagate gradients to original signals
-            b.grad(pass1Node.inputs[0], value: grad1.lazy)
-            b.grad(pass1Node.inputs[1], value: grad2.lazy)
+            // Don't propagate gradients - Pass1 will handle that
 
         case .floor:
             // d(floor(x))/dx = 0 (floor is not differentiable, but we set to 0)
