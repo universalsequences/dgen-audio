@@ -146,13 +146,13 @@ final class SpectralLossBackwardTests: XCTestCase {
     }
 
     /// Test that spectral loss backward pass can learn to match a target frequency
-    func testSpectralLossLearnsFrequency() throws {
+    func testSpectralLossLearnsFrequencyCycles() throws {
         print("\n🧪 Test: Spectral Loss Learning - Frequency Matching")
 
         let g = Graph()
 
         // Learnable frequency parameter (start at 300 Hz, target is 440 Hz)
-        let freqParam = Parameter(graph: g, value: 300.0, name: "frequency")
+        let freqParam = Parameter(graph: g, value: 850.0, name: "frequency")
         let freq = freqParam.node()
 
         // Target frequency (constant 440 Hz)
@@ -170,8 +170,10 @@ final class SpectralLossBackwardTests: XCTestCase {
         let sig2 = g.n(.sin, g.n(.mul, phase2, twoPi))
 
         // Compute spectral loss
-        let windowSize = 64
-        let loss = g.spectralLoss(sig1, sig2, windowSize: windowSize)
+        let loss1 = g.spectralLoss(sig1, sig2, windowSize: 32)
+        let loss2 = g.spectralLoss(sig1, sig2, windowSize: 64)
+        let loss3 = g.spectralLoss(sig1, sig2, windowSize: 128)
+        let loss = g.n(.div, g.n(.add, loss3, g.n(.add, loss1, loss2)), g.n(.constant(3)))
 
         _ = g.n(.output(0), loss)
 
@@ -197,7 +199,7 @@ final class SpectralLossBackwardTests: XCTestCase {
         // Training context using optimizer (replaces manual gradient descent)
         let ctx = TrainingContext(
             parameters: [freqParam],
-            optimizer: SGD(lr: 12.0),  // match manual learning rate used previously
+            optimizer: SGD(lr: 692.0),  // match manual learning rate used previously
             lossNode: loss
         )
         ctx.initializeMemory(
@@ -212,7 +214,7 @@ final class SpectralLossBackwardTests: XCTestCase {
         var outputBuffer = [Float](repeating: 0.0, count: frameCount)
 
         // Training loop using TrainingContext
-        let numIterations = 500
+        let numIterations = 2500
         var lossHistory: [Float] = []
         for iteration in 0..<numIterations {
             // Zero gradients and reset memory (preserving params)
@@ -387,7 +389,7 @@ final class SpectralLossBackwardTests: XCTestCase {
         let targetLFOFrequency: Float = 10.0
 
         // Learnable frequency parameter (start at 300 Hz, target is 237 Hz)
-        let freqParam = Parameter(graph: g, value: 287.0, name: "frequency")
+        let freqParam = Parameter(graph: g, value: 350.0, name: "frequency")
         let freq = freqParam.node()
 
         let lfoFreqParam = Parameter(graph: g, value: 8.5, name: "lfo-frequency")
@@ -437,13 +439,13 @@ final class SpectralLossBackwardTests: XCTestCase {
         let spectralLoss = g.spectralLoss(leaky1, leaky2, windowSize: windowSize)
         let l2Loss = g.n(.mse, leaky1, leaky2)
         let loss = g.n(
-            .add, g.n(.mul, g.n(.constant(20.0)), spectralLoss),
+            .add, g.n(.mul, g.n(.constant(100.0)), spectralLoss),
             g.n(.mul, g.n(.constant(0.1)), l2Loss))
 
         _ = g.n(.output(0), loss)
 
         // Compile with backwards pass enabled
-        let frameCount = 512 * 2
+        let frameCount = 256
         let result = try CompilationPipeline.compile(
             graph: g,
             backend: .metal,
@@ -469,7 +471,7 @@ final class SpectralLossBackwardTests: XCTestCase {
         // Training context using optimizer (replaces manual gradient descent)
         let ctx = TrainingContext(
             parameters: [freqParam, lfoFreqParam],
-            optimizer: SGD(lr: 55.3),
+            optimizer: SGD(lr: 165.3),
             lossNode: loss
         )
         ctx.initializeMemory(
@@ -484,7 +486,7 @@ final class SpectralLossBackwardTests: XCTestCase {
         var outputBuffer = [Float](repeating: 0.0, count: frameCount)
 
         // Training loop using TrainingContext
-        let numIterations = 1200
+        let numIterations = 4200
         var lossHistory: [Float] = []
         for iteration in 0..<numIterations {
             // Zero gradients and reset memory (preserving params)

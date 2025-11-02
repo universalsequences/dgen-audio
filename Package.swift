@@ -9,6 +9,7 @@ let package = Package(
     products: [
         .executable(name: "dgen", targets: ["DGenApp"]),
         .library(name: "DGen", targets: ["DGen"]),
+        .library(name: "DGenFrontend", targets: ["DGenFrontend"]),
     ],
     targets: [
         .target(
@@ -20,6 +21,10 @@ let package = Package(
                 .linkedFramework("QuartzCore")
             ]
         ),
+        .target(
+            name: "DGenFrontend",
+            dependencies: ["DGen"]
+        ),
         .executableTarget(
             name: "DGenApp",
             dependencies: ["DGen"],
@@ -27,7 +32,7 @@ let package = Package(
         ),
         .testTarget(
             name: "DGenTests",
-            dependencies: ["DGen"],
+            dependencies: ["DGen", "DGenFrontend"],
             path: "Tests/DGenTests"
         ),
     ]

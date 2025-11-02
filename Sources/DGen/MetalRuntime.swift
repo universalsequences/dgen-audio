@@ -569,6 +569,62 @@ public class MetalCompiledKernel: CompiledKernelRuntime {
     run(outputs: outputs, inputs: inputs, frameCount: frameCount, volumeScale: 1.0)
   }
 
+  // MARK: - Convenience Methods with Internal Buffers
+
+  private var internalInputBuffer: [Float]?
+  private var internalOutputBuffer: [Float]?
+  private var currentFrameCount: Int = 0
+
+  /// Simplified run method that uses internal buffers
+  /// - Parameters:
+  ///   - memory: Memory pointer to copy into Metal buffer
+  ///   - frameCount: Number of frames to process
+  public func run(memory: UnsafeMutableRawPointer, frameCount: Int) {
+    // Allocate or resize internal buffers if needed
+    if internalInputBuffer == nil || currentFrameCount != frameCount {
+      internalInputBuffer = [Float](repeating: 0.0, count: frameCount)
+      internalOutputBuffer = [Float](repeating: 0.0, count: frameCount)
+      currentFrameCount = frameCount
+    }
+
+    // Use internal buffers
+    guard var inputBuf = internalInputBuffer, var outputBuf = internalOutputBuffer else {
+      fatalError("Failed to allocate internal buffers")
+    }
+
+    inputBuf.withUnsafeBufferPointer { inPtr in
+      outputBuf.withUnsafeMutableBufferPointer { outPtr in
+        runWithMemory(
+          outputs: outPtr.baseAddress!,
+          inputs: inPtr.baseAddress!,
+          memory: memory,
+          frameCount: frameCount
+        )
+      }
+    }
+
+    // Store output for later retrieval
+    internalOutputBuffer = outputBuf
+  }
+
+  /// Get a copy of the output buffer from the last run
+  /// - Returns: Array of output samples
+  public func getOutputBuffer() -> [Float] {
+    guard let output = internalOutputBuffer else {
+      return []
+    }
+    return output
+  }
+
+  /// Get the last output value (useful for scalar loss values)
+  /// - Returns: The last frame's output value, or nil if no output available
+  public func getLastOutput() -> Float? {
+    guard let output = internalOutputBuffer, !output.isEmpty else {
+      return nil
+    }
+    return output.last
+  }
+
   deinit {
     cleanup()
   }

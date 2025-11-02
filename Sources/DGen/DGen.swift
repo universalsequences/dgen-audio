@@ -84,7 +84,7 @@ public struct Node {
     }
 }
 
-public final class Graph {
+open class Graph {
     private var next = 0
     public var nodes: [NodeID: Node] = [:]
     private var nextCellId = 0

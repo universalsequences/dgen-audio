@@ -121,7 +121,7 @@ public class TrainingContext {
     private var context: IRContext?
     private let lossNode: NodeID?
 
-    /// Initialize training context
+    /// Initialize training context (simple version - requires manual initializeMemory() call)
     /// - Parameters:
     ///   - parameters: Learnable parameters to optimize
     ///   - optimizer: Optimization algorithm (SGD, Adam, etc.)
@@ -130,6 +130,38 @@ public class TrainingContext {
         self.parameters = parameters
         self.optimizer = optimizer
         self.lossNode = lossNode
+    }
+
+    /// Initialize training context with all dependencies (streamlined version)
+    /// - Parameters:
+    ///   - parameters: Learnable parameters to optimize
+    ///   - optimizer: Optimization algorithm (SGD, Adam, etc.)
+    ///   - lossNode: The loss node to seed gradients from
+    ///   - compilationResult: Result from CompilationPipeline.compile()
+    ///   - frameCount: Number of audio frames per batch
+    public convenience init(
+        parameters: [Parameter],
+        optimizer: Optimizer,
+        lossNode: NodeID,
+        compilationResult: CompilationResult,
+        frameCount: Int
+    ) throws {
+        self.init(parameters: parameters, optimizer: optimizer, lossNode: lossNode)
+
+        // Create runtime
+        let runtime = try MetalCompiledKernel(
+            kernels: compilationResult.kernels,
+            cellAllocations: compilationResult.cellAllocations,
+            context: compilationResult.context
+        )
+
+        // Initialize memory automatically
+        self.initializeMemory(
+            runtime: runtime,
+            cellAllocations: compilationResult.cellAllocations,
+            context: compilationResult.context,
+            frameCount: frameCount
+        )
     }
 
     /// Initialize memory and set up parameter mappings after compilation
@@ -313,6 +345,26 @@ public class TrainingContext {
             fatalError("Memory not initialized. Call initializeMemory() first.")
         }
         return memory
+    }
+
+    /// Run a complete training step: zero gradients, forward+backward pass, optimizer step
+    /// - Returns: The loss value from this step
+    public func runStep() -> Float {
+        guard let runtime = runtime else {
+            fatalError("Runtime not initialized")
+        }
+
+        // Zero gradients
+        zeroGrad()
+
+        // Forward + backward pass - use simplified API!
+        runtime.run(memory: getMemory(), frameCount: frameCount)
+
+        // Update parameters
+        step()
+
+        // Return loss value (last frame)
+        return runtime.getLastOutput() ?? 0.0
     }
 
     deinit {
