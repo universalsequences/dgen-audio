@@ -49,7 +49,7 @@ public class GraphBuilder: Graph {
         if let reset = reset {
             return Node(id: n(.phasor(cellId), freq.id, reset.id), graph: self)
         } else {
-            return Node(id: n(.phasor(cellId), freq.id), graph: self)
+            return Node(id: n(.phasor(cellId), freq.id, self.constant(0.0).id), graph: self)
         }
     }
 
@@ -243,7 +243,9 @@ public func param(_ graph: Graph, cellId: CellID) -> Node {
 }
 
 /// Create a parameter with auto-allocation and configuration
-public func param(_ graph: Graph, name: String, min: Float, max: Float, default defaultValue: Float) -> Node {
+public func param(_ graph: Graph, name: String, min: Float, max: Float, default defaultValue: Float)
+    -> Node
+{
     let cellId = graph.alloc()
     // Note: This simplified version doesn't store min/max/name metadata
     // You may want to extend Graph to track this if needed

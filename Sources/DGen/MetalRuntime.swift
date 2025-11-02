@@ -15,6 +15,11 @@ public class MetalCompiledKernel: CompiledKernelRuntime {
   private let maxFrameCount: Int
   private var firstDebug = true
 
+  // Training kernel functions
+  private var reduceGradientsFunction: MTLFunction?
+  private var updateParametersSGDFunction: MTLFunction?
+  private var updateParametersAdamFunction: MTLFunction?
+
   public init(
     kernels: [CompiledKernel], cellAllocations: CellAllocations, context: IRContext,
     frameCount: Int = 512 * 2
@@ -41,9 +46,88 @@ public class MetalCompiledKernel: CompiledKernelRuntime {
     self.commandQueue = commandQueue
 
     // Combine all kernel sources and compile
-    let combinedSource = kernels.map { $0.source }.joined(separator: "\n\n")
+    var combinedSource = kernels.map { $0.source }.joined(separator: "\n\n")
+
+    // Add training kernels
+    let trainingKernelSource = """
+
+    // MARK: - Training Kernels
+    using namespace metal;
+
+    kernel void reduceGradients(
+        device const float* gradients [[buffer(0)]],
+        device float* reducedGrads [[buffer(1)]],
+        constant uint& frameCount [[buffer(2)]],
+        constant uint& numGradIds [[buffer(3)]],
+        uint gradId [[thread_position_in_grid]]
+    ) {
+        if (gradId >= numGradIds) return;
+
+        float sum = 0.0;
+        uint baseIdx = frameCount * gradId;
+        for (uint i = 0; i < frameCount; i++) {
+            sum += gradients[baseIdx + i];
+        }
+        reducedGrads[gradId] = sum / float(frameCount);
+    }
+
+    kernel void updateParametersSGD(
+        device float* memory [[buffer(0)]],
+        device const float* reducedGrads [[buffer(1)]],
+        constant uint* gradIds [[buffer(2)]],
+        constant uint* physicalCells [[buffer(3)]],
+        constant float& learningRate [[buffer(4)]],
+        constant uint& paramCount [[buffer(5)]],
+        uint paramIdx [[thread_position_in_grid]]
+    ) {
+        if (paramIdx >= paramCount) return;
+
+        uint gradId = gradIds[paramIdx];
+        uint physicalCell = physicalCells[paramIdx];
+        float grad = reducedGrads[gradId];
+
+        memory[physicalCell] -= learningRate * grad;
+    }
+
+    kernel void updateParametersAdam(
+        device float* memory [[buffer(0)]],
+        device const float* reducedGrads [[buffer(1)]],
+        device float* m [[buffer(2)]],
+        device float* v [[buffer(3)]],
+        constant uint* gradIds [[buffer(4)]],
+        constant uint* physicalCells [[buffer(5)]],
+        constant float& learningRate [[buffer(6)]],
+        constant float& beta1 [[buffer(7)]],
+        constant float& beta2 [[buffer(8)]],
+        constant float& epsilon [[buffer(9)]],
+        constant uint& timestep [[buffer(10)]],
+        constant uint& paramCount [[buffer(11)]],
+        uint paramIdx [[thread_position_in_grid]]
+    ) {
+        if (paramIdx >= paramCount) return;
+
+        uint gradId = gradIds[paramIdx];
+        uint physicalCell = physicalCells[paramIdx];
+        float grad = reducedGrads[gradId];
+
+        m[paramIdx] = beta1 * m[paramIdx] + (1.0 - beta1) * grad;
+        v[paramIdx] = beta2 * v[paramIdx] + (1.0 - beta2) * grad * grad;
+
+        float m_hat = m[paramIdx] / (1.0 - pow(beta1, float(timestep)));
+        float v_hat = v[paramIdx] / (1.0 - pow(beta2, float(timestep)));
+
+        memory[physicalCell] -= learningRate * m_hat / (sqrt(v_hat) + epsilon);
+    }
+    """
+
+    combinedSource += trainingKernelSource
+
     do {
-      self.library = try device.makeLibrary(source: combinedSource, options: nil)
+      let options = MTLCompileOptions()
+      options.fastMathEnabled = true
+      // Don't treat warnings as errors - this is important for generated code
+      // that may have unused variables in backward passes
+      self.library = try device.makeLibrary(source: combinedSource, options: options)
     } catch {
       print("Metal compilation error:")
       print("=== Combined Metal Source ===")
@@ -52,7 +136,7 @@ public class MetalCompiledKernel: CompiledKernelRuntime {
       throw error
     }
 
-    // Get function references
+    // Get function references for graph kernels
     for kernel in kernels {
       guard let function = library.makeFunction(name: kernel.name) else {
         throw NSError(
@@ -61,6 +145,11 @@ public class MetalCompiledKernel: CompiledKernelRuntime {
       }
       functions.append(function)
     }
+
+    // Get training kernel function references
+    reduceGradientsFunction = library.makeFunction(name: "reduceGradients")
+    updateParametersSGDFunction = library.makeFunction(name: "updateParametersSGD")
+    updateParametersAdamFunction = library.makeFunction(name: "updateParametersAdam")
 
     try initializeBuffers()
   }
@@ -108,7 +197,7 @@ public class MetalCompiledKernel: CompiledKernelRuntime {
     // Create frameCount buffer for scalar kernels
     guard
       let frameCountBuffer = device.makeBuffer(
-        length: MemoryLayout<Int32>.size, options: .storageModeShared)
+        length: MemoryLayout<UInt32>.size, options: .storageModeShared)
     else {
       throw NSError(
         domain: "MetalError", code: 4,
@@ -180,8 +269,8 @@ public class MetalCompiledKernel: CompiledKernelRuntime {
   ) {
     // Update frameCount buffer with current frameCount value
     if let frameCountBuffer = bufferPool["frameCount"] {
-      let frameCountPtr = frameCountBuffer.contents().assumingMemoryBound(to: Int32.self)
-      frameCountPtr[0] = Int32(frameCount)
+      let frameCountPtr = frameCountBuffer.contents().assumingMemoryBound(to: UInt32.self)
+      frameCountPtr[0] = UInt32(frameCount)
     }
 
     guard var commandBuffer = commandQueue.makeCommandBuffer() else { return }
@@ -223,21 +312,21 @@ public class MetalCompiledKernel: CompiledKernelRuntime {
 
           // Update segmentLen
           if let segBuf = bufferPool["segmentLen"] {
-            let segPtr = segBuf.contents().assumingMemoryBound(to: Int32.self)
-            segPtr[0] = Int32(thisLen)
+            let segPtr = segBuf.contents().assumingMemoryBound(to: UInt32.self)
+            segPtr[0] = UInt32(thisLen)
           }
           // Update segmentBase (in frames)
           if let segBaseBuf = bufferPool["segmentBase"] {
-            let basePtr = segBaseBuf.contents().assumingMemoryBound(to: Int32.self)
-            basePtr[0] = Int32(base)
+            let basePtr = segBaseBuf.contents().assumingMemoryBound(to: UInt32.self)
+            basePtr[0] = UInt32(base)
           }
 
           // Bind buffers with per-segment offsets
           for (bufferIndex, bufferName) in kernel.buffers.enumerated() {
             if firstDebug {
-              //print(
-              //    "kernel[\(index) setting buffer=\(bufferName) index=\(bufferIndex)]"
-              //)
+              print(
+                  "kernel[\(index) setting buffer=\(bufferName) index=\(bufferIndex)]"
+              )
             }
 
             guard let buffer = bufferPool[bufferName] else { continue }
@@ -313,11 +402,22 @@ public class MetalCompiledKernel: CompiledKernelRuntime {
   ) {
     // Find output buffers and copy their contents
     // First check for dedicated "outputs" buffer
+    if let memory = bufferPool["grad_memory"] {
+      let bufferContents = memory.contents().assumingMemoryBound(to: Float.self)
+      // Copy all frameCount frames (not limited to MIN_FRAME_COUNT)
+      for i in 0..<frameCount {
+        if (bufferContents[i] > 0) {
+        //print("memory[\(i)] = \(bufferContents[i])")
+        }
+      }
+
+    }
     if let outputBuffer = bufferPool["outputs"] {
       let bufferContents = outputBuffer.contents().assumingMemoryBound(to: Float.self)
       // Copy all frameCount frames (not limited to MIN_FRAME_COUNT)
       for i in 0..<frameCount {
         outputs[i] = bufferContents[i] * volumeScale
+        //print("outputs[\(i)] = \(outputs[i])")
       }
       return
     }
@@ -623,6 +723,330 @@ public class MetalCompiledKernel: CompiledKernelRuntime {
       return nil
     }
     return output.last
+  }
+
+  // MARK: - Training Kernel Dispatch
+
+  /// Reduce gradients across frames on GPU
+  /// - Parameters:
+  ///   - frameCount: Number of frames per gradient
+  ///   - numGradIds: Total number of gradient IDs
+  /// - Returns: Buffer containing reduced gradients
+  public func reduceGradientsGPU(frameCount: Int, numGradIds: Int) -> MTLBuffer? {
+    guard let function = reduceGradientsFunction else {
+      print("⚠️ reduceGradients function not found")
+      return nil
+    }
+
+    guard let gradientsBuffer = bufferPool["gradients"] else {
+      print("⚠️ gradients buffer not found")
+      return nil
+    }
+
+    // Create or get reducedGrads buffer
+    let reducedGradsSize = numGradIds * MemoryLayout<Float>.size
+    if bufferPool["reducedGrads"] == nil {
+      guard let buffer = device.makeBuffer(length: reducedGradsSize, options: .storageModeShared)
+      else {
+        print("⚠️ Failed to create reducedGrads buffer")
+        return nil
+      }
+      bufferPool["reducedGrads"] = buffer
+    }
+
+    guard let reducedGradsBuffer = bufferPool["reducedGrads"] else {
+      return nil
+    }
+
+    // Create command buffer and encoder
+    guard let commandBuffer = commandQueue.makeCommandBuffer(),
+      let computeEncoder = commandBuffer.makeComputeCommandEncoder()
+    else {
+      print("⚠️ Failed to create command buffer or encoder")
+      return nil
+    }
+
+    guard let pipelineState = try? device.makeComputePipelineState(function: function) else {
+      print("⚠️ Failed to create pipeline state")
+      return nil
+    }
+
+    computeEncoder.setComputePipelineState(pipelineState)
+
+    // Set buffers
+    computeEncoder.setBuffer(gradientsBuffer, offset: 0, index: 0)
+    computeEncoder.setBuffer(reducedGradsBuffer, offset: 0, index: 1)
+
+    // Set scalar parameters
+    var frameCountUInt = UInt32(frameCount)
+    var numGradIdsUInt = UInt32(numGradIds)
+    computeEncoder.setBytes(&frameCountUInt, length: MemoryLayout<UInt32>.size, index: 2)
+    computeEncoder.setBytes(&numGradIdsUInt, length: MemoryLayout<UInt32>.size, index: 3)
+
+    // Dispatch one thread per gradient ID
+    let threadsPerGrid = MTLSize(width: numGradIds, height: 1, depth: 1)
+    let threadsPerThreadgroup = MTLSize(
+      width: min(numGradIds, pipelineState.maxTotalThreadsPerThreadgroup), height: 1, depth: 1)
+    computeEncoder.dispatchThreads(threadsPerGrid, threadsPerThreadgroup: threadsPerThreadgroup)
+
+    computeEncoder.endEncoding()
+    commandBuffer.commit()
+    commandBuffer.waitUntilCompleted()
+
+    return reducedGradsBuffer
+  }
+
+  /// Update parameters using SGD on GPU
+  /// - Parameters:
+  ///   - gradIds: Array mapping parameter index to gradient ID
+  ///   - physicalCells: Array mapping parameter index to memory cell
+  ///   - learningRate: Learning rate for SGD
+  public func updateParametersSGDGPU(
+    gradIds: [UInt32], physicalCells: [UInt32], learningRate: Float
+  ) {
+    guard let function = updateParametersSGDFunction else {
+      print("⚠️ updateParametersSGD function not found")
+      return
+    }
+
+    guard let memoryBuffer = bufferPool["memory"],
+      let reducedGradsBuffer = bufferPool["reducedGrads"]
+    else {
+      print("⚠️ Required buffers not found")
+      return
+    }
+
+    let paramCount = gradIds.count
+
+    // Create or update gradIds buffer
+    let gradIdsSize = paramCount * MemoryLayout<UInt32>.size
+    if bufferPool["gradIds"] == nil || bufferPool["gradIds"]!.length < gradIdsSize {
+      guard let buffer = device.makeBuffer(length: gradIdsSize, options: .storageModeShared)
+      else {
+        print("⚠️ Failed to create gradIds buffer")
+        return
+      }
+      bufferPool["gradIds"] = buffer
+    }
+
+    // Create or update physicalCells buffer
+    let physicalCellsSize = paramCount * MemoryLayout<UInt32>.size
+    if bufferPool["physicalCells"] == nil
+      || bufferPool["physicalCells"]!.length < physicalCellsSize
+    {
+      guard
+        let buffer = device.makeBuffer(length: physicalCellsSize, options: .storageModeShared)
+      else {
+        print("⚠️ Failed to create physicalCells buffer")
+        return
+      }
+      bufferPool["physicalCells"] = buffer
+    }
+
+    // Copy data to buffers
+    if let gradIdsBuffer = bufferPool["gradIds"] {
+      let ptr = gradIdsBuffer.contents().assumingMemoryBound(to: UInt32.self)
+      for i in 0..<paramCount {
+        ptr[i] = gradIds[i]
+      }
+    }
+
+    if let physicalCellsBuffer = bufferPool["physicalCells"] {
+      let ptr = physicalCellsBuffer.contents().assumingMemoryBound(to: UInt32.self)
+      for i in 0..<paramCount {
+        ptr[i] = physicalCells[i]
+      }
+    }
+
+    guard let gradIdsBuffer = bufferPool["gradIds"],
+      let physicalCellsBuffer = bufferPool["physicalCells"]
+    else {
+      return
+    }
+
+    // Create command buffer and encoder
+    guard let commandBuffer = commandQueue.makeCommandBuffer(),
+      let computeEncoder = commandBuffer.makeComputeCommandEncoder()
+    else {
+      print("⚠️ Failed to create command buffer or encoder")
+      return
+    }
+
+    guard let pipelineState = try? device.makeComputePipelineState(function: function) else {
+      print("⚠️ Failed to create pipeline state")
+      return
+    }
+
+    computeEncoder.setComputePipelineState(pipelineState)
+
+    // Set buffers
+    computeEncoder.setBuffer(memoryBuffer, offset: 0, index: 0)
+    computeEncoder.setBuffer(reducedGradsBuffer, offset: 0, index: 1)
+    computeEncoder.setBuffer(gradIdsBuffer, offset: 0, index: 2)
+    computeEncoder.setBuffer(physicalCellsBuffer, offset: 0, index: 3)
+
+    // Set scalar parameters
+    var lr = learningRate
+    var pc = UInt32(paramCount)
+    computeEncoder.setBytes(&lr, length: MemoryLayout<Float>.size, index: 4)
+    computeEncoder.setBytes(&pc, length: MemoryLayout<UInt32>.size, index: 5)
+
+    // Dispatch one thread per parameter
+    let threadsPerGrid = MTLSize(width: paramCount, height: 1, depth: 1)
+    let threadsPerThreadgroup = MTLSize(
+      width: min(paramCount, pipelineState.maxTotalThreadsPerThreadgroup), height: 1, depth: 1)
+    computeEncoder.dispatchThreads(threadsPerGrid, threadsPerThreadgroup: threadsPerThreadgroup)
+
+    computeEncoder.endEncoding()
+    commandBuffer.commit()
+    commandBuffer.waitUntilCompleted()
+  }
+
+  /// Update parameters using Adam on GPU
+  /// - Parameters:
+  ///   - gradIds: Array mapping parameter index to gradient ID
+  ///   - physicalCells: Array mapping parameter index to memory cell
+  ///   - learningRate: Learning rate for Adam
+  ///   - beta1: Exponential decay rate for first moment estimates
+  ///   - beta2: Exponential decay rate for second moment estimates
+  ///   - epsilon: Small constant for numerical stability
+  ///   - timestep: Current training timestep (for bias correction)
+  public func updateParametersAdamGPU(
+    gradIds: [UInt32], physicalCells: [UInt32], learningRate: Float, beta1: Float, beta2: Float,
+    epsilon: Float, timestep: Int
+  ) {
+    guard let function = updateParametersAdamFunction else {
+      print("⚠️ updateParametersAdam function not found")
+      return
+    }
+
+    guard let memoryBuffer = bufferPool["memory"],
+      let reducedGradsBuffer = bufferPool["reducedGrads"]
+    else {
+      print("⚠️ Required buffers not found")
+      return
+    }
+
+    let paramCount = gradIds.count
+
+    // Create or update momentum buffers (m and v)
+    let momentumSize = paramCount * MemoryLayout<Float>.size
+    if bufferPool["adam_m"] == nil || bufferPool["adam_m"]!.length < momentumSize {
+      guard let buffer = device.makeBuffer(length: momentumSize, options: .storageModeShared)
+      else {
+        print("⚠️ Failed to create adam_m buffer")
+        return
+      }
+      // Initialize to zero
+      memset(buffer.contents(), 0, momentumSize)
+      bufferPool["adam_m"] = buffer
+    }
+
+    if bufferPool["adam_v"] == nil || bufferPool["adam_v"]!.length < momentumSize {
+      guard let buffer = device.makeBuffer(length: momentumSize, options: .storageModeShared)
+      else {
+        print("⚠️ Failed to create adam_v buffer")
+        return
+      }
+      // Initialize to zero
+      memset(buffer.contents(), 0, momentumSize)
+      bufferPool["adam_v"] = buffer
+    }
+
+    // Create or update gradIds and physicalCells buffers (same as SGD)
+    let gradIdsSize = paramCount * MemoryLayout<UInt32>.size
+    if bufferPool["gradIds"] == nil || bufferPool["gradIds"]!.length < gradIdsSize {
+      guard let buffer = device.makeBuffer(length: gradIdsSize, options: .storageModeShared)
+      else {
+        print("⚠️ Failed to create gradIds buffer")
+        return
+      }
+      bufferPool["gradIds"] = buffer
+    }
+
+    let physicalCellsSize = paramCount * MemoryLayout<UInt32>.size
+    if bufferPool["physicalCells"] == nil
+      || bufferPool["physicalCells"]!.length < physicalCellsSize
+    {
+      guard
+        let buffer = device.makeBuffer(length: physicalCellsSize, options: .storageModeShared)
+      else {
+        print("⚠️ Failed to create physicalCells buffer")
+        return
+      }
+      bufferPool["physicalCells"] = buffer
+    }
+
+    // Copy data to buffers
+    if let gradIdsBuffer = bufferPool["gradIds"] {
+      let ptr = gradIdsBuffer.contents().assumingMemoryBound(to: UInt32.self)
+      for i in 0..<paramCount {
+        ptr[i] = gradIds[i]
+      }
+    }
+
+    if let physicalCellsBuffer = bufferPool["physicalCells"] {
+      let ptr = physicalCellsBuffer.contents().assumingMemoryBound(to: UInt32.self)
+      for i in 0..<paramCount {
+        ptr[i] = physicalCells[i]
+      }
+    }
+
+    guard let gradIdsBuffer = bufferPool["gradIds"],
+      let physicalCellsBuffer = bufferPool["physicalCells"],
+      let mBuffer = bufferPool["adam_m"],
+      let vBuffer = bufferPool["adam_v"]
+    else {
+      return
+    }
+
+    // Create command buffer and encoder
+    guard let commandBuffer = commandQueue.makeCommandBuffer(),
+      let computeEncoder = commandBuffer.makeComputeCommandEncoder()
+    else {
+      print("⚠️ Failed to create command buffer or encoder")
+      return
+    }
+
+    guard let pipelineState = try? device.makeComputePipelineState(function: function) else {
+      print("⚠️ Failed to create pipeline state")
+      return
+    }
+
+    computeEncoder.setComputePipelineState(pipelineState)
+
+    // Set buffers
+    computeEncoder.setBuffer(memoryBuffer, offset: 0, index: 0)
+    computeEncoder.setBuffer(reducedGradsBuffer, offset: 0, index: 1)
+    computeEncoder.setBuffer(mBuffer, offset: 0, index: 2)
+    computeEncoder.setBuffer(vBuffer, offset: 0, index: 3)
+    computeEncoder.setBuffer(gradIdsBuffer, offset: 0, index: 4)
+    computeEncoder.setBuffer(physicalCellsBuffer, offset: 0, index: 5)
+
+    // Set scalar parameters
+    var lr = learningRate
+    var b1 = beta1
+    var b2 = beta2
+    var eps = epsilon
+    var t = UInt32(timestep)
+    var pc = UInt32(paramCount)
+
+    computeEncoder.setBytes(&lr, length: MemoryLayout<Float>.size, index: 6)
+    computeEncoder.setBytes(&b1, length: MemoryLayout<Float>.size, index: 7)
+    computeEncoder.setBytes(&b2, length: MemoryLayout<Float>.size, index: 8)
+    computeEncoder.setBytes(&eps, length: MemoryLayout<Float>.size, index: 9)
+    computeEncoder.setBytes(&t, length: MemoryLayout<UInt32>.size, index: 10)
+    computeEncoder.setBytes(&pc, length: MemoryLayout<UInt32>.size, index: 11)
+
+    // Dispatch one thread per parameter
+    let threadsPerGrid = MTLSize(width: paramCount, height: 1, depth: 1)
+    let threadsPerThreadgroup = MTLSize(
+      width: min(paramCount, pipelineState.maxTotalThreadsPerThreadgroup), height: 1, depth: 1)
+    computeEncoder.dispatchThreads(threadsPerGrid, threadsPerThreadgroup: threadsPerThreadgroup)
+
+    computeEncoder.endEncoding()
+    commandBuffer.commit()
+    commandBuffer.waitUntilCompleted()
   }
 
   deinit {

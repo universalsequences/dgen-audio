@@ -106,7 +106,18 @@ public class MetalRenderer: Renderer, UOpEmitter {
         beginRange.kind = block.kind
         scheduleItem.ops.append(beginRange)
 
-        var beginLoop = UOp(op: .beginLoop(frameCountUOp, 1), value: .empty)
+        var hasGradMemoryCalls = false
+        for n in block.ops {
+          if case .storeGradMemory(_, _) = n.op {
+            hasGradMemoryCalls = true
+            break
+          } else if case .loadGradMemory(_) = n.op {
+            hasGradMemoryCalls = true
+            break
+          }
+        }
+        let incr = hasGradMemoryCalls ? -1 : 1
+        var beginLoop = UOp(op: .beginLoop(frameCountUOp, incr), value: .empty)
         beginLoop.kind = block.kind
         scheduleItem.ops.append(beginLoop)
       } else {
@@ -181,14 +192,14 @@ public class MetalRenderer: Renderer, UOpEmitter {
     }
 
     // Add frameCount parameter for all Metal kernels (needed for output operations)
-    parameters.append("    constant int &frameCount [[buffer(\(bufferIndex))]]")
+    parameters.append("    constant uint &frameCount [[buffer(\(bufferIndex))]]")
     bufferIndex += 1
 
     // If segmented, add segmentLen and segmentBase buffers
     if bufferRequirements.needsSegmenting {
-      parameters.append("    constant int &segmentLen [[buffer(\(bufferIndex))]]")
+      parameters.append("    constant uint &segmentLen [[buffer(\(bufferIndex))]]")
       bufferIndex += 1
-      parameters.append("    constant int &segmentBase [[buffer(\(bufferIndex))]]")
+      parameters.append("    constant uint &segmentBase [[buffer(\(bufferIndex))]]")
       bufferIndex += 1
     }
 
@@ -210,6 +221,10 @@ public class MetalRenderer: Renderer, UOpEmitter {
     kernels += "kernel void \(name)(\n"
     kernels += parameters.joined(separator: ",\n")
     kernels += "\n) {\n"
+
+    // Suppress unused variable warnings (common in backward pass code generation)
+    kernels += "  #pragma clang diagnostic push\n"
+    kernels += "  #pragma clang diagnostic ignored \"-Wunused-variable\"\n"
 
     var indent = 1
 
@@ -237,6 +252,8 @@ public class MetalRenderer: Renderer, UOpEmitter {
       indent += diff
     }
 
+    // Restore warning settings
+    kernels += "  #pragma clang diagnostic pop\n"
     kernels += "}\n\n"
     return kernels
   }
@@ -548,7 +565,12 @@ public class MetalRenderer: Renderer, UOpEmitter {
     case let .beginIf(cond): return "if (\(g(cond))) {"
     case .endIf: return "}"
 
-    case let .beginLoop(iters, step): return "for (int i = 0; i < \(g(iters)); i += \(step)) {"
+    case let .beginLoop(iters, step):
+      if step < 0 {
+        return "for (int i = \(g(iters)) - 1; i >= 0; i += \(step)) {"
+      } else {
+        return "for (uint i = 0; i < \(g(iters)); i += \(step)) {"
+      }
     case let .beginForLoop(loopVar, count):
       guard case .variable(let varId, _) = loopVar else {
         fatalError("beginForLoop requires variable")
@@ -556,11 +578,11 @@ public class MetalRenderer: Renderer, UOpEmitter {
       // Emit count as integer to avoid "t < 33.0" in loop bounds
       let countStr: String
       if case .constant(_, let val) = count {
-        countStr = "\(Int(val))"
+        countStr = "\(UInt(val))"
       } else {
-        countStr = "(int)\(g(count))"
+        countStr = "(uint)\(g(count))"
       }
-      return "for (int t\(varId) = 0; t\(varId) < \(countStr); t\(varId)++) {"
+      return "for (uint t\(varId) = 0; t\(varId) < \(countStr); t\(varId)++) {"
     case .endLoop: return "}"
 
     case .threadIndex:

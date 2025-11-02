@@ -5,7 +5,7 @@ import DGen
 let g = Graph()
 
 // Source: 220 Hz sine
-let freq = g.n(.constant(50.0))
+let freq = g.n(.constant(500.0))
 let reset = g.n(.constant(0.0))
 let phase = g.n(.phasor(g.alloc()), freq, reset)
 //let m = g.n(.mul, phase, g.n(.constant(0.5)))
@@ -21,7 +21,10 @@ let gain = g.n(.constant(1.0))
 let mode = g.n(.constant(0.0))
 let filtered = g.n(.mul, g.n(.constant(1.0)), g.biquad(phase, cutoff, resonance, gain, mode))
 
+_ = g.n(.output(0), filtered)
+
 //_ = g.n(.output(0), filtered)
+/*
 let cell = g.alloc()
 let feedback = g.n(.mul, g.n(.constant(0.72)), g.n(.historyRead(cell)))
 let delayed = g.delay(
@@ -29,6 +32,8 @@ let delayed = g.delay(
   g.n(.add, g.n(.constant(200)), g.n(.mul, phase3, g.n(.constant(1200)))))
 let c = g.n(.historyWrite(cell), delayed)
 _ = g.n(.output(0), g.n(.mul, delayed, g.n(.constant(0.5))))
+
+ */
 
 let seconds: Double = 10.0
 let sampleRate: Double = 44100

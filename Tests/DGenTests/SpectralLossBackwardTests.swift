@@ -152,7 +152,7 @@ final class SpectralLossBackwardTests: XCTestCase {
         let g = Graph()
 
         // Learnable frequency parameter (start at 300 Hz, target is 440 Hz)
-        let freqParam = Parameter(graph: g, value: 850.0, name: "frequency")
+        let freqParam = Parameter(graph: g, value: 550.0, name: "frequency")
         let freq = freqParam.node()
 
         // Target frequency (constant 440 Hz)

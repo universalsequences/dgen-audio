@@ -106,6 +106,15 @@ public struct Adam: Optimizer {
     public func zeroGrad() {
         // Momentum is persistent across steps - don't clear
     }
+
+    // GPU support methods
+    public func getTimestep() -> Int {
+        return t
+    }
+
+    public mutating func incrementTimestep() {
+        t += 1
+    }
 }
 
 // MARK: - Training Context
@@ -280,6 +289,12 @@ public class TrainingContext {
 
         runtime.resetGradientBuffers(numFrames: frameCount)
 
+        // Zero grad_memory buffer if it exists (used for certain back propagation)
+        if let gradMemBuffer = runtime.getBuffer(name: "grad_memory") {
+            let memorySize = runtime.getMemorySize()
+            memset(gradMemBuffer.contents(), 0, memorySize * MemoryLayout<Float>.size)
+        }
+
         // Zero parameter gradients
         for param in parameters {
             param.grad = 0.0
@@ -304,7 +319,7 @@ public class TrainingContext {
         }
     }
 
-    /// Update parameters using gradients and optimizer
+    /// Update parameters using gradients and optimizer (CPU version)
     public func step() {
         // Extract gradients from gradient buffer
         let gradients = extractGradients()
@@ -339,6 +354,93 @@ public class TrainingContext {
         }
     }
 
+    /// Update parameters using GPU kernels for gradient reduction and parameter updates
+    public func stepGPU() {
+        guard let runtime = runtime, let context = context, let cellAlloc = cellAllocations else {
+            fatalError("Runtime not initialized")
+        }
+
+        // Step 1: Reduce gradients on GPU
+        let numGradIds = context.maxGradId + 1
+        guard runtime.reduceGradientsGPU(frameCount: frameCount, numGradIds: numGradIds) != nil
+        else {
+            print("⚠️ GPU gradient reduction failed, falling back to CPU")
+            step()
+            return
+        }
+
+        // Step 2: Build parameter mappings
+        var gradIds: [UInt32] = []
+        var physicalCells: [UInt32] = []
+
+        for param in parameters {
+            guard let gradId = param.gradId else {
+                fatalError("Parameter has no gradient ID")
+            }
+            let physicalCell = cellAlloc.cellMappings[param.cellId] ?? param.cellId
+
+            gradIds.append(UInt32(gradId))
+            physicalCells.append(UInt32(physicalCell))
+        }
+
+        // Step 3: Dispatch optimizer-specific GPU kernel
+        if var adamOpt = optimizer as? Adam {
+            // Use Adam GPU kernel
+            runtime.updateParametersAdamGPU(
+                gradIds: gradIds,
+                physicalCells: physicalCells,
+                learningRate: adamOpt.learningRate,
+                beta1: adamOpt.beta1,
+                beta2: adamOpt.beta2,
+                epsilon: adamOpt.epsilon,
+                timestep: adamOpt.getTimestep() + 1
+            )
+
+            // Increment Adam timestep
+            adamOpt.incrementTimestep()
+            optimizer = adamOpt
+        } else if let sgdOpt = optimizer as? SGD {
+            // Use SGD GPU kernel
+            runtime.updateParametersSGDGPU(
+                gradIds: gradIds,
+                physicalCells: physicalCells,
+                learningRate: sgdOpt.learningRate
+            )
+        } else {
+            print("⚠️ GPU optimization not supported for this optimizer, falling back to CPU")
+            step()
+            return
+        }
+
+        // Step 4: Read back parameter values from GPU memory buffer
+        if let memBuffer = runtime.getBuffer(name: "memory") {
+            let gpuMemPtr = memBuffer.contents().assumingMemoryBound(to: Float.self)
+            for param in parameters {
+                let physicalCell = cellAlloc.cellMappings[param.cellId] ?? param.cellId
+                param.value = gpuMemPtr[physicalCell]
+            }
+        }
+
+        // Step 5: Sync to host memory
+        guard let mem = self.memory else {
+            fatalError("Memory not initialized")
+        }
+        let memPtr = mem.assumingMemoryBound(to: Float.self)
+        for param in parameters {
+            let physicalCell = cellAlloc.cellMappings[param.cellId] ?? param.cellId
+            memPtr[physicalCell] = param.value
+        }
+
+        // Step 6: Update param.grad for inspection (read from reducedGrads buffer)
+        if let reducedGradsBuffer = runtime.getBuffer(name: "reducedGrads") {
+            let reducedGradsPtr = reducedGradsBuffer.contents().assumingMemoryBound(to: Float.self)
+            for param in parameters {
+                guard let gradId = param.gradId else { continue }
+                param.grad = reducedGradsPtr[gradId]
+            }
+        }
+    }
+
     /// Get the memory pointer for passing to runWithMemory
     public func getMemory() -> UnsafeMutableRawPointer {
         guard let memory = memory else {
@@ -347,7 +449,7 @@ public class TrainingContext {
         return memory
     }
 
-    /// Run a complete training step: zero gradients, forward+backward pass, optimizer step
+    /// Run a complete training step: zero gradients, forward+backward pass, optimizer step (CPU)
     /// - Returns: The loss value from this step
     public func runStep() -> Float {
         guard let runtime = runtime else {
@@ -362,6 +464,26 @@ public class TrainingContext {
 
         // Update parameters
         step()
+
+        // Return loss value (last frame)
+        return runtime.getLastOutput() ?? 0.0
+    }
+
+    /// Run a complete training step using GPU kernels for optimization
+    /// - Returns: The loss value from this step
+    public func runStepGPU() -> Float {
+        guard let runtime = runtime else {
+            fatalError("Runtime not initialized")
+        }
+
+        // Zero gradients
+        zeroGrad()
+
+        // Forward + backward pass
+        runtime.run(memory: getMemory(), frameCount: frameCount)
+
+        // Update parameters using GPU
+        stepGPU()
 
         // Return loss value (last frame)
         return runtime.getLastOutput() ?? 0.0

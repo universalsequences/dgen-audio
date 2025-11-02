@@ -135,10 +135,24 @@ public struct CompilationPipeline {
         if options.backwards {
             var backwardsBlocks: [Block] = []
             for block in finalBlocks.reversed() {
-                var backwardsBlock = Block(kind: block.kind)
+                var kind: Kind = block.kind
+
+                for nodeId in block.nodes {
+                    if let node = graph.nodes[nodeId] {
+                        if case .historyRead(_) = node.op {
+                            kind = .scalar
+                        } else if case .historyReadWrite(_) = node.op {
+                            kind = .scalar
+                        } else if case .historyWrite(_) = node.op {
+                            kind = .scalar
+                        }
+                    }
+                }
+                var backwardsBlock = Block(kind: kind)
                 backwardsBlock.nodes = block.nodes.reversed()
                 backwardsBlock.direction = .backwards
                 backwardsBlocks.append(backwardsBlock)
+
             }
             finalBlocks += backwardsBlocks
         }
@@ -172,7 +186,8 @@ public struct CompilationPipeline {
         }
 
         // Step 6: Fix memory slot conflicts for vector operations
-        let cellAllocations = remapVectorMemorySlots(&uopBlocks, cellSizes: graph.cellAllocationSizes)
+        let cellAllocations = remapVectorMemorySlots(
+            &uopBlocks, cellSizes: graph.cellAllocationSizes)
 
         let renderer: Renderer = createRenderer(for: backend, options: options)
         if let cr = renderer as? CRenderer {
@@ -254,7 +269,9 @@ extension CompilationResult {
 
 /// Remap memory slots to avoid conflicts between scalar and vector operations
 /// Returns the total number of memory slots needed after remapping
-func remapVectorMemorySlots(_ uopBlocks: inout [BlockUOps], cellSizes: [CellID: Int]) -> CellAllocations {
+func remapVectorMemorySlots(_ uopBlocks: inout [BlockUOps], cellSizes: [CellID: Int])
+    -> CellAllocations
+{
     // Collect all memory operations and their execution modes
     var memoryUsage: [CellID: Kind] = [:]
     var allCellIds: Set<CellID> = []
@@ -309,7 +326,9 @@ func remapVectorMemorySlots(_ uopBlocks: inout [BlockUOps], cellSizes: [CellID: 
 
     // Log cells used in multiple modes
     if !cellUsedInMultipleModes.isEmpty {
-        print("[REMAP DEBUG] Cells used in multiple execution modes (upgraded to SIMD): \(cellUsedInMultipleModes)")
+        print(
+            "[REMAP DEBUG] Cells used in multiple execution modes (upgraded to SIMD): \(cellUsedInMultipleModes)"
+        )
     }
 
     // Second pass: create a remapping for vector cells

@@ -519,11 +519,11 @@ extension CompiledKernelRuntime {
             let n = min(block, totalFrames - rendered)
             pcm.withUnsafeMutableBufferPointer { outPtr in
                 zeroIn.withUnsafeBufferPointer { inPtr in
-                    self.runWithMemory(
+                    self.run(
                         outputs: outPtr.baseAddress!.advanced(by: rendered),
                         inputs: inPtr.baseAddress!,
-                        memory: memory,
-                        frameCount: n
+                        frameCount: n,
+                        volumeScale: 1.0
                     )
                 }
             }
