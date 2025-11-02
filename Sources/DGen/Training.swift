@@ -121,6 +121,9 @@ public struct Adam: Optimizer {
 
 /// Manages learnable parameters, memory, and optimization during training
 public class TrainingContext {
+    // Debug toggle for gradient prints; can be enabled via env DGEN_DEBUG_GRADS=1
+    private let debugGradients: Bool =
+        (ProcessInfo.processInfo.environment["DGEN_DEBUG_GRADS"] == "1")
     public var parameters: [Parameter]
     private var optimizer: Optimizer
     private var memory: UnsafeMutableRawPointer?
@@ -369,7 +372,7 @@ public class TrainingContext {
         }
 
         // Pre-reduction debug: inspect raw per-frame gradients for all gradIds
-        if let gradientsBuffer = runtime.getBuffer(name: "gradients") {
+        if debugGradients, let gradientsBuffer = runtime.getBuffer(name: "gradients") {
             let gptr = gradientsBuffer.contents().assumingMemoryBound(to: Float.self)
             let fc = frameCount
             let numGradIds = context.maxGradId + 1
@@ -389,12 +392,13 @@ public class TrainingContext {
                     if v > maxv { maxv = v }
                     sum += v
                 }
-                // Print the first few samples for context
                 let previewCount = min(8, fc)
                 var preview: [String] = []
                 for i in 0..<previewCount { preview.append(String(format: "%.3e", gptr[base + i])) }
                 let mean = sum / Float(fc)
-                print("   [DEBUG] gid=\(gid) min=\(minv) max=\(maxv) mean=\(mean) NaN=\(anyNaN) Inf=\(anyInf) first=\(preview)")
+                print(
+                    "   [DEBUG] gid=\(gid) min=\(minv) max=\(maxv) mean=\(mean) NaN=\(anyNaN) Inf=\(anyInf) first=\(preview)"
+                )
             }
         }
 
@@ -408,6 +412,7 @@ public class TrainingContext {
         }
 
         // Debug: peek reduced gradient values for our params
+        /*
         if let reducedGradsBuffer = runtime.getBuffer(name: "reducedGrads") {
             let reduced = reducedGradsBuffer.contents().assumingMemoryBound(to: Float.self)
             for (idx, p) in parameters.enumerated() {
@@ -417,6 +422,8 @@ public class TrainingContext {
                 }
             }
         }
+
+         */
 
         // Step 2: Build parameter mappings
         var gradIds: [UInt32] = []
@@ -481,11 +488,12 @@ public class TrainingContext {
         }
 
         // Step 6: Update param.grad for inspection (read from reducedGrads buffer)
-        if let reducedGradsBuffer = runtime.getBuffer(name: "reducedGrads") {
+        if debugGradients, let reducedGradsBuffer = runtime.getBuffer(name: "reducedGrads") {
             let reducedGradsPtr = reducedGradsBuffer.contents().assumingMemoryBound(to: Float.self)
             for param in parameters {
                 guard let gradId = param.gradId else { continue }
                 param.grad = reducedGradsPtr[gradId]
+                print("   [DEBUG] param gradId=\(gradId) reducedGrad=\(param.grad)")
             }
         }
     }

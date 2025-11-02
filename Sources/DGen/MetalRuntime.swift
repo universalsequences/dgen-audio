@@ -14,6 +14,7 @@ public class MetalCompiledKernel: CompiledKernelRuntime {
   private var context: IRContext
   private let maxFrameCount: Int
   private var firstDebug = true
+  private let debugGradients: Bool = (ProcessInfo.processInfo.environment["DGEN_DEBUG_GRADS"] == "1")
 
   // Training kernel functions
   private var reduceGradientsFunction: MTLFunction?
@@ -279,7 +280,7 @@ public class MetalCompiledKernel: CompiledKernelRuntime {
     guard var commandBuffer = commandQueue.makeCommandBuffer() else { return }
 
     func debugPrintGradStats(label: String) {
-      guard firstDebug, let gradientsBuf = bufferPool["gradients"] else { return }
+      guard debugGradients, firstDebug, let gradientsBuf = bufferPool["gradients"] else { return }
       let gptr = gradientsBuf.contents().assumingMemoryBound(to: Float.self)
       let numGradIds = context.maxGradId + 1
       let fc = frameCount
@@ -368,12 +369,14 @@ public class MetalCompiledKernel: CompiledKernelRuntime {
           base += thisLen
         }
         computeEncoder.endEncoding()
-        // Execute this kernel now so shared-memory buffers are visible for debug
-        commandBuffer.commit()
-        commandBuffer.waitUntilCompleted()
-        debugPrintGradStats(label: "kernel \(index)")
-        // Start a new command buffer for next kernel
-        if let cb = commandQueue.makeCommandBuffer() { commandBuffer = cb }
+        if debugGradients {
+          // Execute this kernel now so shared-memory buffers are visible for debug
+          commandBuffer.commit()
+          commandBuffer.waitUntilCompleted()
+          debugPrintGradStats(label: "kernel \(index)")
+          // Start a new command buffer for next kernel
+          if let cb = commandQueue.makeCommandBuffer() { commandBuffer = cb }
+        }
       } else {
         // Non-segmented kernel: single dispatch as before
         for (bufferIndex, bufferName) in kernel.buffers.enumerated() {
@@ -403,11 +406,13 @@ public class MetalCompiledKernel: CompiledKernelRuntime {
           computeEncoder.dispatchThreads(total, threadsPerThreadgroup: tpg)
         }
         computeEncoder.endEncoding()
-        // Execute this kernel now so shared-memory buffers are visible for debug
-        commandBuffer.commit()
-        commandBuffer.waitUntilCompleted()
-        debugPrintGradStats(label: "kernel \(index)")
-        if let cb = commandQueue.makeCommandBuffer() { commandBuffer = cb }
+        if debugGradients {
+          // Execute this kernel now so shared-memory buffers are visible for debug
+          commandBuffer.commit()
+          commandBuffer.waitUntilCompleted()
+          debugPrintGradStats(label: "kernel \(index)")
+          if let cb = commandQueue.makeCommandBuffer() { commandBuffer = cb }
+        }
         /*
         pending += 1
         if pending == 5 {
@@ -420,8 +425,11 @@ public class MetalCompiledKernel: CompiledKernelRuntime {
       }
     }
 
+    if !debugGradients {
+      commandBuffer.commit()
+      commandBuffer.waitUntilCompleted()
+    }
     firstDebug = false
-    // Already committed per-kernel above
 
     // Copy results back to outputs
     copyResultsToOutputs(outputs: outputs, frameCount: frameCount, volumeScale: volumeScale)

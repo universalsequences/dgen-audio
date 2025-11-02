@@ -137,6 +137,7 @@ public struct CompilationPipeline {
             for block in finalBlocks.reversed() {
                 var kind: Kind = block.kind
 
+                /*
                 for nodeId in block.nodes {
                     if let node = graph.nodes[nodeId] {
                         if case .historyRead(_) = node.op {
@@ -148,6 +149,8 @@ public struct CompilationPipeline {
                         }
                     }
                 }
+
+                 */
                 var backwardsBlock = Block(kind: kind)
                 backwardsBlock.nodes = block.nodes.reversed()
                 backwardsBlock.direction = .backwards
