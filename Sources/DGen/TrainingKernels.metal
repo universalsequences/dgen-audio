@@ -19,7 +19,10 @@ kernel void reduceGradients(
     float sum = 0.0;
     int baseIdx = frameCount * gradId;
     for (int i = 0; i < frameCount; i++) {
-        sum += gradients[baseIdx + i];
+        float g = gradients[baseIdx + i];
+        // Be robust to any accidental NaNs/Infs in per-frame grads
+        if (!isfinite(g)) { g = 0.0; }
+        sum += g;
     }
 
     // Store mean gradient

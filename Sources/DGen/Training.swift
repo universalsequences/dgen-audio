@@ -188,7 +188,15 @@ public class TrainingContext {
 
         // Mark loss node as seed gradient if specified
         if let lossNode = lossNode {
-            let _ = context.useGradient(src: lossNode, seed: true)
+            // Ensure the loss node is marked as a seed, even if a gradient ID
+            // was already allocated during codegen.
+            if let existing = context.gradients[lossNode] {
+                if !context.seedGradients.contains(existing) {
+                    context.seedGradients.append(existing)
+                }
+            } else {
+                let _ = context.useGradient(src: lossNode, seed: true)
+            }
         }
 
         // Verify we have seed gradients (loss nodes)
@@ -360,6 +368,36 @@ public class TrainingContext {
             fatalError("Runtime not initialized")
         }
 
+        // Pre-reduction debug: inspect raw per-frame gradients for all gradIds
+        if let gradientsBuffer = runtime.getBuffer(name: "gradients") {
+            let gptr = gradientsBuffer.contents().assumingMemoryBound(to: Float.self)
+            let fc = frameCount
+            let numGradIds = context.maxGradId + 1
+            print("   [DEBUG] Gradients pre-reduce: frameCount=\(fc), gradIds=0..\(numGradIds-1)")
+            for gid in 0..<numGradIds {
+                let base = gid * fc
+                var sum: Float = 0
+                var minv: Float = Float.greatestFiniteMagnitude
+                var maxv: Float = -Float.greatestFiniteMagnitude
+                var anyNaN = false
+                var anyInf = false
+                for i in 0..<fc {
+                    let v = gptr[base + i]
+                    if v.isNaN { anyNaN = true }
+                    if !v.isFinite { anyInf = true }
+                    if v < minv { minv = v }
+                    if v > maxv { maxv = v }
+                    sum += v
+                }
+                // Print the first few samples for context
+                let previewCount = min(8, fc)
+                var preview: [String] = []
+                for i in 0..<previewCount { preview.append(String(format: "%.3e", gptr[base + i])) }
+                let mean = sum / Float(fc)
+                print("   [DEBUG] gid=\(gid) min=\(minv) max=\(maxv) mean=\(mean) NaN=\(anyNaN) Inf=\(anyInf) first=\(preview)")
+            }
+        }
+
         // Step 1: Reduce gradients on GPU
         let numGradIds = context.maxGradId + 1
         guard runtime.reduceGradientsGPU(frameCount: frameCount, numGradIds: numGradIds) != nil
@@ -367,6 +405,17 @@ public class TrainingContext {
             print("⚠️ GPU gradient reduction failed, falling back to CPU")
             step()
             return
+        }
+
+        // Debug: peek reduced gradient values for our params
+        if let reducedGradsBuffer = runtime.getBuffer(name: "reducedGrads") {
+            let reduced = reducedGradsBuffer.contents().assumingMemoryBound(to: Float.self)
+            for (idx, p) in parameters.enumerated() {
+                if let gid = p.gradId {
+                    let val = reduced[gid]
+                    print("   [DEBUG] param[\(idx)] gradId=\(gid) reducedGrad=\(val)")
+                }
+            }
         }
 
         // Step 2: Build parameter mappings

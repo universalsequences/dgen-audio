@@ -672,7 +672,9 @@ public enum LazyOp {
         if let gradCellId = ctx.gradients[nodeId] {
             gradOutput = b.loadGrad(gradCellId).lazy
         } else {
-            let gradCellId = ctx.useGradient(src: nodeId, seed: true)
+            // Allocate a gradient ID for this node (not a seed).
+            // Only explicit loss nodes should be seeds.
+            let gradCellId = ctx.useGradient(src: nodeId, seed: false)
             gradOutput = b.loadGrad(gradCellId).lazy
         }
 
@@ -991,28 +993,29 @@ public enum LazyOp {
             b.grad(node.inputs[2], value: gradT.lazy)
 
         case .historyReadWrite(let cellId):
-            print(
-                "HISTORY WRITE CALEDDEDEDEDEDEDEDEDEDEEEEEEEEEEE\(String(repeating:"*", count:256))"
-            )
-
-            // Combined history read/write (not in feedback loop):
-            // Forward returns prev and persists curr. Backward must:
-            //   1) send gradOutput to previous timestep via storeGrad(cellId, gradOutput)
-            //   2) pass grad to input as gradOutput + gradFromFuture (like historyWrite)
+            // Combined read (returns previous state) and write (stores current input)
+            // Backward:
+            //  - Carry to previous timestep must be the gradient w.r.t. y[i] (the read output),
+            //    not the input gradient. Do not re-add existing carry here; that causes runaway.
+            //  - The input only receives gradient from the future via the carry.
             guard inputs.count == 1 else { fatalError("historyReadWrite requires 1 input") }
-            // Whatever hits y[i-1] becomes part of the carry for the previous timestep.
-            // IMPORTANT: don't add loadGradMemory again here; you'll double-count.
-            let inc = b.value(gradOutput)
-            _ = b.storeGradMemory(cellId, inc)
-            let total = b.value(gradOutput) + b.loadGradMemory(cellId)
-            b.grad(node.inputs[0], value: total.lazy)
+            let carry = b.loadGradMemory(cellId)
+            // Set next carry for i-1 to the upstream grad at this read
+            _ = b.storeGradMemory(cellId, b.value(gradOutput))
+            // Gradient to the written input is only the carry from future
+            b.grad(node.inputs[0], value: carry.lazy)
 
         case .historyWrite(let cellId):
+            // Write stores current input into the cell; its forward output is the previous value.
+            // Backward: input only gets gradient from future reads (the carry). There is no
+            // local gradient path from this op's output to its input.
             guard inputs.count == 1 else { fatalError("history write requires 1 input") }
-            // total grad on y[i] = local seed + future carry (slot already holds i+1 in reverse-time)
-            let total = b.value(gradOutput) + b.loadGradMemory(cellId)
-            b.grad(node.inputs[0], value: total.lazy)
+            let carry = b.loadGradMemory(cellId)
+            b.grad(node.inputs[0], value: carry.lazy)
         case .historyRead(let cellId):
+            // Read exposes previous state; the carry for the previous timestep must equal
+            // the gradient w.r.t. this read's output at the current time.
+            // Do not add the existing carry here — that was already used to form gradOutput.
             _ = b.storeGradMemory(cellId, b.value(gradOutput))
         case .latch(_):
             // Gradient flows through value input only when condition was true

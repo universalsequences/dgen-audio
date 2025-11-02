@@ -66,7 +66,10 @@ public class MetalCompiledKernel: CompiledKernelRuntime {
         float sum = 0.0;
         uint baseIdx = frameCount * gradId;
         for (uint i = 0; i < frameCount; i++) {
-            sum += gradients[baseIdx + i];
+            float g = gradients[baseIdx + i];
+            // Be robust to accidental non-finite per-frame gradients
+            if (!isfinite(g)) { g = 0.0; }
+            sum += g;
         }
         reducedGrads[gradId] = sum / float(frameCount);
     }
@@ -275,13 +278,30 @@ public class MetalCompiledKernel: CompiledKernelRuntime {
 
     guard var commandBuffer = commandQueue.makeCommandBuffer() else { return }
 
-    var pending = 0
-
-    func flush() {
-      commandBuffer.commit()
-      commandBuffer.waitUntilScheduled()
-      commandBuffer = commandQueue.makeCommandBuffer()!
-      pending = 0
+    func debugPrintGradStats(label: String) {
+      guard firstDebug, let gradientsBuf = bufferPool["gradients"] else { return }
+      let gptr = gradientsBuf.contents().assumingMemoryBound(to: Float.self)
+      let numGradIds = context.maxGradId + 1
+      let fc = frameCount
+      print("   [DEBUG] Grad stats after \(label):")
+      for gid in 0..<numGradIds {
+        let base = gid * fc
+        var minv: Float = Float.greatestFiniteMagnitude
+        var maxv: Float = -Float.greatestFiniteMagnitude
+        var anyNaN = false
+        var anyInf = false
+        var sum: Float = 0
+        for i in 0..<fc {
+          let v = gptr[base + i]
+          if v.isNaN { anyNaN = true }
+          if !v.isFinite { anyInf = true }
+          if v < minv { minv = v }
+          if v > maxv { maxv = v }
+          sum += v
+        }
+        let mean = sum / Float(fc)
+        print("      gid=\(gid) min=\(minv) max=\(maxv) mean=\(mean) NaN=\(anyNaN) Inf=\(anyInf)")
+      }
     }
 
     //resetGradientBuffers(numFrames: frameCount)
@@ -348,6 +368,12 @@ public class MetalCompiledKernel: CompiledKernelRuntime {
           base += thisLen
         }
         computeEncoder.endEncoding()
+        // Execute this kernel now so shared-memory buffers are visible for debug
+        commandBuffer.commit()
+        commandBuffer.waitUntilCompleted()
+        debugPrintGradStats(label: "kernel \(index)")
+        // Start a new command buffer for next kernel
+        if let cb = commandQueue.makeCommandBuffer() { commandBuffer = cb }
       } else {
         // Non-segmented kernel: single dispatch as before
         for (bufferIndex, bufferName) in kernel.buffers.enumerated() {
@@ -377,11 +403,16 @@ public class MetalCompiledKernel: CompiledKernelRuntime {
           computeEncoder.dispatchThreads(total, threadsPerThreadgroup: tpg)
         }
         computeEncoder.endEncoding()
+        // Execute this kernel now so shared-memory buffers are visible for debug
+        commandBuffer.commit()
+        commandBuffer.waitUntilCompleted()
+        debugPrintGradStats(label: "kernel \(index)")
+        if let cb = commandQueue.makeCommandBuffer() { commandBuffer = cb }
         /*
         pending += 1
         if pending == 5 {
           print("FLUSHING at kernel=\(index)")
-          flush()
+          // old flush path no longer used
           print("finished flush")
         }  // tune 4 to taste
 
@@ -390,8 +421,7 @@ public class MetalCompiledKernel: CompiledKernelRuntime {
     }
 
     firstDebug = false
-    commandBuffer.commit()
-    commandBuffer.waitUntilCompleted()
+    // Already committed per-kernel above
 
     // Copy results back to outputs
     copyResultsToOutputs(outputs: outputs, frameCount: frameCount, volumeScale: volumeScale)
