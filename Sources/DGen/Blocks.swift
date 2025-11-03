@@ -575,52 +575,107 @@ public func determineBlocksSimple(
 
 /// Fuse adjacent blocks of the same kind to reduce cross-block traffic
 /// and improve loop fusion opportunities in later stages.
+import Foundation
+
 public func fuseBlocks(_ blocks: [Block], _ g: Graph) -> [Block] {
-    // Pre-compute which blocks contain Pass1/Pass2 to avoid O(n²) scanning
+    let debugFuse = (ProcessInfo.processInfo.environment["DGEN_DEBUG_FUSE"] == "1")
+    if debugFuse {
+        print("[FUSE] Input blocks: \(blocks.count)")
+        let signature = blocks.map { $0.kind == .simd ? "S" : "C" }.joined()
+        print("[FUSE] Kinds: \(signature)")
+    }
+    // Pre-compute which blocks contain Pass1/Pass2 and which scratch cells they touch
     var blockHasPass1: [Bool] = []
     var blockHasPass2: [Bool] = []
+    var blockPass1Cells: [Set<CellID>] = []
+    var blockPass2Cells: [Set<CellID>] = []
 
     for b in blocks {
         var hasPass1 = false
         var hasPass2 = false
+        var p1Cells = Set<CellID>()
+        var p2Cells = Set<CellID>()
         for nodeId in b.nodes {
             if let node = g.nodes[nodeId] {
-                if case .spectralLossPass1 = node.op { hasPass1 = true }
-                if case .spectralLossPass2 = node.op { hasPass2 = true }
-                if hasPass1 && hasPass2 { break }  // Early exit
+                switch node.op {
+                case let .spectralLossPass1(_, scratchCell):
+                    hasPass1 = true
+                    p1Cells.insert(scratchCell)
+                case let .spectralLossPass2(_, scratchCell):
+                    hasPass2 = true
+                    p2Cells.insert(scratchCell)
+                default:
+                    break
+                }
             }
         }
         blockHasPass1.append(hasPass1)
         blockHasPass2.append(hasPass2)
+        blockPass1Cells.append(p1Cells)
+        blockPass2Cells.append(p2Cells)
     }
 
     var fused: [Block] = []
     var fusedHasPass1: [Bool] = []
     var fusedHasPass2: [Bool] = []
+    var fusedPass1Cells: [Set<CellID>] = []
+    var fusedPass2Cells: [Set<CellID>] = []
 
     for (idx, b) in blocks.enumerated() {
         if b.nodes.isEmpty { continue }
         if let lastIdx = fused.indices.last, fused[lastIdx].kind == b.kind {
             // Check if we should prevent fusion due to spectral loss two-pass
-            let canFuse =
-                !((fusedHasPass1[lastIdx] && blockHasPass2[idx])
-                || (fusedHasPass2[lastIdx] && blockHasPass1[idx]))
+            // Only prevent fusion if Pass1 and Pass2 touch the SAME scratch cell across the boundary
+            var conflict = false
+            if fusedHasPass1[lastIdx] && blockHasPass2[idx] {
+                conflict = !fusedPass1Cells[lastIdx].intersection(blockPass2Cells[idx]).isEmpty
+            }
+            if !conflict && fusedHasPass2[lastIdx] && blockHasPass1[idx] {
+                conflict = !fusedPass2Cells[lastIdx].intersection(blockPass1Cells[idx]).isEmpty
+            }
+            let canFuse = !conflict
 
             if canFuse {
+                if debugFuse {
+                    print("[FUSE] merge idx=\(idx) into last=\(lastIdx) kind=\(b.kind)")
+                }
                 fused[lastIdx].nodes.append(contentsOf: b.nodes)
                 // Update flags
                 fusedHasPass1[lastIdx] = fusedHasPass1[lastIdx] || blockHasPass1[idx]
                 fusedHasPass2[lastIdx] = fusedHasPass2[lastIdx] || blockHasPass2[idx]
+                fusedPass1Cells[lastIdx].formUnion(blockPass1Cells[idx])
+                fusedPass2Cells[lastIdx].formUnion(blockPass2Cells[idx])
             } else {
+                if debugFuse {
+                    let common12 = fusedPass1Cells[lastIdx].intersection(blockPass2Cells[idx])
+                    let common21 = fusedPass2Cells[lastIdx].intersection(blockPass1Cells[idx])
+                    print("[FUSE] prevent (spectral cell conflict) last=\(lastIdx) P1cells=\(fusedPass1Cells[lastIdx]) P2cells=\(fusedPass2Cells[lastIdx]) | idx=\(idx) P1cells=\(blockPass1Cells[idx]) P2cells=\(blockPass2Cells[idx]) common12=\(common12) common21=\(common21)")
+                }
                 fused.append(b)
                 fusedHasPass1.append(blockHasPass1[idx])
                 fusedHasPass2.append(blockHasPass2[idx])
+                fusedPass1Cells.append(blockPass1Cells[idx])
+                fusedPass2Cells.append(blockPass2Cells[idx])
             }
         } else {
+            if debugFuse {
+                if let last = fused.last {
+                    print("[FUSE] new run at idx=\(idx) prevKind=\(last.kind) newKind=\(b.kind)")
+                } else {
+                    print("[FUSE] start with idx=\(idx) kind=\(b.kind)")
+                }
+            }
             fused.append(b)
             fusedHasPass1.append(blockHasPass1[idx])
             fusedHasPass2.append(blockHasPass2[idx])
+            fusedPass1Cells.append(blockPass1Cells[idx])
+            fusedPass2Cells.append(blockPass2Cells[idx])
         }
+    }
+    if debugFuse {
+        print("[FUSE] Output blocks: \(fused.count)")
+        let signature = fused.map { $0.kind == .simd ? "S" : "C" }.joined()
+        print("[FUSE] Fused kinds: \(signature)")
     }
     return fused
 }

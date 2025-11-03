@@ -11,15 +11,20 @@ public class MetalCompiledKernel: CompiledKernelRuntime {
   private let commandQueue: MTLCommandQueue
   private var bufferPool: [String: MTLBuffer] = [:]  // shared source of buffers used by all kernels
   private var functions: [MTLFunction] = []  // one per kernel
+  private var pipelineStates: [MTLComputePipelineState] = []  // cached PSOs matching `functions`
   private var context: IRContext
   private let maxFrameCount: Int
   private var firstDebug = true
-  private let debugGradients: Bool = (ProcessInfo.processInfo.environment["DGEN_DEBUG_GRADS"] == "1")
+  private let debugGradients: Bool =
+    (ProcessInfo.processInfo.environment["DGEN_DEBUG_GRADS"] == "1")
 
   // Training kernel functions
   private var reduceGradientsFunction: MTLFunction?
   private var updateParametersSGDFunction: MTLFunction?
   private var updateParametersAdamFunction: MTLFunction?
+  private var reduceGradientsPSO: MTLComputePipelineState?
+  private var updateParametersSGDPSO: MTLComputePipelineState?
+  private var updateParametersAdamPSO: MTLComputePipelineState?
 
   public init(
     kernels: [CompiledKernel], cellAllocations: CellAllocations, context: IRContext,
@@ -52,77 +57,77 @@ public class MetalCompiledKernel: CompiledKernelRuntime {
     // Add training kernels
     let trainingKernelSource = """
 
-    // MARK: - Training Kernels
-    using namespace metal;
+      // MARK: - Training Kernels
+      using namespace metal;
 
-    kernel void reduceGradients(
-        device const float* gradients [[buffer(0)]],
-        device float* reducedGrads [[buffer(1)]],
-        constant uint& frameCount [[buffer(2)]],
-        constant uint& numGradIds [[buffer(3)]],
-        uint gradId [[thread_position_in_grid]]
-    ) {
-        if (gradId >= numGradIds) return;
+      kernel void reduceGradients(
+          device const float* gradients [[buffer(0)]],
+          device float* reducedGrads [[buffer(1)]],
+          constant uint& frameCount [[buffer(2)]],
+          constant uint& numGradIds [[buffer(3)]],
+          uint gradId [[thread_position_in_grid]]
+      ) {
+          if (gradId >= numGradIds) return;
 
-        float sum = 0.0;
-        uint baseIdx = frameCount * gradId;
-        for (uint i = 0; i < frameCount; i++) {
-            float g = gradients[baseIdx + i];
-            // Be robust to accidental non-finite per-frame gradients
-            if (!isfinite(g)) { g = 0.0; }
-            sum += g;
-        }
-        reducedGrads[gradId] = sum / float(frameCount);
-    }
+          float sum = 0.0;
+          uint baseIdx = frameCount * gradId;
+          for (uint i = 0; i < frameCount; i++) {
+              float g = gradients[baseIdx + i];
+              // Be robust to accidental non-finite per-frame gradients
+              if (!isfinite(g)) { g = 0.0; }
+              sum += g;
+          }
+          reducedGrads[gradId] = sum / float(frameCount);
+      }
 
-    kernel void updateParametersSGD(
-        device float* memory [[buffer(0)]],
-        device const float* reducedGrads [[buffer(1)]],
-        constant uint* gradIds [[buffer(2)]],
-        constant uint* physicalCells [[buffer(3)]],
-        constant float& learningRate [[buffer(4)]],
-        constant uint& paramCount [[buffer(5)]],
-        uint paramIdx [[thread_position_in_grid]]
-    ) {
-        if (paramIdx >= paramCount) return;
+      kernel void updateParametersSGD(
+          device float* memory [[buffer(0)]],
+          device const float* reducedGrads [[buffer(1)]],
+          constant uint* gradIds [[buffer(2)]],
+          constant uint* physicalCells [[buffer(3)]],
+          constant float& learningRate [[buffer(4)]],
+          constant uint& paramCount [[buffer(5)]],
+          uint paramIdx [[thread_position_in_grid]]
+      ) {
+          if (paramIdx >= paramCount) return;
 
-        uint gradId = gradIds[paramIdx];
-        uint physicalCell = physicalCells[paramIdx];
-        float grad = reducedGrads[gradId];
+          uint gradId = gradIds[paramIdx];
+          uint physicalCell = physicalCells[paramIdx];
+          float grad = reducedGrads[gradId];
 
-        memory[physicalCell] -= learningRate * grad;
-    }
+          memory[physicalCell] -= learningRate * grad;
+      }
 
-    kernel void updateParametersAdam(
-        device float* memory [[buffer(0)]],
-        device const float* reducedGrads [[buffer(1)]],
-        device float* m [[buffer(2)]],
-        device float* v [[buffer(3)]],
-        constant uint* gradIds [[buffer(4)]],
-        constant uint* physicalCells [[buffer(5)]],
-        constant float& learningRate [[buffer(6)]],
-        constant float& beta1 [[buffer(7)]],
-        constant float& beta2 [[buffer(8)]],
-        constant float& epsilon [[buffer(9)]],
-        constant uint& timestep [[buffer(10)]],
-        constant uint& paramCount [[buffer(11)]],
-        uint paramIdx [[thread_position_in_grid]]
-    ) {
-        if (paramIdx >= paramCount) return;
+      kernel void updateParametersAdam(
+          device float* memory [[buffer(0)]],
+          device const float* reducedGrads [[buffer(1)]],
+          device float* m [[buffer(2)]],
+          device float* v [[buffer(3)]],
+          constant uint* gradIds [[buffer(4)]],
+          constant uint* physicalCells [[buffer(5)]],
+          constant float& learningRate [[buffer(6)]],
+          constant float& beta1 [[buffer(7)]],
+          constant float& beta2 [[buffer(8)]],
+          constant float& epsilon [[buffer(9)]],
+          constant uint& timestep [[buffer(10)]],
+          constant uint& paramCount [[buffer(11)]],
+          uint paramIdx [[thread_position_in_grid]]
+      ) {
+          if (paramIdx >= paramCount) return;
 
-        uint gradId = gradIds[paramIdx];
-        uint physicalCell = physicalCells[paramIdx];
-        float grad = reducedGrads[gradId];
+          uint gradId = gradIds[paramIdx];
+          uint physicalCell = physicalCells[paramIdx];
+          float grad = reducedGrads[gradId];
 
-        m[paramIdx] = beta1 * m[paramIdx] + (1.0 - beta1) * grad;
-        v[paramIdx] = beta2 * v[paramIdx] + (1.0 - beta2) * grad * grad;
+          m[paramIdx] = beta1 * m[paramIdx] + (1.0 - beta1) * grad;
+          v[paramIdx] = beta2 * v[paramIdx] + (1.0 - beta2) * grad * grad;
 
-        float m_hat = m[paramIdx] / (1.0 - pow(beta1, float(timestep)));
-        float v_hat = v[paramIdx] / (1.0 - pow(beta2, float(timestep)));
+          float m_hat = m[paramIdx] / (1.0 - pow(beta1, float(timestep)));
+          float v_hat = v[paramIdx] / (1.0 - pow(beta2, float(timestep)));
 
-        memory[physicalCell] -= learningRate * m_hat / (sqrt(v_hat) + epsilon);
-    }
-    """
+          memory[physicalCell] -= learningRate * m_hat / (sqrt(v_hat) + epsilon);
+      }
+      """
 
     combinedSource += trainingKernelSource
 
@@ -154,6 +159,24 @@ public class MetalCompiledKernel: CompiledKernelRuntime {
     reduceGradientsFunction = library.makeFunction(name: "reduceGradients")
     updateParametersSGDFunction = library.makeFunction(name: "updateParametersSGD")
     updateParametersAdamFunction = library.makeFunction(name: "updateParametersAdam")
+
+    // Prebuild pipeline states for graph kernels
+    pipelineStates.reserveCapacity(functions.count)
+    for function in functions {
+      let pso = try device.makeComputePipelineState(function: function)
+      pipelineStates.append(pso)
+    }
+
+    // Prebuild pipeline states for training kernels
+    if let f = reduceGradientsFunction {
+      reduceGradientsPSO = try device.makeComputePipelineState(function: f)
+    }
+    if let f = updateParametersSGDFunction {
+      updateParametersSGDPSO = try device.makeComputePipelineState(function: f)
+    }
+    if let f = updateParametersAdamFunction {
+      updateParametersAdamPSO = try device.makeComputePipelineState(function: f)
+    }
 
     try initializeBuffers()
   }
@@ -308,16 +331,26 @@ public class MetalCompiledKernel: CompiledKernelRuntime {
     //resetGradientBuffers(numFrames: frameCount)
 
     // Execute kernels in sequence
+    // In non-debug mode, reuse a single compute encoder across all kernels to reduce CPU overhead
+    var sharedEncoder: MTLComputeCommandEncoder? = nil
+    if !debugGradients {
+      sharedEncoder = commandBuffer.makeComputeCommandEncoder()
+    }
     for (index, kernel) in kernels.enumerated() {
       if firstDebug {
-        print("   [DEBUG] Executing kernel \(index): \(kernel.name)")
+        print("   [DEBUG] Executing kernel \(index): \(kernel.name)  \(kernel.kind)")
       }
-      guard let computeEncoder = commandBuffer.makeComputeCommandEncoder() else { continue }
+      // Pick encoder: shared if available (non-debug), otherwise one per kernel
+      let computeEncoder: MTLComputeCommandEncoder
+      if let enc = sharedEncoder {
+        computeEncoder = enc
+      } else {
+        guard let enc = commandBuffer.makeComputeCommandEncoder() else { continue }
+        computeEncoder = enc
+      }
 
-      let function = functions[index]
-      guard let pipelineState = try? device.makeComputePipelineState(function: function)
-      else { continue }
-
+      guard index < pipelineStates.count else { continue }
+      let pipelineState = pipelineStates[index]
       computeEncoder.setComputePipelineState(pipelineState)
 
       // Detect segmented kernel by presence of segmentLen buffer
@@ -345,9 +378,9 @@ public class MetalCompiledKernel: CompiledKernelRuntime {
           // Bind buffers with per-segment offsets
           for (bufferIndex, bufferName) in kernel.buffers.enumerated() {
             if firstDebug {
-              print(
-                  "kernel[\(index) setting buffer=\(bufferName) index=\(bufferIndex)]"
-              )
+              //print(
+              //  "kernel[\(index) setting buffer=\(bufferName) index=\(bufferIndex)"
+              // )
             }
 
             guard let buffer = bufferPool[bufferName] else { continue }
@@ -368,7 +401,7 @@ public class MetalCompiledKernel: CompiledKernelRuntime {
             numThreadGroups, threadsPerThreadgroup: threadsPerGroup)
           base += thisLen
         }
-        computeEncoder.endEncoding()
+        if sharedEncoder == nil { computeEncoder.endEncoding() }
         if debugGradients {
           // Execute this kernel now so shared-memory buffers are visible for debug
           commandBuffer.commit()
@@ -405,7 +438,7 @@ public class MetalCompiledKernel: CompiledKernelRuntime {
           let tpg = MTLSize(width: tpgW, height: 1, depth: 1)
           computeEncoder.dispatchThreads(total, threadsPerThreadgroup: tpg)
         }
-        computeEncoder.endEncoding()
+        if sharedEncoder == nil { computeEncoder.endEncoding() }
         if debugGradients {
           // Execute this kernel now so shared-memory buffers are visible for debug
           commandBuffer.commit()
@@ -423,6 +456,11 @@ public class MetalCompiledKernel: CompiledKernelRuntime {
 
          */
       }
+    }
+
+    // Close shared encoder if used
+    if let enc = sharedEncoder {
+      enc.endEncoding()
     }
 
     if !debugGradients {
@@ -444,8 +482,8 @@ public class MetalCompiledKernel: CompiledKernelRuntime {
       let bufferContents = memory.contents().assumingMemoryBound(to: Float.self)
       // Copy all frameCount frames (not limited to MIN_FRAME_COUNT)
       for i in 0..<frameCount {
-        if (bufferContents[i] > 0) {
-        //print("memory[\(i)] = \(bufferContents[i])")
+        if bufferContents[i] > 0 {
+          //print("memory[\(i)] = \(bufferContents[i])")
         }
       }
 
@@ -754,6 +792,34 @@ public class MetalCompiledKernel: CompiledKernelRuntime {
     return output
   }
 
+  /// Simplified run that uses existing device `memory` without copying from host
+  /// - Parameter frameCount: number of frames to process
+  public func runNoCopy(frameCount: Int) {
+    // Allocate or resize internal buffers if needed
+    if internalInputBuffer == nil || currentFrameCount != frameCount {
+      internalInputBuffer = [Float](repeating: 0.0, count: frameCount)
+      internalOutputBuffer = [Float](repeating: 0.0, count: frameCount)
+      currentFrameCount = frameCount
+    }
+
+    guard var inputBuf = internalInputBuffer, var outputBuf = internalOutputBuffer else {
+      fatalError("Failed to allocate internal buffers")
+    }
+
+    inputBuf.withUnsafeBufferPointer { inPtr in
+      outputBuf.withUnsafeMutableBufferPointer { outPtr in
+        run(
+          outputs: outPtr.baseAddress!,
+          inputs: inPtr.baseAddress!,
+          frameCount: frameCount,
+          volumeScale: 1.0
+        )
+      }
+    }
+
+    internalOutputBuffer = outputBuf
+  }
+
   /// Get the last output value (useful for scalar loss values)
   /// - Returns: The last frame's output value, or nil if no output available
   public func getLastOutput() -> Float? {
@@ -804,8 +870,8 @@ public class MetalCompiledKernel: CompiledKernelRuntime {
       return nil
     }
 
-    guard let pipelineState = try? device.makeComputePipelineState(function: function) else {
-      print("⚠️ Failed to create pipeline state")
+    guard let pipelineState = reduceGradientsPSO else {
+      print("⚠️ Failed to create reduceGradients pipeline state")
       return nil
     }
 
@@ -832,6 +898,26 @@ public class MetalCompiledKernel: CompiledKernelRuntime {
     commandBuffer.waitUntilCompleted()
 
     return reducedGradsBuffer
+  }
+
+  // MARK: - Parameter + Memory helpers
+
+  /// Write a small set of parameter values into the device `memory` buffer at the given cells
+  public func writeParameters(physicalCells: [UInt32], values: [Float]) {
+    guard let memoryBuffer = bufferPool["memory"] else { return }
+    let count = min(physicalCells.count, values.count)
+    let memPtr = memoryBuffer.contents().assumingMemoryBound(to: Float.self)
+    for i in 0..<count {
+      memPtr[Int(physicalCells[i])] = values[i]
+    }
+  }
+
+  /// Clear the entire device `memory` buffer and then write back parameter values
+  public func clearMemoryPreservingParameters(physicalCells: [UInt32], values: [Float]) {
+    guard let memoryBuffer = bufferPool["memory"] else { return }
+    let memorySize = getMemorySize()
+    memset(memoryBuffer.contents(), 0, memorySize * MemoryLayout<Float>.size)
+    writeParameters(physicalCells: physicalCells, values: values)
   }
 
   /// Update parameters using SGD on GPU
@@ -910,8 +996,8 @@ public class MetalCompiledKernel: CompiledKernelRuntime {
       return
     }
 
-    guard let pipelineState = try? device.makeComputePipelineState(function: function) else {
-      print("⚠️ Failed to create pipeline state")
+    guard let pipelineState = updateParametersSGDPSO else {
+      print("⚠️ Failed to create updateParametersSGD pipeline state")
       return
     }
 
@@ -1046,8 +1132,8 @@ public class MetalCompiledKernel: CompiledKernelRuntime {
       return
     }
 
-    guard let pipelineState = try? device.makeComputePipelineState(function: function) else {
-      print("⚠️ Failed to create pipeline state")
+    guard let pipelineState = updateParametersAdamPSO else {
+      print("⚠️ Failed to create updateParametersAdam pipeline state")
       return
     }
 

@@ -67,6 +67,17 @@ public class GraphBuilder: Graph {
 
     // MARK: - Memory Operations
 
+    /// History read - reads the previous value from a memory cell
+    public func historyRead(_ cellId: CellID) -> Node {
+        return Node(id: n(.historyRead(cellId)), graph: self)
+    }
+
+    /// History write - writes a value to a memory cell for next frame
+    @discardableResult
+    public func historyWrite(_ cellId: CellID, _ signal: Node) -> Node {
+        return Node(id: n(.historyWrite(cellId), signal.id), graph: self)
+    }
+
     /// Latch - sample and hold
     public func latch(_ signal: Node, trigger: Node) -> Node {
         let cellId = alloc()
@@ -77,6 +88,88 @@ public class GraphBuilder: Graph {
     public func accum(_ signal: Node) -> Node {
         let cellId = alloc()
         return Node(id: n(.accum(cellId), signal.id), graph: self)
+    }
+
+    // MARK: - Filters and Effects
+
+    /// Biquad filter
+    public func biquad(_ input: Node, _ cutoff: Node, _ resonance: Node, _ gain: Node, _ mode: Node) -> Node {
+        return Node(id: biquad(input.id, cutoff.id, resonance.id, gain.id, mode.id), graph: self)
+    }
+
+    /// Compressor
+    public func compressor(
+        _ input: Node, _ ratio: Node, _ threshold: Node, _ knee: Node, _ attack: Node,
+        _ release: Node, _ isSideChain: Node, _ sidechainIn: Node
+    ) -> Node {
+        return Node(
+            id: compressor(input.id, ratio.id, threshold.id, knee.id, attack.id, release.id, isSideChain.id, sidechainIn.id),
+            graph: self
+        )
+    }
+
+    /// Delay with linear interpolation
+    public func delay(_ input: Node, _ delayTimeInSamples: Node) -> Node {
+        return Node(id: delay(input.id, delayTimeInSamples.id), graph: self)
+    }
+
+    // MARK: - Utility Operations
+
+    /// Mix (linear interpolation) - mix(a, b, 0.0) = a, mix(a, b, 1.0) = b
+    public func mix(_ a: Node, _ b: Node, _ amount: Node) -> Node {
+        return Node(id: n(.mix, a.id, b.id, amount.id), graph: self)
+    }
+
+    /// Delta - difference between current and previous value
+    public func delta(_ input: Node) -> Node {
+        return Node(id: delta(input.id), graph: self)
+    }
+
+    /// Change - sign of the difference between current and previous value
+    public func change(_ input: Node) -> Node {
+        return Node(id: change(input.id), graph: self)
+    }
+
+    /// RampToTrig - detects discontinuities in a ramp signal
+    public func rampToTrig(_ ramp: Node) -> Node {
+        return Node(id: rampToTrig(ramp.id), graph: self)
+    }
+
+    /// Scale - maps a value from one range to another with optional exponential curve
+    public func scale(
+        _ value: Node, _ min1: Node, _ max1: Node, _ min2: Node, _ max2: Node,
+        _ exponent: Node? = nil
+    ) -> Node {
+        if let exp = exponent {
+            return Node(id: scale(value.id, min1.id, max1.id, min2.id, max2.id, exp.id), graph: self)
+        } else {
+            return Node(id: scale(value.id, min1.id, max1.id, min2.id, max2.id), graph: self)
+        }
+    }
+
+    /// Triangle - converts a ramp signal to a triangle wave
+    public func triangle(_ ramp: Node, _ duty: Node? = nil) -> Node {
+        if let d = duty {
+            return Node(id: triangle(ramp.id, d.id), graph: self)
+        } else {
+            return Node(id: triangle(ramp.id), graph: self)
+        }
+    }
+
+    /// Wrap - wraps value to range [min, max]
+    public func wrap(_ input: Node, _ min: Node, _ max: Node) -> Node {
+        return Node(id: wrap(input.id, min.id, max.id), graph: self)
+    }
+
+    /// Clip - clamps value to range [min, max]
+    public func clip(_ input: Node, _ min: Node, _ max: Node) -> Node {
+        return Node(id: clip(input.id, min.id, max.id), graph: self)
+    }
+
+    /// Selector - selects from multiple inputs based on condition
+    public func selector(_ cond: Node, _ args: Node...) -> Node {
+        let argIds = args.map { $0.id }
+        return Node(id: n(.selector, [cond.id] + argIds), graph: self)
     }
 
     // MARK: - Compilation

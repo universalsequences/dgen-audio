@@ -129,8 +129,12 @@ public struct CompilationPipeline {
         // Isolate spectralLossPass1 and Pass2 into their own kernels to avoid dependency issues
         let isolatedBlocks = isolateSpectralPasses(fusedBlocks, graph)
 
+        // Re-run fusion after isolation, to merge any adjacent same-kind blocks that were split
+        // by isolation but do not straddle Pass1/Pass2 boundaries.
+        let reFusedBlocks = fuseBlocks(isolatedBlocks, graph)
+
         //let splitBlocks = splitBlocksIfNeeded(blocks, backend)
-        var finalBlocks = isolatedBlocks.compactMap { $0 }
+        var finalBlocks = reFusedBlocks.compactMap { $0 }
 
         if options.backwards {
             var backwardsBlocks: [Block] = []
@@ -157,10 +161,16 @@ public struct CompilationPipeline {
                 backwardsBlocks.append(backwardsBlock)
 
             }
-            finalBlocks += backwardsBlocks
+            finalBlocks += fuseBlocks(backwardsBlocks, graph)
         }
 
         let finalBlockIndices = Array(0..<finalBlocks.count)
+
+        var blockId: Int = 0
+        for block in finalBlocks {
+            print("block \(blockId) kind=\(block.kind)")
+            blockId += 1
+        }
 
         // Step 5: Convert blocks to UOp blocks
         let context = IRContext()

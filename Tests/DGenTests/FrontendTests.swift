@@ -14,9 +14,9 @@ final class FrontendTests: XCTestCase {
                         -> DGenFrontend.Node
                 {
                         let cellId = g.alloc()
-                        let history = g.n(.historyRead(cellId))
-                        let mix = Node(id: g.n(.mix, x.id, history, cutoff.id), graph: g)
-                        _ = g.n(.historyWrite(cellId), mix.id)
+                        let history = g.historyRead(cellId)
+                        let mix = g.mix(x, history, cutoff)
+                        g.historyWrite(cellId, mix)
                         return mix
                 }
                 let phase1 = g.phasor(freq)
@@ -39,7 +39,7 @@ final class FrontendTests: XCTestCase {
                         frameCount: frameCount
                 )
 
-                for i in 0..<400 {
+                for i in 0..<40 {
                         let currentLoss = ctx.runStepGPU()
                         if i % 1 == 0 {
                                 print(
@@ -53,46 +53,45 @@ final class FrontendTests: XCTestCase {
         func testBiquadBackward() throws {
                 let g = GraphBuilder()
 
-                let freq = g.constant(440.0)
-                let (cutoffParam, cutoff) = g.learnableParam(value: 1188.0, name: "Cutoff")
+                let targetFreq = g.constant(442.0)
+                let targetCutoff = g.constant(1200.0)
+                let (cutoffParam, cutoff) = g.learnableParam(value: 998.0, name: "Cutoff")
+                let (freqParam, freq) = g.learnableParam(value: 445.0, name: "Cutoff")
                 let phase1 = g.phasor(freq)
-                //``let phase2 = g.phasor(freq)
-                //
+                let phase2 = g.phasor(targetFreq)
                 let resonance = g.constant(4)
                 let gain = g.constant(1)
                 let mode = g.constant(0)
-                let sig1 = Node(
-                        id: g.biquad(
-                                phase1.id, cutoff.id, resonance.id, gain.id, mode.id), graph: g)
-                let frameCount = 256 * 8
-                let sig2 = Node(
-                        id: g.biquad(
-                                phase1.id, g.constant(1000.0).id, resonance.id, gain.id, mode.id
-                        ), graph: g)
+                let sig1 = g.biquad(phase1, cutoff, resonance, gain, mode)
+                let frameCount = 512 * 4
+                let sig2 = g.biquad(phase2, targetCutoff, resonance, gain, mode)
 
                 let loss =
-                        0.5 * g.spectralLoss(sig1, sig2, windowSize: 128) + 0.5 * g.mse(sig1, sig2)
+                        (g.spectralLoss(sig1, sig2, windowSize: 32)
+                                + g.spectralLoss(sig1, sig2, windowSize: 64)
+                                + g.spectralLoss(sig1, sig2, windowSize: 128)) * 1 + 0.1
+                        * g.mse(sig1, sig2)
                 let result = try g.compile(
-                        loss, backend: .metal, frameCount: frameCount, debug: true)
+                        loss, backend: .metal, frameCount: frameCount, debug: false)
 
                 for kernel in result.kernels {
-                        print(kernel.source)
+                        //print(kernel.source)
 
                 }
                 // Streamlined training context - handles everything!
                 let ctx = try TrainingContext(
-                        parameters: [cutoffParam],
-                        optimizer: Adam(lr: 1.5),
+                        parameters: [cutoffParam, freqParam],
+                        optimizer: Adam(lr: 0.1),
                         lossNode: loss.id,
                         compilationResult: result,
                         frameCount: frameCount
                 )
 
-                for i in 0..<300 {
+                for i in 0..<5000 {
                         let currentLoss = ctx.runStepGPU()
                         if i % 10 == 0 {
                                 print(
-                                        "i=\(i) loss=\(currentLoss) cutoff=\(cutoffParam.value) grad=\(cutoffParam.grad)"
+                                        "i=\(i) loss=\(currentLoss) freq=\(freqParam.value) cutoff=\(cutoffParam.value) cutoff.grad=\(cutoffParam.grad) freq.grad=\(freqParam.grad)"
                                 )
                         }
 

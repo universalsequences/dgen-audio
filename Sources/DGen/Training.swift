@@ -132,6 +132,14 @@ public class TrainingContext {
     private var frameCount: Int = 0
     private var context: IRContext?
     private let lossNode: NodeID?
+    // Cache physical cell indices for parameters to avoid recomputing
+    private var paramPhysicalCells: [UInt32] = []
+    // Profiling
+    private let profile: Bool = (ProcessInfo.processInfo.environment["DGEN_PROFILE"] == "1")
+    private let profileEvery: Int = Int(ProcessInfo.processInfo.environment["DGEN_PROFILE_EVERY"] ?? "1") ?? 1
+    private var stepCounter: Int = 0
+    private struct StepProfile { var zero: Double; var fwdBwd: Double; var reduce: Double; var update: Double; var readback: Double; var syncHost: Double; var total: Double }
+    private var lastProfile: StepProfile?
 
     /// Initialize training context (simple version - requires manual initializeMemory() call)
     /// - Parameters:
@@ -227,10 +235,12 @@ public class TrainingContext {
 
         let memPtr = memory.assumingMemoryBound(to: Float.self)
 
-        // Initialize parameter values in memory
+        // Initialize parameter values in host memory and cache physical cells
+        paramPhysicalCells.removeAll(keepingCapacity: true)
         for param in parameters {
             let physicalCell = cellAllocations.cellMappings[param.cellId] ?? param.cellId
             memPtr[physicalCell] = param.value
+            paramPhysicalCells.append(UInt32(physicalCell))
 
             // Look up and store the GradID for this parameter
             param.gradId = context.gradients[param.nodeId]
@@ -244,6 +254,13 @@ public class TrainingContext {
                     "Parameter '\(name)' (node \(param.nodeId)) has no gradient. Did you set backwards: true?"
                 )
             }
+        }
+
+        // Also write the initial parameter values directly into the device memory buffer
+        // so that GPU runs don't need to copy the entire host memory every step.
+        if let rt = self.runtime {
+            let values: [Float] = parameters.map { $0.value }
+            rt.writeParameters(physicalCells: paramPhysicalCells, values: values)
         }
     }
 
@@ -291,9 +308,10 @@ public class TrainingContext {
         }
     }
 
-    /// Zero out all gradients in the gradient buffer
-    /// Must be called before each backward pass
-    public func zeroGrad() {
+    /// Zero out all gradients and reset memory before a backward pass
+    /// - Parameter deviceMemory: when true, clears the device `memory` buffer and restores
+    ///   parameter values without touching host-side memory. Defaults to false for CPU paths.
+    public func zeroGrad(deviceMemory: Bool = false) {
         guard let runtime = runtime else {
             fatalError("Runtime not initialized")
         }
@@ -313,11 +331,17 @@ public class TrainingContext {
 
         optimizer.zeroGrad()
 
-        // Reset runtime memory for the next forward pass, but preserve parameter values.
-        // We operate on the host-side memory pointer that will be copied into the Metal
-        // memory buffer inside runWithMemory().
-        if let mem = self.memory, let runtime = self.runtime, let cellAlloc = self.cellAllocations {
-            // Zero all memory
+        // Reset compute memory for the next forward pass, but preserve parameter values.
+        if deviceMemory {
+            // Operate directly on the device `memory` buffer to avoid host copies.
+            let values: [Float] = parameters.map { $0.value }
+            runtime.clearMemoryPreservingParameters(
+                physicalCells: paramPhysicalCells,
+                values: values
+            )
+        } else if let mem = self.memory, let runtime = self.runtime, let cellAlloc = self.cellAllocations {
+            // CPU path: zero host-side memory and restore parameter values; runWithMemory
+            // will copy this into the device buffer on the next forward pass.
             let memorySize = runtime.getMemorySize()
             memset(mem, 0, memorySize * MemoryLayout<Float>.size)
 
@@ -370,6 +394,12 @@ public class TrainingContext {
         guard let runtime = runtime, let context = context, let cellAlloc = cellAllocations else {
             fatalError("Runtime not initialized")
         }
+        let profEnabled = profile
+        var tStart = CFAbsoluteTimeGetCurrent()
+        var tReduce: Double = 0
+        var tUpdate: Double = 0
+        var tReadback: Double = 0
+        var tSyncHost: Double = 0
 
         // Pre-reduction debug: inspect raw per-frame gradients for all gradIds
         if debugGradients, let gradientsBuffer = runtime.getBuffer(name: "gradients") {
@@ -410,6 +440,7 @@ public class TrainingContext {
             step()
             return
         }
+        if profEnabled { tReduce = CFAbsoluteTimeGetCurrent() - tStart; tStart = CFAbsoluteTimeGetCurrent() }
 
         // Debug: peek reduced gradient values for our params
         /*
@@ -467,6 +498,7 @@ public class TrainingContext {
             step()
             return
         }
+        if profEnabled { tUpdate = CFAbsoluteTimeGetCurrent() - tStart; tStart = CFAbsoluteTimeGetCurrent() }
 
         // Step 4: Read back parameter values from GPU memory buffer
         if let memBuffer = runtime.getBuffer(name: "memory") {
@@ -476,6 +508,7 @@ public class TrainingContext {
                 param.value = gpuMemPtr[physicalCell]
             }
         }
+        if profEnabled { tReadback = CFAbsoluteTimeGetCurrent() - tStart; tStart = CFAbsoluteTimeGetCurrent() }
 
         // Step 5: Sync to host memory
         guard let mem = self.memory else {
@@ -485,6 +518,21 @@ public class TrainingContext {
         for param in parameters {
             let physicalCell = cellAlloc.cellMappings[param.cellId] ?? param.cellId
             memPtr[physicalCell] = param.value
+        }
+        if profEnabled { tSyncHost = CFAbsoluteTimeGetCurrent() - tStart }
+
+        if profEnabled {
+            // Store last profile; zero and fwdBwd are captured in runStepGPU()
+            let prev = lastProfile ?? StepProfile(zero: 0, fwdBwd: 0, reduce: 0, update: 0, readback: 0, syncHost: 0, total: 0)
+            lastProfile = StepProfile(
+                zero: prev.zero,
+                fwdBwd: prev.fwdBwd,
+                reduce: tReduce,
+                update: tUpdate,
+                readback: tReadback,
+                syncHost: tSyncHost,
+                total: 0
+            )
         }
 
         // Step 6: Update param.grad for inspection (read from reducedGrads buffer)
@@ -533,14 +581,35 @@ public class TrainingContext {
             fatalError("Runtime not initialized")
         }
 
-        // Zero gradients
-        zeroGrad()
+        // Zero gradients and reset device memory
+        let profEnabled = profile
+        var t0 = CFAbsoluteTimeGetCurrent()
+        zeroGrad(deviceMemory: true)
+        var zeroTime: Double = 0
+        var fwdTime: Double = 0
+        if profEnabled { zeroTime = CFAbsoluteTimeGetCurrent() - t0; t0 = CFAbsoluteTimeGetCurrent() }
 
         // Forward + backward pass
-        runtime.run(memory: getMemory(), frameCount: frameCount)
+        runtime.runNoCopy(frameCount: frameCount)
+        if profEnabled { fwdTime = CFAbsoluteTimeGetCurrent() - t0 }
 
         // Update parameters using GPU
         stepGPU()
+
+        if profEnabled {
+            // Merge timings from stepGPU
+            if var prof = lastProfile {
+                prof.zero = zeroTime
+                prof.fwdBwd = fwdTime
+                prof.total = zeroTime + fwdTime + prof.reduce + prof.update + prof.readback + prof.syncHost
+                lastProfile = prof
+                stepCounter += 1
+                if stepCounter % max(profileEvery, 1) == 0 {
+                    let ms = { (s: Double) -> String in String(format: "%.2f", s * 1000.0) }
+                    print("[PROFILE] step=\(stepCounter) total=\(ms(prof.total)) ms | zero=\(ms(prof.zero)) fwd+bwd=\(ms(prof.fwdBwd)) reduce=\(ms(prof.reduce)) update=\(ms(prof.update)) readback=\(ms(prof.readback)) syncHost=\(ms(prof.syncHost))")
+                }
+            }
+        }
 
         // Return loss value (last frame)
         return runtime.getLastOutput() ?? 0.0

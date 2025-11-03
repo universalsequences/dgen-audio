@@ -741,8 +741,6 @@ public enum LazyOp {
             let lhs = b.tapeValue(node.inputs[0])
             let gradX = b.value(gradOutput) * rhs
             let gradY = b.value(gradOutput) * lhs
-            print(
-                "GRAD CALLED FOR MUL with inputs[0]=\(node.inputs[0]) inputs[1]=\(node.inputs[1])")
             b.grad(node.inputs[0], value: gradX.lazy)
             b.grad(node.inputs[1], value: gradY.lazy)
         case .div:
