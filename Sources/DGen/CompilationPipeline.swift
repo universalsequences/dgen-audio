@@ -205,7 +205,9 @@ public struct CompilationPipeline {
         let renderer: Renderer = createRenderer(for: backend, options: options)
         if let cr = renderer as? CRenderer {
             cr.voiceCount = options.voiceCount
-            cr.voiceCellIdOpt = voiceCellIdFinal
+            if let voiceCellId = voiceCellIdFinal {
+                cr.voiceCellIdOpt = cellAllocations.cellMappings[voiceCellId]
+            }
         }
         let kernels = try lowerUOpBlocks(
             &uopBlocks,
@@ -291,14 +293,8 @@ func remapVectorMemorySlots(_ uopBlocks: inout [BlockUOps], cellSizes: [CellID: 
     var cellUsedInMultipleModes: Set<CellID> = []
 
     // Helper to register a cell's usage and detect multi-mode access
-    func registerCell(_ cellId: CellID, kind: Kind, forceScalar: Bool = false) {
+    func registerCell(_ cellId: CellID, kind: Kind) {
         allCellIds.insert(cellId)
-
-        if forceScalar {
-            // scalarMemoryWrite forces scalar mode
-            memoryUsage[cellId] = .scalar
-            return
-        }
 
         if let existingKind = memoryUsage[cellId] {
             if existingKind != kind {
@@ -329,8 +325,6 @@ func remapVectorMemorySlots(_ uopBlocks: inout [BlockUOps], cellSizes: [CellID: 
                 registerCell(cellId, kind: block.kind)
             case let .memoryWrite(cellId, _, _):
                 registerCell(cellId, kind: block.kind)
-            case let .scalarMemoryWrite(cellId, _, _):
-                registerCell(cellId, kind: block.kind, forceScalar: true)
             default:
                 break
             }
@@ -414,14 +408,6 @@ func remapVectorMemorySlots(_ uopBlocks: inout [BlockUOps], cellSizes: [CellID: 
                 if let newCellId = cellRemapping[cellId] {
                     uopBlocks[blockIndex].ops[uopIndex] = UOp(
                         op: .memoryWrite(newCellId, offset, value),
-                        value: uop.value,
-                        kind: uop.kind
-                    )
-                }
-            case let .scalarMemoryWrite(cellId, offset, value):
-                if let newCellId = cellRemapping[cellId] {
-                    uopBlocks[blockIndex].ops[uopIndex] = UOp(
-                        op: .scalarMemoryWrite(newCellId, offset, value),
                         value: uop.value,
                         kind: uop.kind
                     )

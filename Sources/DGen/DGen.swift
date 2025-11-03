@@ -189,12 +189,6 @@ open class Graph {
         return n(.seq, a, b)
     }
 
-    // Higher-level compound operations
-    public func spectralLoss2(_ sig1: NodeID, _ sig2: NodeID, windowSize: Int) -> NodeID {
-        return n(.spectralLossTape(windowSize), sig1, sig2)
-
-    }
-
     /// Spectral loss: compute DFT-based magnitude MSE between two signals over a window
     /// Uses tape-based compute; no ring buffers are required.
     public func spectralLoss(_ sig1: NodeID, _ sig2: NodeID, windowSize: Int) -> NodeID {

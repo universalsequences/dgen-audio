@@ -271,14 +271,8 @@ public class MetalRenderer: Renderer, UOpEmitter {
         outputs.insert(varId)
       case let .loadGlobal(varId):
         inputs.insert(varId)
-      case .load, .store, .delay1, .memoryRead, .memoryWrite, .scalarMemoryWrite:
+      case .load, .store, .delay1, .memoryRead, .memoryWrite:
         needsMemory = true
-      case let .spectralLossTape(sig1, sig2, _):
-        inputs.insert(extractVarId(sig1))
-        inputs.insert(extractVarId(sig2))
-      case let .spectralLossTapeBackward(_, sig1, sig2, _, _, _, _, _):
-        inputs.insert(extractVarId(sig1))
-        inputs.insert(extractVarId(sig2))
       case .defineMemory:
         needsMemory = true
       default:
@@ -356,139 +350,6 @@ public class MetalRenderer: Renderer, UOpEmitter {
       return emitAssign(uop, "memory[\(base) + (int)\(g(offset))]", ctx)
     case let .memoryWrite(base, offset, value):
       return "memory[\(base) + (int)\(g(offset))] = \(g(value));"
-    case let .scalarMemoryWrite(base, offset, value):
-      return "memory[\(base) + (int)\(g(offset))] = \(g(value));"
-
-    // Removed ring-only spectral helpers
-
-    // Removed ring-only DFT compute
-
-    // Removed ring-only spectral DFT compute branches
-
-    // Removed ring-only spectralLoss
-
-    case let .spectralLossTape(sig1, sig2, windowSize):
-      // Deprecated in favor of IR abstractions (see .spectralLoss)
-      // Forward pass: compute spectral loss using tape windows ending at current frame
-      let numBins = windowSize / 2 + 1
-      let slot1 = ctx.getGlobalId(extractVarId(sig1))
-      let slot2 = ctx.getGlobalId(extractVarId(sig2))
-      let idx = (uop.kind == .simd) ? "id" : "i"
-
-      let code = """
-        ({
-            const int WIN_SIZE = \(windowSize);
-            const int BASE1 = \(slot1) * frameCount;
-            const int BASE2 = \(slot2) * frameCount;
-
-            float totalError = 0.0;
-            const int NUM_BINS = \(numBins);
-
-            for (int binIndex = 0; binIndex < NUM_BINS; binIndex++) {
-                float real1 = 0.0, imag1 = 0.0;
-                float real2 = 0.0, imag2 = 0.0;
-
-                for (int n = 0; n < WIN_SIZE; n++) {
-                    int j = (int)\(idx) - (WIN_SIZE - 1) + n;
-                    float s1 = (j < 0 || j >= frameCount) ? 0.0 : t[BASE1 + j];
-                    float s2 = (j < 0 || j >= frameCount) ? 0.0 : t[BASE2 + j];
-                    float angle = -2.0 * M_PI_F * (float)binIndex * (float)n / (float)WIN_SIZE;
-                    float c = metal::cos(angle);
-                    float s = metal::sin(angle);
-                    real1 += s1 * c; imag1 += s1 * s;
-                    real2 += s2 * c; imag2 += s2 * s;
-                }
-                float mag1 = metal::sqrt(real1 * real1 + imag1 * imag1);
-                float mag2 = metal::sqrt(real2 * real2 + imag2 * imag2);
-                float diff = mag1 - mag2;
-                totalError += diff * diff;
-            }
-
-            totalError;
-        })
-        """
-      return emitAssign(uop, code, ctx)
-
-    // Removed ring-only spectralLossBackward
-
-    case let .spectralLossTapeBackward(
-      windowSize, sig1, sig2, upstreamGrad, grad1Dest, grad2Dest, _, _):
-      // DEPRECATED: This direct Metal emission is no longer used.
-      // The abstraction-based implementation in u_spectralLossTapeBackward
-      // (Operators.swift) now compiles via normal UOp emission instead.
-      // Kept here for reference and potential rollback.
-      //
-      // Original approach: compute gradients using all samples in the window.
-      // To avoid cross-thread races, we average per-window per-bin
-      // sample contributions and emit a single gradient for the current
-      // sample id (instead of scattering to all j). This reduces the
-      // late-frame bias of using only the last sample.
-      //
-      // IMPORTANT: A true "distributed across j" implementation that
-      // scatters into gradients[... + j] for every j in the window would
-      // require atomic adds or a multipass reduction (e.g., per-bin
-      // accumulation into a scratch buffer, then a second pass to sum
-      // into gradients). Without atomics/multipass, concurrent writes
-      // from many threads are unsafe and can corrupt the gradients.
-      // If you want that behavior, we need to add an atomic or
-      // two-pass variant explicitly.
-      let grad1Var = "t\(grad1Dest)"
-      let grad2Var = "t\(grad2Dest)"
-      let numBins = windowSize / 2 + 1
-      let slot1 = ctx.getGlobalId(extractVarId(sig1))
-      let slot2 = ctx.getGlobalId(extractVarId(sig2))
-      let idx2 = (uop.kind == .simd) ? "id" : "i"
-
-      let code = """
-            const int WIN_SIZE = \(windowSize);
-            const int BASE1 = \(slot1) * frameCount;
-            const int BASE2 = \(slot2) * frameCount;
-
-            float \(grad1Var) = 0.0;
-            float \(grad2Var) = 0.0;
-            const int NUM_BINS = \(numBins);
-
-            for (int binIndex = 0; binIndex < NUM_BINS; binIndex++) {
-                float real1 = 0.0, imag1 = 0.0;
-                float real2 = 0.0, imag2 = 0.0;
-                for (int n = 0; n < WIN_SIZE; n++) {
-                    int j = (int)\(idx2) - (WIN_SIZE - 1) + n;
-                    float s1 = (j < 0 || j >= frameCount) ? 0.0 : t[BASE1 + j];
-                    float s2 = (j < 0 || j >= frameCount) ? 0.0 : t[BASE2 + j];
-                    float angle = -2.0 * M_PI_F * (float)binIndex * (float)n / (float)WIN_SIZE;
-                    float c = metal::cos(angle);
-                    float s = metal::sin(angle);
-                    real1 += s1 * c; imag1 += s1 * s;
-                    real2 += s2 * c; imag2 += s2 * s;
-                }
-                float mag1 = metal::sqrt(real1 * real1 + imag1 * imag1);
-                float mag2 = metal::sqrt(real2 * real2 + imag2 * imag2);
-
-                float magDiff = mag1 - mag2;
-                float lossGrad = 2.0 * magDiff;
-
-                // Average contributions across the full window instead of last sample only
-                float accum1 = 0.0;
-                float accum2 = 0.0;
-                for (int n = 0; n < WIN_SIZE; n++) {
-                    float angle_n = -2.0 * M_PI_F * (float)binIndex * (float)n / (float)WIN_SIZE;
-                    float c_n = metal::cos(angle_n);
-                    float s_n = metal::sin(angle_n);
-                    float sampleGrad1 = (real1 * c_n + imag1 * s_n) / (mag1 + 1e-8);
-                    float sampleGrad2 = (real2 * c_n + imag2 * s_n) / (mag2 + 1e-8);
-                    accum1 += (lossGrad * sampleGrad1);
-                    accum2 += ((-lossGrad) * sampleGrad2);
-                }
-                // Normalize by window size to keep scale consistent
-                \(grad1Var) += accum1 / (float)WIN_SIZE;
-                \(grad2Var) += accum2 / (float)WIN_SIZE;
-            }
-
-            \(grad1Var) *= \(g(upstreamGrad));
-            \(grad2Var) *= \(g(upstreamGrad));
-        """
-      return code
-
     case let .sin(a): return emitAssign(uop, "metal::sin(\(g(a)))", ctx)
     case let .cos(a): return emitAssign(uop, "metal::cos(\(g(a)))", ctx)
     case let .tan(a): return emitAssign(uop, "metal::tan(\(g(a)))", ctx)
@@ -698,9 +559,6 @@ func analyzeRequiredBuffers(scheduleItem: ScheduleItem) -> RequiredBuffers {
     if case .loadGrad = uop.op {
       return true
     } else if case .accumulateGrad = uop.op {
-      return true
-    } else if case .spectralLossTapeBackward = uop.op {
-      // The spectral backward op writes directly to gradients[] now
       return true
     }
     return false

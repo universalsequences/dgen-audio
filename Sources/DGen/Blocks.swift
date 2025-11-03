@@ -1,3 +1,7 @@
+/// Fuse adjacent blocks of the same kind to reduce cross-block traffic
+/// and improve loop fusion opportunities in later stages.
+import Foundation
+
 public enum Kind { case simd, scalar }
 public enum Direction { case forward, backwards }
 
@@ -250,8 +254,6 @@ public func scalarNodes(_ g: Graph, feedbackClusters: [[NodeID]]) -> Set<NodeID>
             scalar.insert($0.id)  // Latch operations need to be scalar (stateful)
         case .phasor(_):
             scalar.insert($0.id)  // Phasor operations need to be scalar (stateful)
-        case .scalarMemoryWrite(_):
-            scalar.insert($0.id)  // Force scalar writes for ring-buffer semantics
         //case .seq:
         //    scalar.insert($0.id)  // Seq operations need to be scalar (ordering dependent)
         default: break
@@ -573,10 +575,6 @@ public func determineBlocksSimple(
     return blocks
 }
 
-/// Fuse adjacent blocks of the same kind to reduce cross-block traffic
-/// and improve loop fusion opportunities in later stages.
-import Foundation
-
 public func fuseBlocks(_ blocks: [Block], _ g: Graph) -> [Block] {
     let debugFuse = (ProcessInfo.processInfo.environment["DGEN_DEBUG_FUSE"] == "1")
     if debugFuse {
@@ -649,7 +647,9 @@ public func fuseBlocks(_ blocks: [Block], _ g: Graph) -> [Block] {
                 if debugFuse {
                     let common12 = fusedPass1Cells[lastIdx].intersection(blockPass2Cells[idx])
                     let common21 = fusedPass2Cells[lastIdx].intersection(blockPass1Cells[idx])
-                    print("[FUSE] prevent (spectral cell conflict) last=\(lastIdx) P1cells=\(fusedPass1Cells[lastIdx]) P2cells=\(fusedPass2Cells[lastIdx]) | idx=\(idx) P1cells=\(blockPass1Cells[idx]) P2cells=\(blockPass2Cells[idx]) common12=\(common12) common21=\(common21)")
+                    print(
+                        "[FUSE] prevent (spectral cell conflict) last=\(lastIdx) P1cells=\(fusedPass1Cells[lastIdx]) P2cells=\(fusedPass2Cells[lastIdx]) | idx=\(idx) P1cells=\(blockPass1Cells[idx]) P2cells=\(blockPass2Cells[idx]) common12=\(common12) common21=\(common21)"
+                    )
                 }
                 fused.append(b)
                 fusedHasPass1.append(blockHasPass1[idx])

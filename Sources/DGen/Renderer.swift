@@ -542,10 +542,6 @@ public class CRenderer: Renderer {
             } else {
                 return "memory[\(base) + (int)\(g(offset))] = \(g(value));"
             }
-        case let .scalarMemoryWrite(base, offset, value):
-            // Always emitted as scalar write
-            return "memory[\(base) + (int)\(g(offset))] = \(g(value));"
-
         case let .sin(a):
             let expr = uop.kind == .simd ? "vsinf(\(g(a)))" : "sinf(\(g(a)))"
             return emitAssign(uop, expr, ctx)

@@ -53,8 +53,8 @@ final class FrontendTests: XCTestCase {
         func testBiquadBackward() throws {
                 let g = GraphBuilder()
 
-                let targetFreq = g.constant(442.0)
-                let targetCutoff = g.constant(1200.0)
+                let targetFreq = g.constant(452.0)
+                let targetCutoff = g.constant(1900.0)
                 let (cutoffParam, cutoff) = g.learnableParam(value: 998.0, name: "Cutoff")
                 let (freqParam, freq) = g.learnableParam(value: 445.0, name: "Cutoff")
                 let phase1 = g.phasor(freq)
@@ -81,7 +81,7 @@ final class FrontendTests: XCTestCase {
                 // Streamlined training context - handles everything!
                 let ctx = try TrainingContext(
                         parameters: [cutoffParam, freqParam],
-                        optimizer: Adam(lr: 0.1),
+                        optimizer: Adam(lr: 0.4),
                         lossNode: loss.id,
                         compilationResult: result,
                         frameCount: frameCount

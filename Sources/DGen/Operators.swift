@@ -130,42 +130,6 @@ func u_mse(_ a: Expr, _ b: Expr) -> (IRBuilder) -> Expr {
     }
 }
 
-/// Compute gradient of DFT magnitude with respect to a sample at given position
-/// Formula: ∂mag/∂sample[n] = (real * cos(angle) + imag * sin(angle)) / mag
-/// where angle = 2π * binIndex * samplePos / windowSize
-func u_dftMagnitudeGradient(
-    _ real: Expr, _ imag: Expr, _ mag: Expr,
-    _ windowSize: Int, _ binIndex: Int, _ samplePos: Int
-) -> (IRBuilder) -> Expr {
-    return { b in
-        // Compute angle = 2π * binIndex * samplePos / windowSize
-        let pi = b.constant(Float.pi)
-        let two = b.constant(2.0)
-        let k = b.constant(Float(binIndex))
-        let n = b.constant(Float(samplePos))
-        let N = b.constant(Float(windowSize))
-
-        let angle = (two * pi * k * n) / N
-
-        // cos and sin of angle (negated for DFT convention)
-        let negAngle = b.constant(0.0) - angle
-        let cosAngle = b.cos(negAngle)
-        let sinAngle = b.sin(negAngle)
-
-        // Gradient: (real * cos + imag * sin) / mag
-        // Note: real, imag, mag are already Expr, not Lazy
-        let realPart = real * cosAngle
-        let imagPart = imag * sinAngle
-        let numerator = realPart + imagPart
-
-        // Avoid division by zero
-        let epsilon = b.constant(1e-8)
-        let safeMag = mag + epsilon
-
-        return numerator / safeMag
-    }
-}
-
 func u_accum(_ cellId: CellID, incr: Expr, reset: Expr, min: Expr, max: Expr) -> (IRBuilder) -> Expr
 {
     return { b in
@@ -300,13 +264,11 @@ public enum LazyOp {
         lt, eq,
         gswitch, mix, pow, floor, ceil, round, mod, min, max
     case mse  // mean squared error per-sample: (a-b)^2
-    case spectralLossTape(Int)  // DEPRECATED: old single-pass spectral loss
     case spectralLossPass1(Int, CellID)  // Pass 1: compute loss & store DFT contributions
     case spectralLossPass2(Int, CellID)  // Pass 2: reduce contributions to gradients (no-op in forward)
     case selector  // selector(mode, options[])
     case memoryRead(CellID)
     case memoryWrite(CellID)
-    case scalarMemoryWrite(CellID)
     case historyWrite(CellID)
     case historyReadWrite(CellID)
     case param(CellID)
@@ -472,18 +434,6 @@ public enum LazyOp {
                     operator: "memoryWrite", expected: 2, actual: inputs.count)
             }
             b.use(val: b.memoryWrite(cellId, b.value(inputs[0]), b.value(inputs[1])))
-        case .scalarMemoryWrite(let cellId):
-            guard inputs.count == 2 else {
-                throw DGenError.insufficientInputs(
-                    operator: "scalarMemoryWrite", expected: 2, actual: inputs.count)
-            }
-            // Force a scalar memory write by emitting a dedicated UOp
-            let dest = ctx.useVariable(src: node.id)
-            let uop = UOp(
-                op: .scalarMemoryWrite(cellId, b.value(inputs[0]).lazy, b.value(inputs[1]).lazy),
-                value: dest)
-            b.ops.append(uop)
-            b.use(val: b.value(dest))
         case .atan2:
             guard inputs.count == 2 else {
                 throw DGenError.insufficientInputs(
@@ -498,14 +448,6 @@ public enum LazyOp {
             let (a, b2) = b.values(inputs, count: 2)
             b.use(val: u_mse(a, b2)(b))
 
-        case let .spectralLossTape(windowSize):
-            guard inputs.count == 2 else {
-                throw DGenError.insufficientInputs(
-                    operator: "spectralLossTape", expected: 2, actual: inputs.count)
-            }
-            let (sig1, sig2) = b.values(inputs, count: 2)
-            b.use(val: u_spectralLoss(sig1: sig1, sig2: sig2, windowSize: windowSize)(b))
-
         case let .spectralLossPass1(windowSize, scratchCell):
             guard inputs.count == 2 else {
                 throw DGenError.insufficientInputs(
@@ -515,7 +457,7 @@ public enum LazyOp {
             // Forward: compute spectral loss normally (Pass1 does the actual work)
             b.use(val: u_spectralLoss(sig1: sig1, sig2: sig2, windowSize: windowSize)(b))
 
-        case let .spectralLossPass2(windowSize, scratchCell):
+        case .spectralLossPass2(_, _):
             guard inputs.count == 1 else {
                 throw DGenError.insufficientInputs(
                     operator: "spectralLossPass2", expected: 1, actual: inputs.count)
@@ -851,23 +793,6 @@ public enum LazyOp {
             b.grad(node.inputs[0], value: gradA.lazy)
             b.grad(node.inputs[1], value: gradB.lazy)
 
-        case let .spectralLossTape(windowSize):
-            guard inputs.count == 2 else { fatalError("spectralLossTape requires 2 inputs") }
-            // We distribute the gradient across the entire analysis window by
-            // writing directly into the gradients buffer for each sample j in
-            // the window. To do that, we pass the gradIds for both inputs into
-            // the specialized backward op so the renderer can index gradients.
-            let sig1 = b.tapeValue(node.inputs[0])
-            let sig2 = b.tapeValue(node.inputs[1])
-            // Pass gradIds (not used by the non-scatter path, but available for future)
-            let gradId1 = b.ctx.useGradient(src: node.inputs[0])
-            let gradId2 = b.ctx.useGradient(src: node.inputs[1])
-            let (gradExpr1, gradExpr2) = u_spectralLossTapeBackward(
-                windowSize, sig1, sig2, b.value(gradOutput), gradId1, gradId2
-            )(b)
-            b.grad(node.inputs[0], value: gradExpr1.lazy)
-            b.grad(node.inputs[1], value: gradExpr2.lazy)
-
         case let .spectralLossPass1(windowSize, scratchCell):
             guard inputs.count == 2 else { fatalError("spectralLossPass1 requires 2 inputs") }
             let sig1 = b.tapeValue(node.inputs[0])
@@ -897,12 +822,10 @@ public enum LazyOp {
 
             // Pass A: Accumulate per-window gradient contributions to memory (WRITE)
             // This runs FIRST in backward (before Pass1), writing data that Pass1 will read
+            // Don't propagate gradients - Pass1 will handle that
             u_spectralLossBackwardPass1(
                 windowSize, scratchCell, sig1, sig2, b.value(gradOutput)
             )(b)
-
-        // Don't propagate gradients - Pass1 will handle that
-
         case .floor:
             // d(floor(x))/dx = 0 (floor is not differentiable, but we set to 0)
             guard inputs.count == 1 else { fatalError("floor requires 1 input") }
@@ -932,12 +855,6 @@ public enum LazyOp {
             let zeroGrad = ctx.useConstant(src: nil, value: 0.0)
             b.grad(node.inputs[0], value: zeroGrad)
             // Gradient for value flows through
-            b.grad(node.inputs[1], value: gradOutput)
-        case .scalarMemoryWrite(_):
-            // Same gradient semantics as memoryWrite
-            guard inputs.count == 2 else { fatalError("scalarMemoryWrite requires 2 inputs") }
-            let zeroGrad = ctx.useConstant(src: nil, value: 0.0)
-            b.grad(node.inputs[0], value: zeroGrad)
             b.grad(node.inputs[1], value: gradOutput)
         case .gt, .gte, .lte, .lt, .eq:
             // Comparisons have zero gradient (non-differentiable)
@@ -1044,7 +961,20 @@ public enum LazyOp {
             b.grad(node.inputs[2], value: ctx.useConstant(src: nil, value: 0.0))
             b.grad(node.inputs[3], value: ctx.useConstant(src: nil, value: 0.0))
 
-        case .phasor(let cellId):
+        case .phasor(_):
+            // NOTE ON GRADIENT SCALE VS frameCount
+            // ------------------------------------------------------------
+            // The phasor’s backward pass produces a gradient proportional
+            // to the current frame index (time). Even though Training.swift
+            // averages gradients across frames, the mean of i/sampleRate over
+            // i = 0..(frameCount-1) grows with the time horizon (~O(frameCount)).
+            // As a result, increasing frameCount increases the effective
+            // gradient scale for frequency parameters, requiring a smaller
+            // learning rate to maintain stability. This is independent of the
+            // particular loss (e.g., spectral loss) and comes from the time-
+            // weighted nature of d(phase)/d(freq).
+            //
+            // TODO - use actual sampleRate in system
             let sampleRate = b.constant(44100.0)
             let currentTime = b.frameIndex(nodeId)
 
@@ -1054,17 +984,6 @@ public enum LazyOp {
 
             // Write gradient directly (no accumulation needed - test will sum across frames)
             b.grad(node.inputs[0], value: gradFreq.lazy)
-        // NOTE ON GRADIENT SCALE VS frameCount
-        // ------------------------------------------------------------
-        // The phasor’s backward pass produces a gradient proportional
-        // to the current frame index (time). Even though Training.swift
-        // averages gradients across frames, the mean of i/sampleRate over
-        // i = 0..(frameCount-1) grows with the time horizon (~O(frameCount)).
-        // As a result, increasing frameCount increases the effective
-        // gradient scale for frequency parameters, requiring a smaller
-        // learning rate to maintain stability. This is independent of the
-        // particular loss (e.g., spectral loss) and comes from the time-
-        // weighted nature of d(phase)/d(freq).
         case .output(_):
             // Output just passes gradient through to its input
             guard inputs.count == 1 else { fatalError("output requires 1 input") }
@@ -1087,103 +1006,6 @@ public enum LazyOp {
 
         ops.append(contentsOf: b.ops)
         return ops
-    }
-}
-
-// Tape-based spectral loss backward op
-/// Backward pass for spectral loss: computes gradients w.r.t. both input signals.
-///
-/// Uses window-averaging to avoid race conditions: instead of scattering gradient
-/// contributions to all samples j in the window, averages contributions and assigns
-/// to the current sample. This is safe but creates late-frame bias.
-func u_spectralLossTapeBackward(
-    _ windowSize: Int,
-    _ sig1: Expr,
-    _ sig2: Expr,
-    _ upstreamGrad: Expr,
-    _ gradId1: GradID,
-    _ gradId2: GradID
-) -> (IRBuilder) -> (Expr, Expr) {
-    return { b in
-        let numBins = windowSize / 2 + 1
-
-        // Accumulate total gradients for current sample
-        let totalGrad1 = b.float(0.0)
-        let totalGrad2 = b.float(0.0)
-
-        // For each frequency bin
-        b.loop(numBins) { binIndex in
-            // DFT accumulators (real and imaginary parts)
-            let real1 = b.float(0.0)
-            let imag1 = b.float(0.0)
-            let real2 = b.float(0.0)
-            let imag2 = b.float(0.0)
-
-            // Compute DFT over window samples
-            b.loop(windowSize) { n in
-                let idx = b.threadIndex()
-                let winSize = b.constant(Float(windowSize))
-                let j = idx - (winSize - b.constant(1.0)) + b.cast(n, to: .float)
-
-                // Load samples from tape with bounds checking
-                let s1 = b.tapeLoad(sig1, at: j)
-                let s2 = b.tapeLoad(sig2, at: j)
-
-                // DFT basis: e^(-2πi*k*n/N) = cos(angle) - i*sin(angle)
-                let binIndexFloat = b.cast(binIndex, to: .float)
-                let nFloat = b.cast(n, to: .float)
-                let angle = b.constant(-2.0) * b.pi * binIndexFloat * nFloat / winSize
-                let c = b.cos(angle)
-                let s = b.sin(angle)
-
-                // Accumulate DFT: Real(X[k]) += x[n]*cos, Imag(X[k]) += x[n]*sin
-                real1.accumulate(s1 * c)
-                imag1.accumulate(s1 * s)
-                real2.accumulate(s2 * c)
-                imag2.accumulate(s2 * s)
-            }
-
-            // Magnitude: |X[k]| = sqrt(Real² + Imag²)
-            let mag1 = b.sqrt(real1.value * real1.value + imag1.value * imag1.value)
-            let mag2 = b.sqrt(real2.value * real2.value + imag2.value * imag2.value)
-
-            // Loss gradient for this bin: d/d(mag1) of (mag1-mag2)²
-            let magDiff = mag1 - mag2
-            let lossGrad = b.constant(2.0) * magDiff
-
-            // Average gradient contributions across window (to avoid scatter races)
-            let accum1 = b.float(0.0)
-            let accum2 = b.float(0.0)
-
-            b.loop(windowSize) { n in
-                let binIndexFloat = b.cast(binIndex, to: .float)
-                let nFloat = b.cast(n, to: .float)
-                let winSize = b.constant(Float(windowSize))
-                let angle_n = b.constant(-2.0) * b.pi * binIndexFloat * nFloat / winSize
-                let c_n = b.cos(angle_n)
-                let s_n = b.sin(angle_n)
-
-                // ∂mag/∂s[n] = (real*cos + imag*sin) / mag
-                let eps = b.constant(1e-8)
-                let sampleGrad1 = (real1.value * c_n + imag1.value * s_n) / (mag1 + eps)
-                let sampleGrad2 = (real2.value * c_n + imag2.value * s_n) / (mag2 + eps)
-
-                // Chain rule: ∂L/∂s = (∂L/∂mag) * (∂mag/∂s)
-                accum1.accumulate(lossGrad * sampleGrad1)
-                accum2.accumulate((b.constant(0.0) - lossGrad) * sampleGrad2)
-            }
-
-            // Normalize by window size to keep scale consistent
-            let winSizeConst = b.constant(Float(windowSize))
-            totalGrad1.accumulate(accum1.value / winSizeConst)
-            totalGrad2.accumulate(accum2.value / winSizeConst)
-        }
-
-        // Multiply by upstream gradient from loss
-        let grad1 = totalGrad1.value * upstreamGrad
-        let grad2 = totalGrad2.value * upstreamGrad
-
-        return (grad1, grad2)
     }
 }
 
