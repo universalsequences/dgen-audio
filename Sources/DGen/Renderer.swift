@@ -227,6 +227,42 @@ public class CRenderer: Renderer {
               return vsubq_f32(a, vmulq_f32(b, q_floor));
             }
 
+            static inline uint32x4_t mask_nz_f32(float32x4_t x) {
+                float32x4_t zero = vdupq_n_f32(0.0f);
+                // eq0 = (x == 0.0f)
+                uint32x4_t eq0  = vceqq_f32(x, zero);
+                // non-zero mask = bitwise NOT of eq0
+                return vmvnq_u32(eq0);
+            }
+
+            static inline float32x4_t boolmask_to_float(uint32x4_t m) {
+                float32x4_t ones  = vdupq_n_f32(1.0f);
+                float32x4_t zeros = vdupq_n_f32(0.0f);
+                // Select 1.0f where mask bits are 1, else 0.0f
+                return vbslq_f32(m, ones, zeros);
+            }
+
+            static inline float32x4_t simd_and_f32(float32x4_t a, float32x4_t b) {
+                uint32x4_t a_nz = mask_nz_f32(a);
+                uint32x4_t b_nz = mask_nz_f32(b);
+                uint32x4_t m    = vandq_u32(a_nz, b_nz);
+                return boolmask_to_float(m);
+            }
+
+            static inline float32x4_t simd_or_f32(float32x4_t a, float32x4_t b) {
+                uint32x4_t a_nz = mask_nz_f32(a);
+                uint32x4_t b_nz = mask_nz_f32(b);
+                uint32x4_t m    = vorrq_u32(a_nz, b_nz);
+                return boolmask_to_float(m);
+            }
+
+            static inline float32x4_t simd_xor_f32(float32x4_t a, float32x4_t b) {
+                uint32x4_t a_nz = mask_nz_f32(a);
+                uint32x4_t b_nz = mask_nz_f32(b);
+                uint32x4_t m    = veorq_u32(a_nz, b_nz);
+                return boolmask_to_float(m);
+            }
+
             // Timing instrumentation for \(name) [\(kernelUUID)]
             #ifdef DGEN_PROFILE
             static uint64_t kernel_invocation_count_\(sanitizedName) = 0;
@@ -577,6 +613,25 @@ public class CRenderer: Renderer {
             let expr = uop.kind == .simd ? "vsqrtf(\(g(a)))" : "sqrtf(\(g(a)))"
             return emitAssign(uop, expr, ctx)
 
+        case let .and(a, b):
+            let expr =
+                uop.kind == .simd
+                ? "simd_and_f32(\(g(a)), \(g(b)))"
+                : "((\(g(a))) && (\(g(b))))"
+            return emitAssign(uop, expr, ctx)
+
+        case let .or(a, b):
+            let expr =
+                uop.kind == .simd
+                ? "simd_or_f32(\(g(a)), \(g(b)))"
+                : "((\(g(a))) || (\(g(b))))"
+            return emitAssign(uop, expr, ctx)
+        case let .xor(a, b):
+            let expr =
+                uop.kind == .simd
+                ? "simd_xor_f32(\(g(a)), \(g(b)))"
+                : "((\(g(a))) ^ (\(g(b))))"
+            return emitAssign(uop, expr, ctx)
         case let .atan2(y, x):
             let expr = uop.kind == .simd ? "vatan2f(\(g(y)), \(g(x)))" : "atan2f(\(g(y)), \(g(x)))"
             return emitAssign(uop, expr, ctx)

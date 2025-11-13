@@ -262,7 +262,7 @@ public enum LazyOp {
     case add, sub, div, mul, abs, sign, sin, cos, tan, tanh, exp, log, log10, sqrt, atan2, gt, gte,
         lte,
         lt, eq,
-        gswitch, mix, pow, floor, ceil, round, mod, min, max
+        gswitch, mix, pow, floor, ceil, round, mod, min, max, and, or, xor
     case mse  // mean squared error per-sample: (a-b)^2
     case spectralLossPass1(Int, CellID)  // Pass 1: compute loss & store DFT contributions
     case spectralLossPass2(Int, CellID)  // Pass 2: reduce contributions to gradients (no-op in forward)
@@ -338,6 +338,24 @@ public enum LazyOp {
                     operator: "max", expected: 2, actual: inputs.count)
             }
             b.use(val: b.max(b.value(inputs[0]), b.value(inputs[1])))
+        case .and:
+            guard inputs.count == 2 else {
+                throw DGenError.insufficientInputs(
+                    operator: "and", expected: 2, actual: inputs.count)
+            }
+            b.use(val: b.and(b.value(inputs[0]), b.value(inputs[1])))
+        case .or:
+            guard inputs.count == 2 else {
+                throw DGenError.insufficientInputs(
+                    operator: "or", expected: 2, actual: inputs.count)
+            }
+            b.use(val: b.or(b.value(inputs[0]), b.value(inputs[1])))
+        case .xor:
+            guard inputs.count == 2 else {
+                throw DGenError.insufficientInputs(
+                    operator: "xor", expected: 2, actual: inputs.count)
+            }
+            b.use(val: b.xor(b.value(inputs[0]), b.value(inputs[1])))
         case .abs:
             guard inputs.count == 1 else {
                 throw DGenError.insufficientInputs(
@@ -628,6 +646,8 @@ public enum LazyOp {
             // Constants have no gradients to propagate
             // should we return 0 so that it can actually propagate?
             // constant is a leaf so it'd be at the very end anyway so probably fine
+            return []
+        case .and, .or, .xor:
             return []
         case .click:
             // TODO - implement backprop for click

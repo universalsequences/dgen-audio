@@ -145,7 +145,6 @@ public final class IRBuilder {
     fatalError("no tape")
   }
 
-
   public func abs(_ val: Expr) -> Expr {
     if case .constant(_, let absConst) = val.lazy {
       return self.constant(fabs(absConst))
@@ -205,7 +204,7 @@ public final class IRBuilder {
     return value(dest)
   }
 
-  public func applyUOp(op: Op, _ val: Expr) -> Expr {
+  public func applyUOp(op: Op) -> Expr {
     let dest = ctx.useVariable(src: nodeId)
     let uop = UOp(op: op, value: dest)
     ops.append(uop)
@@ -213,11 +212,23 @@ public final class IRBuilder {
   }
 
   public func log(_ val: Expr) -> Expr {
-    return applyUOp(op: .log(val.lazy), val)
+    return applyUOp(op: .log(val.lazy))
   }
 
   public func log10(_ val: Expr) -> Expr {
-    return applyUOp(op: .log10(val.lazy), val)
+    return applyUOp(op: .log10(val.lazy))
+  }
+
+  public func and(_ a: Expr, _ b: Expr) -> Expr {
+    return applyUOp(op: .and(a.lazy, b.lazy))
+  }
+
+  public func or(_ a: Expr, _ b: Expr) -> Expr {
+    return applyUOp(op: .or(a.lazy, b.lazy))
+  }
+
+  public func xor(_ a: Expr, _ b: Expr) -> Expr {
+    return applyUOp(op: .xor(a.lazy, b.lazy))
   }
 
   public func sqrt(_ val: Expr) -> Expr {

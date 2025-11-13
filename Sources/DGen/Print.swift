@@ -25,6 +25,12 @@ extension UOp {
             opStr = "\(ANSI.green)mul\(ANSI.reset)(\(a), \(b))"
         case let .div(a, b):
             opStr = "\(ANSI.green)div\(ANSI.reset)(\(a), \(b))"
+        case let .and(a, b):
+            opStr = "\(ANSI.green)and\(ANSI.reset)(\(a), \(b))"
+        case let .or(a, b):
+            opStr = "\(ANSI.green)or\(ANSI.reset)(\(a), \(b))"
+        case let .xor(a, b):
+            opStr = "\(ANSI.green)xor\(ANSI.reset)(\(a), \(b))"
         case let .abs(a):
             opStr = "\(ANSI.green)abs\(ANSI.reset)(\(a))"
         case let .sign(a):
