@@ -10,6 +10,7 @@ public struct Block: Equatable {
     public var kind: Kind
     public var nodes: [NodeID] = []
     public var direction: Direction = .forward
+    public var temporality: Temporality = .static_
 
     public init(kind: Kind) {
         self.kind = kind
@@ -19,6 +20,7 @@ public struct Block: Equatable {
 // Find all nodes that participate in feedback loops (not just minimal cycles)
 public func findFeedbackLoops(_ g: Graph) -> [[NodeID]] {
     // Build maps of history cells to their read/write nodes
+    // historyRead/historyWrite now handle both scalar and tensor cases
     var cellReads: [Int: NodeID] = [:]
     var cellWrites: [Int: NodeID] = [:]
 
@@ -55,8 +57,8 @@ public func findFeedbackLoops(_ g: Graph) -> [[NodeID]] {
             }
 
             // Handle implicit historyWrite -> historyRead connection
-            if let n = g.nodes[node], case .historyWrite(let cellId) = n.op {
-                if let readNode = cellReads[cellId] {
+            if let n = g.nodes[node] {
+                if case .historyWrite(let cellId) = n.op, let readNode = cellReads[cellId] {
                     if reached.insert(readNode).inserted {
                         queue.append(readNode)
                     }
@@ -83,8 +85,8 @@ public func findFeedbackLoops(_ g: Graph) -> [[NodeID]] {
             }
 
             // Handle implicit historyRead -> historyWrite connection
-            if let n = g.nodes[node], case .historyRead(let cellId) = n.op {
-                if let writeNode = cellWrites[cellId] {
+            if let n = g.nodes[node] {
+                if case .historyRead(let cellId) = n.op, let writeNode = cellWrites[cellId] {
                     if reached.insert(writeNode).inserted {
                         queue.append(writeNode)
                     }
@@ -149,8 +151,8 @@ public func findFeedbackLoops(_ g: Graph) -> [[NodeID]] {
             // CRITICAL: Ensure read/write pairs for the same cell are both included
             // If a read is in the cluster, its corresponding write must also be included
             for readNode in allReadsInCluster {
-                if let node = g.nodes[readNode], case .historyRead(let cell) = node.op {
-                    if let writeNode = cellWrites[cell] {
+                if let node = g.nodes[readNode] {
+                    if case .historyRead(let cell) = node.op, let writeNode = cellWrites[cell] {
                         clusterNodes.insert(writeNode)
                         allWritesInCluster.insert(writeNode)
                     }
@@ -159,8 +161,8 @@ public func findFeedbackLoops(_ g: Graph) -> [[NodeID]] {
 
             // If a write is in the cluster, its corresponding read must also be included
             for writeNode in allWritesInCluster {
-                if let node = g.nodes[writeNode], case .historyWrite(let cell) = node.op {
-                    if let readNode = cellReads[cell] {
+                if let node = g.nodes[writeNode] {
+                    if case .historyWrite(let cell) = node.op, let readNode = cellReads[cell] {
                         clusterNodes.insert(readNode)
                         allReadsInCluster.insert(readNode)
                     }
@@ -256,7 +258,66 @@ public func scalarNodes(_ g: Graph, feedbackClusters: [[NodeID]]) -> Set<NodeID>
             scalar.insert($0.id)  // Phasor operations need to be scalar (stateful)
         //case .seq:
         //    scalar.insert($0.id)  // Seq operations need to be scalar (ordering dependent)
+
+        // Tensor operations must be scalar because they have internal loops
+        case .historyRead(let cellId):
+            // Tensor history reads are scalar (they use parallelRange internally)
+            if g.cellToTensor[cellId] != nil {
+                scalar.insert($0.id)
+            }
+        case .historyWrite(let cellId):
+            // Tensor history writes are scalar (they use parallelRange internally)
+            if g.cellToTensor[cellId] != nil {
+                scalar.insert($0.id)
+            }
+        case .conv2d(_):
+            scalar.insert($0.id)
+        case .sum:
+            scalar.insert($0.id)
         default: break
+        }
+    }
+
+    // Also mark nodes with tensor inputs as scalar (they use parallelRange internally)
+    // First, identify all tensor source nodes (tensorRef produces tensors, historyRead with tensor cell)
+    var tensorNodes: Set<NodeID> = []
+    g.nodes.values.forEach {
+        switch $0.op {
+        case .tensorRef(_):
+            tensorNodes.insert($0.id)
+        case .historyRead(let cellId):
+            if g.cellToTensor[cellId] != nil {
+                tensorNodes.insert($0.id)
+            }
+        default: break
+        }
+    }
+
+    // Mark nodes with tensor inputs as scalar (they need element-wise loops)
+    g.nodes.values.forEach {
+        for inputId in $0.inputs {
+            if tensorNodes.contains(inputId) {
+                scalar.insert($0.id)
+                // If this node consumes a tensor and produces something, it's also a tensor producer
+                tensorNodes.insert($0.id)
+            }
+        }
+    }
+
+    // Repeat to propagate through chains of tensor ops
+    var changed = true
+    while changed {
+        changed = false
+        g.nodes.values.forEach { node in
+            for inputId in node.inputs {
+                if tensorNodes.contains(inputId) && !scalar.contains(node.id) {
+                    scalar.insert(node.id)
+                    if !tensorNodes.contains(node.id) {
+                        tensorNodes.insert(node.id)
+                        changed = true
+                    }
+                }
+            }
         }
     }
 
@@ -914,22 +975,6 @@ public func emitBlockUOps(
                 uops.insert(loadGlobalUOp, at: 0)
             default:
                 break
-            }
-        }
-    }
-
-    if debug {
-        var indentLevel = 0
-        for uop in uops {
-            switch uop.op {
-            case .beginIf:
-                print("\(String(repeating: "  ", count: indentLevel))\(uop.prettyDescription())")
-                indentLevel += 1
-            case .endIf:
-                indentLevel = max(0, indentLevel - 1)
-                print("\(String(repeating: "  ", count: indentLevel))\(uop.prettyDescription())")
-            default:
-                print("\(String(repeating: "  ", count: indentLevel))\(uop.prettyDescription())")
             }
         }
     }

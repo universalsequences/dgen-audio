@@ -1,11 +1,102 @@
 import AVFoundation
 import AudioToolbox  // kAudioUnitProperty_MaximumFramesPerSlice
+import CryptoKit
 import Foundation
 import Metal
 
 public typealias AudioLevelCallback = (UnsafePointer<Float>, Int) -> Void
 
 let MIN_FRAME_COUNT = 128
+
+// MARK: - Dylib Cache Infrastructure
+
+/// Result of cache-aware compilation
+public struct DylibCacheResult {
+    public let wasFromCache: Bool
+    public let dylibFileName: String
+    public let sourceCodeHash: String
+}
+
+/// Manages the dylib cache directory and cleanup
+public class DylibCacheManager {
+    public static let shared = DylibCacheManager()
+
+    private init() {}
+
+    /// Get cache directory for a project (creates if needed)
+    /// - Parameter projectDirectory: The project's root directory
+    /// - Returns: URL to the cache directory
+    public func cacheDirectory(for projectDirectory: URL) -> URL {
+        let cacheDir = projectDirectory.appendingPathComponent(".cache/dylibs")
+        try? FileManager.default.createDirectory(
+            at: cacheDir,
+            withIntermediateDirectories: true
+        )
+        return cacheDir
+    }
+
+    /// Compute SHA256 hash of source code string
+    public func hashSourceCode(_ source: String) -> String {
+        let data = Data(source.utf8)
+        let digest = SHA256.hash(data: data)
+        return digest.map { String(format: "%02x", $0) }.joined()
+    }
+
+    /// Delete dylibs not accessed in the specified number of days
+    /// - Parameters:
+    ///   - projectDirectory: The project's root directory
+    ///   - days: Number of days after which a dylib is considered stale (default 30)
+    public func pruneOldDylibs(in projectDirectory: URL, olderThanDays days: Int = 30) {
+        let cacheDir = cacheDirectory(for: projectDirectory)
+        guard let contents = try? FileManager.default.contentsOfDirectory(
+            at: cacheDir,
+            includingPropertiesForKeys: [.contentAccessDateKey]
+        ) else { return }
+
+        let cutoff = Date().addingTimeInterval(-Double(days * 24 * 60 * 60))
+        var prunedCount = 0
+
+        for file in contents where file.pathExtension == "dylib" {
+            guard let attrs = try? file.resourceValues(forKeys: [.contentAccessDateKey]),
+                  let accessDate = attrs.contentAccessDate,
+                  accessDate < cutoff else { continue }
+
+            do {
+                try FileManager.default.removeItem(at: file)
+                prunedCount += 1
+            } catch {
+                print("Warning: Failed to prune cached dylib \(file.lastPathComponent): \(error)")
+            }
+        }
+
+        if prunedCount > 0 {
+            print("🧹 Pruned \(prunedCount) stale cached dylib(s)")
+        }
+    }
+
+    /// Clear all cached dylibs for a project
+    public func clearCache(for projectDirectory: URL) {
+        let cacheDir = cacheDirectory(for: projectDirectory)
+        guard let contents = try? FileManager.default.contentsOfDirectory(
+            at: cacheDir,
+            includingPropertiesForKeys: nil
+        ) else { return }
+
+        var clearedCount = 0
+        for file in contents where file.pathExtension == "dylib" {
+            do {
+                try FileManager.default.removeItem(at: file)
+                clearedCount += 1
+            } catch {
+                print("⚠️ Failed to clear cached dylib \(file.lastPathComponent): \(error.localizedDescription)")
+            }
+        }
+
+        if clearedCount > 0 {
+            print("🗑️ Cleared \(clearedCount) cached dylib(s)")
+        }
+    }
+}
 
 public protocol CompiledKernelRuntime {
     var cellAllocations: CellAllocations { get }
@@ -47,18 +138,12 @@ public class CCompiledKernel: CompiledKernelRuntime {
     private var duplicateHandles: [UnsafeMutableRawPointer] = []
     private var duplicateProcessFns:
         [(
-            @convention(c) (
-                UnsafePointer<UnsafeMutablePointer<Float>?>?,
-                UnsafePointer<UnsafeMutablePointer<Float>?>?, Int32, UnsafeMutableRawPointer?
-            ) -> Void
+            CProcessFunction
         )] = []
     // Match audiograph's actual KernelFn signature (based on Swift binding)
     private var processFn:
         (
-            @convention(c) (
-                UnsafePointer<UnsafeMutablePointer<Float>?>?,
-                UnsafePointer<UnsafeMutablePointer<Float>?>?, Int32, UnsafeMutableRawPointer?
-            ) -> Void
+            CProcessFunction
         )?
 
     private var setParamValueFn: (@convention(c) (Int32, Float) -> Void)?
@@ -75,8 +160,10 @@ public class CCompiledKernel: CompiledKernelRuntime {
         let tmpDir = FileManager.default.temporaryDirectory
         // Use timestamp to force fresh compilation
         let timestamp = String(Int(Date().timeIntervalSince1970 * 1000))
-        let cFile = tmpDir.appendingPathComponent("kernel_\(timestamp).c")
-        let dylibFile = tmpDir.appendingPathComponent("libkernel_\(timestamp).dylib")
+        let salt = Int.random(in: 0..<999999)
+        let uniqueId = "\(timestamp)_\(salt)"
+        let cFile = tmpDir.appendingPathComponent("kernel_\(uniqueId).c")
+        let dylibFile = tmpDir.appendingPathComponent("libkernel_\(uniqueId).dylib")
 
         try source.write(to: cFile, atomically: true, encoding: .utf8)
 
@@ -153,7 +240,8 @@ public class CCompiledKernel: CompiledKernelRuntime {
             processSymAddr!,
             to: (@convention(c) (
                 UnsafePointer<UnsafeMutablePointer<Float>?>?,
-                UnsafePointer<UnsafeMutablePointer<Float>?>?, Int32, UnsafeMutableRawPointer?
+                UnsafePointer<UnsafeMutablePointer<Float>?>?, Int32, UnsafeMutableRawPointer?,
+                UnsafeMutableRawPointer?
             ) -> Void)
             .self)
 
@@ -176,6 +264,198 @@ public class CCompiledKernel: CompiledKernelRuntime {
             paramSym,
             to: (@convention(c) (Int32, Float) -> Void)
                 .self)
+    }
+
+    /// Cache-aware compilation that reuses existing dylibs when source hasn't changed
+    /// - Parameters:
+    ///   - operatorUUID: Unique identifier for the POPerator (used for filename)
+    ///   - existingDylibFileName: Previously stored dylib filename (if any)
+    ///   - existingSourceHash: Previously stored source hash (if any)
+    ///   - projectDirectory: The project's root directory for cache storage
+    /// - Returns: Cache metadata for the operator to store
+    public func compileAndLoadCached(
+        operatorUUID: UUID,
+        existingDylibFileName: String?,
+        existingSourceHash: String?,
+        projectDirectory: URL
+    ) throws -> DylibCacheResult {
+        let cacheManager = DylibCacheManager.shared
+        let currentHash = cacheManager.hashSourceCode(source)
+        let cacheDir = cacheManager.cacheDirectory(for: projectDirectory)
+
+        // Check if we can reuse cached dylib
+        if let existingHash = existingSourceHash,
+           let existingFile = existingDylibFileName,
+           existingHash == currentHash {
+
+            let cachedPath = cacheDir.appendingPathComponent(existingFile)
+
+            if FileManager.default.fileExists(atPath: cachedPath.path) {
+                // Attempt to load cached dylib
+                if let handle = dlopen(cachedPath.path, RTLD_NOW) {
+                    // Load process symbol
+                    guard let processSymAddr = dlsym(handle, symbolName) else {
+                        dlclose(handle)
+                        print("⚠️ Cached dylib missing process symbol, recompiling...")
+                        return try compileNewDylib(
+                            operatorUUID: operatorUUID,
+                            currentHash: currentHash,
+                            cacheDir: cacheDir
+                        )
+                    }
+
+                    self.dylibHandle = handle
+                    self.dylibFileURL = cachedPath
+
+                    self.processFn = unsafeBitCast(
+                        processSymAddr,
+                        to: (@convention(c) (
+                            UnsafePointer<UnsafeMutablePointer<Float>?>?,
+                            UnsafePointer<UnsafeMutablePointer<Float>?>?, Int32,
+                            UnsafeMutableRawPointer?, UnsafeMutableRawPointer?
+                        ) -> Void).self
+                    )
+
+                    // Load setParamValue symbol
+                    guard let paramSym = dlsym(handle, setParamValueSymbolName) else {
+                        dlclose(handle)
+                        self.dylibHandle = nil
+                        self.processFn = nil
+                        print("⚠️ Cached dylib missing setParamValue, recompiling...")
+                        return try compileNewDylib(
+                            operatorUUID: operatorUUID,
+                            currentHash: currentHash,
+                            cacheDir: cacheDir
+                        )
+                    }
+
+                    self.setParamValueFn = unsafeBitCast(
+                        paramSym,
+                        to: (@convention(c) (Int32, Float) -> Void).self
+                    )
+
+                    print("✅ Loaded cached dylib: \(existingFile)")
+                    return DylibCacheResult(
+                        wasFromCache: true,
+                        dylibFileName: existingFile,
+                        sourceCodeHash: currentHash
+                    )
+                } else {
+                    print("⚠️ Failed to dlopen cached dylib, recompiling...")
+                }
+            }
+        }
+
+        // Cache miss or invalid - compile new dylib
+        return try compileNewDylib(
+            operatorUUID: operatorUUID,
+            currentHash: currentHash,
+            cacheDir: cacheDir
+        )
+    }
+
+    /// Internal helper to compile a new dylib and cache it
+    private func compileNewDylib(
+        operatorUUID: UUID,
+        currentHash: String,
+        cacheDir: URL
+    ) throws -> DylibCacheResult {
+        // Use timestamp + salt for unique filename (critical for dlopen to load fresh code)
+        let timestamp = String(Int(Date().timeIntervalSince1970 * 1000))
+        let salt = Int.random(in: 0..<999999)
+        let dylibFileName = "\(operatorUUID.uuidString)_\(timestamp)_\(salt).dylib"
+        let dylibFile = cacheDir.appendingPathComponent(dylibFileName)
+
+        // Write source to temp file
+        let tmpDir = FileManager.default.temporaryDirectory
+        let cFile = tmpDir.appendingPathComponent("kernel_\(operatorUUID.uuidString)_\(timestamp)_\(salt).c")
+        try source.write(to: cFile, atomically: true, encoding: .utf8)
+
+        // Compile with clang
+        let compile = Process()
+        compile.launchPath = "/usr/bin/clang"
+        let arguments = [
+            "-Ofast", "-mcpu=native", "-flto=thin",
+            "-ffast-math", "-fno-math-errno", "-fno-trapping-math", "-ffp-contract=fast",
+            "-fvectorize", "-fslp-vectorize", "-funroll-loops",
+            "-fPIC", "-shared",
+            "-framework", "Accelerate",
+            "-std=c11", "-x", "c",
+            "-o", dylibFile.path, cFile.path,
+        ]
+        compile.arguments = arguments
+
+        let errorPipe = Pipe()
+        compile.standardError = errorPipe
+        compile.launch()
+        compile.waitUntilExit()
+
+        let errorData = errorPipe.fileHandleForReading.readDataToEndOfFile()
+        let errorOutput = String(data: errorData, encoding: .utf8) ?? ""
+
+        guard compile.terminationStatus == 0 else {
+            print("❌ CLANG COMPILATION FAILED: \(errorOutput)")
+            throw NSError(
+                domain: "CompileError", code: 1,
+                userInfo: [NSLocalizedDescriptionKey: "Failed to compile kernel: \(errorOutput)"]
+            )
+        }
+
+        // Load the newly compiled dylib
+        self.dylibHandle = dlopen(dylibFile.path, RTLD_NOW)
+        self.dylibFileURL = dylibFile
+
+        guard let handle = dylibHandle else {
+            let error = String(cString: dlerror())
+            throw NSError(
+                domain: "DLError", code: 2,
+                userInfo: [NSLocalizedDescriptionKey: "Failed to load dylib: \(error)"]
+            )
+        }
+
+        // Load symbols
+        guard let processSymAddr = dlsym(handle, symbolName) else {
+            throw NSError(
+                domain: "DLError", code: 3,
+                userInfo: [NSLocalizedDescriptionKey: "Symbol \(symbolName) not found"]
+            )
+        }
+
+        self.processFn = unsafeBitCast(
+            processSymAddr,
+            to: (@convention(c) (
+                UnsafePointer<UnsafeMutablePointer<Float>?>?,
+                UnsafePointer<UnsafeMutablePointer<Float>?>?, Int32,
+                UnsafeMutableRawPointer?, UnsafeMutableRawPointer?
+            ) -> Void).self
+        )
+
+        guard let paramSym = dlsym(handle, setParamValueSymbolName) else {
+            throw NSError(
+                domain: "DLError", code: 3,
+                userInfo: [NSLocalizedDescriptionKey: "Symbol \(setParamValueSymbolName) not found"]
+            )
+        }
+
+        self.setParamValueFn = unsafeBitCast(
+            paramSym,
+            to: (@convention(c) (Int32, Float) -> Void).self
+        )
+
+        // Clean up temp C file
+        do {
+            try FileManager.default.removeItem(at: cFile)
+        } catch {
+            print("⚠️ Failed to clean up temp C file: \(error.localizedDescription)")
+        }
+
+        print("✅ Compiled and cached new dylib: \(dylibFileName)")
+
+        return DylibCacheResult(
+            wasFromCache: false,
+            dylibFileName: dylibFileName,
+            sourceCodeHash: currentHash
+        )
     }
 
     public func run(
@@ -352,38 +632,30 @@ public class CCompiledKernel: CompiledKernelRuntime {
         let outputChannels: [UnsafeMutablePointer<Float>?] = [outputs]
         let inputChannels: [UnsafeMutablePointer<Float>?] = [UnsafeMutablePointer(mutating: inputs)]
 
+        // TODO - actually pass real buffers
         outputChannels.withUnsafeBufferPointer { outPtr in
             inputChannels.withUnsafeBufferPointer { inPtr in
-                process(inPtr.baseAddress, outPtr.baseAddress, Int32(frameCount), memory)
+                process(inPtr.baseAddress, outPtr.baseAddress, Int32(frameCount), memory, memory)
             }
         }
     }
 
     public func getProcessFunction() -> (
-        @convention(c) (
-            UnsafePointer<UnsafeMutablePointer<Float>?>?,
-            UnsafePointer<UnsafeMutablePointer<Float>?>?, Int32, UnsafeMutableRawPointer?
-        ) -> Void
+        CProcessFunction
     )? {
         return processFn
     }
 
     // Get the typed function directly (preferred method, like working example)
     public func getKernelFunction() -> (
-        @convention(c) (
-            UnsafePointer<UnsafeMutablePointer<Float>?>?,
-            UnsafePointer<UnsafeMutablePointer<Float>?>?, Int32, UnsafeMutableRawPointer?
-        ) -> Void
+        CProcessFunction
     )? {
         return processFn
     }
 
     /// Return per-voice process functions by duplicating the .dylib to unique paths and dlopen'ing
     public func getProcessFunctions(count: Int) throws -> [(
-        @convention(c) (
-            UnsafePointer<UnsafeMutablePointer<Float>?>?,
-            UnsafePointer<UnsafeMutablePointer<Float>?>?, Int32, UnsafeMutableRawPointer?
-        ) -> Void
+        CProcessFunction
     )] {
         let t0 = CFAbsoluteTimeGetCurrent()
         guard count > 0 else { return [] }
@@ -459,10 +731,7 @@ public class CCompiledKernel: CompiledKernelRuntime {
 
             let fn = unsafeBitCast(
                 sym,
-                to: (@convention(c) (
-                    UnsafePointer<UnsafeMutablePointer<Float>?>?,
-                    UnsafePointer<UnsafeMutablePointer<Float>?>?, Int32, UnsafeMutableRawPointer?
-                ) -> Void).self)
+                to: (CProcessFunction).self)
             duplicateHandles.append(handle)
             duplicateProcessFns.append(fn)
         }

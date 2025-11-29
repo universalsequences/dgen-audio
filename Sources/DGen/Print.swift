@@ -54,7 +54,7 @@ extension UOp {
         case let .tan(a):
             opStr = "\(ANSI.green)tan\(ANSI.reset)(\(a))"
         case let .tanh(a):
-            opStr = "\(ANSI.green)tan\(ANSI.reset)(\(a))"
+            opStr = "\(ANSI.green)tanh\(ANSI.reset)(\(a))"
         case let .exp(a):
             opStr = "\(ANSI.green)exp\(ANSI.reset)(\(a))"
         case let .log(a):
@@ -147,6 +147,18 @@ extension UOp {
             opStr = "\(ANSI.green)cast\(ANSI.reset)(\(expr), \(typeStr))"
         case let .declareVar(value):
             opStr = "\(ANSI.cyan)declareVar\(ANSI.reset)(\(value))"
+        case let .beginParallelRange(count):
+            opStr = "\(ANSI.magenta)beginParallelRange\(ANSI.reset)(\(count))"
+        case .endParallelRange:
+            opStr = "\(ANSI.magenta)endParallelRange\(ANSI.reset)"
+        case .parallelIndex:
+            opStr = "\(ANSI.magenta)parallelIndex\(ANSI.reset)"
+        case let .beginReduce(size):
+            opStr = "\(ANSI.magenta)beginReduce\(ANSI.reset)(\(size))"
+        case .endReduce:
+            opStr = "\(ANSI.magenta)endReduce\(ANSI.reset)"
+        case let .reduceAccumulate(val):
+            opStr = "\(ANSI.magenta)reduceAccumulate\(ANSI.reset)(\(val))"
         }
 
         return "\(ANSI.bold)UOp\(ANSI.reset)(op: \(opStr), value: \(value))"

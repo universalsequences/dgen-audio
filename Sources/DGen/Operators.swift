@@ -106,6 +106,142 @@ let u_pow = binaryOp(Op.pow)
 let u_min = binaryOp(Op.min)
 let u_max = binaryOp(Op.max)
 
+// MARK: - Tensor Emit Helpers
+
+/// Emit a binary operation that works on both scalars and tensors.
+/// For scalars: applies op directly.
+/// For tensors: emits parallelRange over elements.
+func emitBinaryOp(
+    b: IRBuilder,
+    g: Graph,
+    node: Node,
+    inputs: [Lazy],
+    op: (Expr, Expr) -> Expr
+) {
+    guard case .tensor(let shape) = node.shape else {
+        // Scalar case - just apply op directly
+        b.use(val: op(b.value(inputs[0]), b.value(inputs[1])))
+        return
+    }
+
+    // Tensor case
+    let size = shape.reduce(1, *)
+    let outputTensorId = g.nodeToTensor[node.id]!
+    let outputCellId = g.tensors[outputTensorId]!.cellId
+
+    // Get input cell IDs (handle scalar + tensor broadcasting)
+    let input0Shape = g.nodes[node.inputs[0]]?.shape ?? .scalar
+    let input1Shape = g.nodes[node.inputs[1]]?.shape ?? .scalar
+
+    b.parallelRange(size) { idx in
+        let a: Expr
+        if case .scalar = input0Shape {
+            a = b.value(inputs[0])
+        } else {
+            let cellId = g.tensors[g.nodeToTensor[node.inputs[0]]!]!.cellId
+            a = b.memoryRead(cellId, b.cast(idx, to: .int))
+        }
+
+        let c: Expr
+        if case .scalar = input1Shape {
+            c = b.value(inputs[1])
+        } else {
+            let cellId = g.tensors[g.nodeToTensor[node.inputs[1]]!]!.cellId
+            c = b.memoryRead(cellId, b.cast(idx, to: .int))
+        }
+
+        let result = op(a, c)
+        _ = b.memoryWrite(outputCellId, b.cast(idx, to: .int), result)
+    }
+}
+
+/// Emit a unary operation that works on both scalars and tensors.
+/// For scalars: applies op directly.
+/// For tensors: emits parallelRange over elements.
+func emitUnaryOp(
+    b: IRBuilder,
+    g: Graph,
+    node: Node,
+    inputs: [Lazy],
+    op: (Expr) -> Expr
+) {
+    guard case .tensor(let shape) = node.shape else {
+        // Scalar case - just apply op directly
+        b.use(val: op(b.value(inputs[0])))
+        return
+    }
+
+    // Tensor case
+    let size = shape.reduce(1, *)
+    let outputTensorId = g.nodeToTensor[node.id]!
+    let outputCellId = g.tensors[outputTensorId]!.cellId
+
+    let inputTensorId = g.nodeToTensor[node.inputs[0]]!
+    let inputCellId = g.tensors[inputTensorId]!.cellId
+
+    b.parallelRange(size) { idx in
+        let a = b.memoryRead(inputCellId, b.cast(idx, to: .int))
+        let result = op(a)
+        _ = b.memoryWrite(outputCellId, b.cast(idx, to: .int), result)
+    }
+}
+
+/// Emit a ternary operation (like gswitch) that works on both scalars and tensors.
+/// For scalars: applies op directly.
+/// For tensors: emits parallelRange over elements with broadcasting.
+func emitTernaryOp(
+    b: IRBuilder,
+    g: Graph,
+    node: Node,
+    inputs: [Lazy],
+    op: (Expr, Expr, Expr) -> Expr
+) {
+    guard case .tensor(let shape) = node.shape else {
+        // Scalar case - just apply op directly
+        b.use(val: op(b.value(inputs[0]), b.value(inputs[1]), b.value(inputs[2])))
+        return
+    }
+
+    // Tensor case
+    let size = shape.reduce(1, *)
+    let outputTensorId = g.nodeToTensor[node.id]!
+    let outputCellId = g.tensors[outputTensorId]!.cellId
+
+    // Get input shapes (handle scalar broadcasting)
+    let input0Shape = g.nodes[node.inputs[0]]?.shape ?? .scalar
+    let input1Shape = g.nodes[node.inputs[1]]?.shape ?? .scalar
+    let input2Shape = g.nodes[node.inputs[2]]?.shape ?? .scalar
+
+    b.parallelRange(size) { idx in
+        let a: Expr
+        if case .scalar = input0Shape {
+            a = b.value(inputs[0])
+        } else {
+            let cellId = g.tensors[g.nodeToTensor[node.inputs[0]]!]!.cellId
+            a = b.memoryRead(cellId, b.cast(idx, to: .int))
+        }
+
+        let c: Expr
+        if case .scalar = input1Shape {
+            c = b.value(inputs[1])
+        } else {
+            let cellId = g.tensors[g.nodeToTensor[node.inputs[1]]!]!.cellId
+            c = b.memoryRead(cellId, b.cast(idx, to: .int))
+        }
+
+        let d: Expr
+        if case .scalar = input2Shape {
+            d = b.value(inputs[2])
+        } else {
+            let cellId = g.tensors[g.nodeToTensor[node.inputs[2]]!]!.cellId
+            d = b.memoryRead(cellId, b.cast(idx, to: .int))
+        }
+
+        let result = op(a, c, d)
+        _ = b.memoryWrite(outputCellId, b.cast(idx, to: .int), result)
+    }
+}
+
 func u_historyWrite(cellId: CellID, _ curr: Expr) -> (IRBuilder) -> Expr {
     return { b in
         return b.delay1(cellId, curr)
@@ -280,7 +416,12 @@ public enum LazyOp {
     case constant(Float)
     case output(Int)
     case input(Int)
+    case tensorRef(TensorID)
     case seq  // Sequential execution - returns value of last input
+
+    // Tensor operations (historyRead/historyWrite handle tensors automatically based on cell size)
+    case conv2d(Shape)               // 2D convolution, Shape is kernel shape [kH, kW]
+    case sum                         // Reduce tensor to scalar by summing all elements
 
     public func emit(ctx: IRContext, g: Graph, nodeId: NodeID) throws -> [UOp] {
         guard let node = g.nodes[nodeId] else { return [] }
@@ -294,152 +435,156 @@ public enum LazyOp {
         case .constant(let value):
             _ = ctx.useConstant(src: nodeId, value: value)
             return []
-
+        case .tensorRef(_):
+            // Register a placeholder value so that downstream ops can find this input
+            // The actual tensor data is accessed via nodeToTensor lookup
+            ctx.values[nodeId] = .empty
+            return []
         case .add:
             guard inputs.count == 2 else {
                 throw DGenError.insufficientInputs(
                     operator: "add", expected: 2, actual: inputs.count)
             }
-            b.use(val: b.value(inputs[0]) + b.value(inputs[1]))
+            emitBinaryOp(b: b, g: g, node: node, inputs: inputs) { $0 + $1 }
         case .sub:
             guard inputs.count == 2 else {
                 throw DGenError.insufficientInputs(
                     operator: "sub", expected: 2, actual: inputs.count)
             }
-            b.use(val: b.value(inputs[0]) - b.value(inputs[1]))
+            emitBinaryOp(b: b, g: g, node: node, inputs: inputs) { $0 - $1 }
         case .mul:
             guard inputs.count == 2 else {
                 print("mul failing \(node.id)")
                 throw DGenError.insufficientInputs(
                     operator: "mul", expected: 2, actual: inputs.count)
             }
-            b.use(val: b.value(inputs[0]) * b.value(inputs[1]))
+            emitBinaryOp(b: b, g: g, node: node, inputs: inputs) { $0 * $1 }
         case .div:
             guard inputs.count == 2 else {
                 throw DGenError.insufficientInputs(
                     operator: "div", expected: 2, actual: inputs.count)
             }
-            b.use(val: b.value(inputs[0]) / b.value(inputs[1]))
+            emitBinaryOp(b: b, g: g, node: node, inputs: inputs) { $0 / $1 }
         case .mod:
             guard inputs.count == 2 else {
                 throw DGenError.insufficientInputs(
                     operator: "mod", expected: 2, actual: inputs.count)
             }
-            b.use(val: b.value(inputs[0]) % b.value(inputs[1]))
+            emitBinaryOp(b: b, g: g, node: node, inputs: inputs) { $0 % $1 }
         case .min:
             guard inputs.count == 2 else {
                 throw DGenError.insufficientInputs(
                     operator: "min", expected: 2, actual: inputs.count)
             }
-            b.use(val: b.min(b.value(inputs[0]), b.value(inputs[1])))
+            emitBinaryOp(b: b, g: g, node: node, inputs: inputs) { b.min($0, $1) }
         case .max:
             guard inputs.count == 2 else {
                 throw DGenError.insufficientInputs(
                     operator: "max", expected: 2, actual: inputs.count)
             }
-            b.use(val: b.max(b.value(inputs[0]), b.value(inputs[1])))
+            emitBinaryOp(b: b, g: g, node: node, inputs: inputs) { b.max($0, $1) }
         case .and:
             guard inputs.count == 2 else {
                 throw DGenError.insufficientInputs(
                     operator: "and", expected: 2, actual: inputs.count)
             }
-            b.use(val: b.and(b.value(inputs[0]), b.value(inputs[1])))
+            emitBinaryOp(b: b, g: g, node: node, inputs: inputs) { b.and($0, $1) }
         case .or:
             guard inputs.count == 2 else {
                 throw DGenError.insufficientInputs(
                     operator: "or", expected: 2, actual: inputs.count)
             }
-            b.use(val: b.or(b.value(inputs[0]), b.value(inputs[1])))
+            emitBinaryOp(b: b, g: g, node: node, inputs: inputs) { b.or($0, $1) }
         case .xor:
             guard inputs.count == 2 else {
                 throw DGenError.insufficientInputs(
                     operator: "xor", expected: 2, actual: inputs.count)
             }
-            b.use(val: b.xor(b.value(inputs[0]), b.value(inputs[1])))
+            emitBinaryOp(b: b, g: g, node: node, inputs: inputs) { b.xor($0, $1) }
         case .abs:
             guard inputs.count == 1 else {
                 throw DGenError.insufficientInputs(
                     operator: "abs", expected: 1, actual: inputs.count)
             }
-            b.use(val: b.abs(b.value(inputs[0])))
+            emitUnaryOp(b: b, g: g, node: node, inputs: inputs) { b.abs($0) }
         case .sign:
             guard inputs.count == 1 else {
                 throw DGenError.insufficientInputs(
                     operator: "sign", expected: 1, actual: inputs.count)
             }
-            b.use(val: b.sign(b.value(inputs[0])))
+            emitUnaryOp(b: b, g: g, node: node, inputs: inputs) { b.sign($0) }
         case .sin:
             guard inputs.count == 1 else {
                 throw DGenError.insufficientInputs(
                     operator: "sin", expected: 1, actual: inputs.count)
             }
-            b.use(val: b.sin(b.value(inputs[0])))
+            emitUnaryOp(b: b, g: g, node: node, inputs: inputs) { b.sin($0) }
         case .cos:
             guard inputs.count == 1 else {
                 throw DGenError.insufficientInputs(
                     operator: "cos", expected: 1, actual: inputs.count)
             }
-            b.use(val: b.cos(b.value(inputs[0])))
+            emitUnaryOp(b: b, g: g, node: node, inputs: inputs) { b.cos($0) }
         case .tan:
             guard inputs.count == 1 else {
                 throw DGenError.insufficientInputs(
                     operator: "tan", expected: 1, actual: inputs.count)
             }
-            b.use(val: b.tan(b.value(inputs[0])))
+            emitUnaryOp(b: b, g: g, node: node, inputs: inputs) { b.tan($0) }
         case .tanh:
             guard inputs.count == 1 else {
                 throw DGenError.insufficientInputs(
                     operator: "tanh", expected: 1, actual: inputs.count)
             }
-            b.use(val: b.tanh(b.value(inputs[0])))
+            emitUnaryOp(b: b, g: g, node: node, inputs: inputs) { b.tanh($0) }
         case .exp:
             guard inputs.count == 1 else {
                 throw DGenError.insufficientInputs(
                     operator: "exp", expected: 1, actual: inputs.count)
             }
-            b.use(val: b.exp(b.value(inputs[0])))
+            emitUnaryOp(b: b, g: g, node: node, inputs: inputs) { b.exp($0) }
         case .log:
             guard inputs.count == 1 else {
                 throw DGenError.insufficientInputs(
                     operator: "log", expected: 1, actual: inputs.count)
             }
-            b.use(val: b.log(b.value(inputs[0])))
+            emitUnaryOp(b: b, g: g, node: node, inputs: inputs) { b.log($0) }
         case .log10:
             guard inputs.count == 1 else {
                 throw DGenError.insufficientInputs(
                     operator: "log10", expected: 1, actual: inputs.count)
             }
-            b.use(val: b.log10(b.value(inputs[0])))
+            emitUnaryOp(b: b, g: g, node: node, inputs: inputs) { b.log10($0) }
         case .sqrt:
             guard inputs.count == 1 else {
                 throw DGenError.insufficientInputs(
                     operator: "sqrt", expected: 1, actual: inputs.count)
             }
-            b.use(val: b.sqrt(b.value(inputs[0])))
+            emitUnaryOp(b: b, g: g, node: node, inputs: inputs) { b.sqrt($0) }
         case .pow:
             guard inputs.count == 2 else {
                 throw DGenError.insufficientInputs(
                     operator: "pow", expected: 2, actual: inputs.count)
             }
-            b.use(val: b.pow(b.value(inputs[0]), b.value(inputs[1])))
+            emitBinaryOp(b: b, g: g, node: node, inputs: inputs) { b.pow($0, $1) }
         case .floor:
             guard inputs.count == 1 else {
                 throw DGenError.insufficientInputs(
                     operator: "floor", expected: 1, actual: inputs.count)
             }
-            b.use(val: b.floor(b.value(inputs[0])))
+            emitUnaryOp(b: b, g: g, node: node, inputs: inputs) { b.floor($0) }
         case .round:
             guard inputs.count == 1 else {
                 throw DGenError.insufficientInputs(
-                    operator: "floor", expected: 1, actual: inputs.count)
+                    operator: "round", expected: 1, actual: inputs.count)
             }
-            b.use(val: b.round(b.value(inputs[0])))
+            emitUnaryOp(b: b, g: g, node: node, inputs: inputs) { b.round($0) }
         case .ceil:
             guard inputs.count == 1 else {
                 throw DGenError.insufficientInputs(
                     operator: "ceil", expected: 1, actual: inputs.count)
             }
-            b.use(val: b.ceil(b.value(inputs[0])))
+            emitUnaryOp(b: b, g: g, node: node, inputs: inputs) { b.ceil($0) }
         case .memoryRead(let cellId):
             guard inputs.count == 1 else {
                 throw DGenError.insufficientInputs(
@@ -489,37 +634,37 @@ public enum LazyOp {
                 throw DGenError.insufficientInputs(
                     operator: "gt", expected: 2, actual: inputs.count)
             }
-            b.use(val: b.value(inputs[0]) > b.value(inputs[1]))
+            emitBinaryOp(b: b, g: g, node: node, inputs: inputs) { $0 > $1 }
         case .gte:
             guard inputs.count == 2 else {
                 throw DGenError.insufficientInputs(
                     operator: "gte", expected: 2, actual: inputs.count)
             }
-            b.use(val: b.value(inputs[0]) >= b.value(inputs[1]))
+            emitBinaryOp(b: b, g: g, node: node, inputs: inputs) { $0 >= $1 }
         case .lte:
             guard inputs.count == 2 else {
                 throw DGenError.insufficientInputs(
                     operator: "lte", expected: 2, actual: inputs.count)
             }
-            b.use(val: b.value(inputs[0]) <= b.value(inputs[1]))
+            emitBinaryOp(b: b, g: g, node: node, inputs: inputs) { $0 <= $1 }
         case .lt:
             guard inputs.count == 2 else {
                 throw DGenError.insufficientInputs(
                     operator: "lt", expected: 2, actual: inputs.count)
             }
-            b.use(val: b.value(inputs[0]) < b.value(inputs[1]))
+            emitBinaryOp(b: b, g: g, node: node, inputs: inputs) { $0 < $1 }
         case .eq:
             guard inputs.count == 2 else {
                 throw DGenError.insufficientInputs(
                     operator: "eq", expected: 2, actual: inputs.count)
             }
-            b.use(val: b.value(inputs[0]) == b.value(inputs[1]))
+            emitBinaryOp(b: b, g: g, node: node, inputs: inputs) { $0 == $1 }
         case .gswitch:
             guard inputs.count == 3 else {
                 throw DGenError.insufficientInputs(
                     operator: "gswitch", expected: 3, actual: inputs.count)
             }
-            b.use(val: b.gswitch(b.value(inputs[0]), b.value(inputs[1]), b.value(inputs[2])))
+            emitTernaryOp(b: b, g: g, node: node, inputs: inputs) { b.gswitch($0, $1, $2) }
         case .selector:
             guard inputs.count >= 2 else {
                 throw DGenError.insufficientInputs(
@@ -529,12 +674,29 @@ public enum LazyOp {
             let options = Array(inputs.dropFirst())
             b.use(val: b.selector(b.value(mode), options.map { b.value($0) }))
         case .historyWrite(let cellId):
-            // for simd its beyond just this -- we need to ensure that we shift the results 1
-            guard inputs.count == 1 else {
-                throw DGenError.insufficientInputs(
-                    operator: "history write", expected: 1, actual: inputs.count)
+            // Unified history write - handles both scalar and tensor based on cellToTensor mapping
+            if let tensorId = g.cellToTensor[cellId], let tensor = g.tensors[tensorId] {
+                // Tensor write: copy from input tensor to history cell
+                guard node.inputs.count >= 1 else {
+                    throw DGenError.insufficientInputs(
+                        operator: "historyWrite", expected: 1, actual: node.inputs.count)
+                }
+                let inputTensorId = g.nodeToTensor[node.inputs[0]]!
+                let inputCellId = g.tensors[inputTensorId]!.cellId
+                let size = tensor.size
+
+                b.parallelRange(size) { idx in
+                    let value = b.memoryRead(inputCellId, b.cast(idx, to: .int))
+                    _ = b.memoryWrite(cellId, b.cast(idx, to: .int), value)
+                }
+            } else {
+                // Scalar write
+                guard inputs.count == 1 else {
+                    throw DGenError.insufficientInputs(
+                        operator: "history write", expected: 1, actual: inputs.count)
+                }
+                b.use(val: b.store(cellId, b.value(inputs[0])))
             }
-            b.use(val: b.store(cellId, b.value(inputs[0])))
         case .param(let cellId):
             b.use(val: b.load(cellId))
         case .historyReadWrite(let cellId):
@@ -545,12 +707,23 @@ public enum LazyOp {
             }
             b.use(val: u_historyWrite(cellId: cellId, b.value(inputs[0]))(b))
         case .historyRead(let cellId):
-            // no longer doing anything here TODO - remove
-            guard inputs.count == 0 else {
-                throw DGenError.insufficientInputs(
-                    operator: "history read", expected: 0, actual: inputs.count)
+            // Unified history read - handles both scalar and tensor based on cellToTensor mapping
+            if let tensorId = g.cellToTensor[cellId], let tensor = g.tensors[tensorId] {
+                // Tensor read: copy from history cell to output tensor
+                let outputTensorId = g.nodeToTensor[node.id]!
+                let outputCellId = g.tensors[outputTensorId]!.cellId
+                let size = tensor.size
+
+                b.parallelRange(size) { idx in
+                    let value = b.memoryRead(cellId, b.cast(idx, to: .int))
+                    _ = b.memoryWrite(outputCellId, b.cast(idx, to: .int), value)
+                }
+                // Register placeholder for downstream ops
+                ctx.values[nodeId] = .empty
+            } else {
+                // Scalar read
+                b.use(val: b.load(cellId))
             }
-            b.use(val: b.load(cellId))
         case .latch(let cellId):
             guard inputs.count == 2 else {
                 throw DGenError.insufficientInputs(
@@ -612,6 +785,99 @@ public enum LazyOp {
                     operator: "seq", expected: node.inputs.count,
                     actual: node.inputs.compactMap { ctx.values[$0] }.count)
             }
+
+        // MARK: - Tensor Operations
+
+        case .conv2d(let kernelShape):
+            // 2D convolution: input tensor convolved with kernel tensor
+            // Check node.inputs for tensor compatibility
+            guard node.inputs.count >= 2 else {
+                throw DGenError.insufficientInputs(
+                    operator: "conv2d", expected: 2, actual: node.inputs.count)
+            }
+            guard case .tensor(let outputShape) = node.shape else {
+                throw DGenError.insufficientInputs(operator: "conv2d", expected: 2, actual: 0)
+            }
+            let inputShape = g.nodes[node.inputs[0]]?.shape
+            guard case .tensor(let inShape) = inputShape, inShape.count == 2 else {
+                throw DGenError.insufficientInputs(operator: "conv2d input must be 2D", expected: 2, actual: 0)
+            }
+
+            let outputSize = outputShape.reduce(1, *)
+            let outputTensorId = g.nodeToTensor[node.id]!
+            let outputCellId = g.tensors[outputTensorId]!.cellId
+
+            let inputTensorId = g.nodeToTensor[node.inputs[0]]!
+            let inputCellId = g.tensors[inputTensorId]!.cellId
+
+            let kernelTensorId = g.nodeToTensor[node.inputs[1]]!
+            let kernelCellId = g.tensors[kernelTensorId]!.cellId
+
+            let inH = inShape[0]
+            let inW = inShape[1]
+            let kH = kernelShape[0]
+            let kW = kernelShape[1]
+            let padH = kH / 2
+            let padW = kW / 2
+
+            // Parallel over output elements
+            b.parallelRange(outputSize) { flatIdx in
+                // Convert flat index to 2D coordinates
+                let outY = b.cast(flatIdx, to: .int) / b.constant(Float(inW))
+                let outX = b.cast(flatIdx, to: .int) % b.constant(Float(inW))
+
+                // Accumulate convolution sum
+                let acc = b.float(0.0)
+
+                // Nested loops over kernel
+                b.loop(kH) { ky in
+                    b.loop(kW) { kx in
+                        let inY = outY + b.cast(ky, to: .float) - b.constant(Float(padH))
+                        let inX = outX + b.cast(kx, to: .float) - b.constant(Float(padW))
+
+                        // Bounds check (zero-padding)
+                        let inBounds = (inY >= b.constant(0.0)) * (inY < b.constant(Float(inH)))
+                            * (inX >= b.constant(0.0)) * (inX < b.constant(Float(inW)))
+
+                        let inputIdx = b.cast(inY, to: .int) * b.constant(Float(inW)) + b.cast(inX, to: .int)
+                        let kernelIdx = b.cast(ky, to: .float) * b.constant(Float(kW)) + b.cast(kx, to: .float)
+
+                        let inputVal = b.gswitch(inBounds, b.memoryRead(inputCellId, inputIdx), b.constant(0.0))
+                        let kernelVal = b.memoryRead(kernelCellId, b.cast(kernelIdx, to: .int))
+
+                        acc.accumulate(inputVal * kernelVal)
+                    }
+                }
+
+                _ = b.memoryWrite(outputCellId, b.cast(flatIdx, to: .int), acc.value)
+            }
+
+        case .sum:
+            // Reduce tensor to scalar by summing all elements
+            // Check node.inputs for tensor compatibility
+            guard node.inputs.count >= 1 else {
+                throw DGenError.insufficientInputs(
+                    operator: "sum", expected: 1, actual: node.inputs.count)
+            }
+            let inputShape = g.nodes[node.inputs[0]]?.shape ?? .scalar
+            guard case .tensor(let shape) = inputShape else {
+                // If input is scalar, just pass through
+                if let scalarInput = inputs.first {
+                    b.use(val: b.value(scalarInput))
+                }
+                break
+            }
+            let size = shape.reduce(1, *)
+            let inputTensorId = g.nodeToTensor[node.inputs[0]]!
+            let inputCellId = g.tensors[inputTensorId]!.cellId
+
+            // Sequential reduction (parallel reduction would need different UOps)
+            let acc = b.float(0.0)
+            b.loop(size) { idx in
+                let val = b.memoryRead(inputCellId, b.cast(idx, to: .int))
+                acc.accumulate(val)
+            }
+            b.use(val: acc.value)
         }
         ops.append(contentsOf: b.ops)
         return ops
@@ -646,6 +912,8 @@ public enum LazyOp {
             // Constants have no gradients to propagate
             // should we return 0 so that it can actually propagate?
             // constant is a leaf so it'd be at the very end anyway so probably fine
+            return []
+        case .tensorRef(_):
             return []
         case .and, .or, .xor:
             return []
@@ -1022,6 +1290,25 @@ public enum LazyOp {
             if let lastInput = node.inputs.last {
                 b.grad(lastInput, value: gradOutput)
             }
+
+        // MARK: - Tensor Operation Gradients
+
+        case .conv2d(_):
+            // Conv2d gradient: gradient w.r.t. input = conv2d(grad_output, flipped_kernel)
+            // gradient w.r.t. kernel = conv2d(input, grad_output)
+            // This is complex - for now, we provide zero gradients (TODO: implement full backprop)
+            guard inputs.count == 2 else { fatalError("conv2d requires 2 inputs") }
+            // For membrane simulation, we often don't need kernel gradients (fixed Laplacian)
+            // Input gradient would require transposed convolution
+            b.grad(node.inputs[0], value: ctx.useConstant(src: nil, value: 0.0))
+            b.grad(node.inputs[1], value: ctx.useConstant(src: nil, value: 0.0))
+
+        case .sum:
+            // d(sum(x))/dx[i] = 1 for all i
+            // Gradient broadcasts from scalar back to tensor
+            guard inputs.count == 1 else { fatalError("sum requires 1 input") }
+            // Pass gradient through (it will be broadcast to all elements)
+            b.grad(node.inputs[0], value: gradOutput)
         }
 
         ops.append(contentsOf: b.ops)

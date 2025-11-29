@@ -347,6 +347,19 @@ public final class IRBuilder {
     ops.append(UOp(op: .endLoop, value: ctx.useVariable(src: nil)))
   }
 
+  /// Parallel range for tensor operations.
+  /// Iterations are independent and can be parallelized.
+  /// Renderer decides: C emits a loop, Metal static emits thread-parallel.
+  public func parallelRange(_ count: Int, body: (Expr) -> Void) {
+    let indexVar = ctx.useVariable(src: nodeId)
+    ops.append(UOp(op: .beginParallelRange(count), value: indexVar))
+    // Emit parallelIndex - use the SAME variable as beginParallelRange
+    // so the renderer can match them up
+    ops.append(UOp(op: .parallelIndex, value: indexVar))
+    body(value(indexVar))
+    ops.append(UOp(op: .endParallelRange, value: ctx.useVariable(src: nil)))
+  }
+
   public func threadIndex() -> Expr {
     let dest = ctx.useVariable(src: nodeId)
     let uop = UOp(op: .threadIndex, value: dest)
