@@ -5,10 +5,12 @@ import Foundation
 public struct BlockUOps {
     public var ops: [UOp]
     public let kind: Kind
+    public let temporality: Temporality
 
-    public init(ops: [UOp], kind: Kind) {
+    public init(ops: [UOp], kind: Kind, temporality: Temporality = .static_) {
         self.ops = ops
         self.kind = kind
+        self.temporality = temporality
     }
 }
 
@@ -263,14 +265,6 @@ public class CRenderer: Renderer {
                 return boolmask_to_float(m);
             }
 
-            // Timing instrumentation for \(name) [\(kernelUUID)]
-            #ifdef DGEN_PROFILE
-            static uint64_t kernel_invocation_count_\(sanitizedName) = 0;
-            static uint64_t kernel_max_time_nanos_\(sanitizedName) = 0;
-            static mach_timebase_info_data_t timebase_info_\(sanitizedName);
-            static int timebase_initialized_\(sanitizedName) = 0;
-            #endif
-
             """)
 
         // Declare globals
@@ -298,30 +292,14 @@ public class CRenderer: Renderer {
             """)
 
         code.append(
-            "void process(float * restrict const *in, float * restrict const *out, int nframes, void * restrict state) {"
+            "void process(float * restrict const *in, float * restrict const *out, int nframes, void * restrict state, void * restrict buffers) {"
         )
-
-        // Add timing instrumentation at start of function
-        code.append(
-            """
-              #ifdef DGEN_PROFILE
-              // Initialize timebase info once
-              if (!timebase_initialized_\(sanitizedName)) {
-                mach_timebase_info(&timebase_info_\(sanitizedName));
-                timebase_initialized_\(sanitizedName) = 1;
-              }
-
-              // Start timing
-              uint64_t start_time = mach_absolute_time();
-              #endif
-
-            """)
 
         // Use audiograph parameters directly - no mapping needed
         code.append("  int frameCount = nframes;  // Use audiograph frame count parameter")
 
-        // Define constants and memory
-        for (constantId, constant) in ctx.constants {
+        // Define constants and memory (sorted by constantId for deterministic output)
+        for (constantId, constant) in ctx.constants.sorted(by: { $0.key < $1.key }) {
             let uop = UOp(op: .defineConstant(constantId, constant), value: .empty)
             code.append("  \(emit(uop, ctx: ctx))")
         }
@@ -332,6 +310,10 @@ public class CRenderer: Renderer {
         code.append("  int voiceIndex = 0;")
         if let voiceCellId = voiceCellIdOpt {
             code.append("  voiceIndex = (int)memory[\(voiceCellId)];")
+        } else {
+            print(
+                "\(ANSI.red)NO VOICE INDEX!!!!!!!!!!!!!\(String(repeating:"********\n", count:24))\(ANSI.reset)"
+            )
         }
         code.append("  if (voiceIndex < 0) voiceIndex = 0;")
         code.append("  if (voiceIndex >= VOICE_COUNT) voiceIndex = VOICE_COUNT - 1;")
@@ -345,9 +327,9 @@ public class CRenderer: Renderer {
         for uop in scheduleItem.ops {
             var diff = 0
             switch uop.op {
-            case .beginIf, .beginLoop, .beginForLoop:
+            case .beginIf, .beginLoop, .beginForLoop, .beginParallelRange:
                 diff = 1
-            case .endIf, .endLoop:
+            case .endIf, .endLoop, .endParallelRange:
                 indent -= 1
             default:
                 break
@@ -358,31 +340,6 @@ public class CRenderer: Renderer {
             code.append("\(indentStr)\(line)")
             indent += diff
         }
-
-        // Add timing instrumentation before closing function
-        code.append(
-            """
-              #ifdef DGEN_PROFILE
-              // End timing and update stats
-              uint64_t end_time = mach_absolute_time();
-              uint64_t elapsed_abs = end_time - start_time;
-              uint64_t elapsed_nanos = elapsed_abs * timebase_info_\(sanitizedName).numer / timebase_info_\(sanitizedName).denom;
-
-              if (elapsed_nanos > kernel_max_time_nanos_\(sanitizedName)) {
-                kernel_max_time_nanos_\(sanitizedName) = elapsed_nanos;
-              }
-
-              kernel_invocation_count_\(sanitizedName)++;
-
-              // Print every 2048 invocations
-              if (kernel_invocation_count_\(sanitizedName) % 2048 == 0) {
-                double max_time_ms = kernel_max_time_nanos_\(sanitizedName) / 1000000.0;
-                printf("⏱️  \(name) [\(kernelUUID)] invocation %llu - Max time: %.3f ms\\n",
-                       kernel_invocation_count_\(sanitizedName), max_time_ms);
-                kernel_max_time_nanos_\(sanitizedName) = 0;  // Reset for next interval
-              }
-              #endif
-            """)
 
         // Close process function
         code.append("}")
@@ -617,20 +574,22 @@ public class CRenderer: Renderer {
             let expr =
                 uop.kind == .simd
                 ? "simd_and_f32(\(g(a)), \(g(b)))"
-                : "((\(g(a))) && (\(g(b))))"
+                : "(((\(g(a)) != 0.0f) && (\(g(b)) != 0.0f)) ? 1.0f : 0.0f)"
             return emitAssign(uop, expr, ctx)
 
         case let .or(a, b):
             let expr =
                 uop.kind == .simd
                 ? "simd_or_f32(\(g(a)), \(g(b)))"
-                : "((\(g(a))) || (\(g(b))))"
+                : "(((\(g(a)) != 0.0f) || (\(g(b)) != 0.0f)) ? 1.0f : 0.0f)"
             return emitAssign(uop, expr, ctx)
+
         case let .xor(a, b):
+            // XOR: true iff exactly one is non-zero
             let expr =
                 uop.kind == .simd
                 ? "simd_xor_f32(\(g(a)), \(g(b)))"
-                : "((\(g(a))) ^ (\(g(b))))"
+                : "((((\(g(a)) != 0.0f) ^ ((\(g(b)) != 0.0f))) ? 1.0f : 0.0f))"
             return emitAssign(uop, expr, ctx)
         case let .atan2(y, x):
             let expr = uop.kind == .simd ? "vatan2f(\(g(y)), \(g(x)))" : "atan2f(\(g(y)), \(g(x)))"
@@ -823,6 +782,23 @@ public class CRenderer: Renderer {
             } else {
                 return emitAssign(uop, "t\(id)[i]", ctx)
             }
+
+        // Parallel range - for C, render as a simple for loop
+        // For static tensor ops, this could be outside frame loop (future optimization)
+        case let .beginParallelRange(count):
+            guard case .variable(let varId, _) = uop.value else {
+                fatalError("beginParallelRange requires variable")
+            }
+            return "for (int _pr\(varId) = 0; _pr\(varId) < \(count); _pr\(varId)++) {"
+        case .endParallelRange:
+            return "}"
+        case .parallelIndex:
+            // Return the loop variable from the enclosing parallelRange
+            // We use the value's varId to match the beginParallelRange
+            guard case .variable(let varId, _) = uop.value else {
+                fatalError("parallelIndex requires variable")
+            }
+            return emitAssign(uop, "_pr\(varId)", ctx)
 
         default:
             return "/* \(uop.prettyDescription()) */"

@@ -6,6 +6,7 @@ public enum DGenError: Error, LocalizedError {
     case missingTensorID
     case invalidNodeReference
     case compilationFailed(String)
+    case shapeMismatch(op: String, shape1: Shape, shape2: Shape)
 
     public var errorDescription: String? {
         switch self {
@@ -19,6 +20,8 @@ public enum DGenError: Error, LocalizedError {
             return "Invalid node reference"
         case .compilationFailed(let message):
             return "Compilation failed: \(message)"
+        case .shapeMismatch(let op, let shape1, let shape2):
+            return "Shape mismatch in \(op): \(shape1) vs \(shape2)"
         }
     }
 }

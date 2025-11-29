@@ -15,7 +15,8 @@ public class MetalRenderer: Renderer, UOpEmitter {
     name: String = "kernel"
   ) -> [CompiledKernel] {
     return scheduleItems.enumerated().map { (i, scheduleItem) in
-      let kernelName = scheduleItems.count > 1 ? "\(name)_\(i)" : name
+      // Always use _0, _1 suffix to avoid 'kernel' being a reserved word in Metal
+      let kernelName = "\(name)_\(i)"
       let source = render(
         name: kernelName, scheduleItem: scheduleItem, ctx: ctx, graph: graph,
         totalMemorySlots: totalMemorySlots)
@@ -239,9 +240,9 @@ public class MetalRenderer: Renderer, UOpEmitter {
     for uop in scheduleItem.ops {
       var diff = 0
       switch uop.op {
-      case .beginIf, .beginLoop, .beginRange, .beginForLoop:
+      case .beginIf, .beginLoop, .beginRange, .beginForLoop, .beginParallelRange:
         diff = 1
-      case .endIf, .endLoop, .endRange:
+      case .endIf, .endLoop, .endRange, .endParallelRange:
         indent -= 1
       default:
         break
@@ -311,12 +312,12 @@ public class MetalRenderer: Renderer, UOpEmitter {
       switch b {
       case let .constant(_, val):
         if val == 1.0 {
-          return emitAssign(uop, "(\(g(a)) - floor(\(g(a))))", ctx)
+          return emitAssign(uop, "(\(g(a)) - metal::floor(\(g(a))))", ctx)
         } else {
-          return emitAssign(uop, "(\(g(a)) - floor(\(g(a)) / \(val)) * \(val))", ctx)
+          return emitAssign(uop, "(\(g(a)) - metal::floor(\(g(a)) / \(val)) * \(val))", ctx)
         }
       default:
-        return emitAssign(uop, "fmod(\(g(a)), \(g(b)))", ctx)
+        return emitAssign(uop, "metal::fmod(\(g(a)), \(g(b)))", ctx)
       }
     case let .pow(a, b):
       // Specialize common exponents to avoid expensive pow
@@ -486,6 +487,37 @@ public class MetalRenderer: Renderer, UOpEmitter {
       // For Metal, loadGlobal is handled transparently through direct buffer access
       // The actual variable access happens in emitLazy
       return "/* loadGlobal(\(id)) - handled in variable access */"
+
+    // Parallel range - for Metal, could be thread-parallel for static tensors
+    // For now, render as a loop (future: check block.temporality and use thread-parallel for static)
+    case let .beginParallelRange(count):
+      guard case .variable(let varId, _) = uop.value else {
+        fatalError("beginParallelRange requires variable")
+      }
+      return "for (uint _pr\(varId) = 0; _pr\(varId) < \(count); _pr\(varId)++) {"
+    case .endParallelRange:
+      // IMPORTANT: Memory fence required for correctness on Metal.
+      //
+      // Without this fence, the Metal compiler may hoist memory reads outside the
+      // enclosing frame loop, causing all frames to read the initial state instead
+      // of seeing updates from previous frames. For example:
+      //
+      //   for (frame = 0; frame < 4; frame++) {
+      //     for (i = 0; i < 4; i++) {
+      //       val = memory[history + i];   // Metal may hoist this read
+      //       memory[history + i] = val + 1;
+      //     }
+      //   }
+      //
+      // The fence ensures writes complete and are visible before the next frame's reads.
+      // This matches how the C backend behaves (sequential consistency on CPU).
+      return "} atomic_thread_fence(metal::mem_flags::mem_device, metal::memory_order_seq_cst);"
+    case .parallelIndex:
+      // Return the loop variable from the enclosing parallelRange
+      guard case .variable(let varId, _) = uop.value else {
+        fatalError("parallelIndex requires variable")
+      }
+      return emitAssign(uop, "_pr\(varId)", ctx)
 
     default:
       return "/* \(uop.prettyDescription()) */"

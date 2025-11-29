@@ -77,6 +77,7 @@ public struct Node {
     public var op: LazyOp
     public let inputs: [NodeID]
     public var temporalDependencies: [NodeID] = []
+    public var shape: ValueShape? = nil
 
     /// Returns all dependencies (both regular inputs and temporal dependencies)
     public var allDependencies: [NodeID] {
@@ -90,6 +91,7 @@ open class Graph {
     private var nextCellId = 0
     public var nextTensorId = 0
     public var tensors: [TensorID: Tensor] = [:]
+    public var nodeToTensor: [NodeID: TensorID] = [:]
 
     /// Track allocation sizes for memory cells (especially large buffers like spectral scratch)
     public var cellAllocationSizes: [CellID: Int] = [:]
@@ -103,12 +105,15 @@ open class Graph {
         return n(op, ins)
     }
 
-    @discardableResult public func n(_ op: LazyOp, _ ins: [NodeID]) -> NodeID {
+    @discardableResult public func n(_ op: LazyOp, _ ins: [NodeID], shape: ValueShape? = .scalar)
+        -> NodeID
+    {
         // No special spectralLoss expansion (use Graph.spectralLoss API)
 
         let id = next
         next += 1
         nodes[id] = Node(id: id, op: op, inputs: ins)
+        nodes[id]?.shape = shape
 
         // Handle seq operator: find root dependencies of B and make them depend on A
         if case .seq = op, ins.count >= 2 {

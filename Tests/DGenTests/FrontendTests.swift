@@ -21,7 +21,7 @@ final class FrontendTests: XCTestCase {
                 }
                 let phase1 = g.phasor(freq)
                 let filtered1 = onepole(phase1, cutoff)
-                let loss = g.mse(filtered1, onepole(phase1, g.constant(0.8)))
+                let loss = g.mse(filtered1, onepole(phase1, g.constant(0.2)))
                 let frameCount = 256
                 let result = try g.compile(
                         loss, backend: .metal, frameCount: frameCount, debug: true)

@@ -70,8 +70,20 @@ public enum Op {
   case endLoop
   case beginRange(Lazy, Lazy)
   case endRange
+  case beginParallelRange(Int)   // count - iterations are independent, can be parallelized
+  case endParallelRange
+  case parallelIndex             // current index within parallel range
   case output(ChannelNumber, Lazy)
   case input(ChannelNumber)
+
+  // Tensor history operations (for state across frames)
+  case tensorHistoryRead(CellID, Int)       // (cellId, size) - read previous frame's tensor
+  case tensorHistoryWrite(CellID, Int)      // (cellId, size) - write tensor for next frame
+
+  // Tensor reduction operations
+  case beginReduce(Int)                     // (size) - start reduction over tensor elements
+  case endReduce                            // end reduction
+  case reduceAccumulate(Lazy)               // accumulate value into reduction result
   case frameCount
   case frameIndex
   case threadIndex
@@ -83,5 +95,5 @@ public enum Op {
 public struct UOp {
   public let op: Op
   public let value: Lazy
-  public var kind: Kind? = nil
+  public var kind: Kind? = nil  // SIMD or Scalar
 }
