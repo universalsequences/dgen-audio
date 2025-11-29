@@ -1,7 +1,10 @@
 public func inferShape(op: LazyOp, inputs: [ValueShape], graph: Graph) throws -> ValueShape {
   switch op {
   case .tensorRef(let tid):
-    return .tensor(graph.tensors[tid]!.shape)
+    guard let tensor = graph.tensors[tid] else {
+      throw DGenError.missingTensorID
+    }
+    return .tensor(tensor.shape)
 
   // Tensor history read - returns tensor of the same shape as allocated
   case .tensorHistoryRead(let cellId):
@@ -11,21 +14,21 @@ public func inferShape(op: LazyOp, inputs: [ValueShape], graph: Graph) throws ->
         return .tensor(tensor.shape)
       }
     }
-    return .scalar  // Fallback
+    throw DGenError.missingCellID(cellId)
 
   // Tensor history write - output shape same as input (passthrough)
   case .tensorHistoryWrite(_):
-    if let firstInput = inputs.first {
-      return firstInput
+    guard let firstInput = inputs.first else {
+      throw DGenError.shapeInferenceFailed(op: "tensorHistoryWrite", reason: "missing input")
     }
-    return .scalar
+    return firstInput
 
   // Conv2d - output shape matches input shape (same padding)
   case .conv2d(_):
-    if let firstInput = inputs.first {
-      return firstInput
+    guard let firstInput = inputs.first else {
+      throw DGenError.shapeInferenceFailed(op: "conv2d", reason: "missing input tensor")
     }
-    return .scalar
+    return firstInput
 
   // Sum reduce - always outputs scalar
   case .sum:
