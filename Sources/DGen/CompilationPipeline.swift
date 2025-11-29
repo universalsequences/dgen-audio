@@ -205,6 +205,25 @@ public struct CompilationPipeline {
             uopBlocks[i].ops = fuseParallelRanges(uopBlocks[i].ops)
         }
 
+        // Debug: print UOps after fusion
+        if options.debug {
+            for uopBlock in uopBlocks {
+                var indentLevel = 0
+                for uop in uopBlock.ops {
+                    switch uop.op {
+                    case .beginIf, .beginForLoop, .beginParallelRange, .beginLoop, .beginRange:
+                        print("\(String(repeating: "  ", count: indentLevel))\(uop.prettyDescription())")
+                        indentLevel += 1
+                    case .endIf, .endLoop, .endParallelRange, .endRange:
+                        indentLevel = max(0, indentLevel - 1)
+                        print("\(String(repeating: "  ", count: indentLevel))\(uop.prettyDescription())")
+                    default:
+                        print("\(String(repeating: "  ", count: indentLevel))\(uop.prettyDescription())")
+                    }
+                }
+            }
+        }
+
         // Step 7: Lower UOp blocks to compiled kernels
         // Ensure a dedicated voice cell exists when voiceCount > 1
         var voiceCellIdFinal: Int? = options.voiceCellId

@@ -6,20 +6,19 @@ public func inferShape(op: LazyOp, inputs: [ValueShape], graph: Graph) throws ->
     }
     return .tensor(tensor.shape)
 
-  // Tensor history read - returns tensor of the same shape as allocated
-  case .tensorHistoryRead(let cellId):
-    // Find the tensor that uses this cell
-    for (_, tensor) in graph.tensors {
-      if tensor.cellId == cellId {
-        return .tensor(tensor.shape)
-      }
+  // History read - returns scalar or tensor shape depending on cell
+  case .historyRead(let cellId):
+    // O(1) lookup using cellToTensor mapping
+    if let tensorId = graph.cellToTensor[cellId], let tensor = graph.tensors[tensorId] {
+      return .tensor(tensor.shape)
     }
-    throw DGenError.missingCellID(cellId)
+    // Scalar cell
+    return .scalar
 
-  // Tensor history write - output shape same as input (passthrough)
-  case .tensorHistoryWrite(_):
+  // History write - output shape same as input (passthrough)
+  case .historyWrite(_):
     guard let firstInput = inputs.first else {
-      throw DGenError.shapeInferenceFailed(op: "tensorHistoryWrite", reason: "missing input")
+      throw DGenError.shapeInferenceFailed(op: "historyWrite", reason: "missing input")
     }
     return firstInput
 
@@ -102,11 +101,9 @@ public func isIntrinsicallyFrameBased(_ op: LazyOp) -> Bool {
   case .phasor(_):              return true  // oscillator state changes each frame
   case .accum(_):               return true  // accumulator state changes each frame
   case .input(_):               return true  // audio input varies each frame
-  case .historyRead(_):         return true  // reads temporal state
-  case .historyWrite(_):        return true  // writes temporal state
+  case .historyRead(_):         return true  // reads temporal state (scalar or tensor)
+  case .historyWrite(_):        return true  // writes temporal state (scalar or tensor)
   case .historyReadWrite(_):    return true  // combined temporal operation
-  case .tensorHistoryRead(_):   return true  // reads tensor temporal state
-  case .tensorHistoryWrite(_):  return true  // writes tensor temporal state
   case .latch(_):               return true  // conditional state update
   case .click(_):               return true  // trigger/event based
   default:                      return false

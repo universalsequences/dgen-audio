@@ -153,10 +153,6 @@ extension UOp {
             opStr = "\(ANSI.magenta)endParallelRange\(ANSI.reset)"
         case .parallelIndex:
             opStr = "\(ANSI.magenta)parallelIndex\(ANSI.reset)"
-        case let .tensorHistoryRead(cellId, size):
-            opStr = "\(ANSI.cyan)tensorHistoryRead\(ANSI.reset)(\(cellId), size=\(size))"
-        case let .tensorHistoryWrite(cellId, size):
-            opStr = "\(ANSI.cyan)tensorHistoryWrite\(ANSI.reset)(\(cellId), size=\(size))"
         case let .beginReduce(size):
             opStr = "\(ANSI.magenta)beginReduce\(ANSI.reset)(\(size))"
         case .endReduce:

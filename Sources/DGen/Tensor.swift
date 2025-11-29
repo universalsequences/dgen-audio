@@ -68,6 +68,7 @@ extension Graph {
         let tensorId = nextTensorId
         nextTensorId += 1
         self.tensors[tensorId] = Tensor(id: tensorId, shape: shape, cellId: cellId, data: data)
+        self.cellToTensor[cellId] = tensorId
         let nodeId = self.n(.tensorRef(tensorId), [], shape: .tensor(shape))
         self.nodeToTensor[nodeId] = tensorId
         return nodeId
@@ -121,6 +122,7 @@ extension Graph {
         let tensorId = nextTensorId
         nextTensorId += 1
         tensors[tensorId] = Tensor(id: tensorId, shape: shape, cellId: cellId, data: data)
+        cellToTensor[cellId] = tensorId
         return TensorHistoryBuffer(cellId: cellId, shape: shape, tensorId: tensorId)
     }
 
@@ -136,8 +138,10 @@ extension Graph {
         nextTensorId += 1
         tensors[outputTensorId] = Tensor(
             id: outputTensorId, shape: buffer.shape, cellId: outputCellId)
+        cellToTensor[outputCellId] = outputTensorId
 
-        let nodeId = n(.tensorHistoryRead(buffer.cellId), [], shape: .tensor(buffer.shape))
+        // Use unified historyRead - checks cellToTensor to determine if tensor or scalar
+        let nodeId = n(.historyRead(buffer.cellId), [], shape: .tensor(buffer.shape))
         nodeToTensor[nodeId] = outputTensorId
         return nodeId
     }
@@ -145,7 +149,8 @@ extension Graph {
     /// Write new state to a tensor history buffer
     @discardableResult
     public func tensorHistoryWrite(_ buffer: TensorHistoryBuffer, _ value: NodeID) -> NodeID {
-        return n(.tensorHistoryWrite(buffer.cellId), value)
+        // Use unified historyWrite - checks cellToTensor to determine if tensor or scalar
+        return n(.historyWrite(buffer.cellId), [value], shape: .tensor(buffer.shape))
     }
 
     public func poke(tensor: NodeID, index: NodeID, channel: NodeID, value: NodeID) throws

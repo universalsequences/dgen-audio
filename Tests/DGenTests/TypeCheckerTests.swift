@@ -108,45 +108,42 @@ final class TypeCheckerTests: XCTestCase {
         }
     }
 
-    func testTensorHistoryReadInfersShape() throws {
+    func testHistoryReadWithTensorCellInfersTensorShape() throws {
         let g = Graph()
         let buffer = g.tensorHistoryBuffer(shape: [4, 4])
 
-        let shape = try inferShape(op: .tensorHistoryRead(buffer.cellId), inputs: [], graph: g)
+        // historyRead with a tensor cell returns tensor shape
+        let shape = try inferShape(op: .historyRead(buffer.cellId), inputs: [], graph: g)
         XCTAssertEqual(shape, .tensor([4, 4]))
     }
 
-    func testTensorHistoryReadMissingCellThrows() throws {
+    func testHistoryReadWithScalarCellInfersScalar() throws {
         let g = Graph()
+        let scalarCell = g.alloc()  // Scalar cell, not in cellToTensor
 
-        XCTAssertThrowsError(try inferShape(op: .tensorHistoryRead(999), inputs: [], graph: g)) {
-            error in
-            guard case DGenError.missingCellID(let cellId) = error else {
-                XCTFail("Expected missingCellID error, got \(error)")
-                return
-            }
-            XCTAssertEqual(cellId, 999)
-        }
+        // historyRead with a scalar cell returns scalar
+        let shape = try inferShape(op: .historyRead(scalarCell), inputs: [], graph: g)
+        XCTAssertEqual(shape, .scalar)
     }
 
-    func testTensorHistoryWritePassthroughShape() throws {
+    func testHistoryWritePassthroughShape() throws {
         let g = Graph()
 
         let shape = try inferShape(
-            op: .tensorHistoryWrite(0), inputs: [.tensor([3, 3])], graph: g)
+            op: .historyWrite(0), inputs: [.tensor([3, 3])], graph: g)
         XCTAssertEqual(shape, .tensor([3, 3]))
     }
 
-    func testTensorHistoryWriteMissingInputThrows() throws {
+    func testHistoryWriteMissingInputThrows() throws {
         let g = Graph()
 
-        XCTAssertThrowsError(try inferShape(op: .tensorHistoryWrite(0), inputs: [], graph: g)) {
+        XCTAssertThrowsError(try inferShape(op: .historyWrite(0), inputs: [], graph: g)) {
             error in
             guard case DGenError.shapeInferenceFailed(let op, _) = error else {
                 XCTFail("Expected shapeInferenceFailed error, got \(error)")
                 return
             }
-            XCTAssertEqual(op, "tensorHistoryWrite")
+            XCTAssertEqual(op, "historyWrite")
         }
     }
 
@@ -201,8 +198,8 @@ final class TypeCheckerTests: XCTestCase {
         XCTAssertFalse(isIntrinsicallyFrameBased(.constant(1.0)))
     }
 
-    func testTensorHistoryReadIsFrameBased() {
-        XCTAssertTrue(isIntrinsicallyFrameBased(.tensorHistoryRead(0)))
+    func testHistoryReadIsFrameBased() {
+        XCTAssertTrue(isIntrinsicallyFrameBased(.historyRead(0)))
     }
 
     func testTemporalityPropagates() {

@@ -419,9 +419,7 @@ public enum LazyOp {
     case tensorRef(TensorID)
     case seq  // Sequential execution - returns value of last input
 
-    // Tensor operations
-    case tensorHistoryRead(CellID)   // Read previous frame's tensor state
-    case tensorHistoryWrite(CellID)  // Write tensor state for next frame
+    // Tensor operations (historyRead/historyWrite handle tensors automatically based on cell size)
     case conv2d(Shape)               // 2D convolution, Shape is kernel shape [kH, kW]
     case sum                         // Reduce tensor to scalar by summing all elements
 
@@ -676,12 +674,29 @@ public enum LazyOp {
             let options = Array(inputs.dropFirst())
             b.use(val: b.selector(b.value(mode), options.map { b.value($0) }))
         case .historyWrite(let cellId):
-            // for simd its beyond just this -- we need to ensure that we shift the results 1
-            guard inputs.count == 1 else {
-                throw DGenError.insufficientInputs(
-                    operator: "history write", expected: 1, actual: inputs.count)
+            // Unified history write - handles both scalar and tensor based on cellToTensor mapping
+            if let tensorId = g.cellToTensor[cellId], let tensor = g.tensors[tensorId] {
+                // Tensor write: copy from input tensor to history cell
+                guard node.inputs.count >= 1 else {
+                    throw DGenError.insufficientInputs(
+                        operator: "historyWrite", expected: 1, actual: node.inputs.count)
+                }
+                let inputTensorId = g.nodeToTensor[node.inputs[0]]!
+                let inputCellId = g.tensors[inputTensorId]!.cellId
+                let size = tensor.size
+
+                b.parallelRange(size) { idx in
+                    let value = b.memoryRead(inputCellId, b.cast(idx, to: .int))
+                    _ = b.memoryWrite(cellId, b.cast(idx, to: .int), value)
+                }
+            } else {
+                // Scalar write
+                guard inputs.count == 1 else {
+                    throw DGenError.insufficientInputs(
+                        operator: "history write", expected: 1, actual: inputs.count)
+                }
+                b.use(val: b.store(cellId, b.value(inputs[0])))
             }
-            b.use(val: b.store(cellId, b.value(inputs[0])))
         case .param(let cellId):
             b.use(val: b.load(cellId))
         case .historyReadWrite(let cellId):
@@ -692,12 +707,23 @@ public enum LazyOp {
             }
             b.use(val: u_historyWrite(cellId: cellId, b.value(inputs[0]))(b))
         case .historyRead(let cellId):
-            // no longer doing anything here TODO - remove
-            guard inputs.count == 0 else {
-                throw DGenError.insufficientInputs(
-                    operator: "history read", expected: 0, actual: inputs.count)
+            // Unified history read - handles both scalar and tensor based on cellToTensor mapping
+            if let tensorId = g.cellToTensor[cellId], let tensor = g.tensors[tensorId] {
+                // Tensor read: copy from history cell to output tensor
+                let outputTensorId = g.nodeToTensor[node.id]!
+                let outputCellId = g.tensors[outputTensorId]!.cellId
+                let size = tensor.size
+
+                b.parallelRange(size) { idx in
+                    let value = b.memoryRead(cellId, b.cast(idx, to: .int))
+                    _ = b.memoryWrite(outputCellId, b.cast(idx, to: .int), value)
+                }
+                // Register placeholder for downstream ops
+                ctx.values[nodeId] = .empty
+            } else {
+                // Scalar read
+                b.use(val: b.load(cellId))
             }
-            b.use(val: b.load(cellId))
         case .latch(let cellId):
             guard inputs.count == 2 else {
                 throw DGenError.insufficientInputs(
@@ -761,44 +787,6 @@ public enum LazyOp {
             }
 
         // MARK: - Tensor Operations
-
-        case .tensorHistoryRead(let cellId):
-            // Read previous frame's tensor state
-            guard case .tensor(let shape) = node.shape else {
-                throw DGenError.insufficientInputs(operator: "tensorHistoryRead", expected: 0, actual: 0)
-            }
-            let size = shape.reduce(1, *)
-            let outputTensorId = g.nodeToTensor[node.id]!
-            let outputCellId = g.tensors[outputTensorId]!.cellId
-
-            // Copy from history cell to output tensor
-            b.parallelRange(size) { idx in
-                let value = b.memoryRead(cellId, b.cast(idx, to: .int))
-                _ = b.memoryWrite(outputCellId, b.cast(idx, to: .int), value)
-            }
-            // Register placeholder for downstream ops
-            ctx.values[nodeId] = .empty
-
-        case .tensorHistoryWrite(let cellId):
-            // Write tensor state for next frame
-            // Check node.inputs instead of ctx.values inputs for tensor compatibility
-            guard node.inputs.count >= 1 else {
-                throw DGenError.insufficientInputs(
-                    operator: "tensorHistoryWrite", expected: 1, actual: node.inputs.count)
-            }
-            let inputShape = g.nodes[node.inputs[0]]?.shape ?? .scalar
-            guard case .tensor(let shape) = inputShape else {
-                throw DGenError.insufficientInputs(operator: "tensorHistoryWrite", expected: 1, actual: 0)
-            }
-            let size = shape.reduce(1, *)
-            let inputTensorId = g.nodeToTensor[node.inputs[0]]!
-            let inputCellId = g.tensors[inputTensorId]!.cellId
-
-            // Copy from input tensor to history cell
-            b.parallelRange(size) { idx in
-                let value = b.memoryRead(inputCellId, b.cast(idx, to: .int))
-                _ = b.memoryWrite(cellId, b.cast(idx, to: .int), value)
-            }
 
         case .conv2d(let kernelShape):
             // 2D convolution: input tensor convolved with kernel tensor
@@ -1304,24 +1292,6 @@ public enum LazyOp {
             }
 
         // MARK: - Tensor Operation Gradients
-
-        case .tensorHistoryRead(let cellId):
-            // Read exposes previous frame's tensor state
-            // Gradient flows back through time to whoever wrote this tensor
-            // Store gradient into grad memory for the previous frame's write to pick up
-            guard case .tensor(let shape) = node.shape else { break }
-            let size = shape.reduce(1, *)
-
-            // For tensor gradients, we need per-element gradient flow
-            // This is simplified - full implementation would need tensor gradient buffers
-            _ = b.storeGradMemory(cellId, b.value(gradOutput))
-
-        case .tensorHistoryWrite(let cellId):
-            // Write stores tensor for next frame to read
-            // Gradient comes from the next frame's read via grad memory carry
-            guard inputs.count == 1 else { fatalError("tensorHistoryWrite requires 1 input") }
-            let carry = b.loadGradMemory(cellId)
-            b.grad(node.inputs[0], value: carry.lazy)
 
         case .conv2d(_):
             // Conv2d gradient: gradient w.r.t. input = conv2d(grad_output, flipped_kernel)

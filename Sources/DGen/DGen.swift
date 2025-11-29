@@ -92,6 +92,7 @@ open class Graph {
     public var nextTensorId = 0
     public var tensors: [TensorID: Tensor] = [:]
     public var nodeToTensor: [NodeID: TensorID] = [:]
+    public var cellToTensor: [CellID: TensorID] = [:]  // Maps cell IDs to their associated tensor
 
     /// Track allocation sizes for memory cells (especially large buffers like spectral scratch)
     public var cellAllocationSizes: [CellID: Int] = [:]

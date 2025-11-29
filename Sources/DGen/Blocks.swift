@@ -20,7 +20,7 @@ public struct Block: Equatable {
 // Find all nodes that participate in feedback loops (not just minimal cycles)
 public func findFeedbackLoops(_ g: Graph) -> [[NodeID]] {
     // Build maps of history cells to their read/write nodes
-    // This includes both scalar history ops and tensor history ops
+    // historyRead/historyWrite now handle both scalar and tensor cases
     var cellReads: [Int: NodeID] = [:]
     var cellWrites: [Int: NodeID] = [:]
 
@@ -29,10 +29,6 @@ public func findFeedbackLoops(_ g: Graph) -> [[NodeID]] {
         case .historyRead(let cell):
             cellReads[cell] = nodeId
         case .historyWrite(let cell):
-            cellWrites[cell] = nodeId
-        case .tensorHistoryRead(let cell):
-            cellReads[cell] = nodeId
-        case .tensorHistoryWrite(let cell):
             cellWrites[cell] = nodeId
         default:
             break
@@ -60,13 +56,9 @@ public func findFeedbackLoops(_ g: Graph) -> [[NodeID]] {
                 }
             }
 
-            // Handle implicit historyWrite -> historyRead connection (scalar and tensor)
+            // Handle implicit historyWrite -> historyRead connection
             if let n = g.nodes[node] {
-                var cellIdOpt: Int? = nil
-                if case .historyWrite(let cellId) = n.op { cellIdOpt = cellId }
-                if case .tensorHistoryWrite(let cellId) = n.op { cellIdOpt = cellId }
-
-                if let cellId = cellIdOpt, let readNode = cellReads[cellId] {
+                if case .historyWrite(let cellId) = n.op, let readNode = cellReads[cellId] {
                     if reached.insert(readNode).inserted {
                         queue.append(readNode)
                     }
@@ -92,13 +84,9 @@ public func findFeedbackLoops(_ g: Graph) -> [[NodeID]] {
                 }
             }
 
-            // Handle implicit historyRead -> historyWrite connection (scalar and tensor)
+            // Handle implicit historyRead -> historyWrite connection
             if let n = g.nodes[node] {
-                var cellIdOpt: Int? = nil
-                if case .historyRead(let cellId) = n.op { cellIdOpt = cellId }
-                if case .tensorHistoryRead(let cellId) = n.op { cellIdOpt = cellId }
-
-                if let cellId = cellIdOpt, let writeNode = cellWrites[cellId] {
+                if case .historyRead(let cellId) = n.op, let writeNode = cellWrites[cellId] {
                     if reached.insert(writeNode).inserted {
                         queue.append(writeNode)
                     }
@@ -164,11 +152,7 @@ public func findFeedbackLoops(_ g: Graph) -> [[NodeID]] {
             // If a read is in the cluster, its corresponding write must also be included
             for readNode in allReadsInCluster {
                 if let node = g.nodes[readNode] {
-                    var cellOpt: Int? = nil
-                    if case .historyRead(let cell) = node.op { cellOpt = cell }
-                    if case .tensorHistoryRead(let cell) = node.op { cellOpt = cell }
-
-                    if let cell = cellOpt, let writeNode = cellWrites[cell] {
+                    if case .historyRead(let cell) = node.op, let writeNode = cellWrites[cell] {
                         clusterNodes.insert(writeNode)
                         allWritesInCluster.insert(writeNode)
                     }
@@ -178,11 +162,7 @@ public func findFeedbackLoops(_ g: Graph) -> [[NodeID]] {
             // If a write is in the cluster, its corresponding read must also be included
             for writeNode in allWritesInCluster {
                 if let node = g.nodes[writeNode] {
-                    var cellOpt: Int? = nil
-                    if case .historyWrite(let cell) = node.op { cellOpt = cell }
-                    if case .tensorHistoryWrite(let cell) = node.op { cellOpt = cell }
-
-                    if let cell = cellOpt, let readNode = cellReads[cell] {
+                    if case .historyWrite(let cell) = node.op, let readNode = cellReads[cell] {
                         clusterNodes.insert(readNode)
                         allReadsInCluster.insert(readNode)
                     }
@@ -238,10 +218,6 @@ public func determineScalarCorridors(_ g: Graph, feedbackClusters: [[NodeID]]) -
             reads[c, default: []].append($0.id)
         case .historyWrite(let c):
             writes[c, default: []].append($0.id)
-        case .tensorHistoryRead(let c):
-            reads[c, default: []].append($0.id)
-        case .tensorHistoryWrite(let c):
-            writes[c, default: []].append($0.id)
         case .memoryRead(let c):
             reads[c, default: []].append($0.id)
         case .memoryWrite(let c):
@@ -284,8 +260,16 @@ public func scalarNodes(_ g: Graph, feedbackClusters: [[NodeID]]) -> Set<NodeID>
         //    scalar.insert($0.id)  // Seq operations need to be scalar (ordering dependent)
 
         // Tensor operations must be scalar because they have internal loops
-        case .tensorHistoryRead(_), .tensorHistoryWrite(_):
-            scalar.insert($0.id)
+        case .historyRead(let cellId):
+            // Tensor history reads are scalar (they use parallelRange internally)
+            if g.cellToTensor[cellId] != nil {
+                scalar.insert($0.id)
+            }
+        case .historyWrite(let cellId):
+            // Tensor history writes are scalar (they use parallelRange internally)
+            if g.cellToTensor[cellId] != nil {
+                scalar.insert($0.id)
+            }
         case .conv2d(_):
             scalar.insert($0.id)
         case .sum:
@@ -295,12 +279,16 @@ public func scalarNodes(_ g: Graph, feedbackClusters: [[NodeID]]) -> Set<NodeID>
     }
 
     // Also mark nodes with tensor inputs as scalar (they use parallelRange internally)
-    // First, identify all tensor source nodes (tensorRef, tensorHistoryRead produce tensors)
+    // First, identify all tensor source nodes (tensorRef produces tensors, historyRead with tensor cell)
     var tensorNodes: Set<NodeID> = []
     g.nodes.values.forEach {
         switch $0.op {
-        case .tensorRef(_), .tensorHistoryRead(_):
+        case .tensorRef(_):
             tensorNodes.insert($0.id)
+        case .historyRead(let cellId):
+            if g.cellToTensor[cellId] != nil {
+                tensorNodes.insert($0.id)
+            }
         default: break
         }
     }
@@ -987,22 +975,6 @@ public func emitBlockUOps(
                 uops.insert(loadGlobalUOp, at: 0)
             default:
                 break
-            }
-        }
-    }
-
-    if debug {
-        var indentLevel = 0
-        for uop in uops {
-            switch uop.op {
-            case .beginIf:
-                print("\(String(repeating: "  ", count: indentLevel))\(uop.prettyDescription())")
-                indentLevel += 1
-            case .endIf:
-                indentLevel = max(0, indentLevel - 1)
-                print("\(String(repeating: "  ", count: indentLevel))\(uop.prettyDescription())")
-            default:
-                print("\(String(repeating: "  ", count: indentLevel))\(uop.prettyDescription())")
             }
         }
     }

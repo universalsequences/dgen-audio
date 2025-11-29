@@ -76,10 +76,6 @@ public enum Op {
   case output(ChannelNumber, Lazy)
   case input(ChannelNumber)
 
-  // Tensor history operations (for state across frames)
-  case tensorHistoryRead(CellID, Int)       // (cellId, size) - read previous frame's tensor
-  case tensorHistoryWrite(CellID, Int)      // (cellId, size) - write tensor for next frame
-
   // Tensor reduction operations
   case beginReduce(Int)                     // (size) - start reduction over tensor elements
   case endReduce                            // end reduction
