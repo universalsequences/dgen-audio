@@ -202,23 +202,32 @@ public struct CompilationPipeline {
         // Step 5.5: Fuse consecutive parallelRange loops with producer-consumer relationships.
         // This reduces redundant memory traffic and makes the generated code cleaner.
         for i in 0..<uopBlocks.count {
-            uopBlocks[i].ops = fuseParallelRanges(uopBlocks[i].ops)
+            //uopBlocks[i].ops = fuseParallelRanges(uopBlocks[i].ops)
         }
 
         // Debug: print UOps after fusion
         if options.debug {
+            var i = 1
             for uopBlock in uopBlocks {
+                print("Block \(i)")
+                i += 1
                 var indentLevel = 0
                 for uop in uopBlock.ops {
                     switch uop.op {
                     case .beginIf, .beginForLoop, .beginParallelRange, .beginLoop, .beginRange:
-                        print("\(String(repeating: "  ", count: indentLevel))\(uop.prettyDescription())")
+                        print(
+                            "\(String(repeating: "  ", count: indentLevel))\(uop.prettyDescription())"
+                        )
                         indentLevel += 1
                     case .endIf, .endLoop, .endParallelRange, .endRange:
                         indentLevel = max(0, indentLevel - 1)
-                        print("\(String(repeating: "  ", count: indentLevel))\(uop.prettyDescription())")
+                        print(
+                            "\(String(repeating: "  ", count: indentLevel))\(uop.prettyDescription())"
+                        )
                     default:
-                        print("\(String(repeating: "  ", count: indentLevel))\(uop.prettyDescription())")
+                        print(
+                            "\(String(repeating: "  ", count: indentLevel))\(uop.prettyDescription())"
+                        )
                     }
                 }
             }
@@ -505,14 +514,18 @@ public struct CellAllocations {
 //   Loop 1: read history[i] → t3, compute t3+1 → t10, write t10 → history[i]
 
 /// Fuse consecutive parallelRange loops that have producer-consumer relationships.
+/*
 func fuseParallelRanges(_ ops: [UOp]) -> [UOp] {
     // Parse parallelRange blocks: (startIndex, endIndex, count, indexVarId, ops, memoryWrites)
-    var ranges: [(start: Int, end: Int, count: Int, indexVar: VarID, ops: [UOp], writes: [CellID: VarID])] = []
+    var ranges:
+        [(start: Int, end: Int, count: Int, indexVar: VarID, ops: [UOp], writes: [CellID: VarID])] =
+            []
     var i = 0
 
     while i < ops.count {
         if case .beginParallelRange(let count) = ops[i].op,
-           case .variable(let indexVarId, _) = ops[i].value {
+            case .variable(let indexVarId, _) = ops[i].value
+        {
             let startIndex = i
             var rangeOps: [UOp] = []
             var writes: [CellID: VarID] = [:]
@@ -521,14 +534,16 @@ func fuseParallelRanges(_ ops: [UOp]) -> [UOp] {
             var depth = 1
             i += 1
             while i < ops.count && depth > 0 {
-                if case .beginParallelRange = ops[i].op { depth += 1 }
-                else if case .endParallelRange = ops[i].op {
+                if case .beginParallelRange = ops[i].op {
+                    depth += 1
+                } else if case .endParallelRange = ops[i].op {
                     depth -= 1
                     if depth == 0 { break }
                 }
                 // Track memory writes: cellId -> written value's varId
                 if case .memoryWrite(let cellId, _, let value) = ops[i].op,
-                   case .variable(let valueVarId, _) = value {
+                    case .variable(let valueVarId, _) = value
+                {
                     writes[cellId] = valueVarId
                 }
                 rangeOps.append(ops[i])
@@ -547,7 +562,8 @@ func fuseParallelRanges(_ ops: [UOp]) -> [UOp] {
     var currentGroup: [Int] = [0]
 
     for i in 1..<ranges.count {
-        let prev = ranges[i - 1], curr = ranges[i]
+        let prev = ranges[i - 1]
+        let curr = ranges[i]
         let isConsecutive = curr.start == prev.end + 1
         let sameCount = prev.count == curr.count
         let hasProducerConsumer = curr.ops.contains { op in
@@ -600,20 +616,26 @@ func fuseParallelRanges(_ ops: [UOp]) -> [UOp] {
                         // Substitute memory reads from intermediate cells with direct value reference
                         if case .memoryRead(let cellId, _) = op.op, let srcVar = valueFor[cellId] {
                             if case .variable(_, let nodeId) = op.value {
-                                newOp = UOp(op: .declareVar(.variable(srcVar, nodeId)), value: op.value, kind: op.kind)
+                                newOp = UOp(
+                                    op: .declareVar(.variable(srcVar, nodeId)), value: op.value,
+                                    kind: op.kind)
                             }
                         }
 
                         // Remap index variable references in cast operations
                         if case .cast(let expr, let castType) = newOp.op,
-                           case .variable(let varId, let nodeId) = expr,
-                           let newVar = indexRemap[varId] {
-                            newOp = UOp(op: .cast(.variable(newVar, nodeId), castType), value: newOp.value, kind: newOp.kind)
+                            case .variable(let varId, let nodeId) = expr,
+                            let newVar = indexRemap[varId]
+                        {
+                            newOp = UOp(
+                                op: .cast(.variable(newVar, nodeId), castType), value: newOp.value,
+                                kind: newOp.kind)
                         }
 
                         // Track writes for subsequent ranges in this group
                         if case .memoryWrite(let cellId, _, let value) = op.op,
-                           case .variable(let valueVarId, _) = value {
+                            case .variable(let valueVarId, _) = value
+                        {
                             valueFor[cellId] = valueVarId
                         }
 
@@ -635,6 +657,7 @@ func fuseParallelRanges(_ ops: [UOp]) -> [UOp] {
 
     return result
 }
+ */
 
 /// Combines historyRead and historyWrite operations that are not in feedback loops
 /// into a single historyReadWrite operation

@@ -186,7 +186,7 @@ public class CRenderer: Renderer {
 
             for uop in block.ops {
                 if case .defineGlobal = uop.op { continue }
-                scheduleItem.ops.append(UOp(op: uop.op, value: uop.value, kind: block.kind))
+                scheduleItem.ops.append(UOp(op: uop.op, value: uop.value, kind: uop.kind))
             }
         }
 
@@ -516,7 +516,8 @@ public class CRenderer: Renderer {
                         memory[\(base) + (int)vgetq_lane_f32(\(offsetExpr), 3)]
                     }
                     """.trimmingCharacters(in: .whitespacesAndNewlines)
-                return emitAssign(uop, gatherExpr, ctx)
+                return emitAssign(uop, "vld1q_f32(&memory[\(base) + (int)\(offsetExpr)])", ctx)
+                //return emitAssign(uop, gatherExpr, ctx)
             } else {
                 return emitAssign(uop, "memory[\(base) + (int)\(g(offset))]", ctx)
             }
@@ -526,12 +527,13 @@ public class CRenderer: Renderer {
                 // For SIMD: scatter 4 values to potentially different memory locations
                 let offsetExpr = g(offset)
                 let valueExpr = g(value)
-                return """
-                    memory[\(base) + (int)vgetq_lane_f32(\(offsetExpr), 0)] = vgetq_lane_f32(\(valueExpr), 0);
-                    memory[\(base) + (int)vgetq_lane_f32(\(offsetExpr), 1)] = vgetq_lane_f32(\(valueExpr), 1);
-                    memory[\(base) + (int)vgetq_lane_f32(\(offsetExpr), 2)] = vgetq_lane_f32(\(valueExpr), 2);
-                    memory[\(base) + (int)vgetq_lane_f32(\(offsetExpr), 3)] = vgetq_lane_f32(\(valueExpr), 3);
-                    """.trimmingCharacters(in: .whitespacesAndNewlines)
+                return "vst1q_f32(&memory[\(base) + (int)\(offsetExpr)], \(valueExpr));"
+                //return """
+                //    memory[\(base) + (int)vgetq_lane_f32(\(offsetExpr), 0)] = vgetq_lane_f32(\(valueExpr), 0);
+                //    memory[\(base) + (int)vgetq_lane_f32(\(offsetExpr), 1)] = vgetq_lane_f32(\(valueExpr), 1);
+                //    memory[\(base) + (int)vgetq_lane_f32(\(offsetExpr), 2)] = vgetq_lane_f32(\(valueExpr), 2);
+                //    memory[\(base) + (int)vgetq_lane_f32(\(offsetExpr), 3)] = vgetq_lane_f32(\(valueExpr), 3);
+                //    """.trimmingCharacters(in: .whitespacesAndNewlines)
             } else {
                 return "memory[\(base) + (int)\(g(offset))] = \(g(value));"
             }
@@ -767,8 +769,9 @@ public class CRenderer: Renderer {
 
         case let .cast(expr, castType):
             let typeStr = castType == .int ? "int" : "float"
-            return emitAssign(uop, "(\(typeStr))\(g(expr))", ctx)
-
+            return emitAssign(
+                uop, "(\(typeStr))\(g(expr))", ctx,
+                forceFloatType: true)
         case let .declareVar(value):
             // Declares and initializes a variable: float t = value;
             return emitAssign(uop, g(value), ctx)
@@ -780,16 +783,19 @@ public class CRenderer: Renderer {
                 // Create a proper SIMD variable declaration for loadGlobal
                 return "float32x4_t simd\(id) = vld1q_f32(t\(id) + i);"
             } else {
-                return emitAssign(uop, "t\(id)[i]", ctx)
+                let simdVersion = "float32x4_t simd\(id) = vld1q_f32(t\(id) + i);"
+                let scalarVersion = emitAssign(uop, "t\(id)[i]", ctx)
+                return simdVersion + "\n" + scalarVersion
             }
 
         // Parallel range - for C, render as a simple for loop
         // For static tensor ops, this could be outside frame loop (future optimization)
-        case let .beginParallelRange(count):
+        case let .beginParallelRange(count, incr):
             guard case .variable(let varId, _) = uop.value else {
                 fatalError("beginParallelRange requires variable")
             }
-            return "for (int _pr\(varId) = 0; _pr\(varId) < \(count); _pr\(varId)++) {"
+            print("BEGIN PARALLE RANGE KIND=\(uop.kind)")
+            return "for (int _pr\(varId) = 0; _pr\(varId) < \(count); _pr\(varId)+=\(incr)) {"
         case .endParallelRange:
             return "}"
         case .parallelIndex:
@@ -798,7 +804,7 @@ public class CRenderer: Renderer {
             guard case .variable(let varId, _) = uop.value else {
                 fatalError("parallelIndex requires variable")
             }
-            return emitAssign(uop, "_pr\(varId)", ctx)
+            return emitAssign(uop, "_pr\(varId)", ctx, forceFloatType: true)
 
         default:
             return "/* \(uop.prettyDescription()) */"
@@ -837,7 +843,9 @@ public class CRenderer: Renderer {
         }
     }
 
-    func emitAssign(_ uop: UOp, _ expr: String, _ ctx: IRContext) -> String {
+    func emitAssign(_ uop: UOp, _ expr: String, _ ctx: IRContext, forceFloatType: Bool = false)
+        -> String
+    {
         let varId = extractVarId(uop.value)
         let isGlobal = ctx.globals.contains(varId)
 
@@ -850,10 +858,12 @@ public class CRenderer: Renderer {
                 return "float32x4_t \(localVar) = \(expr); vst1q_f32(\(globalStore), \(localVar));"
             } else {
                 let lhs = emitLazy(uop.value, ctx: ctx, kind: uop.kind, isOut: true)
-                return "float32x4_t \(lhs) = \(expr);"
+                let type = forceFloatType ? "float" : "float32x4_t"
+                return "\(type) \(lhs) = \(expr);"
             }
         } else {
-            let lhs = emitLazy(uop.value, ctx: ctx, kind: uop.kind, isOut: true)
+            let lhs = emitLazy(
+                uop.value, ctx: ctx, kind: uop.kind, isOut: true)
             return isGlobal
                 ? "\(lhs) = \(expr);"
                 : "float \(lhs) = \(expr);"

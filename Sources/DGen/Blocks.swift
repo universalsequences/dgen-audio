@@ -926,7 +926,10 @@ public func emitBlockUOps(
                     emittedNodes.insert(nodeId)
 
                     var typedUOp = uop
-                    typedUOp.kind = block.kind
+                    typedUOp.kind = uop.kindOverride ?? block.kind
+                    if case .simd = typedUOp.kind {
+                        print("TYPED SIMD=", uop)
+                    }
                     uops.append(typedUOp)
                 }
             } else {

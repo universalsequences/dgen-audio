@@ -133,7 +133,7 @@ func emitBinaryOp(
     let input0Shape = g.nodes[node.inputs[0]]?.shape ?? .scalar
     let input1Shape = g.nodes[node.inputs[1]]?.shape ?? .scalar
 
-    b.parallelRange(size) { idx in
+    b.parallelRange(size, kind: size % 4 == 0 ? .simd : .scalar) { idx in
         let a: Expr
         if case .scalar = input0Shape {
             a = b.value(inputs[0])
@@ -212,7 +212,7 @@ func emitTernaryOp(
     let input1Shape = g.nodes[node.inputs[1]]?.shape ?? .scalar
     let input2Shape = g.nodes[node.inputs[2]]?.shape ?? .scalar
 
-    b.parallelRange(size) { idx in
+    b.parallelRange(size, kind: size % 4 == 0 ? .simd : .scalar) { idx in
         let a: Expr
         if case .scalar = input0Shape {
             a = b.value(inputs[0])
@@ -420,8 +420,8 @@ public enum LazyOp {
     case seq  // Sequential execution - returns value of last input
 
     // Tensor operations (historyRead/historyWrite handle tensors automatically based on cell size)
-    case conv2d(Shape)               // 2D convolution, Shape is kernel shape [kH, kW]
-    case sum                         // Reduce tensor to scalar by summing all elements
+    case conv2d(Shape)  // 2D convolution, Shape is kernel shape [kH, kW]
+    case sum  // Reduce tensor to scalar by summing all elements
 
     public func emit(ctx: IRContext, g: Graph, nodeId: NodeID) throws -> [UOp] {
         guard let node = g.nodes[nodeId] else { return [] }
@@ -737,8 +737,13 @@ public enum LazyOp {
                 throw DGenError.insufficientInputs(
                     operator: "mix", expected: 3, actual: inputs.count)
             }
-            let (x, y, t) = b.values(inputs, count: 3)
-            b.use(val: u_mix(x, y, lerp: t)(b))
+            emitTernaryOp(b: b, g: g, node: node, inputs: inputs) {
+                let val = u_mix($0, $1, lerp: $2)(b)
+                b.use(val: val)
+                return val
+            }
+        //let (x, y, t) = b.values(inputs, count: 3)
+        //b.use(val: u_mix(x, y, lerp: t)(b))
         case .accum(let cellId):
             guard inputs.count == 4 else {
                 throw DGenError.insufficientInputs(
@@ -800,7 +805,8 @@ public enum LazyOp {
             }
             let inputShape = g.nodes[node.inputs[0]]?.shape
             guard case .tensor(let inShape) = inputShape, inShape.count == 2 else {
-                throw DGenError.insufficientInputs(operator: "conv2d input must be 2D", expected: 2, actual: 0)
+                throw DGenError.insufficientInputs(
+                    operator: "conv2d input must be 2D", expected: 2, actual: 0)
             }
 
             let outputSize = outputShape.reduce(1, *)
@@ -812,6 +818,8 @@ public enum LazyOp {
 
             let kernelTensorId = g.nodeToTensor[node.inputs[1]]!
             let kernelCellId = g.tensors[kernelTensorId]!.cellId
+
+            print("OUTPUT CELL ID =\(outputCellId) outputTensorId=\(outputTensorId)")
 
             let inH = inShape[0]
             let inW = inShape[1]
@@ -835,14 +843,34 @@ public enum LazyOp {
                         let inY = outY + b.cast(ky, to: .float) - b.constant(Float(padH))
                         let inX = outX + b.cast(kx, to: .float) - b.constant(Float(padW))
 
-                        // Bounds check (zero-padding)
-                        let inBounds = (inY >= b.constant(0.0)) * (inY < b.constant(Float(inH)))
+                        let kernelIdx =
+                            b.cast(ky, to: .float) * b.constant(Float(kW)) + b.cast(kx, to: .float)
+
+                        let inBounds =
+                            (inY >= b.constant(0.0)) * (inY < b.constant(Float(inH)))
                             * (inX >= b.constant(0.0)) * (inX < b.constant(Float(inW)))
 
-                        let inputIdx = b.cast(inY, to: .int) * b.constant(Float(inW)) + b.cast(inX, to: .int)
-                        let kernelIdx = b.cast(ky, to: .float) * b.constant(Float(kW)) + b.cast(kx, to: .float)
+                        // raw neighbor index (may be OOB)
+                        let rawIdx =
+                            b.cast(inY, to: .int) * b.constant(Float(inW)) + b.cast(inX, to: .int)
 
-                        let inputVal = b.gswitch(inBounds, b.memoryRead(inputCellId, inputIdx), b.constant(0.0))
+                        // convert inBounds (0.0 / 1.0) → int 0 / 1
+                        let inBoundsInt = b.cast(inBounds, to: .int)
+
+                        // safeIdx = inBounds ? rawIdx : 0
+                        // (0 is guaranteed in-range for the 4x4 grid)
+                        let safeIdx = b.gswitch(
+                            inBounds,  // or use an int version if you have one
+                            rawIdx,
+                            b.constant(0)
+                        )
+
+                        // now use *safeIdx* for the read
+                        let inputVal = b.gswitch(
+                            inBounds,
+                            b.memoryRead(inputCellId, safeIdx),
+                            b.constant(0.0)
+                        )
                         let kernelVal = b.memoryRead(kernelCellId, b.cast(kernelIdx, to: .int))
 
                         acc.accumulate(inputVal * kernelVal)

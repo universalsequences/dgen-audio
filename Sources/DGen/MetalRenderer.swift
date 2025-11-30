@@ -490,7 +490,7 @@ public class MetalRenderer: Renderer, UOpEmitter {
 
     // Parallel range - for Metal, could be thread-parallel for static tensors
     // For now, render as a loop (future: check block.temporality and use thread-parallel for static)
-    case let .beginParallelRange(count):
+    case let .beginParallelRange(count, incr):
       guard case .variable(let varId, _) = uop.value else {
         fatalError("beginParallelRange requires variable")
       }
