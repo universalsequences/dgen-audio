@@ -139,7 +139,7 @@ func emitBinaryOp(
             a = b.value(inputs[0])
         } else {
             let cellId = g.tensors[g.nodeToTensor[node.inputs[0]]!]!.cellId
-            a = b.memoryRead(cellId, b.cast(idx, to: .int))
+            a = b.memoryRead(cellId, idx)  //b.cast(idx, to: .int))
         }
 
         let c: Expr
@@ -151,7 +151,7 @@ func emitBinaryOp(
         }
 
         let result = op(a, c)
-        _ = b.memoryWrite(outputCellId, b.cast(idx, to: .int), result)
+        _ = b.memoryWrite(outputCellId, idx, result)
     }
 }
 

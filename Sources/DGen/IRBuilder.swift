@@ -352,14 +352,17 @@ public final class IRBuilder {
   /// Renderer decides: C emits a loop, Metal static emits thread-parallel.
   public func parallelRange(_ count: Int, body: (Expr) -> Void, kind: Kind? = .scalar) {
     let indexVar = ctx.useVariable(src: nodeId)
+
     var incr = 1
     if case .simd = kind {
       incr = 4
     }
+
     ops.append(UOp(op: .beginParallelRange(count, incr), value: indexVar))
+
     // Emit parallelIndex - use the SAME variable as beginParallelRange
     // so the renderer can match them up
-    ops.append(UOp(op: .parallelIndex, value: indexVar))
+    //ops.append(UOp(op: .parallelIndex, value: indexVar))
     body(value(indexVar))
     ops.append(UOp(op: .endParallelRange, value: ctx.useVariable(src: nil)))
     if case .simd = kind {

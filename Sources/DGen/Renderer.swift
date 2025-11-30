@@ -310,10 +310,6 @@ public class CRenderer: Renderer {
         code.append("  int voiceIndex = 0;")
         if let voiceCellId = voiceCellIdOpt {
             code.append("  voiceIndex = (int)memory[\(voiceCellId)];")
-        } else {
-            print(
-                "\(ANSI.red)NO VOICE INDEX!!!!!!!!!!!!!\(String(repeating:"********\n", count:24))\(ANSI.reset)"
-            )
         }
         code.append("  if (voiceIndex < 0) voiceIndex = 0;")
         code.append("  if (voiceIndex >= VOICE_COUNT) voiceIndex = VOICE_COUNT - 1;")
@@ -783,7 +779,10 @@ public class CRenderer: Renderer {
                 // Create a proper SIMD variable declaration for loadGlobal
                 return "float32x4_t simd\(id) = vld1q_f32(t\(id) + i);"
             } else {
-                let simdVersion = "float32x4_t simd\(id) = vld1q_f32(t\(id) + i);"
+                // if this global is required by a beginParallelRange element then we need
+                // a simd version where we
+                let simdVersion =
+                    "float32x4_t simd\(id) = vdupq_n_f32(t\(id)[i]); "
                 let scalarVersion = emitAssign(uop, "t\(id)[i]", ctx)
                 return simdVersion + "\n" + scalarVersion
             }
@@ -791,11 +790,12 @@ public class CRenderer: Renderer {
         // Parallel range - for C, render as a simple for loop
         // For static tensor ops, this could be outside frame loop (future optimization)
         case let .beginParallelRange(count, incr):
+            let pre = incr == 4 ? "simd" : "t"
             guard case .variable(let varId, _) = uop.value else {
                 fatalError("beginParallelRange requires variable")
             }
-            print("BEGIN PARALLE RANGE KIND=\(uop.kind)")
-            return "for (int _pr\(varId) = 0; _pr\(varId) < \(count); _pr\(varId)+=\(incr)) {"
+            return
+                "for (int \(pre)\(varId) = 0; \(pre)\(varId) < \(count); \(pre)\(varId)+=\(incr)) {"
         case .endParallelRange:
             return "}"
         case .parallelIndex:
