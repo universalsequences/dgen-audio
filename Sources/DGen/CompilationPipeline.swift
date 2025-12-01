@@ -742,6 +742,15 @@ func determineTensorBlocks(_ blocks: [Block], _ graph: Graph, _ ctx: IRContext) 
         for nodeId in block.nodes {
             if let node = graph.nodes[nodeId] {
                 print("checking node=(nodeId)")
+
+                // Skip tensorRef nodes for tensor block creation - they emit nothing
+                // and shouldn't start their own parallel range
+                if case .tensorRef = node.op {
+                    // tensorRef nodes stay in current block but don't affect tensor grouping
+                    currentBlock.nodes.append(nodeId)
+                    continue
+                }
+
                 if case .conv2d = node.op {
                     if currentShape != nil {
                         if currentBlock.nodes.count > 0 {
