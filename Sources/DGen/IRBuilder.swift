@@ -287,6 +287,41 @@ public final class IRBuilder {
     return self.value(dest)
   }
 
+  // MARK: - Tensor Register Optimization
+  //
+  // These methods optimize tensor operations by keeping intermediate values in registers
+  // instead of going through memory for every operation.
+  //
+  // tensorMemoryRead: Check if value is already in a register from a previous computation
+  //                   in this block. If so, return that register. Otherwise emit memoryRead.
+  //
+  // tensorMemoryWrite: Record the computed value in a register. Only emit actual memoryWrite
+  //                    if this cell is needed by later blocks (outbound).
+
+  /// Read tensor cell, preferring register if available
+  public func tensorMemoryRead(_ cellId: CellID, _ offset: Expr) -> Expr {
+    // Check if we already have this cell's value in a register from earlier in this block
+    if let existingVar = ctx.tensorCellToVar[cellId] {
+      return value(existingVar)
+    }
+    // Not in register, need to read from memory
+    return memoryRead(cellId, offset)
+  }
+
+  /// Write tensor cell, only emitting memory write if needed for cross-block transfer
+  public func tensorMemoryWrite(_ cellId: CellID, _ offset: Expr, _ val: Expr) -> Expr {
+    // Always record in tensor register map so subsequent reads can use the register
+    ctx.tensorCellToVar[cellId] = val.lazy
+
+    // Only emit actual memory write if this cell is needed by later blocks
+    if ctx.outboundTensorCells.contains(cellId) {
+      return memoryWrite(cellId, offset, val)
+    }
+
+    // Cell is only used within this block - skip memory write, value stays in register
+    return val
+  }
+
   public func min(_ a: Expr, _ b: Expr) -> Expr {
     let dest = ctx.useVariable(src: nodeId)
     let uop = UOp(op: .min(a.lazy, b.lazy), value: dest)

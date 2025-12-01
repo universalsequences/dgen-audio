@@ -12,6 +12,18 @@ public class IRContext {
     // Reuse constant IDs for identical values to reduce duplicate vdupq constants
     private var constantIdByValue: [Float: ConstantID] = [:]
 
+    // Tensor register optimization:
+    // - outboundTensorCells: tensor cells that must be written to memory (needed by later blocks)
+    // - tensorCellToVar: maps cell IDs to computed Lazy values (register variables) within current block
+    // This allows intermediate tensor values to stay in registers instead of going through memory.
+    public var outboundTensorCells: Set<CellID> = []
+    public var tensorCellToVar: [CellID: Lazy] = [:]
+
+    /// Clear tensor register tracking (call at start of each tensor block)
+    public func clearTensorRegisters() {
+        tensorCellToVar = [:]
+    }
+
     public init() {}
 
     // Use Array instead of Set to maintain stable ordering for tape slot assignment

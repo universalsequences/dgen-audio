@@ -914,12 +914,67 @@ public func findNodesAsInboundDependencies(_ blks: [Block], _ g: Graph, block: B
     return need.sorted()  // Return sorted array for stable ordering
 }
 
+/// Compute which tensor cells in this block need to be written to memory because
+/// they're used by later blocks. Cells only used within this block stay in registers.
+public func findOutboundTensorCells(_ blks: [Block], _ g: Graph, block: Block) -> Set<CellID> {
+    guard let thisIdx = blks.firstIndex(of: block) else { return [] }
+
+    // Collect all tensor cells produced by nodes in this block
+    var producedCells: Set<CellID> = []
+    for nodeId in block.nodes {
+        if let node = g.nodes[nodeId], case .tensor = node.shape {
+            if let tensorId = g.nodeToTensor[nodeId], let tensor = g.tensors[tensorId] {
+                producedCells.insert(tensor.cellId)
+            }
+        }
+    }
+
+    // Check which cells are consumed by later blocks
+    var outboundCells: Set<CellID> = []
+    for (blockIdx, b) in blks.enumerated() {
+        if blockIdx <= thisIdx { continue }  // Only look at later blocks
+
+        for nodeId in b.nodes {
+            guard let node = g.nodes[nodeId] else { continue }
+
+            // Check if this node reads from any of our produced cells
+            for inputId in node.inputs {
+                if let inputNode = g.nodes[inputId], case .tensor = inputNode.shape {
+                    if let tensorId = g.nodeToTensor[inputId], let tensor = g.tensors[tensorId] {
+                        if producedCells.contains(tensor.cellId) {
+                            outboundCells.insert(tensor.cellId)
+                        }
+                    }
+                }
+            }
+
+            // Also check historyRead/historyWrite operations that reference tensor cells
+            switch node.op {
+            case .historyRead(let cellId), .historyWrite(let cellId):
+                if producedCells.contains(cellId) {
+                    outboundCells.insert(cellId)
+                }
+            default:
+                break
+            }
+        }
+    }
+
+    return outboundCells
+}
+
 public func emitBlockUOps(
     ctx: IRContext, block: Block, blocks: [Block], g: Graph, debug: Bool = false
 ) throws -> [UOp] {
     var emittedNodes: Set<NodeID> = []
 
     var uops: [UOp] = []
+
+    // Tensor Register Optimization:
+    // Compute which tensor cells need to be written to memory (used by later blocks)
+    // and clear the register tracking for this new block.
+    ctx.outboundTensorCells = findOutboundTensorCells(blocks, g, block: block)
+    ctx.clearTensorRegisters()
 
     if let tensorIndex = block.tensorIndex,
         let shape = block.shape
@@ -930,7 +985,6 @@ public func emitBlockUOps(
         uops.append(UOp(op: .beginParallelRange(count, incr), value: tensorIndex))
     }
 
-    // NO this needs
     for nodeId in block.nodes {
         if let tensorIndex = block.tensorIndex {
             ctx.tensorIndices[nodeId] = tensorIndex

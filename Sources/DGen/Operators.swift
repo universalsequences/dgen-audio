@@ -111,6 +111,10 @@ let u_max = binaryOp(Op.max)
 /// Emit a binary operation that works on both scalars and tensors.
 /// For scalars: applies op directly.
 /// For tensors: emits parallelRange over elements.
+///
+/// Tensor Register Optimization:
+/// Uses tensorMemoryRead/tensorMemoryWrite to keep intermediate values in registers.
+/// Only writes to memory if the output cell is needed by later blocks (outbound).
 func emitBinaryOp(
     b: IRBuilder,
     g: Graph,
@@ -144,7 +148,8 @@ func emitBinaryOp(
         a = b.value(inputs[0])
     } else {
         let cellId = g.tensors[g.nodeToTensor[node.inputs[0]]!]!.cellId
-        a = b.memoryRead(cellId, idx)  //b.cast(idx, to: .int))
+        // Use tensorMemoryRead to check register first before going to memory
+        a = b.tensorMemoryRead(cellId, idx)
     }
 
     let c: Expr
@@ -152,18 +157,23 @@ func emitBinaryOp(
         c = b.value(inputs[1])
     } else {
         let cellId = g.tensors[g.nodeToTensor[node.inputs[1]]!]!.cellId
-        c = b.memoryRead(cellId, b.cast(idx, to: .int))
+        // Use tensorMemoryRead to check register first before going to memory
+        c = b.tensorMemoryRead(cellId, b.cast(idx, to: .int))
     }
 
     let result = op(a, c)
-    _ = b.memoryWrite(outputCellId, idx, result)
+    // Use tensorMemoryWrite - only writes to memory if cell is outbound
+    _ = b.tensorMemoryWrite(outputCellId, idx, result)
     b.use(val: result)
-    //}
 }
 
 /// Emit a unary operation that works on both scalars and tensors.
 /// For scalars: applies op directly.
 /// For tensors: emits parallelRange over elements.
+///
+/// Tensor Register Optimization:
+/// Uses tensorMemoryRead/tensorMemoryWrite to keep intermediate values in registers.
+/// Only writes to memory if the output cell is needed by later blocks (outbound).
 func emitUnaryOp(
     b: IRBuilder,
     g: Graph,
@@ -185,21 +195,27 @@ func emitUnaryOp(
     let idx = b.value(index)
 
     // Tensor case
-    let size = shape.reduce(1, *)
     let outputTensorId = g.nodeToTensor[node.id]!
     let outputCellId = g.tensors[outputTensorId]!.cellId
 
     let inputTensorId = g.nodeToTensor[node.inputs[0]]!
     let inputCellId = g.tensors[inputTensorId]!.cellId
 
-    let a = b.memoryRead(inputCellId, b.cast(idx, to: .int))
+    // Use tensorMemoryRead to check register first before going to memory
+    let a = b.tensorMemoryRead(inputCellId, b.cast(idx, to: .int))
     let result = op(a)
-    _ = b.memoryWrite(outputCellId, b.cast(idx, to: .int), result)
+    // Use tensorMemoryWrite - only writes to memory if cell is outbound
+    _ = b.tensorMemoryWrite(outputCellId, b.cast(idx, to: .int), result)
+    b.use(val: result)
 }
 
 /// Emit a ternary operation (like gswitch) that works on both scalars and tensors.
 /// For scalars: applies op directly.
 /// For tensors: emits parallelRange over elements with broadcasting.
+///
+/// Tensor Register Optimization:
+/// Uses tensorMemoryRead/tensorMemoryWrite to keep intermediate values in registers.
+/// Only writes to memory if the output cell is needed by later blocks (outbound).
 func emitTernaryOp(
     b: IRBuilder,
     g: Graph,
@@ -219,7 +235,6 @@ func emitTernaryOp(
     let idx = b.value(index)
 
     // Tensor case
-    let size = shape.reduce(1, *)
     let outputTensorId = g.nodeToTensor[node.id]!
     let outputCellId = g.tensors[outputTensorId]!.cellId
 
@@ -233,7 +248,8 @@ func emitTernaryOp(
         a = b.value(inputs[0])
     } else {
         let cellId = g.tensors[g.nodeToTensor[node.inputs[0]]!]!.cellId
-        a = b.memoryRead(cellId, b.cast(idx, to: .int))
+        // Use tensorMemoryRead to check register first before going to memory
+        a = b.tensorMemoryRead(cellId, b.cast(idx, to: .int))
     }
 
     let c: Expr
@@ -241,7 +257,8 @@ func emitTernaryOp(
         c = b.value(inputs[1])
     } else {
         let cellId = g.tensors[g.nodeToTensor[node.inputs[1]]!]!.cellId
-        c = b.memoryRead(cellId, b.cast(idx, to: .int))
+        // Use tensorMemoryRead to check register first before going to memory
+        c = b.tensorMemoryRead(cellId, b.cast(idx, to: .int))
     }
 
     let d: Expr
@@ -249,11 +266,14 @@ func emitTernaryOp(
         d = b.value(inputs[2])
     } else {
         let cellId = g.tensors[g.nodeToTensor[node.inputs[2]]!]!.cellId
-        d = b.memoryRead(cellId, b.cast(idx, to: .int))
+        // Use tensorMemoryRead to check register first before going to memory
+        d = b.tensorMemoryRead(cellId, b.cast(idx, to: .int))
     }
 
     let result = op(a, c, d)
-    _ = b.memoryWrite(outputCellId, b.cast(idx, to: .int), result)
+    // Use tensorMemoryWrite - only writes to memory if cell is outbound
+    _ = b.tensorMemoryWrite(outputCellId, b.cast(idx, to: .int), result)
+    b.use(val: result)
 }
 
 func u_historyWrite(cellId: CellID, _ curr: Expr) -> (IRBuilder) -> Expr {
@@ -704,10 +724,10 @@ public enum LazyOp {
                         operator: "historyWrite", expected: 1, actual: node.inputs.count)
                 }
                 let idx = b.value(index)
-                //b.parallelRange(size) { idx in
-                let value = b.memoryRead(inputCellId, b.cast(idx, to: .int))
+                // Use tensorMemoryRead to potentially use cached register value,
+                // but ALWAYS write to memory - history cells persist across frames
+                let value = b.tensorMemoryRead(inputCellId, b.cast(idx, to: .int))
                 _ = b.memoryWrite(cellId, b.cast(idx, to: .int), value)
-                //}
             } else {
                 // Scalar write
                 guard inputs.count == 1 else {
@@ -739,10 +759,9 @@ public enum LazyOp {
                 }
                 let idx = b.value(index)
 
-                //b.parallelRange(size) { idx in
-                let value = b.memoryRead(cellId, b.cast(idx, to: .int))
-                _ = b.memoryWrite(outputCellId, b.cast(idx, to: .int), value)
-                //}
+                // Use tensor register optimization - avoid redundant memory traffic
+                let value = b.tensorMemoryRead(cellId, b.cast(idx, to: .int))
+                _ = b.tensorMemoryWrite(outputCellId, b.cast(idx, to: .int), value)
                 // Register placeholder for downstream ops
                 ctx.values[nodeId] = .empty
             } else {
