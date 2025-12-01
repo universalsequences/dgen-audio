@@ -1,4 +1,4 @@
-public enum Lazy {
+public enum Lazy: Equatable {
   case constant(ConstantID, Float)
   case global(VarID)
   case variable(VarID, NodeID?)
@@ -93,4 +93,5 @@ public struct UOp {
   public let value: Lazy
   public var kind: Kind? = nil  // SIMD or Scalar
   public var kindOverride: Kind? = nil
+  public var tensorIndex: Lazy? = nil
 }

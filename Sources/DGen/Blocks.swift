@@ -11,6 +11,8 @@ public struct Block: Equatable {
     public var nodes: [NodeID] = []
     public var direction: Direction = .forward
     public var temporality: Temporality = .static_
+    public var tensorIndex: Lazy?
+    public var shape: Shape?
 
     public init(kind: Kind) {
         self.kind = kind
@@ -918,17 +920,36 @@ public func emitBlockUOps(
     var emittedNodes: Set<NodeID> = []
 
     var uops: [UOp] = []
+
+    if let tensorIndex = block.tensorIndex,
+        let shape = block.shape
+    {
+        print("WE HAVE A BLOCK!")
+        let count = shape[0] * shape[1]
+        let incr = count % 4 == 0 ? 4 : 1
+        uops.append(UOp(op: .beginParallelRange(count, incr), value: tensorIndex))
+    }
+
     // NO this needs
     for nodeId in block.nodes {
+        if let tensorIndex = block.tensorIndex {
+            ctx.tensorIndices[nodeId] = tensorIndex
+        }
+
         if let node = g.nodes[nodeId] {
             if case .forward = block.direction {
                 for uop in try node.op.emit(ctx: ctx, g: g, nodeId: nodeId) {
                     emittedNodes.insert(nodeId)
 
                     var typedUOp = uop
-                    typedUOp.kind = uop.kindOverride ?? block.kind
-                    if case .simd = typedUOp.kind {
-                        print("TYPED SIMD=", uop)
+                    if block.tensorIndex != nil,
+                        let shape = block.shape
+                    {
+                        let size = shape.reduce(1, *)
+                        typedUOp.kind = size % 4 == 0 ? .simd : .scalar
+
+                    } else {
+                        typedUOp.kind = block.kind
                     }
                     uops.append(typedUOp)
                 }
@@ -980,6 +1001,10 @@ public func emitBlockUOps(
                 break
             }
         }
+    }
+
+    if block.tensorIndex != nil {
+        uops.append(UOp(op: .endParallelRange, value: ctx.useVariable(src: nil)))
     }
 
     return uops

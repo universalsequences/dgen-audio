@@ -620,8 +620,8 @@ final class TensorOpsTests: XCTestCase {
                 let one = g.n(.constant(1.0))
 
                 // Coefficients: (2-d) and (1-d)
-                let twoMinusD = g.n(.sub, two, d)      // 1.98
-                let oneMinusD = g.n(.sub, one, d)      // 0.98
+                let twoMinusD = g.n(.sub, two, d)  // 1.98
+                let oneMinusD = g.n(.sub, one, d)  // 0.98
 
                 let scaledState = g.n(.mul, twoMinusD, state_t)
                 let scaledPrev = g.n(.mul, oneMinusD, state_t_1)
@@ -673,9 +673,12 @@ final class TensorOpsTests: XCTestCase {
 
                 // Get state buffer cell ID for inspection
                 let stateCellId = stateBuffer.cellId
-                let stateCellPhysical = cResult.cellAllocations.cellMappings[stateCellId] ?? stateCellId
+                let stateCellPhysical =
+                        cResult.cellAllocations.cellMappings[stateCellId] ?? stateCellId
 
-                print("=== State buffer at cell \(stateCellId) -> physical \(stateCellPhysical) ===")
+                print(
+                        "=== State buffer at cell \(stateCellId) -> physical \(stateCellPhysical) ==="
+                )
 
                 // Run
                 var output = [Float](repeating: 0, count: frameCount)
@@ -751,6 +754,114 @@ final class TensorOpsTests: XCTestCase {
                 let cornerSum = abs(corner00) + abs(corner33)
                 print("Corner sum (propagation check): \(cornerSum)")
 
+        }
+
+        // MARK: - Compressor Tests
+
+        func testStereoCompressor() throws {
+                // Test: stereo compressor - input1 -> compressor -> out1, input2 -> compressor -> out2
+                // This tests that scalar operations still emit correctly after tensor optimization changes
+                let g = Graph()
+
+                // Get stereo inputs
+                let input1 = g.n(.input(0))
+                let input2 = g.n(.input(1))
+
+                // Shared compressor parameters
+                let ratio = g.n(.constant(4.0))       // 4:1 ratio
+                let threshold = g.n(.constant(-12.0)) // -12 dB threshold
+                let knee = g.n(.constant(6.0))        // 6 dB knee
+                let attack = g.n(.constant(0.01))     // 10ms attack
+                let release = g.n(.constant(0.1))     // 100ms release
+                let isSideChain = g.n(.constant(0.0)) // no sidechain
+                let sidechainIn = g.n(.constant(0.0)) // unused
+
+                // Apply compressor to each channel
+                let compressed1 = g.compressor(
+                        input1, ratio, threshold, knee, attack, release, isSideChain, sidechainIn)
+                let compressed2 = g.compressor(
+                        input2, ratio, threshold, knee, attack, release, isSideChain, sidechainIn)
+
+                // Outputs
+                _ = g.n(.output(0), compressed1)
+                _ = g.n(.output(1), compressed2)
+
+                let frameCount = 64
+
+                // Compile
+                let cResult = try CompilationPipeline.compile(
+                        graph: g,
+                        backend: .c,
+                        options: .init(frameCount: frameCount, debug: true)
+                )
+
+                print("=== Stereo Compressor - C Source ===")
+                print(cResult.source)
+
+                // Verify source is not empty
+                XCTAssertFalse(cResult.source.isEmpty, "C source should not be empty")
+
+                // Create runtime and execute
+                let cRuntime = CCompiledKernel(
+                        source: cResult.source,
+                        cellAllocations: cResult.cellAllocations,
+                        memorySize: cResult.totalMemorySlots
+                )
+                try cRuntime.compileAndLoad()
+
+                guard let mem = cRuntime.allocateNodeMemory() else {
+                        XCTFail("Failed to allocate memory")
+                        return
+                }
+                defer { cRuntime.deallocateNodeMemory(mem) }
+
+                // Create test input - a simple sine-like pattern
+                var input1Data = [Float](repeating: 0, count: frameCount)
+                var input2Data = [Float](repeating: 0, count: frameCount)
+                for i in 0..<frameCount {
+                        input1Data[i] = sin(Float(i) * 0.2) * 0.8  // Left channel
+                        input2Data[i] = cos(Float(i) * 0.2) * 0.8  // Right channel (phase shifted)
+                }
+
+                // Run - need 2 output channels
+                var output1 = [Float](repeating: 0, count: frameCount)
+                var output2 = [Float](repeating: 0, count: frameCount)
+
+                // The runtime expects interleaved or separate buffers - check how it works
+                output1.withUnsafeMutableBufferPointer { out1Ptr in
+                        output2.withUnsafeMutableBufferPointer { out2Ptr in
+                                input1Data.withUnsafeBufferPointer { in1Ptr in
+                                        input2Data.withUnsafeBufferPointer { in2Ptr in
+                                                // Create arrays of pointers for multi-channel
+                                                var outPtrs: [UnsafeMutablePointer<Float>?] = [out1Ptr.baseAddress, out2Ptr.baseAddress]
+                                                var inPtrs: [UnsafePointer<Float>?] = [in1Ptr.baseAddress, in2Ptr.baseAddress]
+
+                                                outPtrs.withUnsafeMutableBufferPointer { outBuf in
+                                                        inPtrs.withUnsafeBufferPointer { inBuf in
+                                                                cRuntime.runWithMemory(
+                                                                        outputs: outBuf.baseAddress!.pointee!,
+                                                                        inputs: inBuf.baseAddress!.pointee!,
+                                                                        memory: mem,
+                                                                        frameCount: frameCount
+                                                                )
+                                                        }
+                                                }
+                                        }
+                                }
+                        }
+                }
+
+                // Print some output values
+                print("=== Stereo Compressor Output ===")
+                for i in stride(from: 0, to: min(10, frameCount), by: 1) {
+                        print("frame \(i): L=\(output1[i]) R=\(output2[i])")
+                }
+
+                // Verify we got non-zero output (compressor should pass signal through)
+                let hasNonZeroL = output1.contains { abs($0) > 0.0001 }
+                let hasNonZeroR = output2.contains { abs($0) > 0.0001 }
+                XCTAssertTrue(hasNonZeroL, "Left channel should have non-zero values")
+                XCTAssertTrue(hasNonZeroR, "Right channel should have non-zero values")
         }
 
 }

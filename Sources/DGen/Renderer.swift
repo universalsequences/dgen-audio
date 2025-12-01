@@ -111,6 +111,15 @@ public class CRenderer: Renderer {
     // MC support parameters supplied by CompilationPipeline.Options
     public var voiceCount: Int = 1
     public var voiceCellIdOpt: Int? = nil
+    public var loadedGlobal: [Int: Bool] = [:]
+
+    // Track the emitted type of each variable in current scope
+    public enum EmittedType {
+        case int_
+        case float_
+        case float32x4
+    }
+    public var varEmittedTypes: [VarID: EmittedType] = [:]
 
     public override init() {
     }
@@ -298,6 +307,9 @@ public class CRenderer: Renderer {
         // Use audiograph parameters directly - no mapping needed
         code.append("  int frameCount = nframes;  // Use audiograph frame count parameter")
 
+        loadedGlobal = [:]
+        varEmittedTypes = [:]
+
         // Define constants and memory (sorted by constantId for deterministic output)
         for (constantId, constant) in ctx.constants.sorted(by: { $0.key < $1.key }) {
             let uop = UOp(op: .defineConstant(constantId, constant), value: .empty)
@@ -323,7 +335,14 @@ public class CRenderer: Renderer {
         for uop in scheduleItem.ops {
             var diff = 0
             switch uop.op {
-            case .beginIf, .beginLoop, .beginForLoop, .beginParallelRange:
+            case .beginIf, .beginForLoop:
+                diff = 1
+            case .beginLoop:
+                diff = 1
+                // Reset for each new loop scope - variables need to be redeclared
+                loadedGlobal = [:]
+                varEmittedTypes = [:]
+            case .beginParallelRange:
                 diff = 1
             case .endIf, .endLoop, .endParallelRange:
                 indent -= 1
@@ -502,34 +521,60 @@ public class CRenderer: Renderer {
 
         case let .memoryRead(base, offset):
             if uop.kind == .simd {
-                // For SIMD: gather 4 values from potentially different memory locations
                 let offsetExpr = g(offset)
-                let gatherExpr = """
-                    (float32x4_t){
-                        memory[\(base) + (int)vgetq_lane_f32(\(offsetExpr), 0)],
-                        memory[\(base) + (int)vgetq_lane_f32(\(offsetExpr), 1)],
-                        memory[\(base) + (int)vgetq_lane_f32(\(offsetExpr), 2)],
-                        memory[\(base) + (int)vgetq_lane_f32(\(offsetExpr), 3)]
-                    }
-                    """.trimmingCharacters(in: .whitespacesAndNewlines)
-                return emitAssign(uop, "vld1q_f32(&memory[\(base) + (int)\(offsetExpr)])", ctx)
-                //return emitAssign(uop, gatherExpr, ctx)
+                // Check offset type to determine how to handle it
+                let offsetType: EmittedType
+                if case .variable(let varId, _) = offset {
+                    offsetType = varEmittedTypes[varId] ?? .float32x4
+                } else {
+                    offsetType = .float32x4
+                }
+
+                switch offsetType {
+                case .int_, .float_:
+                    // Offset is scalar (int or float) - use direct SIMD load
+                    return emitAssign(uop, "vld1q_f32(&memory[\(base) + (int)\(offsetExpr)])", ctx)
+                case .float32x4:
+                    // Offset is a SIMD vector - gather 4 values from different locations
+                    let gatherExpr = """
+                        (float32x4_t){
+                            memory[\(base) + (int)vgetq_lane_f32(\(offsetExpr), 0)],
+                            memory[\(base) + (int)vgetq_lane_f32(\(offsetExpr), 1)],
+                            memory[\(base) + (int)vgetq_lane_f32(\(offsetExpr), 2)],
+                            memory[\(base) + (int)vgetq_lane_f32(\(offsetExpr), 3)]
+                        }
+                        """.trimmingCharacters(in: .whitespacesAndNewlines)
+                    return emitAssign(uop, gatherExpr, ctx)
+                }
             } else {
                 return emitAssign(uop, "memory[\(base) + (int)\(g(offset))]", ctx)
             }
 
         case let .memoryWrite(base, offset, value):
             if uop.kind == .simd {
-                // For SIMD: scatter 4 values to potentially different memory locations
                 let offsetExpr = g(offset)
                 let valueExpr = g(value)
-                return "vst1q_f32(&memory[\(base) + (int)\(offsetExpr)], \(valueExpr));"
-                //return """
-                //    memory[\(base) + (int)vgetq_lane_f32(\(offsetExpr), 0)] = vgetq_lane_f32(\(valueExpr), 0);
-                //    memory[\(base) + (int)vgetq_lane_f32(\(offsetExpr), 1)] = vgetq_lane_f32(\(valueExpr), 1);
-                //    memory[\(base) + (int)vgetq_lane_f32(\(offsetExpr), 2)] = vgetq_lane_f32(\(valueExpr), 2);
-                //    memory[\(base) + (int)vgetq_lane_f32(\(offsetExpr), 3)] = vgetq_lane_f32(\(valueExpr), 3);
-                //    """.trimmingCharacters(in: .whitespacesAndNewlines)
+                // Check offset type to determine how to handle it
+                let offsetType: EmittedType
+                if case .variable(let varId, _) = offset {
+                    offsetType = varEmittedTypes[varId] ?? .float32x4
+                } else {
+                    offsetType = .float32x4
+                }
+
+                switch offsetType {
+                case .int_, .float_:
+                    // Offset is scalar (int or float) - use direct SIMD store
+                    return "vst1q_f32(&memory[\(base) + (int)\(offsetExpr)], \(valueExpr));"
+                case .float32x4:
+                    // Offset is a SIMD vector - scatter 4 values to different locations
+                    return """
+                        memory[\(base) + (int)vgetq_lane_f32(\(offsetExpr), 0)] = vgetq_lane_f32(\(valueExpr), 0);
+                        memory[\(base) + (int)vgetq_lane_f32(\(offsetExpr), 1)] = vgetq_lane_f32(\(valueExpr), 1);
+                        memory[\(base) + (int)vgetq_lane_f32(\(offsetExpr), 2)] = vgetq_lane_f32(\(valueExpr), 2);
+                        memory[\(base) + (int)vgetq_lane_f32(\(offsetExpr), 3)] = vgetq_lane_f32(\(valueExpr), 3);
+                        """.trimmingCharacters(in: .whitespacesAndNewlines)
+                }
             } else {
                 return "memory[\(base) + (int)\(g(offset))] = \(g(value));"
             }
@@ -775,6 +820,10 @@ public class CRenderer: Renderer {
         case .frameCount: return "/* frameCount available as function parameter */"
 
         case let .loadGlobal(id):
+            if loadedGlobal[id] != nil {
+                return "/* skip load */"
+            }
+            loadedGlobal[id] = true
             if uop.kind == .simd {
                 // Create a proper SIMD variable declaration for loadGlobal
                 return "float32x4_t simd\(id) = vld1q_f32(t\(id) + i);"
@@ -784,7 +833,7 @@ public class CRenderer: Renderer {
                 let simdVersion =
                     "float32x4_t simd\(id) = vdupq_n_f32(t\(id)[i]); "
                 let scalarVersion = emitAssign(uop, "t\(id)[i]", ctx)
-                return simdVersion + "\n" + scalarVersion
+                return simdVersion + "\n    " + scalarVersion
             }
 
         // Parallel range - for C, render as a simple for loop
@@ -794,6 +843,8 @@ public class CRenderer: Renderer {
             guard case .variable(let varId, _) = uop.value else {
                 fatalError("beginParallelRange requires variable")
             }
+            // Track this as an int loop counter
+            varEmittedTypes[varId] = .int_
             return
                 "for (int \(pre)\(varId) = 0; \(pre)\(varId) < \(count); \(pre)\(varId)+=\(incr)) {"
         case .endParallelRange:
@@ -850,6 +901,9 @@ public class CRenderer: Renderer {
         let isGlobal = ctx.globals.contains(varId)
 
         if uop.kind == .simd {
+            // Track type as float32x4 (or float if forced)
+            varEmittedTypes[varId] = forceFloatType ? .float_ : .float32x4
+
             if isGlobal {
                 // For global variables, we need both a local variable declaration
                 // AND a store to the global buffer for cross-block transfer
@@ -862,6 +916,9 @@ public class CRenderer: Renderer {
                 return "\(type) \(lhs) = \(expr);"
             }
         } else {
+            // Track type as float
+            varEmittedTypes[varId] = .float_
+
             let lhs = emitLazy(
                 uop.value, ctx: ctx, kind: uop.kind, isOut: true)
             return isGlobal

@@ -124,8 +124,14 @@ func emitBinaryOp(
         return
     }
 
+    guard let index = b.ctx.tensorIndices[node.id] else {
+        print("⚠️ [emitBinaryOp] tensorIndices missing for node.id=\(node.id) shape=\(shape)")
+        return
+    }
+
+    let idx = b.value(index)
+
     // Tensor case
-    let size = shape.reduce(1, *)
     let outputTensorId = g.nodeToTensor[node.id]!
     let outputCellId = g.tensors[outputTensorId]!.cellId
 
@@ -133,26 +139,26 @@ func emitBinaryOp(
     let input0Shape = g.nodes[node.inputs[0]]?.shape ?? .scalar
     let input1Shape = g.nodes[node.inputs[1]]?.shape ?? .scalar
 
-    b.parallelRange(size, kind: size % 4 == 0 ? .simd : .scalar) { idx in
-        let a: Expr
-        if case .scalar = input0Shape {
-            a = b.value(inputs[0])
-        } else {
-            let cellId = g.tensors[g.nodeToTensor[node.inputs[0]]!]!.cellId
-            a = b.memoryRead(cellId, idx)  //b.cast(idx, to: .int))
-        }
-
-        let c: Expr
-        if case .scalar = input1Shape {
-            c = b.value(inputs[1])
-        } else {
-            let cellId = g.tensors[g.nodeToTensor[node.inputs[1]]!]!.cellId
-            c = b.memoryRead(cellId, b.cast(idx, to: .int))
-        }
-
-        let result = op(a, c)
-        _ = b.memoryWrite(outputCellId, idx, result)
+    let a: Expr
+    if case .scalar = input0Shape {
+        a = b.value(inputs[0])
+    } else {
+        let cellId = g.tensors[g.nodeToTensor[node.inputs[0]]!]!.cellId
+        a = b.memoryRead(cellId, idx)  //b.cast(idx, to: .int))
     }
+
+    let c: Expr
+    if case .scalar = input1Shape {
+        c = b.value(inputs[1])
+    } else {
+        let cellId = g.tensors[g.nodeToTensor[node.inputs[1]]!]!.cellId
+        c = b.memoryRead(cellId, b.cast(idx, to: .int))
+    }
+
+    let result = op(a, c)
+    _ = b.memoryWrite(outputCellId, idx, result)
+    b.use(val: result)
+    //}
 }
 
 /// Emit a unary operation that works on both scalars and tensors.
@@ -171,6 +177,13 @@ func emitUnaryOp(
         return
     }
 
+    guard let index = b.ctx.tensorIndices[node.id] else {
+        print("⚠️ [emitUnaryOp] tensorIndices missing for node.id=\(node.id) shape=\(shape)")
+        return
+    }
+
+    let idx = b.value(index)
+
     // Tensor case
     let size = shape.reduce(1, *)
     let outputTensorId = g.nodeToTensor[node.id]!
@@ -179,11 +192,9 @@ func emitUnaryOp(
     let inputTensorId = g.nodeToTensor[node.inputs[0]]!
     let inputCellId = g.tensors[inputTensorId]!.cellId
 
-    b.parallelRange(size) { idx in
-        let a = b.memoryRead(inputCellId, b.cast(idx, to: .int))
-        let result = op(a)
-        _ = b.memoryWrite(outputCellId, b.cast(idx, to: .int), result)
-    }
+    let a = b.memoryRead(inputCellId, b.cast(idx, to: .int))
+    let result = op(a)
+    _ = b.memoryWrite(outputCellId, b.cast(idx, to: .int), result)
 }
 
 /// Emit a ternary operation (like gswitch) that works on both scalars and tensors.
@@ -201,6 +212,11 @@ func emitTernaryOp(
         b.use(val: op(b.value(inputs[0]), b.value(inputs[1]), b.value(inputs[2])))
         return
     }
+    guard let index = b.ctx.tensorIndices[node.id] else {
+        return
+    }
+
+    let idx = b.value(index)
 
     // Tensor case
     let size = shape.reduce(1, *)
@@ -212,34 +228,32 @@ func emitTernaryOp(
     let input1Shape = g.nodes[node.inputs[1]]?.shape ?? .scalar
     let input2Shape = g.nodes[node.inputs[2]]?.shape ?? .scalar
 
-    b.parallelRange(size, kind: size % 4 == 0 ? .simd : .scalar) { idx in
-        let a: Expr
-        if case .scalar = input0Shape {
-            a = b.value(inputs[0])
-        } else {
-            let cellId = g.tensors[g.nodeToTensor[node.inputs[0]]!]!.cellId
-            a = b.memoryRead(cellId, b.cast(idx, to: .int))
-        }
-
-        let c: Expr
-        if case .scalar = input1Shape {
-            c = b.value(inputs[1])
-        } else {
-            let cellId = g.tensors[g.nodeToTensor[node.inputs[1]]!]!.cellId
-            c = b.memoryRead(cellId, b.cast(idx, to: .int))
-        }
-
-        let d: Expr
-        if case .scalar = input2Shape {
-            d = b.value(inputs[2])
-        } else {
-            let cellId = g.tensors[g.nodeToTensor[node.inputs[2]]!]!.cellId
-            d = b.memoryRead(cellId, b.cast(idx, to: .int))
-        }
-
-        let result = op(a, c, d)
-        _ = b.memoryWrite(outputCellId, b.cast(idx, to: .int), result)
+    let a: Expr
+    if case .scalar = input0Shape {
+        a = b.value(inputs[0])
+    } else {
+        let cellId = g.tensors[g.nodeToTensor[node.inputs[0]]!]!.cellId
+        a = b.memoryRead(cellId, b.cast(idx, to: .int))
     }
+
+    let c: Expr
+    if case .scalar = input1Shape {
+        c = b.value(inputs[1])
+    } else {
+        let cellId = g.tensors[g.nodeToTensor[node.inputs[1]]!]!.cellId
+        c = b.memoryRead(cellId, b.cast(idx, to: .int))
+    }
+
+    let d: Expr
+    if case .scalar = input2Shape {
+        d = b.value(inputs[2])
+    } else {
+        let cellId = g.tensors[g.nodeToTensor[node.inputs[2]]!]!.cellId
+        d = b.memoryRead(cellId, b.cast(idx, to: .int))
+    }
+
+    let result = op(a, c, d)
+    _ = b.memoryWrite(outputCellId, b.cast(idx, to: .int), result)
 }
 
 func u_historyWrite(cellId: CellID, _ curr: Expr) -> (IRBuilder) -> Expr {
@@ -685,10 +699,15 @@ public enum LazyOp {
                 let inputCellId = g.tensors[inputTensorId]!.cellId
                 let size = tensor.size
 
-                b.parallelRange(size) { idx in
-                    let value = b.memoryRead(inputCellId, b.cast(idx, to: .int))
-                    _ = b.memoryWrite(cellId, b.cast(idx, to: .int), value)
+                guard let index = ctx.tensorIndices[nodeId] else {
+                    throw DGenError.insufficientInputs(
+                        operator: "historyWrite", expected: 1, actual: node.inputs.count)
                 }
+                let idx = b.value(index)
+                //b.parallelRange(size) { idx in
+                let value = b.memoryRead(inputCellId, b.cast(idx, to: .int))
+                _ = b.memoryWrite(cellId, b.cast(idx, to: .int), value)
+                //}
             } else {
                 // Scalar write
                 guard inputs.count == 1 else {
@@ -714,10 +733,16 @@ public enum LazyOp {
                 let outputCellId = g.tensors[outputTensorId]!.cellId
                 let size = tensor.size
 
-                b.parallelRange(size) { idx in
-                    let value = b.memoryRead(cellId, b.cast(idx, to: .int))
-                    _ = b.memoryWrite(outputCellId, b.cast(idx, to: .int), value)
+                guard let index = ctx.tensorIndices[nodeId] else {
+                    throw DGenError.insufficientInputs(
+                        operator: "historyWrite", expected: 1, actual: node.inputs.count)
                 }
+                let idx = b.value(index)
+
+                //b.parallelRange(size) { idx in
+                let value = b.memoryRead(cellId, b.cast(idx, to: .int))
+                _ = b.memoryWrite(outputCellId, b.cast(idx, to: .int), value)
+                //}
                 // Register placeholder for downstream ops
                 ctx.values[nodeId] = .empty
             } else {

@@ -5,6 +5,8 @@ public class IRContext {
     private var gradIdx = 0
     private var constantIdx = 0
 
+    public var tensorIndices: [NodeID: Lazy] = [:]
+
     // Maximum gradient ID allocated (for buffer sizing)
     public var maxGradId: Int { return gradIdx }
     // Reuse constant IDs for identical values to reduce duplicate vdupq constants

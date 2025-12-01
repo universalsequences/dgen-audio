@@ -137,8 +137,13 @@ public struct CompilationPipeline {
         // by isolation but do not straddle Pass1/Pass2 boundaries.
         let reFusedBlocks = fuseBlocks(isolatedBlocks, graph)
 
+        let context = IRContext()
+
+        // finally seperate tensor blocks of shared size into their own blocks
+        let seperatedBlocks = determineTensorBlocks(reFusedBlocks, graph, context)
+
         //let splitBlocks = splitBlocksIfNeeded(blocks, backend)
-        var finalBlocks = reFusedBlocks.compactMap { $0 }
+        var finalBlocks = seperatedBlocks.compactMap { $0 }
 
         if options.backwards {
             var backwardsBlocks: [Block] = []
@@ -181,7 +186,6 @@ public struct CompilationPipeline {
         }
 
         // Step 5: Convert blocks to UOp blocks
-        let context = IRContext()
         var uopBlocks = [BlockUOps]()
 
         for blockIdx in finalBlockIndices {
@@ -717,4 +721,70 @@ func combineHistoryOpsNotInFeedback(
             }
         }
     }
+}
+
+func determineTensorBlocks(_ blocks: [Block], _ graph: Graph, _ ctx: IRContext) -> [Block] {
+    var determined: [Block] = []
+    print("\(ANSI.green) determining blocks! \(ANSI.reset)")
+
+    // Helper to create a new block preserving original properties
+    func makeBlock(from original: Block) -> Block {
+        var newBlock = Block(kind: original.kind)
+        newBlock.direction = original.direction
+        newBlock.temporality = original.temporality
+        return newBlock
+    }
+
+    for block in blocks {
+        var innerBlocks: [Block] = []
+        var currentBlock = makeBlock(from: block)
+        var currentShape: Shape? = nil
+        for nodeId in block.nodes {
+            if let node = graph.nodes[nodeId] {
+                print("checking node=(nodeId)")
+                if case .conv2d = node.op {
+                    if currentShape != nil {
+                        if currentBlock.nodes.count > 0 {
+                            innerBlocks.append(currentBlock)
+                        }
+                        // regular node
+                        currentBlock = makeBlock(from: block)
+                    }
+                    currentShape = nil
+
+                } else if case let .tensor(shape) = node.shape {
+                    print("we have a shape node!")
+                    if shape != currentShape {
+                        print("shape changed \(shape) currentShape")
+                        if currentBlock.nodes.count > 0 {
+                            innerBlocks.append(currentBlock)
+                        }
+                        // tensor block
+                        currentBlock = makeBlock(from: block)
+                        currentBlock.tensorIndex = ctx.useVariable(src: nil)
+                        currentBlock.shape = shape
+                        currentShape = shape
+                    }
+                } else {
+                    if currentShape != nil {
+                        if currentBlock.nodes.count > 0 {
+                            innerBlocks.append(currentBlock)
+                        }
+                        // regular node
+                        currentBlock = makeBlock(from: block)
+                    }
+                    currentShape = nil
+                }
+            }
+            currentBlock.nodes.append(nodeId)
+        }
+        if currentBlock.nodes.count > 0 {
+            innerBlocks.append(currentBlock)
+        }
+        for block in innerBlocks {
+            determined.append(block)
+        }
+    }
+    print("returning determined")
+    return determined
 }
