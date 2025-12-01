@@ -743,10 +743,16 @@ func determineTensorBlocks(_ blocks: [Block], _ graph: Graph, _ ctx: IRContext) 
             if let node = graph.nodes[nodeId] {
                 print("checking node=(nodeId)")
 
-                // Skip tensorRef nodes for tensor block creation - they emit nothing
-                // and shouldn't start their own parallel range
+                // Skip tensorRef nodes for tensor block grouping decisions.
+                //
+                // tensorRef nodes are just data containers - they emit nothing (return []).
+                // If we let them create tensor blocks, we'd get empty parallel loops:
+                //   for (int simd1 = 0; simd1 < 16; simd1+=4) { }  // empty!
+                //
+                // Instead, tensorRef nodes stay in whatever block they're in but don't
+                // trigger new tensor block creation. The actual tensor OPERATIONS (mul, add, etc.)
+                // that process tensor data will create the tensor blocks.
                 if case .tensorRef = node.op {
-                    // tensorRef nodes stay in current block but don't affect tensor grouping
                     currentBlock.nodes.append(nodeId)
                     continue
                 }

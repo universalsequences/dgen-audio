@@ -968,9 +968,28 @@ public func emitBlockUOps(
         }
     }
 
+    // Handle cross-block dependencies using scratch buffers (for scalar values only)
+    //
+    // IMPORTANT: Tensor-valued outputs/inputs do NOT use scratch buffers.
+    //
+    // Why? Scratch buffers are indexed by frame (t<id>[i]), but tensor operations
+    // run inside parallel loops where each tensor element has a different value.
+    // If we wrote tensor results to scratch buffers inside a tensor loop:
+    //   - Each iteration would overwrite the same t<id>[i] location
+    //   - Only the LAST tensor element's value would survive
+    //   - Reading it back and broadcasting would give wrong values (noise!)
+    //
+    // Instead, tensor data flows through memory cells which ARE properly indexed
+    // by the tensor parallel range index (memory[cellId + tensorIndex]).
+
     let outbound = findNodesWithOutboundDependencies(blocks, g, block: block)
     for nodeId in outbound {
         if emittedNodes.contains(nodeId) {
+            // Skip defineGlobal for tensor-valued outputs - they use memory cells, not scratch buffers
+            if let node = g.nodes[nodeId], case .tensor = node.shape {
+                continue
+            }
+
             if let lz = ctx.values[nodeId] {
                 switch lz {
                 case .variable(let a, _):
@@ -991,6 +1010,11 @@ public func emitBlockUOps(
     let inbound = findNodesAsInboundDependencies(blocks, g, block: block)
 
     for nodeId in inbound {
+        // Skip loadGlobal for tensor-valued inputs - they use memory cells, not scratch buffers
+        if let node = g.nodes[nodeId], case .tensor = node.shape {
+            continue
+        }
+
         if let lz = ctx.values[nodeId] {
             switch lz {
             case .variable(let a, _):
