@@ -544,11 +544,14 @@ public func determineBlocksSimple(
             // Check if we can add to an existing block that contains the dependency
             var addedToExistingBlock = false
             if targetBlockIdx != -1 && targetBlockIdx < blocks.count {
-                if !wouldExceedNodeLimit(blocks[targetBlockIdx], maxNodesPerBlock: maxNodesPerBlock) {
+                if !wouldExceedNodeLimit(blocks[targetBlockIdx], maxNodesPerBlock: maxNodesPerBlock)
+                {
                     blocks[targetBlockIdx].nodes.append(nodeId)
                     addedToExistingBlock = true
                     if debug {
-                        print("📍 Placed output node \(nodeId) in block \(targetBlockIdx) with its dependency")
+                        print(
+                            "📍 Placed output node \(nodeId) in block \(targetBlockIdx) with its dependency"
+                        )
                     }
                 }
             }
@@ -984,7 +987,7 @@ public func emitBlockUOps(
     {
         // Use reduce to compute count for any dimensionality
         let count = shape.reduce(1, *)
-        let incr = count % 4 == 0 ? 4 : 1
+        let incr = 1  //count % 4 == 0 ? 4 : 1
         uops.append(UOp(op: .beginParallelRange(count, incr), value: tensorIndex))
     }
 
@@ -999,6 +1002,7 @@ public func emitBlockUOps(
                     emittedNodes.insert(nodeId)
 
                     var typedUOp = uop
+                    /*
                     if block.tensorIndex != nil,
                         let shape = block.shape
                     {
@@ -1008,6 +1012,8 @@ public func emitBlockUOps(
                     } else {
                         typedUOp.kind = block.kind
                     }
+                     */
+                    typedUOp.kind = block.kind
                     uops.append(typedUOp)
                 }
             } else {

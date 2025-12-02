@@ -322,6 +322,150 @@ public final class IRBuilder {
     return val
   }
 
+  // MARK: - Strided Tensor Indexing
+
+  /// Compute linear memory index from multi-dimensional indices using tensor strides.
+  /// Optimizes for the trivial case (contiguous row-major) to avoid unnecessary operations.
+  ///
+  /// For a tensor with shape [M, N] and strides [N, 1]:
+  ///   linearIndex([row, col]) = row * N + col  (trivial: last stride is 1)
+  ///
+  /// For a transposed tensor with shape [N, M] and strides [1, N]:
+  ///   linearIndex([row, col]) = row * 1 + col * N  (non-trivial: requires actual stride math)
+  ///
+  public func stridedIndex(indices: [Expr], strides: [Int]) -> Expr {
+    guard indices.count == strides.count else {
+      fatalError("stridedIndex: indices count (\(indices.count)) must match strides count (\(strides.count))")
+    }
+
+    guard !indices.isEmpty else {
+      return constant(0)
+    }
+
+    var result: Expr? = nil
+
+    for i in 0..<indices.count {
+      let stride = strides[i]
+
+      // Skip stride-0 dimensions (broadcast dimensions)
+      if stride == 0 { continue }
+
+      let idx = indices[i]
+
+      // Optimization: stride of 1 means just use the index directly
+      let term: Expr
+      if stride == 1 {
+        term = idx
+      } else {
+        // Use Expr operators (* and +) which emit proper IR
+        term = idx * constant(Float(stride))
+      }
+
+      // Accumulate terms
+      if let r = result {
+        result = r + term
+      } else {
+        result = term
+      }
+    }
+
+    return result ?? constant(0)
+  }
+
+  /// Read from tensor using multi-dimensional indices (handles strides correctly)
+  /// This is the preferred way to read tensor elements when you have logical indices.
+  public func tensorRead(cellId: CellID, indices: [Expr], strides: [Int]) -> Expr {
+    // Check register cache first
+    if let existingVar = ctx.tensorCellToVar[cellId] {
+      return value(existingVar)
+    }
+
+    // Compute linear index using strides
+    let linearIdx = stridedIndex(indices: indices, strides: strides)
+    return memoryRead(cellId, cast(linearIdx, to: .int))
+  }
+
+  // MARK: - Broadcast Indexing
+
+  /// Convert a flat output index to multi-dimensional indices for the given shape.
+  /// e.g., flatIdx=7 with shape [2,2,3] -> [1,0,1] (row-major)
+  public func flatToMultiIndex(flatIdx: Expr, shape: [Int]) -> [Expr] {
+    guard !shape.isEmpty else { return [] }
+
+    var indices: [Expr] = []
+    var remaining = flatIdx
+
+    for i in 0..<shape.count {
+      // Compute stride for this dimension (product of all subsequent dims)
+      let stride = shape[(i+1)...].reduce(1, *)
+
+      if stride == 1 {
+        // Last dimension - just use remaining
+        indices.append(remaining)
+      } else {
+        // idx[i] = floor(remaining / stride)
+        let strideConst = constant(Float(stride))
+        let rawIdx = remaining / strideConst
+        let flooredIdx = floor(rawIdx)
+        indices.append(flooredIdx)  // Use floored index!
+        // remaining = remaining % stride (using: a - floor(a/b)*b)
+        remaining = remaining - (flooredIdx * strideConst)
+      }
+    }
+
+    return indices
+  }
+
+  /// Compute broadcast-aware memory index for reading from an input tensor.
+  /// Takes the output's flat index and output shape, and computes the correct
+  /// memory offset for an input tensor that may have different (broadcastable) shape.
+  ///
+  /// Broadcasting rules:
+  /// - Shapes are right-aligned (pad shorter shape with 1s on the left)
+  /// - Where input dim == 1, that index is clamped to 0 (broadcast)
+  /// - Uses input tensor's strides for the final memory offset
+  ///
+  /// Example:
+  ///   outputIdx=7, outputShape=[2,2,3], inputShape=[2,1,3], inputStrides=[3,3,1]
+  ///   -> multiIdx = [1,0,1]
+  ///   -> broadcastIdx = [1,0,1] (middle dim clamped to 0 since input dim is 1)
+  ///   -> memoryOffset = 1*3 + 0*3 + 1*1 = 4
+  public func broadcastIndex(
+    outputIdx: Expr,
+    outputShape: [Int],
+    inputShape: [Int],
+    inputStrides: [Int]
+  ) -> Expr {
+    // Convert flat index to multi-dimensional indices for output shape
+    let multiIdx = flatToMultiIndex(flatIdx: outputIdx, shape: outputShape)
+
+    // Right-align shapes (pad input with 1s on left if needed)
+    let outputRank = outputShape.count
+    let inputRank = inputShape.count
+    let rankDiff = outputRank - inputRank
+
+    var broadcastIndices: [Expr] = []
+    var broadcastStrides: [Int] = []
+
+    for i in 0..<inputRank {
+      let outputDimIdx = i + rankDiff
+      let inputDim = inputShape[i]
+      let outputIdx = multiIdx[outputDimIdx]
+
+      if inputDim == 1 {
+        // Broadcast dimension - always index 0
+        broadcastIndices.append(constant(0))
+      } else {
+        // Normal dimension - use the output index
+        broadcastIndices.append(outputIdx)
+      }
+      broadcastStrides.append(inputStrides[i])
+    }
+
+    // Compute final memory offset using input strides
+    return stridedIndex(indices: broadcastIndices, strides: broadcastStrides)
+  }
+
   public func min(_ a: Expr, _ b: Expr) -> Expr {
     let dest = ctx.useVariable(src: nodeId)
     let uop = UOp(op: .min(a.lazy, b.lazy), value: dest)

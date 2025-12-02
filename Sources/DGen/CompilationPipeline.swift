@@ -757,6 +757,21 @@ func determineTensorBlocks(_ blocks: [Block], _ graph: Graph, _ ctx: IRContext) 
                     continue
                 }
 
+                // Skip view operations (reshape, transpose) for tensor block grouping.
+                //
+                // These are metadata-only changes - they share the input tensor's cellId
+                // and don't emit any actual code. If we let them create tensor blocks,
+                // we'd get empty parallel loops. The operations that USE these reshaped
+                // tensors (mul, add, etc.) will create the actual tensor blocks.
+                if case .reshape = node.op {
+                    currentBlock.nodes.append(nodeId)
+                    continue
+                }
+                if case .transpose = node.op {
+                    currentBlock.nodes.append(nodeId)
+                    continue
+                }
+
                 if case .conv2d = node.op {
                     if currentShape != nil {
                         if currentBlock.nodes.count > 0 {

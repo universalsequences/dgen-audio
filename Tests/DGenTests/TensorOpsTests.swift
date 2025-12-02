@@ -897,7 +897,7 @@ final class CTensorOpsTests: XCTestCase {
 
         // MARK: - Matmul Tests
 
-        func testMatmulBasic() throws {
+        func testMatmulExecution() throws {
                 let g = Graph()
 
                 // A: 2x3 matrix
@@ -916,16 +916,50 @@ final class CTensorOpsTests: XCTestCase {
                 let result = g.n(.sum, c)
                 _ = g.n(.output(0), result)
 
-                let compilationResult = try CompilationPipeline.compile(
+                let frameCount = 1
+                let cResult = try CompilationPipeline.compile(
                         graph: g,
                         backend: .c,
-                        options: .init(frameCount: 1, debug: true)
+                        options: .init(frameCount: frameCount, debug: true)
                 )
 
-                print("=== Matmul Basic - Generated Source ===")
-                print(compilationResult.source)
+                print("=== Matmul Execution - Generated Source ===")
+                print(cResult.source)
 
-                XCTAssertFalse(compilationResult.source.isEmpty)
+                let cRuntime = CCompiledKernel(
+                        source: cResult.source,
+                        cellAllocations: cResult.cellAllocations,
+                        memorySize: cResult.totalMemorySlots
+                )
+                try cRuntime.compileAndLoad()
+
+                guard let mem = cRuntime.allocateNodeMemory() else {
+                        XCTFail("Failed to allocate memory")
+                        return
+                }
+                defer { cRuntime.deallocateNodeMemory(mem) }
+
+                injectTensorData(result: cResult, memory: mem.assumingMemoryBound(to: Float.self))
+
+                var output = [Float](repeating: 0, count: frameCount)
+                let input = [Float](repeating: 0, count: frameCount)
+
+                output.withUnsafeMutableBufferPointer { outPtr in
+                        input.withUnsafeBufferPointer { inPtr in
+                                cRuntime.runWithMemory(
+                                        outputs: outPtr.baseAddress!,
+                                        inputs: inPtr.baseAddress!,
+                                        memory: mem,
+                                        frameCount: frameCount
+                                )
+                        }
+                }
+
+                print("=== Matmul Result ===")
+                print("Output: \(output[0]), Expected: 415.0")
+
+                // A @ B = [[58, 64], [139, 154]], sum = 415
+                XCTAssertEqual(output[0], 415.0, accuracy: 0.001, "Matmul sum should be 415")
         }
 
         // MARK: - Comprehensive Reshape Tests
@@ -1041,21 +1075,20 @@ final class CTensorOpsTests: XCTestCase {
 
         // MARK: - Comprehensive Transpose Tests
 
-        // NOTE: Transpose currently does NOT properly reorder elements - it only changes metadata.
-        // For transpose to work correctly, sumAxis and other ops need to use strides for indexing.
-        // This is a known limitation. The test below documents current (incorrect) behavior.
-        func testTransposeExecution_KNOWN_ISSUE() throws {
-                // KNOWN ISSUE: Transpose currently behaves like reshape (metadata only)
-                // Expected: 46 (if transpose worked correctly)
-                // Actual: 50 (same as reshape)
+        func testTransposeExecution() throws {
+                // Transpose [2,3] -> [3,2] and verify with sumAxis
+                // This test verifies that transpose correctly reorders elements via strided indexing
                 let g = Graph()
 
-                // [2,3]: [[1,2,3], [4,5,6]]
-                // If transpose worked: [[1,4], [2,5], [3,6]] -> sumAxis(1) = [5, 7, 9]
-                // Currently (like reshape): [[1,2], [3,4], [5,6]] -> sumAxis(1) = [3, 7, 11]
+                // [2,3]: [[1,2,3], [4,5,6]] stored as [1,2,3,4,5,6]
+                // Transposed [3,2]: [[1,4], [2,5], [3,6]] (same memory, different strides)
                 let t = g.tensor(shape: [2, 3], data: [1.0, 2.0, 3.0, 4.0, 5.0, 6.0])
-                let transposed = g.transpose(t)
+                let transposed = g.transpose(t)  // shape [3,2], strides [1, 3]
+
+                // sumAxis(1) on transposed [3,2]: [1+4, 2+5, 3+6] = [5, 7, 9]
                 let summed = g.sum(transposed, axis: 1)
+
+                // Multiply by [1, 2, 3] -> 5*1 + 7*2 + 9*3 = 5 + 14 + 27 = 46
                 let weights = g.tensor(shape: [3], data: [1.0, 2.0, 3.0])
                 let weighted = g.n(.mul, summed, weights)
                 let result = g.n(.sum, weighted)
@@ -1064,8 +1097,11 @@ final class CTensorOpsTests: XCTestCase {
                 let frameCount = 1
                 let cResult = try CompilationPipeline.compile(
                         graph: g, backend: .c,
-                        options: .init(frameCount: frameCount, debug: false)
+                        options: .init(frameCount: frameCount, debug: true)
                 )
+
+                print("=== Transpose Execution - Generated Source ===")
+                print(cResult.source)
 
                 let cRuntime = CCompiledKernel(
                         source: cResult.source,
@@ -1096,9 +1132,13 @@ final class CTensorOpsTests: XCTestCase {
                         }
                 }
 
-                // TODO: When transpose is properly implemented, change expected to 46.0
-                // Currently behaves like reshape, giving 50.0
-                XCTAssertEqual(output[0], 50.0, accuracy: 0.001, "KNOWN ISSUE: Transpose currently behaves like reshape")
+                print("=== Transpose Result ===")
+                print("Output: \(output[0]), Expected: 46.0")
+
+                // Transpose [3,2]: [[1,4], [2,5], [3,6]] -> sumAxis(1) = [5, 7, 9]
+                // Weighted: 5*1 + 7*2 + 9*3 = 46
+                // (Compare to reshape which would give [3, 7, 11] -> weighted = 50)
+                XCTAssertEqual(output[0], 46.0, accuracy: 0.001, "Transpose should reorder elements correctly via strided indexing")
         }
 
         // MARK: - Comprehensive SumAxis Tests
@@ -1262,9 +1302,69 @@ final class CTensorOpsTests: XCTestCase {
         // doesn't properly handle strided access for broadcast dimensions.
         // Skipping this test until broadcasting code gen is implemented.
 
-        // NOTE: Matmul execution test skipped due to code gen bug with nested parallel ranges.
-        // The testMatmulBasic compilation test passes, but execution has SIMD variable scope issues.
-        // This needs investigation in the C renderer's handling of nested beginParallelRange.
+        // MARK: - Nested ParallelRange Debug Test
+
+        func testNestedParallelRangeDebug() throws {
+                // Test: 4x3 tensor -> sumAxis(1) -> [4] output
+                // This triggers SIMD when output size is divisible by 4
+                let g = Graph()
+
+                // 4x3 tensor -> sumAxis(1) -> [4] output
+                let t = g.tensor(shape: [4, 3], data: [
+                        1.0, 2.0, 3.0,    // row 0: sum = 6
+                        4.0, 5.0, 6.0,    // row 1: sum = 15
+                        7.0, 8.0, 9.0,    // row 2: sum = 24
+                        10.0, 11.0, 12.0  // row 3: sum = 33
+                ])
+
+                let summed = g.sum(t, axis: 1)  // [4,3] -> [4]
+
+                // Output sum: 6 + 15 + 24 + 33 = 78
+                let result = g.n(.sum, summed)
+                _ = g.n(.output(0), result)
+
+                let frameCount = 1
+                let cResult = try CompilationPipeline.compile(
+                        graph: g, backend: .c,
+                        options: .init(frameCount: frameCount, debug: true)
+                )
+
+                print("=== Nested ParallelRange Debug - Generated Source ===")
+                print(cResult.source)
+
+                let cRuntime = CCompiledKernel(
+                        source: cResult.source,
+                        cellAllocations: cResult.cellAllocations,
+                        memorySize: cResult.totalMemorySlots
+                )
+                try cRuntime.compileAndLoad()
+
+                guard let mem = cRuntime.allocateNodeMemory() else {
+                        XCTFail("Failed to allocate memory")
+                        return
+                }
+                defer { cRuntime.deallocateNodeMemory(mem) }
+
+                injectTensorData(result: cResult, memory: mem.assumingMemoryBound(to: Float.self))
+
+                var output = [Float](repeating: 0, count: frameCount)
+                let input = [Float](repeating: 0, count: frameCount)
+
+                output.withUnsafeMutableBufferPointer { outPtr in
+                        input.withUnsafeBufferPointer { inPtr in
+                                cRuntime.runWithMemory(
+                                        outputs: outPtr.baseAddress!,
+                                        inputs: inPtr.baseAddress!,
+                                        memory: mem,
+                                        frameCount: frameCount
+                                )
+                        }
+                }
+
+                // [4,3] -> sumAxis(1) -> [6, 15, 24, 33] -> sum -> 78
+                XCTAssertEqual(output[0], 78.0, accuracy: 0.001, "Sum of sumAxis(1) on [4,3] should be 78")
+        }
+
 
         func testReshapeThenSumAxisExecution() throws {
                 // Test: reshape changes how sumAxis interprets axes

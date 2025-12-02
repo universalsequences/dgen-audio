@@ -122,14 +122,14 @@ func emitBinaryOp(
     inputs: [Lazy],
     op: (Expr, Expr) -> Expr
 ) {
-    guard case .tensor(let shape) = node.shape else {
+    guard case .tensor(let outputShape) = node.shape else {
         // Scalar case - just apply op directly
         b.use(val: op(b.value(inputs[0]), b.value(inputs[1])))
         return
     }
 
     guard let index = b.ctx.tensorIndices[node.id] else {
-        print("⚠️ [emitBinaryOp] tensorIndices missing for node.id=\(node.id) shape=\(shape)")
+        print("⚠️ [emitBinaryOp] tensorIndices missing for node.id=\(node.id) shape=\(outputShape)")
         return
     }
 
@@ -139,26 +139,42 @@ func emitBinaryOp(
     let outputTensorId = g.nodeToTensor[node.id]!
     let outputCellId = g.tensors[outputTensorId]!.cellId
 
-    // Get input cell IDs (handle scalar + tensor broadcasting)
+    // Get input shapes (handle scalar + tensor broadcasting)
     let input0Shape = g.nodes[node.inputs[0]]?.shape ?? .scalar
     let input1Shape = g.nodes[node.inputs[1]]?.shape ?? .scalar
 
     let a: Expr
     if case .scalar = input0Shape {
         a = b.value(inputs[0])
+    } else if case .tensor(_) = input0Shape {
+        let inputTensor = g.tensors[g.nodeToTensor[node.inputs[0]]!]!
+        // Use broadcast-aware indexing for proper strided access
+        let broadcastIdx = b.broadcastIndex(
+            outputIdx: idx,
+            outputShape: outputShape,
+            inputShape: inputTensor.shape,
+            inputStrides: inputTensor.strides
+        )
+        a = b.tensorMemoryRead(inputTensor.cellId, b.cast(broadcastIdx, to: .int))
     } else {
-        let cellId = g.tensors[g.nodeToTensor[node.inputs[0]]!]!.cellId
-        // Use tensorMemoryRead to check register first before going to memory
-        a = b.tensorMemoryRead(cellId, idx)
+        a = b.value(inputs[0])
     }
 
     let c: Expr
     if case .scalar = input1Shape {
         c = b.value(inputs[1])
+    } else if case .tensor(_) = input1Shape {
+        let inputTensor = g.tensors[g.nodeToTensor[node.inputs[1]]!]!
+        // Use broadcast-aware indexing for proper strided access
+        let broadcastIdx = b.broadcastIndex(
+            outputIdx: idx,
+            outputShape: outputShape,
+            inputShape: inputTensor.shape,
+            inputStrides: inputTensor.strides
+        )
+        c = b.tensorMemoryRead(inputTensor.cellId, b.cast(broadcastIdx, to: .int))
     } else {
-        let cellId = g.tensors[g.nodeToTensor[node.inputs[1]]!]!.cellId
-        // Use tensorMemoryRead to check register first before going to memory
-        c = b.tensorMemoryRead(cellId, b.cast(idx, to: .int))
+        c = b.value(inputs[1])
     }
 
     let result = op(a, c)
@@ -961,10 +977,12 @@ public enum LazyOp {
                     operator: "sumAxis", expected: 1, actual: node.inputs.count)
             }
             guard case .tensor(let inputShape) = g.nodes[node.inputs[0]]?.shape else {
-                throw DGenError.insufficientInputs(operator: "sumAxis requires tensor", expected: 1, actual: 0)
+                throw DGenError.insufficientInputs(
+                    operator: "sumAxis requires tensor", expected: 1, actual: 0)
             }
             guard case .tensor(let outputShape) = node.shape else {
-                throw DGenError.insufficientInputs(operator: "sumAxis output", expected: 1, actual: 0)
+                throw DGenError.insufficientInputs(
+                    operator: "sumAxis output", expected: 1, actual: 0)
             }
 
             guard let inputTensorId = g.nodeToTensor[node.inputs[0]] else {
@@ -975,11 +993,18 @@ public enum LazyOp {
             }
 
             guard let outputTensorId = g.nodeToTensor[node.id] else {
-                fatalError("sumAxis: output node \(node.id) has no tensor mapping. nodeToTensor keys=\(Array(g.nodeToTensor.keys))")
+                fatalError(
+                    "sumAxis: output node \(node.id) has no tensor mapping. nodeToTensor keys=\(Array(g.nodeToTensor.keys))"
+                )
             }
             guard let outputTensor = g.tensors[outputTensorId] else {
                 fatalError("sumAxis: output tensor \(outputTensorId) not found")
             }
+            guard let index = b.ctx.tensorIndices[node.id] else {
+                fatalError("index missing from sumAxi")
+            }
+            let outFlatIdx = b.value(index)
+
             let outputCellId = outputTensor.cellId
 
             let outputSize = outputShape.reduce(1, *)
@@ -988,54 +1013,68 @@ public enum LazyOp {
             }
             let reduceSize = inputShape[axis]
 
+            // Get the actual strides from the tensor (handles transpose correctly!)
+            let inputStrides = inputTensor.strides
+
             // Parallel over output elements
-            b.parallelRange(outputSize) { outFlatIdx in
-                // Convert output flat index to output coords
-                // Then map to input coords with reduction axis
-                let acc = b.float(0.0)
+            //b.parallelRange(outputSize) { outFlatIdx in
+            let acc = b.float(0.0)
 
-                b.loop(reduceSize) { reduceIdx in
-                    // Compute input flat index using strides
-                    // For simplicity, assume 2D or 3D and axis is last or second-to-last
-                    var inputFlatIdx: Expr
+            b.loop(reduceSize) { reduceIdx in
+                // Build multi-dimensional indices for the input tensor
+                // Output shape has one fewer dimension than input (the reduced axis is removed)
+                // We need to map outFlatIdx to output coords, then insert reduceIdx at axis position
 
-                    if inputShape.count == 2 {
-                        if axis == 0 {
-                            // [M, N] -> [N], reduce over rows
-                            // input[reduceIdx, outFlatIdx]
-                            inputFlatIdx = b.cast(reduceIdx, to: .float) * b.constant(Float(inputShape[1])) + b.cast(outFlatIdx, to: .float)
-                        } else {
-                            // [M, N] -> [M], reduce over cols
-                            // input[outFlatIdx, reduceIdx]
-                            inputFlatIdx = b.cast(outFlatIdx, to: .float) * b.constant(Float(inputShape[1])) + b.cast(reduceIdx, to: .float)
-                        }
-                    } else if inputShape.count == 3 {
-                        // Handle 3D case - commonly [M, N, K]
-                        let M = inputShape[0], N = inputShape[1], K = inputShape[2]
-                        if axis == 0 {
-                            // [M, N, K] -> [N, K]
-                            let outN = b.cast(outFlatIdx, to: .int) / b.constant(Float(K))
-                            let outK = b.cast(outFlatIdx, to: .int) % b.constant(Float(K))
-                            inputFlatIdx = b.cast(reduceIdx, to: .float) * b.constant(Float(N * K)) + outN * b.constant(Float(K)) + outK
-                        } else if axis == 1 {
-                            // [M, N, K] -> [M, K]
-                            let outM = b.cast(outFlatIdx, to: .int) / b.constant(Float(K))
-                            let outK = b.cast(outFlatIdx, to: .int) % b.constant(Float(K))
-                            inputFlatIdx = outM * b.constant(Float(N * K)) + b.cast(reduceIdx, to: .float) * b.constant(Float(K)) + outK
-                        } else {
-                            // axis == 2: [M, N, K] -> [M, N]
-                            let outM = b.cast(outFlatIdx, to: .int) / b.constant(Float(N))
-                            let outN = b.cast(outFlatIdx, to: .int) % b.constant(Float(N))
-                            inputFlatIdx = outM * b.constant(Float(N * K)) + outN * b.constant(Float(K)) + b.cast(reduceIdx, to: .float)
-                        }
+                var indices: [Expr] = []
+
+                if inputShape.count == 1 {
+                    // 1D: sumAxis(0) reduces to scalar
+                    indices = [b.cast(reduceIdx, to: .float)]
+                } else if inputShape.count == 2 {
+                    // 2D case
+                    if axis == 0 {
+                        // [M, N] -> [N], reduce over rows
+                        // input[reduceIdx, outFlatIdx]
+                        indices = [
+                            b.cast(reduceIdx, to: .float), b.cast(outFlatIdx, to: .float),
+                        ]
                     } else {
-                        // Fallback for other dimensions - just use flat index
-                        inputFlatIdx = b.cast(reduceIdx, to: .float)
+                        // [M, N] -> [M], reduce over cols
+                        // input[outFlatIdx, reduceIdx]
+                        indices = [
+                            b.cast(outFlatIdx, to: .float), b.cast(reduceIdx, to: .float),
+                        ]
                     }
+                } else if inputShape.count == 3 {
+                    // 3D case - commonly [M, N, K]
+                    let innerDim = axis == 2 ? inputShape[1] : inputShape[2]
+                    let rawDiv = b.cast(outFlatIdx, to: .int) / b.constant(Float(innerDim))
+                    let outOuter = b.floor(rawDiv)  // Must floor for integer division!
+                    let modDivisor = b.constant(Float(innerDim))
+                    let outInner = b.cast(outFlatIdx, to: .int) - (outOuter * modDivisor)
 
-                    let val = b.memoryRead(inputTensor.cellId, b.cast(inputFlatIdx, to: .int))
+                    if axis == 0 {
+                        // [M, N, K] -> [N, K]
+                        indices = [b.cast(reduceIdx, to: .float), outOuter, outInner]
+                    } else if axis == 1 {
+                        // [M, N, K] -> [M, K]
+                        indices = [outOuter, b.cast(reduceIdx, to: .float), outInner]
+                    } else {
+                        // axis == 2: [M, N, K] -> [M, N]
+                        indices = [outOuter, outInner, b.cast(reduceIdx, to: .float)]
+                    }
+                } else {
+                    // Fallback: use flat index (won't handle strides correctly for >3D)
+                    let val = b.memoryRead(inputTensor.cellId, b.cast(reduceIdx, to: .int))
                     acc.accumulate(val)
+                    return
                 }
+
+                // Use strided indexing - this handles transpose correctly!
+                let val = b.tensorRead(
+                    cellId: inputTensor.cellId, indices: indices, strides: inputStrides)
+                acc.accumulate(val)
+                // }
 
                 _ = b.memoryWrite(outputCellId, b.cast(outFlatIdx, to: .int), acc.value)
             }

@@ -146,9 +146,12 @@ extension Graph {
         let viewTensorId = nextTensorId
         nextTensorId += 1
 
-        // For reshape, if input is contiguous, output is contiguous with new shape
-        // Compute new row-major strides for the new shape
-        let newStrides = Tensor.computeRowMajorStrides(newShape)
+        // For reshape, preserve input strides for non-contiguous tensors
+        let newStrides = adaptStridesForReshape(
+            inputShape: inputTensor.shape,
+            inputStrides: inputTensor.strides,
+            newShape: newShape
+        )
 
         tensors[viewTensorId] = Tensor(
             id: viewTensorId,
