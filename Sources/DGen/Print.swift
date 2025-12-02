@@ -159,6 +159,12 @@ extension UOp {
             opStr = "\(ANSI.magenta)endReduce\(ANSI.reset)"
         case let .reduceAccumulate(val):
             opStr = "\(ANSI.magenta)reduceAccumulate\(ANSI.reset)(\(val))"
+        case let .reshape(shape):
+            opStr = "\(ANSI.cyan)reshape\(ANSI.reset)(\(shape))"
+        case let .transpose(axes):
+            opStr = "\(ANSI.cyan)transpose\(ANSI.reset)(\(axes))"
+        case .broadcastAccess:
+            opStr = "\(ANSI.cyan)broadcastAccess\(ANSI.reset)"
         }
 
         return "\(ANSI.bold)UOp\(ANSI.reset)(op: \(opStr), value: \(value))"

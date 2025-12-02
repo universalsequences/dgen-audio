@@ -86,6 +86,9 @@ public enum Op {
   case loadTape(Lazy, Lazy)
   case cast(Lazy, CastType)
   case declareVar(Lazy)  // Declares and initializes a variable: float t = value;
+  case reshape([Int])  // View op: reshape to new shape - renders to nothing but prevents SIMD
+  case transpose([Int])  // View op: transpose with permutation - renders to nothing but prevents SIMD
+  case broadcastAccess  // Marker: broadcast indexing used - renders to nothing but prevents SIMD
 }
 
 public struct UOp {

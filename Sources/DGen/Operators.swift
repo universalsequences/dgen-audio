@@ -1079,17 +1079,21 @@ public enum LazyOp {
                 _ = b.memoryWrite(outputCellId, b.cast(outFlatIdx, to: .int), acc.value)
             }
 
-        case .reshape:
+        case .reshape(let newShape):
             // Reshape is metadata-only - the data stays in place
             // Just register that this node produces a tensor view
             // The actual shape change is handled by the tensor metadata
             ctx.values[nodeId] = .empty
+            // Emit marker UOp for debugging and to signal SIMD should be disabled
+            ops.append(UOp(op: .reshape(newShape), value: .empty))
 
-        case .transpose:
+        case .transpose(let axes):
             // Transpose is metadata-only for contiguous layouts
             // For non-trivial transposes, we may need to copy data
             // For now, just register as a view - emit will use strides
             ctx.values[nodeId] = .empty
+            // Emit marker UOp for debugging and to signal SIMD should be disabled
+            ops.append(UOp(op: .transpose(axes), value: .empty))
         }
         ops.append(contentsOf: b.ops)
         return ops

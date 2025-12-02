@@ -436,6 +436,19 @@ public final class IRBuilder {
     inputShape: [Int],
     inputStrides: [Int]
   ) -> Expr {
+    // Fast path: if shapes match exactly and strides are contiguous (row-major),
+    // just use the flat index directly - no complex arithmetic needed.
+    // This is critical for SIMD optimization to work.
+    if inputShape == outputShape {
+      let expectedStrides = Tensor.computeRowMajorStrides(inputShape)
+      if inputStrides == expectedStrides {
+        return outputIdx
+      }
+    }
+
+    // Emit marker to signal SIMD should be disabled for this block
+    ops.append(UOp(op: .broadcastAccess, value: .empty))
+
     // Convert flat index to multi-dimensional indices for output shape
     let multiIdx = flatToMultiIndex(flatIdx: outputIdx, shape: outputShape)
 

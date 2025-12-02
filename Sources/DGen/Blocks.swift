@@ -969,12 +969,31 @@ public func findOutboundTensorCells(_ blks: [Block], _ g: Graph, block: Block) -
     return outboundCells
 }
 
+/// Check if any UOps contain patterns that prevent SIMD optimization:
+/// - Inner loops (beginLoop, beginForLoop)
+/// - View operations (reshape, transpose) that require complex index arithmetic
+/// - Broadcast access (non-contiguous strides or shape mismatch)
+private func containsSIMDBlockers(_ uops: [UOp]) -> Bool {
+    for uop in uops {
+        switch uop.op {
+        case .beginLoop, .beginForLoop:
+            return true
+        case .reshape, .transpose:
+            return true
+        case .broadcastAccess:
+            return true
+        default:
+            break
+        }
+    }
+    return false
+}
+
 public func emitBlockUOps(
     ctx: IRContext, block: Block, blocks: [Block], g: Graph, debug: Bool = false
 ) throws -> [UOp] {
     var emittedNodes: Set<NodeID> = []
-
-    var uops: [UOp] = []
+    var bodyUops: [UOp] = []
 
     // Tensor Register Optimization:
     // Compute which tensor cells need to be written to memory (used by later blocks)
@@ -982,15 +1001,7 @@ public func emitBlockUOps(
     ctx.outboundTensorCells = findOutboundTensorCells(blocks, g, block: block)
     ctx.clearTensorRegisters()
 
-    if let tensorIndex = block.tensorIndex,
-        let shape = block.shape
-    {
-        // Use reduce to compute count for any dimensionality
-        let count = shape.reduce(1, *)
-        let incr = 1  //count % 4 == 0 ? 4 : 1
-        uops.append(UOp(op: .beginParallelRange(count, incr), value: tensorIndex))
-    }
-
+    // Step 1: Emit all node UOps first (without wrapping in parallelRange yet)
     for nodeId in block.nodes {
         if let tensorIndex = block.tensorIndex {
             ctx.tensorIndices[nodeId] = tensorIndex
@@ -1000,36 +1011,57 @@ public func emitBlockUOps(
             if case .forward = block.direction {
                 for uop in try node.op.emit(ctx: ctx, g: g, nodeId: nodeId) {
                     emittedNodes.insert(nodeId)
-
-                    var typedUOp = uop
-                    /*
-                    if block.tensorIndex != nil,
-                        let shape = block.shape
-                    {
-                        let size = shape.reduce(1, *)
-                        typedUOp.kind = size % 4 == 0 ? .simd : .scalar
-
-                    } else {
-                        typedUOp.kind = block.kind
-                    }
-                     */
-                    typedUOp.kind = block.kind
-                    uops.append(typedUOp)
+                    bodyUops.append(uop)
                 }
             } else {
                 let back = node.op.emitBackward(ctx: ctx, g: g, nodeId: nodeId)
-                // should be even better
-                // ideally we could just ask inside emitBackward (is there a grad for nodeId if not use 1 cuz its the start)
                 for uop in back {
                     emittedNodes.insert(nodeId)
-
-                    var typedUOp = uop
-                    typedUOp.kind = block.kind
-                    uops.append(typedUOp)
+                    bodyUops.append(uop)
                 }
             }
         }
     }
+
+    // Step 2: Analyze emitted UOps to determine if SIMD is safe
+    // SIMD is safe if: tensor block + size divisible by 4 + no SIMD blockers
+    let hasSIMDBlockers = containsSIMDBlockers(bodyUops)
+    let canUseSIMD: Bool
+    let simdIncrement: Int
+
+    if let shape = block.shape, block.tensorIndex != nil {
+        let size = shape.reduce(1, *)
+        canUseSIMD = !hasSIMDBlockers && (size % 4 == 0)
+        simdIncrement = canUseSIMD ? 4 : 1
+    } else {
+        canUseSIMD = false
+        simdIncrement = 1
+    }
+
+    // Step 3: Determine the effective kind for this block's ops
+    let effectiveKind: Kind
+    if block.tensorIndex != nil {
+        effectiveKind = canUseSIMD ? .simd : .scalar
+    } else {
+        effectiveKind = block.kind
+    }
+
+    // Step 4: Apply the kind to all body UOps
+    for i in 0..<bodyUops.count {
+        bodyUops[i].kind = effectiveKind
+    }
+
+    // Step 5: Build final UOps array with parallelRange wrapper if needed
+    var uops: [UOp] = []
+
+    if let tensorIndex = block.tensorIndex,
+        let shape = block.shape
+    {
+        let count = shape.reduce(1, *)
+        uops.append(UOp(op: .beginParallelRange(count, simdIncrement), value: tensorIndex))
+    }
+
+    uops.append(contentsOf: bodyUops)
 
     // Handle cross-block dependencies using scratch buffers (for scalar values only)
     //
@@ -1057,7 +1089,7 @@ public func emitBlockUOps(
                 switch lz {
                 case .variable(let a, _):
                     var defineGlobalUOp = UOp(op: .defineGlobal(a), value: .global(a))
-                    defineGlobalUOp.kind = block.kind
+                    defineGlobalUOp.kind = effectiveKind
                     uops.insert(defineGlobalUOp, at: 0)
                     // Only append if not already in globals to maintain stable ordering
                     if !ctx.globals.contains(a) {
@@ -1082,7 +1114,7 @@ public func emitBlockUOps(
             switch lz {
             case .variable(let a, _):
                 var loadGlobalUOp = UOp(op: .loadGlobal(a), value: .variable(a, nil))
-                loadGlobalUOp.kind = block.kind
+                loadGlobalUOp.kind = effectiveKind
                 uops.insert(loadGlobalUOp, at: 0)
             default:
                 break
