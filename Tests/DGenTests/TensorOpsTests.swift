@@ -962,6 +962,70 @@ final class CTensorOpsTests: XCTestCase {
                 XCTAssertEqual(output[0], 415.0, accuracy: 0.001, "Matmul sum should be 415")
         }
 
+        func testMatmulWithScalarMul() throws {
+                // Bug: matmul(tensorA, tensorB * scalar) crashes saying "matmul requires tensor inputs"
+                // The result of tensor * scalar should be a tensor!
+                let g = Graph()
+
+                // A: 2x3 matrix
+                let a = g.tensor(shape: [2, 3], data: [1.0, 2.0, 3.0, 4.0, 5.0, 6.0])
+
+                // B: 3x2 matrix, multiplied by a scalar (simulating phasor output)
+                let b = g.tensor(shape: [3, 2], data: [7.0, 8.0, 9.0, 10.0, 11.0, 12.0])
+                let scalar = g.n(.constant(2.0))  // Simulate phasor output
+                let bScaled = g.n(.mul, b, scalar)  // tensor * scalar should still be tensor
+
+                // This should work: matmul(a, b * scalar)
+                let c = g.matmul(a, bScaled)
+                let result = g.n(.sum, c)
+                _ = g.n(.output(0), result)
+
+                let frameCount = 1
+                let cResult = try CompilationPipeline.compile(
+                        graph: g,
+                        backend: .c,
+                        options: .init(frameCount: frameCount, debug: true)
+                )
+
+                print("=== Matmul with Scalar Mul - Generated Source ===")
+                print(cResult.source)
+
+                let cRuntime = CCompiledKernel(
+                        source: cResult.source,
+                        cellAllocations: cResult.cellAllocations,
+                        memorySize: cResult.totalMemorySlots
+                )
+                try cRuntime.compileAndLoad()
+
+                guard let mem = cRuntime.allocateNodeMemory() else {
+                        XCTFail("Failed to allocate memory")
+                        return
+                }
+                defer { cRuntime.deallocateNodeMemory(mem) }
+
+                injectTensorData(result: cResult, memory: mem.assumingMemoryBound(to: Float.self))
+
+                var output = [Float](repeating: 0, count: frameCount)
+                let input = [Float](repeating: 0, count: frameCount)
+
+                output.withUnsafeMutableBufferPointer { outPtr in
+                        input.withUnsafeBufferPointer { inPtr in
+                                cRuntime.runWithMemory(
+                                        outputs: outPtr.baseAddress!,
+                                        inputs: inPtr.baseAddress!,
+                                        memory: mem,
+                                        frameCount: frameCount
+                                )
+                        }
+                }
+
+                print("=== Matmul with Scalar Mul Result ===")
+                print("Output: \(output[0]), Expected: 830.0")  // 415 * 2 = 830
+
+                // (A @ (B * 2)) = 2 * (A @ B) = 2 * 415 = 830
+                XCTAssertEqual(output[0], 830.0, accuracy: 0.001, "Matmul with scaled B should be 830")
+        }
+
         // MARK: - Comprehensive Reshape Tests
 
         func testReshapeToFlat() throws {
@@ -1456,6 +1520,129 @@ final class CTensorOpsTests: XCTestCase {
                 //   sumAxis(1) -> [3, 7, 11] (3 elements)
                 //   weighted: 3*1 + 7*2 + 11*3 = 50
                 XCTAssertEqual(output[0], 50.0, accuracy: 0.001, "Reshape then sumAxis should give 50.0")
+        }
+
+        // MARK: - Stack Tests
+
+        func testStackBasic() throws {
+                // Stack 4 scalar constants into a [4] tensor
+                let g = Graph()
+
+                let s1 = g.n(.constant(1.0))
+                let s2 = g.n(.constant(2.0))
+                let s3 = g.n(.constant(3.0))
+                let s4 = g.n(.constant(4.0))
+
+                let stacked = g.stack([s1, s2, s3, s4])
+
+                // Sum the stacked tensor: 1 + 2 + 3 + 4 = 10
+                let result = g.n(.sum, stacked)
+                _ = g.n(.output(0), result)
+
+                let frameCount = 1
+                let cResult = try CompilationPipeline.compile(
+                        graph: g, backend: .c,
+                        options: .init(frameCount: frameCount, debug: true)
+                )
+
+                print("=== Stack Basic - Generated Source ===")
+                print(cResult.source)
+
+                let cRuntime = CCompiledKernel(
+                        source: cResult.source,
+                        cellAllocations: cResult.cellAllocations,
+                        memorySize: cResult.totalMemorySlots
+                )
+                try cRuntime.compileAndLoad()
+
+                guard let mem = cRuntime.allocateNodeMemory() else {
+                        XCTFail("Failed to allocate memory")
+                        return
+                }
+                defer { cRuntime.deallocateNodeMemory(mem) }
+
+                var output = [Float](repeating: 0, count: frameCount)
+                let input = [Float](repeating: 0, count: frameCount)
+
+                output.withUnsafeMutableBufferPointer { outPtr in
+                        input.withUnsafeBufferPointer { inPtr in
+                                cRuntime.runWithMemory(
+                                        outputs: outPtr.baseAddress!,
+                                        inputs: inPtr.baseAddress!,
+                                        memory: mem,
+                                        frameCount: frameCount
+                                )
+                        }
+                }
+
+                print("=== Stack Basic Result ===")
+                print("Output: \(output[0]), Expected: 10.0")
+
+                XCTAssertEqual(output[0], 10.0, accuracy: 0.001, "Stack sum should be 10.0")
+        }
+
+        func testStackWithShape() throws {
+                // Stack 4 scalars into a [2, 2] tensor
+                let g = Graph()
+
+                let s1 = g.n(.constant(1.0))
+                let s2 = g.n(.constant(2.0))
+                let s3 = g.n(.constant(3.0))
+                let s4 = g.n(.constant(4.0))
+
+                let stacked = g.stack([s1, s2, s3, s4], shape: [2, 2])
+
+                // Sum along axis 0: [[1,2],[3,4]] -> [4, 6]
+                let summed = g.sum(stacked, axis: 0)
+
+                // Multiply by weights [1, 2]: 4*1 + 6*2 = 16
+                let weights = g.tensor(shape: [2], data: [1.0, 2.0])
+                let weighted = g.n(.mul, summed, weights)
+                let result = g.n(.sum, weighted)
+                _ = g.n(.output(0), result)
+
+                let frameCount = 1
+                let cResult = try CompilationPipeline.compile(
+                        graph: g, backend: .c,
+                        options: .init(frameCount: frameCount, debug: true)
+                )
+
+                print("=== Stack With Shape - Generated Source ===")
+                print(cResult.source)
+
+                let cRuntime = CCompiledKernel(
+                        source: cResult.source,
+                        cellAllocations: cResult.cellAllocations,
+                        memorySize: cResult.totalMemorySlots
+                )
+                try cRuntime.compileAndLoad()
+
+                guard let mem = cRuntime.allocateNodeMemory() else {
+                        XCTFail("Failed to allocate memory")
+                        return
+                }
+                defer { cRuntime.deallocateNodeMemory(mem) }
+
+                injectTensorData(result: cResult, memory: mem.assumingMemoryBound(to: Float.self))
+
+                var output = [Float](repeating: 0, count: frameCount)
+                let input = [Float](repeating: 0, count: frameCount)
+
+                output.withUnsafeMutableBufferPointer { outPtr in
+                        input.withUnsafeBufferPointer { inPtr in
+                                cRuntime.runWithMemory(
+                                        outputs: outPtr.baseAddress!,
+                                        inputs: inPtr.baseAddress!,
+                                        memory: mem,
+                                        frameCount: frameCount
+                                )
+                        }
+                }
+
+                print("=== Stack With Shape Result ===")
+                print("Output: \(output[0]), Expected: 16.0")
+
+                XCTAssertEqual(output[0], 16.0, accuracy: 0.001, "Stack with shape should give 16.0")
         }
 
 }

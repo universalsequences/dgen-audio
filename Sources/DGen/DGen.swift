@@ -122,13 +122,23 @@ open class Graph {
         return n(op, ins)
     }
 
-    @discardableResult public func n(_ op: LazyOp, _ ins: [NodeID], shape: ValueShape? = .scalar)
+    @discardableResult public func n(_ op: LazyOp, _ ins: [NodeID], shape: ValueShape? = nil)
         -> NodeID
     {
         let id = next
         next += 1
         nodes[id] = Node(id: id, op: op, inputs: ins)
-        nodes[id]?.shape = shape
+
+        // If shape is explicitly provided, use it. Otherwise, infer from inputs.
+        if let explicitShape = shape {
+            nodes[id]?.shape = explicitShape
+        } else {
+            // Gather input shapes
+            let inputShapes = ins.compactMap { nodes[$0]?.shape }
+            // Try to infer shape - fall back to .scalar if inference fails
+            let inferredShape = (try? inferShape(op: op, inputs: inputShapes, graph: self)) ?? .scalar
+            nodes[id]?.shape = inferredShape
+        }
 
         // Handle seq operator: find root dependencies of B and make them depend on A
         if case .seq = op, ins.count >= 2 {

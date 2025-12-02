@@ -126,14 +126,80 @@ extension Graph {
         return tensor(shape: shape, data: [Float](repeating: value, count: size))
     }
 
+    /// Stack scalar nodes into a tensor (dynamic, per-frame values)
+    /// At each frame, writes the current value of each scalar into the tensor
+    /// Example: stack([phasor1, phasor2, phasor3]) creates a [3] tensor
+    public func stack(_ scalars: [NodeID], shape: Shape? = nil) -> NodeID {
+        let count = scalars.count
+        guard count > 0 else {
+            fatalError("stack requires at least one scalar")
+        }
+
+        let finalShape = shape ?? [count]
+        let size = finalShape.reduce(1, *)
+
+        guard size == count else {
+            fatalError("stack: shape \(finalShape) size \(size) doesn't match scalar count \(count)")
+        }
+
+        // Allocate tensor
+        let cellId = alloc(vectorWidth: size)
+        let tensorId = nextTensorId
+        nextTensorId += 1
+        tensors[tensorId] = Tensor(id: tensorId, shape: finalShape, cellId: cellId)
+        cellToTensor[cellId] = tensorId
+
+        // Create writes for each scalar
+        var writes: [NodeID] = []
+        for (i, scalar) in scalars.enumerated() {
+            let indexNode = n(.constant(Float(i)))
+            let writeNode = n(.memoryWrite(cellId), indexNode, scalar)
+            writes.append(writeNode)
+        }
+
+        // Create tensorRef
+        let tensorRefNode = n(.tensorRef(tensorId), [], shape: .tensor(finalShape))
+        nodeToTensor[tensorRefNode] = tensorId
+
+        // Chain: write0 -> write1 -> ... -> tensorRef using seq
+        // This ensures all writes happen before the tensor is read
+        var result = writes[0]
+        for i in 1..<writes.count {
+            result = n(.seq, result, writes[i])
+        }
+        result = n(.seq, result, tensorRefNode)
+
+        // Map the final seq node to the same tensor so downstream ops can find it
+        nodeToTensor[result] = tensorId
+
+        return result
+    }
+
     // MARK: - Tensor Views (Reshape/Transpose)
 
     /// Reshape a tensor to a new shape (metadata only, no data movement)
     /// Total size must match: product of newShape must equal product of old shape
     public func reshape(_ input: NodeID, to newShape: Shape) -> NodeID {
-        guard let inputTensorId = nodeToTensor[input],
-              let inputTensor = tensors[inputTensorId] else {
-            fatalError("reshape requires tensor input")
+        // If input doesn't have a tensor mapping yet (e.g., tensor * scalar),
+        // allocate one based on the node's shape
+        var inputTensorId = nodeToTensor[input]
+        if inputTensorId == nil {
+            guard let inputNode = nodes[input], case .tensor(let inputShape) = inputNode.shape else {
+                fatalError("reshape requires tensor input")
+            }
+            // Allocate a tensor for this derived op
+            let size = inputShape.reduce(1, *)
+            let cellId = alloc(vectorWidth: size)
+            let newTensorId = nextTensorId
+            nextTensorId += 1
+            tensors[newTensorId] = Tensor(id: newTensorId, shape: inputShape, cellId: cellId)
+            cellToTensor[cellId] = newTensorId
+            nodeToTensor[input] = newTensorId
+            inputTensorId = newTensorId
+        }
+
+        guard let inputTensor = tensors[inputTensorId!] else {
+            fatalError("reshape: tensor not found")
         }
 
         let oldSize = inputTensor.size
@@ -170,9 +236,26 @@ extension Graph {
     /// Transpose a tensor by permuting axes
     /// axes: permutation of [0, 1, ..., ndim-1], e.g. [1, 0] swaps rows/cols
     public func transpose(_ input: NodeID, axes: [Int]? = nil) -> NodeID {
-        guard let inputTensorId = nodeToTensor[input],
-              let inputTensor = tensors[inputTensorId] else {
-            fatalError("transpose requires tensor input")
+        // If input doesn't have a tensor mapping yet (e.g., tensor * scalar),
+        // allocate one based on the node's shape
+        var inputTensorId = nodeToTensor[input]
+        if inputTensorId == nil {
+            guard let inputNode = nodes[input], case .tensor(let inputShape) = inputNode.shape else {
+                fatalError("transpose requires tensor input")
+            }
+            // Allocate a tensor for this derived op
+            let size = inputShape.reduce(1, *)
+            let cellId = alloc(vectorWidth: size)
+            let newTensorId = nextTensorId
+            nextTensorId += 1
+            tensors[newTensorId] = Tensor(id: newTensorId, shape: inputShape, cellId: cellId)
+            cellToTensor[cellId] = newTensorId
+            nodeToTensor[input] = newTensorId
+            inputTensorId = newTensorId
+        }
+
+        guard let inputTensor = tensors[inputTensorId!] else {
+            fatalError("transpose: tensor not found")
         }
 
         let ndim = inputTensor.shape.count
@@ -249,21 +332,22 @@ extension Graph {
     /// Matrix multiply: A[M,K] @ B[K,N] -> C[M,N]
     /// Implemented as: reshape + broadcast multiply + sum
     public func matmul(_ a: NodeID, _ b: NodeID) -> NodeID {
-        guard let aTensorId = nodeToTensor[a], let aTensor = tensors[aTensorId],
-              let bTensorId = nodeToTensor[b], let bTensor = tensors[bTensorId] else {
+        // Get shapes from nodes - works even for derived tensor ops like (tensor * scalar)
+        guard let aNode = nodes[a], case .tensor(let aShape) = aNode.shape,
+              let bNode = nodes[b], case .tensor(let bShape) = bNode.shape else {
             fatalError("matmul requires tensor inputs")
         }
 
-        guard aTensor.shape.count == 2, bTensor.shape.count == 2 else {
+        guard aShape.count == 2, bShape.count == 2 else {
             fatalError("matmul requires 2D tensors")
         }
 
-        let M = aTensor.shape[0]
-        let K = aTensor.shape[1]
-        let N = bTensor.shape[1]
+        let M = aShape[0]
+        let K = aShape[1]
+        let N = bShape[1]
 
-        guard bTensor.shape[0] == K else {
-            fatalError("matmul dimension mismatch: [\(M),\(K)] @ [\(bTensor.shape[0]),\(N)]")
+        guard bShape[0] == K else {
+            fatalError("matmul dimension mismatch: [\(M),\(K)] @ [\(bShape[0]),\(N)]")
         }
 
         // A: [M, K] -> [M, 1, K]

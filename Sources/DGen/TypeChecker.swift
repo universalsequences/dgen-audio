@@ -169,6 +169,11 @@ public func inferShape(op: LazyOp, inputs: [ValueShape], graph: Graph) throws ->
       return tensors[0]  // return the tensor as the shape
     }
     return .scalar
+
+  // Seq returns the shape of the last input (the value that's returned)
+  case .seq:
+    return inputs.last ?? .scalar
+
   // everything else is a scalar
   default: return .scalar
   }

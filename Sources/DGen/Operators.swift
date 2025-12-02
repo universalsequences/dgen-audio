@@ -1007,7 +1007,6 @@ public enum LazyOp {
 
             let outputCellId = outputTensor.cellId
 
-            let outputSize = outputShape.reduce(1, *)
             guard axis >= 0 && axis < inputShape.count else {
                 fatalError("sumAxis: axis \(axis) out of range for shape \(inputShape)")
             }
