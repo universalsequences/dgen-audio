@@ -1089,7 +1089,9 @@ public func emitBlockUOps(
                 switch lz {
                 case .variable(let a, _):
                     var defineGlobalUOp = UOp(op: .defineGlobal(a), value: .global(a))
-                    defineGlobalUOp.kind = effectiveKind
+                    // Use block.kind (frame loop kind), not effectiveKind (tensor loop kind)
+                    // Globals are indexed by frame loop, not tensor loop
+                    defineGlobalUOp.kind = block.kind
                     uops.insert(defineGlobalUOp, at: 0)
                     // Only append if not already in globals to maintain stable ordering
                     if !ctx.globals.contains(a) {
@@ -1114,7 +1116,9 @@ public func emitBlockUOps(
             switch lz {
             case .variable(let a, _):
                 var loadGlobalUOp = UOp(op: .loadGlobal(a), value: .variable(a, nil))
-                loadGlobalUOp.kind = effectiveKind
+                // Use block.kind (frame loop kind), not effectiveKind (tensor loop kind)
+                // Globals are indexed by frame loop, not tensor loop
+                loadGlobalUOp.kind = block.kind
                 uops.insert(loadGlobalUOp, at: 0)
             default:
                 break
