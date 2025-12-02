@@ -180,17 +180,21 @@ public class CRenderer: Renderer {
 
         // Merge adjacent blocks of the same kind into a single loop to reduce passes
         var currentKind: Kind? = nil
+        var currentTemporality: Temporality? = nil
         for block in uopBlocks {
-            if currentKind != block.kind {
+            if currentKind != block.kind || currentTemporality != block.temporality {
                 // Close previous loop if open
                 if currentKind != nil {
                     scheduleItem.ops.append(UOp(op: .endLoop, value: .empty))
                 }
                 // Open new loop for this kind
                 scheduleItem.ops.append(
-                    UOp(op: .beginLoop(frameCountUOp, block.kind == .scalar ? 1 : 4), value: .empty)
+                    UOp(
+                        op: .beginLoop(frameCountUOp, block.kind == .scalar ? 1 : 4),
+                        value: .empty)
                 )
                 currentKind = block.kind
+                currentTemporality = block.temporality
             }
 
             for uop in block.ops {

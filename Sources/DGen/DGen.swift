@@ -5,6 +5,8 @@ public class IRContext {
     private var gradIdx = 0
     private var constantIdx = 0
 
+    // Maps node ids to what the current "index" is for tensor-based computation
+    // E.g we are on the 2nd element in tensor in a loop
     public var tensorIndices: [NodeID: Lazy] = [:]
 
     // Maximum gradient ID allocated (for buffer sizing)
@@ -123,8 +125,6 @@ open class Graph {
     @discardableResult public func n(_ op: LazyOp, _ ins: [NodeID], shape: ValueShape? = .scalar)
         -> NodeID
     {
-        // No special spectralLoss expansion (use Graph.spectralLoss API)
-
         let id = next
         next += 1
         nodes[id] = Node(id: id, op: op, inputs: ins)
@@ -178,31 +178,6 @@ open class Graph {
     /// Allocate a single cell (backward compatibility)
     public func alloc() -> CellID {
         return alloc(vectorWidth: 1)
-    }
-
-    /// Find all root dependencies of a node (nodes with no inputs in the dependency tree)
-    private func findRootDependencies(of nodeId: NodeID) -> Set<NodeID> {
-        var roots = Set<NodeID>()
-        var visited = Set<NodeID>()
-        var queue = [nodeId]
-
-        while !queue.isEmpty {
-            let currentId = queue.removeFirst()
-            if visited.contains(currentId) { continue }
-            visited.insert(currentId)
-
-            guard let node = nodes[currentId] else { continue }
-
-            if node.inputs.isEmpty {
-                // This is a root node (no dependencies)
-                roots.insert(currentId)
-            } else {
-                // Add all inputs to the queue to explore
-                queue.append(contentsOf: node.inputs)
-            }
-        }
-
-        return roots
     }
 
     public func seq(a: NodeID, b: NodeID) -> NodeID {

@@ -99,13 +99,14 @@ public struct CompilationPipeline {
             graph, feedbackClusters: feedbackClusters, scalarNodeSet: scalarNodeSet, debug: false)
 
         try inferShapes(graph: graph, sortedNodes: sortedNodes)
+
         allocateTensorOutputs(graph: graph, sortedNodes: sortedNodes)
 
         // Step 2: Determine scalar nodes and create blocks
 
         // Step 2.5: Handle seq operators - if any input to seq is scalar, make all inputs scalar
         var finalScalarSet = scalarNodeSet
-        for node in graph.nodes.values {
+        for (_, node) in graph.nodes {
             if case .seq = node.op {
                 let hasScalarInput = node.inputs.contains { finalScalarSet.contains($0) }
                 if hasScalarInput {
@@ -139,10 +140,9 @@ public struct CompilationPipeline {
 
         let context = IRContext()
 
-        // finally seperate tensor blocks of shared size into their own blocks
+        // finally separate tensor blocks of shared size into their own blocks
         let seperatedBlocks = determineTensorBlocks(reFusedBlocks, graph, context)
 
-        //let splitBlocks = splitBlocksIfNeeded(blocks, backend)
         var finalBlocks = seperatedBlocks.compactMap { $0 }
 
         if options.backwards {
@@ -213,7 +213,7 @@ public struct CompilationPipeline {
         if options.debug {
             var i = 1
             for uopBlock in uopBlocks {
-                print("Block \(i)")
+                print("Block \(i) temporality=\(uopBlock.temporality)")
                 i += 1
                 var indentLevel = 0
                 for uop in uopBlock.ops {

@@ -1,19 +1,40 @@
 public struct Tensor {
     public let id: TensorID
     public let shape: Shape
+    public let strides: [Int]  // How many elements to skip per dimension
     public let cellId: CellID
     public var data: [Float]?  // Initial data to be injected by runtime
+    public let isView: Bool    // True if this is a view of another tensor (reshape/transpose)
 
-    public init(id: TensorID, shape: Shape, cellId: CellID, data: [Float]? = nil) {
+    public init(id: TensorID, shape: Shape, cellId: CellID, data: [Float]? = nil, strides: [Int]? = nil, isView: Bool = false) {
         self.id = id
         self.shape = shape
         self.cellId = cellId
         self.data = data
+        self.isView = isView
+        // Default to row-major (C-style) strides if not specified
+        self.strides = strides ?? Tensor.computeRowMajorStrides(shape)
     }
 
     /// Total number of elements in this tensor
     public var size: Int {
         shape.reduce(1, *)
+    }
+
+    /// Compute row-major strides for a given shape
+    /// e.g. shape [M, N, K] -> strides [N*K, K, 1]
+    public static func computeRowMajorStrides(_ shape: Shape) -> [Int] {
+        guard !shape.isEmpty else { return [] }
+        var strides = [Int](repeating: 1, count: shape.count)
+        for i in stride(from: shape.count - 2, through: 0, by: -1) {
+            strides[i] = strides[i + 1] * shape[i + 1]
+        }
+        return strides
+    }
+
+    /// Check if this tensor is contiguous (strides match row-major layout)
+    public var isContiguous: Bool {
+        strides == Tensor.computeRowMajorStrides(shape)
     }
 }
 
@@ -103,6 +124,166 @@ extension Graph {
     public func full(shape: Shape, value: Float) -> NodeID {
         let size = shape.reduce(1, *)
         return tensor(shape: shape, data: [Float](repeating: value, count: size))
+    }
+
+    // MARK: - Tensor Views (Reshape/Transpose)
+
+    /// Reshape a tensor to a new shape (metadata only, no data movement)
+    /// Total size must match: product of newShape must equal product of old shape
+    public func reshape(_ input: NodeID, to newShape: Shape) -> NodeID {
+        guard let inputTensorId = nodeToTensor[input],
+              let inputTensor = tensors[inputTensorId] else {
+            fatalError("reshape requires tensor input")
+        }
+
+        let oldSize = inputTensor.size
+        let newSize = newShape.reduce(1, *)
+        guard oldSize == newSize else {
+            fatalError("reshape size mismatch: \(oldSize) vs \(newSize)")
+        }
+
+        // Create a new tensor view sharing the same cellId
+        let viewTensorId = nextTensorId
+        nextTensorId += 1
+
+        // For reshape, if input is contiguous, output is contiguous with new shape
+        // Compute new row-major strides for the new shape
+        let newStrides = Tensor.computeRowMajorStrides(newShape)
+
+        tensors[viewTensorId] = Tensor(
+            id: viewTensorId,
+            shape: newShape,
+            cellId: inputTensor.cellId,  // Same underlying data!
+            data: nil,
+            strides: newStrides,
+            isView: true
+        )
+
+        let nodeId = n(.reshape(newShape), [input], shape: .tensor(newShape))
+        nodeToTensor[nodeId] = viewTensorId
+        return nodeId
+    }
+
+    /// Transpose a tensor by permuting axes
+    /// axes: permutation of [0, 1, ..., ndim-1], e.g. [1, 0] swaps rows/cols
+    public func transpose(_ input: NodeID, axes: [Int]? = nil) -> NodeID {
+        guard let inputTensorId = nodeToTensor[input],
+              let inputTensor = tensors[inputTensorId] else {
+            fatalError("transpose requires tensor input")
+        }
+
+        let ndim = inputTensor.shape.count
+        let perm = axes ?? Array((0..<ndim).reversed())  // Default: reverse all axes
+
+        guard perm.count == ndim else {
+            fatalError("transpose axes must have \(ndim) elements")
+        }
+
+        // Permute shape and strides
+        var newShape = [Int](repeating: 0, count: ndim)
+        var newStrides = [Int](repeating: 0, count: ndim)
+        for i in 0..<ndim {
+            newShape[i] = inputTensor.shape[perm[i]]
+            newStrides[i] = inputTensor.strides[perm[i]]
+        }
+
+        // Create a new tensor view sharing the same cellId
+        let viewTensorId = nextTensorId
+        nextTensorId += 1
+
+        tensors[viewTensorId] = Tensor(
+            id: viewTensorId,
+            shape: newShape,
+            cellId: inputTensor.cellId,  // Same underlying data!
+            data: nil,
+            strides: newStrides,
+            isView: true
+        )
+
+        let nodeId = n(.transpose(perm), [input], shape: .tensor(newShape))
+        nodeToTensor[nodeId] = viewTensorId
+        return nodeId
+    }
+
+    /// Sum a tensor along a specific axis, reducing that dimension
+    /// e.g. [M, N, K].sum(axis: -1) -> [M, N]
+    public func sum(_ input: NodeID, axis: Int) -> NodeID {
+        guard let inputNode = nodes[input] else {
+            fatalError("sumAxis: input node not found")
+        }
+        guard case .tensor(let inputShape) = inputNode.shape else {
+            fatalError("sumAxis requires tensor input, got \(String(describing: inputNode.shape))")
+        }
+
+        // Handle negative axis
+        let ndim = inputShape.count
+        let normalizedAxis = axis < 0 ? ndim + axis : axis
+        guard normalizedAxis >= 0 && normalizedAxis < ndim else {
+            fatalError("axis \(axis) out of range for tensor with \(ndim) dimensions")
+        }
+
+        // Compute output shape (remove the reduced axis)
+        var outputShape = inputShape
+        outputShape.remove(at: normalizedAxis)
+        if outputShape.isEmpty {
+            // Reducing to scalar
+            return n(.sum, [input])
+        }
+
+        // Allocate output tensor
+        let outputSize = outputShape.reduce(1, *)
+        let outputCellId = alloc(vectorWidth: outputSize)
+        let outputTensorId = nextTensorId
+        nextTensorId += 1
+        tensors[outputTensorId] = Tensor(id: outputTensorId, shape: outputShape, cellId: outputCellId)
+        cellToTensor[outputCellId] = outputTensorId
+
+        let nodeId = n(.sumAxis(normalizedAxis), [input], shape: .tensor(outputShape))
+        nodeToTensor[nodeId] = outputTensorId
+        return nodeId
+    }
+
+    /// Matrix multiply: A[M,K] @ B[K,N] -> C[M,N]
+    /// Implemented as: reshape + broadcast multiply + sum
+    public func matmul(_ a: NodeID, _ b: NodeID) -> NodeID {
+        guard let aTensorId = nodeToTensor[a], let aTensor = tensors[aTensorId],
+              let bTensorId = nodeToTensor[b], let bTensor = tensors[bTensorId] else {
+            fatalError("matmul requires tensor inputs")
+        }
+
+        guard aTensor.shape.count == 2, bTensor.shape.count == 2 else {
+            fatalError("matmul requires 2D tensors")
+        }
+
+        let M = aTensor.shape[0]
+        let K = aTensor.shape[1]
+        let N = bTensor.shape[1]
+
+        guard bTensor.shape[0] == K else {
+            fatalError("matmul dimension mismatch: [\(M),\(K)] @ [\(bTensor.shape[0]),\(N)]")
+        }
+
+        // A: [M, K] -> [M, 1, K]
+        let aReshaped = reshape(a, to: [M, 1, K])
+
+        // B: [K, N] -> [1, N, K] (transpose then reshape)
+        let bTransposed = transpose(b, axes: [1, 0])  // [K, N] -> [N, K]
+        let bReshaped = reshape(bTransposed, to: [1, N, K])
+
+        // Broadcast multiply: [M, 1, K] * [1, N, K] -> [M, N, K]
+        let product = n(.mul, [aReshaped, bReshaped], shape: .tensor([M, N, K]))
+
+        // Need to allocate tensor for the product
+        let productSize = M * N * K
+        let productCellId = alloc(vectorWidth: productSize)
+        let productTensorId = nextTensorId
+        nextTensorId += 1
+        tensors[productTensorId] = Tensor(id: productTensorId, shape: [M, N, K], cellId: productCellId)
+        cellToTensor[productCellId] = productTensorId
+        nodeToTensor[product] = productTensorId
+
+        // Sum along last axis: [M, N, K] -> [M, N]
+        return sum(product, axis: -1)
     }
 
     // MARK: - Tensor History (State Buffers)

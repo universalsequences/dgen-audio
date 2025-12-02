@@ -456,6 +456,9 @@ public enum LazyOp {
     // Tensor operations (historyRead/historyWrite handle tensors automatically based on cell size)
     case conv2d(Shape)  // 2D convolution, Shape is kernel shape [kH, kW]
     case sum  // Reduce tensor to scalar by summing all elements
+    case sumAxis(Int)  // Reduce along a specific axis
+    case reshape(Shape)  // Reshape tensor (metadata only, no data movement)
+    case transpose([Int])  // Transpose/permute axes (metadata only)
 
     public func emit(ctx: IRContext, g: Graph, nodeId: NodeID) throws -> [UOp] {
         guard let node = g.nodes[nodeId] else { return [] }
@@ -950,6 +953,104 @@ public enum LazyOp {
                 acc.accumulate(val)
             }
             b.use(val: acc.value)
+
+        case .sumAxis(let axis):
+            // Reduce along a specific axis
+            guard node.inputs.count >= 1 else {
+                throw DGenError.insufficientInputs(
+                    operator: "sumAxis", expected: 1, actual: node.inputs.count)
+            }
+            guard case .tensor(let inputShape) = g.nodes[node.inputs[0]]?.shape else {
+                throw DGenError.insufficientInputs(operator: "sumAxis requires tensor", expected: 1, actual: 0)
+            }
+            guard case .tensor(let outputShape) = node.shape else {
+                throw DGenError.insufficientInputs(operator: "sumAxis output", expected: 1, actual: 0)
+            }
+
+            guard let inputTensorId = g.nodeToTensor[node.inputs[0]] else {
+                fatalError("sumAxis: input node \(node.inputs[0]) has no tensor mapping")
+            }
+            guard let inputTensor = g.tensors[inputTensorId] else {
+                fatalError("sumAxis: tensor \(inputTensorId) not found")
+            }
+
+            guard let outputTensorId = g.nodeToTensor[node.id] else {
+                fatalError("sumAxis: output node \(node.id) has no tensor mapping. nodeToTensor keys=\(Array(g.nodeToTensor.keys))")
+            }
+            guard let outputTensor = g.tensors[outputTensorId] else {
+                fatalError("sumAxis: output tensor \(outputTensorId) not found")
+            }
+            let outputCellId = outputTensor.cellId
+
+            let outputSize = outputShape.reduce(1, *)
+            guard axis >= 0 && axis < inputShape.count else {
+                fatalError("sumAxis: axis \(axis) out of range for shape \(inputShape)")
+            }
+            let reduceSize = inputShape[axis]
+
+            // Parallel over output elements
+            b.parallelRange(outputSize) { outFlatIdx in
+                // Convert output flat index to output coords
+                // Then map to input coords with reduction axis
+                let acc = b.float(0.0)
+
+                b.loop(reduceSize) { reduceIdx in
+                    // Compute input flat index using strides
+                    // For simplicity, assume 2D or 3D and axis is last or second-to-last
+                    var inputFlatIdx: Expr
+
+                    if inputShape.count == 2 {
+                        if axis == 0 {
+                            // [M, N] -> [N], reduce over rows
+                            // input[reduceIdx, outFlatIdx]
+                            inputFlatIdx = b.cast(reduceIdx, to: .float) * b.constant(Float(inputShape[1])) + b.cast(outFlatIdx, to: .float)
+                        } else {
+                            // [M, N] -> [M], reduce over cols
+                            // input[outFlatIdx, reduceIdx]
+                            inputFlatIdx = b.cast(outFlatIdx, to: .float) * b.constant(Float(inputShape[1])) + b.cast(reduceIdx, to: .float)
+                        }
+                    } else if inputShape.count == 3 {
+                        // Handle 3D case - commonly [M, N, K]
+                        let M = inputShape[0], N = inputShape[1], K = inputShape[2]
+                        if axis == 0 {
+                            // [M, N, K] -> [N, K]
+                            let outN = b.cast(outFlatIdx, to: .int) / b.constant(Float(K))
+                            let outK = b.cast(outFlatIdx, to: .int) % b.constant(Float(K))
+                            inputFlatIdx = b.cast(reduceIdx, to: .float) * b.constant(Float(N * K)) + outN * b.constant(Float(K)) + outK
+                        } else if axis == 1 {
+                            // [M, N, K] -> [M, K]
+                            let outM = b.cast(outFlatIdx, to: .int) / b.constant(Float(K))
+                            let outK = b.cast(outFlatIdx, to: .int) % b.constant(Float(K))
+                            inputFlatIdx = outM * b.constant(Float(N * K)) + b.cast(reduceIdx, to: .float) * b.constant(Float(K)) + outK
+                        } else {
+                            // axis == 2: [M, N, K] -> [M, N]
+                            let outM = b.cast(outFlatIdx, to: .int) / b.constant(Float(N))
+                            let outN = b.cast(outFlatIdx, to: .int) % b.constant(Float(N))
+                            inputFlatIdx = outM * b.constant(Float(N * K)) + outN * b.constant(Float(K)) + b.cast(reduceIdx, to: .float)
+                        }
+                    } else {
+                        // Fallback for other dimensions - just use flat index
+                        inputFlatIdx = b.cast(reduceIdx, to: .float)
+                    }
+
+                    let val = b.memoryRead(inputTensor.cellId, b.cast(inputFlatIdx, to: .int))
+                    acc.accumulate(val)
+                }
+
+                _ = b.memoryWrite(outputCellId, b.cast(outFlatIdx, to: .int), acc.value)
+            }
+
+        case .reshape:
+            // Reshape is metadata-only - the data stays in place
+            // Just register that this node produces a tensor view
+            // The actual shape change is handled by the tensor metadata
+            ctx.values[nodeId] = .empty
+
+        case .transpose:
+            // Transpose is metadata-only for contiguous layouts
+            // For non-trivial transposes, we may need to copy data
+            // For now, just register as a view - emit will use strides
+            ctx.values[nodeId] = .empty
         }
         ops.append(contentsOf: b.ops)
         return ops
@@ -1380,6 +1481,22 @@ public enum LazyOp {
             // Gradient broadcasts from scalar back to tensor
             guard inputs.count == 1 else { fatalError("sum requires 1 input") }
             // Pass gradient through (it will be broadcast to all elements)
+            b.grad(node.inputs[0], value: gradOutput)
+
+        case .sumAxis(_):
+            // TODO: implement proper backprop for sumAxis
+            // For now, pass gradient through (will need broadcasting logic)
+            guard inputs.count == 1 else { fatalError("sumAxis requires 1 input") }
+            b.grad(node.inputs[0], value: gradOutput)
+
+        case .reshape(_):
+            // Reshape is metadata-only, gradient flows through unchanged
+            guard inputs.count == 1 else { fatalError("reshape requires 1 input") }
+            b.grad(node.inputs[0], value: gradOutput)
+
+        case .transpose(_):
+            // Transpose is metadata-only, gradient flows through unchanged
+            guard inputs.count == 1 else { fatalError("transpose requires 1 input") }
             b.grad(node.inputs[0], value: gradOutput)
         }
 

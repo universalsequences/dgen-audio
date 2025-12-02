@@ -541,16 +541,19 @@ public func determineBlocksSimple(
                 if targetBlockIdx != -1 { break }
             }
 
-            if targetBlockIdx != -1
-                && !wouldExceedNodeLimit(blocks[targetBlockIdx], maxNodesPerBlock: maxNodesPerBlock)
-            {
-                blocks[targetBlockIdx].nodes.append(nodeId)
-                if debug {
-                    print(
-                        "📍 Placed output node \(nodeId) in block \(targetBlockIdx) with its dependency"
-                    )
+            // Check if we can add to an existing block that contains the dependency
+            var addedToExistingBlock = false
+            if targetBlockIdx != -1 && targetBlockIdx < blocks.count {
+                if !wouldExceedNodeLimit(blocks[targetBlockIdx], maxNodesPerBlock: maxNodesPerBlock) {
+                    blocks[targetBlockIdx].nodes.append(nodeId)
+                    addedToExistingBlock = true
+                    if debug {
+                        print("📍 Placed output node \(nodeId) in block \(targetBlockIdx) with its dependency")
+                    }
                 }
-            } else {
+            }
+
+            if !addedToExistingBlock {
                 // If we have a current block and the dependency isn't found yet,
                 // the dependency is likely in the current block
                 if let current = currentBlock,
@@ -979,8 +982,8 @@ public func emitBlockUOps(
     if let tensorIndex = block.tensorIndex,
         let shape = block.shape
     {
-        print("WE HAVE A BLOCK!")
-        let count = shape[0] * shape[1]
+        // Use reduce to compute count for any dimensionality
+        let count = shape.reduce(1, *)
         let incr = count % 4 == 0 ? 4 : 1
         uops.append(UOp(op: .beginParallelRange(count, incr), value: tensorIndex))
     }
