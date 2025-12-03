@@ -7,13 +7,7 @@ public typealias ChannelNumber = Int
 
 // MARK: - Tensor Emit Helpers
 
-/// Emit a binary operation that works on both scalars and tensors.
-/// For scalars: applies op directly.
-/// For tensors: emits parallelRange over elements.
-///
-/// Tensor Register Optimization:
-/// Uses tensorMemoryRead/tensorMemoryWrite to keep intermediate values in registers.
-/// Only writes to memory if the output cell is needed by later blocks (outbound).
+/// Emit a binary op for scalars or tensors.
 func emitBinaryOp(
     b: IRBuilder,
     g: Graph,
@@ -21,20 +15,14 @@ func emitBinaryOp(
     inputs: [Lazy],
     op: (Expr, Expr) -> Expr
 ) throws {
-    let a: Expr = try b.readInput(node: node, inputs: inputs, at: 0)
-    let c: Expr = try b.readInput(node: node, inputs: inputs, at: 1)
+    let a = try b.readInput(node, inputs, at: 0)
+    let c = try b.readInput(node, inputs, at: 1)
     let result = op(a, c)
 
-    try b.writeOutput(node: node, result: result)
+    try b.writeOutput(node, result)
 }
 
-/// Emit a unary operation that works on both scalars and tensors.
-/// For scalars: applies op directly.
-/// For tensors: emits parallelRange over elements.
-///
-/// Tensor Register Optimization:
-/// Uses tensorMemoryRead/tensorMemoryWrite to keep intermediate values in registers.
-/// Only writes to memory if the output cell is needed by later blocks (outbound).
+/// Emit a unary op for scalars or tensors.
 func emitUnaryOp(
     b: IRBuilder,
     g: Graph,
@@ -42,18 +30,12 @@ func emitUnaryOp(
     inputs: [Lazy],
     op: (Expr) -> Expr
 ) throws {
-    let a: Expr = try b.readInput(node: node, inputs: inputs, at: 0)
+    let a = try b.readInput(node, inputs, at: 0)
     let result = op(a)
-    try b.writeOutput(node: node, result: result)
+    try b.writeOutput(node, result)
 }
 
-/// Emit a ternary operation (like gswitch) that works on both scalars and tensors.
-/// For scalars: applies op directly.
-/// For tensors: emits parallelRange over elements with broadcasting.
-///
-/// Tensor Register Optimization:
-/// Uses tensorMemoryRead/tensorMemoryWrite to keep intermediate values in registers.
-/// Only writes to memory if the output cell is needed by later blocks (outbound).
+/// Emit a ternary op for scalars or tensors.
 func emitTernaryOp(
     b: IRBuilder,
     g: Graph,
@@ -61,13 +43,13 @@ func emitTernaryOp(
     inputs: [Lazy],
     op: (Expr, Expr, Expr) -> Expr
 ) throws {
-    let a: Expr = try b.readInput(node: node, inputs: inputs, at: 0)
-    let c: Expr = try b.readInput(node: node, inputs: inputs, at: 1)
-    let d: Expr = try b.readInput(node: node, inputs: inputs, at: 2)
+    let a = try b.readInput(node, inputs, at: 0)
+    let c = try b.readInput(node, inputs, at: 1)
+    let d = try b.readInput(node, inputs, at: 2)
 
     let result = op(a, c, d)
 
-    try b.writeOutput(node: node, result: result)
+    try b.writeOutput(node, result)
 }
 
 public struct BackwardsEmitResult {
@@ -375,9 +357,8 @@ public enum LazyOp {
                         operator: "historyWrite", expected: 1, actual: node.inputs.count)
                 }
                 let idx = b.value(index)
-                // Use tensorMemoryRead to potentially use cached register value,
-                // but ALWAYS write to memory - history cells persist across frames
-                let value = b.tensorMemoryRead(inputCellId, b.cast(idx, to: .int))
+                // tload for cached register, but ALWAYS write - history persists across frames
+                let value = b.tload(inputCellId, idx)
                 _ = b.memoryWrite(cellId, b.cast(idx, to: .int), value)
             } else {
                 // Scalar write
@@ -409,10 +390,8 @@ public enum LazyOp {
                         operator: "historyWrite", expected: 1, actual: node.inputs.count)
                 }
                 let idx = b.value(index)
-
-                // Use tensor register optimization - avoid redundant memory traffic
-                let value = b.tensorMemoryRead(cellId, b.cast(idx, to: .int))
-                _ = b.tensorMemoryWrite(outputCellId, b.cast(idx, to: .int), value)
+                let value = b.tload(cellId, idx)
+                _ = b.tstore(outputCellId, idx, value)
                 // Register placeholder for downstream ops
                 ctx.values[nodeId] = .empty
             } else {
@@ -489,228 +468,104 @@ public enum LazyOp {
         // MARK: - Tensor Operations
 
         case .conv2d(let kernelShape):
-            // 2D convolution: input tensor convolved with kernel tensor
-            // Check node.inputs for tensor compatibility
-            guard node.inputs.count >= 2 else {
-                throw DGenError.insufficientInputs(
-                    operator: "conv2d", expected: 2, actual: node.inputs.count)
-            }
-            guard case .tensor(let outputShape) = node.shape else {
-                throw DGenError.insufficientInputs(operator: "conv2d", expected: 2, actual: 0)
-            }
-            let inputShape = g.nodes[node.inputs[0]]?.shape
-            guard case .tensor(let inShape) = inputShape, inShape.count == 2 else {
-                throw DGenError.insufficientInputs(
-                    operator: "conv2d input must be 2D", expected: 2, actual: 0)
+            guard node.inputs.count >= 2,
+                case .tensor(let outShape) = node.shape,
+                case .tensor(let inShape) = g.nodes[node.inputs[0]]?.shape, inShape.count == 2,
+                let outCell = g.nodeToTensor[node.id].flatMap({ g.tensors[$0] })?.cellId,
+                let inCell = g.nodeToTensor[node.inputs[0]].flatMap({ g.tensors[$0] })?.cellId,
+                let kCell = g.nodeToTensor[node.inputs[1]].flatMap({ g.tensors[$0] })?.cellId
+            else {
+                throw DGenError.tensorError(
+                    op: "conv2d", reason: "requires 2D input/output tensors")
             }
 
-            let outputSize = outputShape.reduce(1, *)
-            let outputTensorId = g.nodeToTensor[node.id]!
-            let outputCellId = g.tensors[outputTensorId]!.cellId
+            let (inH, inW) = (inShape[0], inShape[1])
+            let (kH, kW) = (kernelShape[0], kernelShape[1])
+            let (padH, padW) = (kH / 2, kW / 2)
 
-            let inputTensorId = g.nodeToTensor[node.inputs[0]]!
-            let inputCellId = g.tensors[inputTensorId]!.cellId
-
-            let kernelTensorId = g.nodeToTensor[node.inputs[1]]!
-            let kernelCellId = g.tensors[kernelTensorId]!.cellId
-
-            print("OUTPUT CELL ID =\(outputCellId) outputTensorId=\(outputTensorId)")
-
-            let inH = inShape[0]
-            let inW = inShape[1]
-            let kH = kernelShape[0]
-            let kW = kernelShape[1]
-            let padH = kH / 2
-            let padW = kW / 2
-
-            // Parallel over output elements
-            b.parallelRange(outputSize) { flatIdx in
-                // Convert flat index to 2D coordinates
+            b.parallelRange(outShape.reduce(1, *)) { flatIdx in
                 let outY = b.cast(flatIdx, to: .int) / b.constant(Float(inW))
                 let outX = b.cast(flatIdx, to: .int) % b.constant(Float(inW))
-
-                // Accumulate convolution sum
                 let acc = b.float(0.0)
 
-                // Nested loops over kernel
                 b.loop(kH) { ky in
                     b.loop(kW) { kx in
                         let inY = outY + b.cast(ky, to: .float) - b.constant(Float(padH))
                         let inX = outX + b.cast(kx, to: .float) - b.constant(Float(padW))
-
-                        let kernelIdx =
+                        let kIdx =
                             b.cast(ky, to: .float) * b.constant(Float(kW)) + b.cast(kx, to: .float)
 
                         let inBounds =
-                            (inY >= b.constant(0.0)) * (inY < b.constant(Float(inH)))
-                            * (inX >= b.constant(0.0)) * (inX < b.constant(Float(inW)))
-
-                        // raw neighbor index (may be OOB)
+                            (inY >= b.constant(0)) * (inY < b.constant(Float(inH)))
+                            * (inX >= b.constant(0)) * (inX < b.constant(Float(inW)))
                         let rawIdx =
                             b.cast(inY, to: .int) * b.constant(Float(inW)) + b.cast(inX, to: .int)
+                        let safeIdx = b.gswitch(inBounds, rawIdx, b.constant(0))
 
-                        // convert inBounds (0.0 / 1.0) → int 0 / 1
-                        let inBoundsInt = b.cast(inBounds, to: .int)
-
-                        // safeIdx = inBounds ? rawIdx : 0
-                        // (0 is guaranteed in-range for the 4x4 grid)
-                        let safeIdx = b.gswitch(
-                            inBounds,  // or use an int version if you have one
-                            rawIdx,
-                            b.constant(0)
-                        )
-
-                        // now use *safeIdx* for the read
-                        let inputVal = b.gswitch(
-                            inBounds,
-                            b.memoryRead(inputCellId, safeIdx),
-                            b.constant(0.0)
-                        )
-                        let kernelVal = b.memoryRead(kernelCellId, b.cast(kernelIdx, to: .int))
-
-                        acc.accumulate(inputVal * kernelVal)
+                        let inVal = b.gswitch(
+                            inBounds, b.memoryRead(inCell, safeIdx), b.constant(0))
+                        let kVal = b.memoryRead(kCell, b.cast(kIdx, to: .int))
+                        acc.accumulate(inVal * kVal)
                     }
                 }
-
-                _ = b.memoryWrite(outputCellId, b.cast(flatIdx, to: .int), acc.value)
+                _ = b.memoryWrite(outCell, b.cast(flatIdx, to: .int), acc.value)
             }
 
         case .sum:
-            // Reduce tensor to scalar by summing all elements
-            // Check node.inputs for tensor compatibility
-            guard node.inputs.count >= 1 else {
-                throw DGenError.insufficientInputs(
-                    operator: "sum", expected: 1, actual: node.inputs.count)
-            }
-            let inputShape = g.nodes[node.inputs[0]]?.shape ?? .scalar
-            guard case .tensor(let shape) = inputShape else {
-                // If input is scalar, just pass through
-                if let scalarInput = inputs.first {
-                    b.use(val: b.value(scalarInput))
-                }
+            guard case .tensor(let shape) = g.nodes[node.inputs[0]]?.shape,
+                let inCell = g.nodeToTensor[node.inputs[0]].flatMap({ g.tensors[$0] })?.cellId
+            else {
+                if let s = inputs.first { b.use(val: b.value(s)) }
                 break
             }
-            let size = shape.reduce(1, *)
-            let inputTensorId = g.nodeToTensor[node.inputs[0]]!
-            let inputCellId = g.tensors[inputTensorId]!.cellId
-
-            // Sequential reduction (parallel reduction would need different UOps)
             let acc = b.float(0.0)
-            b.loop(size) { idx in
-                let val = b.memoryRead(inputCellId, b.cast(idx, to: .int))
-                acc.accumulate(val)
+            b.loop(shape.reduce(1, *)) { i in
+                acc.accumulate(b.memoryRead(inCell, b.cast(i, to: .int)))
             }
             b.use(val: acc.value)
 
         case .sumAxis(let axis):
-            // Reduce along a specific axis
-            guard node.inputs.count >= 1 else {
-                throw DGenError.insufficientInputs(
-                    operator: "sumAxis", expected: 1, actual: node.inputs.count)
-            }
-            guard case .tensor(let inputShape) = g.nodes[node.inputs[0]]?.shape else {
-                throw DGenError.insufficientInputs(
-                    operator: "sumAxis requires tensor", expected: 1, actual: 0)
-            }
-            guard case .tensor(let outputShape) = node.shape else {
-                throw DGenError.insufficientInputs(
-                    operator: "sumAxis output", expected: 1, actual: 0)
+            guard case .tensor(let inShape) = g.nodes[node.inputs[0]]?.shape,
+                case .tensor = node.shape,
+                let inTensor = g.nodeToTensor[node.inputs[0]].flatMap({ g.tensors[$0] }),
+                let outCell = g.nodeToTensor[node.id].flatMap({ g.tensors[$0] })?.cellId,
+                let loopIdx = b.ctx.tensorIndices[node.id],
+                axis >= 0 && axis < inShape.count
+            else {
+                throw DGenError.tensorError(op: "sumAxis", reason: "invalid input")
             }
 
-            guard let inputTensorId = g.nodeToTensor[node.inputs[0]] else {
-                throw DGenError.tensorError(
-                    op: "sumAxis", reason: "input node \(node.inputs[0]) has no tensor mapping")
-            }
-            guard let inputTensor = g.tensors[inputTensorId] else {
-                throw DGenError.tensorError(
-                    op: "sumAxis", reason: "tensor \(inputTensorId) not found")
-            }
-
-            guard let outputTensorId = g.nodeToTensor[node.id] else {
-                throw DGenError.tensorError(
-                    op: "sumAxis", reason: "output node \(node.id) has no tensor mapping")
-            }
-            guard let outputTensor = g.tensors[outputTensorId] else {
-                throw DGenError.tensorError(
-                    op: "sumAxis", reason: "output tensor \(outputTensorId) not found")
-            }
-            guard let index = b.ctx.tensorIndices[node.id] else {
-                throw DGenError.tensorError(op: "sumAxis", reason: "index missing")
-            }
-            let outFlatIdx = b.value(index)
-
-            let outputCellId = outputTensor.cellId
-
-            guard axis >= 0 && axis < inputShape.count else {
-                throw DGenError.tensorError(
-                    op: "sumAxis", reason: "axis \(axis) out of range for shape \(inputShape)")
-            }
-            let reduceSize = inputShape[axis]
-
-            // Get the actual strides from the tensor (handles transpose correctly!)
-            let inputStrides = inputTensor.strides
-
-            // Parallel over output elements
-            //b.parallelRange(outputSize) { outFlatIdx in
+            let outIdx = b.value(loopIdx)
+            let strides = inTensor.strides
             let acc = b.float(0.0)
 
-            b.loop(reduceSize) { reduceIdx in
-                // Build multi-dimensional indices for the input tensor
-                // Output shape has one fewer dimension than input (the reduced axis is removed)
-                // We need to map outFlatIdx to output coords, then insert reduceIdx at axis position
+            b.loop(inShape[axis]) { reduceIdx in
+                let rIdx = b.cast(reduceIdx, to: .float)
+                let oIdx = b.cast(outIdx, to: .float)
 
-                var indices: [Expr] = []
-
-                if inputShape.count == 1 {
-                    // 1D: sumAxis(0) reduces to scalar
-                    indices = [b.cast(reduceIdx, to: .float)]
-                } else if inputShape.count == 2 {
-                    // 2D case
-                    if axis == 0 {
-                        // [M, N] -> [N], reduce over rows
-                        // input[reduceIdx, outFlatIdx]
-                        indices = [
-                            b.cast(reduceIdx, to: .float), b.cast(outFlatIdx, to: .float),
-                        ]
-                    } else {
-                        // [M, N] -> [M], reduce over cols
-                        // input[outFlatIdx, reduceIdx]
-                        indices = [
-                            b.cast(outFlatIdx, to: .float), b.cast(reduceIdx, to: .float),
-                        ]
+                let indices: [Expr]
+                switch inShape.count {
+                case 1:
+                    indices = [rIdx]
+                case 2:
+                    indices = axis == 0 ? [rIdx, oIdx] : [oIdx, rIdx]
+                case 3:
+                    let innerDim = axis == 2 ? inShape[1] : inShape[2]
+                    let outer = b.floor(b.cast(outIdx, to: .int) / b.constant(Float(innerDim)))
+                    let inner = b.cast(outIdx, to: .int) - outer * b.constant(Float(innerDim))
+                    switch axis {
+                    case 0: indices = [rIdx, outer, inner]
+                    case 1: indices = [outer, rIdx, inner]
+                    default: indices = [outer, inner, rIdx]
                     }
-                } else if inputShape.count == 3 {
-                    // 3D case - commonly [M, N, K]
-                    let innerDim = axis == 2 ? inputShape[1] : inputShape[2]
-                    let rawDiv = b.cast(outFlatIdx, to: .int) / b.constant(Float(innerDim))
-                    let outOuter = b.floor(rawDiv)  // Must floor for integer division!
-                    let modDivisor = b.constant(Float(innerDim))
-                    let outInner = b.cast(outFlatIdx, to: .int) - (outOuter * modDivisor)
-
-                    if axis == 0 {
-                        // [M, N, K] -> [N, K]
-                        indices = [b.cast(reduceIdx, to: .float), outOuter, outInner]
-                    } else if axis == 1 {
-                        // [M, N, K] -> [M, K]
-                        indices = [outOuter, b.cast(reduceIdx, to: .float), outInner]
-                    } else {
-                        // axis == 2: [M, N, K] -> [M, N]
-                        indices = [outOuter, outInner, b.cast(reduceIdx, to: .float)]
-                    }
-                } else {
-                    // Fallback: use flat index (won't handle strides correctly for >3D)
-                    let val = b.memoryRead(inputTensor.cellId, b.cast(reduceIdx, to: .int))
-                    acc.accumulate(val)
+                default:
+                    acc.accumulate(b.memoryRead(inTensor.cellId, b.cast(reduceIdx, to: .int)))
                     return
                 }
 
-                // Use strided indexing - this handles transpose correctly!
-                let val = b.tensorRead(
-                    cellId: inputTensor.cellId, indices: indices, strides: inputStrides)
-                acc.accumulate(val)
-                // }
-
-                _ = b.memoryWrite(outputCellId, b.cast(outFlatIdx, to: .int), acc.value)
+                let offset = b.stridedIndex(indices: indices, strides: strides)
+                acc.accumulate(b.memoryRead(inTensor.cellId, b.cast(offset, to: .int)))
+                _ = b.memoryWrite(outCell, b.cast(outIdx, to: .int), acc.value)
             }
 
         case .reshape(let newShape):
@@ -1264,46 +1119,5 @@ func u_spectralLossBackwardPass1(
                 _ = b.memoryWrite(scratchCell, b.cast(offset2, to: .int), contrib2)
             }
         }
-    }
-}
-
-/// Pass B: Reduce from memory to gradients.
-/// Each thread j (sample index) gathers contributions from all windows that include sample j.
-func u_spectralLossBackwardPass2(
-    _ windowSize: Int,
-    _ scratchCell: CellID,
-    _ sig1: Expr,
-    _ sig2: Expr,
-    _ upstreamGrad: Expr,
-    _ gradId1: GradID,
-    _ gradId2: GradID
-) -> (IRBuilder) -> (Expr, Expr) {
-    return { b in
-        let j = b.threadIndex()  // Sample index
-        let grad1 = b.float(0.0)
-        let grad2 = b.float(0.0)
-
-        // Gather from all windows that include sample j
-        // Windows ending at i ∈ [j .. j+(windowSize-1)]
-        b.loop(windowSize) { offsetFromJ in
-            let windowEnd = j + b.cast(offsetFromJ, to: .float)  // i
-
-            // Window offset: n = j - i + (windowSize - 1)
-            let winSize = b.constant(Float(windowSize))
-            let n = j - windowEnd + (winSize - b.constant(1.0))
-
-            // Memory offset: memory[scratchCell + (i * windowSize * 2) + (n * 2) + component]
-            let offset1 = windowEnd * winSize * b.constant(2.0) + n * b.constant(2.0)
-            let offset2 = offset1 + b.constant(1.0)
-
-            // Read contributions from memory
-            let contrib1 = b.memoryRead(scratchCell, b.cast(offset1, to: .int))
-            let contrib2 = b.memoryRead(scratchCell, b.cast(offset2, to: .int))
-
-            grad1.accumulate(contrib1)
-            grad2.accumulate(contrib2)
-        }
-
-        return (grad1.value, grad2.value)
     }
 }

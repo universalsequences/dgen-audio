@@ -287,266 +287,103 @@ public final class IRBuilder {
     return self.value(dest)
   }
 
-  // MARK: - Tensor Register Optimization
-  //
-  // These methods optimize tensor operations by keeping intermediate values in registers
-  // instead of going through memory for every operation.
-  //
-  // tensorMemoryRead: Check if value is already in a register from a previous computation
-  //                   in this block. If so, return that register. Otherwise emit memoryRead.
-  //
-  // tensorMemoryWrite: Record the computed value in a register. Only emit actual memoryWrite
-  //                    if this cell is needed by later blocks (outbound).
+  // MARK: - Tensor Ops (register-cached)
 
-  /// Read tensor cell, preferring register if available
-  public func tensorMemoryRead(_ cellId: CellID, _ offset: Expr) -> Expr {
-    // Check if we already have this cell's value in a register from earlier in this block
-    if let existingVar = ctx.tensorCellToVar[cellId] {
-      return value(existingVar)
-    }
-    // Not in register, need to read from memory
-    return memoryRead(cellId, offset)
+  /// Load from tensor cell - uses cached register if available
+  public func tload(_ cell: CellID, _ idx: Expr) -> Expr {
+    if let v = ctx.tensorCellToVar[cell] { return value(v) }
+    return memoryRead(cell, cast(idx, to: .int))
   }
 
-  public func readInput(
-    node: Node,
-    inputs: [Lazy],
-    at: Int
-  ) throws -> Expr {
-    // first handle scalar input case
-    let inputNodeId = node.inputs[at]
-    guard
-      let inputNode = ctx.g.nodes[inputNodeId]
-    else {
-      throw DGenError.missingTensorID
-    }
-    let inputNShape = inputNode.shape ?? .scalar
-    if case .scalar = inputNShape {
-      return value(inputs[at])
-    }
+  /// Store to tensor cell - caches in register, only writes memory if outbound
+  public func tstore(_ cell: CellID, _ idx: Expr, _ val: Expr) -> Expr {
+    ctx.tensorCellToVar[cell] = val.lazy
+    guard ctx.outboundTensorCells.contains(cell) else { return val }
+    return memoryWrite(cell, cast(idx, to: .int), val)
+  }
 
-    // otherwise we have a tensor
-    guard case .tensor(let outputShape) = node.shape else {
-      throw DGenError.tensorError(op: "yo", reason: "node has no tensor shape")
-    }
+  // MARK: - High-level tensor I/O
 
-    guard
-      let inputTensorId = ctx.g.nodeToTensor[inputNodeId],
-      let inputTensor = ctx.g.tensors[inputTensorId]
-    else {
-      throw DGenError.tensorError(op: "yo", reason: "input has no tensor")
-    }
-    guard let index = ctx.tensorIndices[node.id] else {
-      throw DGenError.tensorError(op: "yo", reason: "no index")
-    }
+  public func readInput(_ node: Node, _ inputs: [Lazy], at idx: Int) throws -> Expr {
+    let inputId = node.inputs[idx]
+    guard let inputNode = ctx.g.nodes[inputId] else { throw DGenError.missingTensorID }
 
-    let idx = value(index)
+    // scalar
+    if case .scalar = inputNode.shape ?? .scalar { return value(inputs[idx]) }
 
-    let broadcastIdx = broadcastIndex(
-      outputIdx: idx,
-      outputShape: outputShape,
-      inputShape: inputTensor.shape,
-      inputStrides: inputTensor.strides
+    // tensor
+    guard case .tensor(let outShape) = node.shape,
+      let tensor = ctx.g.nodeToTensor[inputId].flatMap({ ctx.g.tensors[$0] }),
+      let loopIdx = ctx.tensorIndices[node.id]
+    else { throw DGenError.missingTensorID }
+
+    let offset = broadcastIndex(
+      outputIdx: value(loopIdx), outputShape: outShape,
+      inputShape: tensor.shape, inputStrides: tensor.strides
     )
-
-    // Use tensorMemoryRead to check register first before going to memory
-    return tensorMemoryRead(inputTensor.cellId, cast(broadcastIdx, to: .int))
+    return tload(tensor.cellId, offset)
   }
 
-  public func writeOutput(
-    node: Node,
-    result: Expr,
-  ) throws {
-    guard case .tensor(_) = node.shape else {
-      // Scalar case - just apply op directly
-      use(val: result)
-      return
-    }
-    guard let index = ctx.tensorIndices[node.id] else {
-      throw DGenError.missingTensorID
-    }
-
-    let idx = value(index)
-
-    let outputTensorId = ctx.g.nodeToTensor[node.id]!
-    let outputCellId = ctx.g.tensors[outputTensorId]!.cellId
-
-    _ = tensorMemoryWrite(outputCellId, cast(idx, to: .int), result)
-
+  public func writeOutput(_ node: Node, _ result: Expr) throws {
     use(val: result)
+    guard case .tensor = node.shape,
+      let tensor = ctx.g.nodeToTensor[node.id].flatMap({ ctx.g.tensors[$0] }),
+      let loopIdx = ctx.tensorIndices[node.id]
+    else { return }
+    _ = tstore(tensor.cellId, value(loopIdx), result)
   }
 
-  /// Write tensor cell, only emitting memory write if needed for cross-block transfer
-  public func tensorMemoryWrite(_ cellId: CellID, _ offset: Expr, _ val: Expr) -> Expr {
-    // Always record in tensor register map so subsequent reads can use the register
-    ctx.tensorCellToVar[cellId] = val.lazy
-
-    // Only emit actual memory write if this cell is needed by later blocks
-    if ctx.outboundTensorCells.contains(cellId) {
-      return memoryWrite(cellId, offset, val)
-    }
-
-    // Cell is only used within this block - skip memory write, value stays in register
-    return val
-  }
-
-  // MARK: - Strided Tensor Indexing
-
-  /// Compute linear memory index from multi-dimensional indices using tensor strides.
-  /// Optimizes for the trivial case (contiguous row-major) to avoid unnecessary operations.
-  ///
-  /// For a tensor with shape [M, N] and strides [N, 1]:
-  ///   linearIndex([row, col]) = row * N + col  (trivial: last stride is 1)
-  ///
-  /// For a transposed tensor with shape [N, M] and strides [1, N]:
-  ///   linearIndex([row, col]) = row * 1 + col * N  (non-trivial: requires actual stride math)
-  ///
+  /// Multi-dim indices + strides → linear offset
   public func stridedIndex(indices: [Expr], strides: [Int]) -> Expr {
-    guard indices.count == strides.count else {
-      fatalError(
-        "stridedIndex: indices count (\(indices.count)) must match strides count (\(strides.count))"
-      )
+    assert(indices.count == strides.count)
+    var acc: Expr? = nil
+    for (idx, s) in zip(indices, strides) where s != 0 {
+      let term = s == 1 ? idx : idx * constant(Float(s))
+      acc = acc.map { $0 + term } ?? term
     }
-
-    guard !indices.isEmpty else {
-      return constant(0)
-    }
-
-    var result: Expr? = nil
-
-    for i in 0..<indices.count {
-      let stride = strides[i]
-
-      // Skip stride-0 dimensions (broadcast dimensions)
-      if stride == 0 { continue }
-
-      let idx = indices[i]
-
-      // Optimization: stride of 1 means just use the index directly
-      let term: Expr
-      if stride == 1 {
-        term = idx
-      } else {
-        // Use Expr operators (* and +) which emit proper IR
-        term = idx * constant(Float(stride))
-      }
-
-      // Accumulate terms
-      if let r = result {
-        result = r + term
-      } else {
-        result = term
-      }
-    }
-
-    return result ?? constant(0)
-  }
-
-  /// Read from tensor using multi-dimensional indices (handles strides correctly)
-  /// This is the preferred way to read tensor elements when you have logical indices.
-  public func tensorRead(cellId: CellID, indices: [Expr], strides: [Int]) -> Expr {
-    // Check register cache first
-    if let existingVar = ctx.tensorCellToVar[cellId] {
-      return value(existingVar)
-    }
-
-    // Compute linear index using strides
-    let linearIdx = stridedIndex(indices: indices, strides: strides)
-    return memoryRead(cellId, cast(linearIdx, to: .int))
+    return acc ?? constant(0)
   }
 
   // MARK: - Broadcast Indexing
 
-  /// Convert a flat output index to multi-dimensional indices for the given shape.
-  /// e.g., flatIdx=7 with shape [2,2,3] -> [1,0,1] (row-major)
-  public func flatToMultiIndex(flatIdx: Expr, shape: [Int]) -> [Expr] {
-    guard !shape.isEmpty else { return [] }
-
+  /// Flat index → multi-dim indices for shape (row-major)
+  private func flatToMultiIndex(_ flat: Expr, _ shape: [Int]) -> [Expr] {
     var indices: [Expr] = []
-    var remaining = flatIdx
-
+    var rem = flat
     for i in 0..<shape.count {
-      // Compute stride for this dimension (product of all subsequent dims)
       let stride = shape[(i + 1)...].reduce(1, *)
-
       if stride == 1 {
-        // Last dimension - just use remaining
-        indices.append(remaining)
+        indices.append(rem)
       } else {
-        // idx[i] = floor(remaining / stride)
-        let strideConst = constant(Float(stride))
-        let rawIdx = remaining / strideConst
-        let flooredIdx = floor(rawIdx)
-        indices.append(flooredIdx)  // Use floored index!
-        // remaining = remaining % stride (using: a - floor(a/b)*b)
-        remaining = remaining - (flooredIdx * strideConst)
+        let s = constant(Float(stride))
+        let idx = floor(rem / s)
+        indices.append(idx)
+        rem = rem - idx * s
       }
     }
-
     return indices
   }
 
-  /// Compute broadcast-aware memory index for reading from an input tensor.
-  /// Takes the output's flat index and output shape, and computes the correct
-  /// memory offset for an input tensor that may have different (broadcastable) shape.
-  ///
-  /// Broadcasting rules:
-  /// - Shapes are right-aligned (pad shorter shape with 1s on the left)
-  /// - Where input dim == 1, that index is clamped to 0 (broadcast)
-  /// - Uses input tensor's strides for the final memory offset
-  ///
-  /// Example:
-  ///   outputIdx=7, outputShape=[2,2,3], inputShape=[2,1,3], inputStrides=[3,3,1]
-  ///   -> multiIdx = [1,0,1]
-  ///   -> broadcastIdx = [1,0,1] (middle dim clamped to 0 since input dim is 1)
-  ///   -> memoryOffset = 1*3 + 0*3 + 1*1 = 4
-  public func broadcastIndex(
-    outputIdx: Expr,
-    outputShape: [Int],
-    inputShape: [Int],
-    inputStrides: [Int]
+  /// Output flat idx → input memory offset (handles broadcasting)
+  func broadcastIndex(
+    outputIdx: Expr, outputShape: [Int],
+    inputShape: [Int], inputStrides: [Int]
   ) -> Expr {
-    // Fast path: if shapes match exactly and strides are contiguous (row-major),
-    // just use the flat index directly - no complex arithmetic needed.
-    // This is critical for SIMD optimization to work.
-    if inputShape == outputShape {
-      let expectedStrides = Tensor.computeRowMajorStrides(inputShape)
-      if inputStrides == expectedStrides {
-        return outputIdx
-      }
+    // fast path: shapes match + contiguous → just use flat idx
+    if inputShape == outputShape && inputStrides == Tensor.computeRowMajorStrides(inputShape) {
+      return outputIdx
     }
 
-    // Emit marker to signal SIMD should be disabled for this block
-    ops.append(UOp(op: .broadcastAccess, value: .empty))
+    ops.append(UOp(op: .broadcastAccess, value: .empty))  // disable SIMD
 
-    // Convert flat index to multi-dimensional indices for output shape
-    let multiIdx = flatToMultiIndex(flatIdx: outputIdx, shape: outputShape)
+    let multiIdx = flatToMultiIndex(outputIdx, outputShape)
+    let rankDiff = outputShape.count - inputShape.count
 
-    // Right-align shapes (pad input with 1s on left if needed)
-    let outputRank = outputShape.count
-    let inputRank = inputShape.count
-    let rankDiff = outputRank - inputRank
-
-    var broadcastIndices: [Expr] = []
-    var broadcastStrides: [Int] = []
-
-    for i in 0..<inputRank {
-      let outputDimIdx = i + rankDiff
-      let inputDim = inputShape[i]
-      let outputIdx = multiIdx[outputDimIdx]
-
-      if inputDim == 1 {
-        // Broadcast dimension - always index 0
-        broadcastIndices.append(constant(0))
-      } else {
-        // Normal dimension - use the output index
-        broadcastIndices.append(outputIdx)
-      }
-      broadcastStrides.append(inputStrides[i])
+    // right-align shapes, clamp broadcast dims to 0
+    let indices = inputShape.enumerated().map { i, dim in
+      dim == 1 ? constant(0) : multiIdx[i + rankDiff]
     }
-
-    // Compute final memory offset using input strides
-    return stridedIndex(indices: broadcastIndices, strides: broadcastStrides)
+    return stridedIndex(indices: indices, strides: inputStrides)
   }
 
   public func min(_ a: Expr, _ b: Expr) -> Expr {
