@@ -1014,7 +1014,7 @@ public func emitBlockUOps(
                     bodyUops.append(uop)
                 }
             } else {
-                let back = node.op.emitBackward(ctx: ctx, g: g, nodeId: nodeId)
+                let back = try node.op.emitBackward(ctx: ctx, g: g, nodeId: nodeId)
                 for uop in back {
                     emittedNodes.insert(nodeId)
                     bodyUops.append(uop)

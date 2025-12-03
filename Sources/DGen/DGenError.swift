@@ -9,6 +9,7 @@ public enum DGenError: Error, LocalizedError {
     case compilationFailed(String)
     case shapeMismatch(op: String, shape1: Shape, shape2: Shape)
     case shapeInferenceFailed(op: String, reason: String)
+    case tensorError(op: String, reason: String)
 
     public var errorDescription: String? {
         switch self {
@@ -28,6 +29,8 @@ public enum DGenError: Error, LocalizedError {
             return "Shape mismatch in \(op): \(shape1) vs \(shape2)"
         case .shapeInferenceFailed(let op, let reason):
             return "Shape inference failed for \(op): \(reason)"
+        case .tensorError(let op, let reason):
+            return "\(op): \(reason)"
         }
     }
 }

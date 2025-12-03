@@ -308,6 +308,74 @@ public final class IRBuilder {
     return memoryRead(cellId, offset)
   }
 
+  public func readInput(
+    node: Node,
+    inputs: [Lazy],
+    at: Int
+  ) throws -> Expr {
+    // first handle scalar input case
+    let inputNodeId = node.inputs[at]
+    guard
+      let inputNode = ctx.g.nodes[inputNodeId]
+    else {
+      throw DGenError.missingTensorID
+    }
+    let inputNShape = inputNode.shape ?? .scalar
+    if case .scalar = inputNShape {
+      return value(inputs[at])
+    }
+
+    // otherwise we have a tensor
+    guard case .tensor(let outputShape) = node.shape else {
+      throw DGenError.tensorError(op: "yo", reason: "node has no tensor shape")
+    }
+
+    guard
+      let inputTensorId = ctx.g.nodeToTensor[inputNodeId],
+      let inputTensor = ctx.g.tensors[inputTensorId]
+    else {
+      throw DGenError.tensorError(op: "yo", reason: "input has no tensor")
+    }
+    guard let index = ctx.tensorIndices[node.id] else {
+      throw DGenError.tensorError(op: "yo", reason: "no index")
+    }
+
+    let idx = value(index)
+
+    let broadcastIdx = broadcastIndex(
+      outputIdx: idx,
+      outputShape: outputShape,
+      inputShape: inputTensor.shape,
+      inputStrides: inputTensor.strides
+    )
+
+    // Use tensorMemoryRead to check register first before going to memory
+    return tensorMemoryRead(inputTensor.cellId, cast(broadcastIdx, to: .int))
+  }
+
+  public func writeOutput(
+    node: Node,
+    result: Expr,
+  ) throws {
+    guard case .tensor(_) = node.shape else {
+      // Scalar case - just apply op directly
+      use(val: result)
+      return
+    }
+    guard let index = ctx.tensorIndices[node.id] else {
+      throw DGenError.missingTensorID
+    }
+
+    let idx = value(index)
+
+    let outputTensorId = ctx.g.nodeToTensor[node.id]!
+    let outputCellId = ctx.g.tensors[outputTensorId]!.cellId
+
+    _ = tensorMemoryWrite(outputCellId, cast(idx, to: .int), result)
+
+    use(val: result)
+  }
+
   /// Write tensor cell, only emitting memory write if needed for cross-block transfer
   public func tensorMemoryWrite(_ cellId: CellID, _ offset: Expr, _ val: Expr) -> Expr {
     // Always record in tensor register map so subsequent reads can use the register
@@ -335,7 +403,9 @@ public final class IRBuilder {
   ///
   public func stridedIndex(indices: [Expr], strides: [Int]) -> Expr {
     guard indices.count == strides.count else {
-      fatalError("stridedIndex: indices count (\(indices.count)) must match strides count (\(strides.count))")
+      fatalError(
+        "stridedIndex: indices count (\(indices.count)) must match strides count (\(strides.count))"
+      )
     }
 
     guard !indices.isEmpty else {
@@ -397,7 +467,7 @@ public final class IRBuilder {
 
     for i in 0..<shape.count {
       // Compute stride for this dimension (product of all subsequent dims)
-      let stride = shape[(i+1)...].reduce(1, *)
+      let stride = shape[(i + 1)...].reduce(1, *)
 
       if stride == 1 {
         // Last dimension - just use remaining

@@ -692,7 +692,7 @@ final class CTensorOpsTests: XCTestCase {
                 // let result = g.n(.sum, t)
 
                 // Reshape to 3x2
-                let reshaped = g.reshape(t, to: [3, 2])
+                let reshaped = try g.reshape(t, to: [3, 2])
 
                 // Sum to verify the data is preserved
                 let result = g.n(.sum, reshaped)
@@ -737,7 +737,7 @@ final class CTensorOpsTests: XCTestCase {
                 let t = g.tensor(shape: [2, 3], data: [1.0, 2.0, 3.0, 4.0, 5.0, 6.0])
 
                 // Reshape to 3x2 and sum
-                let reshaped = g.reshape(t, to: [3, 2])
+                let reshaped = try g.reshape(t, to: [3, 2])
                 let result = g.n(.sum, reshaped)
                 _ = g.n(.output(0), result)
 
@@ -794,7 +794,7 @@ final class CTensorOpsTests: XCTestCase {
                 let t = g.tensor(shape: [2, 3], data: [1.0, 2.0, 3.0, 4.0, 5.0, 6.0])
 
                 // Transpose to 3x2
-                let transposed = g.transpose(t)
+                let transposed = try g.transpose(t)
 
                 // Sum to verify data preserved
                 let result = g.n(.sum, transposed)
@@ -821,7 +821,7 @@ final class CTensorOpsTests: XCTestCase {
                 let t = g.tensor(shape: [2, 3], data: [1.0, 2.0, 3.0, 4.0, 5.0, 6.0])
 
                 // Sum along axis 1 (columns) -> [6, 15]
-                let summed = g.sum(t, axis: 1)
+                let summed = try g.sum(t, axis: 1)
 
                 // Sum the result to get a scalar
                 let result = g.n(.sum, summed)
@@ -847,7 +847,7 @@ final class CTensorOpsTests: XCTestCase {
 
                 // Sum along axis -1 (last axis, columns) -> [6, 15]
                 // Then sum again to get 21
-                let summed = g.sum(t, axis: -1)
+                let summed = try g.sum(t, axis: -1)
                 let result = g.n(.sum, summed)
                 _ = g.n(.output(0), result)
 
@@ -912,7 +912,7 @@ final class CTensorOpsTests: XCTestCase {
                 // C[1,0] = 4*7 + 5*9 + 6*11 = 28 + 45 + 66 = 139
                 // C[1,1] = 4*8 + 5*10 + 6*12 = 32 + 50 + 72 = 154
                 // Sum = 58 + 64 + 139 + 154 = 415
-                let c = g.matmul(a, b)
+                let c = try g.matmul(a, b)
                 let result = g.n(.sum, c)
                 _ = g.n(.output(0), result)
 
@@ -976,7 +976,7 @@ final class CTensorOpsTests: XCTestCase {
                 let bScaled = g.n(.mul, b, scalar)  // tensor * scalar should still be tensor
 
                 // This should work: matmul(a, b * scalar)
-                let c = g.matmul(a, bScaled)
+                let c = try g.matmul(a, bScaled)
                 let result = g.n(.sum, c)
                 _ = g.n(.output(0), result)
 
@@ -1034,7 +1034,7 @@ final class CTensorOpsTests: XCTestCase {
 
                 // [2,3] -> [6]
                 let t = g.tensor(shape: [2, 3], data: [1.0, 2.0, 3.0, 4.0, 5.0, 6.0])
-                let flat = g.reshape(t, to: [6])
+                let flat = try g.reshape(t, to: [6])
 
                 // Multiply by weights [1,2,3,4,5,6] to verify order preserved
                 let weights = g.tensor(shape: [6], data: [1.0, 2.0, 3.0, 4.0, 5.0, 6.0])
@@ -1087,10 +1087,10 @@ final class CTensorOpsTests: XCTestCase {
 
                 // [6] -> [2,3]
                 let t = g.tensor(shape: [6], data: [1.0, 2.0, 3.0, 4.0, 5.0, 6.0])
-                let reshaped = g.reshape(t, to: [2, 3])
+                let reshaped = try g.reshape(t, to: [2, 3])
 
                 // sumAxis(1) on [2,3] -> [1+2+3, 4+5+6] = [6, 15]
-                let summed = g.sum(reshaped, axis: 1)
+                let summed = try g.sum(reshaped, axis: 1)
 
                 // Multiply by [1, 2] -> 6*1 + 15*2 = 36
                 let weights = g.tensor(shape: [2], data: [1.0, 2.0])
@@ -1147,10 +1147,10 @@ final class CTensorOpsTests: XCTestCase {
                 // [2,3]: [[1,2,3], [4,5,6]] stored as [1,2,3,4,5,6]
                 // Transposed [3,2]: [[1,4], [2,5], [3,6]] (same memory, different strides)
                 let t = g.tensor(shape: [2, 3], data: [1.0, 2.0, 3.0, 4.0, 5.0, 6.0])
-                let transposed = g.transpose(t)  // shape [3,2], strides [1, 3]
+                let transposed = try g.transpose(t)  // shape [3,2], strides [1, 3]
 
                 // sumAxis(1) on transposed [3,2]: [1+4, 2+5, 3+6] = [5, 7, 9]
-                let summed = g.sum(transposed, axis: 1)
+                let summed = try g.sum(transposed, axis: 1)
 
                 // Multiply by [1, 2, 3] -> 5*1 + 7*2 + 9*3 = 5 + 14 + 27 = 46
                 let weights = g.tensor(shape: [3], data: [1.0, 2.0, 3.0])
@@ -1214,7 +1214,7 @@ final class CTensorOpsTests: XCTestCase {
                 // [2,3]: [[1,2,3], [4,5,6]]
                 // sumAxis(0) -> [1+4, 2+5, 3+6] = [5, 7, 9]
                 let t = g.tensor(shape: [2, 3], data: [1.0, 2.0, 3.0, 4.0, 5.0, 6.0])
-                let summed = g.sum(t, axis: 0)
+                let summed = try g.sum(t, axis: 0)
 
                 // Multiply by [1, 2, 3] -> 5*1 + 7*2 + 9*3 = 5 + 14 + 27 = 46
                 let weights = g.tensor(shape: [3], data: [1.0, 2.0, 3.0])
@@ -1269,7 +1269,7 @@ final class CTensorOpsTests: XCTestCase {
                 let g = Graph()
 
                 let t = g.tensor(shape: [4], data: [1.0, 2.0, 3.0, 4.0])
-                let summed = g.sum(t, axis: 0)  // Only axis, becomes scalar
+                let summed = try g.sum(t, axis: 0)  // Only axis, becomes scalar
                 _ = g.n(.output(0), summed)
 
                 let frameCount = 1
@@ -1381,7 +1381,7 @@ final class CTensorOpsTests: XCTestCase {
                         10.0, 11.0, 12.0  // row 3: sum = 33
                 ])
 
-                let summed = g.sum(t, axis: 1)  // [4,3] -> [4]
+                let summed = try g.sum(t, axis: 1)  // [4,3] -> [4]
 
                 // Output sum: 6 + 15 + 24 + 33 = 78
                 let result = g.n(.sum, summed)
@@ -1458,10 +1458,10 @@ final class CTensorOpsTests: XCTestCase {
                 let t = g.tensor(shape: [2, 3], data: [1.0, 2.0, 3.0, 4.0, 5.0, 6.0])
 
                 // Reshape to [3,2]: [[1,2], [3,4], [5,6]]
-                let reshaped = g.reshape(t, to: [3, 2])
+                let reshaped = try g.reshape(t, to: [3, 2])
 
                 // sumAxis(1) on [3,2] sums each row: [1+2, 3+4, 5+6] = [3, 7, 11]
-                let summed = g.sum(reshaped, axis: 1)
+                let summed = try g.sum(reshaped, axis: 1)
 
                 // Multiply by weights [1, 2, 3] and sum: 3*1 + 7*2 + 11*3 = 3 + 14 + 33 = 50
                 let weights = g.tensor(shape: [3], data: [1.0, 2.0, 3.0])
@@ -1533,7 +1533,7 @@ final class CTensorOpsTests: XCTestCase {
                 let s3 = g.n(.constant(3.0))
                 let s4 = g.n(.constant(4.0))
 
-                let stacked = g.stack([s1, s2, s3, s4])
+                let stacked = try g.stack([s1, s2, s3, s4])
 
                 // Sum the stacked tensor: 1 + 2 + 3 + 4 = 10
                 let result = g.n(.sum, stacked)
@@ -1590,10 +1590,10 @@ final class CTensorOpsTests: XCTestCase {
                 let s3 = g.n(.constant(3.0))
                 let s4 = g.n(.constant(4.0))
 
-                let stacked = g.stack([s1, s2, s3, s4], shape: [2, 2])
+                let stacked = try g.stack([s1, s2, s3, s4], shape: [2, 2])
 
                 // Sum along axis 0: [[1,2],[3,4]] -> [4, 6]
-                let summed = g.sum(stacked, axis: 0)
+                let summed = try g.sum(stacked, axis: 0)
 
                 // Multiply by weights [1, 2]: 4*1 + 6*2 = 16
                 let weights = g.tensor(shape: [2], data: [1.0, 2.0])

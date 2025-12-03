@@ -1,6 +1,7 @@
 import Foundation
 
 public class IRContext {
+    public var g: Graph
     private var varIdx = 0
     private var gradIdx = 0
     private var constantIdx = 0
@@ -26,7 +27,9 @@ public class IRContext {
         tensorCellToVar = [:]
     }
 
-    public init() {}
+    public init(g: Graph) {
+        self.g = g
+    }
 
     // Use Array instead of Set to maintain stable ordering for tape slot assignment
     public var globals: [VarID] = []
@@ -136,7 +139,8 @@ open class Graph {
             // Gather input shapes
             let inputShapes = ins.compactMap { nodes[$0]?.shape }
             // Try to infer shape - fall back to .scalar if inference fails
-            let inferredShape = (try? inferShape(op: op, inputs: inputShapes, graph: self)) ?? .scalar
+            let inferredShape =
+                (try? inferShape(op: op, inputs: inputShapes, graph: self)) ?? .scalar
             nodes[id]?.shape = inferredShape
         }
 

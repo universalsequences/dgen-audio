@@ -138,7 +138,7 @@ public struct CompilationPipeline {
         // by isolation but do not straddle Pass1/Pass2 boundaries.
         let reFusedBlocks = fuseBlocks(isolatedBlocks, graph)
 
-        let context = IRContext()
+        let context = IRContext(g: graph)
 
         // finally separate tensor blocks of shared size into their own blocks
         let seperatedBlocks = determineTensorBlocks(reFusedBlocks, graph, context)

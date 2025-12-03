@@ -4,9 +4,12 @@ public struct Tensor {
     public let strides: [Int]  // How many elements to skip per dimension
     public let cellId: CellID
     public var data: [Float]?  // Initial data to be injected by runtime
-    public let isView: Bool    // True if this is a view of another tensor (reshape/transpose)
+    public let isView: Bool  // True if this is a view of another tensor (reshape/transpose)
 
-    public init(id: TensorID, shape: Shape, cellId: CellID, data: [Float]? = nil, strides: [Int]? = nil, isView: Bool = false) {
+    public init(
+        id: TensorID, shape: Shape, cellId: CellID, data: [Float]? = nil, strides: [Int]? = nil,
+        isView: Bool = false
+    ) {
         self.id = id
         self.shape = shape
         self.cellId = cellId
@@ -129,17 +132,19 @@ extension Graph {
     /// Stack scalar nodes into a tensor (dynamic, per-frame values)
     /// At each frame, writes the current value of each scalar into the tensor
     /// Example: stack([phasor1, phasor2, phasor3]) creates a [3] tensor
-    public func stack(_ scalars: [NodeID], shape: Shape? = nil) -> NodeID {
+    public func stack(_ scalars: [NodeID], shape: Shape? = nil) throws -> NodeID {
         let count = scalars.count
         guard count > 0 else {
-            fatalError("stack requires at least one scalar")
+            throw DGenError.tensorError(op: "stack", reason: "requires at least one scalar")
         }
 
         let finalShape = shape ?? [count]
         let size = finalShape.reduce(1, *)
 
         guard size == count else {
-            fatalError("stack: shape \(finalShape) size \(size) doesn't match scalar count \(count)")
+            throw DGenError.tensorError(
+                op: "stack",
+                reason: "shape \(finalShape) size \(size) doesn't match scalar count \(count)")
         }
 
         // Allocate tensor
@@ -179,33 +184,19 @@ extension Graph {
 
     /// Reshape a tensor to a new shape (metadata only, no data movement)
     /// Total size must match: product of newShape must equal product of old shape
-    public func reshape(_ input: NodeID, to newShape: Shape) -> NodeID {
-        // If input doesn't have a tensor mapping yet (e.g., tensor * scalar),
-        // allocate one based on the node's shape
-        var inputTensorId = nodeToTensor[input]
-        if inputTensorId == nil {
-            guard let inputNode = nodes[input], case .tensor(let inputShape) = inputNode.shape else {
-                fatalError("reshape requires tensor input")
-            }
-            // Allocate a tensor for this derived op
-            let size = inputShape.reduce(1, *)
-            let cellId = alloc(vectorWidth: size)
-            let newTensorId = nextTensorId
-            nextTensorId += 1
-            tensors[newTensorId] = Tensor(id: newTensorId, shape: inputShape, cellId: cellId)
-            cellToTensor[cellId] = newTensorId
-            nodeToTensor[input] = newTensorId
-            inputTensorId = newTensorId
-        }
-
-        guard let inputTensor = tensors[inputTensorId!] else {
-            fatalError("reshape: tensor not found")
+    public func reshape(_ input: NodeID, to newShape: Shape) throws -> NodeID {
+        guard
+            let inputTensorId = nodeToTensor[input],
+            let inputTensor = tensors[inputTensorId]
+        else {
+            throw DGenError.tensorError(op: "reshape", reason: "tensor not found")
         }
 
         let oldSize = inputTensor.size
         let newSize = newShape.reduce(1, *)
         guard oldSize == newSize else {
-            fatalError("reshape size mismatch: \(oldSize) vs \(newSize)")
+            throw DGenError.tensorError(
+                op: "reshape", reason: "size mismatch: \(oldSize) vs \(newSize)")
         }
 
         // Create a new tensor view sharing the same cellId
@@ -235,34 +226,20 @@ extension Graph {
 
     /// Transpose a tensor by permuting axes
     /// axes: permutation of [0, 1, ..., ndim-1], e.g. [1, 0] swaps rows/cols
-    public func transpose(_ input: NodeID, axes: [Int]? = nil) -> NodeID {
-        // If input doesn't have a tensor mapping yet (e.g., tensor * scalar),
-        // allocate one based on the node's shape
-        var inputTensorId = nodeToTensor[input]
-        if inputTensorId == nil {
-            guard let inputNode = nodes[input], case .tensor(let inputShape) = inputNode.shape else {
-                fatalError("transpose requires tensor input")
-            }
-            // Allocate a tensor for this derived op
-            let size = inputShape.reduce(1, *)
-            let cellId = alloc(vectorWidth: size)
-            let newTensorId = nextTensorId
-            nextTensorId += 1
-            tensors[newTensorId] = Tensor(id: newTensorId, shape: inputShape, cellId: cellId)
-            cellToTensor[cellId] = newTensorId
-            nodeToTensor[input] = newTensorId
-            inputTensorId = newTensorId
-        }
-
-        guard let inputTensor = tensors[inputTensorId!] else {
-            fatalError("transpose: tensor not found")
+    public func transpose(_ input: NodeID, axes: [Int]? = nil) throws -> NodeID {
+        guard
+            let inputTensorId = nodeToTensor[input],
+            let inputTensor = tensors[inputTensorId]
+        else {
+            throw DGenError.tensorError(op: "transpose", reason: "tensor not found")
         }
 
         let ndim = inputTensor.shape.count
         let perm = axes ?? Array((0..<ndim).reversed())  // Default: reverse all axes
 
         guard perm.count == ndim else {
-            fatalError("transpose axes must have \(ndim) elements")
+            throw DGenError.tensorError(
+                op: "transpose", reason: "axes must have \(ndim) elements, got \(perm.count)")
         }
 
         // Permute shape and strides
@@ -293,19 +270,22 @@ extension Graph {
 
     /// Sum a tensor along a specific axis, reducing that dimension
     /// e.g. [M, N, K].sum(axis: -1) -> [M, N]
-    public func sum(_ input: NodeID, axis: Int) -> NodeID {
+    public func sum(_ input: NodeID, axis: Int) throws -> NodeID {
         guard let inputNode = nodes[input] else {
-            fatalError("sumAxis: input node not found")
+            throw DGenError.tensorError(op: "sum", reason: "input node not found")
         }
         guard case .tensor(let inputShape) = inputNode.shape else {
-            fatalError("sumAxis requires tensor input, got \(String(describing: inputNode.shape))")
+            throw DGenError.tensorError(
+                op: "sum",
+                reason: "requires tensor input, got \(String(describing: inputNode.shape))")
         }
 
         // Handle negative axis
         let ndim = inputShape.count
         let normalizedAxis = axis < 0 ? ndim + axis : axis
         guard normalizedAxis >= 0 && normalizedAxis < ndim else {
-            fatalError("axis \(axis) out of range for tensor with \(ndim) dimensions")
+            throw DGenError.tensorError(
+                op: "sum", reason: "axis \(axis) out of range for tensor with \(ndim) dimensions")
         }
 
         // Compute output shape (remove the reduced axis)
@@ -321,7 +301,8 @@ extension Graph {
         let outputCellId = alloc(vectorWidth: outputSize)
         let outputTensorId = nextTensorId
         nextTensorId += 1
-        tensors[outputTensorId] = Tensor(id: outputTensorId, shape: outputShape, cellId: outputCellId)
+        tensors[outputTensorId] = Tensor(
+            id: outputTensorId, shape: outputShape, cellId: outputCellId)
         cellToTensor[outputCellId] = outputTensorId
 
         let nodeId = n(.sumAxis(normalizedAxis), [input], shape: .tensor(outputShape))
@@ -331,15 +312,18 @@ extension Graph {
 
     /// Matrix multiply: A[M,K] @ B[K,N] -> C[M,N]
     /// Implemented as: reshape + broadcast multiply + sum
-    public func matmul(_ a: NodeID, _ b: NodeID) -> NodeID {
+    public func matmul(_ a: NodeID, _ b: NodeID) throws -> NodeID {
         // Get shapes from nodes - works even for derived tensor ops like (tensor * scalar)
         guard let aNode = nodes[a], case .tensor(let aShape) = aNode.shape,
-              let bNode = nodes[b], case .tensor(let bShape) = bNode.shape else {
-            fatalError("matmul requires tensor inputs")
+            let bNode = nodes[b], case .tensor(let bShape) = bNode.shape
+        else {
+            throw DGenError.tensorError(op: "matmul", reason: "requires tensor inputs")
         }
 
         guard aShape.count == 2, bShape.count == 2 else {
-            fatalError("matmul requires 2D tensors")
+            throw DGenError.tensorError(
+                op: "matmul",
+                reason: "requires 2D tensors, got \(aShape.count)D and \(bShape.count)D")
         }
 
         let M = aShape[0]
@@ -347,30 +331,22 @@ extension Graph {
         let N = bShape[1]
 
         guard bShape[0] == K else {
-            fatalError("matmul dimension mismatch: [\(M),\(K)] @ [\(bShape[0]),\(N)]")
+            throw DGenError.tensorError(
+                op: "matmul", reason: "dimension mismatch: [\(M),\(K)] @ [\(bShape[0]),\(N)]")
         }
 
         // A: [M, K] -> [M, 1, K]
-        let aReshaped = reshape(a, to: [M, 1, K])
+        let aReshaped = try reshape(a, to: [M, 1, K])
 
         // B: [K, N] -> [1, N, K] (transpose then reshape)
-        let bTransposed = transpose(b, axes: [1, 0])  // [K, N] -> [N, K]
-        let bReshaped = reshape(bTransposed, to: [1, N, K])
+        let bTransposed = try transpose(b, axes: [1, 0])  // [K, N] -> [N, K]
+        let bReshaped = try reshape(bTransposed, to: [1, N, K])
 
         // Broadcast multiply: [M, 1, K] * [1, N, K] -> [M, N, K]
         let product = n(.mul, [aReshaped, bReshaped], shape: .tensor([M, N, K]))
 
-        // Need to allocate tensor for the product
-        let productSize = M * N * K
-        let productCellId = alloc(vectorWidth: productSize)
-        let productTensorId = nextTensorId
-        nextTensorId += 1
-        tensors[productTensorId] = Tensor(id: productTensorId, shape: [M, N, K], cellId: productCellId)
-        cellToTensor[productCellId] = productTensorId
-        nodeToTensor[product] = productTensorId
-
         // Sum along last axis: [M, N, K] -> [M, N]
-        return sum(product, axis: -1)
+        return try sum(product, axis: -1)
     }
 
     // MARK: - Tensor History (State Buffers)
@@ -468,6 +444,9 @@ extension Graph {
         }
         guard let tensor = tensors[tensorId] else {
             throw DGenError.missingTensorID
+        }
+        guard tensor.shape.count >= 2 else {
+            throw DGenError.shapeMismatch(op: "peek", shape1: tensor.shape, shape2: tensor.shape)
         }
 
         let one = n(.constant(1.0))
