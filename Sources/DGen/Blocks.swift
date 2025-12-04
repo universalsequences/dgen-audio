@@ -971,14 +971,14 @@ public func findOutboundTensorCells(_ blks: [Block], _ g: Graph, block: Block) -
 
 /// Check if any UOps contain patterns that prevent SIMD optimization:
 /// - Inner loops (beginLoop, beginForLoop)
-/// - View operations (reshape, transpose) that require complex index arithmetic
+/// - View operations (reshape, transpose, shrink) that require complex index arithmetic
 /// - Broadcast access (non-contiguous strides or shape mismatch)
 private func containsSIMDBlockers(_ uops: [UOp]) -> Bool {
     for uop in uops {
         switch uop.op {
         case .beginLoop, .beginForLoop:
             return true
-        case .reshape, .transpose:
+        case .reshape, .transpose, .shrink:
             return true
         case .broadcastAccess:
             return true

@@ -163,6 +163,8 @@ extension UOp {
             opStr = "\(ANSI.cyan)reshape\(ANSI.reset)(\(shape))"
         case let .transpose(axes):
             opStr = "\(ANSI.cyan)transpose\(ANSI.reset)(\(axes))"
+        case let .shrink(ranges):
+            opStr = "\(ANSI.cyan)shrink\(ANSI.reset)(\(ranges))"
         case .broadcastAccess:
             opStr = "\(ANSI.cyan)broadcastAccess\(ANSI.reset)"
         }

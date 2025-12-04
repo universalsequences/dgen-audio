@@ -1645,4 +1645,522 @@ final class CTensorOpsTests: XCTestCase {
                 XCTAssertEqual(output[0], 16.0, accuracy: 0.001, "Stack with shape should give 16.0")
         }
 
+        // MARK: - Shrink Tests
+
+        func testShrinkBasic() throws {
+                // Test basic shrink compilation
+                let g = Graph()
+
+                // Create a 4x4 tensor
+                let t = g.tensor(shape: [4, 4], data: [
+                        1.0, 2.0, 3.0, 4.0,
+                        5.0, 6.0, 7.0, 8.0,
+                        9.0, 10.0, 11.0, 12.0,
+                        13.0, 14.0, 15.0, 16.0
+                ])
+
+                // Shrink to rows 1:3, cols 1:3 -> [[6,7], [10,11]]
+                let shrunk = try g.shrink(t, ranges: [(1, 3), (1, 3)])
+
+                // Sum to verify
+                let result = g.n(.sum, shrunk)
+                _ = g.n(.output(0), result)
+
+                let compilationResult = try CompilationPipeline.compile(
+                        graph: g,
+                        backend: .c,
+                        options: .init(frameCount: 1, debug: true)
+                )
+
+                print("=== Shrink Basic - Generated Source ===")
+                print(compilationResult.source)
+
+                XCTAssertFalse(compilationResult.source.isEmpty)
+        }
+
+        func testShrinkExecution() throws {
+                // Test shrink with actual execution
+                let g = Graph()
+
+                // Create a 4x4 tensor:
+                // [[ 1,  2,  3,  4],
+                //  [ 5,  6,  7,  8],
+                //  [ 9, 10, 11, 12],
+                //  [13, 14, 15, 16]]
+                let t = g.tensor(shape: [4, 4], data: [
+                        1.0, 2.0, 3.0, 4.0,
+                        5.0, 6.0, 7.0, 8.0,
+                        9.0, 10.0, 11.0, 12.0,
+                        13.0, 14.0, 15.0, 16.0
+                ])
+
+                // Shrink to rows 1:3, cols 1:3 -> 2x2 submatrix:
+                // [[6, 7],
+                //  [10, 11]]
+                // Sum = 6 + 7 + 10 + 11 = 34
+                let shrunk = try g.shrink(t, ranges: [(1, 3), (1, 3)])
+                let result = g.n(.sum, shrunk)
+                _ = g.n(.output(0), result)
+
+                let frameCount = 1
+                let cResult = try CompilationPipeline.compile(
+                        graph: g,
+                        backend: .c,
+                        options: .init(frameCount: frameCount, debug: true)
+                )
+
+                print("=== Shrink Execution - Generated Source ===")
+                print(cResult.source)
+
+                let cRuntime = CCompiledKernel(
+                        source: cResult.source,
+                        cellAllocations: cResult.cellAllocations,
+                        memorySize: cResult.totalMemorySlots
+                )
+                try cRuntime.compileAndLoad()
+
+                guard let mem = cRuntime.allocateNodeMemory() else {
+                        XCTFail("Failed to allocate memory")
+                        return
+                }
+                defer { cRuntime.deallocateNodeMemory(mem) }
+
+                injectTensorData(result: cResult, memory: mem.assumingMemoryBound(to: Float.self))
+
+                var output = [Float](repeating: 0, count: frameCount)
+                let input = [Float](repeating: 0, count: frameCount)
+
+                output.withUnsafeMutableBufferPointer { outPtr in
+                        input.withUnsafeBufferPointer { inPtr in
+                                cRuntime.runWithMemory(
+                                        outputs: outPtr.baseAddress!,
+                                        inputs: inPtr.baseAddress!,
+                                        memory: mem,
+                                        frameCount: frameCount
+                                )
+                        }
+                }
+
+                print("=== Shrink Execution Result ===")
+                print("Output: \(output[0]), Expected: 34.0")
+
+                // Shrunk [[6,7],[10,11]] sum = 34
+                XCTAssertEqual(output[0], 34.0, accuracy: 0.001, "Shrink sum should be 34.0")
+        }
+
+        func testShrinkColumnOnly() throws {
+                // Shrink only columns, keep all rows
+                let g = Graph()
+
+                // 3x6 tensor
+                let t = g.tensor(shape: [3, 6], data: [
+                        1.0, 2.0, 3.0, 4.0, 5.0, 6.0,
+                        7.0, 8.0, 9.0, 10.0, 11.0, 12.0,
+                        13.0, 14.0, 15.0, 16.0, 17.0, 18.0
+                ])
+
+                // Shrink to cols 2:5 (keep all rows) -> 3x3 submatrix:
+                // [[3, 4, 5],
+                //  [9, 10, 11],
+                //  [15, 16, 17]]
+                // Sum = 3+4+5 + 9+10+11 + 15+16+17 = 12 + 30 + 48 = 90
+                let shrunk = try g.shrink(t, ranges: [nil, (2, 5)])
+                let result = g.n(.sum, shrunk)
+                _ = g.n(.output(0), result)
+
+                let frameCount = 1
+                let cResult = try CompilationPipeline.compile(
+                        graph: g,
+                        backend: .c,
+                        options: .init(frameCount: frameCount, debug: false)
+                )
+
+                let cRuntime = CCompiledKernel(
+                        source: cResult.source,
+                        cellAllocations: cResult.cellAllocations,
+                        memorySize: cResult.totalMemorySlots
+                )
+                try cRuntime.compileAndLoad()
+
+                guard let mem = cRuntime.allocateNodeMemory() else {
+                        XCTFail("Failed to allocate memory")
+                        return
+                }
+                defer { cRuntime.deallocateNodeMemory(mem) }
+
+                injectTensorData(result: cResult, memory: mem.assumingMemoryBound(to: Float.self))
+
+                var output = [Float](repeating: 0, count: frameCount)
+                let input = [Float](repeating: 0, count: frameCount)
+
+                output.withUnsafeMutableBufferPointer { outPtr in
+                        input.withUnsafeBufferPointer { inPtr in
+                                cRuntime.runWithMemory(
+                                        outputs: outPtr.baseAddress!,
+                                        inputs: inPtr.baseAddress!,
+                                        memory: mem,
+                                        frameCount: frameCount
+                                )
+                        }
+                }
+
+                print("=== Shrink Column Only Result ===")
+                print("Output: \(output[0]), Expected: 90.0")
+
+                XCTAssertEqual(output[0], 90.0, accuracy: 0.001, "Shrink column-only sum should be 90.0")
+        }
+
+        func testShrinkWithScalarOp() throws {
+                // Shrink then element-wise op with scalar
+                let g = Graph()
+
+                // 4x4 tensor
+                let t = g.tensor(shape: [4, 4], data: [
+                        1.0, 2.0, 3.0, 4.0,
+                        5.0, 6.0, 7.0, 8.0,
+                        9.0, 10.0, 11.0, 12.0,
+                        13.0, 14.0, 15.0, 16.0
+                ])
+
+                // Shrink to [[6,7],[10,11]]
+                let shrunk = try g.shrink(t, ranges: [(1, 3), (1, 3)])
+
+                // Multiply by 2: [[12,14],[20,22]]
+                let scaled = g.n(.mul, shrunk, g.n(.constant(2.0)))
+
+                // Sum = 12 + 14 + 20 + 22 = 68
+                let result = g.n(.sum, scaled)
+                _ = g.n(.output(0), result)
+
+                let frameCount = 1
+                let cResult = try CompilationPipeline.compile(
+                        graph: g,
+                        backend: .c,
+                        options: .init(frameCount: frameCount, debug: false)
+                )
+
+                let cRuntime = CCompiledKernel(
+                        source: cResult.source,
+                        cellAllocations: cResult.cellAllocations,
+                        memorySize: cResult.totalMemorySlots
+                )
+                try cRuntime.compileAndLoad()
+
+                guard let mem = cRuntime.allocateNodeMemory() else {
+                        XCTFail("Failed to allocate memory")
+                        return
+                }
+                defer { cRuntime.deallocateNodeMemory(mem) }
+
+                injectTensorData(result: cResult, memory: mem.assumingMemoryBound(to: Float.self))
+
+                var output = [Float](repeating: 0, count: frameCount)
+                let input = [Float](repeating: 0, count: frameCount)
+
+                output.withUnsafeMutableBufferPointer { outPtr in
+                        input.withUnsafeBufferPointer { inPtr in
+                                cRuntime.runWithMemory(
+                                        outputs: outPtr.baseAddress!,
+                                        inputs: inPtr.baseAddress!,
+                                        memory: mem,
+                                        frameCount: frameCount
+                                )
+                        }
+                }
+
+                // (6+7+10+11) * 2 = 34 * 2 = 68
+                XCTAssertEqual(output[0], 68.0, accuracy: 0.001, "Shrink then scalar mul should be 68.0")
+        }
+
+        func testShrinkWithSumAxis() throws {
+                // Shrink then sumAxis - tests strided access in sumAxis
+                let g = Graph()
+
+                // 4x4 tensor
+                let t = g.tensor(shape: [4, 4], data: [
+                        1.0, 2.0, 3.0, 4.0,
+                        5.0, 6.0, 7.0, 8.0,
+                        9.0, 10.0, 11.0, 12.0,
+                        13.0, 14.0, 15.0, 16.0
+                ])
+
+                // Shrink to rows 1:3, cols 0:4 (keep all cols) -> 2x4:
+                // [[5, 6, 7, 8],
+                //  [9, 10, 11, 12]]
+                let shrunk = try g.shrink(t, ranges: [(1, 3), nil])
+
+                // sumAxis(1) -> [5+6+7+8, 9+10+11+12] = [26, 42]
+                let summed = try g.sum(shrunk, axis: 1)
+
+                // Multiply by weights [1, 2] -> 26*1 + 42*2 = 26 + 84 = 110
+                let weights = g.tensor(shape: [2], data: [1.0, 2.0])
+                let weighted = g.n(.mul, summed, weights)
+                let result = g.n(.sum, weighted)
+                _ = g.n(.output(0), result)
+
+                let frameCount = 1
+                let cResult = try CompilationPipeline.compile(
+                        graph: g,
+                        backend: .c,
+                        options: .init(frameCount: frameCount, debug: true)
+                )
+
+                print("=== Shrink With SumAxis - Generated Source ===")
+                print(cResult.source)
+
+                let cRuntime = CCompiledKernel(
+                        source: cResult.source,
+                        cellAllocations: cResult.cellAllocations,
+                        memorySize: cResult.totalMemorySlots
+                )
+                try cRuntime.compileAndLoad()
+
+                guard let mem = cRuntime.allocateNodeMemory() else {
+                        XCTFail("Failed to allocate memory")
+                        return
+                }
+                defer { cRuntime.deallocateNodeMemory(mem) }
+
+                injectTensorData(result: cResult, memory: mem.assumingMemoryBound(to: Float.self))
+
+                var output = [Float](repeating: 0, count: frameCount)
+                let input = [Float](repeating: 0, count: frameCount)
+
+                output.withUnsafeMutableBufferPointer { outPtr in
+                        input.withUnsafeBufferPointer { inPtr in
+                                cRuntime.runWithMemory(
+                                        outputs: outPtr.baseAddress!,
+                                        inputs: inPtr.baseAddress!,
+                                        memory: mem,
+                                        frameCount: frameCount
+                                )
+                        }
+                }
+
+                print("=== Shrink With SumAxis Result ===")
+                print("Output: \(output[0]), Expected: 110.0")
+
+                XCTAssertEqual(output[0], 110.0, accuracy: 0.001, "Shrink then sumAxis should be 110.0")
+        }
+
+        func testChainedShrink() throws {
+                // Test shrinking a shrunk tensor (cumulative offset)
+                let g = Graph()
+
+                // 6x6 tensor
+                var data = [Float]()
+                for i in 0..<36 {
+                        data.append(Float(i + 1))
+                }
+                let t = g.tensor(shape: [6, 6], data: data)
+
+                // First shrink: rows 1:5, cols 1:5 -> 4x4 submatrix
+                // Values at positions: offset = 1*6 + 1 = 7
+                // [[8,9,10,11], [14,15,16,17], [20,21,22,23], [26,27,28,29]]
+                let shrunk1 = try g.shrink(t, ranges: [(1, 5), (1, 5)])
+
+                // Second shrink: rows 1:3, cols 1:3 -> 2x2 submatrix
+                // From the 4x4 above, take [[15,16], [21,22]]
+                // Sum = 15 + 16 + 21 + 22 = 74
+                let shrunk2 = try g.shrink(shrunk1, ranges: [(1, 3), (1, 3)])
+
+                let result = g.n(.sum, shrunk2)
+                _ = g.n(.output(0), result)
+
+                let frameCount = 1
+                let cResult = try CompilationPipeline.compile(
+                        graph: g,
+                        backend: .c,
+                        options: .init(frameCount: frameCount, debug: true)
+                )
+
+                print("=== Chained Shrink - Generated Source ===")
+                print(cResult.source)
+
+                let cRuntime = CCompiledKernel(
+                        source: cResult.source,
+                        cellAllocations: cResult.cellAllocations,
+                        memorySize: cResult.totalMemorySlots
+                )
+                try cRuntime.compileAndLoad()
+
+                guard let mem = cRuntime.allocateNodeMemory() else {
+                        XCTFail("Failed to allocate memory")
+                        return
+                }
+                defer { cRuntime.deallocateNodeMemory(mem) }
+
+                injectTensorData(result: cResult, memory: mem.assumingMemoryBound(to: Float.self))
+
+                var output = [Float](repeating: 0, count: frameCount)
+                let input = [Float](repeating: 0, count: frameCount)
+
+                output.withUnsafeMutableBufferPointer { outPtr in
+                        input.withUnsafeBufferPointer { inPtr in
+                                cRuntime.runWithMemory(
+                                        outputs: outPtr.baseAddress!,
+                                        inputs: inPtr.baseAddress!,
+                                        memory: mem,
+                                        frameCount: frameCount
+                                )
+                        }
+                }
+
+                print("=== Chained Shrink Result ===")
+                print("Output: \(output[0]), Expected: 74.0")
+
+                // Chained shrink should give [[15,16],[21,22]] sum = 74
+                XCTAssertEqual(output[0], 74.0, accuracy: 0.001, "Chained shrink sum should be 74.0")
+        }
+
+        func testShrinkWithBroadcastOp() throws {
+                // Shrink then broadcast multiply with another shrunk tensor
+                let g = Graph()
+
+                // 4x4 tensor A
+                let a = g.tensor(shape: [4, 4], data: [
+                        1.0, 2.0, 3.0, 4.0,
+                        5.0, 6.0, 7.0, 8.0,
+                        9.0, 10.0, 11.0, 12.0,
+                        13.0, 14.0, 15.0, 16.0
+                ])
+
+                // 4x4 tensor B (all 2s)
+                let b = g.tensor(shape: [4, 4], data: [Float](repeating: 2.0, count: 16))
+
+                // Shrink both to 2x2
+                let shrunkA = try g.shrink(a, ranges: [(1, 3), (1, 3)])  // [[6,7],[10,11]]
+                let shrunkB = try g.shrink(b, ranges: [(0, 2), (0, 2)])  // [[2,2],[2,2]]
+
+                // Element-wise multiply: [[12,14],[20,22]]
+                let product = g.n(.mul, shrunkA, shrunkB)
+
+                // Sum = 12 + 14 + 20 + 22 = 68
+                let result = g.n(.sum, product)
+                _ = g.n(.output(0), result)
+
+                let frameCount = 1
+                let cResult = try CompilationPipeline.compile(
+                        graph: g,
+                        backend: .c,
+                        options: .init(frameCount: frameCount, debug: false)
+                )
+
+                let cRuntime = CCompiledKernel(
+                        source: cResult.source,
+                        cellAllocations: cResult.cellAllocations,
+                        memorySize: cResult.totalMemorySlots
+                )
+                try cRuntime.compileAndLoad()
+
+                guard let mem = cRuntime.allocateNodeMemory() else {
+                        XCTFail("Failed to allocate memory")
+                        return
+                }
+                defer { cRuntime.deallocateNodeMemory(mem) }
+
+                injectTensorData(result: cResult, memory: mem.assumingMemoryBound(to: Float.self))
+
+                var output = [Float](repeating: 0, count: frameCount)
+                let input = [Float](repeating: 0, count: frameCount)
+
+                output.withUnsafeMutableBufferPointer { outPtr in
+                        input.withUnsafeBufferPointer { inPtr in
+                                cRuntime.runWithMemory(
+                                        outputs: outPtr.baseAddress!,
+                                        inputs: inPtr.baseAddress!,
+                                        memory: mem,
+                                        frameCount: frameCount
+                                )
+                        }
+                }
+
+                // [[6,7],[10,11]] * [[2,2],[2,2]] = [[12,14],[20,22]] sum = 68
+                XCTAssertEqual(output[0], 68.0, accuracy: 0.001, "Shrink broadcast mul sum should be 68.0")
+        }
+
+        func testShrinkThenConv2d() throws {
+                // Shrink a tensor, then apply conv2d with identity kernel
+                // This tests that conv2d properly uses the shrunk tensor's offset
+                let g = Graph()
+
+                // 4x4 tensor where first 2x2 block is zeros, rest is ones
+                // [[0, 0, 1, 1],
+                //  [0, 0, 1, 1],
+                //  [1, 1, 1, 1],
+                //  [1, 1, 1, 1]]
+                let t = g.tensor(shape: [4, 4], data: [
+                        0.0, 0.0, 1.0, 1.0,
+                        0.0, 0.0, 1.0, 1.0,
+                        1.0, 1.0, 1.0, 1.0,
+                        1.0, 1.0, 1.0, 1.0
+                ])
+
+                // Shrink to bottom-right 2x2 which should be all 1s:
+                // [[1, 1],
+                //  [1, 1]]
+                let shrunk = try g.shrink(t, ranges: [(2, 4), (2, 4)])
+
+                // Identity kernel (just passes through center value)
+                let kernel = g.tensor(shape: [3, 3], data: [
+                        0.0, 0.0, 0.0,
+                        0.0, 1.0, 0.0,
+                        0.0, 0.0, 0.0
+                ])
+
+                // Conv2d with identity kernel on 2x2 all-ones should give 2x2 all-ones
+                let convResult = g.n(.conv2d([3, 3]), shrunk, kernel)
+
+                // Sum should be 4.0 (four ones)
+                let result = g.n(.sum, convResult)
+                _ = g.n(.output(0), result)
+
+                let frameCount = 1
+                let cResult = try CompilationPipeline.compile(
+                        graph: g,
+                        backend: .c,
+                        options: .init(frameCount: frameCount, debug: true)
+                )
+
+                print("=== Shrink Then Conv2d - Generated Source ===")
+                print(cResult.source)
+
+                let cRuntime = CCompiledKernel(
+                        source: cResult.source,
+                        cellAllocations: cResult.cellAllocations,
+                        memorySize: cResult.totalMemorySlots
+                )
+                try cRuntime.compileAndLoad()
+
+                guard let mem = cRuntime.allocateNodeMemory() else {
+                        XCTFail("Failed to allocate memory")
+                        return
+                }
+                defer { cRuntime.deallocateNodeMemory(mem) }
+
+                injectTensorData(result: cResult, memory: mem.assumingMemoryBound(to: Float.self))
+
+                var output = [Float](repeating: 0, count: frameCount)
+                let input = [Float](repeating: 0, count: frameCount)
+
+                output.withUnsafeMutableBufferPointer { outPtr in
+                        input.withUnsafeBufferPointer { inPtr in
+                                cRuntime.runWithMemory(
+                                        outputs: outPtr.baseAddress!,
+                                        inputs: inPtr.baseAddress!,
+                                        memory: mem,
+                                        frameCount: frameCount
+                                )
+                        }
+                }
+
+                print("=== Shrink Then Conv2d Result ===")
+                print("Output: \(output[0]), Expected: 4.0")
+
+                // If conv2d correctly reads from shrunk region (all 1s), sum = 4.0
+                // If conv2d incorrectly reads from start (first 2x2 is zeros), sum would be < 4.0
+                XCTAssertEqual(output[0], 4.0, accuracy: 0.001,
+                        "Conv2d on shrunk all-ones should sum to 4.0 - offset may not be applied")
+        }
+
 }

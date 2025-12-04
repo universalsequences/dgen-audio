@@ -148,23 +148,7 @@ public struct CompilationPipeline {
         if options.backwards {
             var backwardsBlocks: [Block] = []
             for block in finalBlocks.reversed() {
-                var kind: Kind = block.kind
-
-                /*
-                for nodeId in block.nodes {
-                    if let node = graph.nodes[nodeId] {
-                        if case .historyRead(_) = node.op {
-                            kind = .scalar
-                        } else if case .historyReadWrite(_) = node.op {
-                            kind = .scalar
-                        } else if case .historyWrite(_) = node.op {
-                            kind = .scalar
-                        }
-                    }
-                }
-
-                 */
-                var backwardsBlock = Block(kind: kind)
+                var backwardsBlock = Block(kind: block.kind)
                 backwardsBlock.nodes = block.nodes.reversed()
                 backwardsBlock.direction = .backwards
                 backwardsBlocks.append(backwardsBlock)
@@ -503,166 +487,6 @@ public struct CellAllocations {
 
 // MARK: - History Operation Combining Pass
 
-// MARK: - ParallelRange Loop Fusion
-//
-// Tensor operations generate separate parallelRange loops for each step:
-//   Loop 1: tensorHistoryRead  - copy history[i] → temp[i]
-//   Loop 2: add                - read temp[i], add 1, write result[i]
-//   Loop 3: tensorHistoryWrite - copy result[i] → history[i]
-//
-// This fusion pass merges consecutive parallelRange loops that have producer-consumer
-// relationships (one writes to a cell that the next reads from) into a single loop.
-// The memory reads from intermediate cells are replaced with direct variable references.
-//
-// After fusion, the above becomes a single loop:
-//   Loop 1: read history[i] → t3, compute t3+1 → t10, write t10 → history[i]
-
-/// Fuse consecutive parallelRange loops that have producer-consumer relationships.
-/*
-func fuseParallelRanges(_ ops: [UOp]) -> [UOp] {
-    // Parse parallelRange blocks: (startIndex, endIndex, count, indexVarId, ops, memoryWrites)
-    var ranges:
-        [(start: Int, end: Int, count: Int, indexVar: VarID, ops: [UOp], writes: [CellID: VarID])] =
-            []
-    var i = 0
-
-    while i < ops.count {
-        if case .beginParallelRange(let count) = ops[i].op,
-            case .variable(let indexVarId, _) = ops[i].value
-        {
-            let startIndex = i
-            var rangeOps: [UOp] = []
-            var writes: [CellID: VarID] = [:]
-
-            // Collect ops until matching endParallelRange
-            var depth = 1
-            i += 1
-            while i < ops.count && depth > 0 {
-                if case .beginParallelRange = ops[i].op {
-                    depth += 1
-                } else if case .endParallelRange = ops[i].op {
-                    depth -= 1
-                    if depth == 0 { break }
-                }
-                // Track memory writes: cellId -> written value's varId
-                if case .memoryWrite(let cellId, _, let value) = ops[i].op,
-                    case .variable(let valueVarId, _) = value
-                {
-                    writes[cellId] = valueVarId
-                }
-                rangeOps.append(ops[i])
-                i += 1
-            }
-            ranges.append((startIndex, i, count, indexVarId, rangeOps, writes))
-        }
-        i += 1
-    }
-
-    guard ranges.count >= 2 else { return ops }
-
-    // Find groups of consecutive ranges that can be fused
-    // Criteria: consecutive in source, same count, producer-consumer relationship
-    var groups: [[Int]] = []
-    var currentGroup: [Int] = [0]
-
-    for i in 1..<ranges.count {
-        let prev = ranges[i - 1]
-        let curr = ranges[i]
-        let isConsecutive = curr.start == prev.end + 1
-        let sameCount = prev.count == curr.count
-        let hasProducerConsumer = curr.ops.contains { op in
-            if case .memoryRead(let cellId, _) = op.op { return prev.writes[cellId] != nil }
-            return false
-        }
-
-        if isConsecutive && sameCount && hasProducerConsumer {
-            currentGroup.append(i)
-        } else {
-            if currentGroup.count > 1 { groups.append(currentGroup) }
-            currentGroup = [i]
-        }
-    }
-    if currentGroup.count > 1 { groups.append(currentGroup) }
-
-    guard !groups.isEmpty else { return ops }
-
-    // Build fused output
-    var result: [UOp] = []
-    var nextRangeIdx = 0
-    var groupIdx = 0
-    i = 0
-
-    while i < ops.count {
-        // Check if we're at the start of a range that begins a fusion group
-        if nextRangeIdx < ranges.count && i == ranges[nextRangeIdx].start {
-            if groupIdx < groups.count && groups[groupIdx].first == nextRangeIdx {
-                let group = groups[groupIdx]
-                let firstRange = ranges[group.first!]
-                let lastRange = ranges[group.last!]
-
-                // Emit beginParallelRange from first range
-                result.append(ops[firstRange.start])
-
-                // Track substitutions: intermediate cell reads → value variables, index vars → first index var
-                var valueFor: [CellID: VarID] = [:]
-                var indexRemap: [VarID: VarID] = [:]
-
-                for rangeIdx in group {
-                    let range = ranges[rangeIdx]
-                    if rangeIdx != group.first { indexRemap[range.indexVar] = firstRange.indexVar }
-
-                    for op in range.ops {
-                        // Skip duplicate parallelIndex declarations
-                        if case .parallelIndex = op.op, rangeIdx != group.first { continue }
-
-                        var newOp = op
-
-                        // Substitute memory reads from intermediate cells with direct value reference
-                        if case .memoryRead(let cellId, _) = op.op, let srcVar = valueFor[cellId] {
-                            if case .variable(_, let nodeId) = op.value {
-                                newOp = UOp(
-                                    op: .declareVar(.variable(srcVar, nodeId)), value: op.value,
-                                    kind: op.kind)
-                            }
-                        }
-
-                        // Remap index variable references in cast operations
-                        if case .cast(let expr, let castType) = newOp.op,
-                            case .variable(let varId, let nodeId) = expr,
-                            let newVar = indexRemap[varId]
-                        {
-                            newOp = UOp(
-                                op: .cast(.variable(newVar, nodeId), castType), value: newOp.value,
-                                kind: newOp.kind)
-                        }
-
-                        // Track writes for subsequent ranges in this group
-                        if case .memoryWrite(let cellId, _, let value) = op.op,
-                            case .variable(let valueVarId, _) = value
-                        {
-                            valueFor[cellId] = valueVarId
-                        }
-
-                        result.append(newOp)
-                    }
-                }
-
-                result.append(ops[lastRange.end])  // endParallelRange
-                i = lastRange.end + 1
-                nextRangeIdx = group.last! + 1
-                groupIdx += 1
-                continue
-            }
-            nextRangeIdx += 1
-        }
-        result.append(ops[i])
-        i += 1
-    }
-
-    return result
-}
- */
-
 /// Combines historyRead and historyWrite operations that are not in feedback loops
 /// into a single historyReadWrite operation
 func combineHistoryOpsNotInFeedback(
@@ -725,7 +549,6 @@ func combineHistoryOpsNotInFeedback(
 
 func determineTensorBlocks(_ blocks: [Block], _ graph: Graph, _ ctx: IRContext) -> [Block] {
     var determined: [Block] = []
-    print("\(ANSI.green) determining blocks! \(ANSI.reset)")
 
     // Helper to create a new block preserving original properties
     func makeBlock(from original: Block) -> Block {
@@ -741,8 +564,6 @@ func determineTensorBlocks(_ blocks: [Block], _ graph: Graph, _ ctx: IRContext) 
         var currentShape: Shape? = nil
         for nodeId in block.nodes {
             if let node = graph.nodes[nodeId] {
-                print("checking node=(nodeId)")
-
                 // Skip tensorRef nodes for tensor block grouping decisions.
                 //
                 // tensorRef nodes are just data containers - they emit nothing (return []).
@@ -783,9 +604,7 @@ func determineTensorBlocks(_ blocks: [Block], _ graph: Graph, _ ctx: IRContext) 
                     currentShape = nil
 
                 } else if case let .tensor(shape) = node.shape {
-                    print("we have a shape node!")
                     if shape != currentShape {
-                        print("shape changed \(shape) currentShape")
                         if currentBlock.nodes.count > 0 {
                             innerBlocks.append(currentBlock)
                         }
@@ -815,6 +634,5 @@ func determineTensorBlocks(_ blocks: [Block], _ graph: Graph, _ ctx: IRContext) 
             determined.append(block)
         }
     }
-    print("returning determined")
     return determined
 }

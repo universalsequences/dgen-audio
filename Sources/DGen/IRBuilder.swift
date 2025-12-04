@@ -317,11 +317,11 @@ public final class IRBuilder {
       let loopIdx = ctx.tensorIndices[node.id]
     else { throw DGenError.missingTensorID }
 
-    let offset = broadcastIndex(
+    let memOffset = broadcastIndex(
       outputIdx: value(loopIdx), outputShape: outShape,
-      inputShape: tensor.shape, inputStrides: tensor.strides
+      inputTensor: tensor
     )
-    return tload(tensor.cellId, offset)
+    return tload(tensor.cellId, memOffset)
   }
 
   public func writeOutput(_ node: Node, _ result: Expr) throws {
@@ -333,10 +333,10 @@ public final class IRBuilder {
     _ = tstore(tensor.cellId, value(loopIdx), result)
   }
 
-  /// Multi-dim indices + strides → linear offset
-  public func stridedIndex(indices: [Expr], strides: [Int]) -> Expr {
+  /// Multi-dim indices + strides + offset → linear memory offset
+  public func stridedIndex(indices: [Expr], strides: [Int], offset: Int = 0) -> Expr {
     assert(indices.count == strides.count)
-    var acc: Expr? = nil
+    var acc: Expr? = offset != 0 ? constant(Float(offset)) : nil
     for (idx, s) in zip(indices, strides) where s != 0 {
       let term = s == 1 ? idx : idx * constant(Float(s))
       acc = acc.map { $0 + term } ?? term
@@ -344,10 +344,28 @@ public final class IRBuilder {
     return acc ?? constant(0)
   }
 
+  // MARK: - Tensor Memory Indexing (encapsulates fast path vs strided path)
+
+  /// Compute memory index for tensor access from flat iteration index.
+  /// Fast path avoids multi-index conversion for contiguous tensors with no offset.
+  public func tensorMemoryIndex(_ tensor: Tensor, flatIdx: Expr, shape: [Int]) -> Expr {
+    if tensor.isContiguous && tensor.offset == 0 {
+      return flatIdx
+    }
+    let multiIdx = flatToMultiIndex(flatIdx, shape)
+    return stridedIndex(indices: multiIdx, strides: tensor.strides, offset: tensor.offset)
+  }
+
+  /// Compute memory index for tensor access from multi-dimensional indices.
+  /// Uses strides and offset to support views (shrink, transpose, etc.)
+  public func tensorMemoryIndex(_ tensor: Tensor, indices: [Expr]) -> Expr {
+    return stridedIndex(indices: indices, strides: tensor.strides, offset: tensor.offset)
+  }
+
   // MARK: - Broadcast Indexing
 
   /// Flat index → multi-dim indices for shape (row-major)
-  private func flatToMultiIndex(_ flat: Expr, _ shape: [Int]) -> [Expr] {
+  func flatToMultiIndex(_ flat: Expr, _ shape: [Int]) -> [Expr] {
     var indices: [Expr] = []
     var rem = flat
     for i in 0..<shape.count {
@@ -364,14 +382,21 @@ public final class IRBuilder {
     return indices
   }
 
-  /// Output flat idx → input memory offset (handles broadcasting)
+  /// Output flat idx → input memory offset (handles broadcasting and view offsets)
   func broadcastIndex(
     outputIdx: Expr, outputShape: [Int],
-    inputShape: [Int], inputStrides: [Int]
+    inputTensor: Tensor
   ) -> Expr {
-    // fast path: shapes match + contiguous → just use flat idx
-    if inputShape == outputShape && inputStrides == Tensor.computeRowMajorStrides(inputShape) {
+    let inputShape = inputTensor.shape
+
+    // fast path: shapes match + contiguous + no offset → just use flat idx
+    if inputShape == outputShape && inputTensor.isContiguous && inputTensor.offset == 0 {
       return outputIdx
+    }
+
+    // fast path: shapes match + contiguous + has offset → just add offset
+    if inputShape == outputShape && inputTensor.isContiguous {
+      return outputIdx + constant(Float(inputTensor.offset))
     }
 
     ops.append(UOp(op: .broadcastAccess, value: .empty))  // disable SIMD
@@ -383,7 +408,7 @@ public final class IRBuilder {
     let indices = inputShape.enumerated().map { i, dim in
       dim == 1 ? constant(0) : multiIdx[i + rankDiff]
     }
-    return stridedIndex(indices: indices, strides: inputStrides)
+    return tensorMemoryIndex(inputTensor, indices: indices)
   }
 
   public func min(_ a: Expr, _ b: Expr) -> Expr {

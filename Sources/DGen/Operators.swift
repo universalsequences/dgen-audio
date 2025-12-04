@@ -89,6 +89,7 @@ public enum LazyOp {
     case sumAxis(Int)  // Reduce along a specific axis
     case reshape(Shape)  // Reshape tensor (metadata only, no data movement)
     case transpose([Int])  // Transpose/permute axes (metadata only)
+    case shrink([(Int, Int)?])  // Shrink/slice tensor (metadata only, no data movement)
 
     public func emit(ctx: IRContext, g: Graph, nodeId: NodeID) throws -> [UOp] {
         guard let node = g.nodes[nodeId] else { return [] }
@@ -416,8 +417,6 @@ public enum LazyOp {
                 b.use(val: val)
                 return val
             }
-        //let (x, y, t) = b.values(inputs, count: 3)
-        //b.use(val: u_mix(x, y, lerp: t)(b))
         case .accum(let cellId):
             guard inputs.count == 4 else {
                 throw DGenError.insufficientInputs(
@@ -472,8 +471,8 @@ public enum LazyOp {
                 case .tensor(let outShape) = node.shape,
                 case .tensor(let inShape) = g.nodes[node.inputs[0]]?.shape, inShape.count == 2,
                 let outCell = g.nodeToTensor[node.id].flatMap({ g.tensors[$0] })?.cellId,
-                let inCell = g.nodeToTensor[node.inputs[0]].flatMap({ g.tensors[$0] })?.cellId,
-                let kCell = g.nodeToTensor[node.inputs[1]].flatMap({ g.tensors[$0] })?.cellId
+                let inTensor = g.nodeToTensor[node.inputs[0]].flatMap({ g.tensors[$0] }),
+                let kTensor = g.nodeToTensor[node.inputs[1]].flatMap({ g.tensors[$0] })
             else {
                 throw DGenError.tensorError(
                     op: "conv2d", reason: "requires 2D input/output tensors")
@@ -492,19 +491,18 @@ public enum LazyOp {
                     b.loop(kW) { kx in
                         let inY = outY + b.cast(ky, to: .float) - b.constant(Float(padH))
                         let inX = outX + b.cast(kx, to: .float) - b.constant(Float(padW))
-                        let kIdx =
-                            b.cast(ky, to: .float) * b.constant(Float(kW)) + b.cast(kx, to: .float)
 
                         let inBounds =
                             (inY >= b.constant(0)) * (inY < b.constant(Float(inH)))
                             * (inX >= b.constant(0)) * (inX < b.constant(Float(inW)))
-                        let rawIdx =
-                            b.cast(inY, to: .int) * b.constant(Float(inW)) + b.cast(inX, to: .int)
-                        let safeIdx = b.gswitch(inBounds, rawIdx, b.constant(0))
 
-                        let inVal = b.gswitch(
-                            inBounds, b.memoryRead(inCell, safeIdx), b.constant(0))
-                        let kVal = b.memoryRead(kCell, b.cast(kIdx, to: .int))
+                        let rawIdx = b.tensorMemoryIndex(inTensor, indices: [b.cast(inY, to: .int), b.cast(inX, to: .int)])
+                        let safeIdx = b.gswitch(inBounds, rawIdx, b.constant(0))
+                        let inVal = b.gswitch(inBounds, b.memoryRead(inTensor.cellId, safeIdx), b.constant(0))
+
+                        let kMemIdx = b.tensorMemoryIndex(kTensor, indices: [b.cast(ky, to: .int), b.cast(kx, to: .int)])
+                        let kVal = b.memoryRead(kTensor.cellId, kMemIdx)
+
                         acc.accumulate(inVal * kVal)
                     }
                 }
@@ -513,14 +511,15 @@ public enum LazyOp {
 
         case .sum:
             guard case .tensor(let shape) = g.nodes[node.inputs[0]]?.shape,
-                let inCell = g.nodeToTensor[node.inputs[0]].flatMap({ g.tensors[$0] })?.cellId
+                let inTensor = g.nodeToTensor[node.inputs[0]].flatMap({ g.tensors[$0] })
             else {
                 if let s = inputs.first { b.use(val: b.value(s)) }
                 break
             }
             let acc = b.float(0.0)
             b.loop(shape.reduce(1, *)) { i in
-                acc.accumulate(b.memoryRead(inCell, b.cast(i, to: .int)))
+                let memIdx = b.tensorMemoryIndex(inTensor, flatIdx: i, shape: shape)
+                acc.accumulate(b.memoryRead(inTensor.cellId, b.cast(memIdx, to: .int)))
             }
             b.use(val: acc.value)
 
@@ -536,7 +535,6 @@ public enum LazyOp {
             }
 
             let outIdx = b.value(loopIdx)
-            let strides = inTensor.strides
             let acc = b.float(0.0)
 
             b.loop(inShape[axis]) { reduceIdx in
@@ -559,12 +557,13 @@ public enum LazyOp {
                     default: indices = [outer, inner, rIdx]
                     }
                 default:
-                    acc.accumulate(b.memoryRead(inTensor.cellId, b.cast(reduceIdx, to: .int)))
+                    let fallbackIdx = b.stridedIndex(indices: [reduceIdx], strides: [1], offset: inTensor.offset)
+                    acc.accumulate(b.memoryRead(inTensor.cellId, b.cast(fallbackIdx, to: .int)))
                     return
                 }
 
-                let offset = b.stridedIndex(indices: indices, strides: strides)
-                acc.accumulate(b.memoryRead(inTensor.cellId, b.cast(offset, to: .int)))
+                let memIdx = b.stridedIndex(indices: indices, strides: inTensor.strides, offset: inTensor.offset)
+                acc.accumulate(b.memoryRead(inTensor.cellId, b.cast(memIdx, to: .int)))
                 _ = b.memoryWrite(outCell, b.cast(outIdx, to: .int), acc.value)
             }
 
@@ -583,6 +582,12 @@ public enum LazyOp {
             ctx.values[nodeId] = .empty
             // Emit marker UOp for debugging and to signal SIMD should be disabled
             ops.append(UOp(op: .transpose(axes), value: .empty))
+
+        case .shrink(let ranges):
+            // Shrink is metadata-only - uses offset + strides to access slice
+            ctx.values[nodeId] = .empty
+            // Emit marker UOp for debugging and to signal SIMD should be disabled
+            ops.append(UOp(op: .shrink(ranges), value: .empty))
         }
         ops.append(contentsOf: b.ops)
         return ops
@@ -1029,6 +1034,11 @@ public enum LazyOp {
         case .transpose(_):
             // Transpose is metadata-only, gradient flows through unchanged
             guard inputs.count == 1 else { fatalError("transpose requires 1 input") }
+            b.grad(node.inputs[0], value: gradOutput)
+
+        case .shrink(_):
+            // Shrink is metadata-only, gradient flows through unchanged
+            guard inputs.count == 1 else { fatalError("shrink requires 1 input") }
             b.grad(node.inputs[0], value: gradOutput)
         }
 

@@ -2,18 +2,20 @@ public struct Tensor {
     public let id: TensorID
     public let shape: Shape
     public let strides: [Int]  // How many elements to skip per dimension
+    public let offset: Int     // Starting index in underlying storage (for views like shrink)
     public let cellId: CellID
     public var data: [Float]?  // Initial data to be injected by runtime
-    public let isView: Bool  // True if this is a view of another tensor (reshape/transpose)
+    public let isView: Bool    // True if this is a view of another tensor (reshape/transpose/shrink)
 
     public init(
         id: TensorID, shape: Shape, cellId: CellID, data: [Float]? = nil, strides: [Int]? = nil,
-        isView: Bool = false
+        offset: Int = 0, isView: Bool = false
     ) {
         self.id = id
         self.shape = shape
         self.cellId = cellId
         self.data = data
+        self.offset = offset
         self.isView = isView
         // Default to row-major (C-style) strides if not specified
         self.strides = strides ?? Tensor.computeRowMajorStrides(shape)
@@ -180,92 +182,112 @@ extension Graph {
         return result
     }
 
-    // MARK: - Tensor Views (Reshape/Transpose)
+    // MARK: - Tensor View Helpers
 
-    /// Reshape a tensor to a new shape (metadata only, no data movement)
-    /// Total size must match: product of newShape must equal product of old shape
-    public func reshape(_ input: NodeID, to newShape: Shape) throws -> NodeID {
-        guard
-            let inputTensorId = nodeToTensor[input],
-            let inputTensor = tensors[inputTensorId]
-        else {
-            throw DGenError.tensorError(op: "reshape", reason: "tensor not found")
+    /// Get the tensor associated with a node
+    public func getTensor(_ nodeId: NodeID) throws -> Tensor {
+        guard let tensorId = nodeToTensor[nodeId],
+              let tensor = tensors[tensorId] else {
+            throw DGenError.tensorError(op: "getTensor", reason: "tensor not found")
         }
+        return tensor
+    }
 
-        let oldSize = inputTensor.size
-        let newSize = newShape.reduce(1, *)
-        guard oldSize == newSize else {
-            throw DGenError.tensorError(
-                op: "reshape", reason: "size mismatch: \(oldSize) vs \(newSize)")
-        }
+    /// Create a tensor view with new shape/strides, sharing the same underlying data
+    private func createView(
+        input: NodeID,
+        op: LazyOp,
+        newShape: Shape,
+        offset: Int = 0,
+        computeStrides: (Tensor) -> [Int]
+    ) throws -> NodeID {
+        let inputTensor = try getTensor(input)
+        let newStrides = computeStrides(inputTensor)
+        let totalOffset = inputTensor.offset + offset
 
-        // Create a new tensor view sharing the same cellId
-        let viewTensorId = nextTensorId
+        let tensorId = nextTensorId
         nextTensorId += 1
 
-        // For reshape, preserve input strides for non-contiguous tensors
-        let newStrides = adaptStridesForReshape(
-            inputShape: inputTensor.shape,
-            inputStrides: inputTensor.strides,
-            newShape: newShape
-        )
-
-        tensors[viewTensorId] = Tensor(
-            id: viewTensorId,
+        tensors[tensorId] = Tensor(
+            id: tensorId,
             shape: newShape,
-            cellId: inputTensor.cellId,  // Same underlying data!
-            data: nil,
+            cellId: inputTensor.cellId,
             strides: newStrides,
+            offset: totalOffset,
             isView: true
         )
 
-        let nodeId = n(.reshape(newShape), [input], shape: .tensor(newShape))
-        nodeToTensor[nodeId] = viewTensorId
+        let nodeId = n(op, [input], shape: .tensor(newShape))
+        nodeToTensor[nodeId] = tensorId
         return nodeId
     }
 
-    /// Transpose a tensor by permuting axes
-    /// axes: permutation of [0, 1, ..., ndim-1], e.g. [1, 0] swaps rows/cols
-    public func transpose(_ input: NodeID, axes: [Int]? = nil) throws -> NodeID {
-        guard
-            let inputTensorId = nodeToTensor[input],
-            let inputTensor = tensors[inputTensorId]
-        else {
-            throw DGenError.tensorError(op: "transpose", reason: "tensor not found")
+    // MARK: - Tensor Views (Reshape/Transpose/Shrink)
+
+    /// Reshape a tensor to a new shape (metadata only, no data movement)
+    public func reshape(_ input: NodeID, to newShape: Shape) throws -> NodeID {
+        let inputTensor = try getTensor(input)
+
+        guard inputTensor.size == newShape.reduce(1, *) else {
+            throw DGenError.tensorError(
+                op: "reshape",
+                reason: "size mismatch: \(inputTensor.size) vs \(newShape.reduce(1, *))")
         }
 
+        return try createView(input: input, op: .reshape(newShape), newShape: newShape) { t in
+            adaptStridesForReshape(inputShape: t.shape, inputStrides: t.strides, newShape: newShape)
+        }
+    }
+
+    /// Transpose a tensor by permuting axes
+    public func transpose(_ input: NodeID, axes: [Int]? = nil) throws -> NodeID {
+        let inputTensor = try getTensor(input)
         let ndim = inputTensor.shape.count
-        let perm = axes ?? Array((0..<ndim).reversed())  // Default: reverse all axes
+        let perm = axes ?? Array((0..<ndim).reversed())
 
         guard perm.count == ndim else {
             throw DGenError.tensorError(
                 op: "transpose", reason: "axes must have \(ndim) elements, got \(perm.count)")
         }
 
-        // Permute shape and strides
-        var newShape = [Int](repeating: 0, count: ndim)
-        var newStrides = [Int](repeating: 0, count: ndim)
-        for i in 0..<ndim {
-            newShape[i] = inputTensor.shape[perm[i]]
-            newStrides[i] = inputTensor.strides[perm[i]]
+        let newShape = perm.map { inputTensor.shape[$0] }
+
+        return try createView(input: input, op: .transpose(perm), newShape: newShape) { t in
+            perm.map { t.strides[$0] }
+        }
+    }
+
+    /// Shrink/slice a tensor along each axis (metadata only, no data movement)
+    /// ranges: for each dimension, either nil (keep all) or (start, end) tuple
+    public func shrink(_ input: NodeID, ranges: [(Int, Int)?]) throws -> NodeID {
+        let inputTensor = try getTensor(input)
+
+        guard ranges.count == inputTensor.shape.count else {
+            throw DGenError.tensorError(
+                op: "shrink",
+                reason: "ranges count \(ranges.count) must match ndim \(inputTensor.shape.count)")
         }
 
-        // Create a new tensor view sharing the same cellId
-        let viewTensorId = nextTensorId
-        nextTensorId += 1
+        var offset = 0
+        var newShape = [Int]()
 
-        tensors[viewTensorId] = Tensor(
-            id: viewTensorId,
-            shape: newShape,
-            cellId: inputTensor.cellId,  // Same underlying data!
-            data: nil,
-            strides: newStrides,
-            isView: true
-        )
+        for (dim, range) in ranges.enumerated() {
+            if let (start, end) = range {
+                guard start >= 0 && end <= inputTensor.shape[dim] && start < end else {
+                    throw DGenError.tensorError(
+                        op: "shrink",
+                        reason: "invalid range (\(start), \(end)) for dimension \(dim) with size \(inputTensor.shape[dim])")
+                }
+                offset += start * inputTensor.strides[dim]
+                newShape.append(end - start)
+            } else {
+                newShape.append(inputTensor.shape[dim])
+            }
+        }
 
-        let nodeId = n(.transpose(perm), [input], shape: .tensor(newShape))
-        nodeToTensor[nodeId] = viewTensorId
-        return nodeId
+        return try createView(input: input, op: .shrink(ranges), newShape: newShape, offset: offset) { t in
+            t.strides  // strides unchanged for shrink
+        }
     }
 
     /// Sum a tensor along a specific axis, reducing that dimension

@@ -41,13 +41,11 @@ func adaptStridesForReshape(inputShape: [Int], inputStrides: [Int], newShape: [I
                 }
             }
         }
-        print("[adaptStrides] non-contiguous -> \(newStrides)")
         return newStrides
     }
 
     // Fallback: this reshape requires a copy (not supported as view)
-    // For now, just compute row-major strides and hope for the best
-    print("⚠️ [adaptStridesForReshape] Non-contiguous reshape may produce incorrect results")
+    // For now, just compute row-major strides
     return Tensor.computeRowMajorStrides(newShape)
 }
 
@@ -146,6 +144,21 @@ public func inferShape(op: LazyOp, inputs: [ValueShape], graph: Graph) throws ->
     }
     return .tensor(newShape)
 
+  // Shrink - slices tensor along each axis
+  case .shrink(let ranges):
+    guard let firstInput = inputs.first, case .tensor(let shape) = firstInput else {
+      throw DGenError.shapeInferenceFailed(op: "shrink", reason: "requires tensor input")
+    }
+    var newShape = [Int]()
+    for (dim, range) in ranges.enumerated() {
+      if let (start, end) = range {
+        newShape.append(end - start)
+      } else {
+        newShape.append(shape[dim])
+      }
+    }
+    return .tensor(newShape)
+
   // Inherited (elementwise) - includes all binary and unary math ops
   case .add, .sub, .mul, .div, .sin, .cos, .exp, .sqrt, .tanh,
     .tan, .log, .log10, .abs, .sign, .floor, .ceil, .round,
@@ -203,63 +216,7 @@ public func allocateTensorOutputs(graph: Graph, sortedNodes: [NodeID]) {
     // Only allocate for tensor-shaped outputs
     guard case .tensor(let shape) = node.shape else { continue }
 
-    // Handle view operations - reuse input tensor's cellId
-    switch node.op {
-    case .reshape(let newShape):
-      // Reshape is a view: same data, different shape interpretation
-      if let inputNodeId = node.inputs.first,
-         let inputTensorId = graph.nodeToTensor[inputNodeId],
-         let inputTensor = graph.tensors[inputTensorId] {
-        let tensorId = graph.nextTensorId
-        graph.nextTensorId += 1
-
-        // Compute new strides, preserving input strides for non-contiguous tensors
-        let newStrides = adaptStridesForReshape(
-          inputShape: inputTensor.shape,
-          inputStrides: inputTensor.strides,
-          newShape: newShape
-        )
-
-        graph.tensors[tensorId] = Tensor(
-          id: tensorId,
-          shape: newShape,
-          cellId: inputTensor.cellId,
-          strides: newStrides
-        )
-        graph.nodeToTensor[nodeId] = tensorId
-        continue
-      }
-
-    case .transpose(let axes):
-      // Transpose is a view: same data, permuted shape and strides
-      if let inputNodeId = node.inputs.first,
-         let inputTensorId = graph.nodeToTensor[inputNodeId],
-         let inputTensor = graph.tensors[inputTensorId] {
-        let tensorId = graph.nextTensorId
-        graph.nextTensorId += 1
-        // Permute shape and strides
-        let perm = axes.isEmpty ? Array((0..<inputTensor.shape.count).reversed()) : axes
-        var newShape = [Int](repeating: 0, count: inputTensor.shape.count)
-        var newStrides = [Int](repeating: 0, count: inputTensor.strides.count)
-        for i in 0..<inputTensor.shape.count {
-          newShape[i] = inputTensor.shape[perm[i]]
-          newStrides[i] = inputTensor.strides[perm[i]]
-        }
-        graph.tensors[tensorId] = Tensor(
-          id: tensorId,
-          shape: newShape,
-          cellId: inputTensor.cellId,
-          strides: newStrides
-        )
-        graph.nodeToTensor[nodeId] = tensorId
-        continue
-      }
-
-    default:
-      break
-    }
-
-    // Regular allocation for other tensor ops
+    // Allocate for tensor ops (view ops like reshape/transpose are handled by Graph methods)
     let size = shape.reduce(1, *)
     let cellId = graph.alloc(vectorWidth: size)
 
