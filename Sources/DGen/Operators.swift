@@ -90,6 +90,7 @@ public enum LazyOp {
     case reshape(Shape)  // Reshape tensor (metadata only, no data movement)
     case transpose([Int])  // Transpose/permute axes (metadata only)
     case shrink([(Int, Int)?])  // Shrink/slice tensor (metadata only, no data movement)
+    case pad([(Int, Int)])      // Pad tensor with zeros (virtual view, conditional reads)
 
     public func emit(ctx: IRContext, g: Graph, nodeId: NodeID) throws -> [UOp] {
         guard let node = g.nodes[nodeId] else { return [] }
@@ -518,8 +519,8 @@ public enum LazyOp {
             }
             let acc = b.float(0.0)
             b.loop(shape.reduce(1, *)) { i in
-                let memIdx = b.tensorMemoryIndex(inTensor, flatIdx: i, shape: shape)
-                acc.accumulate(b.memoryRead(inTensor.cellId, b.cast(memIdx, to: .int)))
+                let val = b.tensorRead(inTensor, flatIdx: i, shape: shape)
+                acc.accumulate(val)
             }
             b.use(val: acc.value)
 
@@ -557,13 +558,14 @@ public enum LazyOp {
                     default: indices = [outer, inner, rIdx]
                     }
                 default:
-                    let fallbackIdx = b.stridedIndex(indices: [reduceIdx], strides: [1], offset: inTensor.offset)
-                    acc.accumulate(b.memoryRead(inTensor.cellId, b.cast(fallbackIdx, to: .int)))
+                    // Fallback for higher dimensions - uses tensorRead
+                    let val = b.tensorRead(inTensor, flatIdx: reduceIdx, shape: inShape)
+                    acc.accumulate(val)
                     return
                 }
 
-                let memIdx = b.stridedIndex(indices: indices, strides: inTensor.strides, offset: inTensor.offset)
-                acc.accumulate(b.memoryRead(inTensor.cellId, b.cast(memIdx, to: .int)))
+                let val = b.tensorRead(inTensor, indices: indices)
+                acc.accumulate(val)
                 _ = b.memoryWrite(outCell, b.cast(outIdx, to: .int), acc.value)
             }
 
@@ -588,6 +590,12 @@ public enum LazyOp {
             ctx.values[nodeId] = .empty
             // Emit marker UOp for debugging and to signal SIMD should be disabled
             ops.append(UOp(op: .shrink(ranges), value: .empty))
+
+        case .pad(let padding):
+            // Pad is a virtual view - reads return 0 for padded regions
+            ctx.values[nodeId] = .empty
+            // Emit marker UOp for debugging and to signal SIMD should be disabled
+            ops.append(UOp(op: .pad(padding), value: .empty))
         }
         ops.append(contentsOf: b.ops)
         return ops
@@ -1039,6 +1047,12 @@ public enum LazyOp {
         case .shrink(_):
             // Shrink is metadata-only, gradient flows through unchanged
             guard inputs.count == 1 else { fatalError("shrink requires 1 input") }
+            b.grad(node.inputs[0], value: gradOutput)
+
+        case .pad(_):
+            // Pad is a virtual view, gradient flows through unchanged
+            // (padded regions have zero gradient contribution)
+            guard inputs.count == 1 else { fatalError("pad requires 1 input") }
             b.grad(node.inputs[0], value: gradOutput)
         }
 

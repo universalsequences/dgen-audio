@@ -317,11 +317,28 @@ public final class IRBuilder {
       let loopIdx = ctx.tensorIndices[node.id]
     else { throw DGenError.missingTensorID }
 
+    // For padded tensors, use tensorRead which handles bounds checking
+    if tensor.padding != nil {
+      let indices = flatToMultiIndex(value(loopIdx), outShape)
+      return tensorRead(tensor, indices: broadcastIndices(outputIndices: indices, outputShape: outShape, inputTensor: tensor))
+    }
+
     let memOffset = broadcastIndex(
       outputIdx: value(loopIdx), outputShape: outShape,
       inputTensor: tensor
     )
     return tload(tensor.cellId, memOffset)
+  }
+
+  /// Compute broadcast-adjusted indices (handles shape broadcasting)
+  func broadcastIndices(outputIndices: [Expr], outputShape: [Int], inputTensor: Tensor) -> [Expr] {
+    let inputShape = inputTensor.shape
+    let rankDiff = outputShape.count - inputShape.count
+
+    // right-align shapes, clamp broadcast dims to 0
+    return inputShape.enumerated().map { i, dim in
+      dim == 1 ? constant(0) : outputIndices[i + rankDiff]
+    }
   }
 
   public func writeOutput(_ node: Node, _ result: Expr) throws {
@@ -360,6 +377,55 @@ public final class IRBuilder {
   /// Uses strides and offset to support views (shrink, transpose, etc.)
   public func tensorMemoryIndex(_ tensor: Tensor, indices: [Expr]) -> Expr {
     return stridedIndex(indices: indices, strides: tensor.strides, offset: tensor.offset)
+  }
+
+  // MARK: - Tensor Read (handles padding)
+
+  /// Read from tensor with padding support.
+  /// For non-padded tensors: direct memory read.
+  /// For padded tensors: returns 0 for padded regions, real data otherwise.
+  public func tensorRead(_ tensor: Tensor, indices: [Expr]) -> Expr {
+    if let padding = tensor.padding {
+      // Padded tensor: default to 0, conditionally read real data
+      let val = float(0.0)
+
+      // Build inBounds check for all axes
+      var inBounds: Expr = constant(1.0)
+      for (i, (left, right)) in padding.enumerated() {
+        let idx = indices[i]
+        let innerEnd = constant(Float(tensor.shape[i] - right))
+        // idx >= left AND idx < innerEnd
+        inBounds = inBounds * (idx >= constant(Float(left))) * (idx < innerEnd)
+      }
+
+      self.if(inBounds) {
+        // Adjust indices by subtracting padLeft
+        let adjusted = indices.enumerated().map { i, idx in
+          idx - constant(Float(padding[i].left))
+        }
+        let memIdx = tensorMemoryIndex(tensor, indices: adjusted)
+        mutate(val.value, to: memoryRead(tensor.cellId, memIdx))
+      }
+
+      return val.value
+    } else {
+      // Non-padded: direct read
+      let memIdx = tensorMemoryIndex(tensor, indices: indices)
+      return memoryRead(tensor.cellId, memIdx)
+    }
+  }
+
+  /// Read from tensor using flat index with padding support.
+  public func tensorRead(_ tensor: Tensor, flatIdx: Expr, shape: [Int]) -> Expr {
+    if tensor.padding != nil {
+      // Need multi-dim indices for padding check
+      let indices = flatToMultiIndex(flatIdx, shape)
+      return tensorRead(tensor, indices: indices)
+    } else {
+      // Non-padded: use fast path
+      let memIdx = tensorMemoryIndex(tensor, flatIdx: flatIdx, shape: shape)
+      return memoryRead(tensor.cellId, memIdx)
+    }
   }
 
   // MARK: - Broadcast Indexing

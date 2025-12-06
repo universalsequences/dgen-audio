@@ -159,6 +159,16 @@ public func inferShape(op: LazyOp, inputs: [ValueShape], graph: Graph) throws ->
     }
     return .tensor(newShape)
 
+  // Pad - expands tensor with zeros along each axis
+  case .pad(let padding):
+    guard let firstInput = inputs.first, case .tensor(let shape) = firstInput else {
+      throw DGenError.shapeInferenceFailed(op: "pad", reason: "requires tensor input")
+    }
+    let newShape = zip(shape, padding).map { dim, pad in
+      dim + pad.0 + pad.1
+    }
+    return .tensor(newShape)
+
   // Inherited (elementwise) - includes all binary and unary math ops
   case .add, .sub, .mul, .div, .sin, .cos, .exp, .sqrt, .tanh,
     .tan, .log, .log10, .abs, .sign, .floor, .ceil, .round,
@@ -205,22 +215,116 @@ public func inferShapes(graph: Graph, sortedNodes: [NodeID]) throws {
 /// Allocate output tensors for nodes that produce tensor results.
 /// This is called after shape inference, so all nodes have their shapes assigned.
 /// Nodes that already have a tensor (via tensorRef) are skipped.
-/// View operations (reshape, transpose) reuse input tensor's cellId instead of allocating.
+/// View operations (reshape, transpose, shrink, pad) create views of their input's tensor.
 public func allocateTensorOutputs(graph: Graph, sortedNodes: [NodeID]) {
   for nodeId in sortedNodes {
     guard let node = graph.nodes[nodeId] else { continue }
 
-    // Skip if this node already has a tensor (e.g., tensorRef nodes)
+    // Skip if this node already has a tensor (e.g., tensorRef nodes or already-created views)
     if graph.nodeToTensor[nodeId] != nil { continue }
 
     // Only allocate for tensor-shaped outputs
     guard case .tensor(let shape) = node.shape else { continue }
 
-    // Allocate for tensor ops (view ops like reshape/transpose are handled by Graph methods)
+    // Handle view operations - create view of input tensor instead of allocating
+    switch node.op {
+    case .reshape(let newShape):
+      guard let inputId = node.inputs.first,
+            let inputTensorId = graph.nodeToTensor[inputId],
+            let inputTensor = graph.tensors[inputTensorId] else { continue }
+
+      let newStrides = adaptStridesForReshape(
+        inputShape: inputTensor.shape,
+        inputStrides: inputTensor.strides,
+        newShape: newShape
+      )
+
+      let tensorId = graph.nextTensorId
+      graph.nextTensorId += 1
+      graph.tensors[tensorId] = Tensor(
+        id: tensorId,
+        shape: newShape,
+        cellId: inputTensor.cellId,
+        strides: newStrides,
+        offset: inputTensor.offset,
+        isView: true
+      )
+      graph.nodeToTensor[nodeId] = tensorId
+      continue
+
+    case .transpose(let axes):
+      guard let inputId = node.inputs.first,
+            let inputTensorId = graph.nodeToTensor[inputId],
+            let inputTensor = graph.tensors[inputTensorId] else { continue }
+
+      let perm = axes.isEmpty ? Array((0..<inputTensor.shape.count).reversed()) : axes
+      let newStrides = perm.map { inputTensor.strides[$0] }
+
+      let tensorId = graph.nextTensorId
+      graph.nextTensorId += 1
+      graph.tensors[tensorId] = Tensor(
+        id: tensorId,
+        shape: shape,
+        cellId: inputTensor.cellId,
+        strides: newStrides,
+        offset: inputTensor.offset,
+        isView: true
+      )
+      graph.nodeToTensor[nodeId] = tensorId
+      continue
+
+    case .shrink(let ranges):
+      guard let inputId = node.inputs.first,
+            let inputTensorId = graph.nodeToTensor[inputId],
+            let inputTensor = graph.tensors[inputTensorId] else { continue }
+
+      var offset = inputTensor.offset
+      for (dim, range) in ranges.enumerated() {
+        if let (start, _) = range {
+          offset += start * inputTensor.strides[dim]
+        }
+      }
+
+      let tensorId = graph.nextTensorId
+      graph.nextTensorId += 1
+      graph.tensors[tensorId] = Tensor(
+        id: tensorId,
+        shape: shape,
+        cellId: inputTensor.cellId,
+        strides: inputTensor.strides,
+        offset: offset,
+        isView: true
+      )
+      graph.nodeToTensor[nodeId] = tensorId
+      continue
+
+    case .pad(let padding):
+      guard let inputId = node.inputs.first,
+            let inputTensorId = graph.nodeToTensor[inputId],
+            let inputTensor = graph.tensors[inputTensorId] else { continue }
+
+      let tensorId = graph.nextTensorId
+      graph.nextTensorId += 1
+      graph.tensors[tensorId] = Tensor(
+        id: tensorId,
+        shape: shape,
+        cellId: inputTensor.cellId,
+        strides: inputTensor.strides,
+        offset: inputTensor.offset,
+        isView: true,
+        padding: padding
+      )
+      graph.nodeToTensor[nodeId] = tensorId
+      continue
+
+    default:
+      break
+    }
+
+    // Allocate new tensor for non-view ops
     let size = shape.reduce(1, *)
     let cellId = graph.alloc(vectorWidth: size)
 
-    // Create tensor and register mapping
     let tensorId = graph.nextTensorId
     graph.nextTensorId += 1
     graph.tensors[tensorId] = Tensor(id: tensorId, shape: shape, cellId: cellId)
