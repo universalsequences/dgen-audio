@@ -2,14 +2,15 @@ public struct Tensor {
     public let id: TensorID
     public let shape: Shape
     public let strides: [Int]  // How many elements to skip per dimension
-    public let offset: Int     // Starting index in underlying storage (for views like shrink)
+    public let offset: Int  // Starting index in underlying storage (for views like shrink)
     public let cellId: CellID
     public var data: [Float]?  // Initial data to be injected by runtime
-    public let isView: Bool    // True if this is a view of another tensor (reshape/transpose/shrink)
+    public let isView: Bool  // True if this is a view of another tensor (reshape/transpose/shrink)
+    public let padding: [(left: Int, right: Int)]?  // Per-axis padding for virtual pad views
 
     public init(
         id: TensorID, shape: Shape, cellId: CellID, data: [Float]? = nil, strides: [Int]? = nil,
-        offset: Int = 0, isView: Bool = false
+        offset: Int = 0, isView: Bool = false, padding: [(left: Int, right: Int)]? = nil
     ) {
         self.id = id
         self.shape = shape
@@ -17,8 +18,17 @@ public struct Tensor {
         self.data = data
         self.offset = offset
         self.isView = isView
+        self.padding = padding
         // Default to row-major (C-style) strides if not specified
         self.strides = strides ?? Tensor.computeRowMajorStrides(shape)
+    }
+
+    /// The inner (unpadded) shape - only valid when padding is set
+    public var innerShape: [Int]? {
+        guard let padding = padding else { return nil }
+        return zip(shape, padding).map { dim, pad in
+            dim - pad.left - pad.right
+        }
     }
 
     /// Total number of elements in this tensor
@@ -187,13 +197,15 @@ extension Graph {
     /// Get the tensor associated with a node
     public func getTensor(_ nodeId: NodeID) throws -> Tensor {
         guard let tensorId = nodeToTensor[nodeId],
-              let tensor = tensors[tensorId] else {
+            let tensor = tensors[tensorId]
+        else {
             throw DGenError.tensorError(op: "getTensor", reason: "tensor not found")
         }
         return tensor
     }
 
-    /// Create a tensor view with new shape/strides, sharing the same underlying data
+    /// Create a tensor view with new shape/strides, sharing the same underlying data.
+    /// For derived ops without tensors, creates node only - tensor created during allocation.
     private func createView(
         input: NodeID,
         op: LazyOp,
@@ -201,24 +213,30 @@ extension Graph {
         offset: Int = 0,
         computeStrides: (Tensor) -> [Int]
     ) throws -> NodeID {
-        let inputTensor = try getTensor(input)
-        let newStrides = computeStrides(inputTensor)
-        let totalOffset = inputTensor.offset + offset
-
-        let tensorId = nextTensorId
-        nextTensorId += 1
-
-        tensors[tensorId] = Tensor(
-            id: tensorId,
-            shape: newShape,
-            cellId: inputTensor.cellId,
-            strides: newStrides,
-            offset: totalOffset,
-            isView: true
-        )
-
+        // Create the node first
         let nodeId = n(op, [input], shape: .tensor(newShape))
-        nodeToTensor[nodeId] = tensorId
+
+        // If input has a concrete tensor, create the view tensor now
+        if let inputTensor = nodeToTensor[input].flatMap({ tensors[$0] }) {
+            let newStrides = computeStrides(inputTensor)
+            let totalOffset = inputTensor.offset + offset
+
+            let tensorId = nextTensorId
+            nextTensorId += 1
+
+            tensors[tensorId] = Tensor(
+                id: tensorId,
+                shape: newShape,
+                cellId: inputTensor.cellId,
+                strides: newStrides,
+                offset: totalOffset,
+                isView: true
+            )
+
+            nodeToTensor[nodeId] = tensorId
+        }
+        // If no concrete tensor, the view will be created during allocateTensorOutputs
+
         return nodeId
     }
 
@@ -226,23 +244,37 @@ extension Graph {
 
     /// Reshape a tensor to a new shape (metadata only, no data movement)
     public func reshape(_ input: NodeID, to newShape: Shape) throws -> NodeID {
-        let inputTensor = try getTensor(input)
-
-        guard inputTensor.size == newShape.reduce(1, *) else {
-            throw DGenError.tensorError(
-                op: "reshape",
-                reason: "size mismatch: \(inputTensor.size) vs \(newShape.reduce(1, *))")
+        // Get input shape - works for both concrete tensors and derived ops
+        guard let inputNode = nodes[input], case .tensor(let inputShape) = inputNode.shape else {
+            throw DGenError.tensorError(op: "reshape", reason: "requires tensor input")
         }
 
-        return try createView(input: input, op: .reshape(newShape), newShape: newShape) { t in
-            adaptStridesForReshape(inputShape: t.shape, inputStrides: t.strides, newShape: newShape)
+        let inputSize = inputShape.reduce(1, *)
+        guard inputSize == newShape.reduce(1, *) else {
+            throw DGenError.tensorError(
+                op: "reshape",
+                reason: "size mismatch: \(inputSize) vs \(newShape.reduce(1, *))")
+        }
+
+        // If input has a concrete tensor, use its strides; otherwise assume row-major
+        let inputStrides =
+            nodeToTensor[input].flatMap { tensors[$0]?.strides }
+            ?? Tensor.computeRowMajorStrides(inputShape)
+
+        return try createView(input: input, op: .reshape(newShape), newShape: newShape) { _ in
+            adaptStridesForReshape(
+                inputShape: inputShape, inputStrides: inputStrides, newShape: newShape)
         }
     }
 
     /// Transpose a tensor by permuting axes
     public func transpose(_ input: NodeID, axes: [Int]? = nil) throws -> NodeID {
-        let inputTensor = try getTensor(input)
-        let ndim = inputTensor.shape.count
+        // Get input shape - works for both concrete tensors and derived ops
+        guard let inputNode = nodes[input], case .tensor(let inputShape) = inputNode.shape else {
+            throw DGenError.tensorError(op: "transpose", reason: "requires tensor input")
+        }
+
+        let ndim = inputShape.count
         let perm = axes ?? Array((0..<ndim).reversed())
 
         guard perm.count == ndim else {
@@ -250,10 +282,16 @@ extension Graph {
                 op: "transpose", reason: "axes must have \(ndim) elements, got \(perm.count)")
         }
 
-        let newShape = perm.map { inputTensor.shape[$0] }
+        // If input has a concrete tensor, use its strides; otherwise assume row-major
+        let inputStrides =
+            nodeToTensor[input].flatMap { tensors[$0]?.strides }
+            ?? Tensor.computeRowMajorStrides(inputShape)
 
-        return try createView(input: input, op: .transpose(perm), newShape: newShape) { t in
-            perm.map { t.strides[$0] }
+        let newShape = perm.map { inputShape[$0] }
+        let newStrides = perm.map { inputStrides[$0] }
+
+        return try createView(input: input, op: .transpose(perm), newShape: newShape) { _ in
+            newStrides
         }
     }
 
@@ -276,7 +314,9 @@ extension Graph {
                 guard start >= 0 && end <= inputTensor.shape[dim] && start < end else {
                     throw DGenError.tensorError(
                         op: "shrink",
-                        reason: "invalid range (\(start), \(end)) for dimension \(dim) with size \(inputTensor.shape[dim])")
+                        reason:
+                            "invalid range (\(start), \(end)) for dimension \(dim) with size \(inputTensor.shape[dim])"
+                    )
                 }
                 offset += start * inputTensor.strides[dim]
                 newShape.append(end - start)
@@ -285,9 +325,48 @@ extension Graph {
             }
         }
 
-        return try createView(input: input, op: .shrink(ranges), newShape: newShape, offset: offset) { t in
+        return try createView(input: input, op: .shrink(ranges), newShape: newShape, offset: offset)
+        { t in
             t.strides  // strides unchanged for shrink
         }
+    }
+
+    /// Pad a tensor with zeros along each axis (virtual view, no data copy)
+    /// a virtual view requires conditional logic at read time (bounds check)
+    /// padding: for each dimension, (left, right) padding amounts
+    public func pad(_ input: NodeID, padding: [(Int, Int)]) throws -> NodeID {
+        let inputTensor = try getTensor(input)
+
+        guard padding.count == inputTensor.shape.count else {
+            throw DGenError.tensorError(
+                op: "pad",
+                reason: "padding count \(padding.count) must match ndim \(inputTensor.shape.count)")
+        }
+
+        // Compute new padded shape
+        let newShape = zip(inputTensor.shape, padding).map { dim, pad in
+            dim + pad.0 + pad.1
+        }
+
+        // Create padded tensor view
+        let tensorId = nextTensorId
+        nextTensorId += 1
+
+        // Strides are based on the INNER (unpadded) shape for memory access
+        // The padded tensor shares the same underlying data
+        tensors[tensorId] = Tensor(
+            id: tensorId,
+            shape: newShape,
+            cellId: inputTensor.cellId,
+            strides: inputTensor.strides,
+            offset: inputTensor.offset,
+            isView: true,
+            padding: padding
+        )
+
+        let nodeId = n(.pad(padding), [input], shape: .tensor(newShape))
+        nodeToTensor[nodeId] = tensorId
+        return nodeId
     }
 
     /// Sum a tensor along a specific axis, reducing that dimension

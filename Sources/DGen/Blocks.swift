@@ -978,7 +978,7 @@ private func containsSIMDBlockers(_ uops: [UOp]) -> Bool {
         switch uop.op {
         case .beginLoop, .beginForLoop:
             return true
-        case .reshape, .transpose, .shrink:
+        case .reshape, .transpose, .shrink, .pad:
             return true
         case .broadcastAccess:
             return true

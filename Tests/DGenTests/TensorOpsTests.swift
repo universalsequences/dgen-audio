@@ -1023,7 +1023,8 @@ final class CTensorOpsTests: XCTestCase {
                 print("Output: \(output[0]), Expected: 830.0")  // 415 * 2 = 830
 
                 // (A @ (B * 2)) = 2 * (A @ B) = 2 * 415 = 830
-                XCTAssertEqual(output[0], 830.0, accuracy: 0.001, "Matmul with scaled B should be 830")
+                XCTAssertEqual(
+                        output[0], 830.0, accuracy: 0.001, "Matmul with scaled B should be 830")
         }
 
         // MARK: - Comprehensive Reshape Tests
@@ -1078,7 +1079,9 @@ final class CTensorOpsTests: XCTestCase {
                 }
 
                 // 1*1 + 2*2 + 3*3 + 4*4 + 5*5 + 6*6 = 1+4+9+16+25+36 = 91
-                XCTAssertEqual(output[0], 91.0, accuracy: 0.001, "Reshape to flat should preserve data order")
+                XCTAssertEqual(
+                        output[0], 91.0, accuracy: 0.001,
+                        "Reshape to flat should preserve data order")
         }
 
         func testReshapeFromFlat() throws {
@@ -1134,7 +1137,9 @@ final class CTensorOpsTests: XCTestCase {
                 }
 
                 // [6, 15] * [1, 2] = 6 + 30 = 36
-                XCTAssertEqual(output[0], 36.0, accuracy: 0.001, "Reshape from flat should create correct 2D shape")
+                XCTAssertEqual(
+                        output[0], 36.0, accuracy: 0.001,
+                        "Reshape from flat should create correct 2D shape")
         }
 
         // MARK: - Comprehensive Transpose Tests
@@ -1202,7 +1207,9 @@ final class CTensorOpsTests: XCTestCase {
                 // Transpose [3,2]: [[1,4], [2,5], [3,6]] -> sumAxis(1) = [5, 7, 9]
                 // Weighted: 5*1 + 7*2 + 9*3 = 46
                 // (Compare to reshape which would give [3, 7, 11] -> weighted = 50)
-                XCTAssertEqual(output[0], 46.0, accuracy: 0.001, "Transpose should reorder elements correctly via strided indexing")
+                XCTAssertEqual(
+                        output[0], 46.0, accuracy: 0.001,
+                        "Transpose should reorder elements correctly via strided indexing")
         }
 
         // MARK: - Comprehensive SumAxis Tests
@@ -1307,7 +1314,8 @@ final class CTensorOpsTests: XCTestCase {
                         }
                 }
 
-                XCTAssertEqual(output[0], 10.0, accuracy: 0.001, "SumAxis on 1D should reduce to scalar")
+                XCTAssertEqual(
+                        output[0], 10.0, accuracy: 0.001, "SumAxis on 1D should reduce to scalar")
         }
 
         // MARK: - Broadcasting Tests
@@ -1374,12 +1382,14 @@ final class CTensorOpsTests: XCTestCase {
                 let g = Graph()
 
                 // 4x3 tensor -> sumAxis(1) -> [4] output
-                let t = g.tensor(shape: [4, 3], data: [
-                        1.0, 2.0, 3.0,    // row 0: sum = 6
-                        4.0, 5.0, 6.0,    // row 1: sum = 15
-                        7.0, 8.0, 9.0,    // row 2: sum = 24
-                        10.0, 11.0, 12.0  // row 3: sum = 33
-                ])
+                let t = g.tensor(
+                        shape: [4, 3],
+                        data: [
+                                1.0, 2.0, 3.0,  // row 0: sum = 6
+                                4.0, 5.0, 6.0,  // row 1: sum = 15
+                                7.0, 8.0, 9.0,  // row 2: sum = 24
+                                10.0, 11.0, 12.0,  // row 3: sum = 33
+                        ])
 
                 let summed = try g.sum(t, axis: 1)  // [4,3] -> [4]
 
@@ -1426,9 +1436,9 @@ final class CTensorOpsTests: XCTestCase {
                 }
 
                 // [4,3] -> sumAxis(1) -> [6, 15, 24, 33] -> sum -> 78
-                XCTAssertEqual(output[0], 78.0, accuracy: 0.001, "Sum of sumAxis(1) on [4,3] should be 78")
+                XCTAssertEqual(
+                        output[0], 78.0, accuracy: 0.001, "Sum of sumAxis(1) on [4,3] should be 78")
         }
-
 
         func testReshapeThenSumAxisExecution() throws {
                 // Test: reshape changes how sumAxis interprets axes
@@ -1519,7 +1529,8 @@ final class CTensorOpsTests: XCTestCase {
                 // With reshape to [3,2]:
                 //   sumAxis(1) -> [3, 7, 11] (3 elements)
                 //   weighted: 3*1 + 7*2 + 11*3 = 50
-                XCTAssertEqual(output[0], 50.0, accuracy: 0.001, "Reshape then sumAxis should give 50.0")
+                XCTAssertEqual(
+                        output[0], 50.0, accuracy: 0.001, "Reshape then sumAxis should give 50.0")
         }
 
         // MARK: - Stack Tests
@@ -1642,7 +1653,8 @@ final class CTensorOpsTests: XCTestCase {
                 print("=== Stack With Shape Result ===")
                 print("Output: \(output[0]), Expected: 16.0")
 
-                XCTAssertEqual(output[0], 16.0, accuracy: 0.001, "Stack with shape should give 16.0")
+                XCTAssertEqual(
+                        output[0], 16.0, accuracy: 0.001, "Stack with shape should give 16.0")
         }
 
         // MARK: - Shrink Tests
@@ -1652,12 +1664,14 @@ final class CTensorOpsTests: XCTestCase {
                 let g = Graph()
 
                 // Create a 4x4 tensor
-                let t = g.tensor(shape: [4, 4], data: [
-                        1.0, 2.0, 3.0, 4.0,
-                        5.0, 6.0, 7.0, 8.0,
-                        9.0, 10.0, 11.0, 12.0,
-                        13.0, 14.0, 15.0, 16.0
-                ])
+                let t = g.tensor(
+                        shape: [4, 4],
+                        data: [
+                                1.0, 2.0, 3.0, 4.0,
+                                5.0, 6.0, 7.0, 8.0,
+                                9.0, 10.0, 11.0, 12.0,
+                                13.0, 14.0, 15.0, 16.0,
+                        ])
 
                 // Shrink to rows 1:3, cols 1:3 -> [[6,7], [10,11]]
                 let shrunk = try g.shrink(t, ranges: [(1, 3), (1, 3)])
@@ -1687,12 +1701,14 @@ final class CTensorOpsTests: XCTestCase {
                 //  [ 5,  6,  7,  8],
                 //  [ 9, 10, 11, 12],
                 //  [13, 14, 15, 16]]
-                let t = g.tensor(shape: [4, 4], data: [
-                        1.0, 2.0, 3.0, 4.0,
-                        5.0, 6.0, 7.0, 8.0,
-                        9.0, 10.0, 11.0, 12.0,
-                        13.0, 14.0, 15.0, 16.0
-                ])
+                let t = g.tensor(
+                        shape: [4, 4],
+                        data: [
+                                1.0, 2.0, 3.0, 4.0,
+                                5.0, 6.0, 7.0, 8.0,
+                                9.0, 10.0, 11.0, 12.0,
+                                13.0, 14.0, 15.0, 16.0,
+                        ])
 
                 // Shrink to rows 1:3, cols 1:3 -> 2x2 submatrix:
                 // [[6, 7],
@@ -1753,11 +1769,13 @@ final class CTensorOpsTests: XCTestCase {
                 let g = Graph()
 
                 // 3x6 tensor
-                let t = g.tensor(shape: [3, 6], data: [
-                        1.0, 2.0, 3.0, 4.0, 5.0, 6.0,
-                        7.0, 8.0, 9.0, 10.0, 11.0, 12.0,
-                        13.0, 14.0, 15.0, 16.0, 17.0, 18.0
-                ])
+                let t = g.tensor(
+                        shape: [3, 6],
+                        data: [
+                                1.0, 2.0, 3.0, 4.0, 5.0, 6.0,
+                                7.0, 8.0, 9.0, 10.0, 11.0, 12.0,
+                                13.0, 14.0, 15.0, 16.0, 17.0, 18.0,
+                        ])
 
                 // Shrink to cols 2:5 (keep all rows) -> 3x3 submatrix:
                 // [[3, 4, 5],
@@ -1807,7 +1825,8 @@ final class CTensorOpsTests: XCTestCase {
                 print("=== Shrink Column Only Result ===")
                 print("Output: \(output[0]), Expected: 90.0")
 
-                XCTAssertEqual(output[0], 90.0, accuracy: 0.001, "Shrink column-only sum should be 90.0")
+                XCTAssertEqual(
+                        output[0], 90.0, accuracy: 0.001, "Shrink column-only sum should be 90.0")
         }
 
         func testShrinkWithScalarOp() throws {
@@ -1815,12 +1834,14 @@ final class CTensorOpsTests: XCTestCase {
                 let g = Graph()
 
                 // 4x4 tensor
-                let t = g.tensor(shape: [4, 4], data: [
-                        1.0, 2.0, 3.0, 4.0,
-                        5.0, 6.0, 7.0, 8.0,
-                        9.0, 10.0, 11.0, 12.0,
-                        13.0, 14.0, 15.0, 16.0
-                ])
+                let t = g.tensor(
+                        shape: [4, 4],
+                        data: [
+                                1.0, 2.0, 3.0, 4.0,
+                                5.0, 6.0, 7.0, 8.0,
+                                9.0, 10.0, 11.0, 12.0,
+                                13.0, 14.0, 15.0, 16.0,
+                        ])
 
                 // Shrink to [[6,7],[10,11]]
                 let shrunk = try g.shrink(t, ranges: [(1, 3), (1, 3)])
@@ -1869,7 +1890,8 @@ final class CTensorOpsTests: XCTestCase {
                 }
 
                 // (6+7+10+11) * 2 = 34 * 2 = 68
-                XCTAssertEqual(output[0], 68.0, accuracy: 0.001, "Shrink then scalar mul should be 68.0")
+                XCTAssertEqual(
+                        output[0], 68.0, accuracy: 0.001, "Shrink then scalar mul should be 68.0")
         }
 
         func testShrinkWithSumAxis() throws {
@@ -1877,12 +1899,14 @@ final class CTensorOpsTests: XCTestCase {
                 let g = Graph()
 
                 // 4x4 tensor
-                let t = g.tensor(shape: [4, 4], data: [
-                        1.0, 2.0, 3.0, 4.0,
-                        5.0, 6.0, 7.0, 8.0,
-                        9.0, 10.0, 11.0, 12.0,
-                        13.0, 14.0, 15.0, 16.0
-                ])
+                let t = g.tensor(
+                        shape: [4, 4],
+                        data: [
+                                1.0, 2.0, 3.0, 4.0,
+                                5.0, 6.0, 7.0, 8.0,
+                                9.0, 10.0, 11.0, 12.0,
+                                13.0, 14.0, 15.0, 16.0,
+                        ])
 
                 // Shrink to rows 1:3, cols 0:4 (keep all cols) -> 2x4:
                 // [[5, 6, 7, 8],
@@ -1940,7 +1964,8 @@ final class CTensorOpsTests: XCTestCase {
                 print("=== Shrink With SumAxis Result ===")
                 print("Output: \(output[0]), Expected: 110.0")
 
-                XCTAssertEqual(output[0], 110.0, accuracy: 0.001, "Shrink then sumAxis should be 110.0")
+                XCTAssertEqual(
+                        output[0], 110.0, accuracy: 0.001, "Shrink then sumAxis should be 110.0")
         }
 
         func testChainedShrink() throws {
@@ -2010,7 +2035,8 @@ final class CTensorOpsTests: XCTestCase {
                 print("Output: \(output[0]), Expected: 74.0")
 
                 // Chained shrink should give [[15,16],[21,22]] sum = 74
-                XCTAssertEqual(output[0], 74.0, accuracy: 0.001, "Chained shrink sum should be 74.0")
+                XCTAssertEqual(
+                        output[0], 74.0, accuracy: 0.001, "Chained shrink sum should be 74.0")
         }
 
         func testShrinkWithBroadcastOp() throws {
@@ -2018,12 +2044,14 @@ final class CTensorOpsTests: XCTestCase {
                 let g = Graph()
 
                 // 4x4 tensor A
-                let a = g.tensor(shape: [4, 4], data: [
-                        1.0, 2.0, 3.0, 4.0,
-                        5.0, 6.0, 7.0, 8.0,
-                        9.0, 10.0, 11.0, 12.0,
-                        13.0, 14.0, 15.0, 16.0
-                ])
+                let a = g.tensor(
+                        shape: [4, 4],
+                        data: [
+                                1.0, 2.0, 3.0, 4.0,
+                                5.0, 6.0, 7.0, 8.0,
+                                9.0, 10.0, 11.0, 12.0,
+                                13.0, 14.0, 15.0, 16.0,
+                        ])
 
                 // 4x4 tensor B (all 2s)
                 let b = g.tensor(shape: [4, 4], data: [Float](repeating: 2.0, count: 16))
@@ -2076,7 +2104,8 @@ final class CTensorOpsTests: XCTestCase {
                 }
 
                 // [[6,7],[10,11]] * [[2,2],[2,2]] = [[12,14],[20,22]] sum = 68
-                XCTAssertEqual(output[0], 68.0, accuracy: 0.001, "Shrink broadcast mul sum should be 68.0")
+                XCTAssertEqual(
+                        output[0], 68.0, accuracy: 0.001, "Shrink broadcast mul sum should be 68.0")
         }
 
         func testShrinkThenConv2d() throws {
@@ -2089,12 +2118,14 @@ final class CTensorOpsTests: XCTestCase {
                 //  [0, 0, 1, 1],
                 //  [1, 1, 1, 1],
                 //  [1, 1, 1, 1]]
-                let t = g.tensor(shape: [4, 4], data: [
-                        0.0, 0.0, 1.0, 1.0,
-                        0.0, 0.0, 1.0, 1.0,
-                        1.0, 1.0, 1.0, 1.0,
-                        1.0, 1.0, 1.0, 1.0
-                ])
+                let t = g.tensor(
+                        shape: [4, 4],
+                        data: [
+                                0.0, 0.0, 1.0, 1.0,
+                                0.0, 0.0, 1.0, 1.0,
+                                1.0, 1.0, 1.0, 1.0,
+                                1.0, 1.0, 1.0, 1.0,
+                        ])
 
                 // Shrink to bottom-right 2x2 which should be all 1s:
                 // [[1, 1],
@@ -2102,11 +2133,13 @@ final class CTensorOpsTests: XCTestCase {
                 let shrunk = try g.shrink(t, ranges: [(2, 4), (2, 4)])
 
                 // Identity kernel (just passes through center value)
-                let kernel = g.tensor(shape: [3, 3], data: [
-                        0.0, 0.0, 0.0,
-                        0.0, 1.0, 0.0,
-                        0.0, 0.0, 0.0
-                ])
+                let kernel = g.tensor(
+                        shape: [3, 3],
+                        data: [
+                                0.0, 0.0, 0.0,
+                                0.0, 1.0, 0.0,
+                                0.0, 0.0, 0.0,
+                        ])
 
                 // Conv2d with identity kernel on 2x2 all-ones should give 2x2 all-ones
                 let convResult = g.n(.conv2d([3, 3]), shrunk, kernel)
@@ -2159,8 +2192,293 @@ final class CTensorOpsTests: XCTestCase {
 
                 // If conv2d correctly reads from shrunk region (all 1s), sum = 4.0
                 // If conv2d incorrectly reads from start (first 2x2 is zeros), sum would be < 4.0
-                XCTAssertEqual(output[0], 4.0, accuracy: 0.001,
+                XCTAssertEqual(
+                        output[0], 4.0, accuracy: 0.001,
                         "Conv2d on shrunk all-ones should sum to 4.0 - offset may not be applied")
+        }
+
+        // MARK: - Pad Tests
+
+        func testPadBasic() throws {
+                // Test: basic pad operation - metadata only
+                let g = Graph()
+
+                // Create a 2x2 tensor with data [1, 2, 3, 4]
+                let tensorNode = g.tensor([[1.0, 2.0], [3.0, 4.0]])
+
+                // Pad with 1 on each side: (1, 1) for each axis
+                // Result shape should be [4, 4]
+                let padded = try g.pad(tensorNode, padding: [(1, 1), (1, 1)])
+
+                // Verify the padded tensor has correct shape
+                let paddedTensor = try g.getTensor(padded)
+                XCTAssertEqual(paddedTensor.shape, [4, 4], "Padded shape should be [4, 4]")
+                XCTAssertNotNil(paddedTensor.padding, "Padded tensor should have padding info")
+                XCTAssertEqual(paddedTensor.padding?[0].left, 1)
+                XCTAssertEqual(paddedTensor.padding?[0].right, 1)
+        }
+
+        func testPadExecution() throws {
+                // Test: pad a tensor and sum it - zeros in pad region
+                let g = Graph()
+
+                // Create a 2x2 tensor with data [1, 2, 3, 4] (sum = 10)
+                let tensorNode = g.tensor([[1.0, 2.0], [3.0, 4.0]])
+
+                // Pad with 1 on each side -> [4, 4] tensor
+                // Padded region is zeros, so sum should still be 10
+                let padded = try g.pad(tensorNode, padding: [(1, 1), (1, 1)])
+
+                // Sum the padded tensor
+                let sumResult = g.n(.sum, padded)
+                _ = g.n(.output(0), sumResult)
+
+                let frameCount = 1
+                let cResult = try CompilationPipeline.compile(
+                        graph: g,
+                        backend: .c,
+                        options: .init(frameCount: frameCount, debug: true)
+                )
+
+                print("=== Pad Execution - Generated Source ===")
+                print(cResult.source)
+
+                let cRuntime = CCompiledKernel(
+                        source: cResult.source,
+                        cellAllocations: cResult.cellAllocations,
+                        memorySize: cResult.totalMemorySlots
+                )
+                try cRuntime.compileAndLoad()
+
+                guard let mem = cRuntime.allocateNodeMemory() else {
+                        XCTFail("Failed to allocate memory")
+                        return
+                }
+                defer { cRuntime.deallocateNodeMemory(mem) }
+
+                injectTensorData(result: cResult, memory: mem.assumingMemoryBound(to: Float.self))
+
+                var output = [Float](repeating: 0, count: frameCount)
+                let input = [Float](repeating: 0, count: frameCount)
+
+                output.withUnsafeMutableBufferPointer { outPtr in
+                        input.withUnsafeBufferPointer { inPtr in
+                                cRuntime.runWithMemory(
+                                        outputs: outPtr.baseAddress!,
+                                        inputs: inPtr.baseAddress!,
+                                        memory: mem,
+                                        frameCount: frameCount
+                                )
+                        }
+                }
+
+                print("=== Pad Execution Result ===")
+                print("Output: \(output[0]), Expected: 10.0")
+
+                // Sum of padded tensor should equal sum of original (zeros don't contribute)
+                XCTAssertEqual(
+                        output[0], 10.0, accuracy: 0.001,
+                        "Sum of padded tensor should equal sum of original data")
+        }
+
+        func testPadAsymmetric() throws {
+                // Test: asymmetric padding (different left/right)
+                let g = Graph()
+
+                // Create a 1D tensor [1, 2, 3]
+                let tensorNode = g.tensor([1.0, 2.0, 3.0])
+
+                // Pad with 2 on left, 1 on right -> [0, 0, 1, 2, 3, 0]
+                let padded = try g.pad(tensorNode, padding: [(2, 1)])
+
+                let paddedTensor = try g.getTensor(padded)
+                XCTAssertEqual(paddedTensor.shape, [6], "Padded shape should be [6]")
+
+                // Sum should still be 6
+                let sumResult = g.n(.sum, padded)
+                _ = g.n(.output(0), sumResult)
+
+                let frameCount = 1
+                let cResult = try CompilationPipeline.compile(
+                        graph: g,
+                        backend: .c,
+                        options: .init(frameCount: frameCount, debug: true)
+                )
+
+                let cRuntime = CCompiledKernel(
+                        source: cResult.source,
+                        cellAllocations: cResult.cellAllocations,
+                        memorySize: cResult.totalMemorySlots
+                )
+                try cRuntime.compileAndLoad()
+
+                guard let mem = cRuntime.allocateNodeMemory() else {
+                        XCTFail("Failed to allocate memory")
+                        return
+                }
+                defer { cRuntime.deallocateNodeMemory(mem) }
+
+                injectTensorData(result: cResult, memory: mem.assumingMemoryBound(to: Float.self))
+
+                var output = [Float](repeating: 0, count: frameCount)
+                let input = [Float](repeating: 0, count: frameCount)
+
+                output.withUnsafeMutableBufferPointer { outPtr in
+                        input.withUnsafeBufferPointer { inPtr in
+                                cRuntime.runWithMemory(
+                                        outputs: outPtr.baseAddress!,
+                                        inputs: inPtr.baseAddress!,
+                                        memory: mem,
+                                        frameCount: frameCount
+                                )
+                        }
+                }
+
+                print("=== Asymmetric Pad Result ===")
+                print("Output: \(output[0]), Expected: 6.0")
+
+                XCTAssertEqual(output[0], 6.0, accuracy: 0.001)
+        }
+
+        func testConcatViaPadAndAdd() throws {
+                // Test: concat [1, 2] and [3, 4] via padding and addition
+                // [1, 2] padded right: [1, 2, 0, 0]
+                // [3, 4] padded left:  [0, 0, 3, 4]
+                // Sum:                 [1, 2, 3, 4]
+                let g = Graph()
+
+                // Create two 1D tensors
+                let t1 = g.tensor([1.0, 2.0])  // [1, 2]
+                let t2 = g.tensor([3.0, 4.0])  // [3, 4]
+
+                // Pad t1 with 0 left, 2 right -> [1, 2, 0, 0]
+                let t1Padded = try g.pad(t1, padding: [(0, 2)])
+
+                // Pad t2 with 2 left, 0 right -> [0, 0, 3, 4]
+                let t2Padded = try g.pad(t2, padding: [(2, 0)])
+
+                // Add them together -> [1, 2, 3, 4]
+                let concat = g.n(.add, t1Padded, t2Padded)
+
+                // Sum to verify: 1 + 2 + 3 + 4 = 10
+                let sumResult = g.n(.sum, concat)
+                _ = g.n(.output(0), sumResult)
+
+                let frameCount = 1
+                let cResult = try CompilationPipeline.compile(
+                        graph: g,
+                        backend: .c,
+                        options: .init(frameCount: frameCount, debug: true)
+                )
+
+                print("=== Concat via Pad+Add - Generated Source ===")
+                print(cResult.source)
+
+                let cRuntime = CCompiledKernel(
+                        source: cResult.source,
+                        cellAllocations: cResult.cellAllocations,
+                        memorySize: cResult.totalMemorySlots
+                )
+                try cRuntime.compileAndLoad()
+
+                guard let mem = cRuntime.allocateNodeMemory() else {
+                        XCTFail("Failed to allocate memory")
+                        return
+                }
+                defer { cRuntime.deallocateNodeMemory(mem) }
+
+                injectTensorData(result: cResult, memory: mem.assumingMemoryBound(to: Float.self))
+
+                var output = [Float](repeating: 0, count: frameCount)
+                let input = [Float](repeating: 0, count: frameCount)
+
+                output.withUnsafeMutableBufferPointer { outPtr in
+                        input.withUnsafeBufferPointer { inPtr in
+                                cRuntime.runWithMemory(
+                                        outputs: outPtr.baseAddress!,
+                                        inputs: inPtr.baseAddress!,
+                                        memory: mem,
+                                        frameCount: frameCount
+                                )
+                        }
+                }
+
+                print("=== Concat via Pad+Add Result ===")
+                print("Output: \(output[0]), Expected: 10.0")
+
+                // Sum of concatenated tensor [1, 2, 3, 4] = 10
+                XCTAssertEqual(
+                        output[0], 10.0, accuracy: 0.001,
+                        "Concat via pad+add should give [1,2,3,4] with sum 10")
+        }
+
+        func testConcat2DViaPadAndAdd() throws {
+                // Test: concat two 2x2 matrices along axis 0
+                // [[1, 2], [3, 4]] concat [[5, 6], [7, 8]] -> [[1,2], [3,4], [5,6], [7,8]]
+                let g = Graph()
+
+                // Create two 2x2 tensors
+                let t1 = g.tensor([[1.0, 2.0], [3.0, 4.0]])  // shape [2, 2]
+                let t2 = g.tensor([[5.0, 6.0], [7.0, 8.0]])  // shape [2, 2]
+
+                // Pad t1 with 0 top, 2 bottom (axis 0) -> shape [4, 2]
+                let t1Padded = try g.pad(t1, padding: [(0, 2), (0, 0)])
+
+                // Pad t2 with 2 top, 0 bottom (axis 0) -> shape [4, 2]
+                let t2Padded = try g.pad(t2, padding: [(2, 0), (0, 0)])
+
+                // Add them -> [[1,2], [3,4], [5,6], [7,8]]
+                let concat = g.n(.add, t1Padded, t2Padded)
+
+                // Sum to verify: 1+2+3+4+5+6+7+8 = 36
+                let sumResult = g.n(.sum, concat)
+                _ = g.n(.output(0), sumResult)
+
+                let frameCount = 1
+                let cResult = try CompilationPipeline.compile(
+                        graph: g,
+                        backend: .c,
+                        options: .init(frameCount: frameCount, debug: true)
+                )
+
+                print("=== 2D Concat via Pad+Add - Generated Source ===")
+                print(cResult.source)
+
+                let cRuntime = CCompiledKernel(
+                        source: cResult.source,
+                        cellAllocations: cResult.cellAllocations,
+                        memorySize: cResult.totalMemorySlots
+                )
+                try cRuntime.compileAndLoad()
+
+                guard let mem = cRuntime.allocateNodeMemory() else {
+                        XCTFail("Failed to allocate memory")
+                        return
+                }
+                defer { cRuntime.deallocateNodeMemory(mem) }
+
+                injectTensorData(result: cResult, memory: mem.assumingMemoryBound(to: Float.self))
+
+                var output = [Float](repeating: 0, count: frameCount)
+                let input = [Float](repeating: 0, count: frameCount)
+
+                output.withUnsafeMutableBufferPointer { outPtr in
+                        input.withUnsafeBufferPointer { inPtr in
+                                cRuntime.runWithMemory(
+                                        outputs: outPtr.baseAddress!,
+                                        inputs: inPtr.baseAddress!,
+                                        memory: mem,
+                                        frameCount: frameCount
+                                )
+                        }
+                }
+
+                print("=== 2D Concat via Pad+Add Result ===")
+                print("Output: \(output[0]), Expected: 36.0")
+
+                XCTAssertEqual(
+                        output[0], 36.0, accuracy: 0.001,
+                        "2D concat via pad+add should sum to 36")
         }
 
 }
