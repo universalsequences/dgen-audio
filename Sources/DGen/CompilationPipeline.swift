@@ -145,6 +145,17 @@ public struct CompilationPipeline {
 
         var finalBlocks = seperatedBlocks.compactMap { $0 }
 
+        // Re-check block kinds after tensor block splitting.
+        // When determineTensorBlocks splits a block, the new blocks inherit the original's kind,
+        // but if all nodes in the new block are scalar, the block should be scalar.
+        // This is critical for frame-based tensor ops (cos(phasor(tensor))) to get stride 1.
+        for i in 0..<finalBlocks.count {
+            let allNodesScalar = finalBlocks[i].nodes.allSatisfy { finalScalarSet.contains($0) }
+            if allNodesScalar && finalBlocks[i].kind == .simd {
+                finalBlocks[i].kind = .scalar
+            }
+        }
+
         if options.backwards {
             var backwardsBlocks: [Block] = []
             for block in finalBlocks.reversed() {

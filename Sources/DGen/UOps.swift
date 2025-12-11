@@ -91,6 +91,7 @@ public enum Op {
   case shrink([(Int, Int)?])  // View op: shrink/slice - renders to nothing but prevents SIMD
   case pad([(Int, Int)])      // View op: pad with zeros - renders to nothing but prevents SIMD
   case broadcastAccess  // Marker: broadcast indexing used - renders to nothing but prevents SIMD
+  case requiresScalar   // Marker: stateful accumulation requires scalar (sample-by-sample) execution
 }
 
 public struct UOp {

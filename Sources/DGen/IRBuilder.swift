@@ -108,6 +108,14 @@ public final class IRBuilder {
     ops.append(uop)
   }
 
+  /// Mark that this block requires scalar (sample-by-sample) execution.
+  /// Used by stateful ops like phasor, accum, latch that accumulate state
+  /// and cannot be safely vectorized.
+  public func markRequiresScalar() {
+    let uop = UOp(op: .requiresScalar, value: .empty)
+    ops.append(uop)
+  }
+
   public func `if`(_ cond: Expr, then: () -> Void) {
     ops.append(u_begin_if(cond.lazy)(ctx, nodeId))
     then()

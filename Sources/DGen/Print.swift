@@ -169,6 +169,8 @@ extension UOp {
             opStr = "\(ANSI.cyan)pad\(ANSI.reset)(\(padding))"
         case .broadcastAccess:
             opStr = "\(ANSI.cyan)broadcastAccess\(ANSI.reset)"
+        case .requiresScalar:
+            opStr = "\(ANSI.cyan)requiresScalar\(ANSI.reset)"
         }
 
         return "\(ANSI.bold)UOp\(ANSI.reset)(op: \(opStr), value: \(value))"

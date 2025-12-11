@@ -100,6 +100,13 @@ public func inferShape(op: LazyOp, inputs: [ValueShape], graph: Graph) throws ->
     }
     return firstInput
 
+  // Conv1d - output shape matches input shape (same padding)
+  case .conv1d(_):
+    guard let firstInput = inputs.first else {
+      throw DGenError.shapeInferenceFailed(op: "conv1d", reason: "missing input tensor")
+    }
+    return firstInput
+
   // Conv2d - output shape matches input shape (same padding)
   case .conv2d(_):
     guard let firstInput = inputs.first else {
@@ -170,10 +177,12 @@ public func inferShape(op: LazyOp, inputs: [ValueShape], graph: Graph) throws ->
     return .tensor(newShape)
 
   // Inherited (elementwise) - includes all binary and unary math ops
+  // Also includes stateful ops (phasor, accum, latch) that can operate element-wise on tensors
   case .add, .sub, .mul, .div, .sin, .cos, .exp, .sqrt, .tanh,
     .tan, .log, .log10, .abs, .sign, .floor, .ceil, .round,
     .pow, .mod, .min, .max, .atan2, .gt, .gte, .lt, .lte, .eq,
-    .and, .or, .xor, .gswitch, .mix:
+    .and, .or, .xor, .gswitch, .mix,
+    .phasor(_), .accum(_), .latch(_):
     let tensors = inputs.filter { x in
       if case .tensor(_) = x { return true }
       return false
@@ -225,6 +234,23 @@ public func allocateTensorOutputs(graph: Graph, sortedNodes: [NodeID]) {
 
     // Only allocate for tensor-shaped outputs
     guard case .tensor(let shape) = node.shape else { continue }
+
+    // Handle stateful ops (phasor, accum, latch) - need to expand their state cell for tensor operations
+    // These ops have a cellId for state that was allocated before shape inference.
+    // Now that we know the tensor shape, we need to re-allocate with proper size.
+    switch node.op {
+    case .phasor(let originalCellId), .accum(let originalCellId), .latch(let originalCellId):
+      let size = shape.reduce(1, *)
+      // Only re-allocate if we need more than 1 cell
+      if size > 1 {
+        // Update the cell allocation size (the memory remapping will handle the actual layout)
+        graph.cellAllocationSizes[originalCellId] = size
+      }
+      // Continue to allocate output tensor below
+
+    default:
+      break
+    }
 
     // Handle view operations - create view of input tensor instead of allocating
     switch node.op {

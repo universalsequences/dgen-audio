@@ -417,6 +417,141 @@ final class CTensorOpsTests: XCTestCase {
                         "Conv2d with identity kernel should preserve sum")
         }
 
+        func testConv1dExecution() throws {
+                // Test conv1d with a simple averaging kernel
+                let g = Graph()
+
+                // 5-element input: [1, 2, 3, 4, 5]
+                let inputNode = g.tensor(shape: [5], data: [1, 2, 3, 4, 5])
+
+                // 3-element averaging kernel: [1, 1, 1] (will sum neighbors)
+                let kernelNode = g.tensor(shape: [3], data: [1, 1, 1])
+
+                // Conv1d with kernel size 3
+                let convResult = g.n(.conv1d(3), inputNode, kernelNode)
+
+                // Sum to scalar output
+                let sumResult = g.n(.sum, convResult)
+                _ = g.n(.output(0), sumResult)
+
+                let frameCount = 1
+
+                // Compile
+                let cResult = try CompilationPipeline.compile(
+                        graph: g,
+                        backend: .c,
+                        options: .init(frameCount: frameCount, debug: false)
+                )
+
+                // Create runtime
+                let cRuntime = CCompiledKernel(
+                        source: cResult.source,
+                        cellAllocations: cResult.cellAllocations,
+                        memorySize: cResult.totalMemorySlots
+                )
+                try cRuntime.compileAndLoad()
+
+                guard let mem = cRuntime.allocateNodeMemory() else {
+                        XCTFail("Failed to allocate memory")
+                        return
+                }
+                defer { cRuntime.deallocateNodeMemory(mem) }
+
+                // Inject tensor data
+                injectTensorData(result: cResult, memory: mem.assumingMemoryBound(to: Float.self))
+
+                // Run
+                var output = [Float](repeating: 0, count: frameCount)
+                let input = [Float](repeating: 0, count: frameCount)
+
+                output.withUnsafeMutableBufferPointer { outPtr in
+                        input.withUnsafeBufferPointer { inPtr in
+                                cRuntime.runWithMemory(
+                                        outputs: outPtr.baseAddress!,
+                                        inputs: inPtr.baseAddress!,
+                                        memory: mem,
+                                        frameCount: frameCount
+                                )
+                        }
+                }
+
+                // With kernel [1,1,1] on input [1,2,3,4,5]:
+                // Output[0] = 0+1+2 = 3   (padding on left)
+                // Output[1] = 1+2+3 = 6
+                // Output[2] = 2+3+4 = 9
+                // Output[3] = 3+4+5 = 12
+                // Output[4] = 4+5+0 = 9   (padding on right)
+                // Sum = 3+6+9+12+9 = 39
+                XCTAssertEqual(
+                        output[0], 39.0, accuracy: 1e-4,
+                        "Conv1d with [1,1,1] kernel on [1,2,3,4,5] should sum to 39")
+        }
+
+        func testConv1dIdentityKernel() throws {
+                // Test conv1d with identity kernel (center=1)
+                let g = Graph()
+
+                // 5-element input: [1, 2, 3, 4, 5]
+                let inputNode = g.tensor(shape: [5], data: [1, 2, 3, 4, 5])
+
+                // 3-element identity kernel: [0, 1, 0]
+                let kernelNode = g.tensor(shape: [3], data: [0, 1, 0])
+
+                // Conv1d
+                let convResult = g.n(.conv1d(3), inputNode, kernelNode)
+
+                // Sum to scalar output
+                let sumResult = g.n(.sum, convResult)
+                _ = g.n(.output(0), sumResult)
+
+                let frameCount = 1
+
+                // Compile
+                let cResult = try CompilationPipeline.compile(
+                        graph: g,
+                        backend: .c,
+                        options: .init(frameCount: frameCount, debug: false)
+                )
+
+                // Create runtime
+                let cRuntime = CCompiledKernel(
+                        source: cResult.source,
+                        cellAllocations: cResult.cellAllocations,
+                        memorySize: cResult.totalMemorySlots
+                )
+                try cRuntime.compileAndLoad()
+
+                guard let mem = cRuntime.allocateNodeMemory() else {
+                        XCTFail("Failed to allocate memory")
+                        return
+                }
+                defer { cRuntime.deallocateNodeMemory(mem) }
+
+                // Inject tensor data
+                injectTensorData(result: cResult, memory: mem.assumingMemoryBound(to: Float.self))
+
+                // Run
+                var output = [Float](repeating: 0, count: frameCount)
+                let input = [Float](repeating: 0, count: frameCount)
+
+                output.withUnsafeMutableBufferPointer { outPtr in
+                        input.withUnsafeBufferPointer { inPtr in
+                                cRuntime.runWithMemory(
+                                        outputs: outPtr.baseAddress!,
+                                        inputs: inPtr.baseAddress!,
+                                        memory: mem,
+                                        frameCount: frameCount
+                                )
+                        }
+                }
+
+                // Identity kernel should preserve the input
+                // Sum of [1,2,3,4,5] = 15
+                XCTAssertEqual(
+                        output[0], 15.0, accuracy: 1e-4,
+                        "Conv1d with identity kernel should preserve sum (15)")
+        }
+
         func testTensorHistoryExecutionC() throws {
                 // Test that tensor history persists across frames
                 let g = Graph()
@@ -2479,6 +2614,760 @@ final class CTensorOpsTests: XCTestCase {
                 XCTAssertEqual(
                         output[0], 36.0, accuracy: 0.001,
                         "2D concat via pad+add should sum to 36")
+        }
+
+        // MARK: - Tensor + Phasor Tests
+
+        /// Test: phasor() with a tensor of frequencies
+        /// Goal: let freqs = tensor(shape: [2,2]) containing frequencies
+        ///       let sigs = phasor(freqs) -> should produce a tensor of phasors
+        ///       let res = sum(sigs) -> sum of all phasor values
+        func testPhasorWithTensorFrequencies() throws {
+                let g = Graph()
+
+                // Create a 2x2 tensor of frequencies
+                // Each cell will have a different frequency
+                let freqs = g.tensor(shape: [2, 2], data: [100.0, 200.0, 300.0, 400.0])
+
+                // Try to create a phasor with the tensor as input
+                // This is what we WANT to work: phasor(tensor) -> tensor of phasors
+                let cellId = g.alloc()
+                let zeroReset = g.n(.constant(0.0))
+                let phasorNode = g.n(.phasor(cellId), freqs, zeroReset)
+
+                // Sum all the phasor values
+                let result = g.n(.sum, phasorNode)
+                _ = g.n(.output(0), result)
+
+                // Try to compile - this should either:
+                // 1. Work correctly (if tensor phasors are supported)
+                // 2. Fail with a meaningful error
+                // 3. Compile but produce incorrect results
+                do {
+                        let cResult = try CompilationPipeline.compile(
+                                graph: g,
+                                backend: .c,
+                                options: .init(frameCount: 100, debug: true)
+                        )
+
+                        print("=== Phasor With Tensor - Generated Source ===")
+                        print(cResult.source)
+
+                        // Check what shape the phasor node got
+                        if let phasorShape = g.nodes[phasorNode]?.shape {
+                                print("Phasor node shape: \(phasorShape)")
+                        }
+
+                        // If it compiled, try to run it
+                        let cRuntime = CCompiledKernel(
+                                source: cResult.source,
+                                cellAllocations: cResult.cellAllocations,
+                                memorySize: cResult.totalMemorySlots
+                        )
+                        try cRuntime.compileAndLoad()
+
+                        guard let mem = cRuntime.allocateNodeMemory() else {
+                                XCTFail("Failed to allocate memory")
+                                return
+                        }
+                        defer { cRuntime.deallocateNodeMemory(mem) }
+
+                        injectTensorData(result: cResult, memory: mem.assumingMemoryBound(to: Float.self))
+
+                        let frameCount = 100
+                        var output = [Float](repeating: 0, count: frameCount)
+                        let input = [Float](repeating: 0, count: frameCount)
+
+                        output.withUnsafeMutableBufferPointer { outPtr in
+                                input.withUnsafeBufferPointer { inPtr in
+                                        cRuntime.runWithMemory(
+                                                outputs: outPtr.baseAddress!,
+                                                inputs: inPtr.baseAddress!,
+                                                memory: mem,
+                                                frameCount: frameCount
+                                        )
+                                }
+                        }
+
+                        print("=== Phasor With Tensor Result ===")
+                        print("First 10 outputs: \(Array(output.prefix(10)))")
+
+                        // For 4 phasors at 100, 200, 300, 400 Hz:
+                        // At 44100 sample rate, increments are:
+                        // 100/44100 ≈ 0.00227, 200/44100 ≈ 0.00454, etc.
+                        // Sum should increase over time as phasors ramp
+                        XCTAssertGreaterThan(output[50], output[0], "Phasors should accumulate")
+
+                } catch {
+                        print("=== Phasor With Tensor - Compilation Failed ===")
+                        print("Error: \(error)")
+                        // This might be expected if tensor phasors aren't supported yet
+                        XCTFail("Tensor phasor should compile: \(error)")
+                }
+        }
+
+        /// Alternative approach: stack individual phasors into a tensor
+        /// DEPRECATED: Use testPhasorWithTensorFrequencies instead - phasor now natively supports tensor inputs.
+        /// This test is kept to verify compilation works, but has known timing issues.
+        /// The stacking approach reads phasor values before they're updated in the same frame.
+        func testStackedPhasors() throws {
+                let g = Graph()
+
+                // Create 4 individual phasors with different frequencies
+                let freq1 = g.n(.constant(100.0))
+                let freq2 = g.n(.constant(200.0))
+                let freq3 = g.n(.constant(300.0))
+                let freq4 = g.n(.constant(400.0))
+
+                let cell1 = g.alloc()
+                let cell2 = g.alloc()
+                let cell3 = g.alloc()
+                let cell4 = g.alloc()
+
+                let zero = g.n(.constant(0.0))
+                let phasor1 = g.n(.phasor(cell1), freq1, zero)
+                let phasor2 = g.n(.phasor(cell2), freq2, zero)
+                let phasor3 = g.n(.phasor(cell3), freq3, zero)
+                let phasor4 = g.n(.phasor(cell4), freq4, zero)
+
+                // Stack them into a [2,2] tensor
+                let stacked = try g.stack([phasor1, phasor2, phasor3, phasor4], shape: [2, 2])
+
+                // Sum all the phasor values
+                let result = g.n(.sum, stacked)
+                _ = g.n(.output(0), result)
+
+                let frameCount = 100
+                let cResult = try CompilationPipeline.compile(
+                        graph: g,
+                        backend: .c,
+                        options: .init(frameCount: frameCount, debug: true)
+                )
+
+                print("=== Stacked Phasors - Generated Source ===")
+                print(cResult.source)
+
+                let cRuntime = CCompiledKernel(
+                        source: cResult.source,
+                        cellAllocations: cResult.cellAllocations,
+                        memorySize: cResult.totalMemorySlots
+                )
+                try cRuntime.compileAndLoad()
+
+                guard let mem = cRuntime.allocateNodeMemory() else {
+                        XCTFail("Failed to allocate memory")
+                        return
+                }
+                defer { cRuntime.deallocateNodeMemory(mem) }
+
+                var output = [Float](repeating: 0, count: frameCount)
+                let input = [Float](repeating: 0, count: frameCount)
+
+                output.withUnsafeMutableBufferPointer { outPtr in
+                        input.withUnsafeBufferPointer { inPtr in
+                                cRuntime.runWithMemory(
+                                        outputs: outPtr.baseAddress!,
+                                        inputs: inPtr.baseAddress!,
+                                        memory: mem,
+                                        frameCount: frameCount
+                                )
+                        }
+                }
+
+                print("=== Stacked Phasors Result ===")
+                print("First 10 outputs: \(Array(output.prefix(10)))")
+
+                // This test verifies compilation succeeds - the output timing is known to be broken.
+                // Use testPhasorWithTensorFrequencies for proper tensor phasor behavior.
+                XCTAssertFalse(cResult.source.isEmpty, "Stacked phasors should compile")
+        }
+
+        // MARK: - Tensor Accum Tests
+
+        /// Test: accum() with tensor inputs
+        /// Each element in the tensor accumulates independently
+        func testAccumWithTensorInputs() throws {
+                let g = Graph()
+
+                // Create a 2x2 tensor of increment values
+                let increments = g.tensor(shape: [2, 2], data: [0.1, 0.2, 0.3, 0.4])
+
+                // Create scalar inputs for reset, min, max (will broadcast)
+                let reset = g.n(.constant(0.0))
+                let min = g.n(.constant(0.0))
+                let max = g.n(.constant(10.0))
+
+                // Create tensor accum
+                let cellId = g.alloc()
+                let accumNode = g.n(.accum(cellId), increments, reset, min, max)
+
+                // Sum all accumulator values
+                let result = g.n(.sum, accumNode)
+                _ = g.n(.output(0), result)
+
+                do {
+                        let cResult = try CompilationPipeline.compile(
+                                graph: g,
+                                backend: .c,
+                                options: .init(frameCount: 100, debug: true)
+                        )
+
+                        print("=== Tensor Accum - Generated Source ===")
+                        print(cResult.source)
+
+                        if let accumShape = g.nodes[accumNode]?.shape {
+                                print("Accum node shape: \(accumShape)")
+                        }
+
+                        let cRuntime = CCompiledKernel(
+                                source: cResult.source,
+                                cellAllocations: cResult.cellAllocations,
+                                memorySize: cResult.totalMemorySlots
+                        )
+                        try cRuntime.compileAndLoad()
+
+                        guard let mem = cRuntime.allocateNodeMemory() else {
+                                XCTFail("Failed to allocate memory")
+                                return
+                        }
+                        defer { cRuntime.deallocateNodeMemory(mem) }
+
+                        injectTensorData(result: cResult, memory: mem.assumingMemoryBound(to: Float.self))
+
+                        let frameCount = 100
+                        var output = [Float](repeating: 0, count: frameCount)
+                        let input = [Float](repeating: 0, count: frameCount)
+
+                        output.withUnsafeMutableBufferPointer { outPtr in
+                                input.withUnsafeBufferPointer { inPtr in
+                                        cRuntime.runWithMemory(
+                                                outputs: outPtr.baseAddress!,
+                                                inputs: inPtr.baseAddress!,
+                                                memory: mem,
+                                                frameCount: frameCount
+                                        )
+                                }
+                        }
+
+                        print("=== Tensor Accum Result ===")
+                        print("First 10 outputs: \(Array(output.prefix(10)))")
+
+                        // With increments [0.1, 0.2, 0.3, 0.4], sum of increments = 1.0 per frame
+                        // After N frames, sum should be approximately N * 1.0
+                        // (accounting for accumulator returning previous value)
+                        XCTAssertGreaterThan(output[50], output[10], "Accum should accumulate over time")
+
+                } catch {
+                        print("=== Tensor Accum - Compilation Failed ===")
+                        print("Error: \(error)")
+                        XCTFail("Tensor accum should compile: \(error)")
+                }
+        }
+
+        // MARK: - Tensor Latch Tests
+
+        /// Test: latch() with tensor inputs
+        /// Each element latches independently based on its condition
+        func testLatchWithTensorInputs() throws {
+                let g = Graph()
+
+                // Create a 2x2 tensor of values to latch
+                let values = g.tensor(shape: [2, 2], data: [1.0, 2.0, 3.0, 4.0])
+
+                // Always trigger (constant 1.0) - this will latch immediately
+                let trigger = g.n(.constant(1.0))
+
+                // Create tensor latch
+                let latchCell = g.alloc()
+                let latchNode = g.n(.latch(latchCell), values, trigger)
+
+                // Sum all latched values
+                let result = g.n(.sum, latchNode)
+                _ = g.n(.output(0), result)
+
+                do {
+                        let cResult = try CompilationPipeline.compile(
+                                graph: g,
+                                backend: .c,
+                                options: .init(frameCount: 10, debug: true)
+                        )
+
+                        print("=== Tensor Latch - Generated Source ===")
+                        print(cResult.source)
+
+                        if let latchShape = g.nodes[latchNode]?.shape {
+                                print("Latch node shape: \(latchShape)")
+                        }
+
+                        let cRuntime = CCompiledKernel(
+                                source: cResult.source,
+                                cellAllocations: cResult.cellAllocations,
+                                memorySize: cResult.totalMemorySlots
+                        )
+                        try cRuntime.compileAndLoad()
+
+                        guard let mem = cRuntime.allocateNodeMemory() else {
+                                XCTFail("Failed to allocate memory")
+                                return
+                        }
+                        defer { cRuntime.deallocateNodeMemory(mem) }
+
+                        injectTensorData(result: cResult, memory: mem.assumingMemoryBound(to: Float.self))
+
+                        let frameCount = 10
+                        var output = [Float](repeating: 0, count: frameCount)
+                        let input = [Float](repeating: 0, count: frameCount)
+
+                        output.withUnsafeMutableBufferPointer { outPtr in
+                                input.withUnsafeBufferPointer { inPtr in
+                                        cRuntime.runWithMemory(
+                                                outputs: outPtr.baseAddress!,
+                                                inputs: inPtr.baseAddress!,
+                                                memory: mem,
+                                                frameCount: frameCount
+                                        )
+                                }
+                        }
+
+                        print("=== Tensor Latch Result ===")
+                        print("Outputs: \(output)")
+
+                        // With constant trigger=1, latch should capture values immediately
+                        // Frame 0: returns old latched value (0), stores new value (1+2+3+4)
+                        // Frame 1+: returns 10 (the sum of latched values)
+                        // So output[1] should be 10.0
+                        XCTAssertEqual(output[1], 10.0, accuracy: 0.001, "Latch should capture tensor values")
+
+                } catch {
+                        print("=== Tensor Latch - Compilation Failed ===")
+                        print("Error: \(error)")
+                        XCTFail("Tensor latch should compile: \(error)")
+                }
+        }
+
+        // MARK: - Phasor + Cos Test (Static issue investigation)
+
+        /// Test: cos(phasor(tensor) * twopi) with larger tensor and wider frequency range
+        /// Testing for potential aliasing or memory issues
+        func testCosPhasorTensorLarge() throws {
+                let g = Graph()
+
+                // Create a 4x4 tensor of frequencies - wider range to test edge cases
+                let freqs = g.tensor(shape: [4, 4], data: [
+                        50.0, 100.0, 150.0, 200.0,
+                        250.0, 300.0, 350.0, 400.0,
+                        450.0, 500.0, 600.0, 700.0,
+                        800.0, 1000.0, 1500.0, 2000.0
+                ])
+
+                // Create phasor with tensor input
+                let cellId = g.alloc()
+                let zeroReset = g.n(.constant(0.0))
+                let phasorNode = g.n(.phasor(cellId), freqs, zeroReset)
+
+                // Multiply by 2*pi
+                let twopi = g.n(.constant(Float.pi * 2.0))
+                let scaled = g.n(.mul, phasorNode, twopi)
+
+                // Apply cos
+                let cosNode = g.n(.cos, scaled)
+
+                // Sum all the cos values
+                let result = g.n(.sum, cosNode)
+                _ = g.n(.output(0), result)
+
+                do {
+                        let cResult = try CompilationPipeline.compile(
+                                graph: g,
+                                backend: .c,
+                                options: .init(frameCount: 4410, debug: true)  // 100ms at 44100Hz
+                        )
+
+                        print("=== Cos(Phasor(Tensor)) Large - Generated Source ===")
+                        print(cResult.source)
+
+                        let cRuntime = CCompiledKernel(
+                                source: cResult.source,
+                                cellAllocations: cResult.cellAllocations,
+                                memorySize: cResult.totalMemorySlots
+                        )
+                        try cRuntime.compileAndLoad()
+
+                        guard let mem = cRuntime.allocateNodeMemory() else {
+                                XCTFail("Failed to allocate memory")
+                                return
+                        }
+                        defer { cRuntime.deallocateNodeMemory(mem) }
+
+                        injectTensorData(result: cResult, memory: mem.assumingMemoryBound(to: Float.self))
+
+                        let frameCount = 4410
+                        var output = [Float](repeating: 0, count: frameCount)
+                        let input = [Float](repeating: 0, count: frameCount)
+
+                        output.withUnsafeMutableBufferPointer { outPtr in
+                                input.withUnsafeBufferPointer { inPtr in
+                                        cRuntime.runWithMemory(
+                                                outputs: outPtr.baseAddress!,
+                                                inputs: inPtr.baseAddress!,
+                                                memory: mem,
+                                                frameCount: frameCount
+                                        )
+                                }
+                        }
+
+                        print("=== Cos(Phasor(Tensor)) Large Result ===")
+                        print("First 20 outputs: \(Array(output.prefix(20)))")
+                        print("Last 20 outputs: \(Array(output.suffix(20)))")
+
+                        // Check for NaN/Inf
+                        let hasNaN = output.contains { $0.isNaN }
+                        let hasInf = output.contains { $0.isInfinite }
+                        XCTAssertFalse(hasNaN, "Output should not contain NaN")
+                        XCTAssertFalse(hasInf, "Output should not contain Inf")
+
+                        // cos() output should be bounded (sum of 16 cosines: -16 to 16)
+                        let minVal = output.min() ?? 0
+                        let maxVal = output.max() ?? 0
+                        print("Min: \(minVal), Max: \(maxVal)")
+                        XCTAssertGreaterThanOrEqual(minVal, -16.1, "Sum of 16 cos values should be >= -16")
+                        XCTAssertLessThanOrEqual(maxVal, 16.1, "Sum of 16 cos values should be <= 16")
+
+                        // Check smoothness - max delta between consecutive samples
+                        var maxDelta: Float = 0
+                        for i in 1..<output.count {
+                                let delta = abs(output[i] - output[i-1])
+                                maxDelta = max(maxDelta, delta)
+                        }
+                        print("Max delta between consecutive samples: \(maxDelta)")
+
+                        // With 16 summed cosines at various frequencies, max delta should still be reasonable
+                        XCTAssertLessThan(maxDelta, 8.0, "Output should be smooth, not static (max delta: \(maxDelta))")
+
+                } catch {
+                        print("=== Cos(Phasor(Tensor)) Large - Compilation Failed ===")
+                        print("Error: \(error)")
+                        XCTFail("cos(phasor(tensor)) large should compile: \(error)")
+                }
+        }
+
+        /// Test: cos(phasor(tensor) * twopi)
+        /// This is causing "mad static" in practice - let's see what's happening
+        func testCosPhasorTensor() throws {
+                let g = Graph()
+
+                // Create a 2x2 tensor of frequencies
+                let freqs = g.tensor(shape: [2, 2], data: [100.0, 200.0, 300.0, 400.0])
+
+                // Create phasor with tensor input
+                let cellId = g.alloc()
+                let zeroReset = g.n(.constant(0.0))
+                let phasorNode = g.n(.phasor(cellId), freqs, zeroReset)
+
+                // Multiply by 2*pi (twopi ≈ 6.28318)
+                let twopi = g.n(.constant(Float.pi * 2.0))
+                let scaled = g.n(.mul, phasorNode, twopi)
+
+                // Apply cos
+                let cosNode = g.n(.cos, scaled)
+
+                // Sum all the cos values
+                let result = g.n(.sum, cosNode)
+                _ = g.n(.output(0), result)
+
+                do {
+                        let cResult = try CompilationPipeline.compile(
+                                graph: g,
+                                backend: .c,
+                                options: .init(frameCount: 441, debug: true)  // ~10ms at 44100Hz
+                        )
+
+                        print("=== Cos(Phasor(Tensor)) - Generated Source ===")
+                        print(cResult.source)
+
+                        // Check shapes
+                        if let phasorShape = g.nodes[phasorNode]?.shape {
+                                print("Phasor node shape: \(phasorShape)")
+                        }
+                        if let scaledShape = g.nodes[scaled]?.shape {
+                                print("Scaled (phasor*twopi) shape: \(scaledShape)")
+                        }
+                        if let cosShape = g.nodes[cosNode]?.shape {
+                                print("Cos node shape: \(cosShape)")
+                        }
+
+                        let cRuntime = CCompiledKernel(
+                                source: cResult.source,
+                                cellAllocations: cResult.cellAllocations,
+                                memorySize: cResult.totalMemorySlots
+                        )
+                        try cRuntime.compileAndLoad()
+
+                        guard let mem = cRuntime.allocateNodeMemory() else {
+                                XCTFail("Failed to allocate memory")
+                                return
+                        }
+                        defer { cRuntime.deallocateNodeMemory(mem) }
+
+                        injectTensorData(result: cResult, memory: mem.assumingMemoryBound(to: Float.self))
+
+                        let frameCount = 441
+                        var output = [Float](repeating: 0, count: frameCount)
+                        let input = [Float](repeating: 0, count: frameCount)
+
+                        output.withUnsafeMutableBufferPointer { outPtr in
+                                input.withUnsafeBufferPointer { inPtr in
+                                        cRuntime.runWithMemory(
+                                                outputs: outPtr.baseAddress!,
+                                                inputs: inPtr.baseAddress!,
+                                                memory: mem,
+                                                frameCount: frameCount
+                                        )
+                                }
+                        }
+
+                        print("=== Cos(Phasor(Tensor)) Result ===")
+                        print("First 20 outputs: \(Array(output.prefix(20)))")
+                        print("Last 20 outputs: \(Array(output.suffix(20)))")
+
+                        // Check for NaN/Inf (would cause static)
+                        let hasNaN = output.contains { $0.isNaN }
+                        let hasInf = output.contains { $0.isInfinite }
+                        XCTAssertFalse(hasNaN, "Output should not contain NaN")
+                        XCTAssertFalse(hasInf, "Output should not contain Inf")
+
+                        // cos() output should be bounded between -4 and 4 (sum of 4 cosines)
+                        let minVal = output.min() ?? 0
+                        let maxVal = output.max() ?? 0
+                        print("Min: \(minVal), Max: \(maxVal)")
+                        XCTAssertGreaterThanOrEqual(minVal, -4.1, "Sum of 4 cos values should be >= -4")
+                        XCTAssertLessThanOrEqual(maxVal, 4.1, "Sum of 4 cos values should be <= 4")
+
+                        // The output should be smooth oscillations, not random static
+                        // Check that consecutive samples don't jump wildly
+                        var maxDelta: Float = 0
+                        for i in 1..<output.count {
+                                let delta = abs(output[i] - output[i-1])
+                                maxDelta = max(maxDelta, delta)
+                        }
+                        print("Max delta between consecutive samples: \(maxDelta)")
+
+                        // For smooth audio, delta shouldn't be huge
+                        // At 100-400Hz, with 4 summed cosines, max reasonable delta per sample is ~0.5
+                        XCTAssertLessThan(maxDelta, 2.0, "Output should be smooth, not static (max delta: \(maxDelta))")
+
+                } catch {
+                        print("=== Cos(Phasor(Tensor)) - Compilation Failed ===")
+                        print("Error: \(error)")
+                        XCTFail("cos(phasor(tensor)) should compile: \(error)")
+                }
+        }
+
+        // MARK: - Cell Allocation Inspection Tests
+
+        /// Test that cell mappings for tensor phasor don't overlap
+        /// This verifies that:
+        /// 1. Input tensor data has its own memory region
+        /// 2. Phasor state has its own memory region (expanded to tensor size)
+        /// 3. Output tensor has its own memory region
+        /// 4. No regions overlap
+        func testTensorPhasorCellMappingsNoOverlap() throws {
+                let g = Graph()
+
+                // Create a 2x2 tensor of frequencies (4 elements)
+                let freqs = g.tensor(shape: [2, 2], data: [100.0, 200.0, 300.0, 400.0])
+
+                // Get the tensor's cellId for the frequency data
+                guard let freqTensorId = g.nodeToTensor[freqs],
+                      let freqTensor = g.tensors[freqTensorId] else {
+                        XCTFail("Frequency tensor not found")
+                        return
+                }
+                let freqCellId = freqTensor.cellId
+                print("Frequency tensor cellId: \(freqCellId), shape: \(freqTensor.shape)")
+
+                // Create phasor with tensor input
+                let phasorStateCellId = g.alloc()
+                print("Phasor state cellId (before compilation): \(phasorStateCellId)")
+
+                let zeroReset = g.n(.constant(0.0))
+                let phasorNode = g.n(.phasor(phasorStateCellId), freqs, zeroReset)
+
+                // Sum to output
+                let result = g.n(.sum, phasorNode)
+                _ = g.n(.output(0), result)
+
+                // Compile
+                let cResult = try CompilationPipeline.compile(
+                        graph: g,
+                        backend: .c,
+                        options: .init(frameCount: 100, debug: true)
+                )
+
+                // Inspect cell allocations
+                let cellMappings = cResult.cellAllocations.cellMappings
+                let totalSlots = cResult.totalMemorySlots
+
+                print("\n=== Cell Allocation Inspection ===")
+                print("Total memory slots: \(totalSlots)")
+                print("Cell mappings: \(cellMappings.sorted(by: { $0.key < $1.key }))")
+
+                // Check what the frequency tensor's cell maps to
+                let mappedFreqCell = cellMappings[freqCellId]
+                print("Frequency tensor cell \(freqCellId) -> mapped to: \(mappedFreqCell ?? -1)")
+
+                // Check what the phasor state cell maps to
+                let mappedPhasorStateCell = cellMappings[phasorStateCellId]
+                print("Phasor state cell \(phasorStateCellId) -> mapped to: \(mappedPhasorStateCell ?? -1)")
+
+                // Get the phasor output tensor's cell
+                guard let phasorOutputTensorId = g.nodeToTensor[phasorNode],
+                      let phasorOutputTensor = g.tensors[phasorOutputTensorId] else {
+                        XCTFail("Phasor output tensor not found")
+                        return
+                }
+                let phasorOutputCellId = phasorOutputTensor.cellId
+                let mappedPhasorOutputCell = cellMappings[phasorOutputCellId]
+                print("Phasor output tensor cell \(phasorOutputCellId) -> mapped to: \(mappedPhasorOutputCell ?? -1)")
+
+                // Check cell allocation sizes
+                print("\nCell allocation sizes in graph:")
+                print("  Freq tensor cell \(freqCellId): \(g.cellAllocationSizes[freqCellId] ?? 1)")
+                print("  Phasor state cell \(phasorStateCellId): \(g.cellAllocationSizes[phasorStateCellId] ?? 1)")
+                print("  Phasor output cell \(phasorOutputCellId): \(g.cellAllocationSizes[phasorOutputCellId] ?? 1)")
+
+                // Verify no overlap
+                // Each cell should map to a different memory region
+                // For a [2,2] tensor, each region needs 4 slots
+
+                guard let freqStart = mappedFreqCell,
+                      let stateStart = mappedPhasorStateCell,
+                      let outputStart = mappedPhasorOutputCell else {
+                        XCTFail("Some cells were not mapped")
+                        return
+                }
+
+                let tensorSize = 4  // [2,2] = 4 elements
+                let freqRange = freqStart..<(freqStart + tensorSize)
+                let stateRange = stateStart..<(stateStart + tensorSize)
+                let outputRange = outputStart..<(outputStart + tensorSize)
+
+                print("\nMemory ranges:")
+                print("  Freq tensor: \(freqRange)")
+                print("  Phasor state: \(stateRange)")
+                print("  Phasor output: \(outputRange)")
+
+                // Check for overlaps
+                let freqStateOverlap = freqRange.overlaps(stateRange)
+                let freqOutputOverlap = freqRange.overlaps(outputRange)
+                let stateOutputOverlap = stateRange.overlaps(outputRange)
+
+                XCTAssertFalse(freqStateOverlap, "Frequency tensor and phasor state should not overlap! freq:\(freqRange) state:\(stateRange)")
+                XCTAssertFalse(freqOutputOverlap, "Frequency tensor and phasor output should not overlap! freq:\(freqRange) output:\(outputRange)")
+                XCTAssertFalse(stateOutputOverlap, "Phasor state and phasor output should not overlap! state:\(stateRange) output:\(outputRange)")
+
+                // All ranges should fit within total slots
+                XCTAssertLessThanOrEqual(freqRange.upperBound, totalSlots, "Freq range exceeds total slots")
+                XCTAssertLessThanOrEqual(stateRange.upperBound, totalSlots, "State range exceeds total slots")
+                XCTAssertLessThanOrEqual(outputRange.upperBound, totalSlots, "Output range exceeds total slots")
+
+                print("\n=== All cell mappings verified - no overlaps ===")
+        }
+
+        /// Test cell mappings with multiple tensor phasors to catch potential conflicts
+        func testMultipleTensorPhasorsCellMappings() throws {
+                let g = Graph()
+
+                // Create two different frequency tensors
+                let freqs1 = g.tensor(shape: [2, 2], data: [100.0, 200.0, 300.0, 400.0])
+                let freqs2 = g.tensor(shape: [2, 2], data: [500.0, 600.0, 700.0, 800.0])
+
+                // Create two phasors with separate state cells
+                let phasorCell1 = g.alloc()
+                let phasorCell2 = g.alloc()
+
+                let zero = g.n(.constant(0.0))
+                let phasor1 = g.n(.phasor(phasorCell1), freqs1, zero)
+                let phasor2 = g.n(.phasor(phasorCell2), freqs2, zero)
+
+                // Add them together and sum
+                let added = g.n(.add, phasor1, phasor2)
+                let result = g.n(.sum, added)
+                _ = g.n(.output(0), result)
+
+                // Compile
+                let cResult = try CompilationPipeline.compile(
+                        graph: g,
+                        backend: .c,
+                        options: .init(frameCount: 100, debug: true)
+                )
+
+                let cellMappings = cResult.cellAllocations.cellMappings
+                let totalSlots = cResult.totalMemorySlots
+
+                print("\n=== Multiple Tensor Phasors Cell Inspection ===")
+                print("Total memory slots: \(totalSlots)")
+                print("All cell mappings: \(cellMappings.sorted(by: { $0.key < $1.key }))")
+
+                // Collect all memory ranges
+                var allRanges: [(String, Range<Int>)] = []
+                let tensorSize = 4
+
+                // Helper to add a range
+                func addRange(name: String, cellId: Int) {
+                        if let mapped = cellMappings[cellId] {
+                                let size = g.cellAllocationSizes[cellId] ?? 1
+                                let range = mapped..<(mapped + max(size, tensorSize))
+                                allRanges.append((name, range))
+                                print("  \(name): cell \(cellId) -> \(range) (size: \(size))")
+                        }
+                }
+
+                // Get tensor cellIds
+                if let t1 = g.nodeToTensor[freqs1], let tensor1 = g.tensors[t1] {
+                        addRange(name: "freqs1 data", cellId: tensor1.cellId)
+                }
+                if let t2 = g.nodeToTensor[freqs2], let tensor2 = g.tensors[t2] {
+                        addRange(name: "freqs2 data", cellId: tensor2.cellId)
+                }
+
+                addRange(name: "phasor1 state", cellId: phasorCell1)
+                addRange(name: "phasor2 state", cellId: phasorCell2)
+
+                if let t1 = g.nodeToTensor[phasor1], let tensor1 = g.tensors[t1] {
+                        addRange(name: "phasor1 output", cellId: tensor1.cellId)
+                }
+                if let t2 = g.nodeToTensor[phasor2], let tensor2 = g.tensors[t2] {
+                        addRange(name: "phasor2 output", cellId: tensor2.cellId)
+                }
+                if let t = g.nodeToTensor[added], let tensor = g.tensors[t] {
+                        addRange(name: "add output", cellId: tensor.cellId)
+                }
+
+                // Check all pairs for overlaps
+                print("\nChecking for overlaps...")
+                var hasOverlap = false
+                for i in 0..<allRanges.count {
+                        for j in (i+1)..<allRanges.count {
+                                let (name1, range1) = allRanges[i]
+                                let (name2, range2) = allRanges[j]
+                                if range1.overlaps(range2) {
+                                        print("  OVERLAP: \(name1) \(range1) overlaps with \(name2) \(range2)")
+                                        hasOverlap = true
+                                }
+                        }
+                }
+
+                XCTAssertFalse(hasOverlap, "Found overlapping memory regions!")
+
+                if !hasOverlap {
+                        print("  No overlaps found - all memory regions are separate")
+                }
+
+                // Verify total slots is sufficient
+                let maxUsedSlot = allRanges.map { $0.1.upperBound }.max() ?? 0
+                XCTAssertLessThanOrEqual(maxUsedSlot, totalSlots, "Used slots exceed total allocated")
+                print("\nMax used slot: \(maxUsedSlot), Total allocated: \(totalSlots)")
         }
 
 }

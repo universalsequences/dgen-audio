@@ -312,8 +312,14 @@ public func scalarNodes(_ g: Graph, feedbackClusters: [[NodeID]]) -> Set<NodeID>
         changed = false
         g.nodes.values.forEach { node in
             for inputId in node.inputs {
-                if tensorNodes.contains(inputId) && !scalar.contains(node.id) {
-                    scalar.insert(node.id)
+                if tensorNodes.contains(inputId) {
+                    // Mark as scalar if not already
+                    if !scalar.contains(node.id) {
+                        scalar.insert(node.id)
+                        changed = true
+                    }
+                    // Also propagate tensorNodes status (separate from scalar check)
+                    // This ensures cos(tensor) is in tensorNodes even if already scalar
                     if !tensorNodes.contains(node.id) {
                         tensorNodes.insert(node.id)
                         changed = true
@@ -322,6 +328,64 @@ public func scalarNodes(_ g: Graph, feedbackClusters: [[NodeID]]) -> Set<NodeID>
             }
         }
     }
+
+    // Track frame-based tensor producers (phasor/accum/latch with tensor input).
+    // These produce tensors whose values change every frame, so downstream tensor ops
+    // must also run per-frame (scalar) to stay synchronized.
+    // Note: We check if any input is a tensor node (since shape inference hasn't run yet)
+    var frameBasedTensorNodes: Set<NodeID> = []
+    for (nodeId, node) in g.nodes {
+        switch node.op {
+        case .phasor(_), .accum(_), .latch(_):
+            // Check if this stateful op has a tensor input
+            let hasTensorInput = node.inputs.contains { tensorNodes.contains($0) }
+            if hasTensorInput {
+                frameBasedTensorNodes.insert(nodeId)
+                // Also add to tensorNodes since it produces a tensor
+                tensorNodes.insert(nodeId)
+                print("[FRAME-TENSOR] Found frame-based tensor producer: \(nodeId) (\(node.op))")
+            }
+        default:
+            break
+        }
+    }
+    print("[FRAME-TENSOR] Initial frameBasedTensorNodes: \(frameBasedTensorNodes)")
+
+    // Propagate frame-based tensor status to downstream tensor consumers.
+    // Any tensor op that consumes a frame-based tensor must also be scalar,
+    // because its input values change every frame.
+    // We iterate until no changes, checking ALL inputs (not just direct ones).
+    changed = true
+    var iteration = 0
+    while changed {
+        changed = false
+        iteration += 1
+        for (nodeId, node) in g.nodes {
+            // Skip if already marked as frame-based tensor
+            if frameBasedTensorNodes.contains(nodeId) { continue }
+
+            // Check if any input is a frame-based tensor
+            for inputId in node.inputs {
+                if frameBasedTensorNodes.contains(inputId) {
+                    // This node consumes a frame-based tensor
+                    print("[FRAME-TENSOR] iter \(iteration): node \(nodeId) (\(node.op)) consumes frame-based \(inputId), tensorNodes.contains=\(tensorNodes.contains(nodeId))")
+                    // Mark as scalar (must run per-frame)
+                    if !scalar.contains(nodeId) {
+                        scalar.insert(nodeId)
+                        changed = true
+                    }
+                    // If this node is a tensor op, it's also a frame-based tensor producer
+                    // (so downstream tensor ops will also be marked)
+                    if tensorNodes.contains(nodeId) {
+                        frameBasedTensorNodes.insert(nodeId)
+                        changed = true
+                    }
+                    break
+                }
+            }
+        }
+    }
+    print("[FRAME-TENSOR] Final frameBasedTensorNodes: \(frameBasedTensorNodes)")
 
     // Use the new feedback loop detection to mark all nodes in feedback loops as scalar
     for loop in feedbackClusters {
@@ -982,6 +1046,8 @@ private func containsSIMDBlockers(_ uops: [UOp]) -> Bool {
             return true
         case .broadcastAccess:
             return true
+        case .requiresScalar:
+            return true  // Stateful ops (phasor, accum, latch) need sample-by-sample execution
         default:
             break
         }
@@ -1024,14 +1090,17 @@ public func emitBlockUOps(
     }
 
     // Step 2: Analyze emitted UOps to determine if SIMD is safe
-    // SIMD is safe if: tensor block + size divisible by 4 + no SIMD blockers
+    // SIMD is safe if: tensor block + size divisible by 4 + no SIMD blockers + not frame-based
     let hasSIMDBlockers = containsSIMDBlockers(bodyUops)
     let canUseSIMD: Bool
     let simdIncrement: Int
 
     if let shape = block.shape, block.tensorIndex != nil {
         let size = shape.reduce(1, *)
-        canUseSIMD = !hasSIMDBlockers && (size % 4 == 0)
+        // Frame-based tensor blocks must run element-by-element per frame
+        // because their values change every frame (e.g., downstream of phasor(tensor))
+        let isFrameBased = block.temporality == .frameBased
+        canUseSIMD = !hasSIMDBlockers && !isFrameBased && (size % 4 == 0)
         simdIncrement = canUseSIMD ? 4 : 1
     } else {
         canUseSIMD = false

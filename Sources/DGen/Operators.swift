@@ -84,6 +84,7 @@ public enum LazyOp {
     case seq  // Sequential execution - returns value of last input
 
     // Tensor operations (historyRead/historyWrite handle tensors automatically based on cell size)
+    case conv1d(Int)    // 1D convolution, Int is kernel size
     case conv2d(Shape)  // 2D convolution, Shape is kernel shape [kH, kW]
     case sum  // Reduce tensor to scalar by summing all elements
     case sumAxis(Int)  // Reduce along a specific axis
@@ -405,9 +406,37 @@ public enum LazyOp {
                 throw DGenError.insufficientInputs(
                     operator: "latch", expected: 2, actual: inputs.count)
             }
-            let value = b.value(inputs[0])
-            let cond = b.value(inputs[1])
-            b.use(val: u_latch(cellId, value: value, cond: cond)(b))
+
+            // Check if we're in a tensor context
+            if let tensorIndex = ctx.tensorIndices[nodeId] {
+                // Tensor latch: read inputs from tensors, use indexed state
+                // Mark as requiring scalar execution - latch state updates sample-by-sample
+                b.markRequiresScalar()
+
+                let value = try b.readInput(node, inputs, at: 0)
+                let cond = try b.readInput(node, inputs, at: 1)
+                let idx = b.value(tensorIndex)
+
+                let zero = b.constant(0.0)
+
+                // Load current latched value from indexed position
+                let latched = b.memoryRead(cellId, b.cast(idx, to: .int))
+
+                // If cond > 0, store new value; else keep latched
+                // Use gswitch for SIMD compatibility
+                let newLatched = b.gswitch(cond > zero, value, latched)
+
+                // Store the result
+                _ = b.memoryWrite(cellId, b.cast(idx, to: .int), newLatched)
+
+                // Output the latched value (returns old value, like scalar latch)
+                try b.writeOutput(node, latched)
+            } else {
+                // Scalar latch: use original implementation
+                let value = b.value(inputs[0])
+                let cond = b.value(inputs[1])
+                b.use(val: u_latch(cellId, value: value, cond: cond)(b))
+            }
         case .mix:
             guard inputs.count == 3 else {
                 throw DGenError.insufficientInputs(
@@ -423,8 +452,49 @@ public enum LazyOp {
                 throw DGenError.insufficientInputs(
                     operator: "accum", expected: 4, actual: inputs.count)
             }
-            let (incr, reset, min, max) = b.values(inputs, count: 4)
-            b.use(val: u_accum(cellId, incr: incr, reset: reset, min: min, max: max)(b))
+
+            // Check if we're in a tensor context
+            if let tensorIndex = ctx.tensorIndices[nodeId] {
+                // Tensor accum: read inputs from tensors, use indexed state
+                // Mark as requiring scalar execution - accum state accumulates sample-by-sample
+                b.markRequiresScalar()
+
+                let incr = try b.readInput(node, inputs, at: 0)
+                let reset = try b.readInput(node, inputs, at: 1)
+                let min = try b.readInput(node, inputs, at: 2)
+                let max = try b.readInput(node, inputs, at: 3)
+                let idx = b.value(tensorIndex)
+
+                let zero = b.constant(0.0)
+                let span = max - min
+
+                // Load current state from indexed position
+                let acc = b.memoryRead(cellId, b.cast(idx, to: .int))
+
+                let nextCand = acc + incr
+                let next = b.gswitch(reset > zero, min, nextCand)
+
+                // Modulo wrap to [min, max)
+                let rel = next - min
+                let k = b.floor(rel / span)
+                let wBase = next - (k * span)
+
+                // Correct if >= max, using gswitch for SIMD compatibility
+                let corrected = b.gswitch(wBase >= max, wBase - span, wBase)
+
+                // Reset override using gswitch
+                let finalValue = b.gswitch(reset > zero, min, corrected)
+
+                // Store final value
+                _ = b.memoryWrite(cellId, b.cast(idx, to: .int), finalValue)
+
+                // Output the previous value (like scalar accum)
+                try b.writeOutput(node, acc)
+            } else {
+                // Scalar accum: use original implementation
+                let (incr, reset, min, max) = b.values(inputs, count: 4)
+                b.use(val: u_accum(cellId, incr: incr, reset: reset, min: min, max: max)(b))
+            }
         case .click(let cellId):
             guard inputs.count == 0 else {
                 throw DGenError.insufficientInputs(
@@ -436,8 +506,50 @@ public enum LazyOp {
                 throw DGenError.insufficientInputs(
                     operator: "phasor", expected: 2, actual: inputs.count)
             }
-            let (freq, reset) = b.values(inputs, count: 2)
-            b.use(val: u_phasor(cellId, freq: freq, reset: reset)(b))
+
+            // Check if we're in a tensor context
+            if let tensorIndex = ctx.tensorIndices[nodeId] {
+                // Tensor phasor: read freq from tensor, use indexed state
+                // Mark as requiring scalar execution - phasor state accumulates sample-by-sample
+                b.markRequiresScalar()
+
+                let freq = try b.readInput(node, inputs, at: 0)
+                let reset = try b.readInput(node, inputs, at: 1)
+                let idx = b.value(tensorIndex)
+
+                // Phasor accumulator logic with indexed state
+                // Uses gswitch instead of if statements for SIMD compatibility
+                let sampleRate = b.constant(44100.0)
+                let incr = freq / sampleRate
+                let zero = b.constant(0.0)
+                let one = b.constant(1.0)
+
+                // Load current state from indexed position
+                let acc = b.memoryRead(cellId, b.cast(idx, to: .int))
+
+                let nextCand = acc + incr
+                let next = b.gswitch(reset > zero, zero, nextCand)
+
+                // Modulo wrap to [0, 1)
+                let k = b.floor(next)
+                let wBase = next - k
+
+                // Correct if >= 1, using gswitch for SIMD compatibility
+                let corrected = b.gswitch(wBase >= one, wBase - one, wBase)
+
+                // Reset override using gswitch
+                let finalValue = b.gswitch(reset > zero, zero, corrected)
+
+                // Store final value
+                _ = b.memoryWrite(cellId, b.cast(idx, to: .int), finalValue)
+
+                // Output the previous value (like scalar phasor)
+                try b.writeOutput(node, acc)
+            } else {
+                // Scalar phasor: use original implementation
+                let (freq, reset) = b.values(inputs, count: 2)
+                b.use(val: u_phasor(cellId, freq: freq, reset: reset)(b))
+            }
         case .output(let outputNumber):
             guard inputs.count == 1 else {
                 throw DGenError.insufficientInputs(
@@ -466,6 +578,40 @@ public enum LazyOp {
             }
 
         // MARK: - Tensor Operations
+
+        case .conv1d(let kernelSize):
+            guard node.inputs.count >= 2,
+                case .tensor(let outShape) = node.shape,
+                case .tensor(let inShape) = g.nodes[node.inputs[0]]?.shape, inShape.count == 1,
+                let outCell = g.nodeToTensor[node.id].flatMap({ g.tensors[$0] })?.cellId,
+                let inTensor = g.nodeToTensor[node.inputs[0]].flatMap({ g.tensors[$0] }),
+                let kTensor = g.nodeToTensor[node.inputs[1]].flatMap({ g.tensors[$0] })
+            else {
+                throw DGenError.tensorError(op: "conv1d", reason: "requires 1D input/output tensors")
+            }
+
+            let inLen = inShape[0]
+            let pad = kernelSize / 2
+
+            b.parallelRange(outShape.reduce(1, *)) { flatIdx in
+                let outX = b.cast(flatIdx, to: .int)
+                let acc = b.float(0.0)
+
+                b.loop(kernelSize) { kx in
+                    let inX = outX + b.cast(kx, to: .float) - b.constant(Float(pad))
+                    let inBounds = (inX >= b.constant(0)) * (inX < b.constant(Float(inLen)))
+
+                    let rawIdx = b.tensorMemoryIndex(inTensor, indices: [b.cast(inX, to: .int)])
+                    let safeIdx = b.gswitch(inBounds, rawIdx, b.constant(0))
+                    let inVal = b.gswitch(inBounds, b.memoryRead(inTensor.cellId, safeIdx), b.constant(0))
+
+                    let kMemIdx = b.tensorMemoryIndex(kTensor, indices: [b.cast(kx, to: .int)])
+                    let kVal = b.memoryRead(kTensor.cellId, kMemIdx)
+
+                    acc.accumulate(inVal * kVal)
+                }
+                _ = b.memoryWrite(outCell, b.cast(flatIdx, to: .int), acc.value)
+            }
 
         case .conv2d(let kernelShape):
             guard node.inputs.count >= 2,
@@ -1010,6 +1156,13 @@ public enum LazyOp {
             }
 
         // MARK: - Tensor Operation Gradients
+
+        case .conv1d(_):
+            // Conv1d gradient: similar to conv2d, would require transposed convolution
+            // For now, we provide zero gradients (TODO: implement full backprop)
+            guard inputs.count == 2 else { fatalError("conv1d requires 2 inputs") }
+            b.grad(node.inputs[0], value: ctx.useConstant(src: nil, value: 0.0))
+            b.grad(node.inputs[1], value: ctx.useConstant(src: nil, value: 0.0))
 
         case .conv2d(_):
             // Conv2d gradient: gradient w.r.t. input = conv2d(grad_output, flipped_kernel)
