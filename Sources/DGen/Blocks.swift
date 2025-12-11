@@ -276,6 +276,8 @@ public func scalarNodes(_ g: Graph, feedbackClusters: [[NodeID]]) -> Set<NodeID>
             scalar.insert($0.id)
         case .sum:
             scalar.insert($0.id)
+        case .peek:
+            scalar.insert($0.id)  // Peek operations must be scalar (reads from tensor)
         default: break
         }
     }

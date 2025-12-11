@@ -92,6 +92,7 @@ public enum LazyOp {
     case transpose([Int])  // Transpose/permute axes (metadata only)
     case shrink([(Int, Int)?])  // Shrink/slice tensor (metadata only, no data movement)
     case pad([(Int, Int)])      // Pad tensor with zeros (virtual view, conditional reads)
+    case peek  // Read from 2D tensor at (index, channel) with interpolation - lazy version
 
     public func emit(ctx: IRContext, g: Graph, nodeId: NodeID) throws -> [UOp] {
         guard let node = g.nodes[nodeId] else { return [] }
@@ -742,6 +743,73 @@ public enum LazyOp {
             ctx.values[nodeId] = .empty
             // Emit marker UOp for debugging and to signal SIMD should be disabled
             ops.append(UOp(op: .pad(padding), value: .empty))
+
+        case .peek:
+            // Lazy peek: read from 2D tensor at (index, channel) with linear interpolation
+            // Inputs: [tensor, index, channel]
+            guard node.inputs.count == 3 else {
+                throw DGenError.insufficientInputs(operator: "peek", expected: 3, actual: node.inputs.count)
+            }
+
+            let tensorInput = node.inputs[0]
+
+            // Get tensor shape from the input node
+            guard let inputNode = g.nodes[tensorInput],
+                  case .tensor(let shape) = inputNode.shape,
+                  shape.count >= 2 else {
+                throw DGenError.tensorError(op: "peek", reason: "requires 2D tensor input")
+            }
+
+            // Try to get concrete tensor, or use shape info to compute access
+            let channelSize = shape[0]
+            let numChannels = shape[1]
+
+            // Read index and channel inputs
+            let index = try b.readInput(node, inputs, at: 1)
+            let channel = try b.readInput(node, inputs, at: 2)
+
+            let one = b.constant(1.0)
+            let zero = b.constant(0.0)
+            let channelSizeFloat = b.constant(Float(channelSize))
+
+            // Wrap index within channel using modulo
+            let wrappedIndex = b.mod(index, channelSizeFloat)
+            let isNegative = wrappedIndex < zero
+            let positiveIndex = b.gswitch(isNegative, wrappedIndex + channelSizeFloat, wrappedIndex)
+
+            // Clamp channel to valid range [0, numChannels-1]
+            let clampedChannel = b.floor(b.max(zero, b.min(channel, b.constant(Float(numChannels - 1)))))
+            let channelOffset = channelSizeFloat * clampedChannel
+
+            // Calculate final read position
+            let finalReadPos = channelOffset + positiveIndex
+
+            // Linear interpolation for fractional indices
+            let flooredPos = b.floor(finalReadPos)
+            let frac = finalReadPos - flooredPos
+
+            // Get tensor cellId - either from concrete tensor or from input tensor
+            let cellId: CellID
+            if let tensorId = g.nodeToTensor[tensorInput],
+               let tensor = g.tensors[tensorId] {
+                cellId = tensor.cellId
+            } else {
+                throw DGenError.tensorError(op: "peek", reason: "frame-based tensor peek requires tensor context - not yet implemented")
+            }
+
+            // Read two samples for interpolation
+            let sample1 = b.memoryRead(cellId, b.cast(flooredPos, to: .int))
+            let nextPos = flooredPos + one
+
+            // Wrap nextPos if it crosses channel boundary
+            let nextChannelOffset = channelOffset + channelSizeFloat
+            let nextPosWrapped = b.gswitch(nextPos >= nextChannelOffset, channelOffset, nextPos)
+
+            let sample2 = b.memoryRead(cellId, b.cast(nextPosWrapped, to: .int))
+
+            // Linear interpolation: (1-frac)*sample1 + frac*sample2
+            let interpolated = b.mix(sample1, sample2, frac)
+            b.use(val: interpolated)
         }
         ops.append(contentsOf: b.ops)
         return ops
@@ -1207,6 +1275,14 @@ public enum LazyOp {
             // (padded regions have zero gradient contribution)
             guard inputs.count == 1 else { fatalError("pad requires 1 input") }
             b.grad(node.inputs[0], value: gradOutput)
+
+        case .peek:
+            // Peek reads a single value from tensor - gradient only affects that position
+            // For now, zero gradients (TODO: implement scatter gradient back to tensor position)
+            guard inputs.count == 3 else { fatalError("peek requires 3 inputs") }
+            b.grad(node.inputs[0], value: ctx.useConstant(src: nil, value: 0.0))
+            b.grad(node.inputs[1], value: ctx.useConstant(src: nil, value: 0.0))
+            b.grad(node.inputs[2], value: ctx.useConstant(src: nil, value: 0.0))
         }
 
         ops.append(contentsOf: b.ops)

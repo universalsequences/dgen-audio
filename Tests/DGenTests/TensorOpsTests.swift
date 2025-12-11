@@ -3370,4 +3370,98 @@ final class CTensorOpsTests: XCTestCase {
                 print("\nMax used slot: \(maxUsedSlot), Total allocated: \(totalSlots)")
         }
 
+        // MARK: - Peek with Frame-Based Tensor Tests
+
+        /// Simple test: peek on a static tensor (should work with existing implementation)
+        func testPeekOnStaticTensor() throws {
+                let g = Graph()
+
+                // Create a simple 2D tensor
+                let data = g.tensor(shape: [3, 1], data: [1.0, 2.0, 3.0])
+
+                let zero = g.n(.constant(0.0))
+                let peekResult = try g.peek(tensor: data, index: zero, channel: zero)
+
+                _ = g.n(.output(0), peekResult)
+
+                let cResult = try CompilationPipeline.compile(
+                        graph: g,
+                        backend: .c,
+                        options: .init(frameCount: 10, debug: true)
+                )
+
+                print("=== Simple Peek Test - Generated Source ===")
+                print(cResult.source)
+
+                XCTAssertFalse(cResult.source.isEmpty)
+        }
+
+        /// Test: peek on a frame-based tensor (phasor with tensor input)
+        /// This demonstrates that peek NOW properly handles frame-based tensors via lazy evaluation.
+        func testPeekOnPhasorTensor() throws {
+                let g = Graph()
+
+                // Create a [3,1] tensor of frequencies
+                let freqs = g.tensor(shape: [3, 1], data: [100.0, 200.0, 300.0])
+
+                // Create phasor with tensor input - this produces a frame-based tensor
+                let phasorCell = g.alloc()
+                let zeroReset = g.n(.constant(0.0))
+                let phasorTensor = g.n(.phasor(phasorCell), freqs, zeroReset)
+
+                // Peek the first element - this now uses the lazy .peek operation
+                let zero = g.n(.constant(0.0))
+                let peekResult = try g.peek(tensor: phasorTensor, index: zero, channel: zero)
+
+                // Just output peek result (single output)
+                _ = g.n(.output(0), peekResult)
+
+                let frameCount = 100
+                let cResult = try CompilationPipeline.compile(
+                        graph: g,
+                        backend: .c,
+                        options: .init(frameCount: frameCount, debug: true)
+                )
+
+                print("=== Peek on Phasor Tensor - Generated Source ===")
+                print(cResult.source)
+
+                let cRuntime = CCompiledKernel(
+                        source: cResult.source,
+                        cellAllocations: cResult.cellAllocations,
+                        memorySize: cResult.totalMemorySlots
+                )
+                try cRuntime.compileAndLoad()
+
+                guard let mem = cRuntime.allocateNodeMemory() else {
+                        XCTFail("Failed to allocate memory")
+                        return
+                }
+                defer { cRuntime.deallocateNodeMemory(mem) }
+
+                injectTensorData(result: cResult, memory: mem.assumingMemoryBound(to: Float.self))
+
+                var output = [Float](repeating: 0, count: frameCount)
+                let input = [Float](repeating: 0, count: frameCount)
+
+                output.withUnsafeMutableBufferPointer { outPtr in
+                        input.withUnsafeBufferPointer { inPtr in
+                                cRuntime.runWithMemory(
+                                        outputs: outPtr.baseAddress!,
+                                        inputs: inPtr.baseAddress!,
+                                        memory: mem,
+                                        frameCount: frameCount
+                                )
+                        }
+                }
+
+                print("=== Peek on Phasor Tensor Results ===")
+                print("First 10 outputs: \(Array(output.prefix(10)))")
+                print("Outputs 40-50: \(Array(output[40..<50]))")
+
+                // Peek should increase over time as phasor accumulates phase
+                XCTAssertGreaterThan(output[50], output[0], "Peek should increase (frame-based tensor)")
+                XCTAssertGreaterThan(output[10], 0, "Peek should return non-zero from phasor tensor")
+        }
+
 }

@@ -499,6 +499,18 @@ public final class IRBuilder {
     return value(dest)
   }
 
+  public func mod(_ a: Expr, _ b: Expr) -> Expr {
+    let dest = ctx.useVariable(src: nodeId)
+    let uop = UOp(op: .mod(a.lazy, b.lazy), value: dest)
+    ops.append(uop)
+    return value(dest)
+  }
+
+  public func mix(_ a: Expr, _ b: Expr, _ t: Expr) -> Expr {
+    // mix(a, b, t) = a * (1 - t) + b * t
+    return u_mix(a, b, lerp: t)(self)
+  }
+
   public func selector(_ mode: Expr, _ options: [Expr]) -> Expr {
     if case .constant(let constId, let constMode) = mode.lazy {
       if constMode <= 0 {

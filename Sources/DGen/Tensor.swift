@@ -539,67 +539,67 @@ extension Graph {
         return n(.memoryWrite(bufferBase), finalWritePos, value)
     }
 
-    public func peek(tensor: NodeID, index: NodeID, channel: NodeID) throws -> NodeID {
-        guard let tensorId = nodeToTensor[tensor] else {
-            throw DGenError.missingTensorID
-        }
-        guard let tensor = tensors[tensorId] else {
-            throw DGenError.missingTensorID
-        }
-        guard tensor.shape.count >= 2 else {
-            throw DGenError.shapeMismatch(op: "peek", shape1: tensor.shape, shape2: tensor.shape)
+    public func peek(tensor tensorNode: NodeID, index: NodeID, channel: NodeID) throws -> NodeID {
+        // Check if input has tensor shape (works for both concrete and frame-based tensors)
+        guard let inputNode = nodes[tensorNode],
+              case .tensor(let shape) = inputNode.shape else {
+            throw DGenError.tensorError(op: "peek", reason: "requires tensor input")
         }
 
-        let one = n(.constant(1.0))
-        let zero = n(.constant(0.0))
-        let channelSizeFloat = n(.constant(Float(tensor.shape[0])))
+        guard shape.count >= 2 else {
+            throw DGenError.shapeMismatch(op: "peek", shape1: shape, shape2: shape)
+        }
 
-        // Properly wrap the index within the channel using modulo for true wrapping
-        // This handles cases where index might be very negative or very positive
-        let wrappedIndex = n(.mod, index, channelSizeFloat)
+        // Check if we have a concrete tensor with known cellId
+        if let tensorId = nodeToTensor[tensorNode],
+           let tensor = tensors[tensorId] {
+            // Concrete tensor: use eager implementation with direct memory access
+            let one = n(.constant(1.0))
+            let zero = n(.constant(0.0))
+            let channelSizeFloat = n(.constant(Float(tensor.shape[0])))
 
-        // Handle negative modulo results: if wrappedIndex < 0, add channelSize
-        let isNegative = n(.lt, wrappedIndex, zero)
-        let positiveIndex = n(
-            .gswitch, isNegative,
-            n(.add, wrappedIndex, channelSizeFloat),
-            wrappedIndex)
+            // Properly wrap the index within the channel using modulo for true wrapping
+            let wrappedIndex = n(.mod, index, channelSizeFloat)
 
-        // Calculate channel offset: floor(channel) * channelSize
-        // Clamp channel to valid range [0, numChannels-1]
-        let clampedChannel = n(
-            .floor,
-            n(
-                .max, zero,
-                n(.min, channel, n(.constant(Float(tensor.shape[1] - 1))))))
+            // Handle negative modulo results: if wrappedIndex < 0, add channelSize
+            let isNegative = n(.lt, wrappedIndex, zero)
+            let positiveIndex = n(
+                .gswitch, isNegative,
+                n(.add, wrappedIndex, channelSizeFloat),
+                wrappedIndex)
 
-        let channelOffset = n(.mul, channelSizeFloat, clampedChannel)
+            // Clamp channel to valid range [0, numChannels-1]
+            let clampedChannel = n(
+                .floor,
+                n(
+                    .max, zero,
+                    n(.min, channel, n(.constant(Float(tensor.shape[1] - 1))))))
 
-        // Calculate final read position within the channel
-        let finalReadPos = n(.add, channelOffset, positiveIndex)
+            let channelOffset = n(.mul, channelSizeFloat, clampedChannel)
+            let finalReadPos = n(.add, channelOffset, positiveIndex)
 
-        let bufferBase = tensor.cellId
+            let bufferBase = tensor.cellId
 
-        // Read with linear interpolation for fractional indices
-        let flooredPos = n(.floor, finalReadPos)
-        let frac = n(.sub, finalReadPos, flooredPos)
+            // Read with linear interpolation for fractional indices
+            let flooredPos = n(.floor, finalReadPos)
+            let frac = n(.sub, finalReadPos, flooredPos)
 
-        // Read two samples for interpolation
-        let sample1 = n(.memoryRead(bufferBase), flooredPos)
-        let nextPos = n(.add, flooredPos, one)
+            let sample1 = n(.memoryRead(bufferBase), flooredPos)
+            let nextPos = n(.add, flooredPos, one)
 
-        // Calculate the boundary for wrapping: channelOffset + channelSize
-        let nextChannelOffset = n(.add, channelOffset, channelSizeFloat)
+            let nextChannelOffset = n(.add, channelOffset, channelSizeFloat)
+            let nextPosWrapped = n(
+                .gswitch, n(.gte, nextPos, nextChannelOffset), channelOffset, nextPos)
 
-        // Wrap nextPos if it crosses into the next channel
-        // If nextPos >= nextChannelOffset, wrap back to channelOffset
-        let nextPosWrapped = n(
-            .gswitch, n(.gte, nextPos, nextChannelOffset), channelOffset, nextPos)
+            let sample2 = n(.memoryRead(bufferBase), nextPosWrapped)
 
-        let sample2 = n(.memoryRead(bufferBase), nextPosWrapped)
-
-        // Linear interpolation: (1-frac)*sample1 + frac*sample2
-        let interpolated = n(.mix, sample1, sample2, frac)
-        return interpolated
+            // Linear interpolation: (1-frac)*sample1 + frac*sample2
+            let interpolated = n(.mix, sample1, sample2, frac)
+            return interpolated
+        } else {
+            // Frame-based tensor (e.g., phasor(tensor) or tensor ops): use lazy peek node
+            // The lazy peek will be resolved during emit when tensor context is available
+            return n(.peek, tensorNode, index, channel)
+        }
     }
 }

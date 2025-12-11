@@ -176,6 +176,11 @@ public func inferShape(op: LazyOp, inputs: [ValueShape], graph: Graph) throws ->
     }
     return .tensor(newShape)
 
+  // Peek - reads a scalar from a 2D tensor at (index, channel)
+  case .peek:
+    // Peek always outputs scalar - it reads one value from the tensor
+    return .scalar
+
   // Inherited (elementwise) - includes all binary and unary math ops
   // Also includes stateful ops (phasor, accum, latch) that can operate element-wise on tensors
   case .add, .sub, .mul, .div, .sin, .cos, .exp, .sqrt, .tanh,
