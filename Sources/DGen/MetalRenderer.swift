@@ -347,6 +347,18 @@ public class MetalRenderer: Renderer, UOpEmitter {
     case let .floor(a): return emitAssign(uop, "metal::floor(\(g(a)))", ctx)
     case let .ceil(a): return emitAssign(uop, "metal::ceil(\(g(a)))", ctx)
     case let .round(a): return emitAssign(uop, "metal::round\(g(a)))", ctx)
+    case let .noise(cellId):
+      // Xorshift32 PRNG - better spectral properties than LCG
+      let expr = """
+        ({
+          uint s = as_type<uint>(memory[\(cellId)]);
+          if (s == 0u) s = 1u;
+          s ^= s << 13; s ^= s >> 17; s ^= s << 5;
+          memory[\(cellId)] = as_type<float>(s);
+          float(s) / 4294967296.0f;
+        })
+        """
+      return emitAssign(uop, expr, ctx)
     case let .memoryRead(base, offset):
       return emitAssign(uop, "memory[\(base) + (int)\(g(offset))]", ctx)
     case let .memoryWrite(base, offset, value):

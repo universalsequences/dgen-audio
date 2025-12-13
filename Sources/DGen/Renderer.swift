@@ -523,6 +523,40 @@ public class CRenderer: Renderer {
                 : "roundf(\(g(a)))"
             return emitAssign(uop, expr, ctx)
 
+        case let .noise(cellId):
+            // Xorshift32 PRNG - better spectral properties than LCG
+            if uop.kind == .simd {
+                // For SIMD, generate 4 random values using 4 sequential xorshift updates
+                let expr = """
+                    ({
+                        uint32_t s = (uint32_t)memory[\(cellId)];
+                        if (s == 0u) s = 1u;
+                        s ^= s << 13; s ^= s >> 17; s ^= s << 5;
+                        float r0 = (float)s / 4294967296.0f;
+                        s ^= s << 13; s ^= s >> 17; s ^= s << 5;
+                        float r1 = (float)s / 4294967296.0f;
+                        s ^= s << 13; s ^= s >> 17; s ^= s << 5;
+                        float r2 = (float)s / 4294967296.0f;
+                        s ^= s << 13; s ^= s >> 17; s ^= s << 5;
+                        float r3 = (float)s / 4294967296.0f;
+                        memory[\(cellId)] = (float)s;
+                        (float32x4_t){r0, r1, r2, r3};
+                    })
+                    """
+                return emitAssign(uop, expr, ctx)
+            } else {
+                let expr = """
+                    ({
+                        uint32_t s = (uint32_t)memory[\(cellId)];
+                        if (s == 0u) s = 1u;
+                        s ^= s << 13; s ^= s >> 17; s ^= s << 5;
+                        memory[\(cellId)] = (float)s;
+                        (float)s / 4294967296.0f;
+                    })
+                    """
+                return emitAssign(uop, expr, ctx)
+            }
+
         case let .memoryRead(base, offset):
             if uop.kind == .simd {
                 let offsetExpr = g(offset)

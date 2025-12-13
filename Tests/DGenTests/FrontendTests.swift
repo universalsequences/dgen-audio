@@ -71,11 +71,12 @@ final class FrontendTests: XCTestCase {
                                 + g.spectralLoss(sig1, sig2, windowSize: 64)
                                 + g.spectralLoss(sig1, sig2, windowSize: 128)) * 1 + 0.1
                         * g.mse(sig1, sig2)
+                print("about to compile")
                 let result = try g.compile(
                         loss, backend: .metal, frameCount: frameCount, debug: false)
 
                 for kernel in result.kernels {
-                        //print(kernel.source)
+                        print(kernel.source)
 
                 }
                 // Streamlined training context - handles everything!

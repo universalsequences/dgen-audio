@@ -41,6 +41,8 @@ extension UOp {
             opStr = "\(ANSI.green)ceil\(ANSI.reset)(\(a))"
         case let .round(a):
             opStr = "\(ANSI.green)round\(ANSI.reset)(\(a))"
+        case let .noise(cellId):
+            opStr = "\(ANSI.green)noise\(ANSI.reset)(\(cellId))"
         case let .memoryRead(base, offset):
             opStr = "\(ANSI.cyan)memoryRead\(ANSI.reset)(\(base), \(offset))"
         case let .memoryWrite(base, offset, value):

@@ -203,6 +203,12 @@ func u_click(_ cellId: CellID) -> (IRBuilder) -> Expr {
   }
 }
 
+func u_noise(_ cellId: CellID) -> (IRBuilder) -> Expr {
+  return { b in
+    b.noise(cellId)
+  }
+}
+
 func u_mse(_ a: Expr, _ b: Expr) -> (IRBuilder) -> Expr {
   return { builder in
     // MSE = (a - b)^2

@@ -77,6 +77,7 @@ public enum LazyOp {
     case historyRead(CellID)
     case phasor(CellID)
     case accum(CellID)
+    case noise(CellID)
     case constant(Float)
     case output(Int)
     case input(Int)
@@ -499,9 +500,15 @@ public enum LazyOp {
         case .click(let cellId):
             guard inputs.count == 0 else {
                 throw DGenError.insufficientInputs(
-                    operator: "click", expected: 4, actual: inputs.count)
+                    operator: "click", expected: 0, actual: inputs.count)
             }
             b.use(val: u_click(cellId)(b))
+        case .noise(let cellId):
+            guard inputs.count == 0 else {
+                throw DGenError.insufficientInputs(
+                    operator: "noise", expected: 0, actual: inputs.count)
+            }
+            b.use(val: u_noise(cellId)(b))
         case .phasor(let cellId):
             guard inputs.count == 2 else {
                 throw DGenError.insufficientInputs(
@@ -851,6 +858,9 @@ public enum LazyOp {
             return []
         case .click:
             // TODO - implement backprop for click
+            break
+        case .noise:
+            // Noise is non-differentiable (random values have zero gradient)
             break
         case .add:
             // d(x+y)/dx = 1, d(x+y)/dy = 1

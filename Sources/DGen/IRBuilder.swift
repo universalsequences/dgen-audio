@@ -281,6 +281,13 @@ public final class IRBuilder {
     return value(dest)
   }
 
+  public func noise(_ cellId: CellID) -> Expr {
+    let dest = ctx.useVariable(src: nodeId)
+    let uop = UOp(op: .noise(cellId), value: dest)
+    ops.append(uop)
+    return value(dest)
+  }
+
   public func memoryRead(_ cellId: CellID, _ offset: Expr) -> Expr {
     let dest = ctx.useVariable(src: nodeId)
     let uop = UOp(op: .memoryRead(cellId, offset.lazy), value: dest)

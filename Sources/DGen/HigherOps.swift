@@ -136,6 +136,24 @@ extension Graph {
     return n(.selector, [cond] + args)
   }
 
+  /// Biquad filter with multiple filter types.
+  ///
+  /// - Parameters:
+  ///   - in1: Input signal
+  ///   - cutoff: Cutoff/center frequency in Hz
+  ///   - resonance: Q factor / resonance (higher = narrower bandwidth)
+  ///   - gain: Output gain (linear). For shelf filters, this controls the shelf boost/cut amount.
+  ///   - mode: Filter type:
+  ///     - 0: Lowpass - passes frequencies below cutoff
+  ///     - 1: Highpass - passes frequencies above cutoff
+  ///     - 2: Bandpass (constant skirt gain) - passes frequencies around cutoff
+  ///     - 3: Bandpass (constant peak gain) - passes frequencies around cutoff
+  ///     - 4: Allpass - passes all frequencies, only affects phase
+  ///     - 5: Notch - rejects frequencies around cutoff
+  ///     - 6: High shelf - boosts/cuts frequencies above cutoff (gain > 1 boosts, < 1 cuts)
+  ///     - 7: Low shelf - boosts/cuts frequencies below cutoff (gain > 1 boosts, < 1 cuts)
+  ///
+  /// - Returns: Filtered output signal
   public func biquad(
     _ in1: NodeID, _ cutoff: NodeID, _ resonance: NodeID, _ gain: NodeID, _ mode: NodeID
   ) -> NodeID {
@@ -179,30 +197,104 @@ extension Graph {
     let mult20 = n(.mul, div18, abs17)
     let mult21 = n(.mul, mult20, n(.constant(-1)))
     let add22 = n(.add, div18, n(.constant(1)))
-    let selector23 = selector(add4, div11, div13, mult19, mult21, n(.constant(1)), add22)
-    let reciprical24 = n(.div, n(.constant(1)), add22)
+
+    // Shelf filter coefficients (mode 6 = high shelf, mode 7 = low shelf)
+    // A = sqrt(gain) for amplitude, using gain param directly as linear amplitude
     let param25 = gain
+    let A = n(.sqrt, n(.abs, param25))
+    let cosW0Pos = n(.mul, mult9, n(.constant(-1)))  // cos(w0) = -(-cos(w0))
+    let sinW0 = sin14
+
+    // alpha for shelf: sin(w0)/2 * sqrt((A + 1/A)*(1/S - 1) + 2)
+    // Using S = resonance (slope), simplified: alpha = sin(w0)/(2*Q) where Q relates to slope
+    let alphaShelf = n(.div, sinW0, n(.mul, n(.constant(2.0)), abs17))
+
+    // Common shelf terms
+    let Ap1 = n(.add, A, n(.constant(1)))           // A + 1
+    let Am1 = n(.sub, A, n(.constant(1)))           // A - 1
+    let Ap1_cosW0 = n(.mul, Ap1, cosW0Pos)          // (A+1)*cos(w0)
+    let Am1_cosW0 = n(.mul, Am1, cosW0Pos)          // (A-1)*cos(w0)
+    let twoSqrtA_alpha = n(.mul, n(.mul, n(.constant(2.0)), n(.sqrt, A)), alphaShelf)  // 2*sqrt(A)*alpha
+
+    // High shelf (mode 6):
+    // b0 =    A*( (A+1) + (A-1)*cos(w0) + 2*sqrt(A)*alpha )
+    // b1 = -2*A*( (A-1) + (A+1)*cos(w0)                   )
+    // b2 =    A*( (A+1) + (A-1)*cos(w0) - 2*sqrt(A)*alpha )
+    // a0 =        (A+1) - (A-1)*cos(w0) + 2*sqrt(A)*alpha
+    // a1 =    2*( (A-1) - (A+1)*cos(w0)                   )
+    // a2 =        (A+1) - (A-1)*cos(w0) - 2*sqrt(A)*alpha
+    let hs_b0 = n(.mul, A, n(.add, n(.add, Ap1, Am1_cosW0), twoSqrtA_alpha))
+    let hs_b1 = n(.mul, n(.constant(-2.0)), n(.mul, A, n(.add, Am1, Ap1_cosW0)))
+    let hs_b2 = n(.mul, A, n(.sub, n(.add, Ap1, Am1_cosW0), twoSqrtA_alpha))
+    let hs_a0 = n(.add, n(.sub, Ap1, Am1_cosW0), twoSqrtA_alpha)
+
+    // Low shelf (mode 7):
+    // b0 =    A*( (A+1) - (A-1)*cos(w0) + 2*sqrt(A)*alpha )
+    // b1 =  2*A*( (A-1) - (A+1)*cos(w0)                   )
+    // b2 =    A*( (A+1) - (A-1)*cos(w0) - 2*sqrt(A)*alpha )
+    // a0 =        (A+1) + (A-1)*cos(w0) + 2*sqrt(A)*alpha
+    // a1 =   -2*( (A-1) + (A+1)*cos(w0)                   )
+    // a2 =        (A+1) + (A-1)*cos(w0) - 2*sqrt(A)*alpha
+    let ls_b0 = n(.mul, A, n(.add, n(.sub, Ap1, Am1_cosW0), twoSqrtA_alpha))
+    let ls_b1 = n(.mul, n(.constant(2.0)), n(.mul, A, n(.sub, Am1, Ap1_cosW0)))
+    let ls_b2 = n(.mul, A, n(.sub, n(.sub, Ap1, Am1_cosW0), twoSqrtA_alpha))
+    let ls_a0 = n(.add, n(.add, Ap1, Am1_cosW0), twoSqrtA_alpha)
+
+    // Normalize shelf coefficients by a0
+    let hs_b0_norm = n(.div, hs_b0, hs_a0)
+    let hs_b1_norm = n(.div, hs_b1, hs_a0)
+    let hs_b2_norm = n(.div, hs_b2, hs_a0)
+    let ls_b0_norm = n(.div, ls_b0, ls_a0)
+    let ls_b1_norm = n(.div, ls_b1, ls_a0)
+    let ls_b2_norm = n(.div, ls_b2, ls_a0)
+
+    // a1, a2 normalized for feedback (modes 0-5 use different normalization)
+    let hs_a1_norm = n(.div, n(.mul, n(.constant(2.0)), n(.sub, Am1, Ap1_cosW0)), hs_a0)
+    let hs_a2_norm = n(.div, n(.sub, n(.sub, Ap1, Am1_cosW0), twoSqrtA_alpha), hs_a0)
+    let ls_a1_norm = n(.div, n(.mul, n(.constant(-2.0)), n(.add, Am1, Ap1_cosW0)), ls_a0)
+    let ls_a2_norm = n(.div, n(.sub, n(.add, Ap1, Am1_cosW0), twoSqrtA_alpha), ls_a0)
+
+    let selector23 = selector(add4, div11, div13, mult19, mult21, n(.constant(1)), add22, hs_b2_norm, ls_b2_norm)
+    let reciprical24 = n(.div, n(.constant(1)), add22)
     let mult26 = n(.mul, reciprical24, param25)
-    let b2 = n(.mul, selector23, mult26)
+    // For modes 0-5, apply gain scaling; for modes 6-7, coefficients already include gain via A
+    let b2_scaled = n(.mul, selector23, mult26)
+    // Use selector to pick between scaled (modes 0-5) and shelf (modes 6-7)
+    let isShelfMode = n(.gte, param3, n(.constant(6)))
+    let b2 = n(.gswitch, isShelfMode, selector23, b2_scaled)
     let mult28 = n(.mul, history3Read, b2)
     let mult31 = n(.mul, mult9, n(.constant(2)))
     let selector32 = selector(
-      add4, add10, sub12, n(.constant(0)), n(.constant(0)), mult31, mult31)
-    let b1 = n(.mul, selector32, mult26)
+      add4, add10, sub12, n(.constant(0)), n(.constant(0)), mult31, mult31, hs_b1_norm, ls_b1_norm)
+    let b1_scaled = n(.mul, selector32, mult26)
+    let b1 = n(.gswitch, isShelfMode, selector32, b1_scaled)
     let mult34 = n(.mul, history2Read, b1)
     let not_sub35 = n(.sub, n(.constant(1)), div18)
-    let selector36 = selector(add4, div11, div13, div18, mult20, n(.constant(1)), not_sub35)
-    let b0 = n(.mul, selector36, mult26)
+    let selector36 = selector(add4, div11, div13, div18, mult20, n(.constant(1)), not_sub35, hs_b0_norm, ls_b0_norm)
+    let b0_scaled = n(.mul, selector36, mult26)
+    let b0 = n(.gswitch, isShelfMode, selector36, b0_scaled)
     let mult38 = n(.mul, in1, b0)
 
     // Final computation - following TypeScript s() pattern
     let add39 = n(.add, n(.add, mult28, mult34), mult38)
 
+    // Feedback coefficients (a1, a2 normalized by a0)
+    // For modes 0-5: use original coefficients
+    // For modes 6-7: use shelf-specific a1, a2
     let history040 = history0Read
-    let mult41 = n(.mul, not_sub35, reciprical24)
-    let mult42 = n(.mul, history040, mult41)
-    let mult43 = n(.mul, mult31, reciprical24)
-    let mult44 = n(.mul, history1Read, mult43)
+    let a2_orig = n(.mul, not_sub35, reciprical24)  // Original a2/a0
+    let a1_orig = n(.mul, mult31, reciprical24)     // Original a1/a0
+
+    // Select appropriate feedback coefficients based on mode
+    let a2 = n(.gswitch, isShelfMode,
+               n(.gswitch, n(.gte, param3, n(.constant(7))), ls_a2_norm, hs_a2_norm),
+               a2_orig)
+    let a1 = n(.gswitch, isShelfMode,
+               n(.gswitch, n(.gte, param3, n(.constant(7))), ls_a1_norm, hs_a1_norm),
+               a1_orig)
+
+    let mult42 = n(.mul, history040, a2)
+    let mult44 = n(.mul, history1Read, a1)
     let add45 = n(.add, mult42, mult44)
     let sub46 = n(.sub, add39, add45)
 

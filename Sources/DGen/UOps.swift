@@ -54,6 +54,7 @@ public enum Op {
   case floor(Lazy)
   case ceil(Lazy)
   case round(Lazy)
+  case noise(CellID)
   case memoryRead(CellID, Lazy)
   case memoryWrite(CellID, Lazy, Lazy)
   case latch(Lazy, Lazy)
