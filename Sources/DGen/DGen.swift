@@ -143,6 +143,10 @@ open class Graph {
     /// Track allocation sizes for memory cells (especially large buffers like spectral scratch)
     public var cellAllocationSizes: [CellID: Int] = [:]
 
+    /// Tracks hop-based update rate for nodes (hopSize, counterCell)
+    /// Used for FFT/IFFT nodes and operations that inherit hop-based temporality
+    public var nodeHopRate: [NodeID: (Int, CellID)] = [:]
+
     public init() {}
 
     /// Returns the total number of allocated memory cells

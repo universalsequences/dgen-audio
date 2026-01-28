@@ -181,18 +181,47 @@ public class CRenderer: Renderer {
         // Merge adjacent blocks of the same kind into a single loop to reduce passes
         var currentKind: Kind? = nil
         var currentTemporality: Temporality? = nil
+        var hopCheckOpen = false  // Track if we have an open hop check conditional
+
         for block in uopBlocks {
-            if currentKind != block.kind || currentTemporality != block.temporality {
+            let needsNewLoop = currentKind != block.kind || currentTemporality != block.temporality
+
+            if needsNewLoop {
+                // Close previous hop check if open
+                if hopCheckOpen {
+                    scheduleItem.ops.append(UOp(op: .endHopCheck, value: .empty))
+                    hopCheckOpen = false
+                }
+
                 // Close previous loop if open
                 if currentKind != nil {
                     scheduleItem.ops.append(UOp(op: .endLoop, value: .empty))
                 }
-                // Open new loop for this kind
-                scheduleItem.ops.append(
-                    UOp(
-                        op: .beginLoop(frameCountUOp, block.kind == .scalar ? 1 : 4),
-                        value: .empty)
-                )
+
+                // Open new loop based on temporality
+                switch block.temporality {
+                case .frameBased, .static_:
+                    // Frame-based or static: standard frame loop
+                    scheduleItem.ops.append(
+                        UOp(
+                            op: .beginLoop(frameCountUOp, block.kind == .scalar ? 1 : 4),
+                            value: .empty)
+                    )
+
+                case .hopBased(_, let counterCell):
+                    // Hop-based: frame loop with conditional check inside
+                    // The block only executes when counter == 0
+                    scheduleItem.ops.append(
+                        UOp(
+                            op: .beginLoop(frameCountUOp, block.kind == .scalar ? 1 : 4),
+                            value: .empty)
+                    )
+                    scheduleItem.ops.append(
+                        UOp(op: .beginHopCheck(counterCell), value: .empty)
+                    )
+                    hopCheckOpen = true
+                }
+
                 currentKind = block.kind
                 currentTemporality = block.temporality
             }
@@ -201,6 +230,11 @@ public class CRenderer: Renderer {
                 if case .defineGlobal = uop.op { continue }
                 scheduleItem.ops.append(UOp(op: uop.op, value: uop.value, kind: uop.kind))
             }
+        }
+
+        // Close any open hop check
+        if hopCheckOpen {
+            scheduleItem.ops.append(UOp(op: .endHopCheck, value: .empty))
         }
 
         // Close any open loop
@@ -339,7 +373,7 @@ public class CRenderer: Renderer {
         for uop in scheduleItem.ops {
             var diff = 0
             switch uop.op {
-            case .beginIf, .beginForLoop:
+            case .beginIf, .beginForLoop, .beginHopCheck:
                 diff = 1
             case .beginLoop:
                 diff = 1
@@ -348,7 +382,7 @@ public class CRenderer: Renderer {
                 varEmittedTypes = [:]
             case .beginParallelRange:
                 diff = 1
-            case .endIf, .endLoop, .endParallelRange:
+            case .endIf, .endLoop, .endParallelRange, .endHopCheck:
                 indent -= 1
             default:
                 break
@@ -911,6 +945,12 @@ public class CRenderer: Renderer {
 
         case let .accumulateTensorGrad(baseGradId, indexLazy, valueLazy):
             return "gradients[(\(baseGradId)+(int)(\(g(indexLazy)))) * frameCount + i] += \(g(valueLazy));"
+
+        // Hop-based execution: only run block when counter == 0
+        case .beginHopCheck(let counterCell):
+            return "if (memory[\(counterCell)] == 0.0f) {"
+        case .endHopCheck:
+            return "}"
 
         default:
             return "/* \(uop.prettyDescription()) */"

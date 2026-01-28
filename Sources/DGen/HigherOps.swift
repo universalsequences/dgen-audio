@@ -449,4 +449,163 @@ extension Graph {
     return n(.seq, writeOp, out)
   }
 
+  /// Compute FFT of a signal using Cooley-Tukey algorithm.
+  /// - Parameters:
+  ///   - signal: Input signal (scalar per frame)
+  ///   - windowSize: FFT window size (MUST be power of 2)
+  ///   - hopSize: Compute FFT every hopSize frames (default: windowSize/4 for efficiency)
+  ///              Use hopSize=1 to compute every frame (slow but most responsive)
+  ///              Use hopSize=windowSize for one FFT per window (most efficient)
+  /// - Returns: Tensor [numBins, 2] where numBins = windowSize/2 + 1
+  ///            [k, 0] = Real component, [k, 1] = Imaginary component
+  ///
+  /// The FFT operation has hop-based temporality: the FFT computation only runs every
+  /// hopSize frames, while ring buffer management runs every frame. Operations downstream
+  /// of FFT (like conv2d, mul) inherit this hop-based temporality and also only run
+  /// every hopSize frames, avoiding redundant computation.
+  public func fft(_ signal: NodeID, windowSize: Int, hopSize: Int? = nil) -> NodeID {
+    precondition(windowSize > 0 && (windowSize & (windowSize - 1)) == 0,
+                 "windowSize must be a power of 2")
+
+    // Default hopSize to windowSize/4 (75% overlap) - good balance of efficiency and responsiveness
+    let actualHopSize = hopSize ?? max(1, windowSize / 4)
+    precondition(actualHopSize > 0, "hopSize must be positive")
+
+    let numBins = windowSize / 2 + 1
+    let outputSize = numBins * 2
+
+    // Allocate output tensor
+    let cellId = alloc(vectorWidth: outputSize)
+    let tensorId = nextTensorId
+    nextTensorId += 1
+    tensors[tensorId] = Tensor(id: tensorId, shape: [numBins, 2], cellId: cellId)
+    cellToTensor[cellId] = tensorId
+
+    // Allocate scratch for in-place FFT computation: real[N] + imag[N]
+    let scratchCell = alloc(vectorWidth: windowSize * 2)
+
+    // Allocate ring buffer for storing last windowSize samples
+    let ringBufferCell = alloc(vectorWidth: windowSize)
+
+    // Allocate write position cell (single float, 0.0 to windowSize-1)
+    let writePosCell = alloc(vectorWidth: 1)
+
+    // Allocate counter cell for hop timing (single float, 0 to hopSize-1)
+    let counterCell = alloc(vectorWidth: 1)
+
+    let fftNode = n(.fft(windowSize, actualHopSize, scratchCell, ringBufferCell, writePosCell, counterCell), [signal], shape: .tensor([numBins, 2]))
+    nodeToTensor[fftNode] = tensorId
+
+    // Register hop-based temporality for this FFT node
+    // This allows downstream operations to inherit hop-based execution
+    nodeHopRate[fftNode] = (actualHopSize, counterCell)
+
+    return fftNode
+  }
+
+  /// Compute magnitude spectrum from FFT output.
+  /// - Parameter fftOutput: FFT tensor output [numBins, 2]
+  /// - Returns: Tensor [numBins] with magnitude = sqrt(real^2 + imag^2) for each bin
+  public func fftMagnitude(_ fftOutput: NodeID) -> NodeID {
+    // Get the FFT output tensor info
+    guard let fftTensorId = nodeToTensor[fftOutput],
+          let fftTensor = tensors[fftTensorId],
+          fftTensor.shape.count == 2 && fftTensor.shape[1] == 2 else {
+      fatalError("fftMagnitude requires an FFT output tensor with shape [numBins, 2]")
+    }
+
+    let numBins = fftTensor.shape[0]
+
+    // Allocate output tensor for magnitude
+    let magCellId = alloc(vectorWidth: numBins)
+    let magTensorId = nextTensorId
+    nextTensorId += 1
+    tensors[magTensorId] = Tensor(id: magTensorId, shape: [numBins], cellId: magCellId)
+    cellToTensor[magCellId] = magTensorId
+
+    // Create a tensor reference node for the magnitude output
+    let magRef = n(.tensorRef(magTensorId), [], shape: .tensor([numBins]))
+    nodeToTensor[magRef] = magTensorId
+
+    // For each bin, compute sqrt(real^2 + imag^2)
+    // We need to read from the FFT output tensor and write to the magnitude tensor
+    // This is done element-wise: for k in 0..<numBins: mag[k] = sqrt(fft[k,0]^2 + fft[k,1]^2)
+
+    // Create element-wise computation using peek operations
+    // First, create a loop counter using phasor or similar mechanism
+    // Actually, we need to use the tensor operation infrastructure
+
+    // For now, we implement this by creating individual peek operations
+    // This is inefficient but works; a better approach would be a dedicated op
+
+    // Create nodes that will compute magnitude for each bin at read time
+    // Using peek to read from the FFT tensor and compute magnitude
+
+    // Create constant nodes for indices
+    var lastMagNode: NodeID = magRef
+
+    for k in 0..<numBins {
+      let kConst = n(.constant(Float(k)))
+      let realChannel = n(.constant(0.0))
+      let imagChannel = n(.constant(1.0))
+
+      // Peek real and imaginary parts
+      let realVal = n(.peek, fftOutput, kConst, realChannel)
+      let imagVal = n(.peek, fftOutput, kConst, imagChannel)
+
+      // Compute magnitude = sqrt(real^2 + imag^2)
+      let realSq = n(.mul, realVal, realVal)
+      let imagSq = n(.mul, imagVal, imagVal)
+      let sumSq = n(.add, realSq, imagSq)
+      let mag = n(.sqrt, sumSq)
+
+      // Write to magnitude tensor
+      let writeOp = n(.memoryWrite(magCellId), kConst, mag)
+      lastMagNode = n(.seq, lastMagNode, writeOp)
+    }
+
+    return lastMagNode
+  }
+
+  /// Compute Inverse FFT to reconstruct time-domain signal from spectrum.
+  /// Uses overlap-add for smooth reconstruction.
+  /// - Parameters:
+  ///   - spectrum: Input spectrum tensor [numBins, 2] (typically from FFT or modified FFT output)
+  ///   - windowSize: IFFT window size (MUST match the FFT windowSize that produced the spectrum)
+  ///   - hopSize: How often to compute IFFT (default windowSize/4 for 75% overlap)
+  /// - Returns: Scalar output (one sample per frame)
+  ///
+  /// The IFFT operation has hop-based temporality for the IFFT computation itself,
+  /// while the overlap-add output runs every frame. This allows the expensive IFFT
+  /// to run only when needed (when counter == 0).
+  public func ifft(_ spectrum: NodeID, windowSize: Int, hopSize: Int? = nil) -> NodeID {
+    precondition(windowSize > 0 && (windowSize & (windowSize - 1)) == 0,
+                 "windowSize must be a power of 2")
+
+    // Default hopSize to windowSize/4 (75% overlap) for smooth reconstruction
+    let actualHopSize = hopSize ?? max(1, windowSize / 4)
+    precondition(actualHopSize > 0, "hopSize must be positive")
+
+    // Allocate scratch for in-place IFFT computation: real[N] + imag[N]
+    let scratchCell = alloc(vectorWidth: windowSize * 2)
+
+    // Allocate output ring buffer for overlap-add reconstruction
+    let outputRingCell = alloc(vectorWidth: windowSize)
+
+    // Allocate read position cell (single float, 0.0 to windowSize-1)
+    let readPosCell = alloc(vectorWidth: 1)
+
+    // Allocate counter cell for hop timing (single float, 0 to hopSize-1)
+    let counterCell = alloc(vectorWidth: 1)
+
+    let ifftNode = n(.ifft(windowSize, actualHopSize, scratchCell, outputRingCell, readPosCell, counterCell), [spectrum], shape: .scalar)
+
+    // Register hop-based temporality for this IFFT node
+    // Note: IFFT output is scalar (one sample per frame via overlap-add),
+    // but the expensive IFFT computation only runs every hopSize frames
+    nodeHopRate[ifftNode] = (actualHopSize, counterCell)
+
+    return ifftNode
+  }
+
 }

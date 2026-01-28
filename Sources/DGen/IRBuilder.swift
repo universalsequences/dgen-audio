@@ -161,6 +161,20 @@ public final class IRBuilder {
     return memoryRead(cellId, index)
   }
 
+  /// Read a tensor element using proper strides (for view tensors with non-contiguous layout)
+  /// Converts flat output index -> multi-dim coords -> strided memory access
+  public func readTensorWithStrides(tensor: Tensor, flatIdx: Expr, shape: [Int]) -> Expr {
+    // Fast path: contiguous tensor with no offset
+    if tensor.isContiguous && tensor.offset == 0 {
+      return memoryRead(tensor.cellId, flatIdx)
+    }
+
+    // Slow path: use strides to compute memory offset
+    let multiIdx = flatToMultiIndex(flatIdx, shape)
+    let memOffset = stridedIndex(indices: multiIdx, strides: tensor.strides, offset: tensor.offset)
+    return memoryRead(tensor.cellId, memOffset)
+  }
+
   func storeGradMemory(_ cellId: CellID, _ val: Expr) -> Expr {
     let dest = ctx.useVariable(src: nil)
     let uop = UOp(op: .storeGradMemory(cellId, val.lazy), value: dest)
@@ -617,6 +631,14 @@ public final class IRBuilder {
     ops.append(UOp(op: .beginForLoop(loopVar, countLazy), value: loopVar))
     body(value(loopVar))
     ops.append(UOp(op: .endLoop, value: ctx.useVariable(src: nil)))
+  }
+
+  /// Conditional execution block.
+  /// The body is only executed when condition is true (non-zero).
+  public func if_(_ condition: Expr, body: () -> Void) {
+    ops.append(UOp(op: .beginIf(condition.lazy), value: ctx.useVariable(src: nil)))
+    body()
+    ops.append(UOp(op: .endIf, value: ctx.useVariable(src: nil)))
   }
 
   /// Parallel range for tensor operations.

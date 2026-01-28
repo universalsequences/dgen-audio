@@ -215,7 +215,8 @@ final class TypeCheckerTests: XCTestCase {
         let scaled = g.n(.mul, phasor, scale)
 
         let sortedNodes = [freq, phasor, scale, scaled]
-        let frameBased = inferTemporality(graph: g, sortedNodes: sortedNodes)
+        let temporalityResult = inferTemporality(graph: g, sortedNodes: sortedNodes)
+        let frameBased = temporalityResult.frameBasedNodes
 
         XCTAssertFalse(frameBased.contains(freq))  // constant is static
         XCTAssertTrue(frameBased.contains(phasor))  // phasor is frame-based

@@ -13,6 +13,7 @@ public enum ValueShape: Equatable {
 }
 
 public enum Temporality: Equatable {
-  case frameBased  // runs every frame (phasor, input, audio processing)
-  case static_     // runs once (wavetable generation, constants)
+  case frameBased                              // runs every frame (phasor, input, audio processing)
+  case hopBased(hopSize: Int, counter: CellID) // runs every N frames (FFT output, spectral ops)
+  case static_                                 // runs once (wavetable generation, constants)
 }

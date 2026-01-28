@@ -181,6 +181,18 @@ public func inferShape(op: LazyOp, inputs: [ValueShape], graph: Graph) throws ->
     // Peek always outputs scalar - it reads one value from the tensor
     return .scalar
 
+  // FFT - outputs [numBins, 2] tensor where numBins = windowSize/2 + 1
+  // Note: FFT is a bulk operation that handles all tensor writes internally,
+  // so it should not be wrapped in parallelRange (handled in CompilationPipeline)
+  case .fft(let windowSize, _, _, _, _, _):
+    let numBins = windowSize / 2 + 1
+    return .tensor([numBins, 2])
+
+  // IFFT - outputs scalar (one sample per frame via overlap-add)
+  // Takes spectrum tensor [numBins, 2] as input, reconstructs time-domain signal
+  case .ifft(_, _, _, _, _, _):
+    return .scalar
+
   // Inherited (elementwise) - includes all binary and unary math ops
   // Also includes stateful ops (phasor, accum, latch) that can operate element-wise on tensors
   case .add, .sub, .mul, .div, .sin, .cos, .exp, .sqrt, .tanh,
@@ -381,13 +393,65 @@ public func isIntrinsicallyFrameBased(_ op: LazyOp) -> Bool {
   }
 }
 
-/// Infer temporality for all nodes. Returns the set of frame-based nodes.
-/// Frame-based taint propagates: if any input is frame-based, output is frame-based.
-public func inferTemporality(graph: Graph, sortedNodes: [NodeID]) -> Set<NodeID> {
+/// Returns the hop rate if the op is intrinsically hop-based.
+/// Note: FFT/IFFT are NOT intrinsically hop-based from a block perspective because
+/// they handle their own internal hop logic (ring buffer writes run every frame,
+/// FFT computation only runs when counter == 0). However, their OUTPUT is hop-based,
+/// so downstream operations that consume FFT/IFFT output should inherit hop temporality.
+public func intrinsicHopRate(_ op: LazyOp, graph: Graph, nodeId: NodeID) -> (Int, CellID)? {
+  // No ops are intrinsically hop-based from a rendering perspective
+  // FFT/IFFT handle their own hop logic internally
+  return nil
+}
+
+/// Returns the hop rate if the node produces hop-based output (FFT, IFFT)
+/// This is different from intrinsicHopRate - these nodes handle hop logic internally
+/// but their OUTPUT only changes every hopSize frames.
+public func producesHopBasedOutput(_ op: LazyOp, graph: Graph, nodeId: NodeID) -> (Int, CellID)? {
+  switch op {
+  case .fft(_, _, _, _, _, _), .ifft(_, _, _, _, _, _):
+    return graph.nodeHopRate[nodeId]
+  default:
+    return nil
+  }
+}
+
+/// Temporality propagation result containing both frame-based and hop-based node sets
+public struct TemporalityResult {
+  public let frameBasedNodes: Set<NodeID>
+  public let hopBasedNodes: [NodeID: (Int, CellID)]
+}
+
+/// Infer temporality for all nodes. Returns sets of frame-based and hop-based nodes.
+///
+/// Temporality Propagation Rules:
+/// - All static inputs → static output
+/// - All same hopBased(N, cell) inputs → hopBased(N, cell) output
+/// - Mixed hopBased rates → use fastest rate (smallest hopSize)
+/// - Any frameBased input → frameBased output
+/// - hopBased + static inputs → hopBased output
+///
+/// Special handling for FFT/IFFT:
+/// - FFT/IFFT are frame-based (they have ring buffer ops that run every frame)
+/// - But their OUTPUT is hop-based (only changes every hopSize frames)
+/// - Operations consuming FFT/IFFT output inherit hop-based temporality
+public func inferTemporality(graph: Graph, sortedNodes: [NodeID]) -> TemporalityResult {
   var frameBasedNodes = Set<NodeID>()
+  var hopBasedNodes: [NodeID: (Int, CellID)] = [:]
+  // Track which nodes produce hop-based output (FFT/IFFT)
+  var hopProducingNodes: [NodeID: (Int, CellID)] = [:]
 
   for nodeId in sortedNodes {
     guard let node = graph.nodes[nodeId] else { continue }
+
+    // Check if this node produces hop-based output (FFT/IFFT)
+    // These nodes are frame-based themselves but their output is hop-based
+    if let hopRate = producesHopBasedOutput(node.op, graph: graph, nodeId: nodeId) {
+      hopProducingNodes[nodeId] = hopRate
+      // FFT/IFFT are frame-based (ring buffer ops run every frame)
+      frameBasedNodes.insert(nodeId)
+      continue
+    }
 
     // Check if intrinsically frame-based
     if isIntrinsicallyFrameBased(node.op) {
@@ -395,18 +459,89 @@ public func inferTemporality(graph: Graph, sortedNodes: [NodeID]) -> Set<NodeID>
       continue
     }
 
-    // Check if any input is frame-based (taint propagation)
-    let hasFrameBasedInput = node.inputs.contains { frameBasedNodes.contains($0) }
-    if hasFrameBasedInput {
-      frameBasedNodes.insert(nodeId)
+    // Check if intrinsically hop-based
+    if let hopRate = intrinsicHopRate(node.op, graph: graph, nodeId: nodeId) {
+      hopBasedNodes[nodeId] = hopRate
+      continue
     }
+
+    // Check inputs for temporality propagation
+    // First, check for frame-based inputs (but exclude hop-producing nodes like FFT)
+    let hasFrameBasedInput = node.inputs.contains { inputId in
+      frameBasedNodes.contains(inputId) && !hopProducingNodes.keys.contains(inputId)
+    }
+    if hasFrameBasedInput {
+      // Frame-based input forces frame-based output
+      frameBasedNodes.insert(nodeId)
+      continue
+    }
+
+    // Check for hop-based inputs (either from hopBasedNodes or from hop-producing nodes like FFT)
+    var hopInputRates: [(Int, CellID)] = []
+    for inputId in node.inputs {
+      if let rate = hopBasedNodes[inputId] {
+        hopInputRates.append(rate)
+      } else if let rate = hopProducingNodes[inputId] {
+        // Input is from a hop-producing node (FFT/IFFT) - inherit its hop rate
+        hopInputRates.append(rate)
+      }
+    }
+
+    if !hopInputRates.isEmpty {
+      // Find the fastest hop rate (smallest hopSize) among all inputs
+      // This ensures we don't miss updates from faster-changing inputs
+      let fastestRate = hopInputRates.min(by: { $0.0 < $1.0 })!
+      hopBasedNodes[nodeId] = fastestRate
+    }
+    // If no frame-based or hop-based inputs, node remains static (not added to either set)
   }
 
-  return frameBasedNodes
+  return TemporalityResult(frameBasedNodes: frameBasedNodes, hopBasedNodes: hopBasedNodes)
+}
+
+/// Legacy version for backwards compatibility - returns only frame-based nodes
+public func inferTemporalityFrameBasedOnly(graph: Graph, sortedNodes: [NodeID]) -> Set<NodeID> {
+  return inferTemporality(graph: graph, sortedNodes: sortedNodes).frameBasedNodes
 }
 
 /// Assign temporality to blocks based on their nodes.
-/// A block is frame-based if ANY of its nodes is frame-based.
+/// A block is:
+/// - frameBased if ANY of its nodes is frame-based
+/// - hopBased if ALL non-static nodes share the same hop rate
+/// - static_ otherwise
+public func assignBlockTemporality(
+  blocks: inout [Block],
+  frameBasedNodes: Set<NodeID>,
+  hopBasedNodes: [NodeID: (Int, CellID)]
+) {
+  for i in 0..<blocks.count {
+    // Check for frame-based nodes first (takes precedence)
+    let hasFrameBasedNode = blocks[i].nodes.contains { frameBasedNodes.contains($0) }
+    if hasFrameBasedNode {
+      blocks[i].temporality = .frameBased
+      continue
+    }
+
+    // Check for hop-based nodes
+    let hopRates = blocks[i].nodes.compactMap { hopBasedNodes[$0] }
+    if let firstRate = hopRates.first {
+      // Check if all hop-based nodes have the same rate
+      let allSameRate = hopRates.allSatisfy { $0.0 == firstRate.0 && $0.1 == firstRate.1 }
+      if allSameRate {
+        blocks[i].temporality = .hopBased(hopSize: firstRate.0, counter: firstRate.1)
+        continue
+      }
+      // Mixed rates - fall back to frame-based
+      blocks[i].temporality = .frameBased
+      continue
+    }
+
+    // No frame-based or hop-based nodes - block is static
+    blocks[i].temporality = .static_
+  }
+}
+
+/// Legacy version for backwards compatibility - only considers frame-based nodes
 public func assignBlockTemporality(blocks: inout [Block], frameBasedNodes: Set<NodeID>) {
   for i in 0..<blocks.count {
     let hasFrameBasedNode = blocks[i].nodes.contains { frameBasedNodes.contains($0) }

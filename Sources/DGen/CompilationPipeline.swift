@@ -208,11 +208,16 @@ public struct CompilationPipeline {
         }
 
         // Step 4: Infer temporality and assign to blocks
-        let frameBasedNodes = time("inferTemporality") {
+        // This now includes hop-based temporality for FFT/IFFT and downstream operations
+        let temporalityResult = time("inferTemporality") {
             inferTemporality(graph: graph, sortedNodes: sortedNodes)
         }
         time("assignTemporality") {
-            assignBlockTemporality(blocks: &finalBlocks, frameBasedNodes: frameBasedNodes)
+            assignBlockTemporality(
+                blocks: &finalBlocks,
+                frameBasedNodes: temporalityResult.frameBasedNodes,
+                hopBasedNodes: temporalityResult.hopBasedNodes
+            )
         }
 
         let finalBlockIndices = Array(0..<finalBlocks.count)
@@ -812,6 +817,36 @@ func determineTensorBlocks(_ blocks: [Block], _ graph: Graph, _ ctx: IRContext) 
                     }
                     currentShape = nil
 
+                } else if case .fft = node.op {
+                    // FFT is a bulk tensor operation that handles all tensor writes internally
+                    // It needs its own scalar block - don't mix with SIMD ops
+                    if currentBlock.nodes.count > 0 {
+                        innerBlocks.append(currentBlock)
+                    }
+                    // Create isolated block for FFT
+                    currentBlock = makeBlock(from: block)
+                    currentBlock.kind = .scalar  // Force scalar execution
+                    currentBlock.nodes.append(nodeId)
+                    innerBlocks.append(currentBlock)
+                    // Start fresh block for nodes after FFT
+                    currentBlock = makeBlock(from: block)
+                    currentShape = nil
+                    continue  // Skip the append at end of loop
+                } else if case .ifft = node.op {
+                    // IFFT is a bulk operation that handles spectrum-to-time conversion
+                    // It needs its own scalar block - don't mix with SIMD ops
+                    if currentBlock.nodes.count > 0 {
+                        innerBlocks.append(currentBlock)
+                    }
+                    // Create isolated block for IFFT
+                    currentBlock = makeBlock(from: block)
+                    currentBlock.kind = .scalar  // Force scalar execution
+                    currentBlock.nodes.append(nodeId)
+                    innerBlocks.append(currentBlock)
+                    // Start fresh block for nodes after IFFT
+                    currentBlock = makeBlock(from: block)
+                    currentShape = nil
+                    continue  // Skip the append at end of loop
                 } else if case .tensor(let shape) = node.shape {
                     if shape != currentShape {
                         if currentBlock.nodes.count > 0 {

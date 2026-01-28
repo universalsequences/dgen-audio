@@ -95,6 +95,10 @@ public enum Op {
   case pad([(Int, Int)])      // View op: pad with zeros - renders to nothing but prevents SIMD
   case broadcastAccess  // Marker: broadcast indexing used - renders to nothing but prevents SIMD
   case requiresScalar   // Marker: stateful accumulation requires scalar (sample-by-sample) execution
+
+  // Hop-based execution control (for FFT/spectral processing)
+  case beginHopCheck(CellID)  // if (memory[counterCell] == 0.0f) { - runs block only when counter is 0
+  case endHopCheck            // } - closes the hop check conditional
 }
 
 public struct UOp {

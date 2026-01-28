@@ -177,6 +177,10 @@ extension UOp {
             opStr = "\(ANSI.cyan)broadcastAccess\(ANSI.reset)"
         case .requiresScalar:
             opStr = "\(ANSI.cyan)requiresScalar\(ANSI.reset)"
+        case let .beginHopCheck(counterCell):
+            opStr = "\(ANSI.magenta)beginHopCheck\(ANSI.reset)(\(counterCell))"
+        case .endHopCheck:
+            opStr = "\(ANSI.magenta)endHopCheck\(ANSI.reset)"
         }
 
         return "\(ANSI.bold)UOp\(ANSI.reset)(op: \(opStr), value: \(value))"
