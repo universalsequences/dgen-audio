@@ -4,6 +4,101 @@ import XCTest
 
 final class TensorParameterTests: XCTestCase {
 
+    // MARK: - Test Infrastructure
+
+    /// Result from running a training session
+    private struct TrainingResult {
+        let initialLoss: Float
+        let finalLoss: Float
+        let gradients: [[Float]]
+    }
+
+    /// Runs a training loop and returns results for verification.
+    private func runTrainingLoop(
+        graph g: Graph,
+        parameters: [TensorParameter],
+        lossNode: NodeID,
+        optimizer: Optimizer = Adam(lr: 0.1),
+        epochs: Int = 200
+    ) throws -> TrainingResult {
+        let frameCount = 1
+        let result = try CompilationPipeline.compile(
+            graph: g, backend: .metal,
+            options: .init(frameCount: frameCount, backwards: true))
+
+        let runtime = try MetalCompiledKernel(
+            kernels: result.kernels,
+            cellAllocations: result.cellAllocations,
+            context: result.context)
+
+        let ctx = TrainingContext(
+            tensorParameters: parameters,
+            optimizer: optimizer,
+            lossNode: lossNode)
+
+        ctx.initializeMemory(
+            runtime: runtime,
+            cellAllocations: result.cellAllocations,
+            context: result.context,
+            frameCount: frameCount,
+            graph: g)
+
+        let inputBuffer = [Float](repeating: 0.0, count: frameCount)
+        var outputBuffer = [Float](repeating: 0.0, count: frameCount)
+
+        // Run forward/backward to get initial state
+        ctx.zeroGrad()
+        inputBuffer.withUnsafeBufferPointer { inPtr in
+            outputBuffer.withUnsafeMutableBufferPointer { outPtr in
+                runtime.runWithMemory(
+                    outputs: outPtr.baseAddress!,
+                    inputs: inPtr.baseAddress!,
+                    memory: ctx.getMemory(),
+                    frameCount: frameCount)
+            }
+        }
+
+        let initialLoss = outputBuffer[0]
+        let initialGrads = ctx.extractTensorGradients()
+
+        // Training loop
+        for _ in 0..<epochs {
+            ctx.step()
+            ctx.zeroGrad()
+            inputBuffer.withUnsafeBufferPointer { inPtr in
+                outputBuffer.withUnsafeMutableBufferPointer { outPtr in
+                    runtime.runWithMemory(
+                        outputs: outPtr.baseAddress!,
+                        inputs: inPtr.baseAddress!,
+                        memory: ctx.getMemory(),
+                        frameCount: frameCount)
+                }
+            }
+        }
+
+        return TrainingResult(
+            initialLoss: initialLoss,
+            finalLoss: outputBuffer[0],
+            gradients: initialGrads)
+    }
+
+    /// Verifies that gradients are non-zero for all parameter tensors.
+    private func assertNonZeroGradients(
+        _ gradients: [[Float]],
+        names: [String],
+        file: StaticString = #file,
+        line: UInt = #line
+    ) {
+        for (idx, grads) in gradients.enumerated() {
+            let name = idx < names.count ? names[idx] : "param[\(idx)]"
+            XCTAssertTrue(
+                grads.contains { abs($0) > 0.001 },
+                "\(name) gradients should be non-zero",
+                file: file,
+                line: line)
+        }
+    }
+
     // MARK: - Milestone 1: Tensor Gradient Allocation Infrastructure
 
     func testTensorGradientAllocation() throws {
@@ -473,94 +568,31 @@ final class TensorParameterTests: XCTestCase {
         // Input signal: [1, 2, 3, 4, 5]
         let input = g.tensor(shape: [5], data: [1.0, 2.0, 3.0, 4.0, 5.0])
 
-        // Learnable kernel (size 3) - start with identity-ish kernel
+        // Learnable kernel (size 3)
+        // Target: sum(conv_output) = 30
         let kernel = TensorParameter(
             graph: g, shape: [3],
             data: [0.5, 0.5, 0.5], name: "kernel")
 
-        // Convolve: output[i] = sum_k(input[i+k-1] * kernel[k])
-        // With kernel [0.5, 0.5, 0.5], output ≈ [1.5, 3, 4.5, 6, 7.5] (with padding)
         let convResult = g.n(.conv1d(3), input, kernel.node())
         let output = g.n(.sum, convResult)
-
-        // Target: we want sum(conv_output) = 30
-        // With identity kernel [0, 1, 0], output = input, sum = 15
-        // We want kernel that doubles: [0, 2, 0] would give sum = 30
-        let target = g.n(.constant(30.0))
-        let loss = g.n(.mse, output, target)
+        let loss = g.n(.mse, output, g.n(.constant(30.0)))
         _ = g.n(.output(0), loss)
 
-        let frameCount = 1
-        let result = try CompilationPipeline.compile(
-            graph: g, backend: .metal,
-            options: .init(frameCount: frameCount, backwards: true))
-
-        let runtime = try MetalCompiledKernel(
-            kernels: result.kernels,
-            cellAllocations: result.cellAllocations,
-            context: result.context)
-
-        let ctx = TrainingContext(
-            tensorParameters: [kernel],
+        let result = try runTrainingLoop(
+            graph: g,
+            parameters: [kernel],
+            lossNode: loss,
             optimizer: Adam(lr: 0.05),
-            lossNode: loss)
+            epochs: 300)
 
-        ctx.initializeMemory(
-            runtime: runtime,
-            cellAllocations: result.cellAllocations,
-            context: result.context,
-            frameCount: frameCount,
-            graph: g)
+        print("Conv1d initial loss: \(result.initialLoss)")
+        print("Conv1d initial kernel grads: \(result.gradients[0])")
+        assertNonZeroGradients(result.gradients, names: ["kernel"])
 
-        let inputBuffer = [Float](repeating: 0.0, count: frameCount)
-        var outputBuffer = [Float](repeating: 0.0, count: frameCount)
-
-        // Run one step to get initial gradients
-        ctx.zeroGrad()
-        inputBuffer.withUnsafeBufferPointer { inPtr in
-            outputBuffer.withUnsafeMutableBufferPointer { outPtr in
-                runtime.runWithMemory(
-                    outputs: outPtr.baseAddress!,
-                    inputs: inPtr.baseAddress!,
-                    memory: ctx.getMemory(),
-                    frameCount: frameCount)
-            }
-        }
-
-        let initialLoss = outputBuffer[0]
-        let initialGrads = ctx.extractTensorGradients()[0]
-        print("Conv1d initial loss: \(initialLoss)")
-        print("Conv1d initial kernel grads: \(initialGrads)")
-
-        // Verify gradients are non-zero
-        let hasNonZeroGrad = initialGrads.contains { abs($0) > 0.001 }
-        XCTAssertTrue(hasNonZeroGrad, "Kernel gradients should be non-zero")
-
-        // Train for a while
-        var losses: [Float] = [initialLoss]
-        for _ in 0..<300 {
-            ctx.step()
-            ctx.zeroGrad()
-
-            inputBuffer.withUnsafeBufferPointer { inPtr in
-                outputBuffer.withUnsafeMutableBufferPointer { outPtr in
-                    runtime.runWithMemory(
-                        outputs: outPtr.baseAddress!,
-                        inputs: inPtr.baseAddress!,
-                        memory: ctx.getMemory(),
-                        frameCount: frameCount)
-                }
-            }
-
-            losses.append(outputBuffer[0])
-        }
-
-        let finalLoss = losses.last!
-        print("Conv1d final loss: \(finalLoss)")
+        print("Conv1d final loss: \(result.finalLoss)")
         print("Conv1d final kernel: \(kernel.data)")
-
-        // Verify loss decreased significantly
-        XCTAssertLessThan(finalLoss, initialLoss * 0.1, "Loss should decrease significantly")
+        XCTAssertLessThan(result.finalLoss, result.initialLoss * 0.1, "Loss should decrease significantly")
     }
 
     func testConv2dKernelBackward() throws {
@@ -569,94 +601,33 @@ final class TensorParameterTests: XCTestCase {
         // Input: 3x3 grid of ones
         let input = g.ones(shape: [3, 3])
 
-        // Learnable 3x3 kernel - start with small values
+        // Learnable 3x3 kernel
+        // Target: sum(conv_output) = 18
         let kernel = TensorParameter(
             graph: g, shape: [3, 3],
             data: [0.1, 0.1, 0.1,
                    0.1, 0.1, 0.1,
                    0.1, 0.1, 0.1], name: "kernel")
 
-        // Convolve
         let convResult = g.n(.conv2d([3, 3]), input, kernel.node())
         let output = g.n(.sum, convResult)
-
-        // Target: we want sum(conv_output) = 18
-        // With a center-only kernel [0,0,0, 0,2,0, 0,0,0], sum would = 18 for 3x3 input of ones
-        let target = g.n(.constant(18.0))
-        let loss = g.n(.mse, output, target)
+        let loss = g.n(.mse, output, g.n(.constant(18.0)))
         _ = g.n(.output(0), loss)
 
-        let frameCount = 1
-        let result = try CompilationPipeline.compile(
-            graph: g, backend: .metal,
-            options: .init(frameCount: frameCount, backwards: true))
-
-        let runtime = try MetalCompiledKernel(
-            kernels: result.kernels,
-            cellAllocations: result.cellAllocations,
-            context: result.context)
-
-        let ctx = TrainingContext(
-            tensorParameters: [kernel],
+        let result = try runTrainingLoop(
+            graph: g,
+            parameters: [kernel],
+            lossNode: loss,
             optimizer: Adam(lr: 0.05),
-            lossNode: loss)
+            epochs: 300)
 
-        ctx.initializeMemory(
-            runtime: runtime,
-            cellAllocations: result.cellAllocations,
-            context: result.context,
-            frameCount: frameCount,
-            graph: g)
+        print("Conv2d initial loss: \(result.initialLoss)")
+        print("Conv2d initial kernel grads: \(result.gradients[0])")
+        assertNonZeroGradients(result.gradients, names: ["kernel"])
 
-        let inputBuffer = [Float](repeating: 0.0, count: frameCount)
-        var outputBuffer = [Float](repeating: 0.0, count: frameCount)
-
-        // Run one step to get initial gradients
-        ctx.zeroGrad()
-        inputBuffer.withUnsafeBufferPointer { inPtr in
-            outputBuffer.withUnsafeMutableBufferPointer { outPtr in
-                runtime.runWithMemory(
-                    outputs: outPtr.baseAddress!,
-                    inputs: inPtr.baseAddress!,
-                    memory: ctx.getMemory(),
-                    frameCount: frameCount)
-            }
-        }
-
-        let initialLoss = outputBuffer[0]
-        let initialGrads = ctx.extractTensorGradients()[0]
-        print("Conv2d initial loss: \(initialLoss)")
-        print("Conv2d initial kernel grads: \(initialGrads)")
-
-        // Verify gradients are non-zero
-        let hasNonZeroGrad = initialGrads.contains { abs($0) > 0.001 }
-        XCTAssertTrue(hasNonZeroGrad, "Kernel gradients should be non-zero")
-
-        // Train for a while
-        var losses: [Float] = [initialLoss]
-        for _ in 0..<300 {
-            ctx.step()
-            ctx.zeroGrad()
-
-            inputBuffer.withUnsafeBufferPointer { inPtr in
-                outputBuffer.withUnsafeMutableBufferPointer { outPtr in
-                    runtime.runWithMemory(
-                        outputs: outPtr.baseAddress!,
-                        inputs: inPtr.baseAddress!,
-                        memory: ctx.getMemory(),
-                        frameCount: frameCount)
-                }
-            }
-
-            losses.append(outputBuffer[0])
-        }
-
-        let finalLoss = losses.last!
-        print("Conv2d final loss: \(finalLoss)")
+        print("Conv2d final loss: \(result.finalLoss)")
         print("Conv2d final kernel: \(kernel.data)")
-
-        // Verify loss decreased significantly
-        XCTAssertLessThan(finalLoss, initialLoss * 0.1, "Loss should decrease significantly")
+        XCTAssertLessThan(result.finalLoss, result.initialLoss * 0.1, "Loss should decrease significantly")
     }
 
     // MARK: - Binary Op Backward Tests (using emitBinaryOpBackward)
@@ -665,75 +636,19 @@ final class TensorParameterTests: XCTestCase {
         let g = Graph()
 
         // Test: a + b where both are learnable tensors
+        // output = sum(a + b) = sum(a) + sum(b) = 10 + 2 = 12, target: 20
         let a = TensorParameter(graph: g, shape: [4], data: [1.0, 2.0, 3.0, 4.0], name: "a")
         let b = TensorParameter(graph: g, shape: [4], data: [0.5, 0.5, 0.5, 0.5], name: "b")
 
-        // output = sum(a + b) = sum(a) + sum(b) = 10 + 2 = 12
-        // Target: 20, so we need to increase both a and b
         let added = g.n(.add, a.node(), b.node())
         let output = g.n(.sum, added)
         let loss = g.n(.mse, output, g.n(.constant(20.0)))
         _ = g.n(.output(0), loss)
 
-        let frameCount = 1
-        let result = try CompilationPipeline.compile(
-            graph: g, backend: .metal,
-            options: .init(frameCount: frameCount, backwards: true))
+        let result = try runTrainingLoop(graph: g, parameters: [a, b], lossNode: loss)
 
-        let runtime = try MetalCompiledKernel(
-            kernels: result.kernels,
-            cellAllocations: result.cellAllocations,
-            context: result.context)
-
-        let ctx = TrainingContext(
-            tensorParameters: [a, b],
-            optimizer: Adam(lr: 0.1),
-            lossNode: loss)
-
-        ctx.initializeMemory(
-            runtime: runtime,
-            cellAllocations: result.cellAllocations,
-            context: result.context,
-            frameCount: frameCount,
-            graph: g)
-
-        let inputBuffer = [Float](repeating: 0.0, count: frameCount)
-        var outputBuffer = [Float](repeating: 0.0, count: frameCount)
-
-        // Get initial gradients
-        ctx.zeroGrad()
-        inputBuffer.withUnsafeBufferPointer { inPtr in
-            outputBuffer.withUnsafeMutableBufferPointer { outPtr in
-                runtime.runWithMemory(
-                    outputs: outPtr.baseAddress!,
-                    inputs: inPtr.baseAddress!,
-                    memory: ctx.getMemory(),
-                    frameCount: frameCount)
-            }
-        }
-
-        let grads = ctx.extractTensorGradients()
-        print("Add backward - a grads: \(grads[0]), b grads: \(grads[1])")
-
-        // For add: dL/da = dL/d(sum) = gradOutput, dL/db = gradOutput
-        // Both should have the same gradient (broadcast from sum)
-        XCTAssertTrue(grads[0].contains { abs($0) > 0.001 }, "a gradients should be non-zero")
-        XCTAssertTrue(grads[1].contains { abs($0) > 0.001 }, "b gradients should be non-zero")
-
-        // Train and verify convergence
-        for _ in 0..<200 {
-            ctx.step()
-            ctx.zeroGrad()
-            inputBuffer.withUnsafeBufferPointer { inPtr in
-                outputBuffer.withUnsafeMutableBufferPointer { outPtr in
-                    runtime.runWithMemory(
-                        outputs: outPtr.baseAddress!,
-                        inputs: inPtr.baseAddress!,
-                        memory: ctx.getMemory(),
-                        frameCount: frameCount)
-                }
-            }
-        }
+        print("Add backward - a grads: \(result.gradients[0]), b grads: \(result.gradients[1])")
+        assertNonZeroGradients(result.gradients, names: ["a", "b"])
 
         let finalSum = a.data.reduce(0, +) + b.data.reduce(0, +)
         print("Add backward - final sum: \(finalSum) (target: 20)")
@@ -744,73 +659,19 @@ final class TensorParameterTests: XCTestCase {
         let g = Graph()
 
         // Test: a - b where both are learnable tensors
+        // output = sum(a - b) = 20 - 4 = 16, target: 10
         let a = TensorParameter(graph: g, shape: [4], data: [5.0, 5.0, 5.0, 5.0], name: "a")
         let b = TensorParameter(graph: g, shape: [4], data: [1.0, 1.0, 1.0, 1.0], name: "b")
 
-        // output = sum(a - b) = 20 - 4 = 16
-        // Target: 10, so we need to decrease a or increase b
         let subbed = g.n(.sub, a.node(), b.node())
         let output = g.n(.sum, subbed)
         let loss = g.n(.mse, output, g.n(.constant(10.0)))
         _ = g.n(.output(0), loss)
 
-        let frameCount = 1
-        let result = try CompilationPipeline.compile(
-            graph: g, backend: .metal,
-            options: .init(frameCount: frameCount, backwards: true))
+        let result = try runTrainingLoop(graph: g, parameters: [a, b], lossNode: loss)
 
-        let runtime = try MetalCompiledKernel(
-            kernels: result.kernels,
-            cellAllocations: result.cellAllocations,
-            context: result.context)
-
-        let ctx = TrainingContext(
-            tensorParameters: [a, b],
-            optimizer: Adam(lr: 0.1),
-            lossNode: loss)
-
-        ctx.initializeMemory(
-            runtime: runtime,
-            cellAllocations: result.cellAllocations,
-            context: result.context,
-            frameCount: frameCount,
-            graph: g)
-
-        let inputBuffer = [Float](repeating: 0.0, count: frameCount)
-        var outputBuffer = [Float](repeating: 0.0, count: frameCount)
-
-        ctx.zeroGrad()
-        inputBuffer.withUnsafeBufferPointer { inPtr in
-            outputBuffer.withUnsafeMutableBufferPointer { outPtr in
-                runtime.runWithMemory(
-                    outputs: outPtr.baseAddress!,
-                    inputs: inPtr.baseAddress!,
-                    memory: ctx.getMemory(),
-                    frameCount: frameCount)
-            }
-        }
-
-        let grads = ctx.extractTensorGradients()
-        print("Sub backward - a grads: \(grads[0]), b grads: \(grads[1])")
-
-        // For sub: dL/da = gradOutput, dL/db = -gradOutput
-        XCTAssertTrue(grads[0].contains { abs($0) > 0.001 }, "a gradients should be non-zero")
-        XCTAssertTrue(grads[1].contains { abs($0) > 0.001 }, "b gradients should be non-zero")
-
-        // Train and verify convergence
-        for _ in 0..<200 {
-            ctx.step()
-            ctx.zeroGrad()
-            inputBuffer.withUnsafeBufferPointer { inPtr in
-                outputBuffer.withUnsafeMutableBufferPointer { outPtr in
-                    runtime.runWithMemory(
-                        outputs: outPtr.baseAddress!,
-                        inputs: inPtr.baseAddress!,
-                        memory: ctx.getMemory(),
-                        frameCount: frameCount)
-                }
-            }
-        }
+        print("Sub backward - a grads: \(result.gradients[0]), b grads: \(result.gradients[1])")
+        assertNonZeroGradients(result.gradients, names: ["a", "b"])
 
         let finalDiff = a.data.reduce(0, +) - b.data.reduce(0, +)
         print("Sub backward - final diff: \(finalDiff) (target: 10)")
@@ -821,78 +682,27 @@ final class TensorParameterTests: XCTestCase {
         let g = Graph()
 
         // Test: a / b where both are learnable tensors
+        // output = sum(a / b) = sum([2, 4, 6, 8]) = 20, target: 10
         let a = TensorParameter(graph: g, shape: [4], data: [4.0, 8.0, 12.0, 16.0], name: "a")
         let b = TensorParameter(graph: g, shape: [4], data: [2.0, 2.0, 2.0, 2.0], name: "b")
 
-        // output = sum(a / b) = sum([2, 4, 6, 8]) = 20
-        // Target: 10
         let divided = g.n(.div, a.node(), b.node())
         let output = g.n(.sum, divided)
         let loss = g.n(.mse, output, g.n(.constant(10.0)))
         _ = g.n(.output(0), loss)
 
-        let frameCount = 1
-        let result = try CompilationPipeline.compile(
-            graph: g, backend: .metal,
-            options: .init(frameCount: frameCount, backwards: true))
-
-        let runtime = try MetalCompiledKernel(
-            kernels: result.kernels,
-            cellAllocations: result.cellAllocations,
-            context: result.context)
-
-        let ctx = TrainingContext(
-            tensorParameters: [a, b],
+        let result = try runTrainingLoop(
+            graph: g,
+            parameters: [a, b],
+            lossNode: loss,
             optimizer: Adam(lr: 0.05),
-            lossNode: loss)
+            epochs: 300)
 
-        ctx.initializeMemory(
-            runtime: runtime,
-            cellAllocations: result.cellAllocations,
-            context: result.context,
-            frameCount: frameCount,
-            graph: g)
+        print("Div backward - a grads: \(result.gradients[0]), b grads: \(result.gradients[1])")
+        assertNonZeroGradients(result.gradients, names: ["a", "b"])
 
-        let inputBuffer = [Float](repeating: 0.0, count: frameCount)
-        var outputBuffer = [Float](repeating: 0.0, count: frameCount)
-
-        ctx.zeroGrad()
-        inputBuffer.withUnsafeBufferPointer { inPtr in
-            outputBuffer.withUnsafeMutableBufferPointer { outPtr in
-                runtime.runWithMemory(
-                    outputs: outPtr.baseAddress!,
-                    inputs: inPtr.baseAddress!,
-                    memory: ctx.getMemory(),
-                    frameCount: frameCount)
-            }
-        }
-
-        let grads = ctx.extractTensorGradients()
-        print("Div backward - a grads: \(grads[0]), b grads: \(grads[1])")
-
-        // For div: dL/da = gradOutput / b, dL/db = -gradOutput * a / b^2
-        XCTAssertTrue(grads[0].contains { abs($0) > 0.001 }, "a gradients should be non-zero")
-        XCTAssertTrue(grads[1].contains { abs($0) > 0.001 }, "b gradients should be non-zero")
-
-        // Train and verify convergence
-        let initialLoss = outputBuffer[0]
-        for _ in 0..<300 {
-            ctx.step()
-            ctx.zeroGrad()
-            inputBuffer.withUnsafeBufferPointer { inPtr in
-                outputBuffer.withUnsafeMutableBufferPointer { outPtr in
-                    runtime.runWithMemory(
-                        outputs: outPtr.baseAddress!,
-                        inputs: inPtr.baseAddress!,
-                        memory: ctx.getMemory(),
-                        frameCount: frameCount)
-                }
-            }
-        }
-
-        let finalLoss = outputBuffer[0]
-        print("Div backward - initial loss: \(initialLoss), final loss: \(finalLoss)")
-        XCTAssertLessThan(finalLoss, initialLoss * 0.1, "Loss should decrease significantly")
+        print("Div backward - initial loss: \(result.initialLoss), final loss: \(result.finalLoss)")
+        XCTAssertLessThan(result.finalLoss, result.initialLoss * 0.1, "Loss should decrease significantly")
     }
 
     // MARK: - Unary Op Backward Tests (using emitUnaryOpBackward)
@@ -900,505 +710,159 @@ final class TensorParameterTests: XCTestCase {
     func testTensorSinBackward() throws {
         let g = Graph()
 
-        // Test: sin(x) where x is learnable
-        // sin has derivative cos(x)
+        // sin(x) has derivative cos(x)
+        // Target: maximize sum(sin(x)) = 4 -> x should converge to pi/2
         let x = TensorParameter(graph: g, shape: [4], data: [0.0, 0.5, 1.0, 1.5], name: "x")
 
         let sinResult = g.n(.sin, x.node())
         let output = g.n(.sum, sinResult)
-        // Target: maximize sum(sin(x)) -> x should converge to π/2
-        let loss = g.n(.mse, output, g.n(.constant(4.0)))  // max sum(sin) for 4 elements = 4
+        let loss = g.n(.mse, output, g.n(.constant(4.0)))
         _ = g.n(.output(0), loss)
 
-        let frameCount = 1
-        let result = try CompilationPipeline.compile(
-            graph: g, backend: .metal,
-            options: .init(frameCount: frameCount, backwards: true))
+        let result = try runTrainingLoop(graph: g, parameters: [x], lossNode: loss)
 
-        let runtime = try MetalCompiledKernel(
-            kernels: result.kernels,
-            cellAllocations: result.cellAllocations,
-            context: result.context)
+        print("Sin backward - grads: \(result.gradients[0])")
+        assertNonZeroGradients(result.gradients, names: ["x"])
 
-        let ctx = TrainingContext(
-            tensorParameters: [x],
-            optimizer: Adam(lr: 0.1),
-            lossNode: loss)
-
-        ctx.initializeMemory(
-            runtime: runtime,
-            cellAllocations: result.cellAllocations,
-            context: result.context,
-            frameCount: frameCount,
-            graph: g)
-
-        let inputBuffer = [Float](repeating: 0.0, count: frameCount)
-        var outputBuffer = [Float](repeating: 0.0, count: frameCount)
-
-        ctx.zeroGrad()
-        inputBuffer.withUnsafeBufferPointer { inPtr in
-            outputBuffer.withUnsafeMutableBufferPointer { outPtr in
-                runtime.runWithMemory(
-                    outputs: outPtr.baseAddress!,
-                    inputs: inPtr.baseAddress!,
-                    memory: ctx.getMemory(),
-                    frameCount: frameCount)
-            }
-        }
-
-        let grads = ctx.extractTensorGradients()[0]
-        print("Sin backward - grads: \(grads)")
-        XCTAssertTrue(grads.contains { abs($0) > 0.001 }, "sin gradients should be non-zero")
-
-        // Train
-        let initialLoss = outputBuffer[0]
-        for _ in 0..<200 {
-            ctx.step()
-            ctx.zeroGrad()
-            inputBuffer.withUnsafeBufferPointer { inPtr in
-                outputBuffer.withUnsafeMutableBufferPointer { outPtr in
-                    runtime.runWithMemory(
-                        outputs: outPtr.baseAddress!,
-                        inputs: inPtr.baseAddress!,
-                        memory: ctx.getMemory(),
-                        frameCount: frameCount)
-                }
-            }
-        }
-
-        let finalLoss = outputBuffer[0]
-        print("Sin backward - initial loss: \(initialLoss), final loss: \(finalLoss)")
+        print("Sin backward - initial loss: \(result.initialLoss), final loss: \(result.finalLoss)")
         print("Sin backward - final x: \(x.data)")
-        XCTAssertLessThan(finalLoss, initialLoss * 0.5, "Loss should decrease")
+        XCTAssertLessThan(result.finalLoss, result.initialLoss * 0.5, "Loss should decrease")
     }
 
     func testTensorCosBackward() throws {
         let g = Graph()
 
+        // Target: sum(cos(x)) = 4 -> x should converge to 0
         let x = TensorParameter(graph: g, shape: [4], data: [1.0, 1.0, 1.0, 1.0], name: "x")
 
         let cosResult = g.n(.cos, x.node())
         let output = g.n(.sum, cosResult)
-        // Target: sum(cos(x)) = 4 -> x should be 0
         let loss = g.n(.mse, output, g.n(.constant(4.0)))
         _ = g.n(.output(0), loss)
 
-        let frameCount = 1
-        let result = try CompilationPipeline.compile(
-            graph: g, backend: .metal,
-            options: .init(frameCount: frameCount, backwards: true))
+        let result = try runTrainingLoop(graph: g, parameters: [x], lossNode: loss)
 
-        let runtime = try MetalCompiledKernel(
-            kernels: result.kernels,
-            cellAllocations: result.cellAllocations,
-            context: result.context)
+        print("Cos backward - grads: \(result.gradients[0])")
+        assertNonZeroGradients(result.gradients, names: ["x"])
 
-        let ctx = TrainingContext(
-            tensorParameters: [x],
-            optimizer: Adam(lr: 0.1),
-            lossNode: loss)
-
-        ctx.initializeMemory(
-            runtime: runtime,
-            cellAllocations: result.cellAllocations,
-            context: result.context,
-            frameCount: frameCount,
-            graph: g)
-
-        let inputBuffer = [Float](repeating: 0.0, count: frameCount)
-        var outputBuffer = [Float](repeating: 0.0, count: frameCount)
-
-        ctx.zeroGrad()
-        inputBuffer.withUnsafeBufferPointer { inPtr in
-            outputBuffer.withUnsafeMutableBufferPointer { outPtr in
-                runtime.runWithMemory(
-                    outputs: outPtr.baseAddress!,
-                    inputs: inPtr.baseAddress!,
-                    memory: ctx.getMemory(),
-                    frameCount: frameCount)
-            }
-        }
-
-        let grads = ctx.extractTensorGradients()[0]
-        print("Cos backward - grads: \(grads)")
-        XCTAssertTrue(grads.contains { abs($0) > 0.001 }, "cos gradients should be non-zero")
-
-        let initialLoss = outputBuffer[0]
-        for _ in 0..<200 {
-            ctx.step()
-            ctx.zeroGrad()
-            inputBuffer.withUnsafeBufferPointer { inPtr in
-                outputBuffer.withUnsafeMutableBufferPointer { outPtr in
-                    runtime.runWithMemory(
-                        outputs: outPtr.baseAddress!,
-                        inputs: inPtr.baseAddress!,
-                        memory: ctx.getMemory(),
-                        frameCount: frameCount)
-                }
-            }
-        }
-
-        let finalLoss = outputBuffer[0]
-        print("Cos backward - initial loss: \(initialLoss), final loss: \(finalLoss)")
-        XCTAssertLessThan(finalLoss, initialLoss * 0.5, "Loss should decrease")
+        print("Cos backward - initial loss: \(result.initialLoss), final loss: \(result.finalLoss)")
+        XCTAssertLessThan(result.finalLoss, result.initialLoss * 0.5, "Loss should decrease")
     }
 
     func testTensorTanhBackward() throws {
         let g = Graph()
 
+        // Target: sum(tanh(x)) = 2 -> x should become positive
         let x = TensorParameter(graph: g, shape: [4], data: [0.0, 0.0, 0.0, 0.0], name: "x")
 
         let tanhResult = g.n(.tanh, x.node())
         let output = g.n(.sum, tanhResult)
-        // Target: sum(tanh(x)) = 2 -> x should be positive
         let loss = g.n(.mse, output, g.n(.constant(2.0)))
         _ = g.n(.output(0), loss)
 
-        let frameCount = 1
-        let result = try CompilationPipeline.compile(
-            graph: g, backend: .metal,
-            options: .init(frameCount: frameCount, backwards: true))
+        let result = try runTrainingLoop(
+            graph: g,
+            parameters: [x],
+            lossNode: loss,
+            optimizer: Adam(lr: 0.2))
 
-        let runtime = try MetalCompiledKernel(
-            kernels: result.kernels,
-            cellAllocations: result.cellAllocations,
-            context: result.context)
+        print("Tanh backward - grads: \(result.gradients[0])")
+        assertNonZeroGradients(result.gradients, names: ["x"])
 
-        let ctx = TrainingContext(
-            tensorParameters: [x],
-            optimizer: Adam(lr: 0.2),
-            lossNode: loss)
-
-        ctx.initializeMemory(
-            runtime: runtime,
-            cellAllocations: result.cellAllocations,
-            context: result.context,
-            frameCount: frameCount,
-            graph: g)
-
-        let inputBuffer = [Float](repeating: 0.0, count: frameCount)
-        var outputBuffer = [Float](repeating: 0.0, count: frameCount)
-
-        ctx.zeroGrad()
-        inputBuffer.withUnsafeBufferPointer { inPtr in
-            outputBuffer.withUnsafeMutableBufferPointer { outPtr in
-                runtime.runWithMemory(
-                    outputs: outPtr.baseAddress!,
-                    inputs: inPtr.baseAddress!,
-                    memory: ctx.getMemory(),
-                    frameCount: frameCount)
-            }
-        }
-
-        let grads = ctx.extractTensorGradients()[0]
-        print("Tanh backward - grads: \(grads)")
-        XCTAssertTrue(grads.contains { abs($0) > 0.001 }, "tanh gradients should be non-zero")
-
-        let initialLoss = outputBuffer[0]
-        for _ in 0..<200 {
-            ctx.step()
-            ctx.zeroGrad()
-            inputBuffer.withUnsafeBufferPointer { inPtr in
-                outputBuffer.withUnsafeMutableBufferPointer { outPtr in
-                    runtime.runWithMemory(
-                        outputs: outPtr.baseAddress!,
-                        inputs: inPtr.baseAddress!,
-                        memory: ctx.getMemory(),
-                        frameCount: frameCount)
-                }
-            }
-        }
-
-        let finalLoss = outputBuffer[0]
-        print("Tanh backward - initial loss: \(initialLoss), final loss: \(finalLoss)")
-        XCTAssertLessThan(finalLoss, initialLoss * 0.5, "Loss should decrease")
+        print("Tanh backward - initial loss: \(result.initialLoss), final loss: \(result.finalLoss)")
+        XCTAssertLessThan(result.finalLoss, result.initialLoss * 0.5, "Loss should decrease")
     }
 
     func testTensorExpBackward() throws {
         let g = Graph()
 
+        // exp(0) = 1, sum = 4. Target: 8 -> x should increase
         let x = TensorParameter(graph: g, shape: [4], data: [0.0, 0.0, 0.0, 0.0], name: "x")
 
         let expResult = g.n(.exp, x.node())
         let output = g.n(.sum, expResult)
-        // exp(0) = 1, so sum = 4. Target: 8 -> x should increase
         let loss = g.n(.mse, output, g.n(.constant(8.0)))
         _ = g.n(.output(0), loss)
 
-        let frameCount = 1
-        let result = try CompilationPipeline.compile(
-            graph: g, backend: .metal,
-            options: .init(frameCount: frameCount, backwards: true))
+        let result = try runTrainingLoop(graph: g, parameters: [x], lossNode: loss)
 
-        let runtime = try MetalCompiledKernel(
-            kernels: result.kernels,
-            cellAllocations: result.cellAllocations,
-            context: result.context)
+        print("Exp backward - grads: \(result.gradients[0])")
+        assertNonZeroGradients(result.gradients, names: ["x"])
 
-        let ctx = TrainingContext(
-            tensorParameters: [x],
-            optimizer: Adam(lr: 0.1),
-            lossNode: loss)
-
-        ctx.initializeMemory(
-            runtime: runtime,
-            cellAllocations: result.cellAllocations,
-            context: result.context,
-            frameCount: frameCount,
-            graph: g)
-
-        let inputBuffer = [Float](repeating: 0.0, count: frameCount)
-        var outputBuffer = [Float](repeating: 0.0, count: frameCount)
-
-        ctx.zeroGrad()
-        inputBuffer.withUnsafeBufferPointer { inPtr in
-            outputBuffer.withUnsafeMutableBufferPointer { outPtr in
-                runtime.runWithMemory(
-                    outputs: outPtr.baseAddress!,
-                    inputs: inPtr.baseAddress!,
-                    memory: ctx.getMemory(),
-                    frameCount: frameCount)
-            }
-        }
-
-        let grads = ctx.extractTensorGradients()[0]
-        print("Exp backward - grads: \(grads)")
-        XCTAssertTrue(grads.contains { abs($0) > 0.001 }, "exp gradients should be non-zero")
-
-        let initialLoss = outputBuffer[0]
-        for _ in 0..<200 {
-            ctx.step()
-            ctx.zeroGrad()
-            inputBuffer.withUnsafeBufferPointer { inPtr in
-                outputBuffer.withUnsafeMutableBufferPointer { outPtr in
-                    runtime.runWithMemory(
-                        outputs: outPtr.baseAddress!,
-                        inputs: inPtr.baseAddress!,
-                        memory: ctx.getMemory(),
-                        frameCount: frameCount)
-                }
-            }
-        }
-
-        let finalLoss = outputBuffer[0]
-        print("Exp backward - initial loss: \(initialLoss), final loss: \(finalLoss)")
-        XCTAssertLessThan(finalLoss, initialLoss * 0.1, "Loss should decrease significantly")
+        print("Exp backward - initial loss: \(result.initialLoss), final loss: \(result.finalLoss)")
+        XCTAssertLessThan(result.finalLoss, result.initialLoss * 0.1, "Loss should decrease significantly")
     }
 
     func testTensorLogBackward() throws {
         let g = Graph()
 
-        // Start with positive values for log
+        // log(1) = 0, sum = 0. Target: 4 -> x should increase to e
         let x = TensorParameter(graph: g, shape: [4], data: [1.0, 1.0, 1.0, 1.0], name: "x")
 
         let logResult = g.n(.log, x.node())
         let output = g.n(.sum, logResult)
-        // log(1) = 0, so sum = 0. Target: 4 -> x should increase to e
         let loss = g.n(.mse, output, g.n(.constant(4.0)))
         _ = g.n(.output(0), loss)
 
-        let frameCount = 1
-        let result = try CompilationPipeline.compile(
-            graph: g, backend: .metal,
-            options: .init(frameCount: frameCount, backwards: true))
+        let result = try runTrainingLoop(
+            graph: g,
+            parameters: [x],
+            lossNode: loss,
+            optimizer: Adam(lr: 0.2))
 
-        let runtime = try MetalCompiledKernel(
-            kernels: result.kernels,
-            cellAllocations: result.cellAllocations,
-            context: result.context)
+        print("Log backward - grads: \(result.gradients[0])")
+        assertNonZeroGradients(result.gradients, names: ["x"])
 
-        let ctx = TrainingContext(
-            tensorParameters: [x],
-            optimizer: Adam(lr: 0.2),
-            lossNode: loss)
-
-        ctx.initializeMemory(
-            runtime: runtime,
-            cellAllocations: result.cellAllocations,
-            context: result.context,
-            frameCount: frameCount,
-            graph: g)
-
-        let inputBuffer = [Float](repeating: 0.0, count: frameCount)
-        var outputBuffer = [Float](repeating: 0.0, count: frameCount)
-
-        ctx.zeroGrad()
-        inputBuffer.withUnsafeBufferPointer { inPtr in
-            outputBuffer.withUnsafeMutableBufferPointer { outPtr in
-                runtime.runWithMemory(
-                    outputs: outPtr.baseAddress!,
-                    inputs: inPtr.baseAddress!,
-                    memory: ctx.getMemory(),
-                    frameCount: frameCount)
-            }
-        }
-
-        let grads = ctx.extractTensorGradients()[0]
-        print("Log backward - grads: \(grads)")
-        XCTAssertTrue(grads.contains { abs($0) > 0.001 }, "log gradients should be non-zero")
-
-        let initialLoss = outputBuffer[0]
-        for _ in 0..<200 {
-            ctx.step()
-            ctx.zeroGrad()
-            inputBuffer.withUnsafeBufferPointer { inPtr in
-                outputBuffer.withUnsafeMutableBufferPointer { outPtr in
-                    runtime.runWithMemory(
-                        outputs: outPtr.baseAddress!,
-                        inputs: inPtr.baseAddress!,
-                        memory: ctx.getMemory(),
-                        frameCount: frameCount)
-                }
-            }
-        }
-
-        let finalLoss = outputBuffer[0]
-        print("Log backward - initial loss: \(initialLoss), final loss: \(finalLoss)")
-        XCTAssertLessThan(finalLoss, initialLoss * 0.5, "Loss should decrease")
+        print("Log backward - initial loss: \(result.initialLoss), final loss: \(result.finalLoss)")
+        XCTAssertLessThan(result.finalLoss, result.initialLoss * 0.5, "Loss should decrease")
     }
 
     func testTensorSqrtBackward() throws {
         let g = Graph()
 
-        // Start with positive values for sqrt
+        // sqrt(1) = 1, sum = 4. Target: 8 -> x should increase to 4
         let x = TensorParameter(graph: g, shape: [4], data: [1.0, 1.0, 1.0, 1.0], name: "x")
 
         let sqrtResult = g.n(.sqrt, x.node())
         let output = g.n(.sum, sqrtResult)
-        // sqrt(1) = 1, so sum = 4. Target: 8 -> x should increase to 4
         let loss = g.n(.mse, output, g.n(.constant(8.0)))
         _ = g.n(.output(0), loss)
 
-        let frameCount = 1
-        let result = try CompilationPipeline.compile(
-            graph: g, backend: .metal,
-            options: .init(frameCount: frameCount, backwards: true))
+        let result = try runTrainingLoop(
+            graph: g,
+            parameters: [x],
+            lossNode: loss,
+            optimizer: Adam(lr: 0.5))
 
-        let runtime = try MetalCompiledKernel(
-            kernels: result.kernels,
-            cellAllocations: result.cellAllocations,
-            context: result.context)
+        print("Sqrt backward - grads: \(result.gradients[0])")
+        assertNonZeroGradients(result.gradients, names: ["x"])
 
-        let ctx = TrainingContext(
-            tensorParameters: [x],
-            optimizer: Adam(lr: 0.5),
-            lossNode: loss)
-
-        ctx.initializeMemory(
-            runtime: runtime,
-            cellAllocations: result.cellAllocations,
-            context: result.context,
-            frameCount: frameCount,
-            graph: g)
-
-        let inputBuffer = [Float](repeating: 0.0, count: frameCount)
-        var outputBuffer = [Float](repeating: 0.0, count: frameCount)
-
-        ctx.zeroGrad()
-        inputBuffer.withUnsafeBufferPointer { inPtr in
-            outputBuffer.withUnsafeMutableBufferPointer { outPtr in
-                runtime.runWithMemory(
-                    outputs: outPtr.baseAddress!,
-                    inputs: inPtr.baseAddress!,
-                    memory: ctx.getMemory(),
-                    frameCount: frameCount)
-            }
-        }
-
-        let grads = ctx.extractTensorGradients()[0]
-        print("Sqrt backward - grads: \(grads)")
-        XCTAssertTrue(grads.contains { abs($0) > 0.001 }, "sqrt gradients should be non-zero")
-
-        let initialLoss = outputBuffer[0]
-        for _ in 0..<200 {
-            ctx.step()
-            ctx.zeroGrad()
-            inputBuffer.withUnsafeBufferPointer { inPtr in
-                outputBuffer.withUnsafeMutableBufferPointer { outPtr in
-                    runtime.runWithMemory(
-                        outputs: outPtr.baseAddress!,
-                        inputs: inPtr.baseAddress!,
-                        memory: ctx.getMemory(),
-                        frameCount: frameCount)
-                }
-            }
-        }
-
-        let finalLoss = outputBuffer[0]
-        print("Sqrt backward - initial loss: \(initialLoss), final loss: \(finalLoss)")
-        XCTAssertLessThan(finalLoss, initialLoss * 0.1, "Loss should decrease significantly")
+        print("Sqrt backward - initial loss: \(result.initialLoss), final loss: \(result.finalLoss)")
+        XCTAssertLessThan(result.finalLoss, result.initialLoss * 0.1, "Loss should decrease significantly")
     }
 
     func testTensorAbsBackward() throws {
         let g = Graph()
 
+        // abs([-2,-1,1,2]) = [2,1,1,2], sum = 6. Target: 2 -> reduce magnitudes
         // abs has gradient sign(x)
         let x = TensorParameter(graph: g, shape: [4], data: [-2.0, -1.0, 1.0, 2.0], name: "x")
 
         let absResult = g.n(.abs, x.node())
         let output = g.n(.sum, absResult)
-        // abs([-2,-1,1,2]) = [2,1,1,2], sum = 6. Target: 2 -> reduce magnitudes
         let loss = g.n(.mse, output, g.n(.constant(2.0)))
         _ = g.n(.output(0), loss)
 
-        let frameCount = 1
-        let result = try CompilationPipeline.compile(
-            graph: g, backend: .metal,
-            options: .init(frameCount: frameCount, backwards: true))
+        let result = try runTrainingLoop(
+            graph: g,
+            parameters: [x],
+            lossNode: loss,
+            optimizer: Adam(lr: 0.2))
 
-        let runtime = try MetalCompiledKernel(
-            kernels: result.kernels,
-            cellAllocations: result.cellAllocations,
-            context: result.context)
+        print("Abs backward - grads: \(result.gradients[0])")
+        assertNonZeroGradients(result.gradients, names: ["x"])
 
-        let ctx = TrainingContext(
-            tensorParameters: [x],
-            optimizer: Adam(lr: 0.2),
-            lossNode: loss)
-
-        ctx.initializeMemory(
-            runtime: runtime,
-            cellAllocations: result.cellAllocations,
-            context: result.context,
-            frameCount: frameCount,
-            graph: g)
-
-        let inputBuffer = [Float](repeating: 0.0, count: frameCount)
-        var outputBuffer = [Float](repeating: 0.0, count: frameCount)
-
-        ctx.zeroGrad()
-        inputBuffer.withUnsafeBufferPointer { inPtr in
-            outputBuffer.withUnsafeMutableBufferPointer { outPtr in
-                runtime.runWithMemory(
-                    outputs: outPtr.baseAddress!,
-                    inputs: inPtr.baseAddress!,
-                    memory: ctx.getMemory(),
-                    frameCount: frameCount)
-            }
-        }
-
-        let grads = ctx.extractTensorGradients()[0]
-        print("Abs backward - grads: \(grads)")
-        // Gradient should be sign(x) * gradOutput
-        XCTAssertTrue(grads.contains { abs($0) > 0.001 }, "abs gradients should be non-zero")
-
-        let initialLoss = outputBuffer[0]
-        for _ in 0..<200 {
-            ctx.step()
-            ctx.zeroGrad()
-            inputBuffer.withUnsafeBufferPointer { inPtr in
-                outputBuffer.withUnsafeMutableBufferPointer { outPtr in
-                    runtime.runWithMemory(
-                        outputs: outPtr.baseAddress!,
-                        inputs: inPtr.baseAddress!,
-                        memory: ctx.getMemory(),
-                        frameCount: frameCount)
-                }
-            }
-        }
-
-        let finalLoss = outputBuffer[0]
-        print("Abs backward - initial loss: \(initialLoss), final loss: \(finalLoss)")
-        XCTAssertLessThan(finalLoss, initialLoss * 0.5, "Loss should decrease")
+        print("Abs backward - initial loss: \(result.initialLoss), final loss: \(result.finalLoss)")
+        XCTAssertLessThan(result.finalLoss, result.initialLoss * 0.5, "Loss should decrease")
     }
 }
