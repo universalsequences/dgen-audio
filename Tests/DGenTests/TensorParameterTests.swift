@@ -464,4 +464,198 @@ final class TensorParameterTests: XCTestCase {
         print("Final sum: \(finalSum), weights: \(weights.data)")
         XCTAssertEqual(finalSum, 0.0, accuracy: 0.5, "Weights should sum close to 0")
     }
+
+    // MARK: - Conv1d Backward Tests
+
+    func testConv1dKernelBackward() throws {
+        let g = Graph()
+
+        // Input signal: [1, 2, 3, 4, 5]
+        let input = g.tensor(shape: [5], data: [1.0, 2.0, 3.0, 4.0, 5.0])
+
+        // Learnable kernel (size 3) - start with identity-ish kernel
+        let kernel = TensorParameter(
+            graph: g, shape: [3],
+            data: [0.5, 0.5, 0.5], name: "kernel")
+
+        // Convolve: output[i] = sum_k(input[i+k-1] * kernel[k])
+        // With kernel [0.5, 0.5, 0.5], output ≈ [1.5, 3, 4.5, 6, 7.5] (with padding)
+        let convResult = g.n(.conv1d(3), input, kernel.node())
+        let output = g.n(.sum, convResult)
+
+        // Target: we want sum(conv_output) = 30
+        // With identity kernel [0, 1, 0], output = input, sum = 15
+        // We want kernel that doubles: [0, 2, 0] would give sum = 30
+        let target = g.n(.constant(30.0))
+        let loss = g.n(.mse, output, target)
+        _ = g.n(.output(0), loss)
+
+        let frameCount = 1
+        let result = try CompilationPipeline.compile(
+            graph: g, backend: .metal,
+            options: .init(frameCount: frameCount, backwards: true))
+
+        let runtime = try MetalCompiledKernel(
+            kernels: result.kernels,
+            cellAllocations: result.cellAllocations,
+            context: result.context)
+
+        let ctx = TrainingContext(
+            tensorParameters: [kernel],
+            optimizer: Adam(lr: 0.05),
+            lossNode: loss)
+
+        ctx.initializeMemory(
+            runtime: runtime,
+            cellAllocations: result.cellAllocations,
+            context: result.context,
+            frameCount: frameCount,
+            graph: g)
+
+        let inputBuffer = [Float](repeating: 0.0, count: frameCount)
+        var outputBuffer = [Float](repeating: 0.0, count: frameCount)
+
+        // Run one step to get initial gradients
+        ctx.zeroGrad()
+        inputBuffer.withUnsafeBufferPointer { inPtr in
+            outputBuffer.withUnsafeMutableBufferPointer { outPtr in
+                runtime.runWithMemory(
+                    outputs: outPtr.baseAddress!,
+                    inputs: inPtr.baseAddress!,
+                    memory: ctx.getMemory(),
+                    frameCount: frameCount)
+            }
+        }
+
+        let initialLoss = outputBuffer[0]
+        let initialGrads = ctx.extractTensorGradients()[0]
+        print("Conv1d initial loss: \(initialLoss)")
+        print("Conv1d initial kernel grads: \(initialGrads)")
+
+        // Verify gradients are non-zero
+        let hasNonZeroGrad = initialGrads.contains { abs($0) > 0.001 }
+        XCTAssertTrue(hasNonZeroGrad, "Kernel gradients should be non-zero")
+
+        // Train for a while
+        var losses: [Float] = [initialLoss]
+        for _ in 0..<300 {
+            ctx.step()
+            ctx.zeroGrad()
+
+            inputBuffer.withUnsafeBufferPointer { inPtr in
+                outputBuffer.withUnsafeMutableBufferPointer { outPtr in
+                    runtime.runWithMemory(
+                        outputs: outPtr.baseAddress!,
+                        inputs: inPtr.baseAddress!,
+                        memory: ctx.getMemory(),
+                        frameCount: frameCount)
+                }
+            }
+
+            losses.append(outputBuffer[0])
+        }
+
+        let finalLoss = losses.last!
+        print("Conv1d final loss: \(finalLoss)")
+        print("Conv1d final kernel: \(kernel.data)")
+
+        // Verify loss decreased significantly
+        XCTAssertLessThan(finalLoss, initialLoss * 0.1, "Loss should decrease significantly")
+    }
+
+    func testConv2dKernelBackward() throws {
+        let g = Graph()
+
+        // Input: 3x3 grid of ones
+        let input = g.ones(shape: [3, 3])
+
+        // Learnable 3x3 kernel - start with small values
+        let kernel = TensorParameter(
+            graph: g, shape: [3, 3],
+            data: [0.1, 0.1, 0.1,
+                   0.1, 0.1, 0.1,
+                   0.1, 0.1, 0.1], name: "kernel")
+
+        // Convolve
+        let convResult = g.n(.conv2d([3, 3]), input, kernel.node())
+        let output = g.n(.sum, convResult)
+
+        // Target: we want sum(conv_output) = 18
+        // With a center-only kernel [0,0,0, 0,2,0, 0,0,0], sum would = 18 for 3x3 input of ones
+        let target = g.n(.constant(18.0))
+        let loss = g.n(.mse, output, target)
+        _ = g.n(.output(0), loss)
+
+        let frameCount = 1
+        let result = try CompilationPipeline.compile(
+            graph: g, backend: .metal,
+            options: .init(frameCount: frameCount, backwards: true))
+
+        let runtime = try MetalCompiledKernel(
+            kernels: result.kernels,
+            cellAllocations: result.cellAllocations,
+            context: result.context)
+
+        let ctx = TrainingContext(
+            tensorParameters: [kernel],
+            optimizer: Adam(lr: 0.05),
+            lossNode: loss)
+
+        ctx.initializeMemory(
+            runtime: runtime,
+            cellAllocations: result.cellAllocations,
+            context: result.context,
+            frameCount: frameCount,
+            graph: g)
+
+        let inputBuffer = [Float](repeating: 0.0, count: frameCount)
+        var outputBuffer = [Float](repeating: 0.0, count: frameCount)
+
+        // Run one step to get initial gradients
+        ctx.zeroGrad()
+        inputBuffer.withUnsafeBufferPointer { inPtr in
+            outputBuffer.withUnsafeMutableBufferPointer { outPtr in
+                runtime.runWithMemory(
+                    outputs: outPtr.baseAddress!,
+                    inputs: inPtr.baseAddress!,
+                    memory: ctx.getMemory(),
+                    frameCount: frameCount)
+            }
+        }
+
+        let initialLoss = outputBuffer[0]
+        let initialGrads = ctx.extractTensorGradients()[0]
+        print("Conv2d initial loss: \(initialLoss)")
+        print("Conv2d initial kernel grads: \(initialGrads)")
+
+        // Verify gradients are non-zero
+        let hasNonZeroGrad = initialGrads.contains { abs($0) > 0.001 }
+        XCTAssertTrue(hasNonZeroGrad, "Kernel gradients should be non-zero")
+
+        // Train for a while
+        var losses: [Float] = [initialLoss]
+        for _ in 0..<300 {
+            ctx.step()
+            ctx.zeroGrad()
+
+            inputBuffer.withUnsafeBufferPointer { inPtr in
+                outputBuffer.withUnsafeMutableBufferPointer { outPtr in
+                    runtime.runWithMemory(
+                        outputs: outPtr.baseAddress!,
+                        inputs: inPtr.baseAddress!,
+                        memory: ctx.getMemory(),
+                        frameCount: frameCount)
+                }
+            }
+
+            losses.append(outputBuffer[0])
+        }
+
+        let finalLoss = losses.last!
+        print("Conv2d final loss: \(finalLoss)")
+        print("Conv2d final kernel: \(kernel.data)")
+
+        // Verify loss decreased significantly
+        XCTAssertLessThan(finalLoss, initialLoss * 0.1, "Loss should decrease significantly")
+    }
 }

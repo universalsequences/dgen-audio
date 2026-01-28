@@ -1451,22 +1451,135 @@ public enum LazyOp {
 
         // MARK: - Tensor Operation Gradients
 
-        case .conv1d(_):
-            // Conv1d gradient: similar to conv2d, would require transposed convolution
-            // For now, we provide zero gradients (TODO: implement full backprop)
+        case .conv1d(let kernelSize):
+            // Forward: output[x] = sum_k(input[x+k-pad] * kernel[k])
+            // dL/dInput[i] = sum_k(dL/dOutput[i-k+pad] * kernel[k])
+            // dL/dKernel[k] = sum_x(dL/dOutput[x] * input[x+k-pad])
             guard inputs.count == 2 else { fatalError("conv1d requires 2 inputs") }
-            b.grad(node.inputs[0], value: ctx.useConstant(src: nil, value: 0.0))
-            b.grad(node.inputs[1], value: ctx.useConstant(src: nil, value: 0.0))
+            let inputNodeId = node.inputs[0]
+            let kernelNodeId = node.inputs[1]
 
-        case .conv2d(_):
-            // Conv2d gradient: gradient w.r.t. input = conv2d(grad_output, flipped_kernel)
-            // gradient w.r.t. kernel = conv2d(input, grad_output)
-            // This is complex - for now, we provide zero gradients (TODO: implement full backprop)
+            guard let inputNode = g.nodes[inputNodeId],
+                  case .tensor(let inShape) = inputNode.shape, inShape.count == 1,
+                  case .tensor(let outShape) = node.shape,
+                  let inTensor = g.nodeToTensor[inputNodeId].flatMap({ g.tensors[$0] }),
+                  let kTensor = g.nodeToTensor[kernelNodeId].flatMap({ g.tensors[$0] }) else {
+                b.grad(node.inputs[0], value: ctx.useConstant(src: nil, value: 0.0))
+                b.grad(node.inputs[1], value: ctx.useConstant(src: nil, value: 0.0))
+                break
+            }
+
+            let inLen = inShape[0]
+            let outLen = outShape[0]
+            let pad = kernelSize / 2
+
+            let _ = ctx.useTensorGradient(src: inputNodeId, size: inLen)
+            let _ = ctx.useTensorGradient(src: kernelNodeId, size: kernelSize)
+            let _ = ctx.useTensorGradient(src: node.id, size: outLen)
+
+            // dL/dInput[i] = sum_k(dL/dOutput[i-k+pad] * kernel[k])
+            b.parallelRange(inLen) { i in
+                let acc = b.float(0.0)
+                b.loop(kernelSize) { k in
+                    let outX = i - b.cast(k, to: .float) + b.constant(Float(pad))
+                    let inBounds = (outX >= b.constant(0)) * (outX < b.constant(Float(outLen)))
+                    let gradOut = b.gswitch(inBounds, b.loadTensorGrad(node.id, index: outX), b.constant(0))
+                    let kMemIdx = b.tensorMemoryIndex(kTensor, indices: [b.cast(k, to: .int)])
+                    let kVal = b.memoryRead(kTensor.cellId, kMemIdx)
+                    acc.accumulate(b.gswitch(inBounds, gradOut * kVal, b.constant(0)))
+                }
+                b.tensorGrad(inputNodeId, index: i, value: acc.value.lazy)
+            }
+
+            // dL/dKernel[k] = sum_x(dL/dOutput[x] * input[x+k-pad])
+            b.parallelRange(kernelSize) { k in
+                let acc = b.float(0.0)
+                b.loop(outLen) { x in
+                    let inX = b.cast(x, to: .float) + b.cast(k, to: .float) - b.constant(Float(pad))
+                    let inBounds = (inX >= b.constant(0)) * (inX < b.constant(Float(inLen)))
+                    let gradOut = b.loadTensorGrad(node.id, index: b.cast(x, to: .float))
+                    let rawIdx = b.tensorMemoryIndex(inTensor, indices: [b.cast(inX, to: .int)])
+                    let safeIdx = b.gswitch(inBounds, rawIdx, b.constant(0))
+                    let inVal = b.gswitch(inBounds, b.memoryRead(inTensor.cellId, safeIdx), b.constant(0))
+                    acc.accumulate(gradOut * inVal)
+                }
+                b.tensorGrad(kernelNodeId, index: b.cast(k, to: .float), value: acc.value.lazy)
+            }
+
+        case .conv2d(let kernelShape):
+            // Forward: output[y,x] = sum_ky,kx(input[y+ky-padH, x+kx-padW] * kernel[ky,kx])
+            // dL/dInput[iy,ix] = sum_ky,kx(dL/dOutput[iy-ky+padH, ix-kx+padW] * kernel[ky,kx])
+            // dL/dKernel[ky,kx] = sum_y,x(dL/dOutput[y,x] * input[y+ky-padH, x+kx-padW])
             guard inputs.count == 2 else { fatalError("conv2d requires 2 inputs") }
-            // For membrane simulation, we often don't need kernel gradients (fixed Laplacian)
-            // Input gradient would require transposed convolution
-            b.grad(node.inputs[0], value: ctx.useConstant(src: nil, value: 0.0))
-            b.grad(node.inputs[1], value: ctx.useConstant(src: nil, value: 0.0))
+            let inputNodeId = node.inputs[0]
+            let kernelNodeId = node.inputs[1]
+
+            guard let inputNode = g.nodes[inputNodeId],
+                  case .tensor(let inShape) = inputNode.shape, inShape.count == 2,
+                  case .tensor(let outShape) = node.shape,
+                  let inTensor = g.nodeToTensor[inputNodeId].flatMap({ g.tensors[$0] }),
+                  let kTensor = g.nodeToTensor[kernelNodeId].flatMap({ g.tensors[$0] }) else {
+                b.grad(node.inputs[0], value: ctx.useConstant(src: nil, value: 0.0))
+                b.grad(node.inputs[1], value: ctx.useConstant(src: nil, value: 0.0))
+                break
+            }
+
+            let (inH, inW) = (inShape[0], inShape[1])
+            let (outH, outW) = (outShape[0], outShape[1])
+            let (kH, kW) = (kernelShape[0], kernelShape[1])
+            let (padH, padW) = (kH / 2, kW / 2)
+            let inSize = inH * inW
+            let outSize = outH * outW
+            let kSize = kH * kW
+
+            let _ = ctx.useTensorGradient(src: inputNodeId, size: inSize)
+            let _ = ctx.useTensorGradient(src: kernelNodeId, size: kSize)
+            let _ = ctx.useTensorGradient(src: node.id, size: outSize)
+
+            // dL/dInput[iy,ix]
+            b.parallelRange(inSize) { flatIdx in
+                let iy = b.cast(flatIdx, to: .int) / b.constant(Float(inW))
+                let ix = b.cast(flatIdx, to: .int) % b.constant(Float(inW))
+                let acc = b.float(0.0)
+
+                b.loop(kH) { ky in
+                    b.loop(kW) { kx in
+                        let outY = iy - b.cast(ky, to: .float) + b.constant(Float(padH))
+                        let outX = ix - b.cast(kx, to: .float) + b.constant(Float(padW))
+                        let inBounds = (outY >= b.constant(0)) * (outY < b.constant(Float(outH)))
+                            * (outX >= b.constant(0)) * (outX < b.constant(Float(outW)))
+                        let outFlatIdx = outY * b.constant(Float(outW)) + outX
+                        let gradOut = b.gswitch(inBounds, b.loadTensorGrad(node.id, index: outFlatIdx), b.constant(0))
+                        let kMemIdx = b.tensorMemoryIndex(kTensor, indices: [b.cast(ky, to: .int), b.cast(kx, to: .int)])
+                        let kVal = b.memoryRead(kTensor.cellId, kMemIdx)
+                        acc.accumulate(b.gswitch(inBounds, gradOut * kVal, b.constant(0)))
+                    }
+                }
+                b.tensorGrad(inputNodeId, index: flatIdx, value: acc.value.lazy)
+            }
+
+            // dL/dKernel[ky,kx]
+            b.parallelRange(kSize) { flatKIdx in
+                let ky = b.cast(flatKIdx, to: .int) / b.constant(Float(kW))
+                let kx = b.cast(flatKIdx, to: .int) % b.constant(Float(kW))
+                let acc = b.float(0.0)
+
+                b.loop(outH) { y in
+                    b.loop(outW) { x in
+                        let inY = b.cast(y, to: .float) + b.cast(ky, to: .float) - b.constant(Float(padH))
+                        let inX = b.cast(x, to: .float) + b.cast(kx, to: .float) - b.constant(Float(padW))
+                        let inBounds = (inY >= b.constant(0)) * (inY < b.constant(Float(inH)))
+                            * (inX >= b.constant(0)) * (inX < b.constant(Float(inW)))
+                        let outFlatIdx = b.cast(y, to: .float) * b.constant(Float(outW)) + b.cast(x, to: .float)
+                        let gradOut = b.loadTensorGrad(node.id, index: outFlatIdx)
+                        let rawIdx = b.tensorMemoryIndex(inTensor, indices: [b.cast(inY, to: .int), b.cast(inX, to: .int)])
+                        let safeIdx = b.gswitch(inBounds, rawIdx, b.constant(0))
+                        let inVal = b.gswitch(inBounds, b.memoryRead(inTensor.cellId, safeIdx), b.constant(0))
+                        acc.accumulate(gradOut * inVal)
+                    }
+                }
+                b.tensorGrad(kernelNodeId, index: flatKIdx, value: acc.value.lazy)
+            }
 
         case .sum:
             // d(sum(x))/dx[i] = 1 for all i
