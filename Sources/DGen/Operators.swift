@@ -1716,10 +1716,57 @@ public enum LazyOp {
             }
 
         case .peek:
-            // Peek reads a single value from tensor - gradient only affects that position
-            // For now, zero gradients (TODO: implement scatter gradient back to tensor position)
+            // Peek reads from 2D tensor at (index, channel) with linear interpolation.
+            // output = (1-frac)*tensor[pos1] + frac*tensor[pos2]
+            // Scatter gradient back to the two interpolated positions.
             guard inputs.count == 3 else { fatalError("peek requires 3 inputs") }
-            b.grad(node.inputs[0], value: ctx.useConstant(src: nil, value: 0.0))
+
+            let tensorInput = node.inputs[0]
+            guard let inputNode = g.nodes[tensorInput],
+                  case .tensor(let shape) = inputNode.shape,
+                  shape.count >= 2 else {
+                // Scalar fallback
+                b.grad(node.inputs[0], value: ctx.useConstant(src: nil, value: 0.0))
+                b.grad(node.inputs[1], value: ctx.useConstant(src: nil, value: 0.0))
+                b.grad(node.inputs[2], value: ctx.useConstant(src: nil, value: 0.0))
+                break
+            }
+
+            let channelSize = shape[0]
+            let numChannels = shape[1]
+            let totalSize = channelSize * numChannels
+            let _ = ctx.useTensorGradient(src: tensorInput, size: totalSize)
+
+            // Recompute the interpolation positions (same logic as forward)
+            let index = b.tapeValue(node.inputs[1])
+            let channel = b.tapeValue(node.inputs[2])
+            let gradOutExpr = b.value(gradOutput)
+
+            let one = b.constant(1.0)
+            let zero = b.constant(0.0)
+            let channelSizeFloat = b.constant(Float(channelSize))
+
+            let wrappedIndex = b.mod(index, channelSizeFloat)
+            let isNegative = wrappedIndex < zero
+            let positiveIndex = b.gswitch(isNegative, wrappedIndex + channelSizeFloat, wrappedIndex)
+
+            let clampedChannel = b.floor(b.max(zero, b.min(channel, b.constant(Float(numChannels - 1)))))
+            let channelOffset = channelSizeFloat * clampedChannel
+
+            let finalReadPos = channelOffset + positiveIndex
+            let flooredPos = b.floor(finalReadPos)
+            let frac = finalReadPos - flooredPos
+
+            let nextPos = flooredPos + one
+            let nextChannelOffset = channelOffset + channelSizeFloat
+            let nextPosWrapped = b.gswitch(nextPos >= nextChannelOffset, channelOffset, nextPos)
+
+            // Scatter: dL/d(tensor[pos1]) += gradOut * (1-frac)
+            //          dL/d(tensor[pos2]) += gradOut * frac
+            b.tensorGrad(tensorInput, index: flooredPos, value: (gradOutExpr * (one - frac)).lazy)
+            b.tensorGrad(tensorInput, index: nextPosWrapped, value: (gradOutExpr * frac).lazy)
+
+            // Index and channel gradients are zero (not typically learnable)
             b.grad(node.inputs[1], value: ctx.useConstant(src: nil, value: 0.0))
             b.grad(node.inputs[2], value: ctx.useConstant(src: nil, value: 0.0))
         }
