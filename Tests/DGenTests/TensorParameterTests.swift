@@ -865,4 +865,89 @@ final class TensorParameterTests: XCTestCase {
         print("Abs backward - initial loss: \(result.initialLoss), final loss: \(result.finalLoss)")
         XCTAssertLessThan(result.finalLoss, result.initialLoss * 0.5, "Loss should decrease")
     }
+
+    // MARK: - Matmul Backward Test
+
+    func testMatmulBackward() throws {
+        let g = Graph()
+
+        // A[2,3] @ B[3,2] = C[2,2]
+        // Learn weights A to produce a target output sum
+        let a = TensorParameter(
+            graph: g, shape: [2, 3],
+            data: [1.0, 0.0, 0.0,
+                   0.0, 1.0, 0.0], name: "A")
+
+        // Fixed B matrix
+        let b = g.tensor(shape: [3, 2], data: [1.0, 2.0,
+                                                3.0, 4.0,
+                                                5.0, 6.0])
+
+        // C = A @ B
+        // With initial A = [[1,0,0],[0,1,0]], C = [[1,2],[3,4]], sum = 10
+        let c = try g.matmul(a.node(), b)
+        let output = g.n(.sum, c)
+
+        // Target: sum(C) = 30
+        let loss = g.n(.mse, output, g.n(.constant(30.0)))
+        _ = g.n(.output(0), loss)
+
+        let result = try runTrainingLoop(
+            graph: g,
+            parameters: [a],
+            lossNode: loss,
+            optimizer: Adam(lr: 0.1),
+            epochs: 300)
+
+        print("Matmul backward - A grads: \(result.gradients[0])")
+        print("Matmul backward - initial loss: \(result.initialLoss), final loss: \(result.finalLoss)")
+        print("Matmul backward - final A: \(a.data)")
+
+        // Verify gradients are non-zero
+        assertNonZeroGradients(result.gradients, names: ["A"])
+
+        // Verify loss decreased significantly
+        XCTAssertLessThan(result.finalLoss, result.initialLoss * 0.1, "Loss should decrease significantly")
+    }
+
+    func testMatmulBothLearnableBackward() throws {
+        let g = Graph()
+
+        // Both A and B are learnable
+        let a = TensorParameter(
+            graph: g, shape: [2, 2],
+            data: [1.0, 0.0,
+                   0.0, 1.0], name: "A")  // Identity matrix
+
+        let b = TensorParameter(
+            graph: g, shape: [2, 2],
+            data: [1.0, 0.0,
+                   0.0, 1.0], name: "B")  // Identity matrix
+
+        // C = A @ B = I @ I = I, sum = 2
+        let c = try g.matmul(a.node(), b.node())
+        let output = g.n(.sum, c)
+
+        // Target: sum(C) = 8 (need to scale up the matrices)
+        let loss = g.n(.mse, output, g.n(.constant(8.0)))
+        _ = g.n(.output(0), loss)
+
+        let result = try runTrainingLoop(
+            graph: g,
+            parameters: [a, b],
+            lossNode: loss,
+            optimizer: Adam(lr: 0.1),
+            epochs: 300)
+
+        print("Matmul both learnable - A grads: \(result.gradients[0])")
+        print("Matmul both learnable - B grads: \(result.gradients[1])")
+        print("Matmul both learnable - initial loss: \(result.initialLoss), final loss: \(result.finalLoss)")
+        print("Matmul both learnable - final A: \(a.data), final B: \(b.data)")
+
+        // Verify gradients are non-zero for both
+        assertNonZeroGradients(result.gradients, names: ["A", "B"])
+
+        // Verify loss decreased significantly
+        XCTAssertLessThan(result.finalLoss, result.initialLoss * 0.1, "Loss should decrease significantly")
+    }
 }
