@@ -1256,35 +1256,248 @@ public enum LazyOp {
             // d(sum(x))/dx[i] = 1 for all i
             // Gradient broadcasts from scalar back to tensor
             guard inputs.count == 1 else { fatalError("sum requires 1 input") }
-            // Pass gradient through (it will be broadcast to all elements)
-            b.grad(node.inputs[0], value: gradOutput)
+            let inputNodeId = node.inputs[0]
 
-        case .sumAxis(_):
-            // TODO: implement proper backprop for sumAxis
-            // For now, pass gradient through (will need broadcasting logic)
+            // Check if input is a tensor
+            guard let inputNode = g.nodes[inputNodeId],
+                  case .tensor(let inputShape) = inputNode.shape else {
+                // Scalar input: just pass gradient through
+                b.grad(node.inputs[0], value: gradOutput)
+                break
+            }
+
+            let size = inputShape.reduce(1, *)
+
+            // Allocate tensor gradients for input
+            let _ = ctx.useTensorGradient(src: inputNodeId, size: size)
+
+            // Broadcast: dL/dx[i] = dL/d(sum) for all i
+            b.parallelRange(size) { idx in
+                b.tensorGrad(inputNodeId, index: idx, value: gradOutput)
+            }
+
+        case .sumAxis(let axis):
+            // d(sumAxis(x, axis))/dx[i] = dL/d(output[reduced_index])
+            // Each input element's gradient = gradient of corresponding output element
             guard inputs.count == 1 else { fatalError("sumAxis requires 1 input") }
-            b.grad(node.inputs[0], value: gradOutput)
+            let inputNodeId = node.inputs[0]
 
-        case .reshape(_):
+            guard let inputNode = g.nodes[inputNodeId],
+                  case .tensor(let inputShape) = inputNode.shape,
+                  case .tensor(let outputShape) = node.shape else {
+                // Fallback for non-tensor case
+                b.grad(node.inputs[0], value: gradOutput)
+                break
+            }
+
+            let inputSize = inputShape.reduce(1, *)
+            let normalizedAxis = axis < 0 ? inputShape.count + axis : axis
+
+            // Allocate tensor gradients for input and ensure we have them for output
+            let _ = ctx.useTensorGradient(src: inputNodeId, size: inputSize)
+            let outputSize = outputShape.reduce(1, *)
+            let _ = ctx.useTensorGradient(src: node.id, size: outputSize)
+
+            // Compute strides for index mapping
+            let inputStrides = Tensor.computeRowMajorStrides(inputShape)
+            let outputStrides = Tensor.computeRowMajorStrides(outputShape)
+
+            // Each input element maps to an output element by removing the axis dimension
+            b.parallelRange(inputSize) { flatIdx in
+                // Convert flat index to multi-dimensional index
+                // Then remove the axis dimension to get output index
+
+                // Build output flat index by skipping the axis dimension
+                var outputFlatIdx = b.int(0)
+                var outDim = 0
+                for dim in 0..<inputShape.count {
+                    if dim == normalizedAxis {
+                        continue  // Skip reduced dimension
+                    }
+                    // coordAtDim = (flatIdx / inputStrides[dim]) % inputShape[dim]
+                    let strideExpr = b.int(inputStrides[dim])
+                    let shapeExpr = b.int(inputShape[dim])
+                    let coordAtDim = b.mod(b.div(flatIdx, strideExpr), shapeExpr)
+
+                    // outputFlatIdx += coordAtDim * outputStrides[outDim]
+                    let outStrideExpr = b.int(outputStrides[outDim])
+                    outputFlatIdx = b.add(outputFlatIdx, b.mul(coordAtDim, outStrideExpr))
+                    outDim += 1
+                }
+
+                // Load the gradient from the output tensor
+                let gradVal = b.loadTensorGrad(node.id, index: b.cast(outputFlatIdx, to: .float))
+                b.tensorGrad(inputNodeId, index: flatIdx, value: gradVal.lazy)
+            }
+
+        case .reshape(let newShape):
             // Reshape is metadata-only, gradient flows through unchanged
+            // Flat indices are the same between input and output
             guard inputs.count == 1 else { fatalError("reshape requires 1 input") }
-            b.grad(node.inputs[0], value: gradOutput)
+            let inputNodeId = node.inputs[0]
 
-        case .transpose(_):
-            // Transpose is metadata-only, gradient flows through unchanged
+            guard let inputNode = g.nodes[inputNodeId],
+                  case .tensor(let inputShape) = inputNode.shape else {
+                b.grad(node.inputs[0], value: gradOutput)
+                break
+            }
+
+            let size = inputShape.reduce(1, *)
+
+            // Allocate tensor gradients for both input and output (they share flat indices)
+            let _ = ctx.useTensorGradient(src: inputNodeId, size: size)
+            let _ = ctx.useTensorGradient(src: node.id, size: newShape.reduce(1, *))
+
+            // Pass through: dL/dx[i] = dL/dy[i] (same flat index)
+            b.parallelRange(size) { idx in
+                let gradVal = b.loadTensorGrad(node.id, index: idx)
+                b.tensorGrad(inputNodeId, index: idx, value: gradVal.lazy)
+            }
+
+        case .transpose(let perm):
+            // Transpose permutes dimensions, need inverse permutation for gradients
             guard inputs.count == 1 else { fatalError("transpose requires 1 input") }
-            b.grad(node.inputs[0], value: gradOutput)
+            let inputNodeId = node.inputs[0]
 
-        case .shrink(_):
-            // Shrink is metadata-only, gradient flows through unchanged
+            guard let inputNode = g.nodes[inputNodeId],
+                  case .tensor(let inputShape) = inputNode.shape,
+                  case .tensor(let outputShape) = node.shape else {
+                b.grad(node.inputs[0], value: gradOutput)
+                break
+            }
+
+            let size = inputShape.reduce(1, *)
+
+            // Allocate tensor gradients
+            let _ = ctx.useTensorGradient(src: inputNodeId, size: size)
+            let _ = ctx.useTensorGradient(src: node.id, size: size)
+
+            // Compute inverse permutation
+            var inversePerm = [Int](repeating: 0, count: perm.count)
+            for (i, p) in perm.enumerated() {
+                inversePerm[p] = i
+            }
+
+            let inputStrides = Tensor.computeRowMajorStrides(inputShape)
+            let outputStrides = Tensor.computeRowMajorStrides(outputShape)
+
+            // For each output element, compute corresponding input element
+            b.parallelRange(size) { outputFlatIdx in
+                // Convert output flat index to output multi-dim index
+                // Apply inverse perm to get input multi-dim index
+                // Convert to input flat index
+
+                var inputFlatIdx = b.int(0)
+                for outDim in 0..<outputShape.count {
+                    // outCoord = (outputFlatIdx / outputStrides[outDim]) % outputShape[outDim]
+                    let outStrideExpr = b.int(outputStrides[outDim])
+                    let outShapeExpr = b.int(outputShape[outDim])
+                    let outCoord = b.mod(b.div(outputFlatIdx, outStrideExpr), outShapeExpr)
+
+                    // This output coord maps to input dimension inversePerm[outDim]
+                    let inDim = inversePerm[outDim]
+                    let inStrideExpr = b.int(inputStrides[inDim])
+                    inputFlatIdx = b.add(inputFlatIdx, b.mul(outCoord, inStrideExpr))
+                }
+
+                let gradVal = b.loadTensorGrad(node.id, index: outputFlatIdx)
+                b.tensorGrad(inputNodeId, index: b.cast(inputFlatIdx, to: .float), value: gradVal.lazy)
+            }
+
+        case .shrink(let ranges):
+            // Shrink only includes elements in the specified range
+            // Gradients flow back only to elements within the shrunk region
             guard inputs.count == 1 else { fatalError("shrink requires 1 input") }
-            b.grad(node.inputs[0], value: gradOutput)
+            let inputNodeId = node.inputs[0]
 
-        case .pad(_):
-            // Pad is a virtual view, gradient flows through unchanged
-            // (padded regions have zero gradient contribution)
+            guard let inputNode = g.nodes[inputNodeId],
+                  case .tensor(let inputShape) = inputNode.shape,
+                  case .tensor(let outputShape) = node.shape else {
+                b.grad(node.inputs[0], value: gradOutput)
+                break
+            }
+
+            let inputSize = inputShape.reduce(1, *)
+            let outputSize = outputShape.reduce(1, *)
+
+            // Allocate tensor gradients
+            let _ = ctx.useTensorGradient(src: inputNodeId, size: inputSize)
+            let _ = ctx.useTensorGradient(src: node.id, size: outputSize)
+
+            // Compute start offsets for each dimension
+            var startOffsets = [Int]()
+            for range in ranges {
+                if let (start, _) = range {
+                    startOffsets.append(start)
+                } else {
+                    startOffsets.append(0)
+                }
+            }
+
+            let inputStrides = Tensor.computeRowMajorStrides(inputShape)
+            let outputStrides = Tensor.computeRowMajorStrides(outputShape)
+
+            // For each output element, compute corresponding input element
+            b.parallelRange(outputSize) { outputFlatIdx in
+                // Convert output index to input index by adding start offsets
+                var inputFlatIdx = b.int(0)
+                for dim in 0..<outputShape.count {
+                    // outCoord = (outputFlatIdx / outputStrides[dim]) % outputShape[dim]
+                    let outStrideExpr = b.int(outputStrides[dim])
+                    let outShapeExpr = b.int(outputShape[dim])
+                    let outCoord = b.mod(b.div(outputFlatIdx, outStrideExpr), outShapeExpr)
+
+                    // inCoord = outCoord + startOffset[dim]
+                    let inCoord = b.add(outCoord, b.int(startOffsets[dim]))
+                    let inStrideExpr = b.int(inputStrides[dim])
+                    inputFlatIdx = b.add(inputFlatIdx, b.mul(inCoord, inStrideExpr))
+                }
+
+                let gradVal = b.loadTensorGrad(node.id, index: outputFlatIdx)
+                b.tensorGrad(inputNodeId, index: b.cast(inputFlatIdx, to: .float), value: gradVal.lazy)
+            }
+
+        case .pad(let padding):
+            // Pad adds zeros around the tensor; only inner region has gradient
             guard inputs.count == 1 else { fatalError("pad requires 1 input") }
-            b.grad(node.inputs[0], value: gradOutput)
+            let inputNodeId = node.inputs[0]
+
+            guard let inputNode = g.nodes[inputNodeId],
+                  case .tensor(let inputShape) = inputNode.shape,
+                  case .tensor(let outputShape) = node.shape else {
+                b.grad(node.inputs[0], value: gradOutput)
+                break
+            }
+
+            let inputSize = inputShape.reduce(1, *)
+            let outputSize = outputShape.reduce(1, *)
+
+            // Allocate tensor gradients
+            let _ = ctx.useTensorGradient(src: inputNodeId, size: inputSize)
+            let _ = ctx.useTensorGradient(src: node.id, size: outputSize)
+
+            let inputStrides = Tensor.computeRowMajorStrides(inputShape)
+            let outputStrides = Tensor.computeRowMajorStrides(outputShape)
+
+            // For each input element, compute corresponding output element
+            b.parallelRange(inputSize) { inputFlatIdx in
+                // Convert input index to output index by adding left padding
+                var outputFlatIdx = b.int(0)
+                for dim in 0..<inputShape.count {
+                    let inStrideExpr = b.int(inputStrides[dim])
+                    let inShapeExpr = b.int(inputShape[dim])
+                    let inCoord = b.mod(b.div(inputFlatIdx, inStrideExpr), inShapeExpr)
+
+                    // outCoord = inCoord + leftPad[dim]
+                    let leftPad = padding[dim].0
+                    let outCoord = b.add(inCoord, b.int(leftPad))
+                    let outStrideExpr = b.int(outputStrides[dim])
+                    outputFlatIdx = b.add(outputFlatIdx, b.mul(outCoord, outStrideExpr))
+                }
+
+                let gradVal = b.loadTensorGrad(node.id, index: b.cast(outputFlatIdx, to: .float))
+                b.tensorGrad(inputNodeId, index: inputFlatIdx, value: gradVal.lazy)
+            }
 
         case .peek:
             // Peek reads a single value from tensor - gradient only affects that position

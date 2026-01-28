@@ -29,10 +29,70 @@ public class Parameter {
     }
 }
 
+// MARK: - TensorParameter
+
+/// A learnable tensor parameter in the computation graph
+/// Each element has its own gradient, allocated contiguously for efficient access
+public class TensorParameter {
+    let tensorId: TensorID
+    let cellId: CellID
+    let nodeId: NodeID
+    public let shape: Shape
+    public var data: [Float]
+    let name: String?
+    var baseGradId: GradID?
+
+    /// Total number of elements in the tensor
+    public var size: Int { shape.reduce(1, *) }
+
+    /// Per-element gradients (updated after each backward pass)
+    public var grads: [Float]
+
+    public init(graph: Graph, shape: Shape, data: [Float]? = nil, name: String? = nil) {
+        self.shape = shape
+        self.name = name
+        let totalSize = shape.reduce(1, *)
+
+        // Initialize data with Xavier initialization if not provided
+        if let providedData = data {
+            self.data = providedData
+            precondition(providedData.count == totalSize, "Data count must match shape size")
+        } else {
+            // Xavier initialization: N(0, sqrt(2 / (fan_in + fan_out)))
+            // For simplicity, use sqrt(1/n) where n is size
+            let stddev = sqrt(1.0 / Float(totalSize))
+            self.data = (0..<totalSize).map { _ in
+                // Box-Muller transform for normal distribution
+                let u1 = Float.random(in: 0..<1)
+                let u2 = Float.random(in: 0..<1)
+                return stddev * sqrt(-2.0 * log(u1)) * cos(2.0 * .pi * u2)
+            }
+        }
+
+        self.grads = [Float](repeating: 0.0, count: totalSize)
+
+        // Allocate tensor in graph
+        self.cellId = graph.alloc(vectorWidth: totalSize)
+        self.tensorId = graph.nextTensorId
+        graph.nextTensorId += 1
+        graph.tensors[tensorId] = Tensor(id: tensorId, shape: shape, cellId: cellId, data: self.data)
+        graph.cellToTensor[cellId] = tensorId
+
+        // Create tensorRef node
+        self.nodeId = graph.n(.tensorRef(tensorId), [], shape: .tensor(shape))
+        graph.nodeToTensor[nodeId] = tensorId
+    }
+
+    public func node() -> NodeID {
+        return nodeId
+    }
+}
+
 // MARK: - Optimizer Protocol
 
 public protocol Optimizer {
     mutating func step(parameters: inout [Parameter], gradients: [Float])
+    mutating func stepTensor(tensorParams: inout [TensorParameter], gradients: [[Float]])
     func zeroGrad()
 }
 
@@ -48,6 +108,14 @@ public struct SGD: Optimizer {
     public mutating func step(parameters: inout [Parameter], gradients: [Float]) {
         for i in 0..<parameters.count {
             parameters[i].value -= learningRate * gradients[i]
+        }
+    }
+
+    public mutating func stepTensor(tensorParams: inout [TensorParameter], gradients: [[Float]]) {
+        for i in 0..<tensorParams.count {
+            for j in 0..<tensorParams[i].data.count {
+                tensorParams[i].data[j] -= learningRate * gradients[i][j]
+            }
         }
     }
 
@@ -103,6 +171,41 @@ public struct Adam: Optimizer {
         }
     }
 
+    // Separate momentum buffers for tensor parameters
+    private var tensorM: [[Float]] = []
+    private var tensorV: [[Float]] = []
+
+    public mutating func stepTensor(tensorParams: inout [TensorParameter], gradients: [[Float]]) {
+        // Initialize tensor momentum buffers on first call
+        if tensorM.isEmpty {
+            tensorM = tensorParams.map { [Float](repeating: 0.0, count: $0.size) }
+            tensorV = tensorParams.map { [Float](repeating: 0.0, count: $0.size) }
+        }
+
+        t += 1
+
+        for i in 0..<tensorParams.count {
+            for j in 0..<tensorParams[i].data.count {
+                let grad = gradients[i][j]
+
+                // Update biased first moment estimate
+                tensorM[i][j] = beta1 * tensorM[i][j] + (1 - beta1) * grad
+
+                // Update biased second raw moment estimate
+                tensorV[i][j] = beta2 * tensorV[i][j] + (1 - beta2) * grad * grad
+
+                // Compute bias-corrected first moment estimate
+                let mHat = tensorM[i][j] / (1 - pow(beta1, Float(t)))
+
+                // Compute bias-corrected second raw moment estimate
+                let vHat = tensorV[i][j] / (1 - pow(beta2, Float(t)))
+
+                // Update parameters
+                tensorParams[i].data[j] -= learningRate * mHat / (sqrt(vHat) + epsilon)
+            }
+        }
+    }
+
     public func zeroGrad() {
         // Momentum is persistent across steps - don't clear
     }
@@ -125,6 +228,7 @@ public class TrainingContext {
     private let debugGradients: Bool =
         (ProcessInfo.processInfo.environment["DGEN_DEBUG_GRADS"] == "1")
     public var parameters: [Parameter]
+    public var tensorParameters: [TensorParameter]
     private var optimizer: Optimizer
     private var memory: UnsafeMutableRawPointer?
     private var cellAllocations: CellAllocations?
@@ -134,6 +238,8 @@ public class TrainingContext {
     private let lossNode: NodeID?
     // Cache physical cell indices for parameters to avoid recomputing
     private var paramPhysicalCells: [UInt32] = []
+    // Cache physical cell indices for tensor parameters
+    private var tensorParamPhysicalCells: [[UInt32]] = []
     // Profiling
     private let profile: Bool = (ProcessInfo.processInfo.environment["DGEN_PROFILE"] == "1")
     private let profileEvery: Int =
@@ -153,10 +259,12 @@ public class TrainingContext {
     /// Initialize training context (simple version - requires manual initializeMemory() call)
     /// - Parameters:
     ///   - parameters: Learnable parameters to optimize
+    ///   - tensorParameters: Learnable tensor parameters to optimize
     ///   - optimizer: Optimization algorithm (SGD, Adam, etc.)
     ///   - lossNode: The loss node to seed gradients from (optional, can be inferred if only one output)
-    public init(parameters: [Parameter], optimizer: Optimizer, lossNode: NodeID? = nil) {
+    public init(parameters: [Parameter] = [], tensorParameters: [TensorParameter] = [], optimizer: Optimizer, lossNode: NodeID? = nil) {
         self.parameters = parameters
+        self.tensorParameters = tensorParameters
         self.optimizer = optimizer
         self.lossNode = lossNode
     }
@@ -164,18 +272,20 @@ public class TrainingContext {
     /// Initialize training context with all dependencies (streamlined version)
     /// - Parameters:
     ///   - parameters: Learnable parameters to optimize
+    ///   - tensorParameters: Learnable tensor parameters to optimize
     ///   - optimizer: Optimization algorithm (SGD, Adam, etc.)
     ///   - lossNode: The loss node to seed gradients from
     ///   - compilationResult: Result from CompilationPipeline.compile()
     ///   - frameCount: Number of audio frames per batch
     public convenience init(
-        parameters: [Parameter],
+        parameters: [Parameter] = [],
+        tensorParameters: [TensorParameter] = [],
         optimizer: Optimizer,
         lossNode: NodeID,
         compilationResult: CompilationResult,
         frameCount: Int
     ) throws {
-        self.init(parameters: parameters, optimizer: optimizer, lossNode: lossNode)
+        self.init(parameters: parameters, tensorParameters: tensorParameters, optimizer: optimizer, lossNode: lossNode)
 
         // Create runtime
         let runtime = try MetalCompiledKernel(
@@ -265,6 +375,31 @@ public class TrainingContext {
             }
         }
 
+        // Initialize tensor parameter values in host memory and cache physical cells
+        tensorParamPhysicalCells.removeAll(keepingCapacity: true)
+        for tensorParam in tensorParameters {
+            let physicalCell = cellAllocations.cellMappings[tensorParam.cellId] ?? tensorParam.cellId
+            var cells: [UInt32] = []
+
+            // Inject tensor data into memory
+            for i in 0..<tensorParam.size {
+                memPtr[physicalCell + i] = tensorParam.data[i]
+                cells.append(UInt32(physicalCell + i))
+            }
+            tensorParamPhysicalCells.append(cells)
+
+            // Look up and store the base GradID for this tensor parameter
+            tensorParam.baseGradId = context.tensorGradients[tensorParam.nodeId]
+        }
+
+        // Verify all tensor parameters have gradients if backwards was enabled
+        for tensorParam in tensorParameters {
+            if tensorParam.baseGradId == nil {
+                let name = tensorParam.name ?? "unnamed"
+                print("Warning: TensorParameter '\(name)' (node \(tensorParam.nodeId)) has no tensor gradient allocated yet")
+            }
+        }
+
         // Also write the initial parameter values directly into the device memory buffer
         // so that GPU runs don't need to copy the entire host memory every step.
         if let rt = self.runtime {
@@ -317,6 +452,41 @@ public class TrainingContext {
         }
     }
 
+    /// Extract and reduce gradients from the gradients buffer for tensor parameters
+    /// Gradients are stored as: gradients[frameCount * (baseGradId + elementIndex) + frameIndex]
+    /// We sum across all frames to get the total gradient per element
+    public func extractTensorGradients() -> [[Float]] {
+        guard let runtime = runtime else {
+            fatalError("Runtime not initialized")
+        }
+
+        let gradPtr = runtime.getGradientsBuffer()
+
+        return tensorParameters.map { tensorParam in
+            guard let baseGradId = tensorParam.baseGradId else {
+                // Return zeros if no gradient allocated
+                return [Float](repeating: 0.0, count: tensorParam.size)
+            }
+
+            var grads = [Float](repeating: 0.0, count: tensorParam.size)
+            for elementIndex in 0..<tensorParam.size {
+                let gradId = baseGradId + elementIndex
+                let baseIndex = frameCount * gradId
+
+                // Sum gradients across all frames
+                var totalGrad: Float = 0.0
+                for frameIndex in 0..<frameCount {
+                    totalGrad += gradPtr[baseIndex + frameIndex]
+                }
+
+                // Use mean instead of sum (average over frames)
+                grads[elementIndex] = totalGrad / Float(frameCount)
+            }
+
+            return grads
+        }
+    }
+
     /// Zero out all gradients and reset memory before a backward pass
     /// - Parameter deviceMemory: when true, clears the device `memory` buffer and restores
     ///   parameter values without touching host-side memory. Defaults to false for CPU paths.
@@ -336,6 +506,13 @@ public class TrainingContext {
         // Zero parameter gradients
         for param in parameters {
             param.grad = 0.0
+        }
+
+        // Zero tensor parameter gradients
+        for tensorParam in tensorParameters {
+            for i in 0..<tensorParam.grads.count {
+                tensorParam.grads[i] = 0.0
+            }
         }
 
         optimizer.zeroGrad()
@@ -362,6 +539,14 @@ public class TrainingContext {
                 let physicalCell = cellAlloc.cellMappings[param.cellId] ?? param.cellId
                 memPtr[physicalCell] = param.value
             }
+
+            // Restore tensor parameter values into their physical cells
+            for tensorParam in tensorParameters {
+                let physicalCell = cellAlloc.cellMappings[tensorParam.cellId] ?? tensorParam.cellId
+                for i in 0..<tensorParam.size {
+                    memPtr[physicalCell + i] = tensorParam.data[i]
+                }
+            }
         }
     }
 
@@ -378,6 +563,15 @@ public class TrainingContext {
         // Update parameters via optimizer
         optimizer.step(parameters: &parameters, gradients: gradients)
 
+        // Extract and apply tensor gradients
+        let tensorGradients = extractTensorGradients()
+        for (i, tensorParam) in tensorParameters.enumerated() {
+            tensorParam.grads = tensorGradients[i]
+        }
+        if !tensorParameters.isEmpty {
+            optimizer.stepTensor(tensorParams: &tensorParameters, gradients: tensorGradients)
+        }
+
         // Write updated values back to host memory that is passed to runWithMemory.
         // runWithMemory will copy this host memory into the Metal buffer at call time.
         guard let mem = self.memory, let cellAlloc = self.cellAllocations else {
@@ -389,6 +583,14 @@ public class TrainingContext {
             memPtr[physicalCell] = param.value
         }
 
+        // Write updated tensor parameter values to host memory
+        for tensorParam in tensorParameters {
+            let physicalCell = cellAlloc.cellMappings[tensorParam.cellId] ?? tensorParam.cellId
+            for i in 0..<tensorParam.size {
+                memPtr[physicalCell + i] = tensorParam.data[i]
+            }
+        }
+
         // Also mirror into the Metal buffer now so any debug reads of `memory` buffer
         // reflect the latest parameter values before the next runWithMemory call.
         if let rt = self.runtime, let memBuffer = rt.getBuffer(name: "memory") {
@@ -396,6 +598,13 @@ public class TrainingContext {
             for param in parameters {
                 let physicalCell = cellAlloc.cellMappings[param.cellId] ?? param.cellId
                 gpuMemPtr[physicalCell] = param.value
+            }
+            // Mirror tensor parameters too
+            for tensorParam in tensorParameters {
+                let physicalCell = cellAlloc.cellMappings[tensorParam.cellId] ?? tensorParam.cellId
+                for i in 0..<tensorParam.size {
+                    gpuMemPtr[physicalCell + i] = tensorParam.data[i]
+                }
             }
         }
     }

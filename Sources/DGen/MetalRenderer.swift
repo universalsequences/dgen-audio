@@ -464,6 +464,12 @@ public class MetalRenderer: Renderer, UOpEmitter {
     case let .accumulateGrad(gradId, val):
       return
         "gradients[frameCount*\(gradId)+\(uop.kind == .scalar ? "i" : "id")] += \(g(val));"
+    case let .loadTensorGrad(baseGradId, indexLazy):
+      let idx = uop.kind == .scalar ? "i" : "id"
+      return emitAssign(uop, "gradients[frameCount*(\(baseGradId)+(int)(\(g(indexLazy))))+\(idx)]", ctx)
+    case let .accumulateTensorGrad(baseGradId, indexLazy, valueLazy):
+      let idx = uop.kind == .scalar ? "i" : "id"
+      return "gradients[frameCount*(\(baseGradId)+(int)(\(g(indexLazy))))+\(idx)] += \(g(valueLazy));"
     case let .mutate(a, b):
       return "\(emitLazy(a, ctx: ctx, kind: uop.kind, isOut: true)) = \(g(b));"
     case let .beginIf(cond): return "if (\(g(cond))) {"
@@ -637,6 +643,10 @@ func analyzeRequiredBuffers(scheduleItem: ScheduleItem) -> RequiredBuffers {
     if case .loadGrad = uop.op {
       return true
     } else if case .accumulateGrad = uop.op {
+      return true
+    } else if case .loadTensorGrad = uop.op {
+      return true
+    } else if case .accumulateTensorGrad = uop.op {
       return true
     }
     return false

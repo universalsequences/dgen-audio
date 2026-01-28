@@ -42,6 +42,10 @@ public class IRContext {
     public var tapeIndex: [NodeID: Int] = [:]
     public var seedGradients: [GradID] = []
 
+    // Tensor gradient support: maps tensor nodes to base GradID for contiguous allocation
+    public var tensorGradients: [NodeID: GradID] = [:]
+    public var tensorGradientSizes: [NodeID: Int] = [:]
+
     public func getGlobalId(_ varId: VarID) -> Int {
         if let index = globals.firstIndex(of: varId) {
             return index
@@ -77,6 +81,29 @@ public class IRContext {
             self.seedGradients.append(gradId)
         }
         return gradId
+    }
+
+    /// Allocate contiguous block of GradIDs for tensor gradients.
+    /// Each tensor element gets its own GradID: baseGradId, baseGradId+1, ..., baseGradId+(size-1)
+    /// - Parameters:
+    ///   - src: The tensor node ID
+    ///   - size: Number of elements in the tensor
+    ///   - seed: If true, add all GradIDs to seedGradients
+    /// - Returns: The base GradID for this tensor
+    public func useTensorGradient(src: NodeID, size: Int, seed: Bool = false) -> GradID {
+        if let existing = tensorGradients[src] {
+            return existing
+        }
+        let baseGradId = gradIdx + 1
+        gradIdx += size  // Reserve `size` contiguous IDs
+        tensorGradients[src] = baseGradId
+        tensorGradientSizes[src] = size
+        if seed {
+            for i in 0..<size {
+                seedGradients.append(baseGradId + i)
+            }
+        }
+        return baseGradId
     }
 
     public func useVariable(src: NodeID?, trackInValues: Bool = true) -> Lazy {

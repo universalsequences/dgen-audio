@@ -22,6 +22,8 @@ public enum Op {
   case storeGradMemory(CellID, Lazy)
   case accumulateGrad(GradID, Lazy)
   case loadGrad(GradID)
+  case loadTensorGrad(GradID, Lazy)  // Load gradient at baseGradId + index
+  case accumulateTensorGrad(GradID, Lazy, Lazy)  // Accumulate to baseGradId + index
   case mse(Lazy, Lazy)
   case mutate(Lazy, Lazy)
   case add(Lazy, Lazy)

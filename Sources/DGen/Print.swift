@@ -135,6 +135,10 @@ extension UOp {
             opStr = "\(ANSI.magenta)storeGrad\(ANSI.reset)(\(a), \(b))"
         case let .accumulateGrad(a, b):
             opStr = "\(ANSI.magenta)accumulateGrad\(ANSI.reset)(\(a), \(b))"
+        case let .loadTensorGrad(baseGradId, indexLazy):
+            opStr = "\(ANSI.magenta)loadTensorGrad\(ANSI.reset)(\(baseGradId), \(indexLazy))"
+        case let .accumulateTensorGrad(baseGradId, indexLazy, valueLazy):
+            opStr = "\(ANSI.magenta)accumulateTensorGrad\(ANSI.reset)(\(baseGradId), \(indexLazy), \(valueLazy))"
         case let .loadTape(val, offset):
             opStr = "\(ANSI.magenta)loadTape\(ANSI.reset)(\(val), \(offset))"
         case let .mse(a, b):

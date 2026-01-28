@@ -900,6 +900,18 @@ public class CRenderer: Renderer {
             }
             return emitAssign(uop, "_pr\(varId)", ctx, forceFloatType: true)
 
+        case let .loadGrad(gradId):
+            return emitAssign(uop, "gradients[\(gradId) * frameCount + i]", ctx)
+
+        case let .accumulateGrad(gradId, val):
+            return "gradients[\(gradId) * frameCount + i] += \(g(val));"
+
+        case let .loadTensorGrad(baseGradId, indexLazy):
+            return emitAssign(uop, "gradients[(\(baseGradId)+(int)(\(g(indexLazy)))) * frameCount + i]", ctx)
+
+        case let .accumulateTensorGrad(baseGradId, indexLazy, valueLazy):
+            return "gradients[(\(baseGradId)+(int)(\(g(indexLazy)))) * frameCount + i] += \(g(valueLazy));"
+
         default:
             return "/* \(uop.prettyDescription()) */"
         }

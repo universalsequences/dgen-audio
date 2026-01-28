@@ -136,6 +136,26 @@ public final class IRBuilder {
     return value(dest)
   }
 
+  /// Load tensor gradient at baseGradId + index
+  public func loadTensorGrad(_ nodeId: NodeID, index: Expr) -> Expr {
+    guard let baseGradId = ctx.tensorGradients[nodeId] else {
+      fatalError("No tensor gradient allocated for node \(nodeId)")
+    }
+    let dest = ctx.useVariable(src: nil)
+    let uop = UOp(op: .loadTensorGrad(baseGradId, index.lazy), value: dest)
+    ops.append(uop)
+    return value(dest)
+  }
+
+  /// Accumulate gradient to tensor element at baseGradId + index
+  public func tensorGrad(_ nodeId: NodeID, index: Expr, value: Lazy) {
+    guard let baseGradId = ctx.tensorGradients[nodeId] else {
+      fatalError("No tensor gradient allocated for node \(nodeId)")
+    }
+    let uop = UOp(op: .accumulateTensorGrad(baseGradId, index.lazy, value), value: .empty)
+    ops.append(uop)
+  }
+
   func storeGradMemory(_ cellId: CellID, _ val: Expr) -> Expr {
     let dest = ctx.useVariable(src: nil)
     let uop = UOp(op: .storeGradMemory(cellId, val.lazy), value: dest)
@@ -554,6 +574,36 @@ public final class IRBuilder {
     let uop = UOp(op: .declareVar(constLazy), value: dest)
     ops.append(uop)
     return MutableVar(dest, ctx: ctx, nodeId: nodeId, builder: self)
+  }
+
+  /// Create an integer constant expression (for index calculations)
+  public func int(_ value: Int) -> Expr {
+    let constLazy = ctx.useConstant(src: nodeId, value: Float(value))
+    return Expr(constLazy, ctx: ctx, nodeId: nodeId, builder: self)
+  }
+
+  /// Add two expressions
+  public func add(_ a: Expr, _ b: Expr) -> Expr {
+    let dest = ctx.useVariable(src: nodeId)
+    let uop = UOp(op: .add(a.lazy, b.lazy), value: dest)
+    ops.append(uop)
+    return value(dest)
+  }
+
+  /// Multiply two expressions
+  public func mul(_ a: Expr, _ b: Expr) -> Expr {
+    let dest = ctx.useVariable(src: nodeId)
+    let uop = UOp(op: .mul(a.lazy, b.lazy), value: dest)
+    ops.append(uop)
+    return value(dest)
+  }
+
+  /// Divide two expressions
+  public func div(_ a: Expr, _ b: Expr) -> Expr {
+    let dest = ctx.useVariable(src: nodeId)
+    let uop = UOp(op: .div(a.lazy, b.lazy), value: dest)
+    ops.append(uop)
+    return value(dest)
   }
 
   public func loop(_ count: Int, body: (Expr) -> Void) {
