@@ -234,6 +234,52 @@ func emitBinaryOpBackward(
     }
 }
 
+/// Emit backward pass for unary operations, handling both tensor and scalar inputs.
+/// - Parameters:
+///   - localGrad: Closure computing the local derivative given (gradOutput, inputValue)
+func emitUnaryOpBackward(
+    b: IRBuilder,
+    g: Graph,
+    ctx: IRContext,
+    node: Node,
+    gradOutput: Lazy,
+    localGrad: @escaping (Expr, Expr) -> Expr
+) throws {
+    let inputNodeId = node.inputs[0]
+    let inputNode = g.nodes[inputNodeId]
+
+    let inputIsTensor: Bool
+    if case .tensor = inputNode?.shape { inputIsTensor = true } else { inputIsTensor = false }
+
+    if inputIsTensor {
+        guard case .tensor(let inputShape) = inputNode?.shape else {
+            fatalError("Expected tensor shape")
+        }
+        let size = inputShape.reduce(1, *)
+
+        guard let tensorId = g.nodeToTensor[inputNodeId],
+              let tensor = g.tensors[tensorId] else {
+            fatalError("Could not find tensor for backward")
+        }
+
+        let _ = ctx.useTensorGradient(src: inputNodeId, size: size)
+        let _ = ctx.useTensorGradient(src: node.id, size: size)
+
+        b.parallelRange(size) { idx in
+            let gradOut = b.loadTensorGrad(node.id, index: idx)
+            let inputVal = b.readTensorElement(cellId: tensor.cellId, at: idx)
+            let grad = localGrad(gradOut, inputVal)
+            b.tensorGrad(inputNodeId, index: idx, value: grad.lazy)
+        }
+    } else {
+        // Scalar path
+        let input = b.tapeValue(inputNodeId)
+        let gradOutExpr = b.value(gradOutput)
+        let grad = localGrad(gradOutExpr, input)
+        b.grad(inputNodeId, value: grad.lazy)
+    }
+}
+
 // frontend
 public enum LazyOp {
     case add, sub, div, mul, abs, sign, sin, cos, tan, tanh, exp, log, log10, sqrt, atan2, gt, gte,
@@ -1104,68 +1150,59 @@ public enum LazyOp {
                 gradRhs: { gradOut, lhsVal, rhsVal in (b.constant(0.0) - gradOut) * (lhsVal / (rhsVal * rhsVal)) }
             )
         case .abs:
-            // d(abs(x))/dx = sign(x), but zero at x=0
             guard inputs.count == 1 else { fatalError("abs requires 1 input") }
-            let input = b.tapeValue(node.inputs[0])
-            let grad = b.value(gradOutput) * b.sign(input)
-            b.grad(node.inputs[0], value: grad.lazy)
+            try emitUnaryOpBackward(b: b, g: g, ctx: ctx, node: node, gradOutput: gradOutput) {
+                gradOut, inputVal in gradOut * b.sign(inputVal)
+            }
         case .sign:
-            // d(sign(x))/dx = 0 everywhere except at x=0 where it's undefined
             guard inputs.count == 1 else { fatalError("sign requires 1 input") }
-            let zero = ctx.useConstant(src: nil, value: 0.0)
-            b.grad(node.inputs[0], value: zero)
+            try emitUnaryOpBackward(b: b, g: g, ctx: ctx, node: node, gradOutput: gradOutput) {
+                _, _ in b.constant(0.0)
+            }
         case .sin:
-            // d(sin(x))/dx = cos(x)
             guard inputs.count == 1 else { fatalError("sin requires 1 input") }
-            let input = b.tapeValue(node.inputs[0])
-            let grad = b.value(gradOutput) * b.cos(input)
-            b.grad(node.inputs[0], value: grad.lazy)
+            try emitUnaryOpBackward(b: b, g: g, ctx: ctx, node: node, gradOutput: gradOutput) {
+                gradOut, inputVal in gradOut * b.cos(inputVal)
+            }
         case .cos:
-            // d(cos(x))/dx = -sin(x)
             guard inputs.count == 1 else { fatalError("cos requires 1 input") }
-            let input = b.tapeValue(node.inputs[0])
-            let grad = b.value(gradOutput) * (b.constant(0.0) - b.sin(input))
-            b.grad(node.inputs[0], value: grad.lazy)
+            try emitUnaryOpBackward(b: b, g: g, ctx: ctx, node: node, gradOutput: gradOutput) {
+                gradOut, inputVal in gradOut * (b.constant(0.0) - b.sin(inputVal))
+            }
         case .tan:
-            // d(tan(x))/dx = sec²(x) = 1/cos²(x)
             guard inputs.count == 1 else { fatalError("tan requires 1 input") }
-            let input = b.tapeValue(node.inputs[0])
-            let cosInput = b.cos(input)
-            let sec2 = b.constant(1.0) / (cosInput * cosInput)
-            let grad = b.value(gradOutput) * sec2
-            b.grad(node.inputs[0], value: grad.lazy)
+            try emitUnaryOpBackward(b: b, g: g, ctx: ctx, node: node, gradOutput: gradOutput) {
+                gradOut, inputVal in
+                let cosInput = b.cos(inputVal)
+                return gradOut * (b.constant(1.0) / (cosInput * cosInput))
+            }
         case .tanh:
-            // d(tanh(x))/dx = 1 - tanh(x)^2
             guard inputs.count == 1 else { fatalError("tanh requires 1 input") }
-            let input = b.tapeValue(node.inputs[0])
-            let t = b.tanh(input)
-            let grad = b.value(gradOutput) * (b.constant(1.0) - t * t)
-            b.grad(node.inputs[0], value: grad.lazy)
+            try emitUnaryOpBackward(b: b, g: g, ctx: ctx, node: node, gradOutput: gradOutput) {
+                gradOut, inputVal in
+                let t = b.tanh(inputVal)
+                return gradOut * (b.constant(1.0) - t * t)
+            }
         case .exp:
-            // d(exp(x))/dx = exp(x)
             guard inputs.count == 1 else { fatalError("exp requires 1 input") }
-            let input = b.tapeValue(node.inputs[0])
-            let grad = b.value(gradOutput) * b.exp(input)
-            b.grad(node.inputs[0], value: grad.lazy)
+            try emitUnaryOpBackward(b: b, g: g, ctx: ctx, node: node, gradOutput: gradOutput) {
+                gradOut, inputVal in gradOut * b.exp(inputVal)
+            }
         case .log:
-            // d(log(x))/dx = 1/x
             guard inputs.count == 1 else { fatalError("log requires 1 input") }
-            let input = b.tapeValue(node.inputs[0])
-            let grad = b.value(gradOutput) / input
-            b.grad(node.inputs[0], value: grad.lazy)
+            try emitUnaryOpBackward(b: b, g: g, ctx: ctx, node: node, gradOutput: gradOutput) {
+                gradOut, inputVal in gradOut / inputVal
+            }
         case .log10:
-            // d(log10(x))/dx = 1 / (x * ln(10))
             guard inputs.count == 1 else { fatalError("log10 requires 1 input") }
-            let input = b.tapeValue(node.inputs[0])
-            let ln10 = b.constant(2.302585092994046)  // natural log of 10
-            let grad = b.value(gradOutput) / (input * ln10)
-            b.grad(node.inputs[0], value: grad.lazy)
+            try emitUnaryOpBackward(b: b, g: g, ctx: ctx, node: node, gradOutput: gradOutput) {
+                gradOut, inputVal in gradOut / (inputVal * b.constant(2.302585092994046))
+            }
         case .sqrt:
-            // d(sqrt(x))/dx = 1/(2*sqrt(x))
             guard inputs.count == 1 else { fatalError("sqrt requires 1 input") }
-            let input = b.tapeValue(node.inputs[0])
-            let grad = b.value(gradOutput) / (b.constant(2.0) * b.sqrt(input))
-            b.grad(node.inputs[0], value: grad.lazy)
+            try emitUnaryOpBackward(b: b, g: g, ctx: ctx, node: node, gradOutput: gradOutput) {
+                gradOut, inputVal in gradOut / (b.constant(2.0) * b.sqrt(inputVal))
+            }
         case .pow:
             // d(x^y)/dx = y * x^(y-1), d(x^y)/dy = x^y * ln(x)
             guard inputs.count == 2 else { fatalError("pow requires 2 inputs") }
