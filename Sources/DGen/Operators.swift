@@ -57,6 +57,183 @@ public struct BackwardsEmitResult {
     let dependencies: [NodeID]
 }
 
+/// Emit backward pass for binary operations, handling all tensor/scalar combinations.
+/// - Parameters:
+///   - gradLhs: Closure computing dL/dLhs given (gradOutput, lhsValue, rhsValue)
+///   - gradRhs: Closure computing dL/dRhs given (gradOutput, lhsValue, rhsValue)
+func emitBinaryOpBackward(
+    b: IRBuilder,
+    g: Graph,
+    ctx: IRContext,
+    node: Node,
+    gradOutput: Lazy,
+    gradLhs: @escaping (Expr, Expr, Expr) -> Expr,
+    gradRhs: @escaping (Expr, Expr, Expr) -> Expr
+) throws {
+    let lhsNodeId = node.inputs[0]
+    let rhsNodeId = node.inputs[1]
+    let lhsNode = g.nodes[lhsNodeId]
+    let rhsNode = g.nodes[rhsNodeId]
+
+    let lhsIsTensor: Bool
+    let rhsIsTensor: Bool
+    if case .tensor = lhsNode?.shape { lhsIsTensor = true } else { lhsIsTensor = false }
+    if case .tensor = rhsNode?.shape { rhsIsTensor = true } else { rhsIsTensor = false }
+
+    if lhsIsTensor && rhsIsTensor {
+        // Tensor op Tensor (element-wise)
+        guard case .tensor(let lhsShape) = lhsNode?.shape,
+              case .tensor(let rhsShape) = rhsNode?.shape,
+              case .tensor(let outShape) = node.shape else {
+            fatalError("Expected tensor shapes")
+        }
+
+        let lhsSize = lhsShape.reduce(1, *)
+        let rhsSize = rhsShape.reduce(1, *)
+        let outSize = outShape.reduce(1, *)
+
+        guard let lhsTensorId = g.nodeToTensor[lhsNodeId],
+              let lhsTensor = g.tensors[lhsTensorId],
+              let rhsTensorId = g.nodeToTensor[rhsNodeId],
+              let rhsTensor = g.tensors[rhsTensorId] else {
+            fatalError("Could not find tensors for backward")
+        }
+
+        // Allocate tensor gradients
+        let _ = ctx.useTensorGradient(src: lhsNodeId, size: lhsSize)
+        let _ = ctx.useTensorGradient(src: rhsNodeId, size: rhsSize)
+        let _ = ctx.useTensorGradient(src: node.id, size: outSize)
+
+        if lhsShape == rhsShape {
+            // Same shape - simple element-wise
+            b.parallelRange(outSize) { idx in
+                let gradOut = b.loadTensorGrad(node.id, index: idx)
+                let lhsVal = b.readTensorElement(cellId: lhsTensor.cellId, at: idx)
+                let rhsVal = b.readTensorElement(cellId: rhsTensor.cellId, at: idx)
+
+                let gLhs = gradLhs(gradOut, lhsVal, rhsVal)
+                let gRhs = gradRhs(gradOut, lhsVal, rhsVal)
+
+                b.tensorGrad(lhsNodeId, index: idx, value: gLhs.lazy)
+                b.tensorGrad(rhsNodeId, index: idx, value: gRhs.lazy)
+            }
+        } else {
+            // Different shapes - broadcast handling
+            let lhsStrides = Tensor.computeRowMajorStrides(lhsShape)
+            let rhsStrides = Tensor.computeRowMajorStrides(rhsShape)
+            let outStrides = Tensor.computeRowMajorStrides(outShape)
+
+            b.parallelRange(outSize) { outIdx in
+                let gradOut = b.loadTensorGrad(node.id, index: outIdx)
+
+                // Compute broadcast indices
+                var lhsIdx = b.int(0)
+                var rhsIdx = b.int(0)
+
+                for dim in 0..<outShape.count {
+                    let coord = b.mod(b.div(outIdx, b.int(outStrides[dim])), b.int(outShape[dim]))
+
+                    if dim < lhsShape.count && lhsShape[dim] > 1 {
+                        lhsIdx = b.add(lhsIdx, b.mul(coord, b.int(lhsStrides[dim])))
+                    }
+                    if dim < rhsShape.count && rhsShape[dim] > 1 {
+                        rhsIdx = b.add(rhsIdx, b.mul(coord, b.int(rhsStrides[dim])))
+                    }
+                }
+
+                let lhsIdxFloat = b.cast(lhsIdx, to: .float)
+                let rhsIdxFloat = b.cast(rhsIdx, to: .float)
+                let lhsVal = b.readTensorElement(cellId: lhsTensor.cellId, at: lhsIdxFloat)
+                let rhsVal = b.readTensorElement(cellId: rhsTensor.cellId, at: rhsIdxFloat)
+
+                let gLhs = gradLhs(gradOut, lhsVal, rhsVal)
+                let gRhs = gradRhs(gradOut, lhsVal, rhsVal)
+
+                b.tensorGrad(lhsNodeId, index: lhsIdxFloat, value: gLhs.lazy)
+                b.tensorGrad(rhsNodeId, index: rhsIdxFloat, value: gRhs.lazy)
+            }
+        }
+
+    } else if lhsIsTensor && !rhsIsTensor {
+        // Tensor op Scalar
+        guard case .tensor(let lhsShape) = lhsNode?.shape else { fatalError("Expected tensor shape") }
+        let lhsSize = lhsShape.reduce(1, *)
+
+        guard let lhsTensorId = g.nodeToTensor[lhsNodeId],
+              let lhsTensor = g.tensors[lhsTensorId] else {
+            fatalError("Could not find tensor for backward")
+        }
+
+        let _ = ctx.useTensorGradient(src: lhsNodeId, size: lhsSize)
+        let _ = ctx.useTensorGradient(src: node.id, size: lhsSize)
+
+        let rhsVal = b.tapeValue(rhsNodeId)
+
+        // dL/dTensor[i] using the gradLhs closure
+        b.parallelRange(lhsSize) { idx in
+            let gradOut = b.loadTensorGrad(node.id, index: idx)
+            let lhsVal = b.readTensorElement(cellId: lhsTensor.cellId, at: idx)
+            let gLhs = gradLhs(gradOut, lhsVal, rhsVal)
+            b.tensorGrad(lhsNodeId, index: idx, value: gLhs.lazy)
+        }
+
+        // dL/dScalar = sum over tensor elements
+        let scalarGradAcc = b.float(0.0)
+        b.loop(lhsSize) { idx in
+            let gradOut = b.loadTensorGrad(node.id, index: idx)
+            let lhsVal = b.readTensorElement(cellId: lhsTensor.cellId, at: idx)
+            let gRhs = gradRhs(gradOut, lhsVal, rhsVal)
+            scalarGradAcc.accumulate(gRhs)
+        }
+        b.grad(rhsNodeId, value: scalarGradAcc.value.lazy)
+
+    } else if !lhsIsTensor && rhsIsTensor {
+        // Scalar op Tensor
+        guard case .tensor(let rhsShape) = rhsNode?.shape else { fatalError("Expected tensor shape") }
+        let rhsSize = rhsShape.reduce(1, *)
+
+        guard let rhsTensorId = g.nodeToTensor[rhsNodeId],
+              let rhsTensor = g.tensors[rhsTensorId] else {
+            fatalError("Could not find tensor for backward")
+        }
+
+        let _ = ctx.useTensorGradient(src: rhsNodeId, size: rhsSize)
+        let _ = ctx.useTensorGradient(src: node.id, size: rhsSize)
+
+        let lhsVal = b.tapeValue(lhsNodeId)
+
+        // dL/dTensor[i] using the gradRhs closure
+        b.parallelRange(rhsSize) { idx in
+            let gradOut = b.loadTensorGrad(node.id, index: idx)
+            let rhsVal = b.readTensorElement(cellId: rhsTensor.cellId, at: idx)
+            let gRhs = gradRhs(gradOut, lhsVal, rhsVal)
+            b.tensorGrad(rhsNodeId, index: idx, value: gRhs.lazy)
+        }
+
+        // dL/dScalar = sum over tensor elements
+        let scalarGradAcc = b.float(0.0)
+        b.loop(rhsSize) { idx in
+            let gradOut = b.loadTensorGrad(node.id, index: idx)
+            let rhsVal = b.readTensorElement(cellId: rhsTensor.cellId, at: idx)
+            let gLhs = gradLhs(gradOut, lhsVal, rhsVal)
+            scalarGradAcc.accumulate(gLhs)
+        }
+        b.grad(lhsNodeId, value: scalarGradAcc.value.lazy)
+
+    } else {
+        // Scalar op Scalar (original)
+        let lhsVal = b.tapeValue(lhsNodeId)
+        let rhsVal = b.tapeValue(rhsNodeId)
+        let gradOutExpr = b.value(gradOutput)
+
+        let gLhs = gradLhs(gradOutExpr, lhsVal, rhsVal)
+        let gRhs = gradRhs(gradOutExpr, lhsVal, rhsVal)
+
+        b.grad(lhsNodeId, value: gLhs.lazy)
+        b.grad(rhsNodeId, value: gRhs.lazy)
+    }
+}
+
 // frontend
 public enum LazyOp {
     case add, sub, div, mul, abs, sign, sin, cos, tan, tanh, exp, log, log10, sqrt, atan2, gt, gte,
@@ -865,15 +1042,19 @@ public enum LazyOp {
         case .add:
             // d(x+y)/dx = 1, d(x+y)/dy = 1
             guard node.inputs.count == 2 else { fatalError("add requires 2 inputs") }
-            b.grad(node.inputs[0], value: gradOutput)
-            b.grad(node.inputs[1], value: gradOutput)
+            try emitBinaryOpBackward(
+                b: b, g: g, ctx: ctx, node: node, gradOutput: gradOutput,
+                gradLhs: { gradOut, _, _ in gradOut },
+                gradRhs: { gradOut, _, _ in gradOut }
+            )
         case .sub:
             // z = x - y  =>  dz/dx = 1, dz/dy = -1
             guard node.inputs.count == 2 else { fatalError("sub requires 2 inputs") }
-            b.grad(node.inputs[0], value: gradOutput)
-            // negate grad for second input
-            let negGrad = (b.constant(0.0) - b.value(gradOutput)).lazy
-            b.grad(node.inputs[1], value: negGrad)
+            try emitBinaryOpBackward(
+                b: b, g: g, ctx: ctx, node: node, gradOutput: gradOutput,
+                gradLhs: { gradOut, _, _ in gradOut },
+                gradRhs: { gradOut, _, _ in b.constant(0.0) - gradOut }
+            )
         case .mod:
             // z = fmod(a, b) ≈ a - b*trunc(a/b). Treat trunc grad as 0 almost everywhere.
             // -> dz/da ≈ 1, dz/db ≈ 0 (stable choice for DSP wrapping)
@@ -909,21 +1090,19 @@ public enum LazyOp {
         case .mul:
             // d(x*y)/dx = y, d(x*y)/dy = x
             guard inputs.count == 2 else { fatalError("mul \(node.id) requires 2 inputs") }
-            let rhs = b.tapeValue(node.inputs[1])
-            let lhs = b.tapeValue(node.inputs[0])
-            let gradX = b.value(gradOutput) * rhs
-            let gradY = b.value(gradOutput) * lhs
-            b.grad(node.inputs[0], value: gradX.lazy)
-            b.grad(node.inputs[1], value: gradY.lazy)
+            try emitBinaryOpBackward(
+                b: b, g: g, ctx: ctx, node: node, gradOutput: gradOutput,
+                gradLhs: { gradOut, lhsVal, rhsVal in gradOut * rhsVal },
+                gradRhs: { gradOut, lhsVal, rhsVal in gradOut * lhsVal }
+            )
         case .div:
             // z = x / y  =>  dz/dx = 1/y, dz/dy = -x / y^2
             guard inputs.count == 2 else { fatalError("div \(node.id) requires 2 inputs") }
-            let x = b.tapeValue(node.inputs[0])
-            let y = b.tapeValue(node.inputs[1])
-            let gradX = b.value(gradOutput) / y
-            let gradY = (b.constant(0.0) - b.value(gradOutput)) * (x / (y * y))
-            b.grad(node.inputs[0], value: gradX.lazy)
-            b.grad(node.inputs[1], value: gradY.lazy)
+            try emitBinaryOpBackward(
+                b: b, g: g, ctx: ctx, node: node, gradOutput: gradOutput,
+                gradLhs: { gradOut, _, rhsVal in gradOut / rhsVal },
+                gradRhs: { gradOut, lhsVal, rhsVal in (b.constant(0.0) - gradOut) * (lhsVal / (rhsVal * rhsVal)) }
+            )
         case .abs:
             // d(abs(x))/dx = sign(x), but zero at x=0
             guard inputs.count == 1 else { fatalError("abs requires 1 input") }

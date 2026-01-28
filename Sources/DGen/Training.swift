@@ -235,6 +235,7 @@ public class TrainingContext {
     private var runtime: MetalCompiledKernel?
     private var frameCount: Int = 0
     private var context: IRContext?
+    private var graph: Graph?
     private let lossNode: NodeID?
     // Cache physical cell indices for parameters to avoid recomputing
     private var paramPhysicalCells: [UInt32] = []
@@ -299,7 +300,8 @@ public class TrainingContext {
             runtime: runtime,
             cellAllocations: compilationResult.cellAllocations,
             context: compilationResult.context,
-            frameCount: frameCount
+            frameCount: frameCount,
+            graph: compilationResult.graph
         )
     }
 
@@ -309,12 +311,14 @@ public class TrainingContext {
         runtime: MetalCompiledKernel,
         cellAllocations: CellAllocations,
         context: IRContext,
-        frameCount: Int
+        frameCount: Int,
+        graph: Graph? = nil
     ) {
         self.runtime = runtime
         self.cellAllocations = cellAllocations
         self.frameCount = frameCount
         self.context = context
+        self.graph = graph
 
         // Mark loss node as seed gradient if specified
         if let lossNode = lossNode {
@@ -353,6 +357,11 @@ public class TrainingContext {
         }
 
         let memPtr = memory.assumingMemoryBound(to: Float.self)
+
+        // Inject all tensor data (both parameters and non-parameters) into host memory
+        if let g = graph {
+            injectTensorData(graph: g, cellAllocations: cellAllocations, memory: memPtr)
+        }
 
         // Initialize parameter values in host memory and cache physical cells
         paramPhysicalCells.removeAll(keepingCapacity: true)
@@ -540,7 +549,12 @@ public class TrainingContext {
                 memPtr[physicalCell] = param.value
             }
 
-            // Restore tensor parameter values into their physical cells
+            // Restore all tensor data (non-parameter tensors + parameter tensors)
+            if let g = self.graph {
+                injectTensorData(graph: g, cellAllocations: cellAlloc, memory: memPtr)
+            }
+
+            // Restore tensor parameter values (may have been updated by optimizer)
             for tensorParam in tensorParameters {
                 let physicalCell = cellAlloc.cellMappings[tensorParam.cellId] ?? tensorParam.cellId
                 for i in 0..<tensorParam.size {

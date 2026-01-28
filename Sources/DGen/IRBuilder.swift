@@ -156,6 +156,11 @@ public final class IRBuilder {
     ops.append(uop)
   }
 
+  /// Read a tensor element at flat index from memory (for backward pass)
+  public func readTensorElement(cellId: CellID, at index: Expr) -> Expr {
+    return memoryRead(cellId, index)
+  }
+
   func storeGradMemory(_ cellId: CellID, _ val: Expr) -> Expr {
     let dest = ctx.useVariable(src: nil)
     let uop = UOp(op: .storeGradMemory(cellId, val.lazy), value: dest)

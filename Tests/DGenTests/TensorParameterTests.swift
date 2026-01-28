@@ -243,6 +243,77 @@ final class TensorParameterTests: XCTestCase {
 
     // MARK: - Milestone 7: Full Training Loop
 
+    func testTensorTensorMulBackward() throws {
+        let g = Graph()
+
+        // Test: weights * input where both are tensors
+        let weights = TensorParameter(
+            graph: g, shape: [4],
+            data: [1.0, 2.0, 3.0, 4.0], name: "weights")
+        let input = g.tensor(shape: [4], data: [1.0, 1.0, 1.0, 1.0])
+
+        // output = sum(weights * input) = sum(weights) when input is all 1s
+        let product = g.n(.mul, weights.node(), input)
+        let output = g.n(.sum, product)
+
+        // Target: 20 (sum of weights * 1 = 1+2+3+4 = 10, want 20 so weights should double)
+        let loss = g.n(.mse, output, g.n(.constant(20.0)))
+        _ = g.n(.output(0), loss)
+
+        let frameCount = 1
+        let result = try CompilationPipeline.compile(
+            graph: g, backend: .metal,
+            options: .init(frameCount: frameCount, backwards: true))
+
+        let runtime = try MetalCompiledKernel(
+            kernels: result.kernels,
+            cellAllocations: result.cellAllocations,
+            context: result.context)
+
+        let ctx = TrainingContext(
+            tensorParameters: [weights],
+            optimizer: Adam(lr: 0.1),
+            lossNode: loss)
+
+        ctx.initializeMemory(
+            runtime: runtime,
+            cellAllocations: result.cellAllocations,
+            context: result.context,
+            frameCount: frameCount,
+            graph: g)
+
+        let inputBuffer = [Float](repeating: 0.0, count: frameCount)
+        var outputBuffer = [Float](repeating: 0.0, count: frameCount)
+
+        var losses: [Float] = []
+        for epoch in 0..<200 {
+            ctx.zeroGrad()
+
+            inputBuffer.withUnsafeBufferPointer { inPtr in
+                outputBuffer.withUnsafeMutableBufferPointer { outPtr in
+                    runtime.runWithMemory(
+                        outputs: outPtr.baseAddress!,
+                        inputs: inPtr.baseAddress!,
+                        memory: ctx.getMemory(),
+                        frameCount: frameCount)
+                }
+            }
+
+            let currentLoss = outputBuffer[0]
+            losses.append(currentLoss)
+
+            ctx.step()
+        }
+
+        // Verify convergence: sum(weights) should approach 20
+        let finalSum = weights.data.reduce(0, +)
+        print("Final sum: \(finalSum) (target: 20)")
+        print("Final weights: \(weights.data)")
+
+        XCTAssertEqual(finalSum, 20.0, accuracy: 1.0, "Weights should sum to approximately 20")
+        XCTAssertLessThan(losses.last ?? Float.infinity, 1.0, "Loss should be small")
+    }
+
     func testLearnTensorWeights() throws {
         let g = Graph()
 
