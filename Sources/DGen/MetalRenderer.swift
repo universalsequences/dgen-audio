@@ -3,6 +3,7 @@ import Foundation
 public class MetalRenderer: Renderer, UOpEmitter {
   let memoryVarID = -1  // Virtual ID for the global memory buffer
   var needsSegmenting = false
+  var parallelRangeVars: Set<VarID> = []  // Track parallel range loop variable IDs
 
   public override init() {
   }
@@ -87,63 +88,91 @@ public class MetalRenderer: Renderer, UOpEmitter {
     // Define frameCount UOp for Metal kernels
     let frameCountUOp = Lazy.variable(-1, nil)  // Special variable ID for frameCount
 
+    // Group adjacent blocks of the same kind into a single kernel.
+    // This is critical for correctness when operations need to see per-frame
+    // state (e.g., history read followed by sum must happen within the same frame loop).
+    var currentSchedule: ScheduleItem? = nil
+    var currentKind: Kind? = nil
+    var loopOpened = false
+
     for block in uopBlocks {
-      let scheduleItem = ScheduleItem(kind: block.kind)
-
-      // Add frameCount UOp for all Metal kernels (needed for output operations)
-      scheduleItem.ops.append(UOp(op: .frameCount, value: .empty))
-
-      // Optional: extract defineGlobals early (or leave in place if your IR handles it)
-      for uop in block.ops {
-        if case .defineGlobal = uop.op {
-          scheduleItem.ops.append(uop)
+      // Check if we need to start a new kernel (different block kind)
+      if currentKind != block.kind {
+        // Close previous kernel if open
+        if let schedule = currentSchedule {
+          if loopOpened {
+            if currentKind == .scalar {
+              schedule.ops.append(UOp(op: .endLoop, value: .empty))
+            }
+            schedule.ops.append(UOp(op: .endRange, value: .empty))
+          }
+          scheduleItems.append(schedule)
         }
-      }
 
-      if block.kind == .scalar {
-        // Scalar kernels: only thread 0 executes, then loops through frameCount
-        var beginRange = UOp(
-          op: .beginRange(.constant(0, 0), .constant(0, 1)), value: .empty)
-        beginRange.kind = block.kind
-        scheduleItem.ops.append(beginRange)
+        // Start new kernel
+        let scheduleItem = ScheduleItem(kind: block.kind)
+        scheduleItem.ops.append(UOp(op: .frameCount, value: .empty))
 
-        var hasGradMemoryCalls = false
-        for n in block.ops {
-          if case .storeGradMemory(_, _) = n.op {
-            hasGradMemoryCalls = true
-            break
-          } else if case .loadGradMemory(_) = n.op {
-            hasGradMemoryCalls = true
-            break
+        // Extract defineGlobals early
+        for uop in block.ops {
+          if case .defineGlobal = uop.op {
+            scheduleItem.ops.append(uop)
           }
         }
-        let incr = hasGradMemoryCalls ? -1 : 1
-        var beginLoop = UOp(op: .beginLoop(frameCountUOp, incr), value: .empty)
-        beginLoop.kind = block.kind
-        scheduleItem.ops.append(beginLoop)
-      } else {
-        // SIMD kernels: each thread processes one frame, bound by frameCount
-        var beginRange = UOp(op: .beginRange(.constant(0, 0), frameCountUOp), value: .empty)
-        beginRange.kind = block.kind
-        scheduleItem.ops.append(beginRange)
+
+        if block.kind == .scalar {
+          // Scalar kernels: only thread 0 executes, then loops through frameCount
+          var beginRange = UOp(
+            op: .beginRange(.constant(0, 0), .constant(0, 1)), value: .empty)
+          beginRange.kind = block.kind
+          scheduleItem.ops.append(beginRange)
+
+          var hasGradMemoryCalls = false
+          for n in block.ops {
+            if case .storeGradMemory(_, _) = n.op {
+              hasGradMemoryCalls = true
+              break
+            } else if case .loadGradMemory(_) = n.op {
+              hasGradMemoryCalls = true
+              break
+            }
+          }
+          let incr = hasGradMemoryCalls ? -1 : 1
+          var beginLoop = UOp(op: .beginLoop(frameCountUOp, incr), value: .empty)
+          beginLoop.kind = block.kind
+          scheduleItem.ops.append(beginLoop)
+        } else {
+          // SIMD kernels: each thread processes one frame, bound by frameCount
+          var beginRange = UOp(op: .beginRange(.constant(0, 0), frameCountUOp), value: .empty)
+          beginRange.kind = block.kind
+          scheduleItem.ops.append(beginRange)
+        }
+
+        currentSchedule = scheduleItem
+        currentKind = block.kind
+        loopOpened = true
       }
 
-      for uop in block.ops {
-        if case .defineGlobal = uop.op { continue }
-        var typedUOp = uop
-        typedUOp.kind = block.kind
-        scheduleItem.ops.append(typedUOp)
+      // Add this block's ops to the current kernel (within the existing frame loop)
+      if let schedule = currentSchedule {
+        for uop in block.ops {
+          if case .defineGlobal = uop.op { continue }
+          var typedUOp = uop
+          typedUOp.kind = block.kind
+          schedule.ops.append(typedUOp)
+        }
       }
+    }
 
-      // Close the range/loop blocks
-      if block.kind == .scalar {
-        scheduleItem.ops.append(UOp(op: .endLoop, value: .empty))
-        scheduleItem.ops.append(UOp(op: .endRange, value: .empty))
-      } else {
-        scheduleItem.ops.append(UOp(op: .endRange, value: .empty))
+    // Close the last kernel
+    if let schedule = currentSchedule {
+      if loopOpened {
+        if currentKind == .scalar {
+          schedule.ops.append(UOp(op: .endLoop, value: .empty))
+        }
+        schedule.ops.append(UOp(op: .endRange, value: .empty))
       }
-
-      scheduleItems.append(scheduleItem)
+      scheduleItems.append(schedule)
     }
   }
 
@@ -152,6 +181,7 @@ public class MetalRenderer: Renderer, UOpEmitter {
     totalMemorySlots: Int
   ) -> String {
     var kernels = ""
+    parallelRangeVars.removeAll()  // Reset parallel range tracking for new kernel
     var (inputs, outputs) = analyzeDependencies(scheduleItem: scheduleItem, ctx: ctx)
 
     let hasOutputOps = scheduleItem.ops.contains { uop in
@@ -506,6 +536,7 @@ public class MetalRenderer: Renderer, UOpEmitter {
       guard case .variable(let varId, _) = uop.value else {
         fatalError("beginParallelRange requires variable")
       }
+      parallelRangeVars.insert(varId)  // Track this as a parallel range loop variable
       return "for (uint _pr\(varId) = 0; _pr\(varId) < \(count); _pr\(varId)++) {"
     case .endParallelRange:
       // IMPORTANT: Memory fence required for correctness on Metal.
@@ -542,6 +573,9 @@ public class MetalRenderer: Renderer, UOpEmitter {
     case let .variable(id, _):
       if id == -1 {  // Special case for frameCount
         return "frameCount"
+      } else if parallelRangeVars.contains(id) {
+        // This is a parallel range loop variable - use _pr prefix
+        return "_pr\(id)"
       } else if ctx.globals.contains(id) {
         let tapeSlot = ctx.getGlobalId(id)
         let idx = (kind == .simd) ? "id" : "i"

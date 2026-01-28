@@ -136,9 +136,18 @@ public class TrainingContext {
     private var paramPhysicalCells: [UInt32] = []
     // Profiling
     private let profile: Bool = (ProcessInfo.processInfo.environment["DGEN_PROFILE"] == "1")
-    private let profileEvery: Int = Int(ProcessInfo.processInfo.environment["DGEN_PROFILE_EVERY"] ?? "1") ?? 1
+    private let profileEvery: Int =
+        Int(ProcessInfo.processInfo.environment["DGEN_PROFILE_EVERY"] ?? "1") ?? 1
     private var stepCounter: Int = 0
-    private struct StepProfile { var zero: Double; var fwdBwd: Double; var reduce: Double; var update: Double; var readback: Double; var syncHost: Double; var total: Double }
+    private struct StepProfile {
+        var zero: Double
+        var fwdBwd: Double
+        var reduce: Double
+        var update: Double
+        var readback: Double
+        var syncHost: Double
+        var total: Double
+    }
     private var lastProfile: StepProfile?
 
     /// Initialize training context (simple version - requires manual initializeMemory() call)
@@ -339,7 +348,9 @@ public class TrainingContext {
                 physicalCells: paramPhysicalCells,
                 values: values
             )
-        } else if let mem = self.memory, let runtime = self.runtime, let cellAlloc = self.cellAllocations {
+        } else if let mem = self.memory, let runtime = self.runtime,
+            let cellAlloc = self.cellAllocations
+        {
             // CPU path: zero host-side memory and restore parameter values; runWithMemory
             // will copy this into the device buffer on the next forward pass.
             let memorySize = runtime.getMemorySize()
@@ -440,7 +451,10 @@ public class TrainingContext {
             step()
             return
         }
-        if profEnabled { tReduce = CFAbsoluteTimeGetCurrent() - tStart; tStart = CFAbsoluteTimeGetCurrent() }
+        if profEnabled {
+            tReduce = CFAbsoluteTimeGetCurrent() - tStart
+            tStart = CFAbsoluteTimeGetCurrent()
+        }
 
         // Debug: peek reduced gradient values for our params
         /*
@@ -498,7 +512,10 @@ public class TrainingContext {
             step()
             return
         }
-        if profEnabled { tUpdate = CFAbsoluteTimeGetCurrent() - tStart; tStart = CFAbsoluteTimeGetCurrent() }
+        if profEnabled {
+            tUpdate = CFAbsoluteTimeGetCurrent() - tStart
+            tStart = CFAbsoluteTimeGetCurrent()
+        }
 
         // Step 4: Read back parameter values from GPU memory buffer
         if let memBuffer = runtime.getBuffer(name: "memory") {
@@ -508,7 +525,10 @@ public class TrainingContext {
                 param.value = gpuMemPtr[physicalCell]
             }
         }
-        if profEnabled { tReadback = CFAbsoluteTimeGetCurrent() - tStart; tStart = CFAbsoluteTimeGetCurrent() }
+        if profEnabled {
+            tReadback = CFAbsoluteTimeGetCurrent() - tStart
+            tStart = CFAbsoluteTimeGetCurrent()
+        }
 
         // Step 5: Sync to host memory
         guard let mem = self.memory else {
@@ -523,7 +543,10 @@ public class TrainingContext {
 
         if profEnabled {
             // Store last profile; zero and fwdBwd are captured in runStepGPU()
-            let prev = lastProfile ?? StepProfile(zero: 0, fwdBwd: 0, reduce: 0, update: 0, readback: 0, syncHost: 0, total: 0)
+            let prev =
+                lastProfile
+                ?? StepProfile(
+                    zero: 0, fwdBwd: 0, reduce: 0, update: 0, readback: 0, syncHost: 0, total: 0)
             lastProfile = StepProfile(
                 zero: prev.zero,
                 fwdBwd: prev.fwdBwd,
@@ -536,12 +559,14 @@ public class TrainingContext {
         }
 
         // Step 6: Update param.grad for inspection (read from reducedGrads buffer)
-        if debugGradients, let reducedGradsBuffer = runtime.getBuffer(name: "reducedGrads") {
+        if let reducedGradsBuffer = runtime.getBuffer(name: "reducedGrads") {
             let reducedGradsPtr = reducedGradsBuffer.contents().assumingMemoryBound(to: Float.self)
             for param in parameters {
                 guard let gradId = param.gradId else { continue }
                 param.grad = reducedGradsPtr[gradId]
-                print("   [DEBUG] param gradId=\(gradId) reducedGrad=\(param.grad)")
+                if debugGradients {
+                    print("   [DEBUG] param gradId=\(gradId) reducedGrad=\(param.grad)")
+                }
             }
         }
     }
@@ -587,7 +612,10 @@ public class TrainingContext {
         zeroGrad(deviceMemory: true)
         var zeroTime: Double = 0
         var fwdTime: Double = 0
-        if profEnabled { zeroTime = CFAbsoluteTimeGetCurrent() - t0; t0 = CFAbsoluteTimeGetCurrent() }
+        if profEnabled {
+            zeroTime = CFAbsoluteTimeGetCurrent() - t0
+            t0 = CFAbsoluteTimeGetCurrent()
+        }
 
         // Forward + backward pass
         runtime.runNoCopy(frameCount: frameCount)
@@ -601,12 +629,15 @@ public class TrainingContext {
             if var prof = lastProfile {
                 prof.zero = zeroTime
                 prof.fwdBwd = fwdTime
-                prof.total = zeroTime + fwdTime + prof.reduce + prof.update + prof.readback + prof.syncHost
+                prof.total =
+                    zeroTime + fwdTime + prof.reduce + prof.update + prof.readback + prof.syncHost
                 lastProfile = prof
                 stepCounter += 1
                 if stepCounter % max(profileEvery, 1) == 0 {
                     let ms = { (s: Double) -> String in String(format: "%.2f", s * 1000.0) }
-                    print("[PROFILE] step=\(stepCounter) total=\(ms(prof.total)) ms | zero=\(ms(prof.zero)) fwd+bwd=\(ms(prof.fwdBwd)) reduce=\(ms(prof.reduce)) update=\(ms(prof.update)) readback=\(ms(prof.readback)) syncHost=\(ms(prof.syncHost))")
+                    print(
+                        "[PROFILE] step=\(stepCounter) total=\(ms(prof.total)) ms | zero=\(ms(prof.zero)) fwd+bwd=\(ms(prof.fwdBwd)) reduce=\(ms(prof.reduce)) update=\(ms(prof.update)) readback=\(ms(prof.readback)) syncHost=\(ms(prof.syncHost))"
+                    )
                 }
             }
         }

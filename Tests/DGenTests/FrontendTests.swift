@@ -21,10 +21,18 @@ final class FrontendTests: XCTestCase {
                 }
                 let phase1 = g.phasor(freq)
                 let filtered1 = onepole(phase1, cutoff)
-                let loss = g.mse(filtered1, onepole(phase1, g.constant(0.2)))
-                let frameCount = 256
+                let sig1 = filtered1
+                let sig2 = onepole(phase1, g.constant(0.2))
+                let loss =
+                        (g.spectralLoss(sig1, sig2, windowSize: 32)
+
+                                + g.spectralLoss(sig1, sig2, windowSize: 64)
+                                + g.spectralLoss(sig1, sig2, windowSize: 128)) * 1 + 0.1
+                        * g.mse(sig1, sig2)
+
+                let frameCount = 512 * 2
                 let result = try g.compile(
-                        loss, backend: .metal, frameCount: frameCount, debug: true)
+                        loss, backend: .metal, frameCount: frameCount, debug: false)
 
                 for kernel in result.kernels {
                         print(kernel.source)
@@ -39,7 +47,8 @@ final class FrontendTests: XCTestCase {
                         frameCount: frameCount
                 )
 
-                for i in 0..<40 {
+                for i in 0..<100 {
+                        print("i=\(i)")
                         let currentLoss = ctx.runStepGPU()
                         if i % 1 == 0 {
                                 print(
@@ -52,43 +61,46 @@ final class FrontendTests: XCTestCase {
 
         func testBiquadBackward() throws {
                 let g = GraphBuilder()
+                print("yo")
 
                 let targetFreq = g.constant(452.0)
-                let targetCutoff = g.constant(1900.0)
+                let targetCutoff = g.constant(1300.0)
+
+                let (freqParam, freq) = g.learnableParam(value: 445.0, name: "Freq")
                 let (cutoffParam, cutoff) = g.learnableParam(value: 998.0, name: "Cutoff")
-                let (freqParam, freq) = g.learnableParam(value: 445.0, name: "Cutoff")
+
                 let phase1 = g.phasor(freq)
                 let phase2 = g.phasor(targetFreq)
-                let resonance = g.constant(4)
+                let resonance = g.constant(14)
                 let gain = g.constant(1)
                 let mode = g.constant(0)
                 let sig1 = g.biquad(phase1, cutoff, resonance, gain, mode)
-                let frameCount = 512 * 4
+                let frameCount = 512 * 2
                 let sig2 = g.biquad(phase2, targetCutoff, resonance, gain, mode)
 
                 let loss =
                         (g.spectralLoss(sig1, sig2, windowSize: 32)
                                 + g.spectralLoss(sig1, sig2, windowSize: 64)
-                                + g.spectralLoss(sig1, sig2, windowSize: 128)) * 1 + 0.1
+                                + g.spectralLoss(sig1, sig2, windowSize: 128)) * 1 + 0.8
                         * g.mse(sig1, sig2)
-                print("about to compile")
+
                 let result = try g.compile(
                         loss, backend: .metal, frameCount: frameCount, debug: false)
 
                 for kernel in result.kernels {
                         print(kernel.source)
-
                 }
+
                 // Streamlined training context - handles everything!
                 let ctx = try TrainingContext(
                         parameters: [cutoffParam, freqParam],
-                        optimizer: Adam(lr: 0.4),
+                        optimizer: Adam(lr: 2.4),
                         lossNode: loss.id,
                         compilationResult: result,
                         frameCount: frameCount
                 )
 
-                for i in 0..<5000 {
+                for i in 0..<1000 {
                         let currentLoss = ctx.runStepGPU()
                         if i % 10 == 0 {
                                 print(

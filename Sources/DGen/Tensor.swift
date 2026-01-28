@@ -542,9 +542,12 @@ extension Graph {
     public func peek(tensor tensorNode: NodeID, index: NodeID, channel: NodeID) throws -> NodeID {
         // Check if input has tensor shape (works for both concrete and frame-based tensors)
         guard let inputNode = nodes[tensorNode],
-              case .tensor(let shape) = inputNode.shape else {
+            case .tensor(let originalShape) = inputNode.shape
+        else {
             throw DGenError.tensorError(op: "peek", reason: "requires tensor input")
         }
+
+        let shape = originalShape.count == 1 ? [originalShape[0], 1] : originalShape
 
         guard shape.count >= 2 else {
             throw DGenError.shapeMismatch(op: "peek", shape1: shape, shape2: shape)
@@ -552,11 +555,17 @@ extension Graph {
 
         // Check if we have a concrete tensor with known cellId
         if let tensorId = nodeToTensor[tensorNode],
-           let tensor = tensors[tensorId] {
+            let tensor = tensors[tensorId]
+        {
+
+            let originalTensorShape = tensor.shape
+            let tensorShape =
+                originalTensorShape.count == 1 ? [originalTensorShape[0], 1] : originalTensorShape
+
             // Concrete tensor: use eager implementation with direct memory access
             let one = n(.constant(1.0))
             let zero = n(.constant(0.0))
-            let channelSizeFloat = n(.constant(Float(tensor.shape[0])))
+            let channelSizeFloat = n(.constant(Float(tensorShape[0])))
 
             // Properly wrap the index within the channel using modulo for true wrapping
             let wrappedIndex = n(.mod, index, channelSizeFloat)
@@ -573,7 +582,7 @@ extension Graph {
                 .floor,
                 n(
                     .max, zero,
-                    n(.min, channel, n(.constant(Float(tensor.shape[1] - 1))))))
+                    n(.min, channel, n(.constant(Float(tensorShape[1] - 1))))))
 
             let channelOffset = n(.mul, channelSizeFloat, clampedChannel)
             let finalReadPos = n(.add, channelOffset, positiveIndex)

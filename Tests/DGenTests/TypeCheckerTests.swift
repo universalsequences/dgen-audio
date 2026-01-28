@@ -64,7 +64,8 @@ final class TypeCheckerTests: XCTestCase {
     func testAddTensorAndTensorSameShapeInfersTensor() throws {
         let g = Graph()
 
-        let shape = try inferShape(op: .add, inputs: [.tensor([2, 2]), .tensor([2, 2])], graph: g)
+        let shape = try inferShape(
+            op: .add, inputs: [.tensor([2, 2]), .tensor([2, 2])], graph: g)
         XCTAssertEqual(shape, .tensor([2, 2]))
     }
 
@@ -74,7 +75,7 @@ final class TypeCheckerTests: XCTestCase {
         XCTAssertThrowsError(
             try inferShape(op: .add, inputs: [.tensor([2, 3]), .tensor([3, 2])], graph: g)
         ) { error in
-            guard case DGenError.shapeMismatch(_, _, _) = error else {
+            guard case DGenError.shapeMismatch(op: _, shape1: _, shape2: _) = error else {
                 XCTFail("Expected shapeMismatch error, got \(error)")
                 return
             }
@@ -100,7 +101,7 @@ final class TypeCheckerTests: XCTestCase {
         let g = Graph()
 
         XCTAssertThrowsError(try inferShape(op: .conv2d([3, 3]), inputs: [], graph: g)) { error in
-            guard case DGenError.shapeInferenceFailed(let op, _) = error else {
+            guard case DGenError.shapeInferenceFailed(op: let op, reason: _) = error else {
                 XCTFail("Expected shapeInferenceFailed error, got \(error)")
                 return
             }
@@ -139,7 +140,7 @@ final class TypeCheckerTests: XCTestCase {
 
         XCTAssertThrowsError(try inferShape(op: .historyWrite(0), inputs: [], graph: g)) {
             error in
-            guard case DGenError.shapeInferenceFailed(let op, _) = error else {
+            guard case DGenError.shapeInferenceFailed(op: let op, reason: _) = error else {
                 XCTFail("Expected shapeInferenceFailed error, got \(error)")
                 return
             }
@@ -238,7 +239,8 @@ final class TypeCheckerTests: XCTestCase {
 
     func testDivInheritsShape() throws {
         let g = Graph()
-        let shape = try inferShape(op: .div, inputs: [.tensor([2, 2]), .tensor([2, 2])], graph: g)
+        let shape = try inferShape(
+            op: .div, inputs: [.tensor([2, 2]), .tensor([2, 2])], graph: g)
         XCTAssertEqual(shape, .tensor([2, 2]))
     }
 

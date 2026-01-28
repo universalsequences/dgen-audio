@@ -48,18 +48,21 @@ public class DylibCacheManager {
     ///   - days: Number of days after which a dylib is considered stale (default 30)
     public func pruneOldDylibs(in projectDirectory: URL, olderThanDays days: Int = 30) {
         let cacheDir = cacheDirectory(for: projectDirectory)
-        guard let contents = try? FileManager.default.contentsOfDirectory(
-            at: cacheDir,
-            includingPropertiesForKeys: [.contentAccessDateKey]
-        ) else { return }
+        guard
+            let contents = try? FileManager.default.contentsOfDirectory(
+                at: cacheDir,
+                includingPropertiesForKeys: [.contentAccessDateKey]
+            )
+        else { return }
 
         let cutoff = Date().addingTimeInterval(-Double(days * 24 * 60 * 60))
         var prunedCount = 0
 
         for file in contents where file.pathExtension == "dylib" {
             guard let attrs = try? file.resourceValues(forKeys: [.contentAccessDateKey]),
-                  let accessDate = attrs.contentAccessDate,
-                  accessDate < cutoff else { continue }
+                let accessDate = attrs.contentAccessDate,
+                accessDate < cutoff
+            else { continue }
 
             do {
                 try FileManager.default.removeItem(at: file)
@@ -77,10 +80,12 @@ public class DylibCacheManager {
     /// Clear all cached dylibs for a project
     public func clearCache(for projectDirectory: URL) {
         let cacheDir = cacheDirectory(for: projectDirectory)
-        guard let contents = try? FileManager.default.contentsOfDirectory(
-            at: cacheDir,
-            includingPropertiesForKeys: nil
-        ) else { return }
+        guard
+            let contents = try? FileManager.default.contentsOfDirectory(
+                at: cacheDir,
+                includingPropertiesForKeys: nil
+            )
+        else { return }
 
         var clearedCount = 0
         for file in contents where file.pathExtension == "dylib" {
@@ -88,7 +93,9 @@ public class DylibCacheManager {
                 try FileManager.default.removeItem(at: file)
                 clearedCount += 1
             } catch {
-                print("⚠️ Failed to clear cached dylib \(file.lastPathComponent): \(error.localizedDescription)")
+                print(
+                    "⚠️ Failed to clear cached dylib \(file.lastPathComponent): \(error.localizedDescription)"
+                )
             }
         }
 
@@ -199,12 +206,26 @@ public class CCompiledKernel: CompiledKernelRuntime {
         let errorPipe = Pipe()
         compile.standardError = errorPipe
 
+        // Read pipe data asynchronously to avoid deadlock
+        // (pipes have limited buffer; if clang fills it before we read, both block forever)
+        var errorData = Data()
+        let errorReadQueue = DispatchQueue(label: "clang.stderr")
+        errorPipe.fileHandleForReading.readabilityHandler = { handle in
+            let data = handle.availableData
+            if !data.isEmpty {
+                errorReadQueue.sync { errorData.append(data) }
+            }
+        }
+
         compile.arguments = arguments
         compile.launch()
         compile.waitUntilExit()
 
-        // Read any error output
-        let errorData = errorPipe.fileHandleForReading.readDataToEndOfFile()
+        // Clean up handler and read any remaining data
+        errorPipe.fileHandleForReading.readabilityHandler = nil
+        let remainingData = errorPipe.fileHandleForReading.readDataToEndOfFile()
+        errorReadQueue.sync { errorData.append(remainingData) }
+
         let errorOutput = String(data: errorData, encoding: .utf8) ?? ""
 
         if !errorOutput.isEmpty {
@@ -285,9 +306,9 @@ public class CCompiledKernel: CompiledKernelRuntime {
 
         // Check if we can reuse cached dylib
         if let existingHash = existingSourceHash,
-           let existingFile = existingDylibFileName,
-           existingHash == currentHash {
-
+            let existingFile = existingDylibFileName,
+            existingHash == currentHash
+        {
             let cachedPath = cacheDir.appendingPathComponent(existingFile)
 
             if FileManager.default.fileExists(atPath: cachedPath.path) {
@@ -360,6 +381,8 @@ public class CCompiledKernel: CompiledKernelRuntime {
         currentHash: String,
         cacheDir: URL
     ) throws -> DylibCacheResult {
+        let totalStart = CFAbsoluteTimeGetCurrent()
+
         // Use timestamp + salt for unique filename (critical for dlopen to load fresh code)
         let timestamp = String(Int(Date().timeIntervalSince1970 * 1000))
         let salt = Int.random(in: 0..<999999)
@@ -367,11 +390,15 @@ public class CCompiledKernel: CompiledKernelRuntime {
         let dylibFile = cacheDir.appendingPathComponent(dylibFileName)
 
         // Write source to temp file
+        let writeStart = CFAbsoluteTimeGetCurrent()
         let tmpDir = FileManager.default.temporaryDirectory
-        let cFile = tmpDir.appendingPathComponent("kernel_\(operatorUUID.uuidString)_\(timestamp)_\(salt).c")
+        let cFile = tmpDir.appendingPathComponent(
+            "kernel_\(operatorUUID.uuidString)_\(timestamp)_\(salt).c")
         try source.write(to: cFile, atomically: true, encoding: .utf8)
+        let writeMs = (CFAbsoluteTimeGetCurrent() - writeStart) * 1000
 
         // Compile with clang
+        let clangStart = CFAbsoluteTimeGetCurrent()
         let compile = Process()
         compile.launchPath = "/usr/bin/clang"
         let arguments = [
@@ -387,10 +414,27 @@ public class CCompiledKernel: CompiledKernelRuntime {
 
         let errorPipe = Pipe()
         compile.standardError = errorPipe
+
+        // Read pipe data asynchronously to avoid deadlock
+        // (pipes have limited buffer; if clang fills it before we read, both block forever)
+        var errorData = Data()
+        let errorReadQueue = DispatchQueue(label: "clang.stderr")
+        errorPipe.fileHandleForReading.readabilityHandler = { handle in
+            let data = handle.availableData
+            if !data.isEmpty {
+                errorReadQueue.sync { errorData.append(data) }
+            }
+        }
+
         compile.launch()
         compile.waitUntilExit()
+        let clangMs = (CFAbsoluteTimeGetCurrent() - clangStart) * 1000
 
-        let errorData = errorPipe.fileHandleForReading.readDataToEndOfFile()
+        // Clean up handler and read any remaining data
+        errorPipe.fileHandleForReading.readabilityHandler = nil
+        let remainingData = errorPipe.fileHandleForReading.readDataToEndOfFile()
+        errorReadQueue.sync { errorData.append(remainingData) }
+
         let errorOutput = String(data: errorData, encoding: .utf8) ?? ""
 
         guard compile.terminationStatus == 0 else {
@@ -402,8 +446,10 @@ public class CCompiledKernel: CompiledKernelRuntime {
         }
 
         // Load the newly compiled dylib
+        let dlopenStart = CFAbsoluteTimeGetCurrent()
         self.dylibHandle = dlopen(dylibFile.path, RTLD_NOW)
         self.dylibFileURL = dylibFile
+        let dlopenMs = (CFAbsoluteTimeGetCurrent() - dlopenStart) * 1000
 
         guard let handle = dylibHandle else {
             let error = String(cString: dlerror())
@@ -449,6 +495,9 @@ public class CCompiledKernel: CompiledKernelRuntime {
             print("⚠️ Failed to clean up temp C file: \(error.localizedDescription)")
         }
 
+        let totalMs = (CFAbsoluteTimeGetCurrent() - totalStart) * 1000
+        let sourceLines = source.components(separatedBy: "\n").count
+        print("⏱️ [C Compile] Total: \(String(format: "%.1f", totalMs))ms | clang: \(String(format: "%.1f", clangMs))ms | dlopen: \(String(format: "%.1f", dlopenMs))ms | write: \(String(format: "%.1f", writeMs))ms | lines: \(sourceLines)")
         print("✅ Compiled and cached new dylib: \(dylibFileName)")
 
         return DylibCacheResult(

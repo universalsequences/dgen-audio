@@ -117,6 +117,10 @@ public func findFeedbackLoops(_ g: Graph) -> [[NodeID]] {
             var allReadsInCluster = dependentReads
             var allWritesInCluster = Set([writeNode])
 
+            // OPTIMIZATION: Precompute which nodes can reach writeNode (done once)
+            let canReachWriteNode = reachBackward(from: [writeNode])
+            let allWriteNodes = Set(cellWrites.values)
+
             // Keep expanding until we find all connected reads and writes
             var changed = true
             while changed {
@@ -124,14 +128,11 @@ public func findFeedbackLoops(_ g: Graph) -> [[NodeID]] {
 
                 // From all reads in cluster, find what writes they can reach
                 let forwardFromReads = reachForward(from: allReadsInCluster)
-                // NOTE ->>> when i change this to forwardFromReads.intersection(Set(cellWrites.values)) biquad works correctly
-                // However in that case, it its too aggressive with how
-                let newWrites = forwardFromReads.intersection(Set(cellWrites.values))
+                let newWrites = forwardFromReads.intersection(allWriteNodes)
 
-                //let newWrites = forwardFromReads.intersection(Set([cellWrites[cellId]!]))
+                // OPTIMIZATION: Instead of reachForward per write, just check precomputed set
                 for newWrite in newWrites {
-                    let forwards = reachForward(from: [newWrite])
-                    if forwards.contains(writeNode) {
+                    if canReachWriteNode.contains(newWrite) {
                         if allWritesInCluster.insert(newWrite).inserted {
                             changed = true
                         }
@@ -172,16 +173,16 @@ public func findFeedbackLoops(_ g: Graph) -> [[NodeID]] {
             }
 
             // For each read in the cluster, find all nodes that can reach any write in the cluster
-            for read in allReadsInCluster {
-                let fromRead = reachForward(from: [read])
-                // Only include nodes that can reach at least one write in the cluster
-                for node in fromRead {
-                    let fromNode = reachForward(from: [node])
-                    if !fromNode.isDisjoint(with: allWritesInCluster) {
-                        clusterNodes.insert(node)
-                    }
-                }
-            }
+            // OPTIMIZATION: Instead of checking reachability per-node (O(N²)), compute:
+            // 1. All nodes reachable forward from reads (done once)
+            // 2. All nodes that can reach writes backward (done once)
+            // 3. Intersection gives nodes on paths from reads to writes
+            let forwardFromReadsAll = reachForward(from: allReadsInCluster)
+            let backwardToWrites = reachBackward(from: allWritesInCluster)
+
+            // Nodes on feedback paths = reachable from reads AND can reach writes
+            let nodesOnFeedbackPaths = forwardFromReadsAll.intersection(backwardToWrites)
+            clusterNodes.formUnion(nodesOnFeedbackPaths)
 
             clusters.append(clusterNodes)
         }
@@ -345,13 +346,11 @@ public func scalarNodes(_ g: Graph, feedbackClusters: [[NodeID]]) -> Set<NodeID>
                 frameBasedTensorNodes.insert(nodeId)
                 // Also add to tensorNodes since it produces a tensor
                 tensorNodes.insert(nodeId)
-                print("[FRAME-TENSOR] Found frame-based tensor producer: \(nodeId) (\(node.op))")
             }
         default:
             break
         }
     }
-    print("[FRAME-TENSOR] Initial frameBasedTensorNodes: \(frameBasedTensorNodes)")
 
     // Propagate frame-based tensor status to downstream tensor consumers.
     // Any tensor op that consumes a frame-based tensor must also be scalar,
@@ -370,7 +369,6 @@ public func scalarNodes(_ g: Graph, feedbackClusters: [[NodeID]]) -> Set<NodeID>
             for inputId in node.inputs {
                 if frameBasedTensorNodes.contains(inputId) {
                     // This node consumes a frame-based tensor
-                    print("[FRAME-TENSOR] iter \(iteration): node \(nodeId) (\(node.op)) consumes frame-based \(inputId), tensorNodes.contains=\(tensorNodes.contains(nodeId))")
                     // Mark as scalar (must run per-frame)
                     if !scalar.contains(nodeId) {
                         scalar.insert(nodeId)
@@ -387,7 +385,6 @@ public func scalarNodes(_ g: Graph, feedbackClusters: [[NodeID]]) -> Set<NodeID>
             }
         }
     }
-    print("[FRAME-TENSOR] Final frameBasedTensorNodes: \(frameBasedTensorNodes)")
 
     // Use the new feedback loop detection to mark all nodes in feedback loops as scalar
     for loop in feedbackClusters {
@@ -731,10 +728,10 @@ public func fuseBlocks(_ blocks: [Block], _ g: Graph) -> [Block] {
         for nodeId in b.nodes {
             if let node = g.nodes[nodeId] {
                 switch node.op {
-                case let .spectralLossPass1(_, scratchCell):
+                case .spectralLossPass1(_, let scratchCell):
                     hasPass1 = true
                     p1Cells.insert(scratchCell)
-                case let .spectralLossPass2(_, scratchCell):
+                case .spectralLossPass2(_, let scratchCell):
                     hasPass2 = true
                     p2Cells.insert(scratchCell)
                 default:

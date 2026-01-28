@@ -67,9 +67,9 @@ public func lowerUOpBlocks(
 
 func extractVarId(_ lazy: Lazy) -> VarID {
     switch lazy {
-    case let .variable(varid, _):
+    case .variable(let varid, _):
         return varid
-    case let .global(varid):
+    case .global(let varid):
         return varid
     default:
         fatalError("var id missing")
@@ -142,7 +142,7 @@ public class CRenderer: Renderer {
 
             for uop in scheduleItem.ops {
                 switch uop.op {
-                case let .defineGlobal(varId):
+                case .defineGlobal(let varId):
                     buffers.append("t\(varId)")
                 case .defineMemory:
                     buffers.append("memory")
@@ -370,29 +370,29 @@ public class CRenderer: Renderer {
         let g = { self.emitLazy($0, ctx: ctx, kind: uop.kind, isOut: false) }
 
         switch uop.op {
-        case let .defineConstant(constantId, val):
+        case .defineConstant(let constantId, let val):
             return "float32x4_t c\(constantId) = vdupq_n_f32(\(val)f);"
-        case let .defineGlobal(varId):
+        case .defineGlobal(let varId):
             return "/* t\(varId) declared globally */"
-        case let .defineMemory(length):
+        case .defineMemory(let length):
             return "float memory[\(length)] __attribute__((aligned(16)));"
 
-        case let .add(a, b):
+        case .add(let a, let b):
             let expr = uop.kind == .simd ? "vaddq_f32(\(g(a)), \(g(b)))" : "\(g(a)) + \(g(b))"
             return emitAssign(uop, expr, ctx)
 
-        case let .mul(a, b):
+        case .mul(let a, let b):
             let expr = uop.kind == .simd ? "vmulq_f32(\(g(a)), \(g(b)))" : "\(g(a)) * \(g(b))"
             return emitAssign(uop, expr, ctx)
 
-        case let .sub(a, b):
+        case .sub(let a, let b):
             let expr = uop.kind == .simd ? "vsubq_f32(\(g(a)), \(g(b)))" : "\(g(a)) - \(g(b))"
             return emitAssign(uop, expr, ctx)
 
-        case let .div(a, b):
+        case .div(let a, let b):
             // Strength-reduce division by constant to multiply by reciprocal
             switch b {
-            case let .constant(_, val):
+            case .constant(_, let val):
                 if uop.kind == .simd {
                     let expr = "vmulq_f32(\(g(a)), vdupq_n_f32(\(1.0/val)f))"
                     return emitAssign(uop, expr, ctx)
@@ -405,10 +405,10 @@ public class CRenderer: Renderer {
                 return emitAssign(uop, expr, ctx)
             }
 
-        case let .mod(a, b):
+        case .mod(let a, let b):
             // Fast modulo for constant denominator: a - floor(a / b) * b
             switch b {
-            case let .constant(_, val):
+            case .constant(_, let val):
                 if uop.kind == .simd {
                     if val == 1.0 {
                         let expr = "vsubq_f32(\(g(a)), vrndmq_f32(\(g(a))))"
@@ -433,10 +433,10 @@ public class CRenderer: Renderer {
                 return emitAssign(uop, expr, ctx)
             }
 
-        case let .pow(a, b):
+        case .pow(let a, let b):
             // Specialize common exponents to avoid expensive powf
             switch b {
-            case let .constant(_, val):
+            case .constant(_, let val):
                 if val == 1.0 {
                     return emitAssign(uop, uop.kind == .simd ? "\(g(a))" : "\(g(a))", ctx)
                 } else if val == 2.0 {
@@ -472,7 +472,7 @@ public class CRenderer: Renderer {
                 return emitAssign(uop, expr, ctx)
             default:
                 // If base is constant, emit exp(b * log(base)) which is faster than generic pow
-                if case let .constant(_, baseVal) = a {
+                if case .constant(_, let baseVal) = a {
                     if uop.kind == .simd {
                         let expr = "vexpf(vmulq_f32(\(g(b)), vdupq_n_f32(logf(\(baseVal)f))))"
                         return emitAssign(uop, expr, ctx)
@@ -485,19 +485,19 @@ public class CRenderer: Renderer {
                 return emitAssign(uop, expr, ctx)
             }
 
-        case let .min(a, b):
+        case .min(let a, let b):
             let expr = uop.kind == .simd ? "vminq_f32(\(g(a)), \(g(b)))" : "fminf(\(g(a)), \(g(b)))"
             return emitAssign(uop, expr, ctx)
 
-        case let .max(a, b):
+        case .max(let a, let b):
             let expr = uop.kind == .simd ? "vmaxq_f32(\(g(a)), \(g(b)))" : "fmaxf(\(g(a)), \(g(b)))"
             return emitAssign(uop, expr, ctx)
 
-        case let .abs(a):
+        case .abs(let a):
             let expr = uop.kind == .simd ? "vabsq_f32(\(g(a)))" : "fabs(\(g(a)))"
             return emitAssign(uop, expr, ctx)
 
-        case let .sign(a):
+        case .sign(let a):
             if uop.kind == .simd {
                 // For SIMD: return -1.0 for negative, 1.0 for positive, 0.0 for zero
                 let expr =
@@ -508,22 +508,22 @@ public class CRenderer: Renderer {
                 return emitAssign(uop, "(\(g(a)) == 0.0f) ? 0.0f : copysignf(1.0f, \(g(a)))", ctx)
             }
 
-        case let .floor(a):
+        case .floor(let a):
             let expr = uop.kind == .simd ? "vrndmq_f32(\(g(a)))" : "floorf(\(g(a)))"
             return emitAssign(uop, expr, ctx)
 
-        case let .ceil(a):
+        case .ceil(let a):
             let expr = uop.kind == .simd ? "vrndpq_f32(\(g(a)))" : "ceilf(\(g(a)))"
             return emitAssign(uop, expr, ctx)
 
-        case let .round(a):
+        case .round(let a):
             let expr =
                 uop.kind == .simd
                 ? "vrndaq_f32(\(g(a)))"
                 : "roundf(\(g(a)))"
             return emitAssign(uop, expr, ctx)
 
-        case let .noise(cellId):
+        case .noise(let cellId):
             // Xorshift32 PRNG - better spectral properties than LCG
             if uop.kind == .simd {
                 // For SIMD, generate 4 random values using 4 sequential xorshift updates
@@ -557,7 +557,7 @@ public class CRenderer: Renderer {
                 return emitAssign(uop, expr, ctx)
             }
 
-        case let .memoryRead(base, offset):
+        case .memoryRead(let base, let offset):
             if uop.kind == .simd {
                 let offsetExpr = g(offset)
                 // Check offset type to determine how to handle it
@@ -585,10 +585,14 @@ public class CRenderer: Renderer {
                     return emitAssign(uop, gatherExpr, ctx)
                 }
             } else {
-                return emitAssign(uop, "memory[\(base) + (int)\(g(offset))]", ctx)
+                let safeOffset = "(isfinite((int) \(g(offset))) ? (int) \(g(offset)) : 0)"
+                return emitAssign(
+                    uop,
+                    "memory[\(base) + \(safeOffset)]",
+                    ctx)
             }
 
-        case let .memoryWrite(base, offset, value):
+        case .memoryWrite(let base, let offset, let value):
             if uop.kind == .simd {
                 let offsetExpr = g(offset)
                 let valueExpr = g(value)
@@ -616,94 +620,94 @@ public class CRenderer: Renderer {
             } else {
                 return "memory[\(base) + (int)\(g(offset))] = \(g(value));"
             }
-        case let .sin(a):
+        case .sin(let a):
             let expr = uop.kind == .simd ? "vsinf(\(g(a)))" : "sinf(\(g(a)))"
             return emitAssign(uop, expr, ctx)
 
-        case let .cos(a):
+        case .cos(let a):
             let expr = uop.kind == .simd ? "vcosf(\(g(a)))" : "cosf(\(g(a)))"
             return emitAssign(uop, expr, ctx)
 
-        case let .tan(a):
+        case .tan(let a):
             let expr = uop.kind == .simd ? "vtanf(\(g(a)))" : "tanf(\(g(a)))"
             return emitAssign(uop, expr, ctx)
 
-        case let .tanh(a):
+        case .tanh(let a):
             let expr = uop.kind == .simd ? "vtanhf(\(g(a)))" : "tanhf(\(g(a)))"
             return emitAssign(uop, expr, ctx)
 
-        case let .exp(a):
+        case .exp(let a):
             let expr = uop.kind == .simd ? "vexpf(\(g(a)))" : "expf(\(g(a)))"
             return emitAssign(uop, expr, ctx)
 
-        case let .log(a):
+        case .log(let a):
             let expr = uop.kind == .simd ? "vlogf(\(g(a)))" : "logf(\(g(a)))"
             return emitAssign(uop, expr, ctx)
 
-        case let .log10(a):
+        case .log10(let a):
             let expr =
                 uop.kind == .simd
                 ? "vmulq_f32(vlogf(\(g(a))), vdupq_n_f32((float)M_LOG10E))"  // log10(x) = ln(x) * log10(e)
                 : "log10f(\(g(a)))"
             return emitAssign(uop, expr, ctx)
 
-        case let .sqrt(a):
+        case .sqrt(let a):
             let expr = uop.kind == .simd ? "vsqrtf(\(g(a)))" : "sqrtf(\(g(a)))"
             return emitAssign(uop, expr, ctx)
 
-        case let .and(a, b):
+        case .and(let a, let b):
             let expr =
                 uop.kind == .simd
                 ? "simd_and_f32(\(g(a)), \(g(b)))"
                 : "(((\(g(a)) != 0.0f) && (\(g(b)) != 0.0f)) ? 1.0f : 0.0f)"
             return emitAssign(uop, expr, ctx)
 
-        case let .or(a, b):
+        case .or(let a, let b):
             let expr =
                 uop.kind == .simd
                 ? "simd_or_f32(\(g(a)), \(g(b)))"
                 : "(((\(g(a)) != 0.0f) || (\(g(b)) != 0.0f)) ? 1.0f : 0.0f)"
             return emitAssign(uop, expr, ctx)
 
-        case let .xor(a, b):
+        case .xor(let a, let b):
             // XOR: true iff exactly one is non-zero
             let expr =
                 uop.kind == .simd
                 ? "simd_xor_f32(\(g(a)), \(g(b)))"
                 : "((((\(g(a)) != 0.0f) ^ ((\(g(b)) != 0.0f))) ? 1.0f : 0.0f))"
             return emitAssign(uop, expr, ctx)
-        case let .atan2(y, x):
+        case .atan2(let y, let x):
             let expr = uop.kind == .simd ? "vatan2f(\(g(y)), \(g(x)))" : "atan2f(\(g(y)), \(g(x)))"
             return emitAssign(uop, expr, ctx)
 
-        case let .gt(a, b):
+        case .gt(let a, let b):
             let expr =
                 uop.kind == .simd
                 ? "vbslq_f32(vcgtq_f32(\(g(a)), \(g(b))), vdupq_n_f32(1.0f), vdupq_n_f32(0.0f))"
                 : "\(g(a)) > \(g(b))"
             return emitAssign(uop, expr, ctx)
-        case let .gte(a, b):
+        case .gte(let a, let b):
             let expr =
                 uop.kind == .simd
                 ? "vbslq_f32(vcgeq_f32(\(g(a)), \(g(b))), vdupq_n_f32(1.0f), vdupq_n_f32(0.0f))"
                 : "\(g(a)) >= \(g(b))"
             return emitAssign(uop, expr, ctx)
-        case let .lte(a, b):
+        case .lte(let a, let b):
             let expr =
                 uop.kind == .simd
                 ? "vbslq_f32(vcleq_f32(\(g(a)), \(g(b))), vdupq_n_f32(1.0f), vdupq_n_f32(0.0f))"
                 : "\(g(a)) <= \(g(b))"
             return emitAssign(uop, expr, ctx)
-        case let .lt(a, b):
+        case .lt(let a, let b):
             let expr =
                 uop.kind == .simd
                 ? "vbslq_f32(vcltq_f32(\(g(a)), \(g(b))), vdupq_n_f32(1.0f), vdupq_n_f32(0.0f))"
                 : "\(g(a)) < \(g(b))"
             return emitAssign(uop, expr, ctx)
-        case let .eq(a, b):
+        case .eq(let a, let b):
             // Constant-fold equality when both operands are constants
             switch (a, b) {
-            case let (.constant(_, av), .constant(_, bv)):
+            case (.constant(_, let av), .constant(_, let bv)):
                 if uop.kind == .simd {
                     let expr = (av == bv) ? "vdupq_n_f32(1.0f)" : "vdupq_n_f32(0.0f)"
                     return emitAssign(uop, expr, ctx)
@@ -718,7 +722,7 @@ public class CRenderer: Renderer {
                 return emitAssign(uop, expr, ctx)
             }
 
-        case let .gswitch(cond, a, b):
+        case .gswitch(let cond, let a, let b):
             if uop.kind == .simd {
                 // For SIMD: use vbslq_f32 to select between a and b based on condition > 0
                 let mask = "vcgtq_f32(\(g(cond)), vdupq_n_f32(0.0f))"
@@ -728,7 +732,7 @@ public class CRenderer: Renderer {
                 let expr = "\(g(cond)) > 0.0f ? \(g(a)) : \(g(b))"
                 return emitAssign(uop, expr, ctx)
             }
-        case let .delay1(cell, curr):
+        case .delay1(let cell, let curr):
             if uop.kind == .simd {
                 // Return delayed value, and also persist current vector into memory for next chunk
                 let expr = "vextq_f32(vld1q_f32(&memory[\(cell)]), \(g(curr)), 3)"
@@ -739,7 +743,7 @@ public class CRenderer: Renderer {
                 let assign = emitAssign(uop, "memory[\(cell)]", ctx)
                 return "\(assign) memory[\(cell)] = \(g(curr));"
             }
-        case let .concatShift(a, b, shift):
+        case .concatShift(let a, let b, let shift):
             if uop.kind == .simd {
                 // this op is only relevant in vectorized block
                 let expr = "vextq_f32(\(g(a)), \(g(b)), \(shift))"
@@ -749,7 +753,7 @@ public class CRenderer: Renderer {
                 let expr = "\(g(a))"
                 return emitAssign(uop, expr, ctx)
             }
-        case let .selector(mode, options):
+        case .selector(let mode, let options):
             if uop.kind == .simd {
                 // For SIMD: if mode <= 0 return 0, if mode <= 1 return options[0], etc.
                 var expr = "vdupq_n_f32(0.0f)"  // Default to 0 if mode <= 0
@@ -777,21 +781,21 @@ public class CRenderer: Renderer {
                 return emitAssign(uop, expr, ctx)
             }
 
-        case let .store(cell, val):
+        case .store(let cell, let val):
             if uop.kind == .simd {
                 // For SIMD: store all 4 vector elements to consecutive memory slots
                 return "vst1q_f32(&memory[\(cell)], \(g(val)));"
             } else {
                 return "memory[\(cell)] = \(g(val));"
             }
-        case let .load(cell):
+        case .load(let cell):
             if uop.kind == .simd {
                 // For SIMD: load 4 consecutive memory slots into vector
                 return emitAssign(uop, "vld1q_f32(&memory[\(cell)])", ctx)
             } else {
                 return emitAssign(uop, "memory[\(cell)]", ctx)
             }
-        case let .loadTape(val, offset):
+        case .loadTape(let val, let offset):
             // loadTape reads from global tape buffer with bounds checking
             // In C, this is handled at compile-time (no runtime bounds check for now)
             let varId = g(val)  // The signal/variable to load from
@@ -801,13 +805,13 @@ public class CRenderer: Renderer {
             } else {
                 return emitAssign(uop, "tape[\(varId)][\(g(offset))]", ctx)
             }
-        case let .beginIf(cond): return "if (\(g(cond))) {"
+        case .beginIf(let cond): return "if (\(g(cond))) {"
         case .endIf: return "}"
 
-        case let .mutate(a, b):
+        case .mutate(let a, let b):
             return "\(emitLazy(a, ctx: ctx, kind: uop.kind, isOut: true)) = \(g(b));"
 
-        case let .input(channel):
+        case .input(let channel):
             if uop.kind == .simd {
                 // For SIMD: load 4 consecutive memory slots into vector
                 let ptr = "in[\(channel)] + i"
@@ -816,7 +820,7 @@ public class CRenderer: Renderer {
                 let addr = "in[\(channel)][i]"
                 return emitAssign(uop, "\(addr)", ctx)
             }
-        case let .output(channel, val):
+        case .output(let channel, let val):
             if uop.kind == .simd {
                 // For audiograph compatibility: use out[channel] directly
                 let ptr = "out[\(channel)] + i"
@@ -827,8 +831,9 @@ public class CRenderer: Renderer {
                 return "\(addr) = \(g(val));"
             }
 
-        case let .beginLoop(iters, step): return "for (int i = 0; i < \(g(iters)); i += \(step)) {"
-        case let .beginForLoop(loopVar, count):
+        case .beginLoop(let iters, let step):
+            return "for (int i = 0; i < \(g(iters)); i += \(step)) {"
+        case .beginForLoop(let loopVar, let count):
             guard case .variable(let varId, _) = loopVar else {
                 fatalError("beginForLoop requires variable")
             }
@@ -846,18 +851,18 @@ public class CRenderer: Renderer {
             // In C, threadIndex maps to the loop variable 'i'
             return emitAssign(uop, "i", ctx)
 
-        case let .cast(expr, castType):
+        case .cast(let expr, let castType):
             let typeStr = castType == .int ? "int" : "float"
             return emitAssign(
                 uop, "(\(typeStr))\(g(expr))", ctx,
                 forceFloatType: true)
-        case let .declareVar(value):
+        case .declareVar(let value):
             // Declares and initializes a variable: float t = value;
             return emitAssign(uop, g(value), ctx)
 
         case .frameCount: return "/* frameCount available as function parameter */"
 
-        case let .loadGlobal(id):
+        case .loadGlobal(let id):
             if loadedGlobal[id] != nil {
                 return "/* skip load */"
             }
@@ -876,7 +881,7 @@ public class CRenderer: Renderer {
 
         // Parallel range - for C, render as a simple for loop
         // For static tensor ops, this could be outside frame loop (future optimization)
-        case let .beginParallelRange(count, incr):
+        case .beginParallelRange(let count, let incr):
             let pre = incr == 4 ? "simd" : "t"
             guard case .variable(let varId, _) = uop.value else {
                 fatalError("beginParallelRange requires variable")
@@ -902,9 +907,9 @@ public class CRenderer: Renderer {
 
     func emitLazy(_ lazy: Lazy, ctx: IRContext, kind: Kind?, isOut: Bool) -> String {
         switch lazy {
-        case let .constant(constantId, val):
+        case .constant(let constantId, let val):
             return kind == .simd ? "c\(constantId)" : "\(val)"
-        case let .variable(id, _):
+        case .variable(let id, _):
             if id == -1 {  // Special case for frameCount
                 return "frameCount"
             } else if ctx.globals.contains(id) {
@@ -920,7 +925,7 @@ public class CRenderer: Renderer {
                     return "t\(id)"
                 }
             }
-        case let .global(id):
+        case .global(let id):
             // Global variables are always accessed through global buffers
             if kind == .simd {
                 return isOut ? "t\(id) + i" : "simd\(id)"

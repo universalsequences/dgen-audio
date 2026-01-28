@@ -210,10 +210,10 @@ extension Graph {
     let alphaShelf = n(.div, sinW0, n(.mul, n(.constant(2.0)), abs17))
 
     // Common shelf terms
-    let Ap1 = n(.add, A, n(.constant(1)))           // A + 1
-    let Am1 = n(.sub, A, n(.constant(1)))           // A - 1
-    let Ap1_cosW0 = n(.mul, Ap1, cosW0Pos)          // (A+1)*cos(w0)
-    let Am1_cosW0 = n(.mul, Am1, cosW0Pos)          // (A-1)*cos(w0)
+    let Ap1 = n(.add, A, n(.constant(1)))  // A + 1
+    let Am1 = n(.sub, A, n(.constant(1)))  // A - 1
+    let Ap1_cosW0 = n(.mul, Ap1, cosW0Pos)  // (A+1)*cos(w0)
+    let Am1_cosW0 = n(.mul, Am1, cosW0Pos)  // (A-1)*cos(w0)
     let twoSqrtA_alpha = n(.mul, n(.mul, n(.constant(2.0)), n(.sqrt, A)), alphaShelf)  // 2*sqrt(A)*alpha
 
     // High shelf (mode 6):
@@ -254,7 +254,8 @@ extension Graph {
     let ls_a1_norm = n(.div, n(.mul, n(.constant(-2.0)), n(.add, Am1, Ap1_cosW0)), ls_a0)
     let ls_a2_norm = n(.div, n(.sub, n(.add, Ap1, Am1_cosW0), twoSqrtA_alpha), ls_a0)
 
-    let selector23 = selector(add4, div11, div13, mult19, mult21, n(.constant(1)), add22, hs_b2_norm, ls_b2_norm)
+    let selector23 = selector(
+      add4, div11, div13, mult19, mult21, n(.constant(1)), add22, hs_b2_norm, ls_b2_norm)
     let reciprical24 = n(.div, n(.constant(1)), add22)
     let mult26 = n(.mul, reciprical24, param25)
     // For modes 0-5, apply gain scaling; for modes 6-7, coefficients already include gain via A
@@ -270,7 +271,8 @@ extension Graph {
     let b1 = n(.gswitch, isShelfMode, selector32, b1_scaled)
     let mult34 = n(.mul, history2Read, b1)
     let not_sub35 = n(.sub, n(.constant(1)), div18)
-    let selector36 = selector(add4, div11, div13, div18, mult20, n(.constant(1)), not_sub35, hs_b0_norm, ls_b0_norm)
+    let selector36 = selector(
+      add4, div11, div13, div18, mult20, n(.constant(1)), not_sub35, hs_b0_norm, ls_b0_norm)
     let b0_scaled = n(.mul, selector36, mult26)
     let b0 = n(.gswitch, isShelfMode, selector36, b0_scaled)
     let mult38 = n(.mul, in1, b0)
@@ -283,15 +285,17 @@ extension Graph {
     // For modes 6-7: use shelf-specific a1, a2
     let history040 = history0Read
     let a2_orig = n(.mul, not_sub35, reciprical24)  // Original a2/a0
-    let a1_orig = n(.mul, mult31, reciprical24)     // Original a1/a0
+    let a1_orig = n(.mul, mult31, reciprical24)  // Original a1/a0
 
     // Select appropriate feedback coefficients based on mode
-    let a2 = n(.gswitch, isShelfMode,
-               n(.gswitch, n(.gte, param3, n(.constant(7))), ls_a2_norm, hs_a2_norm),
-               a2_orig)
-    let a1 = n(.gswitch, isShelfMode,
-               n(.gswitch, n(.gte, param3, n(.constant(7))), ls_a1_norm, hs_a1_norm),
-               a1_orig)
+    let a2 = n(
+      .gswitch, isShelfMode,
+      n(.gswitch, n(.gte, param3, n(.constant(7))), ls_a2_norm, hs_a2_norm),
+      a2_orig)
+    let a1 = n(
+      .gswitch, isShelfMode,
+      n(.gswitch, n(.gte, param3, n(.constant(7))), ls_a1_norm, hs_a1_norm),
+      a1_orig)
 
     let mult42 = n(.mul, history040, a2)
     let mult44 = n(.mul, history1Read, a1)
@@ -398,7 +402,7 @@ extension Graph {
   /// Implements a circular buffer with linear interpolation for fractional delay times
   public func delay(_ input: NodeID, _ delayTimeInSamples: NodeID) -> NodeID {
     let MAX_DELAY = 88000
-    let bufferBase = alloc(vectorWidth: MAX_DELAY)  // Allocate proper buffer space
+    let bufferBase = alloc(vectorWidth: MAX_DELAY)
     let writePosCellId = alloc()
 
     // Constants
@@ -406,48 +410,43 @@ extension Graph {
     let zero = n(.constant(0.0))
     let maxDelay = n(.constant(Float(MAX_DELAY)))
 
-    // Accumulator for write position (0 to MAX_DELAY-1, wraps around)
+    // Write head: wraps to [0, MAX_DELAY)
+    // (your original accum+floor style is fine as long as it stays bounded)
     let writePos = n(.floor, n(.accum(writePosCellId), one, zero, zero, maxDelay))
 
-    // Calculate delay read position: writePos - delayTimeInSamples
-    let readPos = n(.sub, writePos, delayTimeInSamples)
-
-    // Wrap-around logic matching TypeScript implementation:
-    // if (readPos < 0) readPos += MAX_DELAY
-    let isNegative = n(.lt, readPos, zero)
-    let afterNegWrap = n(
-      .gswitch, isNegative,
-      n(.add, readPos, maxDelay),
-      readPos)
-
-    // if (readPos >= MAX_DELAY) readPos -= MAX_DELAY
-    let isTooLarge = n(.gte, afterNegWrap, maxDelay)
-    let finalReadPos = n(
-      .gswitch, isTooLarge,
-      n(.sub, afterNegWrap, maxDelay),
-      afterNegWrap)
-
-    // Use seq to ensure write happens before reads
+    // Write first (important for feedback)
     let writeOp = n(.memoryWrite(bufferBase), writePos, input)
 
-    // Read with linear interpolation
-    let flooredPos = n(.floor, finalReadPos)
-    let frac = n(.sub, finalReadPos, flooredPos)
+    // ---- Robust wrap helper (mod) in-node form ----
+    // wrap(x, L) = x - floor(x / L) * L  -> [0, L) for any finite x
+    func wrap0ToL(_ x: NodeID, _ L: NodeID) -> NodeID {
+      let q = n(.div, x, L)
+      let qFloor = n(.floor, q)
+      return n(.sub, x, n(.mul, qFloor, L))
+    }
 
-    // Read two samples for interpolation
-    let sample1 = n(.memoryRead(bufferBase), flooredPos)
-    let nextPos = n(.add, flooredPos, one)
+    // Read position in samples (float)
+    let rawReadPos = n(.sub, writePos, delayTimeInSamples)
 
-    // Wrap nextPos if needed (handle nextPos >= MAX_DELAY)
-    let nextPosWrapped = n(.gswitch, n(.gte, nextPos, maxDelay), zero, nextPos)
+    // True modulo wrap (robust vs huge modulation)
+    let readPos = wrap0ToL(rawReadPos, maxDelay)
 
-    let sample2 = n(.memoryRead(bufferBase), nextPosWrapped)
+    // Linear interpolation
+    let i0 = n(.floor, readPos)
+    let frac = n(.sub, readPos, i0)
 
-    // Linear interpolation: (1-frac)*sample1 + frac*sample2
-    let interpolated = n(.mix, sample1, sample2, frac)
+    // i1 = (i0 + 1) wrapped
+    let i1raw = n(.add, i0, one)
+    let i1 = wrap0ToL(i1raw, maxDelay)
 
-    // Use seq to ensure write happens before interpolation
-    return n(.seq, writeOp, interpolated)
+    let s0 = n(.memoryRead(bufferBase), i0)
+    let s1 = n(.memoryRead(bufferBase), i1)
+
+    // (1-frac)*s0 + frac*s1
+    let out = n(.mix, s0, s1, frac)
+
+    // Ensure ordering: write then read path
+    return n(.seq, writeOp, out)
   }
 
 }
