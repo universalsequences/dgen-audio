@@ -1,4 +1,31 @@
 extension Graph {
+  /// Smart phasor that chooses between deterministic (parallelizable) and stateful versions.
+  /// If freq is constant and reset is constant 0, uses deterministicPhasor for parallel execution.
+  /// Otherwise uses the stateful phasor with memory cell.
+  public func phasor(freq: NodeID, reset: NodeID) -> NodeID {
+    // Check if we can use the deterministic (parallelizable) version
+    guard let freqNode = nodes[freq] else {
+      let cellId = alloc()
+      return n(.phasor(cellId), freq, reset)
+    }
+    guard let resetNode = nodes[reset] else {
+      let cellId = alloc()
+      return n(.phasor(cellId), freq, reset)
+    }
+
+    // If freq is constant and reset is constant 0, use deterministic phasor
+    if case .constant(_) = freqNode.op,
+       case .constant(let resetVal) = resetNode.op,
+       resetVal == 0.0 {
+      // Use deterministic phasor - no memory needed, fully parallelizable
+      return n(.deterministicPhasor, freq)
+    }
+
+    // Otherwise use stateful phasor
+    let cellId = alloc()
+    return n(.phasor(cellId), freq, reset)
+  }
+
   /// Spectral loss: compute DFT-based magnitude MSE between two signals over a window
   /// Uses tape-based compute; no ring buffers are required.
   public func spectralLoss(_ sig1: NodeID, _ sig2: NodeID, windowSize: Int) -> NodeID {

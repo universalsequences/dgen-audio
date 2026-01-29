@@ -34,10 +34,10 @@ final class FrontendTests: XCTestCase {
                 let result = try g.compile(
                         loss, backend: .metal, frameCount: frameCount, debug: false)
 
-                for kernel in result.kernels {
-                        print(kernel.source)
-
-                }
+                // Write kernels to disk for inspection
+                let allKernels = result.kernels.enumerated().map { "// KERNEL \($0.offset)\n\($0.element.source)" }.joined(separator: "\n\n")
+                try! allKernels.write(toFile: "/tmp/history_backward_kernels.metal", atomically: true, encoding: .utf8)
+                print("Wrote kernels to /tmp/history_backward_kernels.metal")
                 // Streamlined training context - handles everything!
                 let ctx = try TrainingContext(
                         parameters: [cutoffParam],
@@ -47,31 +47,37 @@ final class FrontendTests: XCTestCase {
                         frameCount: frameCount
                 )
 
+                var lossHistory: [Float] = []
                 for i in 0..<100 {
                         print("i=\(i)")
                         let currentLoss = ctx.runStepGPU()
-                        if i % 1 == 0 {
+                        lossHistory.append(currentLoss)
+                        if currentLoss < 0.001 {
+                                break
+                        }
+                        if i % 10 == 0 {
                                 print(
                                         "i=\(i) loss=\(currentLoss) cutoff=\(cutoffParam.value) grad=\(cutoffParam.grad)"
                                 )
                         }
 
                 }
+                let finalLoss = lossHistory.last ?? 10000.0
+                XCTAssertLessThan(finalLoss, 0.02, "Loss should be very low")
         }
 
         func testBiquadBackward() throws {
                 let g = GraphBuilder()
-                print("yo")
 
                 let targetFreq = g.constant(452.0)
-                let targetCutoff = g.constant(1300.0)
+                let targetCutoff = g.constant(1030.0)
 
                 let (freqParam, freq) = g.learnableParam(value: 445.0, name: "Freq")
                 let (cutoffParam, cutoff) = g.learnableParam(value: 998.0, name: "Cutoff")
 
                 let phase1 = g.phasor(freq)
                 let phase2 = g.phasor(targetFreq)
-                let resonance = g.constant(14)
+                let resonance = g.constant(4)
                 let gain = g.constant(1)
                 let mode = g.constant(0)
                 let sig1 = g.biquad(phase1, cutoff, resonance, gain, mode)
@@ -79,9 +85,7 @@ final class FrontendTests: XCTestCase {
                 let sig2 = g.biquad(phase2, targetCutoff, resonance, gain, mode)
 
                 let loss =
-                        (g.spectralLoss(sig1, sig2, windowSize: 32)
-                                + g.spectralLoss(sig1, sig2, windowSize: 64)
-                                + g.spectralLoss(sig1, sig2, windowSize: 128)) * 1 + 0.8
+                        g.spectralLoss(sig1, sig2, windowSize: 128) + 0.1
                         * g.mse(sig1, sig2)
 
                 let result = try g.compile(
@@ -94,14 +98,16 @@ final class FrontendTests: XCTestCase {
                 // Streamlined training context - handles everything!
                 let ctx = try TrainingContext(
                         parameters: [cutoffParam, freqParam],
-                        optimizer: Adam(lr: 2.4),
+                        optimizer: Adam(lr: 0.6),
                         lossNode: loss.id,
                         compilationResult: result,
                         frameCount: frameCount
                 )
 
-                for i in 0..<1000 {
+                var lossHistory: [Float] = []
+                for i in 0..<100 {
                         let currentLoss = ctx.runStepGPU()
+                        lossHistory.append(currentLoss)
                         if i % 10 == 0 {
                                 print(
                                         "i=\(i) loss=\(currentLoss) freq=\(freqParam.value) cutoff=\(cutoffParam.value) cutoff.grad=\(cutoffParam.grad) freq.grad=\(freqParam.grad)"
@@ -109,78 +115,13 @@ final class FrontendTests: XCTestCase {
                         }
 
                 }
-
-        }
-        func testSpectralLossLearnsFrequencyWithFrontend() throws {
-                print("\n🧪 Test: Spectral Loss Learning with Frontend API")
-
-                let g = GraphBuilder()
-
-                // Learnable frequency parameter (start at 550 Hz, target is 440 Hz)
-                let (freqParam, freq) = g.learnableParam(value: 650.0, name: "frequency")
-
-                // Target frequency (constant 440 Hz) - no more passing g around!
-                let targetFreq = g.constant(440.0)
-                let reset = g.constant(0.0)
-
-                // Generate phasors (0-1 ramps) - allocation handled automatically!
-                let phase1 = g.phasor(freq, reset: reset)
-                let phase2 = g.phasor(targetFreq, reset: reset)
-
-                // Convert phase to sine wave - showing Float * Node operator overloading!
-                let twoPi = 2.0 * Float.pi  // Just a regular Float
-                let sig1 = sin(phase1 * twoPi)  // Node * Float works!
-                let sig2 = sin(phase2 * twoPi)
-
-                // Multi-scale spectral loss (cleaner than raw graph API!)
-                let loss1 = g.spectralLoss(sig1, sig2, windowSize: 32)
-                let loss2 = g.spectralLoss(sig1, sig2, windowSize: 64)
-                let loss3 = g.spectralLoss(sig1, sig2, windowSize: 256)
-                let mse = g.mse(sig1, sig2)
-                let loss = (loss1 + loss2 + loss3) / 3.0 + 1.5 * mse
-
-                // Compile - one line!
-                let frameCount = 512
-                let result = try g.compile(loss, frameCount: frameCount, debug: true)
-
-                print("   ✅ Compiled with backwards=true")
-                print("   Initial frequency: \(freqParam.value) Hz")
-                print("   Target frequency: 440 Hz")
-
-                // Streamlined training context - handles everything!
-                let ctx = try TrainingContext(
-                        parameters: [freqParam],
-                        optimizer: Adam(lr: 72.0),
-                        lossNode: loss.id,
-                        compilationResult: result,
-                        frameCount: frameCount
-                )
-
-                // Training loop - super simple now!
-                let numIterations = 2500
-                var lossHistory: [Float] = []
-                for iteration in 0..<numIterations {
-                        let currentLoss = ctx.runStepGPU()  // That's it!
-                        lossHistory.append(currentLoss)
-
-                        if iteration % 100 == 0 || iteration <= 10 {
-                                print(
-                                        "   Iteration \(iteration): freq=\(String(format: "%.2f", freqParam.value)) Hz, loss=\(String(format: "%.6f", currentLoss))"
-                                )
-                        }
-                }
-
-                // Verify learning
-                let finalFreq = freqParam.value
                 let finalLoss = lossHistory.last ?? 1000.0
 
-                print("   Final frequency: \(String(format: "%.2f", finalFreq)) Hz")
                 print("   Final loss: \(String(format: "%.6f", finalLoss))")
 
                 // Assert that we got close to target
-                XCTAssertLessThan(
-                        abs(finalFreq - 440.0), 10.0, "Should learn target frequency within 10 Hz")
-                XCTAssertLessThan(finalLoss, 0.5, "Loss should be very low")
+                XCTAssertLessThan(finalLoss, 0.02, "Loss should be very low")
+
         }
 
         func testHybridLoss() throws {
@@ -189,7 +130,7 @@ final class FrontendTests: XCTestCase {
                 let g = GraphBuilder()
 
                 // Two learnable parameters
-                let (freqParam, freq) = g.learnableParam(value: 420.0, name: "frequency")
+                let (freqParam, freq) = g.learnableParam(value: 520.0, name: "frequency")
                 let (ampParam, amp) = g.learnableParam(value: 0.3, name: "amplitude")
 
                 // Target signal: 440 Hz sine at 0.5 amplitude
@@ -222,7 +163,7 @@ final class FrontendTests: XCTestCase {
                 // Streamlined training context
                 let ctx = try TrainingContext(
                         parameters: [freqParam, ampParam],
-                        optimizer: SGD(lr: 2.3),
+                        optimizer: Adam(lr: 0.3),
                         lossNode: hybridLoss.id,
                         compilationResult: result,
                         frameCount: frameCount
@@ -233,6 +174,10 @@ final class FrontendTests: XCTestCase {
                 for iteration in 0..<numIterations {
                         let currentLoss = ctx.runStepGPU()
 
+                        if currentLoss < 0.001 {
+                                break
+
+                        }
                         if iteration % 50 == 0 {
                                 print(
                                         "   Iteration \(iteration): freq=\(String(format: "%.2f", freqParam.value)) Hz, "

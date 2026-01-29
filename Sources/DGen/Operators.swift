@@ -122,10 +122,14 @@ func emitBinaryOpBackward(
             }
         } else {
             // Different shapes - broadcast handling with right-alignment
-            // IMPORTANT: Use actual tensor strides (not row-major) to handle view tensors correctly
-            let lhsStrides = lhsTensor.strides
-            let rhsStrides = rhsTensor.strides
+            // Use actual tensor strides for READING values from memory
+            let lhsMemStrides = lhsTensor.strides
+            let rhsMemStrides = rhsTensor.strides
             let outStrides = Tensor.computeRowMajorStrides(outShape)
+
+            // Use row-major strides for WRITING gradients (gradient buffers are always row-major)
+            let lhsGradStrides = Tensor.computeRowMajorStrides(lhsShape)
+            let rhsGradStrides = Tensor.computeRowMajorStrides(rhsShape)
 
             // Right-align shapes for proper broadcasting
             let lhsOffset = outShape.count - lhsShape.count
@@ -134,38 +138,44 @@ func emitBinaryOpBackward(
             b.parallelRange(outSize) { outIdx in
                 let gradOut = b.loadTensorGrad(node.id, index: outIdx)
 
-                // Compute broadcast indices with right-alignment
-                var lhsIdx = b.int(0)
-                var rhsIdx = b.int(0)
+                // Compute indices with right-alignment
+                // Separate indices for memory reads (use tensor strides) vs gradient writes (use row-major)
+                var lhsMemIdx = b.int(0)
+                var rhsMemIdx = b.int(0)
+                var lhsGradIdx = b.int(0)
+                var rhsGradIdx = b.int(0)
 
                 for dim in 0..<outShape.count {
-                    let coord = b.mod(b.div(outIdx, b.int(outStrides[dim])), b.int(outShape[dim]))
+                    // Use floorDiv for integer division when computing coordinates from flat indices
+                    let coord = b.mod(b.floorDiv(outIdx, b.int(outStrides[dim])), b.int(outShape[dim]))
 
                     // lhs: map output dim to input dim (right-aligned)
                     let lhsDim = dim - lhsOffset
                     if lhsDim >= 0 && lhsShape[lhsDim] > 1 {
-                        lhsIdx = b.add(lhsIdx, b.mul(coord, b.int(lhsStrides[lhsDim])))
+                        lhsMemIdx = b.add(lhsMemIdx, b.mul(coord, b.int(lhsMemStrides[lhsDim])))
+                        lhsGradIdx = b.add(lhsGradIdx, b.mul(coord, b.int(lhsGradStrides[lhsDim])))
                     }
 
                     // rhs: map output dim to input dim (right-aligned)
                     let rhsDim = dim - rhsOffset
                     if rhsDim >= 0 && rhsShape[rhsDim] > 1 {
-                        rhsIdx = b.add(rhsIdx, b.mul(coord, b.int(rhsStrides[rhsDim])))
+                        rhsMemIdx = b.add(rhsMemIdx, b.mul(coord, b.int(rhsMemStrides[rhsDim])))
+                        rhsGradIdx = b.add(rhsGradIdx, b.mul(coord, b.int(rhsGradStrides[rhsDim])))
                     }
                 }
 
-                // Read values using the computed indices (already account for strides)
-                let lhsIdxFloat = b.cast(lhsIdx, to: .float)
-                let rhsIdxFloat = b.cast(rhsIdx, to: .float)
-                // Use direct memory read since we already computed strided indices above
-                let lhsVal = b.memoryRead(lhsTensor.cellId, lhsIdxFloat)
-                let rhsVal = b.memoryRead(rhsTensor.cellId, rhsIdxFloat)
+                // Read values using memory indices (account for tensor strides/views)
+                let lhsMemIdxFloat = b.cast(lhsMemIdx, to: .float)
+                let rhsMemIdxFloat = b.cast(rhsMemIdx, to: .float)
+                let lhsVal = b.memoryRead(lhsTensor.cellId, lhsMemIdxFloat)
+                let rhsVal = b.memoryRead(rhsTensor.cellId, rhsMemIdxFloat)
 
                 let gLhs = gradLhs(gradOut, lhsVal, rhsVal)
                 let gRhs = gradRhs(gradOut, lhsVal, rhsVal)
 
-                b.tensorGrad(lhsNodeId, index: lhsIdxFloat, value: gLhs.lazy)
-                b.tensorGrad(rhsNodeId, index: rhsIdxFloat, value: gRhs.lazy)
+                // Write gradients using row-major indices (gradient buffers are always row-major)
+                b.tensorGrad(lhsNodeId, index: b.cast(lhsGradIdx, to: .float), value: gLhs.lazy)
+                b.tensorGrad(rhsNodeId, index: b.cast(rhsGradIdx, to: .float), value: gRhs.lazy)
             }
         }
 
@@ -315,6 +325,7 @@ public enum LazyOp {
     case click(CellID)
     case historyRead(CellID)
     case phasor(CellID)
+    case deterministicPhasor  // Stateless phasor for constant frequency - parallelizable
     case accum(CellID)
     case noise(CellID)
     case constant(Float)
@@ -333,6 +344,7 @@ public enum LazyOp {
     case shrink([(Int, Int)?])  // Shrink/slice tensor (metadata only, no data movement)
     case pad([(Int, Int)])      // Pad tensor with zeros (virtual view, conditional reads)
     case peek  // Read from 2D tensor at (index, channel) with interpolation - lazy version
+    case peekRow  // Read entire row from 2D tensor with interpolation - outputs 1D tensor
     case fft(Int, Int, CellID, CellID, CellID, CellID)  // FFT transform: windowSize, hopSize, scratchCell, ringBufferCell, writePosCell, counterCell
     case ifft(Int, Int, CellID, CellID, CellID, CellID)  // IFFT transform: windowSize, hopSize, scratchCell, outputRingCell, readPosCell, counterCell
 
@@ -799,6 +811,23 @@ public enum LazyOp {
                 let (freq, reset) = b.values(inputs, count: 2)
                 b.use(val: u_phasor(cellId, freq: freq, reset: reset)(b))
             }
+        case .deterministicPhasor:
+            // Stateless phasor for constant frequency - fully parallelizable
+            // phase = fmod(freq / sampleRate * threadIndex, 1.0)
+            guard inputs.count == 1 else {
+                throw DGenError.insufficientInputs(
+                    operator: "deterministicPhasor", expected: 1, actual: inputs.count)
+            }
+            let freq = b.value(inputs[0])
+            let sampleRate = b.constant(g.sampleRate)
+            // Use threadIndex (maps to 'id' in Metal) for parallel execution
+            let frameIdx = b.threadIndex()
+
+            // Compute phase directly: (freq / sampleRate * frameIndex) mod 1.0
+            let phaseIncrement = freq / sampleRate
+            let rawPhase = phaseIncrement * frameIdx
+            let phase = rawPhase - b.floor(rawPhase)  // fmod equivalent for positive values
+            b.use(val: phase)
         case .output(let outputNumber):
             guard inputs.count == 1 else {
                 throw DGenError.insufficientInputs(
@@ -1058,6 +1087,81 @@ public enum LazyOp {
             // Linear interpolation: (1-frac)*sample1 + frac*sample2
             let interpolated = b.mix(sample1, sample2, frac)
             b.use(val: interpolated)
+
+        case .peekRow:
+            // PeekRow: read entire row from 2D tensor with linear interpolation
+            // Inputs: [tensor, rowIndex]
+            // Output: 1D tensor [numCols]
+            // Memory layout: column-major (offset = col * numRows + row)
+
+            // Mark as scalar to avoid SIMD variable naming collisions in C renderer
+            b.markRequiresScalar()
+
+            guard node.inputs.count == 2 else {
+                throw DGenError.insufficientInputs(operator: "peekRow", expected: 2, actual: node.inputs.count)
+            }
+
+            let tensorInput = node.inputs[0]
+
+            // Get tensor shape from the input node
+            guard let inputNode = g.nodes[tensorInput],
+                  case .tensor(let shape) = inputNode.shape,
+                  shape.count == 2 else {
+                throw DGenError.tensorError(op: "peekRow", reason: "requires 2D tensor input")
+            }
+
+            let numRows = shape[0]
+            let numCols = shape[1]
+
+            // Get input and output tensors
+            guard let inTensorId = g.nodeToTensor[tensorInput],
+                  let inTensor = g.tensors[inTensorId],
+                  let outTensorId = g.nodeToTensor[node.id],
+                  let outTensor = g.tensors[outTensorId] else {
+                throw DGenError.tensorError(op: "peekRow", reason: "missing tensor")
+            }
+
+            // Read rowIndex input
+            let rowIndex = try b.readInput(node, inputs, at: 1)
+
+            let zero = b.constant(0.0)
+            let one = b.constant(1.0)
+            let numRowsFloat = b.constant(Float(numRows))
+
+            // Wrap rowIndex using modulo for wrapping behavior
+            let wrappedIndex = b.mod(rowIndex, numRowsFloat)
+            let isNegative = wrappedIndex < zero
+            let positiveIndex = b.gswitch(isNegative, wrappedIndex + numRowsFloat, wrappedIndex)
+
+            // Compute floor and ceil indices for interpolation
+            let floorIndex = b.floor(positiveIndex)
+            let frac = positiveIndex - floorIndex
+
+            // Compute ceil index with wrapping
+            let ceilIndex = floorIndex + one
+            let ceilWrapped = b.gswitch(ceilIndex >= numRowsFloat, zero, ceilIndex)
+
+            // Iterate over columns and compute interpolated values
+            b.parallelRange(numCols) { colIdx in
+                // Column-major layout: offset = col * numRows + row
+                let colOffset = colIdx * numRowsFloat
+
+                // Read floor and ceil samples
+                let floorPos = colOffset + floorIndex
+                let ceilPos = colOffset + ceilWrapped
+
+                let sample1 = b.memoryRead(inTensor.cellId, b.cast(floorPos, to: .int))
+                let sample2 = b.memoryRead(inTensor.cellId, b.cast(ceilPos, to: .int))
+
+                // Linear interpolation: (1-frac)*sample1 + frac*sample2
+                let interpolated = b.mix(sample1, sample2, frac)
+
+                // Write to output tensor (1D, so just use colIdx)
+                _ = b.memoryWrite(outTensor.cellId, b.cast(colIdx, to: .int), interpolated)
+            }
+
+            // Register the output tensor
+            ctx.values[nodeId] = .empty
 
         case .fft(let windowSize, let hopSize, let scratchCell, let ringBufferCell, let writePosCell, let counterCell):
             // FFT using Cooley-Tukey algorithm with ring buffer for sample history
@@ -1782,6 +1886,12 @@ public enum LazyOp {
 
             // Write gradient directly (no accumulation needed - test will sum across frames)
             b.grad(node.inputs[0], value: gradFreq.lazy)
+        case .deterministicPhasor:
+            // Backward for deterministic phasor: d(phase)/d(freq) = frameIndex / sampleRate
+            let sampleRate = b.constant(g.sampleRate)
+            let frameIdx = b.threadIndex()
+            let gradFreq = b.value(gradOutput) * frameIdx / sampleRate
+            b.grad(node.inputs[0], value: gradFreq.lazy)
         case .output(_):
             // Output just passes gradient through to its input
             guard inputs.count == 1 else { fatalError("output requires 1 input") }
@@ -1996,9 +2106,10 @@ public enum LazyOp {
                         continue  // Skip reduced dimension
                     }
                     // coordAtDim = (flatIdx / inputStrides[dim]) % inputShape[dim]
+                    // Use floorDiv for integer division
                     let strideExpr = b.int(inputStrides[dim])
                     let shapeExpr = b.int(inputShape[dim])
-                    let coordAtDim = b.mod(b.div(flatIdx, strideExpr), shapeExpr)
+                    let coordAtDim = b.mod(b.floorDiv(flatIdx, strideExpr), shapeExpr)
 
                     // outputFlatIdx += coordAtDim * outputStrides[outDim]
                     let outStrideExpr = b.int(outputStrides[outDim])
@@ -2071,9 +2182,10 @@ public enum LazyOp {
                 var inputFlatIdx = b.int(0)
                 for outDim in 0..<outputShape.count {
                     // outCoord = (outputFlatIdx / outputStrides[outDim]) % outputShape[outDim]
+                    // Use floorDiv for integer division
                     let outStrideExpr = b.int(outputStrides[outDim])
                     let outShapeExpr = b.int(outputShape[outDim])
-                    let outCoord = b.mod(b.div(outputFlatIdx, outStrideExpr), outShapeExpr)
+                    let outCoord = b.mod(b.floorDiv(outputFlatIdx, outStrideExpr), outShapeExpr)
 
                     // This output coord maps to input dimension inversePerm[outDim]
                     let inDim = inversePerm[outDim]
@@ -2124,9 +2236,10 @@ public enum LazyOp {
                 var inputFlatIdx = b.int(0)
                 for dim in 0..<outputShape.count {
                     // outCoord = (outputFlatIdx / outputStrides[dim]) % outputShape[dim]
+                    // Use floorDiv for integer division
                     let outStrideExpr = b.int(outputStrides[dim])
                     let outShapeExpr = b.int(outputShape[dim])
-                    let outCoord = b.mod(b.div(outputFlatIdx, outStrideExpr), outShapeExpr)
+                    let outCoord = b.mod(b.floorDiv(outputFlatIdx, outStrideExpr), outShapeExpr)
 
                     // inCoord = outCoord + startOffset[dim]
                     let inCoord = b.add(outCoord, b.int(startOffsets[dim]))
@@ -2165,9 +2278,10 @@ public enum LazyOp {
                 // Convert input index to output index by adding left padding
                 var outputFlatIdx = b.int(0)
                 for dim in 0..<inputShape.count {
+                    // Use floorDiv for integer division
                     let inStrideExpr = b.int(inputStrides[dim])
                     let inShapeExpr = b.int(inputShape[dim])
-                    let inCoord = b.mod(b.div(inputFlatIdx, inStrideExpr), inShapeExpr)
+                    let inCoord = b.mod(b.floorDiv(inputFlatIdx, inStrideExpr), inShapeExpr)
 
                     // outCoord = inCoord + leftPad[dim]
                     let leftPad = padding[dim].0
@@ -2234,6 +2348,72 @@ public enum LazyOp {
             // Index and channel gradients are zero (not typically learnable)
             b.grad(node.inputs[1], value: ctx.useConstant(src: nil, value: 0.0))
             b.grad(node.inputs[2], value: ctx.useConstant(src: nil, value: 0.0))
+
+        case .peekRow:
+            // PeekRow reads entire row from 2D tensor with linear interpolation.
+            // output[c] = (1-frac)*tensor[floor(idx), c] + frac*tensor[ceil(idx), c]
+            // Scatter gradient back to the two interpolated rows.
+            guard inputs.count == 2 else { fatalError("peekRow requires 2 inputs") }
+
+            let tensorInput = node.inputs[0]
+            guard let inputNode = g.nodes[tensorInput],
+                  case .tensor(let shape) = inputNode.shape,
+                  shape.count == 2 else {
+                // Scalar fallback - shouldn't happen for peekRow
+                b.grad(node.inputs[0], value: ctx.useConstant(src: nil, value: 0.0))
+                b.grad(node.inputs[1], value: ctx.useConstant(src: nil, value: 0.0))
+                break
+            }
+
+            let numRows = shape[0]
+            let numCols = shape[1]
+            let totalSize = numRows * numCols
+
+            // Allocate tensor gradients
+            let _ = ctx.useTensorGradient(src: tensorInput, size: totalSize)
+            let _ = ctx.useTensorGradient(src: node.id, size: numCols)
+
+            // Recompute the interpolation positions (same logic as forward)
+            let rowIndex = b.tapeValue(node.inputs[1])
+
+            let zero = b.constant(0.0)
+            let one = b.constant(1.0)
+            let numRowsFloat = b.constant(Float(numRows))
+
+            // Wrap rowIndex using modulo
+            let wrappedIndex = b.mod(rowIndex, numRowsFloat)
+            let isNegative = wrappedIndex < zero
+            let positiveIndex = b.gswitch(isNegative, wrappedIndex + numRowsFloat, wrappedIndex)
+
+            // Compute floor and ceil indices for interpolation
+            let floorIndex = b.floor(positiveIndex)
+            let frac = positiveIndex - floorIndex
+
+            // Compute ceil index with wrapping
+            let ceilIndex = floorIndex + one
+            let ceilWrapped = b.gswitch(ceilIndex >= numRowsFloat, zero, ceilIndex)
+
+            // Scatter gradients to both rows for each column
+            b.parallelRange(numCols) { colIdx in
+                // Load the output gradient for this column
+                let gradOut = b.loadTensorGrad(node.id, index: colIdx)
+
+                // Column-major layout: offset = col * numRows + row
+                let colOffset = colIdx * numRowsFloat
+
+                // Floor position
+                let floorPos = colOffset + floorIndex
+                // Ceil position
+                let ceilPos = colOffset + ceilWrapped
+
+                // Scatter: dL/d(tensor[floor, c]) += gradOut * (1-frac)
+                //          dL/d(tensor[ceil, c]) += gradOut * frac
+                b.tensorGrad(tensorInput, index: floorPos, value: (gradOut * (one - frac)).lazy)
+                b.tensorGrad(tensorInput, index: ceilPos, value: (gradOut * frac).lazy)
+            }
+
+            // rowIndex gradient is zero (not typically learnable)
+            b.grad(node.inputs[1], value: ctx.useConstant(src: nil, value: 0.0))
 
         case .fft(_, _, _, _, _, _):
             // FFT backward pass: not implemented yet (future work)

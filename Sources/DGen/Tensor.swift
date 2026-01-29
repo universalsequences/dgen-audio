@@ -611,4 +611,26 @@ extension Graph {
             return n(.peek, tensorNode, index, channel)
         }
     }
+
+    /// Read an entire row from a 2D tensor with interpolation.
+    /// - Parameters:
+    ///   - tensorNode: A 2D tensor [numRows, numCols]
+    ///   - rowIndex: Scalar index (can be fractional, wraps via modulo)
+    /// - Returns: A 1D tensor [numCols] with interpolated values
+    ///
+    /// Memory layout is column-major for compatibility with peek:
+    /// offset = col * numRows + row
+    ///
+    /// For each column c:
+    /// output[c] = lerp(tensor[floor(idx), c], tensor[ceil(idx), c], frac)
+    public func peekRow(tensor tensorNode: NodeID, rowIndex: NodeID) throws -> NodeID {
+        guard let inputNode = nodes[tensorNode],
+              case .tensor(let shape) = inputNode.shape,
+              shape.count == 2 else {
+            throw DGenError.tensorError(op: "peekRow", reason: "requires 2D tensor input")
+        }
+
+        // Create the lazy peekRow node - resolved during emit
+        return n(.peekRow, tensorNode, rowIndex)
+    }
 }

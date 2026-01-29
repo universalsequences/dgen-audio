@@ -95,6 +95,9 @@ public class IRContext {
             return existing
         }
         let baseGradId = gradIdx + 1
+        // Debug: print node info
+        let opName = g.nodes[src].map { "\($0.op)" } ?? "unknown"
+        print("[GRAD] node=\(src) op=\(opName) size=\(size) baseGradId=\(baseGradId)")
         gradIdx += size  // Reserve `size` contiguous IDs
         tensorGradients[src] = baseGradId
         tensorGradientSizes[src] = size
@@ -147,7 +150,14 @@ open class Graph {
     /// Used for FFT/IFFT nodes and operations that inherit hop-based temporality
     public var nodeHopRate: [NodeID: (Int, CellID)] = [:]
 
+    /// Sample rate for audio processing (default 44100 Hz)
+    public var sampleRate: Float = 44100.0
+
     public init() {}
+
+    public init(sampleRate: Float) {
+        self.sampleRate = sampleRate
+    }
 
     /// Returns the total number of allocated memory cells
     public var totalMemoryCells: Int { nextCellId }

@@ -181,6 +181,15 @@ public func inferShape(op: LazyOp, inputs: [ValueShape], graph: Graph) throws ->
     // Peek always outputs scalar - it reads one value from the tensor
     return .scalar
 
+  // PeekRow - reads an entire row from a 2D tensor with interpolation
+  case .peekRow:
+    guard let firstInput = inputs.first,
+          case .tensor(let shape) = firstInput,
+          shape.count == 2 else {
+      throw DGenError.shapeInferenceFailed(op: "peekRow", reason: "requires 2D tensor input")
+    }
+    return .tensor([shape[1]])  // Output is [numCols]
+
   // FFT - outputs [numBins, 2] tensor where numBins = windowSize/2 + 1
   // Note: FFT is a bulk operation that handles all tensor writes internally,
   // so it should not be wrapped in parallelRange (handled in CompilationPipeline)

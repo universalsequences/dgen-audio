@@ -625,6 +625,12 @@ public final class IRBuilder {
     return value(dest)
   }
 
+  /// Floor division: floor(a / b)
+  /// Use this for integer index calculations where we need truncation toward negative infinity.
+  public func floorDiv(_ a: Expr, _ b: Expr) -> Expr {
+    return floor(div(a, b))
+  }
+
   public func loop(_ count: Int, body: (Expr) -> Void) {
     let loopVar = ctx.useVariable(src: nodeId)
     let countLazy = ctx.useConstant(src: nodeId, value: Float(count))

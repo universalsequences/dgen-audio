@@ -213,11 +213,8 @@ public class MetalCompiledKernel: CompiledKernelRuntime {
       }
       print("name=\(bufferName) buffer size = \(bufferSize)")
 
-      // Initialize buffer contents to zero
-      let bufferContents = buffer.contents().assumingMemoryBound(to: Float.self)
-      for i in 0..<(bufferSize / MemoryLayout<Float>.size) {
-        bufferContents[i] = 0.0
-      }
+      // Initialize buffer contents to zero using memset (much faster than a loop)
+      memset(buffer.contents(), 0, bufferSize)
       bufferPool[bufferName] = buffer
     }
 

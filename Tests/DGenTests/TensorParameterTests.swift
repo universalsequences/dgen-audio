@@ -1342,7 +1342,6 @@ final class TensorParameterTests: XCTestCase {
                         frameCount: frameCount)
                 }
             }
-
             losses.append(outputBuffer[0])
             ctx.step()
         }
@@ -1415,7 +1414,7 @@ final class TensorParameterTests: XCTestCase {
 
         let ctx = TrainingContext(
             tensorParameters: [w1, b1, w2, b2],
-            optimizer: SGD(lr: 0.05),  // Use SGD for more stable training
+            optimizer: SGD(lr: 0.10),  // Use SGD for more stable training
             lossNode: mse)
 
         ctx.initializeMemory(
@@ -1444,7 +1443,7 @@ final class TensorParameterTests: XCTestCase {
         // Train for several epochs
         var losses: [Float] = [initialLoss]
 
-        for epoch in 0..<200 {
+        for epoch in 0..<400 {
             ctx.step()
             ctx.zeroGrad()
 
@@ -1459,6 +1458,9 @@ final class TensorParameterTests: XCTestCase {
             }
 
             losses.append(outputBuffer[0])
+            if epoch % 20 == 0 {
+                print("epoch=\(epoch) loss=\(outputBuffer[0])")
+            }
 
             // Stop early if loss becomes NaN/Inf
             if outputBuffer[0].isNaN || outputBuffer[0].isInfinite {
