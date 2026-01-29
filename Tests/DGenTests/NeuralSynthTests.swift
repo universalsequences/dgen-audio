@@ -65,29 +65,44 @@ final class NeuralSynthTests: XCTestCase {
         let zero = g.n(.constant(0.0))
         let one = g.n(.constant(1.0))
 
-        // BATCHED MLP: Pre-compute ALL time values as tensor [frameCount, 1]
-        // This lets the MLP matmuls run in parallel across all frames!
-        let timeData = (0..<frameCount).map { Float($0) / Float(frameCount - 1) }
-        let allTimes = g.tensor(shape: [frameCount, 1], data: timeData)
-
-        // MLP forward on BATCHED input: [frameCount, 1] → [frameCount, numHarmonics]
-        // These matmuls are fully parallel!
-        let h1 = try g.matmul(allTimes, W1.node())  // [frameCount, 1] × [1, 12] = [frameCount, 12]
-        let h1_bias = g.n(.add, h1, b1.node())       // b1 [1,12] broadcasts to [frameCount, 12]
-        let h1_act = g.n(.tanh, h1_bias)
-        let h2 = try g.matmul(h1_act, W2.node())    // [frameCount, 12] × [12, 6] = [frameCount, 6]
-        let h2_bias = g.n(.add, h2, b2.node())       // b2 [1,6] broadcasts to [frameCount, 6]
-
-        // Sigmoid: 1 / (1 + exp(-x))
-        let neg_h2 = g.n(.mul, h2_bias, g.n(.constant(-1.0)))
-        let exp_neg = g.n(.exp, neg_h2)
-        let amplitudes = g.n(.div, one, g.n(.add, one, exp_neg))  // [frameCount, 6]
-
-        // Frame index for looking up amplitudes - 0 to frameCount-1
+        // PER-FRAME MLP: Compute time as normalized frame index [0, 1]
+        // Frame index phasor goes from 0 to 1 over frameCount samples
         let frameIdx = g.phasor(freq: g.n(.constant(Float(sampleRate) / Float(frameCount))), reset: zero)
         let frameIdxScaled = g.n(.mul, frameIdx, g.n(.constant(Float(frameCount - 1))))
 
-        // Generate harmonics - phases are parallel, amplitude lookup uses peek
+        // MLP forward pass runs per-frame with scalar time input (frameIdx)
+
+        // Hidden layer: h1 = tanh(time * W1 + b1)
+        // W1 is [1, hiddenSize], we compute time * W1[0,j] + b1[0,j] for each j
+        var h1_activations: [NodeID] = []
+        for j in 0..<hiddenSize {
+            // W1[0,j] and b1[0,j]
+            let w1_j = try g.peek(tensor: W1.node(), index: zero, channel: g.n(.constant(Float(j))))
+            let b1_j = try g.peek(tensor: b1.node(), index: zero, channel: g.n(.constant(Float(j))))
+            let h1_j_pre = g.n(.add, g.n(.mul, frameIdx, w1_j), b1_j)
+            let h1_j = g.n(.tanh, h1_j_pre)
+            h1_activations.append(h1_j)
+        }
+
+        // Output layer: h2 = sigmoid(h1 * W2 + b2)
+        // W2 is [hiddenSize, numHarmonics], compute sum_j(h1[j] * W2[j,k]) + b2[0,k]
+        var amplitudeNodes: [NodeID] = []
+        for k in 0..<numHarmonics {
+            var sum = g.n(.constant(0.0))
+            for j in 0..<hiddenSize {
+                let w2_jk = try g.peek(tensor: W2.node(), index: g.n(.constant(Float(j))), channel: g.n(.constant(Float(k))))
+                sum = g.n(.add, sum, g.n(.mul, h1_activations[j], w2_jk))
+            }
+            let b2_k = try g.peek(tensor: b2.node(), index: zero, channel: g.n(.constant(Float(k))))
+            let h2_k_pre = g.n(.add, sum, b2_k)
+            // Sigmoid: 1 / (1 + exp(-x))
+            let neg_h2_k = g.n(.mul, h2_k_pre, g.n(.constant(-1.0)))
+            let exp_neg_k = g.n(.exp, neg_h2_k)
+            let amp_k = g.n(.div, one, g.n(.add, one, exp_neg_k))
+            amplitudeNodes.append(amp_k)
+        }
+
+        // Generate harmonics - phases are parallel, amplitudes computed above
         let twoPi = g.n(.constant(Float.pi * 2.0))
 
         var harmonicNodes: [NodeID] = []
@@ -97,10 +112,8 @@ final class NeuralSynthTests: XCTestCase {
             let phase = g.phasor(freq: freqK, reset: zero)
             let sine = g.n(.sin, g.n(.mul, twoPi, phase))
 
-            // Look up amplitude for this frame from pre-computed [frameCount, 6] tensor
-            let kIdx = g.n(.constant(Float(k - 1)))
-            let ampK = try g.peek(tensor: amplitudes, index: frameIdxScaled, channel: kIdx)
-            harmonicNodes.append(g.n(.mul, sine, ampK))
+            // Use the per-frame computed amplitude
+            harmonicNodes.append(g.n(.mul, sine, amplitudeNodes[k - 1]))
         }
 
         // Sum harmonics

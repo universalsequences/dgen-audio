@@ -182,16 +182,20 @@ public class MetalCompiledKernel: CompiledKernelRuntime {
   }
 
   private func getElementCount(_ bufferName: String) -> Int {
-    return bufferName == "frameCount"
-      ? 1
-      : bufferName == "memory" || bufferName == "grad_memory"
-        ? getMemorySize()
-        : bufferName == "t"
-          ? maxFrameCount * context.globals.count
-          : bufferName == "gradients"
-            // Use maxGradId + 1 to ensure we have enough slots (gradIds start at 1)
-            ? 2 * maxFrameCount * (context.maxGradId + 1) : maxFrameCount
-
+    if bufferName == "frameCount" {
+      return 1
+    } else if bufferName == "memory" || bufferName == "grad_memory" {
+      return getMemorySize()
+    } else if bufferName == "t" {
+      return maxFrameCount * context.globals.count
+    } else if bufferName == "gradients" {
+      // Smart gradient buffer sizing: static gradients don't need frameCount multiplier
+      let smartSize = context.computeGradientBufferSize(frameCount: maxFrameCount)
+      print("[GRAD BUFFER] smart size = \(smartSize), old formula would be \(2 * maxFrameCount * (context.maxGradId + 1))")
+      return smartSize
+    } else {
+      return maxFrameCount
+    }
   }
 
   private func initializeBuffers() throws {

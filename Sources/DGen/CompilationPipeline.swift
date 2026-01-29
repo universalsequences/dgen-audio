@@ -220,6 +220,9 @@ public struct CompilationPipeline {
             )
         }
 
+        // Store frame-based nodes in context for smart gradient buffer allocation
+        context.frameBasedNodes = temporalityResult.frameBasedNodes
+
         let finalBlockIndices = Array(0..<finalBlocks.count)
 
         var blockId: Int = 0
