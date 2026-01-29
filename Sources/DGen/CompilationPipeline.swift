@@ -240,6 +240,35 @@ public struct CompilationPipeline {
         // Step 5: Convert blocks to UOp blocks
         var uopBlocks = [BlockUOps]()
 
+        func inferParallelPolicy(
+            kind: Kind, temporality: Temporality, ops: [UOp]
+        ) -> ParallelPolicy {
+            guard temporality == .static_, kind == .scalar else { return .serial }
+
+            var hasParallelRange = false
+            var hasBlockingOps = false
+            var hasGradOps = false
+
+            for uop in ops {
+                switch uop.op {
+                case .beginParallelRange:
+                    hasParallelRange = true
+                case .loadGrad, .accumulateGrad, .loadTensorGrad, .accumulateTensorGrad,
+                    .loadGradMemory, .storeGradMemory:
+                    hasGradOps = true
+                case .beginReduce, .endReduce, .reduceAccumulate, .requiresScalar:
+                    hasBlockingOps = true
+                default:
+                    break
+                }
+            }
+
+            if hasGradOps { return .serial }
+            if hasBlockingOps { return .serial }
+            if hasParallelRange { return .threadParallel }
+            return .serial
+        }
+
         try time("emitBlockUOps") {
             for blockIdx in finalBlockIndices {
                 let block = finalBlocks[blockIdx]
@@ -250,8 +279,12 @@ public struct CompilationPipeline {
                     g: graph,
                     debug: options.debug
                 )
+                let parallelPolicy = inferParallelPolicy(
+                    kind: block.kind, temporality: block.temporality, ops: ops)
                 uopBlocks.append(
-                    BlockUOps(ops: ops, kind: block.kind, temporality: block.temporality))
+                    BlockUOps(
+                        ops: ops, kind: block.kind, temporality: block.temporality,
+                        parallelPolicy: parallelPolicy))
             }
         }
 

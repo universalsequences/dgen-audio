@@ -33,8 +33,13 @@ public class MetalRenderer: Renderer, UOpEmitter {
       }
     }
 
-    let expanded = scheduleItems.flatMap { splitStaticParallelRanges($0) }
-    let filtered = expanded.filter { !isNoOpStaticKernel($0.item) }
+    let expanded = scheduleItems.flatMap { item in
+      if item.parallelPolicy == .threadParallel {
+        return splitStaticParallelRanges(item)
+      }
+      return [SplitScheduleItem(item: item, threadCount: nil)]
+    }
+    let filtered = expanded.filter { !isNoOpStaticKernel($0.item, ctx: ctx) }
     let fused = fuseStaticThreadParallel(filtered)
 
     return fused.enumerated().map { (i, entry) in
@@ -137,28 +142,6 @@ public class MetalRenderer: Renderer, UOpEmitter {
     guard scheduleItem.temporality == .static_, scheduleItem.kind == .scalar else {
       return [SplitScheduleItem(item: scheduleItem, threadCount: nil)]
     }
-    // If this kernel writes gradients, keep it single-threaded for correctness.
-    let hasGradOps = scheduleItem.ops.contains { uop in
-      if case .loadGrad = uop.op { return true }
-      if case .accumulateGrad = uop.op { return true }
-      if case .loadTensorGrad = uop.op { return true }
-      if case .accumulateTensorGrad = uop.op { return true }
-      if case .storeGradMemory = uop.op { return true }
-      if case .loadGradMemory = uop.op { return true }
-      return false
-    }
-    if hasGradOps {
-      return [SplitScheduleItem(item: scheduleItem, threadCount: nil)]
-    }
-    let hasGradWrites = scheduleItem.ops.contains { uop in
-      if case .accumulateGrad = uop.op { return true }
-      if case .accumulateTensorGrad = uop.op { return true }
-      if case .storeGradMemory = uop.op { return true }
-      return false
-    }
-    if hasGradWrites {
-      return [SplitScheduleItem(item: scheduleItem, threadCount: nil)]
-    }
 
     let ops = scheduleItem.ops
     guard let beginRangeIdx = ops.firstIndex(where: {
@@ -220,12 +203,6 @@ public class MetalRenderer: Renderer, UOpEmitter {
       return [SplitScheduleItem(item: scheduleItem, threadCount: nil)]
     }
 
-    // If there are scalar ops outside parallel ranges, avoid splitting to preserve local dependencies.
-    let hasNonParallelOps = segments.contains { $0.parallelCount == nil && !$0.ops.isEmpty }
-    if hasNonParallelOps {
-      return [SplitScheduleItem(item: scheduleItem, threadCount: nil)]
-    }
-
     let beginRangeOp = ops[beginRangeIdx]
     let endRangeOp = ops[endRangeIdx]
 
@@ -249,18 +226,42 @@ public class MetalRenderer: Renderer, UOpEmitter {
       : splitItems
   }
 
-  private func isNoOpStaticKernel(_ scheduleItem: ScheduleItem) -> Bool {
+  private func isNoOpStaticKernel(_ scheduleItem: ScheduleItem, ctx: IRContext) -> Bool {
     guard scheduleItem.temporality == .static_ else { return false }
+    return !kernelHasSideEffects(scheduleItem, ctx: ctx)
+  }
+
+  private func kernelHasSideEffects(_ scheduleItem: ScheduleItem, ctx: IRContext) -> Bool {
     for uop in scheduleItem.ops {
       switch uop.op {
-      case .frameCount, .beginRange, .endRange,
-        .reshape, .transpose, .shrink, .pad, .broadcastAccess:
-        continue
+      case .memoryWrite, .store, .delay1, .output,
+        .accumulateGrad, .accumulateTensorGrad, .storeGradMemory:
+        return true
+      case .beginRange, .endRange, .beginLoop, .endLoop,
+        .beginForLoop, .beginParallelRange, .endParallelRange,
+        .beginIf, .endIf, .frameCount:
+        break
+      case .defineGlobal:
+        // Only a definition, not a write
+        break
       default:
-        return false
+        break
+      }
+
+      switch uop.value {
+      case .variable(let varId, _):
+        if ctx.globals.contains(varId) {
+          return true
+        }
+      case .global(let varId):
+        if ctx.globals.contains(varId) {
+          return true
+        }
+      default:
+        break
       }
     }
-    return true
+    return false
   }
 
   private struct KernelAccessInfo {
@@ -361,25 +362,16 @@ public class MetalRenderer: Renderer, UOpEmitter {
     var currentSchedule: ScheduleItem? = nil
     var currentKind: Kind? = nil
     var currentTemporality: Temporality? = nil
+    var currentPolicy: ParallelPolicy? = nil
     var loopOpened = false
     var hasFrameLoop = false  // Track if we opened a frame loop (static blocks don't have one)
 
     for block in uopBlocks {
-      let blockHasGradOps = block.ops.contains { uop in
-        if case .loadGrad = uop.op { return true }
-        if case .accumulateGrad = uop.op { return true }
-        if case .loadTensorGrad = uop.op { return true }
-        if case .accumulateTensorGrad = uop.op { return true }
-        if case .loadGradMemory = uop.op { return true }
-        if case .storeGradMemory = uop.op { return true }
-        return false
-      }
+      let blockPolicy = block.parallelPolicy
       // Check if we need to start a new kernel (different block kind or temporality)
-      // For static blocks, avoid fusing across blocks so we can parallelize each block independently.
-      let forceStaticSplit =
-        (block.temporality == .static_) && (currentTemporality == .static_) && !blockHasGradOps
       let needsNewKernel =
-        currentKind != block.kind || currentTemporality != block.temporality || forceStaticSplit
+        currentKind != block.kind || currentTemporality != block.temporality
+        || currentPolicy != blockPolicy
       if needsNewKernel {
         // Close previous kernel if open
         if let schedule = currentSchedule {
@@ -395,6 +387,7 @@ public class MetalRenderer: Renderer, UOpEmitter {
 
         // Start new kernel
         let scheduleItem = ScheduleItem(kind: block.kind, temporality: block.temporality)
+        scheduleItem.parallelPolicy = blockPolicy
         scheduleItem.ops.append(UOp(op: .frameCount, value: .empty))
 
         // Extract defineGlobals early
@@ -447,6 +440,7 @@ public class MetalRenderer: Renderer, UOpEmitter {
         currentSchedule = scheduleItem
         currentKind = block.kind
         currentTemporality = block.temporality
+        currentPolicy = blockPolicy
         loopOpened = true
       }
 

@@ -35,8 +35,12 @@ final class FrontendTests: XCTestCase {
                         loss, backend: .metal, frameCount: frameCount, debug: false)
 
                 // Write kernels to disk for inspection
-                let allKernels = result.kernels.enumerated().map { "// KERNEL \($0.offset)\n\($0.element.source)" }.joined(separator: "\n\n")
-                try! allKernels.write(toFile: "/tmp/history_backward_kernels.metal", atomically: true, encoding: .utf8)
+                let allKernels = result.kernels.enumerated().map {
+                        "// KERNEL \($0.offset)\n\($0.element.source)"
+                }.joined(separator: "\n\n")
+                try! allKernels.write(
+                        toFile: "/tmp/history_backward_kernels.metal", atomically: true,
+                        encoding: .utf8)
                 print("Wrote kernels to /tmp/history_backward_kernels.metal")
                 // Streamlined training context - handles everything!
                 let ctx = try TrainingContext(
@@ -91,21 +95,26 @@ final class FrontendTests: XCTestCase {
                 let result = try g.compile(
                         loss, backend: .metal, frameCount: frameCount, debug: false)
 
-                for kernel in result.kernels {
-                        print(kernel.source)
-                }
+                // Write kernels to disk for inspection
+                let allKernels = result.kernels.enumerated().map {
+                        "// KERNEL \($0.offset)\n\($0.element.source)"
+                }.joined(separator: "\n\n")
+                try! allKernels.write(
+                        toFile: "/tmp/biquad_backward_kernels.metal", atomically: true,
+                        encoding: .utf8)
+                print("Wrote kernels to /tmp/biquad_backward_kernels.metal")
 
                 // Streamlined training context - handles everything!
                 let ctx = try TrainingContext(
                         parameters: [cutoffParam, freqParam],
-                        optimizer: Adam(lr: 0.6),
+                        optimizer: Adam(lr: 0.1),
                         lossNode: loss.id,
                         compilationResult: result,
                         frameCount: frameCount
                 )
 
                 var lossHistory: [Float] = []
-                for i in 0..<100 {
+                for i in 0..<1000 {
                         let currentLoss = ctx.runStepGPU()
                         lossHistory.append(currentLoss)
                         if i % 10 == 0 {

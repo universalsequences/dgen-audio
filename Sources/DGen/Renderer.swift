@@ -6,12 +6,22 @@ public struct BlockUOps {
     public var ops: [UOp]
     public let kind: Kind
     public let temporality: Temporality
+    public var parallelPolicy: ParallelPolicy
 
-    public init(ops: [UOp], kind: Kind, temporality: Temporality = .static_) {
+    public init(
+        ops: [UOp], kind: Kind, temporality: Temporality = .static_,
+        parallelPolicy: ParallelPolicy = .serial
+    ) {
         self.ops = ops
         self.kind = kind
         self.temporality = temporality
+        self.parallelPolicy = parallelPolicy
     }
+}
+
+public enum ParallelPolicy {
+    case serial
+    case threadParallel
 }
 
 public enum Device {
@@ -34,6 +44,7 @@ public class ScheduleItem {
     public var ops: [UOp] = []
     public let kind: Kind
     public var temporality: Temporality = .frameBased
+    public var parallelPolicy: ParallelPolicy = .serial
 
     init(kind: Kind, temporality: Temporality = .frameBased) {
         self.kind = kind
@@ -116,6 +127,7 @@ public class CRenderer: Renderer {
     public var voiceCount: Int = 1
     public var voiceCellIdOpt: Int? = nil
     public var loadedGlobal: [Int: Bool] = [:]
+    private var staticGlobalVars: Set<VarID> = []
 
     // Track the emitted type of each variable in current scope
     public enum EmittedType {
@@ -177,6 +189,16 @@ public class CRenderer: Renderer {
         _ ctx: IRContext,
         _ frameCount: Int
     ) {
+        staticGlobalVars.removeAll()
+        for block in uopBlocks {
+            guard block.temporality == .static_ else { continue }
+            for uop in block.ops {
+                if case let .defineGlobal(varId) = uop.op {
+                    staticGlobalVars.insert(varId)
+                }
+            }
+        }
+
         let scheduleItem = ScheduleItem(kind: .scalar)
         scheduleItems.append(scheduleItem)
 
@@ -188,6 +210,7 @@ public class CRenderer: Renderer {
         var currentKind: Kind? = nil
         var currentTemporality: Temporality? = nil
         var hopCheckOpen = false  // Track if we have an open hop check conditional
+        var loopOpen = false
 
         for block in uopBlocks {
             let needsNewLoop = currentKind != block.kind || currentTemporality != block.temporality
@@ -200,19 +223,21 @@ public class CRenderer: Renderer {
                 }
 
                 // Close previous loop if open
-                if currentKind != nil {
+                if loopOpen {
                     scheduleItem.ops.append(UOp(op: .endLoop, value: .empty))
+                    loopOpen = false
                 }
 
                 // Open new loop based on temporality
                 switch block.temporality {
-                case .frameBased, .static_:
-                    // Frame-based or static: standard frame loop
+                case .frameBased:
+                    // Frame-based: standard frame loop
                     scheduleItem.ops.append(
                         UOp(
                             op: .beginLoop(frameCountUOp, block.kind == .scalar ? 1 : 4),
                             value: .empty)
                     )
+                    loopOpen = true
 
                 case .hopBased(_, let counterCell):
                     // Hop-based: frame loop with conditional check inside
@@ -226,6 +251,11 @@ public class CRenderer: Renderer {
                         UOp(op: .beginHopCheck(counterCell), value: .empty)
                     )
                     hopCheckOpen = true
+                    loopOpen = true
+
+                case .static_:
+                    // Static: no frame loop
+                    loopOpen = false
                 }
 
                 currentKind = block.kind
@@ -244,7 +274,7 @@ public class CRenderer: Renderer {
         }
 
         // Close any open loop
-        if currentKind != nil {
+        if loopOpen {
             scheduleItem.ops.append(UOp(op: .endLoop, value: .empty))
         }
     }
@@ -350,6 +380,7 @@ public class CRenderer: Renderer {
 
         // Use audiograph parameters directly - no mapping needed
         code.append("  int frameCount = nframes;  // Use audiograph frame count parameter")
+        code.append("  int i = 0;")
 
         loadedGlobal = [:]
         varEmittedTypes = [:]
@@ -919,13 +950,22 @@ public class CRenderer: Renderer {
             loadedGlobal[id] = true
             if uop.kind == .simd {
                 // Create a proper SIMD variable declaration for loadGlobal
+                if staticGlobalVars.contains(id) {
+                    return "float32x4_t simd\(id) = vdupq_n_f32(t\(id)[0]);"
+                }
                 return "float32x4_t simd\(id) = vld1q_f32(t\(id) + i);"
             } else {
                 // if this global is required by a beginParallelRange element then we need
                 // a simd version where we
-                let simdVersion =
-                    "float32x4_t simd\(id) = vdupq_n_f32(t\(id)[i]); /* extra */"
-                let scalarVersion = emitAssign(uop, "t\(id)[i]", ctx)
+                let simdVersion: String
+                let scalarVersion: String
+                if staticGlobalVars.contains(id) {
+                    simdVersion = "float32x4_t simd\(id) = vdupq_n_f32(t\(id)[0]); /* extra */"
+                    scalarVersion = emitAssign(uop, "t\(id)[0]", ctx)
+                } else {
+                    simdVersion = "float32x4_t simd\(id) = vdupq_n_f32(t\(id)[i]); /* extra */"
+                    scalarVersion = emitAssign(uop, "t\(id)[i]", ctx)
+                }
                 return simdVersion + "\n    " + scalarVersion
             }
 
@@ -986,6 +1026,9 @@ public class CRenderer: Renderer {
                 if kind == .simd {
                     return isOut ? "t\(id) + i" : "simd\(id)"
                 } else {
+                    if !isOut, staticGlobalVars.contains(id) {
+                        return "t\(id)[0]"
+                    }
                     return "t\(id)[i]"
                 }
             } else {
@@ -1000,6 +1043,9 @@ public class CRenderer: Renderer {
             if kind == .simd {
                 return isOut ? "t\(id) + i" : "simd\(id)"
             } else {
+                if !isOut, staticGlobalVars.contains(id) {
+                    return "t\(id)[0]"
+                }
                 return "t\(id)[i]"
             }
         default:

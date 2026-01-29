@@ -5,7 +5,7 @@ import XCTest
 
 final class MatmulParallelTest: XCTestCase {
 
-    func testMatmulParallelKernels() throws {
+    func testMatmulParallelKernelsForward() throws {
         print("\n========================================")
         print("🧪 testMatmulParallelKernels")
         print("========================================")
@@ -13,17 +13,21 @@ final class MatmulParallelTest: XCTestCase {
         let g = Graph()
 
         // A: 2x3 matrix
-        let a = g.tensor(shape: [2, 3], data: [
-            1.0, 2.0, 3.0,
-            4.0, 5.0, 6.0,
-        ])
+        let a = g.tensor(
+            shape: [2, 3],
+            data: [
+                1.0, 2.0, 3.0,
+                4.0, 5.0, 6.0,
+            ])
 
         // B: 3x4 matrix
-        let b = g.tensor(shape: [3, 4], data: [
-            1.0, 2.0, 3.0, 4.0,
-            5.0, 6.0, 7.0, 8.0,
-            9.0, 10.0, 11.0, 12.0,
-        ])
+        let b = g.tensor(
+            shape: [3, 4],
+            data: [
+                1.0, 2.0, 3.0, 4.0,
+                5.0, 6.0, 7.0, 8.0,
+                9.0, 10.0, 11.0, 12.0,
+            ])
 
         let c = try g.matmul(a, b)
         let sum = g.n(.sum, c)
@@ -45,13 +49,16 @@ final class MatmulParallelTest: XCTestCase {
             for uop in block.ops {
                 switch uop.op {
                 case .beginIf, .beginForLoop, .beginParallelRange, .beginLoop, .beginRange:
-                    print("\(String(repeating: "  ", count: indentLevel))\(uop.prettyDescription())")
+                    print(
+                        "\(String(repeating: "  ", count: indentLevel))\(uop.prettyDescription())")
                     indentLevel += 1
                 case .endIf, .endLoop, .endParallelRange, .endRange:
                     indentLevel = max(0, indentLevel - 1)
-                    print("\(String(repeating: "  ", count: indentLevel))\(uop.prettyDescription())")
+                    print(
+                        "\(String(repeating: "  ", count: indentLevel))\(uop.prettyDescription())")
                 default:
-                    print("\(String(repeating: "  ", count: indentLevel))\(uop.prettyDescription())")
+                    print(
+                        "\(String(repeating: "  ", count: indentLevel))\(uop.prettyDescription())")
                 }
             }
         }
@@ -211,5 +218,48 @@ final class MatmulParallelTest: XCTestCase {
             a.grads.contains { abs($0) > 0.001 },
             "A gradients should be non-zero"
         )
+    }
+
+    func testMatmulParallelKernelsCSource() throws {
+        print("\n========================================")
+        print("🧪 testMatmulParallelKernelsCSource")
+        print("========================================")
+
+        let g = Graph()
+
+        // Static matmul -> sum
+        let a = g.tensor(shape: [2, 3], data: [
+            1.0, 2.0, 3.0,
+            4.0, 5.0, 6.0,
+        ])
+        let b = g.tensor(shape: [3, 4], data: [
+            1.0, 2.0, 3.0, 4.0,
+            5.0, 6.0, 7.0, 8.0,
+            9.0, 10.0, 11.0, 12.0,
+        ])
+        let c = try g.matmul(a, b)
+        let sum = g.n(.sum, c)
+
+        // Frame-based phasor mixed with static sum (matches patch-editor shape)
+        let freq = g.n(.constant(1.0))
+        let reset = g.n(.constant(0.0))
+        let phase = g.n(.phasor(g.alloc()), freq, reset)
+        let out = g.n(.add, sum, phase)
+        _ = g.n(.output(0), out)
+
+        let frameCount = 8
+        let compileResult = try CompilationPipeline.compile(
+            graph: g, backend: .c,
+            options: .init(frameCount: frameCount, debug: false, backwards: false)
+        )
+
+        XCTAssertGreaterThan(compileResult.kernels.count, 0)
+
+        let kernelPath = "/tmp/matmul_parallel_kernels.c"
+        var source = "// Generated C kernel for testMatmulParallelKernelsCSource\n"
+        source += "// Total kernels: \(compileResult.kernels.count)\n\n"
+        source += compileResult.source
+        try source.write(toFile: kernelPath, atomically: true, encoding: .utf8)
+        print("📝 Wrote C kernel to: \(kernelPath)")
     }
 }
