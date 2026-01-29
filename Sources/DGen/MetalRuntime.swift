@@ -189,10 +189,7 @@ public class MetalCompiledKernel: CompiledKernelRuntime {
     } else if bufferName == "t" {
       return maxFrameCount * context.globals.count
     } else if bufferName == "gradients" {
-      // Smart gradient buffer sizing: static gradients don't need frameCount multiplier
-      let smartSize = context.computeGradientBufferSize(frameCount: maxFrameCount)
-      print("[GRAD BUFFER] smart size = \(smartSize), old formula would be \(2 * maxFrameCount * (context.maxGradId + 1))")
-      return smartSize
+      return context.computeGradientBufferSize(frameCount: maxFrameCount)
     } else {
       return maxFrameCount
     }
@@ -215,7 +212,6 @@ public class MetalCompiledKernel: CompiledKernelRuntime {
           domain: "MetalError", code: 4,
           userInfo: [NSLocalizedDescriptionKey: "Failed to create buffer \(bufferName)"])
       }
-      print("name=\(bufferName) buffer size = \(bufferSize)")
 
       // Initialize buffer contents to zero using memset (much faster than a loop)
       memset(buffer.contents(), 0, bufferSize)

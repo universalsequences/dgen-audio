@@ -134,7 +134,7 @@ final class NeuralSynthTests: XCTestCase {
         // Combined loss: spectral + small MSE term
         // Scale up by 1e6 to get meaningful gradients (they're ~1e-6 otherwise)
         let lossRaw = g.n(.add, spectralLoss, g.n(.mul, mseLoss, g.n(.constant(0.1))))
-        let loss = g.n(.mul, lossRaw, g.n(.constant(1.0)))
+        let loss = g.n(.mul, lossRaw, g.n(.constant(1000.0)))
         _ = g.n(.output(0), loss)
 
         print("gonna try compiling")
@@ -165,7 +165,7 @@ final class NeuralSynthTests: XCTestCase {
         // With loss scaled up by 1e6, use normal learning rate
         let ctx = TrainingContext(
             tensorParameters: [W1, b1, W2, b2],
-            optimizer: Adam(lr: 0.3),
+            optimizer: Adam(lr: 0.001),
             lossNode: loss)
 
         print("initial memory")

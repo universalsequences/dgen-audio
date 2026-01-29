@@ -111,9 +111,6 @@ public class IRContext {
         let baseGradId = gradIdx + 1
         // Auto-detect if this node is frame-based from temporality analysis
         let isFrameBased = frameBasedNodes.contains(src)
-        // Debug: print node info
-        let opName = g.nodes[src].map { "\($0.op)" } ?? "unknown"
-        print("[GRAD] node=\(src) op=\(opName) size=\(size) baseGradId=\(baseGradId) frameBased=\(isFrameBased)")
         gradIdx += size  // Reserve `size` contiguous IDs
         tensorGradients[src] = baseGradId
         tensorGradientSizes[src] = size
@@ -128,46 +125,11 @@ public class IRContext {
         return baseGradId
     }
 
-    /// Compute total gradient buffer size with smart allocation.
+    /// Compute total gradient buffer size.
     /// Current layout: gradients[(gradId) * frameCount + threadIndex]
     /// So total buffer size = (maxGradId + 1) * frameCount
-    ///
-    /// For future optimization: track static vs frame-based gradients.
-    /// Static tensor gradients could use a different layout: gradients[staticOffset + tensorIndex]
-    /// This would reduce buffer from O(tensorSize * frameCount) to O(tensorSize) for static ops.
     public func computeGradientBufferSize(frameCount: Int) -> Int {
-        // Count static vs frame-based tensor gradients for diagnostics
-        var staticTensorGradCount = 0
-        var frameBasedTensorGradCount = 0
-        var staticTensorElements = 0
-        var frameBasedTensorElements = 0
-
-        for (nodeId, baseGradId) in tensorGradients {
-            let size = tensorGradientSizes[nodeId] ?? 1
-            if frameBasedGradients.contains(baseGradId) {
-                frameBasedTensorGradCount += 1
-                frameBasedTensorElements += size
-            } else {
-                staticTensorGradCount += 1
-                staticTensorElements += size
-            }
-        }
-
-        print("[GRAD BUFFER] Static tensors: \(staticTensorGradCount) (\(staticTensorElements) elements)")
-        print("[GRAD BUFFER] Frame-based tensors: \(frameBasedTensorGradCount) (\(frameBasedTensorElements) elements)")
-
-        // Current layout requires (maxGradId + 1) * frameCount
-        // With smart layout, static would only need staticTensorElements, saving:
-        // (staticTensorElements * frameCount) - staticTensorElements = staticTensorElements * (frameCount - 1)
         let currentSize = (maxGradId + 1) * frameCount
-        let smartSize = frameBasedTensorElements * frameCount + staticTensorElements
-        let savings = currentSize - smartSize
-        if savings > 0 {
-            print("[GRAD BUFFER] Potential savings with smart layout: \(savings) elements (\(savings * 4 / 1024 / 1024) MB)")
-        }
-
-        // For now, use current layout (all gradients are frame-based)
-        // TODO: Implement smart layout to reduce memory for static tensor gradients
         return 2 * currentSize  // 2x for safety margin
     }
 
