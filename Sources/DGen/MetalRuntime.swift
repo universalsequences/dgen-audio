@@ -422,16 +422,22 @@ public class MetalCompiledKernel: CompiledKernelRuntime {
 
         let tgMax = pipelineState.maxTotalThreadsPerThreadgroup
 
-        if kernel.kind == .scalar {
-          // exactly one thread
+        let totalThreads: Int
+        if let overrideThreads = kernel.threadCount {
+          totalThreads = max(1, overrideThreads)
+        } else if kernel.kind == .scalar {
+          totalThreads = 1
+        } else {
+          totalThreads = frameCount
+        }
+
+        if totalThreads == 1 {
           let threads = MTLSize(width: 1, height: 1, depth: 1)
           let tpg = MTLSize(width: 1, height: 1, depth: 1)
           computeEncoder.dispatchThreads(threads, threadsPerThreadgroup: tpg)
         } else {
-          // 1D over frames
-          let tpgW = min(kernel.threadGroupSize ?? 64, tgMax)  // pick a sane default, clamp to device cap
-          // Round up total threads to a multiple of tpgW
-          let total = MTLSize(width: frameCount, height: 1, depth: 1)
+          let tpgW = min(kernel.threadGroupSize ?? 64, tgMax, totalThreads)  // clamp to device cap
+          let total = MTLSize(width: totalThreads, height: 1, depth: 1)
           let tpg = MTLSize(width: tpgW, height: 1, depth: 1)
           computeEncoder.dispatchThreads(total, threadsPerThreadgroup: tpg)
         }

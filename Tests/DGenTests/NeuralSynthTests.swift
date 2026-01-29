@@ -363,6 +363,7 @@ final class NeuralSynthTests: XCTestCase {
         for (i, kernel) in compileResult.kernels.enumerated() {
             kernelDump += "// ===== KERNEL \(i): \(kernel.name) =====\n"
             kernelDump += "// ThreadGroupSize: \(kernel.threadGroupSize)\n"
+            kernelDump += "// ThreadCount: \(kernel.threadCount)\n"
             kernelDump += "// Buffers: \(kernel.buffers)\n\n"
             kernelDump += kernel.source
             kernelDump += "\n\n"

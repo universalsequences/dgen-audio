@@ -5,6 +5,11 @@ public class MetalRenderer: Renderer, UOpEmitter {
   var needsSegmenting = false
   var parallelRangeVars: Set<VarID> = []  // Track parallel range loop variable IDs
   var currentTemporality: Temporality = .frameBased  // Track temporality for gradient indexing
+  private enum ParallelRangeMode {
+    case loop      // Render as a for-loop (default)
+    case thread    // Render as a single-thread index (thread-parallel kernel)
+  }
+  private var parallelRangeMode: ParallelRangeMode = .loop
 
   public override init() {
   }
@@ -16,12 +21,22 @@ public class MetalRenderer: Renderer, UOpEmitter {
     totalMemorySlots: Int,
     name: String = "kernel"
   ) -> [CompiledKernel] {
-    return scheduleItems.enumerated().map { (i, scheduleItem) in
+    let expanded = scheduleItems.flatMap { splitStaticParallelRanges($0) }
+
+    return expanded.enumerated().map { (i, entry) in
+      let scheduleItem = entry.item
+      let parallelCount = entry.threadCount
+
       // Always use _0, _1 suffix to avoid 'kernel' being a reserved word in Metal
       let kernelName = "\(name)_\(i)"
+
+      // Render parallelRange loops as thread-parallel only for split static kernels
+      parallelRangeMode = parallelCount == nil ? .loop : .thread
       let source = render(
         name: kernelName, scheduleItem: scheduleItem, ctx: ctx, graph: graph,
         totalMemorySlots: totalMemorySlots)
+      parallelRangeMode = .loop
+
       let deps = analyzeDependencies(scheduleItem: scheduleItem, ctx: ctx)
       let allBuffers = Set(deps.inputs + deps.outputs)
 
@@ -69,15 +84,118 @@ public class MetalRenderer: Renderer, UOpEmitter {
         bufferNames.append("gradients")
       }
 
+      let threadGroupSize: Int? =
+        (scheduleItem.kind == .scalar && parallelCount == nil) ? 1 : nil
+
       return CompiledKernel(
         name: kernelName,
         source: source,
         kind: scheduleItem.kind,
         buffers: bufferNames,
-        threadGroupSize: scheduleItem.kind == .scalar ? 1 : nil,
+        threadGroupSize: threadGroupSize,
+        threadCount: parallelCount,
         memorySize: max(totalMemorySlots, 1024)  // Match memory size calculation from render method
       )
     }
+  }
+
+  private struct SplitScheduleItem {
+    let item: ScheduleItem
+    let threadCount: Int?
+  }
+
+  private func splitStaticParallelRanges(_ scheduleItem: ScheduleItem) -> [SplitScheduleItem] {
+    guard scheduleItem.temporality == .static_, scheduleItem.kind == .scalar else {
+      return [SplitScheduleItem(item: scheduleItem, threadCount: nil)]
+    }
+
+    let ops = scheduleItem.ops
+    guard let beginRangeIdx = ops.firstIndex(where: {
+      if case .beginRange = $0.op { return true }
+      return false
+    }),
+      let endRangeIdx = ops.lastIndex(where: {
+        if case .endRange = $0.op { return true }
+        return false
+      }),
+      beginRangeIdx < endRangeIdx
+    else {
+      return [SplitScheduleItem(item: scheduleItem, threadCount: nil)]
+    }
+
+    let prefixOps = Array(ops[0..<beginRangeIdx])
+    let coreOps = Array(ops[(beginRangeIdx + 1)..<endRangeIdx])
+
+    var segments: [(ops: [UOp], parallelCount: Int?)] = []
+    var current: [UOp] = []
+    var parallelDepth = 0
+    var currentParallelCount: Int? = nil
+
+    for op in coreOps {
+      switch op.op {
+      case let .beginParallelRange(count, _):
+        if parallelDepth == 0 {
+          if !current.isEmpty {
+            segments.append((ops: current, parallelCount: nil))
+            current.removeAll(keepingCapacity: true)
+          }
+          currentParallelCount = count
+        }
+        parallelDepth += 1
+        current.append(op)
+      case .endParallelRange:
+        current.append(op)
+        parallelDepth -= 1
+        if parallelDepth == 0 {
+          segments.append((ops: current, parallelCount: currentParallelCount))
+          current.removeAll(keepingCapacity: true)
+          currentParallelCount = nil
+        }
+      default:
+        current.append(op)
+      }
+    }
+
+    // Unbalanced parallel range - fall back to original kernel
+    if parallelDepth != 0 {
+      return [SplitScheduleItem(item: scheduleItem, threadCount: nil)]
+    }
+    if !current.isEmpty {
+      segments.append((ops: current, parallelCount: nil))
+    }
+
+    let hasParallel = segments.contains { $0.parallelCount != nil }
+    guard hasParallel else {
+      return [SplitScheduleItem(item: scheduleItem, threadCount: nil)]
+    }
+
+    // If there are scalar ops outside parallel ranges, avoid splitting to preserve local dependencies.
+    let hasNonParallelOps = segments.contains { $0.parallelCount == nil && !$0.ops.isEmpty }
+    if hasNonParallelOps {
+      return [SplitScheduleItem(item: scheduleItem, threadCount: nil)]
+    }
+
+    let beginRangeOp = ops[beginRangeIdx]
+    let endRangeOp = ops[endRangeIdx]
+
+    var splitItems: [SplitScheduleItem] = []
+    for segment in segments {
+      if segment.ops.isEmpty { continue }
+      let item = ScheduleItem(kind: scheduleItem.kind, temporality: scheduleItem.temporality)
+      item.ops.append(contentsOf: prefixOps)
+      if segment.parallelCount == nil {
+        item.ops.append(beginRangeOp)
+      }
+      item.ops.append(contentsOf: segment.ops)
+      if segment.parallelCount == nil {
+        item.ops.append(endRangeOp)
+      }
+      splitItems.append(SplitScheduleItem(item: item, threadCount: segment.parallelCount))
+    }
+
+    return splitItems.isEmpty
+      ? [SplitScheduleItem(item: scheduleItem, threadCount: nil)]
+      : splitItems
   }
 
   public override func prepareSchedule(
@@ -100,7 +218,11 @@ public class MetalRenderer: Renderer, UOpEmitter {
 
     for block in uopBlocks {
       // Check if we need to start a new kernel (different block kind or temporality)
-      let needsNewKernel = currentKind != block.kind || currentTemporality != block.temporality
+      // For static blocks, avoid fusing across blocks so we can parallelize each block independently.
+      let forceStaticSplit =
+        (block.temporality == .static_) && (currentTemporality == .static_)
+      let needsNewKernel =
+        currentKind != block.kind || currentTemporality != block.temporality || forceStaticSplit
       if needsNewKernel {
         // Close previous kernel if open
         if let schedule = currentSchedule {
@@ -621,6 +743,9 @@ public class MetalRenderer: Renderer, UOpEmitter {
         fatalError("beginParallelRange requires variable")
       }
       parallelRangeVars.insert(varId)  // Track this as a parallel range loop variable
+      if parallelRangeMode == .thread {
+        return "if (id < \(count)) { uint _pr\(varId) = id;"
+      }
       return "for (uint _pr\(varId) = 0; _pr\(varId) < \(count); _pr\(varId)++) {"
     case .endParallelRange:
       // IMPORTANT: Memory fence required for correctness on Metal.
@@ -638,6 +763,9 @@ public class MetalRenderer: Renderer, UOpEmitter {
       //
       // The fence ensures writes complete and are visible before the next frame's reads.
       // This matches how the C backend behaves (sequential consistency on CPU).
+      if parallelRangeMode == .thread {
+        return "}"
+      }
       return "} atomic_thread_fence(metal::mem_flags::mem_device, metal::memory_order_seq_cst);"
     case .parallelIndex:
       // Return the loop variable from the enclosing parallelRange
