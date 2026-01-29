@@ -215,10 +215,9 @@ public struct CompilationPipeline {
             inferTemporality(graph: graph, sortedNodes: sortedNodes)
         }
 
-        // TEMPORARILY DISABLED for testing
-        // finalBlocks = extractStaticOpsIntoBlocks(
-        //     blocks: finalBlocks, frameBasedNodes: temporalityResult.frameBasedNodes,
-        //     hopBasedNodes: temporalityResult.hopBasedNodes)
+        finalBlocks = extractStaticOpsIntoBlocks(
+            blocks: finalBlocks, frameBasedNodes: temporalityResult.frameBasedNodes,
+            hopBasedNodes: temporalityResult.hopBasedNodes)
 
         time("assignTemporality") {
             assignBlockTemporality(

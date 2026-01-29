@@ -4,6 +4,7 @@ public class MetalRenderer: Renderer, UOpEmitter {
   let memoryVarID = -1  // Virtual ID for the global memory buffer
   var needsSegmenting = false
   var parallelRangeVars: Set<VarID> = []  // Track parallel range loop variable IDs
+  var currentTemporality: Temporality = .frameBased  // Track temporality for gradient indexing
 
   public override init() {
   }
@@ -93,15 +94,19 @@ public class MetalRenderer: Renderer, UOpEmitter {
     // state (e.g., history read followed by sum must happen within the same frame loop).
     var currentSchedule: ScheduleItem? = nil
     var currentKind: Kind? = nil
+    var currentTemporality: Temporality? = nil
     var loopOpened = false
+    var hasFrameLoop = false  // Track if we opened a frame loop (static blocks don't have one)
 
     for block in uopBlocks {
-      // Check if we need to start a new kernel (different block kind)
-      if currentKind != block.kind {
+      // Check if we need to start a new kernel (different block kind or temporality)
+      let needsNewKernel = currentKind != block.kind || currentTemporality != block.temporality
+      if needsNewKernel {
         // Close previous kernel if open
         if let schedule = currentSchedule {
           if loopOpened {
-            if currentKind == .scalar {
+            // Only close the frame loop if we opened one (not for static blocks)
+            if hasFrameLoop && currentKind == .scalar {
               schedule.ops.append(UOp(op: .endLoop, value: .empty))
             }
             schedule.ops.append(UOp(op: .endRange, value: .empty))
@@ -110,7 +115,7 @@ public class MetalRenderer: Renderer, UOpEmitter {
         }
 
         // Start new kernel
-        let scheduleItem = ScheduleItem(kind: block.kind)
+        let scheduleItem = ScheduleItem(kind: block.kind, temporality: block.temporality)
         scheduleItem.ops.append(UOp(op: .frameCount, value: .empty))
 
         // Extract defineGlobals early
@@ -120,7 +125,17 @@ public class MetalRenderer: Renderer, UOpEmitter {
           }
         }
 
-        if block.kind == .scalar {
+        if case .static_ = block.temporality, block.kind == .scalar {
+          // Static SCALAR blocks: run once, no frame loop needed
+          // Single thread executes, no looping over frames
+          // NOTE: Static SIMD blocks still need parallel execution over tensor elements
+          var beginRange = UOp(
+            op: .beginRange(.constant(0, 0), .constant(0, 1)), value: .empty)
+          beginRange.kind = block.kind
+          scheduleItem.ops.append(beginRange)
+          // No beginLoop for static blocks - they execute once
+          hasFrameLoop = false
+        } else if block.kind == .scalar {
           // Scalar kernels: only thread 0 executes, then loops through frameCount
           var beginRange = UOp(
             op: .beginRange(.constant(0, 0), .constant(0, 1)), value: .empty)
@@ -141,15 +156,18 @@ public class MetalRenderer: Renderer, UOpEmitter {
           var beginLoop = UOp(op: .beginLoop(frameCountUOp, incr), value: .empty)
           beginLoop.kind = block.kind
           scheduleItem.ops.append(beginLoop)
+          hasFrameLoop = true
         } else {
           // SIMD kernels: each thread processes one frame, bound by frameCount
           var beginRange = UOp(op: .beginRange(.constant(0, 0), frameCountUOp), value: .empty)
           beginRange.kind = block.kind
           scheduleItem.ops.append(beginRange)
+          hasFrameLoop = true  // SIMD uses thread range as frame loop
         }
 
         currentSchedule = scheduleItem
         currentKind = block.kind
+        currentTemporality = block.temporality
         loopOpened = true
       }
 
@@ -167,7 +185,8 @@ public class MetalRenderer: Renderer, UOpEmitter {
     // Close the last kernel
     if let schedule = currentSchedule {
       if loopOpened {
-        if currentKind == .scalar {
+        // Only close the frame loop if we opened one (not for static blocks)
+        if hasFrameLoop && currentKind == .scalar {
           schedule.ops.append(UOp(op: .endLoop, value: .empty))
         }
         schedule.ops.append(UOp(op: .endRange, value: .empty))
@@ -182,6 +201,7 @@ public class MetalRenderer: Renderer, UOpEmitter {
   ) -> String {
     var kernels = ""
     parallelRangeVars.removeAll()  // Reset parallel range tracking for new kernel
+    currentTemporality = scheduleItem.temporality  // Set temporality for gradient indexing
     var (inputs, outputs) = analyzeDependencies(scheduleItem: scheduleItem, ctx: ctx)
 
     let hasOutputOps = scheduleItem.ops.contains { uop in
@@ -267,6 +287,11 @@ public class MetalRenderer: Renderer, UOpEmitter {
 
     self.needsSegmenting = bufferRequirements.needsSegmenting
 
+    // For static blocks, define i=0 since there's no frame loop
+    if case .static_ = currentTemporality {
+      kernels += "  uint i = 0; // Static block - no frame loop\n"
+    }
+
     for uop in scheduleItem.ops {
       var diff = 0
       switch uop.op {
@@ -296,7 +321,28 @@ public class MetalRenderer: Renderer, UOpEmitter {
     var outputs: Set<VarID> = []
     var needsMemory = false
 
+    // Helper to check if a Lazy value contains a global reference
+    func checkLazyForGlobal(_ lazy: Lazy) {
+      switch lazy {
+      case let .global(id):
+        // Global values need the tape buffer
+        inputs.insert(id)
+        outputs.insert(id)
+      case let .variable(id, _):
+        // Check if this variable is a global in the context
+        if ctx.globals.contains(id) {
+          inputs.insert(id)
+          outputs.insert(id)
+        }
+      default:
+        break
+      }
+    }
+
     for uop in scheduleItem.ops {
+      // Check the uop's value for global references
+      checkLazyForGlobal(uop.value)
+
       switch uop.op {
       case let .defineGlobal(varId):
         outputs.insert(varId)
@@ -459,16 +505,48 @@ public class MetalRenderer: Renderer, UOpEmitter {
     case let .store(cell, val): return "memory[\(cell)] = \(g(val));"
     case let .storeGradMemory(cell, val): return "grad_memory[\(cell)] = \(g(val));"
     case let .loadGrad(gradId):
-      return emitAssign(
-        uop, "gradients[frameCount * \(gradId) + \(uop.kind == .scalar ? "i" : "id")]", ctx)
+      if case .static_ = currentTemporality {
+        // Static blocks must sum gradients from all frames
+        let varName = emitLazy(uop.value, ctx: ctx, kind: uop.kind, isOut: true)
+        return """
+          float \(varName) = 0.0;
+          for (uint _gfi = 0; _gfi < frameCount; _gfi++) {
+            \(varName) += gradients[frameCount * \(gradId) + _gfi];
+          }
+        """
+      } else {
+        let idx = uop.kind == .scalar ? "i" : "id"
+        return emitAssign(uop, "gradients[frameCount * \(gradId) + \(idx)]", ctx)
+      }
     case let .accumulateGrad(gradId, val):
-      return
-        "gradients[frameCount*\(gradId)+\(uop.kind == .scalar ? "i" : "id")] += \(g(val));"
+      let idx: String
+      if case .static_ = currentTemporality {
+        idx = "0"
+      } else {
+        idx = uop.kind == .scalar ? "i" : "id"
+      }
+      return "gradients[frameCount*\(gradId)+\(idx)] += \(g(val));"
     case let .loadTensorGrad(baseGradId, indexLazy):
-      let idx = uop.kind == .scalar ? "i" : "id"
-      return emitAssign(uop, "gradients[frameCount*(\(baseGradId)+(int)(\(g(indexLazy))))+\(idx)]", ctx)
+      if case .static_ = currentTemporality {
+        // Static blocks must sum gradients from all frames
+        let varName = emitLazy(uop.value, ctx: ctx, kind: uop.kind, isOut: true)
+        return """
+          float \(varName) = 0.0;
+          for (uint _gfi = 0; _gfi < frameCount; _gfi++) {
+            \(varName) += gradients[frameCount*(\(baseGradId)+(int)(\(g(indexLazy))))+_gfi];
+          }
+        """
+      } else {
+        let idx = uop.kind == .scalar ? "i" : "id"
+        return emitAssign(uop, "gradients[frameCount*(\(baseGradId)+(int)(\(g(indexLazy))))+\(idx)]", ctx)
+      }
     case let .accumulateTensorGrad(baseGradId, indexLazy, valueLazy):
-      let idx = uop.kind == .scalar ? "i" : "id"
+      let idx: String
+      if case .static_ = currentTemporality {
+        idx = "0"
+      } else {
+        idx = uop.kind == .scalar ? "i" : "id"
+      }
       return "gradients[frameCount*(\(baseGradId)+(int)(\(g(indexLazy))))+\(idx)] += \(g(valueLazy));"
     case let .mutate(a, b):
       return "\(emitLazy(a, ctx: ctx, kind: uop.kind, isOut: true)) = \(g(b));"

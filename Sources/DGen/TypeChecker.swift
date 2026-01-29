@@ -396,6 +396,7 @@ public func allocateTensorOutputs(graph: Graph, sortedNodes: [NodeID]) {
 public func isIntrinsicallyFrameBased(_ op: LazyOp) -> Bool {
   switch op {
   case .phasor(_): return true  // oscillator state changes each frame
+  case .deterministicPhasor: return true  // parallelizable phasor, but output still varies per frame
   case .output(_): return true  // oscillator state changes each frame
   case .accum(_): return true  // accumulator state changes each frame
   case .input(_): return true  // audio input varies each frame

@@ -309,8 +309,10 @@ final class NeuralSynthTests: XCTestCase {
         }
 
         // Control-rate amplitude tensors (row-major layout)
-        let ampsPred = try mlpAmps(timeTensor: timeTensor, W1: W1.node(), b1: b1.node(), W2: W2.node(), b2: b2.node())
-        let ampsTarget = try mlpAmps(timeTensor: timeTensor, W1: teacherW1, b1: teacherB1, W2: teacherW2, b2: teacherB2)
+        let ampsPred = try mlpAmps(
+            timeTensor: timeTensor, W1: W1.node(), b1: b1.node(), W2: W2.node(), b2: b2.node())
+        let ampsTarget = try mlpAmps(
+            timeTensor: timeTensor, W1: teacherW1, b1: teacherB1, W2: teacherW2, b2: teacherB2)
 
         // Reshape to [numHarmonics, controlFrames] so peek(index=harmonic, channel=time)
         // maps to row-major offsets (time * numHarmonics + harmonic).
@@ -356,6 +358,19 @@ final class NeuralSynthTests: XCTestCase {
             cellAllocations: compileResult.cellAllocations,
             context: compileResult.context)
 
+        // Dump kernels for analysis
+        var kernelDump = "// Mini-DDSP Kernels - \(compileResult.kernels.count) total\n\n"
+        for (i, kernel) in compileResult.kernels.enumerated() {
+            kernelDump += "// ===== KERNEL \(i): \(kernel.name) =====\n"
+            kernelDump += "// ThreadGroupSize: \(kernel.threadGroupSize)\n"
+            kernelDump += "// Buffers: \(kernel.buffers)\n\n"
+            kernelDump += kernel.source
+            kernelDump += "\n\n"
+        }
+        try kernelDump.write(
+            toFile: "/tmp/miniddsp_control_kernels.metal", atomically: true, encoding: .utf8)
+        print("Wrote \(compileResult.kernels.count) kernels to /tmp/miniddsp_kernels.metal")
+
         let ctx = TrainingContext(
             tensorParameters: [W1, b1, W2, b2],
             optimizer: Adam(lr: 0.05),
@@ -374,8 +389,9 @@ final class NeuralSynthTests: XCTestCase {
         // Train
         let epochs = 40
         var finalLoss = initialLoss
-        for _ in 0..<epochs {
+        for i in 0..<epochs {
             finalLoss = ctx.runStepGPU()
+            print("epoch=\(i) loss=\(finalLoss)")
         }
         print("Control-rate MLP test - Initial loss: \(initialLoss), Final loss: \(finalLoss)")
 

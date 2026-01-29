@@ -31,9 +31,11 @@ public struct CompiledKernel {
 public class ScheduleItem {
     public var ops: [UOp] = []
     public let kind: Kind
+    public var temporality: Temporality = .frameBased
 
-    init(kind: Kind) {
+    init(kind: Kind, temporality: Temporality = .frameBased) {
         self.kind = kind
+        self.temporality = temporality
     }
 }
 
@@ -227,7 +229,7 @@ public class CRenderer: Renderer {
             }
 
             for uop in block.ops {
-                if case .defineGlobal = uop.op { continue }
+                // Don't skip defineGlobal - it needs to run through emit to mark loadedGlobal
                 scheduleItem.ops.append(UOp(op: uop.op, value: uop.value, kind: uop.kind))
             }
         }
@@ -407,6 +409,8 @@ public class CRenderer: Renderer {
         case .defineConstant(let constantId, let val):
             return "float32x4_t c\(constantId) = vdupq_n_f32(\(val)f);"
         case .defineGlobal(let varId):
+            // Mark as loaded so subsequent loadGlobal is skipped (variable will be defined by actual computation)
+            loadedGlobal[varId] = true
             return "/* t\(varId) declared globally */"
         case .defineMemory(let length):
             return "float memory[\(length)] __attribute__((aligned(16)));"
@@ -883,7 +887,15 @@ public class CRenderer: Renderer {
 
         case .threadIndex:
             // In C, threadIndex maps to the loop variable 'i'
-            return emitAssign(uop, "i", ctx)
+            // For SIMD, create a vector of sequential indices: {i, i+1, i+2, i+3}
+            if uop.kind == .simd {
+                let varId = extractVarId(uop.value)
+                varEmittedTypes[varId] = .float32x4
+                let lhs = emitLazy(uop.value, ctx: ctx, kind: uop.kind, isOut: true)
+                return "float32x4_t \(lhs) = (float32x4_t){(float)i, (float)(i+1), (float)(i+2), (float)(i+3)};"
+            } else {
+                return emitAssign(uop, "i", ctx)
+            }
 
         case .cast(let expr, let castType):
             let typeStr = castType == .int ? "int" : "float"
@@ -908,7 +920,7 @@ public class CRenderer: Renderer {
                 // if this global is required by a beginParallelRange element then we need
                 // a simd version where we
                 let simdVersion =
-                    "float32x4_t simd\(id) = vdupq_n_f32(t\(id)[i]); "
+                    "float32x4_t simd\(id) = vdupq_n_f32(t\(id)[i]); /* extra */"
                 let scalarVersion = emitAssign(uop, "t\(id)[i]", ctx)
                 return simdVersion + "\n    " + scalarVersion
             }
@@ -934,17 +946,19 @@ public class CRenderer: Renderer {
             }
             return emitAssign(uop, "_pr\(varId)", ctx, forceFloatType: true)
 
-        case let .loadGrad(gradId):
+        case .loadGrad(let gradId):
             return emitAssign(uop, "gradients[\(gradId) * frameCount + i]", ctx)
 
-        case let .accumulateGrad(gradId, val):
+        case .accumulateGrad(let gradId, let val):
             return "gradients[\(gradId) * frameCount + i] += \(g(val));"
 
-        case let .loadTensorGrad(baseGradId, indexLazy):
-            return emitAssign(uop, "gradients[(\(baseGradId)+(int)(\(g(indexLazy)))) * frameCount + i]", ctx)
+        case .loadTensorGrad(let baseGradId, let indexLazy):
+            return emitAssign(
+                uop, "gradients[(\(baseGradId)+(int)(\(g(indexLazy)))) * frameCount + i]", ctx)
 
-        case let .accumulateTensorGrad(baseGradId, indexLazy, valueLazy):
-            return "gradients[(\(baseGradId)+(int)(\(g(indexLazy)))) * frameCount + i] += \(g(valueLazy));"
+        case .accumulateTensorGrad(let baseGradId, let indexLazy, let valueLazy):
+            return
+                "gradients[(\(baseGradId)+(int)(\(g(indexLazy)))) * frameCount + i] += \(g(valueLazy));"
 
         // Hop-based execution: only run block when counter == 0
         case .beginHopCheck(let counterCell):
