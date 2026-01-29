@@ -20,9 +20,11 @@ public class MetalCompiledKernel: CompiledKernelRuntime {
 
   // Training kernel functions
   private var reduceGradientsFunction: MTLFunction?
+  private var reduceGradientsSumFunction: MTLFunction?
   private var updateParametersSGDFunction: MTLFunction?
   private var updateParametersAdamFunction: MTLFunction?
   private var reduceGradientsPSO: MTLComputePipelineState?
+  private var reduceGradientsSumPSO: MTLComputePipelineState?
   private var updateParametersSGDPSO: MTLComputePipelineState?
   private var updateParametersAdamPSO: MTLComputePipelineState?
 
@@ -78,6 +80,25 @@ public class MetalCompiledKernel: CompiledKernelRuntime {
               sum += g;
           }
           reducedGrads[gradId] = sum / float(frameCount);
+      }
+
+      kernel void reduceGradientsSum(
+          device const float* gradients [[buffer(0)]],
+          device float* reducedGradsSum [[buffer(1)]],
+          constant uint& frameCount [[buffer(2)]],
+          constant uint& numGradIds [[buffer(3)]],
+          uint gradId [[thread_position_in_grid]]
+      ) {
+          if (gradId >= numGradIds) return;
+
+          float sum = 0.0;
+          uint baseIdx = frameCount * gradId;
+          for (uint i = 0; i < frameCount; i++) {
+              float g = gradients[baseIdx + i];
+              if (!isfinite(g)) { g = 0.0; }
+              sum += g;
+          }
+          reducedGradsSum[gradId] = sum;
       }
 
       kernel void updateParametersSGD(
@@ -157,6 +178,7 @@ public class MetalCompiledKernel: CompiledKernelRuntime {
 
     // Get training kernel function references
     reduceGradientsFunction = library.makeFunction(name: "reduceGradients")
+    reduceGradientsSumFunction = library.makeFunction(name: "reduceGradientsSum")
     updateParametersSGDFunction = library.makeFunction(name: "updateParametersSGD")
     updateParametersAdamFunction = library.makeFunction(name: "updateParametersAdam")
 
@@ -170,6 +192,9 @@ public class MetalCompiledKernel: CompiledKernelRuntime {
     // Prebuild pipeline states for training kernels
     if let f = reduceGradientsFunction {
       reduceGradientsPSO = try device.makeComputePipelineState(function: f)
+    }
+    if let f = reduceGradientsSumFunction {
+      reduceGradientsSumPSO = try device.makeComputePipelineState(function: f)
     }
     if let f = updateParametersSGDFunction {
       updateParametersSGDPSO = try device.makeComputePipelineState(function: f)
@@ -190,6 +215,8 @@ public class MetalCompiledKernel: CompiledKernelRuntime {
       return maxFrameCount * context.globals.count
     } else if bufferName == "gradients" {
       return context.computeGradientBufferSize(frameCount: maxFrameCount)
+    } else if bufferName == "reducedGradsSum" || bufferName == "reducedGrads" {
+      return max(1, context.maxGradId + 1)
     } else {
       return maxFrameCount
     }
@@ -336,6 +363,16 @@ public class MetalCompiledKernel: CompiledKernelRuntime {
     for (index, kernel) in kernels.enumerated() {
       if firstDebug {
         print("   [DEBUG] Executing kernel \(index): \(kernel.name)  \(kernel.kind)")
+      }
+      if kernel.needsReducedGradsSum {
+        if let enc = sharedEncoder {
+          enc.endEncoding()
+          sharedEncoder = nil
+        }
+        encodeReduceGradientsSum(commandBuffer: commandBuffer, frameCount: frameCount)
+        if !debugGradients {
+          sharedEncoder = commandBuffer.makeComputeCommandEncoder()
+        }
       }
       // Pick encoder: shared if available (non-debug), otherwise one per kernel
       let computeEncoder: MTLComputeCommandEncoder
@@ -901,6 +938,44 @@ public class MetalCompiledKernel: CompiledKernelRuntime {
     commandBuffer.waitUntilCompleted()
 
     return reducedGradsBuffer
+  }
+
+  private func encodeReduceGradientsSum(commandBuffer: MTLCommandBuffer, frameCount: Int) {
+    guard let pipelineState = reduceGradientsSumPSO else { return }
+    guard let gradientsBuffer = bufferPool["gradients"] else { return }
+
+    let numGradIds = max(0, context.maxGradId + 1)
+    if numGradIds == 0 { return }
+
+    // Create or get reducedGradsSum buffer
+    let reducedGradsSize = numGradIds * MemoryLayout<Float>.size
+    if bufferPool["reducedGradsSum"] == nil
+      || bufferPool["reducedGradsSum"]!.length < reducedGradsSize
+    {
+      guard let buffer = device.makeBuffer(length: reducedGradsSize, options: .storageModeShared)
+      else {
+        return
+      }
+      bufferPool["reducedGradsSum"] = buffer
+    }
+
+    guard let reducedGradsSumBuffer = bufferPool["reducedGradsSum"] else { return }
+
+    guard let computeEncoder = commandBuffer.makeComputeCommandEncoder() else { return }
+    computeEncoder.setComputePipelineState(pipelineState)
+    computeEncoder.setBuffer(gradientsBuffer, offset: 0, index: 0)
+    computeEncoder.setBuffer(reducedGradsSumBuffer, offset: 0, index: 1)
+
+    var frameCountUInt = UInt32(frameCount)
+    var numGradIdsUInt = UInt32(numGradIds)
+    computeEncoder.setBytes(&frameCountUInt, length: MemoryLayout<UInt32>.size, index: 2)
+    computeEncoder.setBytes(&numGradIdsUInt, length: MemoryLayout<UInt32>.size, index: 3)
+
+    let threadsPerGrid = MTLSize(width: numGradIds, height: 1, depth: 1)
+    let threadsPerThreadgroup = MTLSize(
+      width: min(numGradIds, pipelineState.maxTotalThreadsPerThreadgroup), height: 1, depth: 1)
+    computeEncoder.dispatchThreads(threadsPerGrid, threadsPerThreadgroup: threadsPerThreadgroup)
+    computeEncoder.endEncoding()
   }
 
   // MARK: - Parameter + Memory helpers

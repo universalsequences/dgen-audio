@@ -26,6 +26,7 @@ public struct CompiledKernel {
     public let buffers: [String]  // names of inputs/outputs
     public let threadGroupSize: Int?  // for Metal: nil means runtime-determined, 1 for scalar
     public let threadCount: Int?  // for Metal: override total threads (non-frame dispatch)
+    public let needsReducedGradsSum: Bool
     public let memorySize: Int  // Required memory allocation size in floats
 }
 
@@ -164,6 +165,7 @@ public class CRenderer: Renderer {
                 buffers: buffers,
                 threadGroupSize: 1,  // C execution is scalar for now
                 threadCount: nil,
+                needsReducedGradsSum: false,
                 memorySize: computedMem  // Ensure at least enough for voiceCellId
             )
         }

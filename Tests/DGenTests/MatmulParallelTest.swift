@@ -122,4 +122,94 @@ final class MatmulParallelTest: XCTestCase {
         // Expected sum of matmul result = 610.0
         XCTAssertEqual(output[0], 610.0, accuracy: 0.001, "Matmul sum should be 610")
     }
+
+    func testMatmulParallelKernelsBackward() throws {
+        print("\n========================================")
+        print("🧪 testMatmulParallelKernelsBackward")
+        print("========================================")
+
+        let g = Graph()
+
+        // Learnable A: 2x3 matrix
+        let a = TensorParameter(
+            graph: g, shape: [2, 3],
+            data: [
+                1.0, 0.0, 0.0,
+                0.0, 1.0, 0.0,
+            ],
+            name: "A"
+        )
+
+        // Fixed B: 3x2 matrix
+        let b = g.tensor(
+            shape: [3, 2],
+            data: [
+                1.0, 2.0,
+                3.0, 4.0,
+                5.0, 6.0,
+            ])
+
+        let c = try g.matmul(a.node(), b)
+        let output = g.n(.sum, c)
+        let loss = g.n(.mse, output, g.n(.constant(30.0)))
+        _ = g.n(.output(0), loss)
+
+        let frameCount = 1
+        let compileResult = try CompilationPipeline.compile(
+            graph: g, backend: .metal,
+            options: .init(frameCount: frameCount, debug: true, backwards: true)
+        )
+
+        XCTAssertGreaterThan(compileResult.kernels.count, 0)
+
+        // Write backward kernels to file for inspection
+        let kernelPath = "/tmp/matmul_parallel_kernels_backward.metal"
+        var kernelSource = "// Generated kernels for testMatmulParallelKernelsBackward\n"
+        kernelSource += "// Total kernels: \(compileResult.kernels.count)\n\n"
+
+        for (i, kernel) in compileResult.kernels.enumerated() {
+            kernelSource += "// ========================================\n"
+            kernelSource += "// Kernel \(i): \(kernel.name)\n"
+            kernelSource += "// ThreadGroupSize: \(String(describing: kernel.threadGroupSize))\n"
+            kernelSource += "// ThreadCount: \(String(describing: kernel.threadCount))\n"
+            kernelSource += "// Buffers: \(kernel.buffers)\n"
+            kernelSource += "// ========================================\n"
+            kernelSource += kernel.source
+            kernelSource += "\n\n"
+        }
+
+        try kernelSource.write(toFile: kernelPath, atomically: true, encoding: .utf8)
+        print("📝 Wrote kernels to: \(kernelPath)")
+
+        let runtime = try MetalCompiledKernel(
+            kernels: compileResult.kernels,
+            cellAllocations: compileResult.cellAllocations,
+            context: compileResult.context,
+            frameCount: frameCount
+        )
+
+        let ctx = TrainingContext(
+            tensorParameters: [a],
+            optimizer: Adam(lr: 0.1),
+            lossNode: loss
+        )
+
+        ctx.initializeMemory(
+            runtime: runtime,
+            cellAllocations: compileResult.cellAllocations,
+            context: compileResult.context,
+            frameCount: frameCount,
+            graph: g
+        )
+
+        // One training step to compute gradients
+        let initialLoss = ctx.runStepGPU()
+        print("Initial loss: \(initialLoss)")
+
+        // Verify gradients are non-zero
+        XCTAssertTrue(
+            a.grads.contains { abs($0) > 0.001 },
+            "A gradients should be non-zero"
+        )
+    }
 }

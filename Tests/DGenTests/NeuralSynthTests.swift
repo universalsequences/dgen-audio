@@ -169,7 +169,7 @@ final class NeuralSynthTests: XCTestCase {
         // With loss scaled up by 1e6, use normal learning rate
         let ctx = TrainingContext(
             tensorParameters: [W1, b1, W2, b2],
-            optimizer: Adam(lr: 0.01),
+            optimizer: Adam(lr: 0.001),
             lossNode: loss)
 
         print("initial memory")
