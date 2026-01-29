@@ -228,23 +228,9 @@ final class PeekRowTests: XCTestCase {
             frameCount: frameCount,
             graph: g
         )
+        _ = ctx.runStepGPU()
 
-        let inputBuffer = [Float](repeating: 0.0, count: frameCount)
-        var outputBuffer = [Float](repeating: 0.0, count: frameCount)
-
-        ctx.zeroGrad()
-        inputBuffer.withUnsafeBufferPointer { inPtr in
-            outputBuffer.withUnsafeMutableBufferPointer { outPtr in
-                runtime.runWithMemory(
-                    outputs: outPtr.baseAddress!,
-                    inputs: inPtr.baseAddress!,
-                    memory: ctx.getMemory(),
-                    frameCount: frameCount
-                )
-            }
-        }
-
-        let grads = ctx.extractTensorGradients()
+        let grads = [tensorParam.grads]
         XCTAssertEqual(grads.count, 1)
 
         // Only row 1 should have gradients (indices 1, 4 in column-major layout)
@@ -305,26 +291,9 @@ final class PeekRowTests: XCTestCase {
             frameCount: frameCount,
             graph: g
         )
+        _ = ctx.runStepGPU()
 
-        let inputBuffer = [Float](repeating: 0.0, count: frameCount)
-        var outputBuffer = [Float](repeating: 0.0, count: frameCount)
-
-        ctx.zeroGrad()
-        inputBuffer.withUnsafeBufferPointer { inPtr in
-            outputBuffer.withUnsafeMutableBufferPointer { outPtr in
-                runtime.runWithMemory(
-                    outputs: outPtr.baseAddress!,
-                    inputs: inPtr.baseAddress!,
-                    memory: ctx.getMemory(),
-                    frameCount: frameCount
-                )
-            }
-        }
-
-        let grads = ctx.extractTensorGradients()
-        XCTAssertEqual(grads.count, 1)
-
-        let tensorGrads = grads[0]
+        let tensorGrads = tensorParam.grads
         XCTAssertEqual(tensorGrads.count, 4)
 
         // Both rows should have non-zero gradients due to interpolation
@@ -388,40 +357,14 @@ final class PeekRowTests: XCTestCase {
             graph: g
         )
 
-        let inputBuffer = [Float](repeating: 0.0, count: frameCount)
-        var outputBuffer = [Float](repeating: 0.0, count: frameCount)
-
         // Get initial loss
-        ctx.zeroGrad()
-        inputBuffer.withUnsafeBufferPointer { inPtr in
-            outputBuffer.withUnsafeMutableBufferPointer { outPtr in
-                runtime.runWithMemory(
-                    outputs: outPtr.baseAddress!,
-                    inputs: inPtr.baseAddress!,
-                    memory: ctx.getMemory(),
-                    frameCount: frameCount
-                )
-            }
-        }
-        let initialLoss = outputBuffer[0]
+        let initialLoss = ctx.runStepGPU()
 
         // Train for 100 epochs
+        var finalLoss = initialLoss
         for _ in 0..<100 {
-            ctx.step()
-            ctx.zeroGrad()
-            inputBuffer.withUnsafeBufferPointer { inPtr in
-                outputBuffer.withUnsafeMutableBufferPointer { outPtr in
-                    runtime.runWithMemory(
-                        outputs: outPtr.baseAddress!,
-                        inputs: inPtr.baseAddress!,
-                        memory: ctx.getMemory(),
-                        frameCount: frameCount
-                    )
-                }
-            }
+            finalLoss = ctx.runStepGPU()
         }
-
-        let finalLoss = outputBuffer[0]
 
         // Verify training reduced the loss significantly
         XCTAssertLessThan(finalLoss, initialLoss * 0.01, "Loss should decrease significantly")
@@ -521,41 +464,14 @@ final class PeekRowTests: XCTestCase {
             frameCount: frameCount,
             graph: g
         )
-
-        let inputBuffer = [Float](repeating: 0.0, count: frameCount)
-        var outputBuffer = [Float](repeating: 0.0, count: frameCount)
-
         // Get initial loss
-        ctx.zeroGrad()
-        inputBuffer.withUnsafeBufferPointer { inPtr in
-            outputBuffer.withUnsafeMutableBufferPointer { outPtr in
-                runtime.runWithMemory(
-                    outputs: outPtr.baseAddress!,
-                    inputs: inPtr.baseAddress!,
-                    memory: ctx.getMemory(),
-                    frameCount: frameCount
-                )
-            }
-        }
-        let initialLoss = outputBuffer.reduce(0, +) / Float(frameCount)
+        let initialLoss = ctx.runStepGPU()
 
         // Train
+        var finalLoss = initialLoss
         for _ in 0..<200 {
-            ctx.step()
-            ctx.zeroGrad()
-            inputBuffer.withUnsafeBufferPointer { inPtr in
-                outputBuffer.withUnsafeMutableBufferPointer { outPtr in
-                    runtime.runWithMemory(
-                        outputs: outPtr.baseAddress!,
-                        inputs: inPtr.baseAddress!,
-                        memory: ctx.getMemory(),
-                        frameCount: frameCount
-                    )
-                }
-            }
+            finalLoss = ctx.runStepGPU()
         }
-
-        let finalLoss = outputBuffer.reduce(0, +) / Float(frameCount)
 
         print("Neural LFO Test - Initial loss: \(initialLoss), Final loss: \(finalLoss)")
 
@@ -650,47 +566,19 @@ final class PeekRowTests: XCTestCase {
             frameCount: frameCount,
             graph: g
         )
-
-        let inputBuffer = [Float](repeating: 0.0, count: frameCount)
-        var outputBuffer = [Float](repeating: 0.0, count: frameCount)
-
         // Initial loss
-        ctx.zeroGrad()
-        inputBuffer.withUnsafeBufferPointer { inPtr in
-            outputBuffer.withUnsafeMutableBufferPointer { outPtr in
-                runtime.runWithMemory(
-                    outputs: outPtr.baseAddress!,
-                    inputs: inPtr.baseAddress!,
-                    memory: ctx.getMemory(),
-                    frameCount: frameCount
-                )
-            }
-        }
-        let initialLoss = outputBuffer.reduce(0, +) / Float(frameCount)
+        let initialLoss = ctx.runStepGPU()
 
         // Train
         let epochs = 300
+        var finalLoss = initialLoss
         for epoch in 0..<epochs {
-            ctx.step()
-            ctx.zeroGrad()
-            inputBuffer.withUnsafeBufferPointer { inPtr in
-                outputBuffer.withUnsafeMutableBufferPointer { outPtr in
-                    runtime.runWithMemory(
-                        outputs: outPtr.baseAddress!,
-                        inputs: inPtr.baseAddress!,
-                        memory: ctx.getMemory(),
-                        frameCount: frameCount
-                    )
-                }
-            }
+            finalLoss = ctx.runStepGPU()
 
             if epoch % 100 == 0 {
-                let loss = outputBuffer.reduce(0, +) / Float(frameCount)
-                print("Epoch \(epoch): loss = \(loss)")
+                print("Epoch \(epoch): loss = \(finalLoss)")
             }
         }
-
-        let finalLoss = outputBuffer.reduce(0, +) / Float(frameCount)
         print("Neural Synthesis Test - Initial: \(initialLoss), Final: \(finalLoss)")
 
         // Verify the model learned the piano envelope
@@ -813,48 +701,19 @@ final class PeekRowTests: XCTestCase {
             frameCount: frameCount,
             graph: g
         )
-
-        let inputBuffer = [Float](repeating: 0.0, count: frameCount)
-        var outputBuffer = [Float](repeating: 0.0, count: frameCount)
-
         // Initial loss
-        ctx.zeroGrad()
-        inputBuffer.withUnsafeBufferPointer { inPtr in
-            outputBuffer.withUnsafeMutableBufferPointer { outPtr in
-                runtime.runWithMemory(
-                    outputs: outPtr.baseAddress!,
-                    inputs: inPtr.baseAddress!,
-                    memory: ctx.getMemory(),
-                    frameCount: frameCount
-                )
-            }
-        }
-        let initialLoss = outputBuffer.reduce(0, +) / Float(frameCount)
+        let initialLoss = ctx.runStepGPU()
         print("Initial loss: \(initialLoss)")
 
         // Train
         let epochs = 100
+        var finalLoss = initialLoss
         for epoch in 0..<epochs {
-            ctx.step()
-            ctx.zeroGrad()
-            inputBuffer.withUnsafeBufferPointer { inPtr in
-                outputBuffer.withUnsafeMutableBufferPointer { outPtr in
-                    runtime.runWithMemory(
-                        outputs: outPtr.baseAddress!,
-                        inputs: inPtr.baseAddress!,
-                        memory: ctx.getMemory(),
-                        frameCount: frameCount
-                    )
-                }
-            }
-
+            finalLoss = ctx.runStepGPU()
             if epoch % 20 == 0 || epoch == epochs - 1 {
-                let loss = outputBuffer.reduce(0, +) / Float(frameCount)
-                print("Epoch \(epoch): loss = \(loss)")
+                print("Epoch \(epoch): loss = \(finalLoss)")
             }
         }
-
-        let finalLoss = outputBuffer.reduce(0, +) / Float(frameCount)
         print("Final loss: \(finalLoss)")
 
         // Verify learning happened
@@ -1019,48 +878,19 @@ final class PeekRowTests: XCTestCase {
             frameCount: frameCount,
             graph: g
         )
-
-        let inputBuffer = [Float](repeating: 0.0, count: frameCount)
-        var outputBuffer = [Float](repeating: 0.0, count: frameCount)
-
         // Initial loss
-        ctx.zeroGrad()
-        inputBuffer.withUnsafeBufferPointer { inPtr in
-            outputBuffer.withUnsafeMutableBufferPointer { outPtr in
-                runtime.runWithMemory(
-                    outputs: outPtr.baseAddress!,
-                    inputs: inPtr.baseAddress!,
-                    memory: ctx.getMemory(),
-                    frameCount: frameCount
-                )
-            }
-        }
-        let initialLoss = outputBuffer.reduce(0, +) / Float(frameCount)
+        let initialLoss = ctx.runStepGPU()
         print("Initial loss: \(initialLoss)")
 
         // Train
         let epochs = 200
+        var finalLoss = initialLoss
         for epoch in 0..<epochs {
-            ctx.step()
-            ctx.zeroGrad()
-            inputBuffer.withUnsafeBufferPointer { inPtr in
-                outputBuffer.withUnsafeMutableBufferPointer { outPtr in
-                    runtime.runWithMemory(
-                        outputs: outPtr.baseAddress!,
-                        inputs: inPtr.baseAddress!,
-                        memory: ctx.getMemory(),
-                        frameCount: frameCount
-                    )
-                }
-            }
-
+            finalLoss = ctx.runStepGPU()
             if epoch % 50 == 0 || epoch == epochs - 1 {
-                let loss = outputBuffer.reduce(0, +) / Float(frameCount)
-                print("Epoch \(epoch): loss = \(loss)")
+                print("Epoch \(epoch): loss = \(finalLoss)")
             }
         }
-
-        let finalLoss = outputBuffer.reduce(0, +) / Float(frameCount)
         print("Final loss: \(finalLoss)")
 
         // Count parameters

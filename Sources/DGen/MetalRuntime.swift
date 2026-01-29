@@ -938,6 +938,9 @@ public class MetalCompiledKernel: CompiledKernelRuntime {
     }
 
     let paramCount = gradIds.count
+    if paramCount == 0 {
+      return
+    }
 
     // Create or update gradIds buffer
     let gradIdsSize = paramCount * MemoryLayout<UInt32>.size
@@ -1049,6 +1052,9 @@ public class MetalCompiledKernel: CompiledKernelRuntime {
     }
 
     let paramCount = gradIds.count
+    if paramCount == 0 {
+      return
+    }
 
     // Create or update momentum buffers (m and v)
     let momentumSize = paramCount * MemoryLayout<Float>.size

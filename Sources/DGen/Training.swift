@@ -679,6 +679,26 @@ public class TrainingContext {
             tStart = CFAbsoluteTimeGetCurrent()
         }
 
+        if parameters.isEmpty {
+            if profEnabled {
+                let prev =
+                    lastProfile
+                    ?? StepProfile(
+                        zero: 0, fwdBwd: 0, reduce: 0, update: 0, readback: 0, syncHost: 0,
+                        total: 0)
+                lastProfile = StepProfile(
+                    zero: prev.zero,
+                    fwdBwd: prev.fwdBwd,
+                    reduce: tReduce,
+                    update: 0,
+                    readback: 0,
+                    syncHost: 0,
+                    total: 0
+                )
+            }
+            return
+        }
+
         // Debug: peek reduced gradient values for our params
         /*
         if let reducedGradsBuffer = runtime.getBuffer(name: "reducedGrads") {
@@ -818,13 +838,18 @@ public class TrainingContext {
         // Update parameters
         step()
 
-        // Return loss value (last frame)
-        return runtime.getLastOutput() ?? 0.0
+        // Return mean loss across frames (matches typical test usage)
+        let outputs = runtime.getOutputBuffer()
+        if outputs.isEmpty {
+            return 0.0
+        }
+        let sum = outputs.reduce(0.0, +)
+        return sum / Float(outputs.count)
     }
 
     /// Run a complete training step using GPU kernels for optimization
     /// - Returns: The loss value from this step
-    public func runStepGPU() -> Float {
+    public func runStepGPU(configureMemory: ((UnsafeMutablePointer<Float>) -> Void)? = nil) -> Float {
         guard let runtime = runtime else {
             fatalError("Runtime not initialized")
         }
@@ -840,12 +865,81 @@ public class TrainingContext {
             t0 = CFAbsoluteTimeGetCurrent()
         }
 
+        // Restore tensor parameter values into device memory (zeroGrad(deviceMemory: true) clears them)
+        if let memBuffer = runtime.getBuffer(name: "memory") {
+            let gpuMemPtr = memBuffer.contents().assumingMemoryBound(to: Float.self)
+
+            // Restore non-parameter tensor constants so runStepGPU matches CPU memory setup
+            if let g = graph {
+                let paramTensorIds = Set(tensorParameters.map { $0.tensorId })
+                for (_, tensor) in g.tensors {
+                    guard let data = tensor.data else { continue }
+                    if paramTensorIds.contains(tensor.id) { continue }
+                    let physicalCell =
+                        cellAllocations?.cellMappings[tensor.cellId] ?? tensor.cellId
+                    let count = min(data.count, tensor.size)
+                    for i in 0..<count {
+                        gpuMemPtr[physicalCell + i] = data[i]
+                    }
+                }
+            }
+
+            // Restore tensor parameter values into device memory (zeroGrad(deviceMemory: true) clears them)
+            if !tensorParameters.isEmpty {
+                for tensorParam in tensorParameters {
+                    let physicalCell =
+                        cellAllocations?.cellMappings[tensorParam.cellId] ?? tensorParam.cellId
+                    for i in 0..<tensorParam.size {
+                        gpuMemPtr[physicalCell + i] = tensorParam.data[i]
+                    }
+                }
+            }
+        }
+
+        // Optionally write external inputs into device memory after zeroing
+        if let configureMemory = configureMemory, let memBuffer = runtime.getBuffer(name: "memory") {
+            let memPtr = memBuffer.contents().assumingMemoryBound(to: Float.self)
+            configureMemory(memPtr)
+        }
+
         // Forward + backward pass
         runtime.runNoCopy(frameCount: frameCount)
         if profEnabled { fwdTime = CFAbsoluteTimeGetCurrent() - t0 }
 
-        // Update parameters using GPU
+        // Update scalar parameters using GPU
         stepGPU()
+
+        // Update tensor parameters on CPU (tensor GPU update not implemented yet)
+        if !tensorParameters.isEmpty {
+            let tensorGradients = extractTensorGradients()
+            for (i, tensorParam) in tensorParameters.enumerated() {
+                tensorParam.grads = tensorGradients[i]
+            }
+            optimizer.stepTensor(tensorParams: &tensorParameters, gradients: tensorGradients)
+
+            // Sync updated tensor parameters into host memory
+            if let mem = self.memory, let cellAlloc = self.cellAllocations {
+                let memPtr = mem.assumingMemoryBound(to: Float.self)
+                for tensorParam in tensorParameters {
+                    let physicalCell = cellAlloc.cellMappings[tensorParam.cellId] ?? tensorParam.cellId
+                    for i in 0..<tensorParam.size {
+                        memPtr[physicalCell + i] = tensorParam.data[i]
+                    }
+                }
+            }
+
+            // Mirror tensor params into the device memory buffer
+            if let memBuffer = runtime.getBuffer(name: "memory") {
+                let gpuMemPtr = memBuffer.contents().assumingMemoryBound(to: Float.self)
+                for tensorParam in tensorParameters {
+                    let physicalCell =
+                        cellAllocations?.cellMappings[tensorParam.cellId] ?? tensorParam.cellId
+                    for i in 0..<tensorParam.size {
+                        gpuMemPtr[physicalCell + i] = tensorParam.data[i]
+                    }
+                }
+            }
+        }
 
         if profEnabled {
             // Merge timings from stepGPU

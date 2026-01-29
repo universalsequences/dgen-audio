@@ -5,75 +5,75 @@
 ///
 /// Example: [2,3] strides [1,2] (transposed) -> [1,2,3] should give strides [6,1,2]
 func adaptStridesForReshape(inputShape: [Int], inputStrides: [Int], newShape: [Int]) -> [Int] {
-    // Check if input is contiguous (row-major)
-    let expectedContiguousStrides = Tensor.computeRowMajorStrides(inputShape)
-    let isContiguous = (inputStrides == expectedContiguousStrides)
+  // Check if input is contiguous (row-major)
+  let expectedContiguousStrides = Tensor.computeRowMajorStrides(inputShape)
+  let isContiguous = (inputStrides == expectedContiguousStrides)
 
-    if isContiguous {
-        // Input is contiguous, compute fresh row-major strides
-        return Tensor.computeRowMajorStrides(newShape)
-    }
-
-    // Non-contiguous input - try to adapt strides
-    // This works when we're only adding/removing dimensions of size 1
-
-    let inputNonOnes = inputShape.filter { $0 != 1 }
-    let newNonOnes = newShape.filter { $0 != 1 }
-
-    // If the non-1 dimensions match, we can adapt strides
-    if inputNonOnes == newNonOnes {
-        var newStrides = [Int]()
-        var inputIdx = 0
-
-        for dim in newShape {
-            if dim == 1 {
-                // New dimension of size 1 - stride doesn't matter (use product of remaining)
-                let remainingProduct = newShape.suffix(from: newStrides.count + 1).reduce(1, *)
-                newStrides.append(remainingProduct)
-            } else {
-                // Find corresponding stride from input
-                while inputIdx < inputShape.count && inputShape[inputIdx] == 1 {
-                    inputIdx += 1
-                }
-                if inputIdx < inputStrides.count {
-                    newStrides.append(inputStrides[inputIdx])
-                    inputIdx += 1
-                }
-            }
-        }
-        return newStrides
-    }
-
-    // Fallback: this reshape requires a copy (not supported as view)
-    // For now, just compute row-major strides
+  if isContiguous {
+    // Input is contiguous, compute fresh row-major strides
     return Tensor.computeRowMajorStrides(newShape)
+  }
+
+  // Non-contiguous input - try to adapt strides
+  // This works when we're only adding/removing dimensions of size 1
+
+  let inputNonOnes = inputShape.filter { $0 != 1 }
+  let newNonOnes = newShape.filter { $0 != 1 }
+
+  // If the non-1 dimensions match, we can adapt strides
+  if inputNonOnes == newNonOnes {
+    var newStrides = [Int]()
+    var inputIdx = 0
+
+    for dim in newShape {
+      if dim == 1 {
+        // New dimension of size 1 - stride doesn't matter (use product of remaining)
+        let remainingProduct = newShape.suffix(from: newStrides.count + 1).reduce(1, *)
+        newStrides.append(remainingProduct)
+      } else {
+        // Find corresponding stride from input
+        while inputIdx < inputShape.count && inputShape[inputIdx] == 1 {
+          inputIdx += 1
+        }
+        if inputIdx < inputStrides.count {
+          newStrides.append(inputStrides[inputIdx])
+          inputIdx += 1
+        }
+      }
+    }
+    return newStrides
+  }
+
+  // Fallback: this reshape requires a copy (not supported as view)
+  // For now, just compute row-major strides
+  return Tensor.computeRowMajorStrides(newShape)
 }
 
 /// NumPy-style broadcasting: computes the output shape when two shapes are broadcast together.
 /// Returns nil if the shapes are not broadcastable.
 /// Example: [2, 1, 3] + [1, 2, 3] -> [2, 2, 3]
 public func broadcastShapes(_ s1: [Int], _ s2: [Int]) -> [Int]? {
-    // Pad shorter shape with 1s on the left
-    let maxLen = max(s1.count, s2.count)
-    let padded1 = Array(repeating: 1, count: maxLen - s1.count) + s1
-    let padded2 = Array(repeating: 1, count: maxLen - s2.count) + s2
+  // Pad shorter shape with 1s on the left
+  let maxLen = max(s1.count, s2.count)
+  let padded1 = Array(repeating: 1, count: maxLen - s1.count) + s1
+  let padded2 = Array(repeating: 1, count: maxLen - s2.count) + s2
 
-    var result = [Int]()
-    for i in 0..<maxLen {
-        let d1 = padded1[i]
-        let d2 = padded2[i]
-        if d1 == d2 {
-            result.append(d1)
-        } else if d1 == 1 {
-            result.append(d2)
-        } else if d2 == 1 {
-            result.append(d1)
-        } else {
-            // Incompatible dimensions
-            return nil
-        }
+  var result = [Int]()
+  for i in 0..<maxLen {
+    let d1 = padded1[i]
+    let d2 = padded2[i]
+    if d1 == d2 {
+      result.append(d1)
+    } else if d1 == 1 {
+      result.append(d2)
+    } else if d2 == 1 {
+      result.append(d1)
+    } else {
+      // Incompatible dimensions
+      return nil
     }
-    return result
+  }
+  return result
 }
 
 public func inferShape(op: LazyOp, inputs: [ValueShape], graph: Graph) throws -> ValueShape {
@@ -126,7 +126,8 @@ public func inferShape(op: LazyOp, inputs: [ValueShape], graph: Graph) throws ->
     let ndim = shape.count
     let normalizedAxis = axis < 0 ? ndim + axis : axis
     guard normalizedAxis >= 0 && normalizedAxis < ndim else {
-      throw DGenError.shapeInferenceFailed(op: "sumAxis", reason: "axis \(axis) out of range for \(ndim)D tensor")
+      throw DGenError.shapeInferenceFailed(
+        op: "sumAxis", reason: "axis \(axis) out of range for \(ndim)D tensor")
     }
     var outputShape = shape
     outputShape.remove(at: normalizedAxis)
@@ -184,8 +185,9 @@ public func inferShape(op: LazyOp, inputs: [ValueShape], graph: Graph) throws ->
   // PeekRow - reads an entire row from a 2D tensor with interpolation
   case .peekRow:
     guard let firstInput = inputs.first,
-          case .tensor(let shape) = firstInput,
-          shape.count == 2 else {
+      case .tensor(let shape) = firstInput,
+      shape.count == 2
+    else {
       throw DGenError.shapeInferenceFailed(op: "peekRow", reason: "requires 2D tensor input")
     }
     return .tensor([shape[1]])  // Output is [numCols]
@@ -272,7 +274,7 @@ public func allocateTensorOutputs(graph: Graph, sortedNodes: [NodeID]) {
         // Update the cell allocation size (the memory remapping will handle the actual layout)
         graph.cellAllocationSizes[originalCellId] = size
       }
-      // Continue to allocate output tensor below
+    // Continue to allocate output tensor below
 
     default:
       break
@@ -282,8 +284,9 @@ public func allocateTensorOutputs(graph: Graph, sortedNodes: [NodeID]) {
     switch node.op {
     case .reshape(let newShape):
       guard let inputId = node.inputs.first,
-            let inputTensorId = graph.nodeToTensor[inputId],
-            let inputTensor = graph.tensors[inputTensorId] else { continue }
+        let inputTensorId = graph.nodeToTensor[inputId],
+        let inputTensor = graph.tensors[inputTensorId]
+      else { continue }
 
       let newStrides = adaptStridesForReshape(
         inputShape: inputTensor.shape,
@@ -306,8 +309,9 @@ public func allocateTensorOutputs(graph: Graph, sortedNodes: [NodeID]) {
 
     case .transpose(let axes):
       guard let inputId = node.inputs.first,
-            let inputTensorId = graph.nodeToTensor[inputId],
-            let inputTensor = graph.tensors[inputTensorId] else { continue }
+        let inputTensorId = graph.nodeToTensor[inputId],
+        let inputTensor = graph.tensors[inputTensorId]
+      else { continue }
 
       let perm = axes.isEmpty ? Array((0..<inputTensor.shape.count).reversed()) : axes
       let newStrides = perm.map { inputTensor.strides[$0] }
@@ -327,8 +331,9 @@ public func allocateTensorOutputs(graph: Graph, sortedNodes: [NodeID]) {
 
     case .shrink(let ranges):
       guard let inputId = node.inputs.first,
-            let inputTensorId = graph.nodeToTensor[inputId],
-            let inputTensor = graph.tensors[inputTensorId] else { continue }
+        let inputTensorId = graph.nodeToTensor[inputId],
+        let inputTensor = graph.tensors[inputTensorId]
+      else { continue }
 
       var offset = inputTensor.offset
       for (dim, range) in ranges.enumerated() {
@@ -352,8 +357,9 @@ public func allocateTensorOutputs(graph: Graph, sortedNodes: [NodeID]) {
 
     case .pad(let padding):
       guard let inputId = node.inputs.first,
-            let inputTensorId = graph.nodeToTensor[inputId],
-            let inputTensor = graph.tensors[inputTensorId] else { continue }
+        let inputTensorId = graph.nodeToTensor[inputId],
+        let inputTensor = graph.tensors[inputTensorId]
+      else { continue }
 
       let tensorId = graph.nextTensorId
       graph.nextTensorId += 1
@@ -508,11 +514,6 @@ public func inferTemporality(graph: Graph, sortedNodes: [NodeID]) -> Temporality
   return TemporalityResult(frameBasedNodes: frameBasedNodes, hopBasedNodes: hopBasedNodes)
 }
 
-/// Legacy version for backwards compatibility - returns only frame-based nodes
-public func inferTemporalityFrameBasedOnly(graph: Graph, sortedNodes: [NodeID]) -> Set<NodeID> {
-  return inferTemporality(graph: graph, sortedNodes: sortedNodes).frameBasedNodes
-}
-
 /// Assign temporality to blocks based on their nodes.
 /// A block is:
 /// - frameBased if ANY of its nodes is frame-based
@@ -550,10 +551,90 @@ public func assignBlockTemporality(
   }
 }
 
-/// Legacy version for backwards compatibility - only considers frame-based nodes
-public func assignBlockTemporality(blocks: inout [Block], frameBasedNodes: Set<NodeID>) {
-  for i in 0..<blocks.count {
-    let hasFrameBasedNode = blocks[i].nodes.contains { frameBasedNodes.contains($0) }
-    blocks[i].temporality = hasFrameBasedNode ? .frameBased : .static_
+public func splitBlockByStaticIfPossible(
+  block: Block,
+  frameBasedNodes: Set<NodeID>,
+  hopBasedNodes: [NodeID: (Int, CellID)]
+) -> [Block] {
+  func isStatic(_ node: NodeID) -> Bool {
+    return hopBasedNodes[node] == nil && !frameBasedNodes.contains(node)
   }
+  func initBlock(temporality: Temporality?) -> Block {
+    var b = Block(kind: block.kind)
+    if let temporality = temporality {
+      b.temporality = temporality
+    }
+    b.shape = block.shape
+    b.direction = block.direction
+    b.tensorIndex = block.tensorIndex
+    return b
+  }
+
+  var blocks: [Block] = []
+  var currentBlock = initBlock(temporality: nil)
+  var currentTemporality: Temporality? = nil
+  for node in block.nodes {
+    if isStatic(node) {
+      if let temporality = currentTemporality,
+        case .static_ = temporality
+      {
+      } else if currentTemporality == nil {
+        // initial case
+        currentBlock.temporality = .static_
+      } else {
+        // temporality changed
+        if currentBlock.nodes.count > 0 {
+          blocks.append(currentBlock)
+        }
+        currentBlock = initBlock(temporality: .static_)
+      }
+      currentTemporality = .static_
+    } else {
+      if let temporality = currentTemporality,
+        case .frameBased = temporality
+      {
+      } else if currentTemporality == nil {
+        // initial case
+        currentBlock.temporality = .frameBased
+      } else {
+        if currentBlock.nodes.count > 0 {
+          blocks.append(currentBlock)
+        }
+        currentBlock = initBlock(temporality: .frameBased)
+      }
+      currentTemporality = .frameBased
+    }
+    currentBlock.nodes.append(node)
+  }
+
+  if currentBlock.nodes.count > 0 {
+    blocks.append(currentBlock)
+  }
+
+  print("EXTRACTED BLOCK into \(blocks.count)")
+  if blocks.count > 1 {
+    for (i, block) in blocks.enumerated() {
+      print("block \(i)")
+      print(block)
+    }
+  }
+  return blocks
+}
+
+public func extractStaticOpsIntoBlocks(
+  blocks: [Block],
+  frameBasedNodes: Set<NodeID>,
+  hopBasedNodes: [NodeID: (Int, CellID)]
+) -> [Block] {
+  var extractedBlocks: [Block] = []
+
+  for block in blocks {
+    for b in splitBlockByStaticIfPossible(
+      block: block, frameBasedNodes: frameBasedNodes, hopBasedNodes: hopBasedNodes)
+    {
+      extractedBlocks.append(b)
+    }
+    // find groups of ops that contain static
+  }
+  return extractedBlocks
 }

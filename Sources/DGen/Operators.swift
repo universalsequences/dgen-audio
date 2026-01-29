@@ -85,8 +85,9 @@ func emitBinaryOpBackward(
     if lhsIsTensor && rhsIsTensor {
         // Tensor op Tensor (element-wise)
         guard case .tensor(let lhsShape) = lhsNode?.shape,
-              case .tensor(let rhsShape) = rhsNode?.shape,
-              case .tensor(let outShape) = node.shape else {
+            case .tensor(let rhsShape) = rhsNode?.shape,
+            case .tensor(let outShape) = node.shape
+        else {
             fatalError("Expected tensor shapes")
         }
 
@@ -95,9 +96,10 @@ func emitBinaryOpBackward(
         let outSize = outShape.reduce(1, *)
 
         guard let lhsTensorId = g.nodeToTensor[lhsNodeId],
-              let lhsTensor = g.tensors[lhsTensorId],
-              let rhsTensorId = g.nodeToTensor[rhsNodeId],
-              let rhsTensor = g.tensors[rhsTensorId] else {
+            let lhsTensor = g.tensors[lhsTensorId],
+            let rhsTensorId = g.nodeToTensor[rhsNodeId],
+            let rhsTensor = g.tensors[rhsTensorId]
+        else {
             fatalError("Could not find tensors for backward")
         }
 
@@ -111,8 +113,10 @@ func emitBinaryOpBackward(
             // Use proper strided reads for view tensors
             b.parallelRange(outSize) { idx in
                 let gradOut = b.loadTensorGrad(node.id, index: idx)
-                let lhsVal = b.readTensorWithStrides(tensor: lhsTensor, flatIdx: idx, shape: lhsShape)
-                let rhsVal = b.readTensorWithStrides(tensor: rhsTensor, flatIdx: idx, shape: rhsShape)
+                let lhsVal = b.readTensorWithStrides(
+                    tensor: lhsTensor, flatIdx: idx, shape: lhsShape)
+                let rhsVal = b.readTensorWithStrides(
+                    tensor: rhsTensor, flatIdx: idx, shape: rhsShape)
 
                 let gLhs = gradLhs(gradOut, lhsVal, rhsVal)
                 let gRhs = gradRhs(gradOut, lhsVal, rhsVal)
@@ -147,7 +151,8 @@ func emitBinaryOpBackward(
 
                 for dim in 0..<outShape.count {
                     // Use floorDiv for integer division when computing coordinates from flat indices
-                    let coord = b.mod(b.floorDiv(outIdx, b.int(outStrides[dim])), b.int(outShape[dim]))
+                    let coord = b.mod(
+                        b.floorDiv(outIdx, b.int(outStrides[dim])), b.int(outShape[dim]))
 
                     // lhs: map output dim to input dim (right-aligned)
                     let lhsDim = dim - lhsOffset
@@ -181,11 +186,14 @@ func emitBinaryOpBackward(
 
     } else if lhsIsTensor && !rhsIsTensor {
         // Tensor op Scalar
-        guard case .tensor(let lhsShape) = lhsNode?.shape else { fatalError("Expected tensor shape") }
+        guard case .tensor(let lhsShape) = lhsNode?.shape else {
+            fatalError("Expected tensor shape")
+        }
         let lhsSize = lhsShape.reduce(1, *)
 
         guard let lhsTensorId = g.nodeToTensor[lhsNodeId],
-              let lhsTensor = g.tensors[lhsTensorId] else {
+            let lhsTensor = g.tensors[lhsTensorId]
+        else {
             fatalError("Could not find tensor for backward")
         }
 
@@ -214,11 +222,14 @@ func emitBinaryOpBackward(
 
     } else if !lhsIsTensor && rhsIsTensor {
         // Scalar op Tensor
-        guard case .tensor(let rhsShape) = rhsNode?.shape else { fatalError("Expected tensor shape") }
+        guard case .tensor(let rhsShape) = rhsNode?.shape else {
+            fatalError("Expected tensor shape")
+        }
         let rhsSize = rhsShape.reduce(1, *)
 
         guard let rhsTensorId = g.nodeToTensor[rhsNodeId],
-              let rhsTensor = g.tensors[rhsTensorId] else {
+            let rhsTensor = g.tensors[rhsTensorId]
+        else {
             fatalError("Could not find tensor for backward")
         }
 
@@ -283,7 +294,8 @@ func emitUnaryOpBackward(
         let size = inputShape.reduce(1, *)
 
         guard let tensorId = g.nodeToTensor[inputNodeId],
-              let tensor = g.tensors[tensorId] else {
+            let tensor = g.tensors[tensorId]
+        else {
             fatalError("Could not find tensor for backward")
         }
 
@@ -335,14 +347,14 @@ public enum LazyOp {
     case seq  // Sequential execution - returns value of last input
 
     // Tensor operations (historyRead/historyWrite handle tensors automatically based on cell size)
-    case conv1d(Int)    // 1D convolution, Int is kernel size
+    case conv1d(Int)  // 1D convolution, Int is kernel size
     case conv2d(Shape)  // 2D convolution, Shape is kernel shape [kH, kW]
     case sum  // Reduce tensor to scalar by summing all elements
     case sumAxis(Int)  // Reduce along a specific axis
     case reshape(Shape)  // Reshape tensor (metadata only, no data movement)
     case transpose([Int])  // Transpose/permute axes (metadata only)
     case shrink([(Int, Int)?])  // Shrink/slice tensor (metadata only, no data movement)
-    case pad([(Int, Int)])      // Pad tensor with zeros (virtual view, conditional reads)
+    case pad([(Int, Int)])  // Pad tensor with zeros (virtual view, conditional reads)
     case peek  // Read from 2D tensor at (index, channel) with interpolation - lazy version
     case peekRow  // Read entire row from 2D tensor with interpolation - outputs 1D tensor
     case fft(Int, Int, CellID, CellID, CellID, CellID)  // FFT transform: windowSize, hopSize, scratchCell, ringBufferCell, writePosCell, counterCell
@@ -536,7 +548,7 @@ public enum LazyOp {
             let (a, b2) = b.values(inputs, count: 2)
             b.use(val: u_mse(a, b2)(b))
 
-        case let .spectralLossPass1(windowSize, scratchCell):
+        case .spectralLossPass1(let windowSize, let scratchCell):
             guard inputs.count == 2 else {
                 throw DGenError.insufficientInputs(
                     operator: "spectralLossPass1", expected: 2, actual: inputs.count)
@@ -780,7 +792,7 @@ public enum LazyOp {
 
                 // Phasor accumulator logic with indexed state
                 // Uses gswitch instead of if statements for SIMD compatibility
-                let sampleRate = b.constant(44100.0)
+                let sampleRate = b.constant(b.ctx.g.sampleRate)
                 let incr = freq / sampleRate
                 let zero = b.constant(0.0)
                 let one = b.constant(1.0)
@@ -865,7 +877,8 @@ public enum LazyOp {
                 let inTensor = g.nodeToTensor[node.inputs[0]].flatMap({ g.tensors[$0] }),
                 let kTensor = g.nodeToTensor[node.inputs[1]].flatMap({ g.tensors[$0] })
             else {
-                throw DGenError.tensorError(op: "conv1d", reason: "requires 1D input/output tensors")
+                throw DGenError.tensorError(
+                    op: "conv1d", reason: "requires 1D input/output tensors")
             }
 
             let inLen = inShape[0]
@@ -881,7 +894,8 @@ public enum LazyOp {
 
                     let rawIdx = b.tensorMemoryIndex(inTensor, indices: [b.cast(inX, to: .int)])
                     let safeIdx = b.gswitch(inBounds, rawIdx, b.constant(0))
-                    let inVal = b.gswitch(inBounds, b.memoryRead(inTensor.cellId, safeIdx), b.constant(0))
+                    let inVal = b.gswitch(
+                        inBounds, b.memoryRead(inTensor.cellId, safeIdx), b.constant(0))
 
                     let kMemIdx = b.tensorMemoryIndex(kTensor, indices: [b.cast(kx, to: .int)])
                     let kVal = b.memoryRead(kTensor.cellId, kMemIdx)
@@ -921,11 +935,14 @@ public enum LazyOp {
                             (inY >= b.constant(0)) * (inY < b.constant(Float(inH)))
                             * (inX >= b.constant(0)) * (inX < b.constant(Float(inW)))
 
-                        let rawIdx = b.tensorMemoryIndex(inTensor, indices: [b.cast(inY, to: .int), b.cast(inX, to: .int)])
+                        let rawIdx = b.tensorMemoryIndex(
+                            inTensor, indices: [b.cast(inY, to: .int), b.cast(inX, to: .int)])
                         let safeIdx = b.gswitch(inBounds, rawIdx, b.constant(0))
-                        let inVal = b.gswitch(inBounds, b.memoryRead(inTensor.cellId, safeIdx), b.constant(0))
+                        let inVal = b.gswitch(
+                            inBounds, b.memoryRead(inTensor.cellId, safeIdx), b.constant(0))
 
-                        let kMemIdx = b.tensorMemoryIndex(kTensor, indices: [b.cast(ky, to: .int), b.cast(kx, to: .int)])
+                        let kMemIdx = b.tensorMemoryIndex(
+                            kTensor, indices: [b.cast(ky, to: .int), b.cast(kx, to: .int)])
                         let kVal = b.memoryRead(kTensor.cellId, kMemIdx)
 
                         acc.accumulate(inVal * kVal)
@@ -1025,15 +1042,17 @@ public enum LazyOp {
             // Lazy peek: read from 2D tensor at (index, channel) with linear interpolation
             // Inputs: [tensor, index, channel]
             guard node.inputs.count == 3 else {
-                throw DGenError.insufficientInputs(operator: "peek", expected: 3, actual: node.inputs.count)
+                throw DGenError.insufficientInputs(
+                    operator: "peek", expected: 3, actual: node.inputs.count)
             }
 
             let tensorInput = node.inputs[0]
 
             // Get tensor shape from the input node
             guard let inputNode = g.nodes[tensorInput],
-                  case .tensor(let shape) = inputNode.shape,
-                  shape.count >= 2 else {
+                case .tensor(let shape) = inputNode.shape,
+                shape.count >= 2
+            else {
                 throw DGenError.tensorError(op: "peek", reason: "requires 2D tensor input")
             }
 
@@ -1055,7 +1074,8 @@ public enum LazyOp {
             let positiveIndex = b.gswitch(isNegative, wrappedIndex + channelSizeFloat, wrappedIndex)
 
             // Clamp channel to valid range [0, numChannels-1]
-            let clampedChannel = b.floor(b.max(zero, b.min(channel, b.constant(Float(numChannels - 1)))))
+            let clampedChannel = b.floor(
+                b.max(zero, b.min(channel, b.constant(Float(numChannels - 1)))))
             let channelOffset = channelSizeFloat * clampedChannel
 
             // Calculate final read position
@@ -1068,10 +1088,13 @@ public enum LazyOp {
             // Get tensor cellId - either from concrete tensor or from input tensor
             let cellId: CellID
             if let tensorId = g.nodeToTensor[tensorInput],
-               let tensor = g.tensors[tensorId] {
+                let tensor = g.tensors[tensorId]
+            {
                 cellId = tensor.cellId
             } else {
-                throw DGenError.tensorError(op: "peek", reason: "frame-based tensor peek requires tensor context - not yet implemented")
+                throw DGenError.tensorError(
+                    op: "peek",
+                    reason: "frame-based tensor peek requires tensor context - not yet implemented")
             }
 
             // Read two samples for interpolation
@@ -1098,15 +1121,17 @@ public enum LazyOp {
             b.markRequiresScalar()
 
             guard node.inputs.count == 2 else {
-                throw DGenError.insufficientInputs(operator: "peekRow", expected: 2, actual: node.inputs.count)
+                throw DGenError.insufficientInputs(
+                    operator: "peekRow", expected: 2, actual: node.inputs.count)
             }
 
             let tensorInput = node.inputs[0]
 
             // Get tensor shape from the input node
             guard let inputNode = g.nodes[tensorInput],
-                  case .tensor(let shape) = inputNode.shape,
-                  shape.count == 2 else {
+                case .tensor(let shape) = inputNode.shape,
+                shape.count == 2
+            else {
                 throw DGenError.tensorError(op: "peekRow", reason: "requires 2D tensor input")
             }
 
@@ -1115,9 +1140,10 @@ public enum LazyOp {
 
             // Get input and output tensors
             guard let inTensorId = g.nodeToTensor[tensorInput],
-                  let inTensor = g.tensors[inTensorId],
-                  let outTensorId = g.nodeToTensor[node.id],
-                  let outTensor = g.tensors[outTensorId] else {
+                let inTensor = g.tensors[inTensorId],
+                let outTensorId = g.nodeToTensor[node.id],
+                let outTensor = g.tensors[outTensorId]
+            else {
                 throw DGenError.tensorError(op: "peekRow", reason: "missing tensor")
             }
 
@@ -1163,7 +1189,9 @@ public enum LazyOp {
             // Register the output tensor
             ctx.values[nodeId] = .empty
 
-        case .fft(let windowSize, let hopSize, let scratchCell, let ringBufferCell, let writePosCell, let counterCell):
+        case .fft(
+            let windowSize, let hopSize, let scratchCell, let ringBufferCell, let writePosCell,
+            let counterCell):
             // FFT using Cooley-Tukey algorithm with ring buffer for sample history
             // Input: signal (scalar per frame)
             // Output: tensor [numBins, 2] where numBins = windowSize/2 + 1
@@ -1173,7 +1201,8 @@ public enum LazyOp {
             b.markRequiresScalar()
 
             guard inputs.count == 1 else {
-                throw DGenError.insufficientInputs(operator: "fft", expected: 1, actual: inputs.count)
+                throw DGenError.insufficientInputs(
+                    operator: "fft", expected: 1, actual: inputs.count)
             }
             guard windowSize > 0 && (windowSize & (windowSize - 1)) == 0 else {
                 throw DGenError.tensorError(op: "fft", reason: "windowSize must be a power of 2")
@@ -1184,7 +1213,8 @@ public enum LazyOp {
 
             // Get output tensor
             guard let outTensorId = g.nodeToTensor[node.id],
-                  let outTensor = g.tensors[outTensorId] else {
+                let outTensor = g.tensors[outTensorId]
+            else {
                 throw DGenError.tensorError(op: "fft", reason: "missing output tensor")
             }
 
@@ -1230,10 +1260,13 @@ public enum LazyOp {
                     // Read position: (writePos + n) % windowSize gives oldest to newest
                     // Use wrappedWritePos which now points to oldest sample
                     let readIdx = wrappedWritePos + nFloat
-                    let wrappedReadIdx = b.gswitch(readIdx >= winSizeFloat, readIdx - winSizeFloat, readIdx)
+                    let wrappedReadIdx = b.gswitch(
+                        readIdx >= winSizeFloat, readIdx - winSizeFloat, readIdx)
                     let sample = b.memoryRead(ringBufferCell, b.cast(wrappedReadIdx, to: .int))
                     _ = b.memoryWrite(scratchCell, b.cast(n, to: .int), sample)
-                    _ = b.memoryWrite(scratchCell, b.cast(n, to: .int) + b.constant(Float(imagOffset)), b.constant(0.0))
+                    _ = b.memoryWrite(
+                        scratchCell, b.cast(n, to: .int) + b.constant(Float(imagOffset)),
+                        b.constant(0.0))
                 }
 
                 // 2. Bit-reversal permutation
@@ -1256,7 +1289,8 @@ public enum LazyOp {
                     let tempRealI = b.memoryRead(scratchCell, iInt)
                     let tempImagI = b.memoryRead(scratchCell, iInt + b.constant(Float(imagOffset)))
                     let tempRealRev = b.memoryRead(scratchCell, revInt)
-                    let tempImagRev = b.memoryRead(scratchCell, revInt + b.constant(Float(imagOffset)))
+                    let tempImagRev = b.memoryRead(
+                        scratchCell, revInt + b.constant(Float(imagOffset)))
 
                     // Conditionally swap
                     let newRealI = b.gswitch(shouldSwap, tempRealRev, tempRealI)
@@ -1267,7 +1301,8 @@ public enum LazyOp {
                     _ = b.memoryWrite(scratchCell, iInt, newRealI)
                     _ = b.memoryWrite(scratchCell, iInt + b.constant(Float(imagOffset)), newImagI)
                     _ = b.memoryWrite(scratchCell, revInt, newRealRev)
-                    _ = b.memoryWrite(scratchCell, revInt + b.constant(Float(imagOffset)), newImagRev)
+                    _ = b.memoryWrite(
+                        scratchCell, revInt + b.constant(Float(imagOffset)), newImagRev)
                 }
 
                 // 3. Butterfly stages
@@ -1306,9 +1341,11 @@ public enum LazyOp {
                             let ti = wr * bi + wi * br
 
                             _ = b.memoryWrite(scratchCell, iInt, ar + tr)
-                            _ = b.memoryWrite(scratchCell, iInt + b.constant(Float(imagOffset)), ai + ti)
+                            _ = b.memoryWrite(
+                                scratchCell, iInt + b.constant(Float(imagOffset)), ai + ti)
                             _ = b.memoryWrite(scratchCell, jInt, ar - tr)
-                            _ = b.memoryWrite(scratchCell, jInt + b.constant(Float(imagOffset)), ai - ti)
+                            _ = b.memoryWrite(
+                                scratchCell, jInt + b.constant(Float(imagOffset)), ai - ti)
                         }
                     }
                 }
@@ -1329,7 +1366,9 @@ public enum LazyOp {
             // Register output for downstream ops
             ctx.values[nodeId] = .empty
 
-        case .ifft(let windowSize, let hopSize, let scratchCell, let outputRingCell, let readPosCell, let counterCell):
+        case .ifft(
+            let windowSize, let hopSize, let scratchCell, let outputRingCell, let readPosCell,
+            let counterCell):
             // IFFT using Cooley-Tukey algorithm with overlap-add for reconstruction
             // Input: spectrum tensor [numBins, 2] where numBins = windowSize/2 + 1
             // Output: scalar (one sample per frame via overlap-add)
@@ -1337,7 +1376,8 @@ public enum LazyOp {
             b.markRequiresScalar()
 
             guard inputs.count == 1 else {
-                throw DGenError.insufficientInputs(operator: "ifft", expected: 1, actual: inputs.count)
+                throw DGenError.insufficientInputs(
+                    operator: "ifft", expected: 1, actual: inputs.count)
             }
             guard windowSize > 0 && (windowSize & (windowSize - 1)) == 0 else {
                 throw DGenError.tensorError(op: "ifft", reason: "windowSize must be a power of 2")
@@ -1349,8 +1389,9 @@ public enum LazyOp {
 
             // Get input tensor (spectrum)
             guard let inputNodeId = node.inputs.first,
-                  let inputTensorId = g.nodeToTensor[inputNodeId],
-                  let inputTensor = g.tensors[inputTensorId] else {
+                let inputTensorId = g.nodeToTensor[inputNodeId],
+                let inputTensor = g.tensors[inputTensorId]
+            else {
                 throw DGenError.tensorError(op: "ifft", reason: "missing input spectrum tensor")
             }
 
@@ -1397,7 +1438,8 @@ public enum LazyOp {
 
                     // Read real and imag from input tensor (column-major layout)
                     let inReal = b.memoryRead(inputTensor.cellId, inputBinInt)
-                    let inImag = b.memoryRead(inputTensor.cellId, inputBinInt + b.constant(Float(numBins)))
+                    let inImag = b.memoryRead(
+                        inputTensor.cellId, inputBinInt + b.constant(Float(numBins)))
 
                     // For second half (conjugate), negate imaginary part
                     let realVal = inReal
@@ -1451,7 +1493,9 @@ public enum LazyOp {
                             let j = i + b.constant(Float(halfSize))
 
                             // IFFT twiddle: W = e^(+2πi*k/butterflySize) - POSITIVE angle
-                            let angle = b.constant(2.0) * b.constant(Float.pi) * k / b.constant(Float(butterflySize))
+                            let angle =
+                                b.constant(2.0) * b.constant(Float.pi) * k
+                                / b.constant(Float(butterflySize))
                             let wr = b.cos(angle)
                             let wi = b.sin(angle)
 
@@ -1469,9 +1513,11 @@ public enum LazyOp {
 
                             // Butterfly
                             _ = b.memoryWrite(scratchCell, iInt, ar + tr)
-                            _ = b.memoryWrite(scratchCell, iInt + b.constant(Float(imagOffset)), ai + ti)
+                            _ = b.memoryWrite(
+                                scratchCell, iInt + b.constant(Float(imagOffset)), ai + ti)
                             _ = b.memoryWrite(scratchCell, jInt, ar - tr)
-                            _ = b.memoryWrite(scratchCell, jInt + b.constant(Float(imagOffset)), ai - ti)
+                            _ = b.memoryWrite(
+                                scratchCell, jInt + b.constant(Float(imagOffset)), ai - ti)
                         }
                     }
                     butterflySize *= 2
@@ -1485,7 +1531,8 @@ public enum LazyOp {
 
                     // Calculate output position with wrap-around
                     let outPos = readPos + n
-                    let wrappedOutPos = b.gswitch(outPos >= winSizeFloat, outPos - winSizeFloat, outPos)
+                    let wrappedOutPos = b.gswitch(
+                        outPos >= winSizeFloat, outPos - winSizeFloat, outPos)
                     let outPosInt = b.cast(wrappedOutPos, to: .int)
 
                     // Overlap-add: accumulate into output buffer
@@ -1603,7 +1650,9 @@ public enum LazyOp {
             try emitBinaryOpBackward(
                 b: b, g: g, ctx: ctx, node: node, gradOutput: gradOutput,
                 gradLhs: { gradOut, _, rhsVal in gradOut / rhsVal },
-                gradRhs: { gradOut, lhsVal, rhsVal in (b.constant(0.0) - gradOut) * (lhsVal / (rhsVal * rhsVal)) }
+                gradRhs: { gradOut, lhsVal, rhsVal in
+                    (b.constant(0.0) - gradOut) * (lhsVal / (rhsVal * rhsVal))
+                }
             )
         case .abs:
             guard inputs.count == 1 else { fatalError("abs requires 1 input") }
@@ -1695,7 +1744,7 @@ public enum LazyOp {
             b.grad(node.inputs[0], value: gradA.lazy)
             b.grad(node.inputs[1], value: gradB.lazy)
 
-        case let .spectralLossPass1(windowSize, scratchCell):
+        case .spectralLossPass1(let windowSize, let scratchCell):
             guard inputs.count == 2 else { fatalError("spectralLossPass1 requires 2 inputs") }
             let sig1 = b.tapeValue(node.inputs[0])
             let sig2 = b.tapeValue(node.inputs[1])
@@ -1712,7 +1761,7 @@ public enum LazyOp {
             b.grad(node.inputs[0], value: grad1.lazy)
             b.grad(node.inputs[1], value: grad2.lazy)
 
-        case let .spectralLossPass2(windowSize, scratchCell):
+        case .spectralLossPass2(let windowSize, let scratchCell):
             guard inputs.count == 1 else { fatalError("spectralLossPass2 requires 1 input") }
 
             // Get the original signal inputs from Pass1's node
@@ -1877,7 +1926,7 @@ public enum LazyOp {
             // weighted nature of d(phase)/d(freq).
             //
             // TODO - use actual sampleRate in system
-            let sampleRate = b.constant(44100.0)
+            let sampleRate = b.constant(b.ctx.g.sampleRate)
             let currentTime = b.frameIndex(nodeId)
 
             // Compute this timestep's frequency gradient
@@ -1922,10 +1971,11 @@ public enum LazyOp {
             let kernelNodeId = node.inputs[1]
 
             guard let inputNode = g.nodes[inputNodeId],
-                  case .tensor(let inShape) = inputNode.shape, inShape.count == 1,
-                  case .tensor(let outShape) = node.shape,
-                  let inTensor = g.nodeToTensor[inputNodeId].flatMap({ g.tensors[$0] }),
-                  let kTensor = g.nodeToTensor[kernelNodeId].flatMap({ g.tensors[$0] }) else {
+                case .tensor(let inShape) = inputNode.shape, inShape.count == 1,
+                case .tensor(let outShape) = node.shape,
+                let inTensor = g.nodeToTensor[inputNodeId].flatMap({ g.tensors[$0] }),
+                let kTensor = g.nodeToTensor[kernelNodeId].flatMap({ g.tensors[$0] })
+            else {
                 b.grad(node.inputs[0], value: ctx.useConstant(src: nil, value: 0.0))
                 b.grad(node.inputs[1], value: ctx.useConstant(src: nil, value: 0.0))
                 break
@@ -1945,7 +1995,8 @@ public enum LazyOp {
                 b.loop(kernelSize) { k in
                     let outX = i - b.cast(k, to: .float) + b.constant(Float(pad))
                     let inBounds = (outX >= b.constant(0)) * (outX < b.constant(Float(outLen)))
-                    let gradOut = b.gswitch(inBounds, b.loadTensorGrad(node.id, index: outX), b.constant(0))
+                    let gradOut = b.gswitch(
+                        inBounds, b.loadTensorGrad(node.id, index: outX), b.constant(0))
                     let kMemIdx = b.tensorMemoryIndex(kTensor, indices: [b.cast(k, to: .int)])
                     let kVal = b.memoryRead(kTensor.cellId, kMemIdx)
                     acc.accumulate(b.gswitch(inBounds, gradOut * kVal, b.constant(0)))
@@ -1962,7 +2013,8 @@ public enum LazyOp {
                     let gradOut = b.loadTensorGrad(node.id, index: b.cast(x, to: .float))
                     let rawIdx = b.tensorMemoryIndex(inTensor, indices: [b.cast(inX, to: .int)])
                     let safeIdx = b.gswitch(inBounds, rawIdx, b.constant(0))
-                    let inVal = b.gswitch(inBounds, b.memoryRead(inTensor.cellId, safeIdx), b.constant(0))
+                    let inVal = b.gswitch(
+                        inBounds, b.memoryRead(inTensor.cellId, safeIdx), b.constant(0))
                     acc.accumulate(gradOut * inVal)
                 }
                 b.tensorGrad(kernelNodeId, index: b.cast(k, to: .float), value: acc.value.lazy)
@@ -1977,10 +2029,11 @@ public enum LazyOp {
             let kernelNodeId = node.inputs[1]
 
             guard let inputNode = g.nodes[inputNodeId],
-                  case .tensor(let inShape) = inputNode.shape, inShape.count == 2,
-                  case .tensor(let outShape) = node.shape,
-                  let inTensor = g.nodeToTensor[inputNodeId].flatMap({ g.tensors[$0] }),
-                  let kTensor = g.nodeToTensor[kernelNodeId].flatMap({ g.tensors[$0] }) else {
+                case .tensor(let inShape) = inputNode.shape, inShape.count == 2,
+                case .tensor(let outShape) = node.shape,
+                let inTensor = g.nodeToTensor[inputNodeId].flatMap({ g.tensors[$0] }),
+                let kTensor = g.nodeToTensor[kernelNodeId].flatMap({ g.tensors[$0] })
+            else {
                 b.grad(node.inputs[0], value: ctx.useConstant(src: nil, value: 0.0))
                 b.grad(node.inputs[1], value: ctx.useConstant(src: nil, value: 0.0))
                 break
@@ -2008,11 +2061,14 @@ public enum LazyOp {
                     b.loop(kW) { kx in
                         let outY = iy - b.cast(ky, to: .float) + b.constant(Float(padH))
                         let outX = ix - b.cast(kx, to: .float) + b.constant(Float(padW))
-                        let inBounds = (outY >= b.constant(0)) * (outY < b.constant(Float(outH)))
+                        let inBounds =
+                            (outY >= b.constant(0)) * (outY < b.constant(Float(outH)))
                             * (outX >= b.constant(0)) * (outX < b.constant(Float(outW)))
                         let outFlatIdx = outY * b.constant(Float(outW)) + outX
-                        let gradOut = b.gswitch(inBounds, b.loadTensorGrad(node.id, index: outFlatIdx), b.constant(0))
-                        let kMemIdx = b.tensorMemoryIndex(kTensor, indices: [b.cast(ky, to: .int), b.cast(kx, to: .int)])
+                        let gradOut = b.gswitch(
+                            inBounds, b.loadTensorGrad(node.id, index: outFlatIdx), b.constant(0))
+                        let kMemIdx = b.tensorMemoryIndex(
+                            kTensor, indices: [b.cast(ky, to: .int), b.cast(kx, to: .int)])
                         let kVal = b.memoryRead(kTensor.cellId, kMemIdx)
                         acc.accumulate(b.gswitch(inBounds, gradOut * kVal, b.constant(0)))
                     }
@@ -2028,15 +2084,21 @@ public enum LazyOp {
 
                 b.loop(outH) { y in
                     b.loop(outW) { x in
-                        let inY = b.cast(y, to: .float) + b.cast(ky, to: .float) - b.constant(Float(padH))
-                        let inX = b.cast(x, to: .float) + b.cast(kx, to: .float) - b.constant(Float(padW))
-                        let inBounds = (inY >= b.constant(0)) * (inY < b.constant(Float(inH)))
+                        let inY =
+                            b.cast(y, to: .float) + b.cast(ky, to: .float) - b.constant(Float(padH))
+                        let inX =
+                            b.cast(x, to: .float) + b.cast(kx, to: .float) - b.constant(Float(padW))
+                        let inBounds =
+                            (inY >= b.constant(0)) * (inY < b.constant(Float(inH)))
                             * (inX >= b.constant(0)) * (inX < b.constant(Float(inW)))
-                        let outFlatIdx = b.cast(y, to: .float) * b.constant(Float(outW)) + b.cast(x, to: .float)
+                        let outFlatIdx =
+                            b.cast(y, to: .float) * b.constant(Float(outW)) + b.cast(x, to: .float)
                         let gradOut = b.loadTensorGrad(node.id, index: outFlatIdx)
-                        let rawIdx = b.tensorMemoryIndex(inTensor, indices: [b.cast(inY, to: .int), b.cast(inX, to: .int)])
+                        let rawIdx = b.tensorMemoryIndex(
+                            inTensor, indices: [b.cast(inY, to: .int), b.cast(inX, to: .int)])
                         let safeIdx = b.gswitch(inBounds, rawIdx, b.constant(0))
-                        let inVal = b.gswitch(inBounds, b.memoryRead(inTensor.cellId, safeIdx), b.constant(0))
+                        let inVal = b.gswitch(
+                            inBounds, b.memoryRead(inTensor.cellId, safeIdx), b.constant(0))
                         acc.accumulate(gradOut * inVal)
                     }
                 }
@@ -2051,7 +2113,8 @@ public enum LazyOp {
 
             // Check if input is a tensor
             guard let inputNode = g.nodes[inputNodeId],
-                  case .tensor(let inputShape) = inputNode.shape else {
+                case .tensor(let inputShape) = inputNode.shape
+            else {
                 // Scalar input: just pass gradient through
                 b.grad(node.inputs[0], value: gradOutput)
                 break
@@ -2074,8 +2137,9 @@ public enum LazyOp {
             let inputNodeId = node.inputs[0]
 
             guard let inputNode = g.nodes[inputNodeId],
-                  case .tensor(let inputShape) = inputNode.shape,
-                  case .tensor(let outputShape) = node.shape else {
+                case .tensor(let inputShape) = inputNode.shape,
+                case .tensor(let outputShape) = node.shape
+            else {
                 // Fallback for non-tensor case
                 b.grad(node.inputs[0], value: gradOutput)
                 break
@@ -2129,7 +2193,8 @@ public enum LazyOp {
             let inputNodeId = node.inputs[0]
 
             guard let inputNode = g.nodes[inputNodeId],
-                  case .tensor(let inputShape) = inputNode.shape else {
+                case .tensor(let inputShape) = inputNode.shape
+            else {
                 b.grad(node.inputs[0], value: gradOutput)
                 break
             }
@@ -2152,8 +2217,9 @@ public enum LazyOp {
             let inputNodeId = node.inputs[0]
 
             guard let inputNode = g.nodes[inputNodeId],
-                  case .tensor(let inputShape) = inputNode.shape,
-                  case .tensor(let outputShape) = node.shape else {
+                case .tensor(let inputShape) = inputNode.shape,
+                case .tensor(let outputShape) = node.shape
+            else {
                 b.grad(node.inputs[0], value: gradOutput)
                 break
             }
@@ -2194,7 +2260,8 @@ public enum LazyOp {
                 }
 
                 let gradVal = b.loadTensorGrad(node.id, index: outputFlatIdx)
-                b.tensorGrad(inputNodeId, index: b.cast(inputFlatIdx, to: .float), value: gradVal.lazy)
+                b.tensorGrad(
+                    inputNodeId, index: b.cast(inputFlatIdx, to: .float), value: gradVal.lazy)
             }
 
         case .shrink(let ranges):
@@ -2204,8 +2271,9 @@ public enum LazyOp {
             let inputNodeId = node.inputs[0]
 
             guard let inputNode = g.nodes[inputNodeId],
-                  case .tensor(let inputShape) = inputNode.shape,
-                  case .tensor(let outputShape) = node.shape else {
+                case .tensor(let inputShape) = inputNode.shape,
+                case .tensor(let outputShape) = node.shape
+            else {
                 b.grad(node.inputs[0], value: gradOutput)
                 break
             }
@@ -2248,7 +2316,8 @@ public enum LazyOp {
                 }
 
                 let gradVal = b.loadTensorGrad(node.id, index: outputFlatIdx)
-                b.tensorGrad(inputNodeId, index: b.cast(inputFlatIdx, to: .float), value: gradVal.lazy)
+                b.tensorGrad(
+                    inputNodeId, index: b.cast(inputFlatIdx, to: .float), value: gradVal.lazy)
             }
 
         case .pad(let padding):
@@ -2257,8 +2326,9 @@ public enum LazyOp {
             let inputNodeId = node.inputs[0]
 
             guard let inputNode = g.nodes[inputNodeId],
-                  case .tensor(let inputShape) = inputNode.shape,
-                  case .tensor(let outputShape) = node.shape else {
+                case .tensor(let inputShape) = inputNode.shape,
+                case .tensor(let outputShape) = node.shape
+            else {
                 b.grad(node.inputs[0], value: gradOutput)
                 break
             }
@@ -2302,8 +2372,9 @@ public enum LazyOp {
 
             let tensorInput = node.inputs[0]
             guard let inputNode = g.nodes[tensorInput],
-                  case .tensor(let shape) = inputNode.shape,
-                  shape.count >= 2 else {
+                case .tensor(let shape) = inputNode.shape,
+                shape.count >= 2
+            else {
                 // Scalar fallback
                 b.grad(node.inputs[0], value: ctx.useConstant(src: nil, value: 0.0))
                 b.grad(node.inputs[1], value: ctx.useConstant(src: nil, value: 0.0))
@@ -2329,7 +2400,8 @@ public enum LazyOp {
             let isNegative = wrappedIndex < zero
             let positiveIndex = b.gswitch(isNegative, wrappedIndex + channelSizeFloat, wrappedIndex)
 
-            let clampedChannel = b.floor(b.max(zero, b.min(channel, b.constant(Float(numChannels - 1)))))
+            let clampedChannel = b.floor(
+                b.max(zero, b.min(channel, b.constant(Float(numChannels - 1)))))
             let channelOffset = channelSizeFloat * clampedChannel
 
             let finalReadPos = channelOffset + positiveIndex
@@ -2357,8 +2429,9 @@ public enum LazyOp {
 
             let tensorInput = node.inputs[0]
             guard let inputNode = g.nodes[tensorInput],
-                  case .tensor(let shape) = inputNode.shape,
-                  shape.count == 2 else {
+                case .tensor(let shape) = inputNode.shape,
+                shape.count == 2
+            else {
                 // Scalar fallback - shouldn't happen for peekRow
                 b.grad(node.inputs[0], value: ctx.useConstant(src: nil, value: 0.0))
                 b.grad(node.inputs[1], value: ctx.useConstant(src: nil, value: 0.0))

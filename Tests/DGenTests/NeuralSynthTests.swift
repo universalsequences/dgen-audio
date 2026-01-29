@@ -67,7 +67,8 @@ final class NeuralSynthTests: XCTestCase {
 
         // PER-FRAME MLP: Compute time as normalized frame index [0, 1]
         // Frame index phasor goes from 0 to 1 over frameCount samples
-        let frameIdx = g.phasor(freq: g.n(.constant(Float(sampleRate) / Float(frameCount))), reset: zero)
+        let frameIdx = g.phasor(
+            freq: g.n(.constant(Float(sampleRate) / Float(frameCount))), reset: zero)
         let frameIdxScaled = g.n(.mul, frameIdx, g.n(.constant(Float(frameCount - 1))))
 
         // MLP forward pass runs per-frame with scalar time input (frameIdx)
@@ -90,7 +91,9 @@ final class NeuralSynthTests: XCTestCase {
         for k in 0..<numHarmonics {
             var sum = g.n(.constant(0.0))
             for j in 0..<hiddenSize {
-                let w2_jk = try g.peek(tensor: W2.node(), index: g.n(.constant(Float(j))), channel: g.n(.constant(Float(k))))
+                let w2_jk = try g.peek(
+                    tensor: W2.node(), index: g.n(.constant(Float(j))),
+                    channel: g.n(.constant(Float(k))))
                 sum = g.n(.add, sum, g.n(.mul, h1_activations[j], w2_jk))
             }
             let b2_k = try g.peek(tensor: b2.node(), index: zero, channel: g.n(.constant(Float(k))))
@@ -159,13 +162,14 @@ final class NeuralSynthTests: XCTestCase {
             kernelDump += kernel.source
             kernelDump += "\n\n"
         }
-        try kernelDump.write(toFile: "/tmp/miniddsp_kernels.metal", atomically: true, encoding: .utf8)
+        try kernelDump.write(
+            toFile: "/tmp/miniddsp_kernels.metal", atomically: true, encoding: .utf8)
         print("Wrote \(compileResult.kernels.count) kernels to /tmp/miniddsp_kernels.metal")
 
         // With loss scaled up by 1e6, use normal learning rate
         let ctx = TrainingContext(
             tensorParameters: [W1, b1, W2, b2],
-            optimizer: Adam(lr: 0.001),
+            optimizer: Adam(lr: 0.01),
             lossNode: loss)
 
         print("initial memory")
@@ -175,9 +179,6 @@ final class NeuralSynthTests: XCTestCase {
             context: compileResult.context,
             frameCount: frameCount,
             graph: g)
-
-        let inputBuffer = [Float](repeating: 0.0, count: frameCount)
-        var outputBuffer = [Float](repeating: 0.0, count: frameCount)
 
         // Helper to print gradient/weight stats for a tensor parameter
         func printTensorStats(_ param: TensorParameter, label: String) {
@@ -193,22 +194,15 @@ final class NeuralSynthTests: XCTestCase {
             let gMean = grads.reduce(0, +) / Float(grads.count)
             let gAbsMean = grads.map { abs($0) }.reduce(0, +) / Float(grads.count)
 
-            print("  \(label): weights[min=\(String(format: "%.4f", wMin)), max=\(String(format: "%.4f", wMax)), mean=\(String(format: "%.4f", wMean))]")
-            print("           grads[min=\(String(format: "%.4e", gMin)), max=\(String(format: "%.4e", gMax)), mean=\(String(format: "%.4e", gMean)), |mean|=\(String(format: "%.4e", gAbsMean))]")
+            print(
+                "  \(label): weights[min=\(String(format: "%.4f", wMin)), max=\(String(format: "%.4f", wMax)), mean=\(String(format: "%.4f", wMean))]"
+            )
+            print(
+                "           grads[min=\(String(format: "%.4e", gMin)), max=\(String(format: "%.4e", gMax)), mean=\(String(format: "%.4e", gMean)), |mean|=\(String(format: "%.4e", gAbsMean))]"
+            )
         }
-        print("zero grad initial")
-        // Initial loss
-        ctx.zeroGrad()
-        inputBuffer.withUnsafeBufferPointer { inPtr in
-            outputBuffer.withUnsafeMutableBufferPointer { outPtr in
-                runtime.runWithMemory(
-                    outputs: outPtr.baseAddress!,
-                    inputs: inPtr.baseAddress!,
-                    memory: ctx.getMemory(),
-                    frameCount: frameCount)
-            }
-        }
-        let initialLoss = outputBuffer.reduce(0, +) / Float(frameCount)
+        // Initial step (also seeds grads for stats)
+        let initialLoss = ctx.runStepGPU()
         print("Initial loss: \(initialLoss)")
 
         // Check if tensor parameters have gradient IDs allocated
@@ -219,8 +213,7 @@ final class NeuralSynthTests: XCTestCase {
         print("  b2.baseGradId: \(b2.baseGradId.map { String($0) } ?? "nil")")
 
         // Extract initial gradients to see what we're starting with
-        ctx.step()  // This extracts gradients
-        print("Initial gradients (before training):")
+        print("Initial gradients (after first step):")
         printTensorStats(W1, label: "W1")
         printTensorStats(b1, label: "b1")
         printTensorStats(W2, label: "W2")
@@ -228,59 +221,21 @@ final class NeuralSynthTests: XCTestCase {
 
         // Train - fewer epochs since spectral loss is more informative
         let epochs = 100
+        var finalLoss = initialLoss
         for epoch in 0..<epochs {
-            // Forward+backward pass first
-            ctx.zeroGrad()
-            inputBuffer.withUnsafeBufferPointer { inPtr in
-                outputBuffer.withUnsafeMutableBufferPointer { outPtr in
-                    runtime.runWithMemory(
-                        outputs: outPtr.baseAddress!,
-                        inputs: inPtr.baseAddress!,
-                        memory: ctx.getMemory(),
-                        frameCount: frameCount)
-                }
-            }
+            let lossVal = ctx.runStepGPU()
+            finalLoss = lossVal
 
-            // Print BEFORE step() applies gradients (grads are populated from backward pass)
+            // Print after step (grads were reduced for this update)
             if epoch % 2 == 0 || epoch == epochs - 1 {
-                let loss = outputBuffer.reduce(0, +) / Float(frameCount)
-                print("Epoch \(epoch): loss = \(loss)")
-
-                // Extract gradients manually to see them before step() might modify things
-                let tensorGrads = [W1, b1, W2, b2].map { param -> [Float] in
-                    guard let baseGradId = param.baseGradId else { return [] }
-                    let gradPtr = runtime.getGradientsBuffer()
-                    var grads = [Float](repeating: 0.0, count: param.size)
-                    for i in 0..<param.size {
-                        let gradId = baseGradId + i
-                        var total: Float = 0
-                        for f in 0..<frameCount {
-                            total += gradPtr[frameCount * gradId + f]
-                        }
-                        grads[i] = total / Float(frameCount)
-                    }
-                    return grads
-                }
-
-                print("  Gradients (from buffer):")
-                for (i, name) in ["W1", "b1", "W2", "b2"].enumerated() {
-                    let g = tensorGrads[i]
-                    if g.isEmpty {
-                        print("    \(name): NO GRADIENT ID")
-                    } else {
-                        let gMin = g.min() ?? 0
-                        let gMax = g.max() ?? 0
-                        let gAbsMean = g.map { abs($0) }.reduce(0, +) / Float(g.count)
-                        print("    \(name): min=\(String(format: "%.4e", gMin)), max=\(String(format: "%.4e", gMax)), |mean|=\(String(format: "%.4e", gAbsMean))")
-                    }
-                }
+                print("Epoch \(epoch): loss = \(lossVal)")
+                printTensorStats(W1, label: "W1")
+                printTensorStats(b1, label: "b1")
+                printTensorStats(W2, label: "W2")
+                printTensorStats(b2, label: "b2")
             }
-
-            // Now apply gradients
-            ctx.step()
         }
 
-        let finalLoss = outputBuffer.reduce(0, +) / Float(frameCount)
         let numParams = hiddenSize + hiddenSize + hiddenSize * numHarmonics + numHarmonics
         let improvement = (1.0 - finalLoss / initialLoss) * 100
         print(
@@ -288,6 +243,143 @@ final class NeuralSynthTests: XCTestCase {
         )
 
         XCTAssertLessThan(finalLoss, initialLoss * 0.9, "Should improve with spectral loss")
+    }
+
+    // MARK: - Test 1a: Control-Rate MLP -> Tensor -> Audio Read
+
+    /// Build a control-rate amplitude tensor with an MLP, then read it at audio rate.
+    /// This mirrors the DDSP pattern: control network + synth, with a time-indexed lookup.
+    func testMiniDDSP_ControlRateMLP() throws {
+        let frameCount = 64
+        let controlFrames = 16
+        let sampleRate: Float = 2000.0
+        let f0: Float = 100.0
+        let numHarmonics = 4
+        let hiddenSize = 6
+
+        let g = Graph(sampleRate: sampleRate)
+
+        // Control-rate time tensor [controlFrames, 1]
+        let timeData = (0..<controlFrames).map {
+            Float($0) / Float(controlFrames - 1)
+        }
+        let timeTensor = g.tensor(shape: [controlFrames, 1], data: timeData)
+
+        // Learnable MLP weights
+        let W1 = TensorParameter(
+            graph: g, shape: [1, hiddenSize],
+            data: (0..<hiddenSize).map { _ in Float.random(in: -0.5...0.5) }, name: "W1")
+        let b1 = TensorParameter(
+            graph: g, shape: [1, hiddenSize],
+            data: [Float](repeating: 0.0, count: hiddenSize), name: "b1")
+        let W2 = TensorParameter(
+            graph: g, shape: [hiddenSize, numHarmonics],
+            data: (0..<hiddenSize * numHarmonics).map { _ in Float.random(in: -0.3...0.3) },
+            name: "W2")
+        let b2 = TensorParameter(
+            graph: g, shape: [1, numHarmonics],
+            data: [Float](repeating: 0.1, count: numHarmonics), name: "b2")
+
+        // Teacher weights (fixed target)
+        let teacherW1Data = (0..<hiddenSize).map { i in 0.35 * sin(Float(i) * 0.7) }
+        let teacherB1Data = (0..<hiddenSize).map { i in 0.1 * cos(Float(i) * 0.5) }
+        let teacherW2Data = (0..<(hiddenSize * numHarmonics)).map { i in
+            0.25 * sin(Float(i) * 0.3)
+        }
+        let teacherB2Data = (0..<numHarmonics).map { i in 0.2 + 0.05 * sin(Float(i)) }
+
+        let teacherW1 = g.tensor(shape: [1, hiddenSize], data: teacherW1Data)
+        let teacherB1 = g.tensor(shape: [1, hiddenSize], data: teacherB1Data)
+        let teacherW2 = g.tensor(shape: [hiddenSize, numHarmonics], data: teacherW2Data)
+        let teacherB2 = g.tensor(shape: [1, numHarmonics], data: teacherB2Data)
+
+        // Helper: tensor MLP with sigmoid output
+        func mlpAmps(timeTensor: NodeID, W1: NodeID, b1: NodeID, W2: NodeID, b2: NodeID)
+            throws -> NodeID
+        {
+            let one = g.n(.constant(1.0))
+            let h1 = try g.matmul(timeTensor, W1)
+            let h1b = g.n(.add, h1, b1)
+            let h1a = g.n(.tanh, h1b)
+            let h2 = try g.matmul(h1a, W2)
+            let h2b = g.n(.add, h2, b2)
+            let neg = g.n(.mul, h2b, g.n(.constant(-1.0)))
+            let expNeg = g.n(.exp, neg)
+            return g.n(.div, one, g.n(.add, one, expNeg))
+        }
+
+        // Control-rate amplitude tensors (row-major layout)
+        let ampsPred = try mlpAmps(timeTensor: timeTensor, W1: W1.node(), b1: b1.node(), W2: W2.node(), b2: b2.node())
+        let ampsTarget = try mlpAmps(timeTensor: timeTensor, W1: teacherW1, b1: teacherB1, W2: teacherW2, b2: teacherB2)
+
+        // Reshape to [numHarmonics, controlFrames] so peek(index=harmonic, channel=time)
+        // maps to row-major offsets (time * numHarmonics + harmonic).
+        let ampsPredView = try g.reshape(ampsPred, to: [numHarmonics, controlFrames])
+        let ampsTargetView = try g.reshape(ampsTarget, to: [numHarmonics, controlFrames])
+
+        let zero = g.n(.constant(0.0))
+        let twoPi = g.n(.constant(Float.pi * 2.0))
+
+        // Audio-rate playhead through control frames
+        let frameIdx = g.phasor(
+            freq: g.n(.constant(sampleRate / Float(frameCount))), reset: zero)
+        let playhead = g.n(.mul, frameIdx, g.n(.constant(Float(controlFrames - 1))))
+
+        // Harmonic synth using control-rate envelopes
+        var synthOutput = g.n(.constant(0.0))
+        var targetOutput = g.n(.constant(0.0))
+        for k in 0..<numHarmonics {
+            let kIdx = g.n(.constant(Float(k)))
+            let ampK = try g.peek(tensor: ampsPredView, index: kIdx, channel: playhead)
+            let targetAmpK = try g.peek(tensor: ampsTargetView, index: kIdx, channel: playhead)
+
+            let freqK = g.n(.constant(f0 * Float(k + 1)))
+            let phase = g.phasor(freq: freqK, reset: zero)
+            let sine = g.n(.sin, g.n(.mul, twoPi, phase))
+
+            synthOutput = g.n(.add, synthOutput, g.n(.mul, sine, ampK))
+            targetOutput = g.n(.add, targetOutput, g.n(.mul, sine, targetAmpK))
+        }
+
+        // MSE loss
+        let diff = g.n(.sub, synthOutput, targetOutput)
+        let loss = g.n(.mul, diff, diff)
+        _ = g.n(.output(0), loss)
+
+        // Compile
+        let compileResult = try CompilationPipeline.compile(
+            graph: g, backend: .metal,
+            options: .init(frameCount: frameCount, backwards: true))
+
+        let runtime = try MetalCompiledKernel(
+            kernels: compileResult.kernels,
+            cellAllocations: compileResult.cellAllocations,
+            context: compileResult.context)
+
+        let ctx = TrainingContext(
+            tensorParameters: [W1, b1, W2, b2],
+            optimizer: Adam(lr: 0.05),
+            lossNode: loss)
+
+        ctx.initializeMemory(
+            runtime: runtime,
+            cellAllocations: compileResult.cellAllocations,
+            context: compileResult.context,
+            frameCount: frameCount,
+            graph: g)
+
+        // Initial loss
+        let initialLoss = ctx.runStepGPU()
+
+        // Train
+        let epochs = 40
+        var finalLoss = initialLoss
+        for _ in 0..<epochs {
+            finalLoss = ctx.runStepGPU()
+        }
+        print("Control-rate MLP test - Initial loss: \(initialLoss), Final loss: \(finalLoss)")
+
+        XCTAssertLessThan(finalLoss, initialLoss * 0.8, "Control-rate MLP should reduce loss")
     }
 
     // MARK: - Test 1b: Simple Gradient Flow Diagnostic
@@ -301,7 +393,7 @@ final class NeuralSynthTests: XCTestCase {
 
         print("Simple gradient test: learn amplitude to match sine wave")
 
-        let g = Graph()
+        let g = Graph(sampleRate: sampleRate)
 
         // Single learnable amplitude parameter
         let amp = TensorParameter(
@@ -352,9 +444,6 @@ final class NeuralSynthTests: XCTestCase {
             frameCount: frameCount,
             graph: g)
 
-        let inputBuffer = [Float](repeating: 0.0, count: frameCount)
-        var outputBuffer = [Float](repeating: 0.0, count: frameCount)
-
         print("Initial amp: \(amp.data[0])")
         print("Target amp: 1.0")
         print("amp.baseGradId: \(amp.baseGradId.map { String($0) } ?? "nil")")
@@ -362,34 +451,14 @@ final class NeuralSynthTests: XCTestCase {
         // Train
         let epochs = 50
         for epoch in 0..<epochs {
-            ctx.zeroGrad()
-            inputBuffer.withUnsafeBufferPointer { inPtr in
-                outputBuffer.withUnsafeMutableBufferPointer { outPtr in
-                    runtime.runWithMemory(
-                        outputs: outPtr.baseAddress!,
-                        inputs: inPtr.baseAddress!,
-                        memory: ctx.getMemory(),
-                        frameCount: frameCount)
-                }
-            }
-
-            let lossVal = outputBuffer.reduce(0, +) / Float(frameCount)
-
-            // Get gradient before step
-            var grad: Float = 0
-            if let baseGradId = amp.baseGradId {
-                let gradPtr = runtime.getGradientsBuffer()
-                for f in 0..<frameCount {
-                    grad += gradPtr[frameCount * baseGradId + f]
-                }
-                grad /= Float(frameCount)
-            }
+            let lossVal = ctx.runStepGPU()
+            let grad = amp.grads.first ?? 0
 
             if epoch % 10 == 0 || epoch == epochs - 1 {
-                print("Epoch \(epoch): loss=\(String(format: "%.6f", lossVal)), amp=\(String(format: "%.4f", amp.data[0])), grad=\(String(format: "%.6f", grad))")
+                print(
+                    "Epoch \(epoch): loss=\(String(format: "%.6f", lossVal)), amp=\(String(format: "%.4f", amp.data[0])), grad=\(String(format: "%.6f", grad))"
+                )
             }
-
-            ctx.step()
         }
 
         print("Final amp: \(amp.data[0]) (target: 1.0)")
@@ -412,7 +481,7 @@ final class NeuralSynthTests: XCTestCase {
 
         print("Learn single amplitude via peek: target = \(targetAmp)")
 
-        let g = Graph()
+        let g = Graph(sampleRate: sampleRate)
 
         // Learnable amplitude stored in a [1,1] tensor
         let ampTensor = TensorParameter(
@@ -466,47 +535,26 @@ final class NeuralSynthTests: XCTestCase {
             frameCount: frameCount,
             graph: g)
 
-        let inputBuffer = [Float](repeating: 0.0, count: frameCount)
-        var outputBuffer = [Float](repeating: 0.0, count: frameCount)
-
         print("Initial amp: \(ampTensor.data[0])")
         print("ampTensor.baseGradId: \(ampTensor.baseGradId.map { String($0) } ?? "nil")")
 
         // Train
         let epochs = 50
         for epoch in 0..<epochs {
-            ctx.zeroGrad()
-            inputBuffer.withUnsafeBufferPointer { inPtr in
-                outputBuffer.withUnsafeMutableBufferPointer { outPtr in
-                    runtime.runWithMemory(
-                        outputs: outPtr.baseAddress!,
-                        inputs: inPtr.baseAddress!,
-                        memory: ctx.getMemory(),
-                        frameCount: frameCount)
-                }
-            }
-
-            let lossVal = outputBuffer.reduce(0, +) / Float(frameCount)
+            let lossVal = ctx.runStepGPU()
 
             if epoch % 10 == 0 || epoch == epochs - 1 {
-                // Get raw gradient
-                var grad: Float = 0
-                if let baseGradId = ampTensor.baseGradId {
-                    let gradPtr = runtime.getGradientsBuffer()
-                    for f in 0..<frameCount {
-                        grad += gradPtr[frameCount * baseGradId + f]
-                    }
-                    grad /= Float(frameCount)
-                }
-                print("Epoch \(epoch): loss=\(String(format: "%.6f", lossVal)), amp=\(String(format: "%.4f", ampTensor.data[0])), grad=\(String(format: "%.6e", grad))")
+                let grad = ampTensor.grads.first ?? 0
+                print(
+                    "Epoch \(epoch): loss=\(String(format: "%.6f", lossVal)), amp=\(String(format: "%.4f", ampTensor.data[0])), grad=\(String(format: "%.6e", grad))"
+                )
             }
-
-            ctx.step()
         }
 
         print("Final amp: \(ampTensor.data[0]) (target: \(targetAmp))")
 
-        XCTAssertEqual(ampTensor.data[0], targetAmp, accuracy: 0.1,
+        XCTAssertEqual(
+            ampTensor.data[0], targetAmp, accuracy: 0.1,
             "Should learn amplitude close to target")
     }
 
@@ -589,9 +637,6 @@ final class NeuralSynthTests: XCTestCase {
             frameCount: frameCount,
             graph: g)
 
-        let inputBuffer = [Float](repeating: 0.0, count: frameCount)
-        var outputBuffer = [Float](repeating: 0.0, count: frameCount)
-
         print("Initial amps: \(amps.data)")
         print("amps.baseGradId: \(amps.baseGradId.map { String($0) } ?? "nil")")
 
@@ -608,44 +653,25 @@ final class NeuralSynthTests: XCTestCase {
         // Train
         let epochs = 100
         for epoch in 0..<epochs {
-            ctx.zeroGrad()
-            inputBuffer.withUnsafeBufferPointer { inPtr in
-                outputBuffer.withUnsafeMutableBufferPointer { outPtr in
-                    runtime.runWithMemory(
-                        outputs: outPtr.baseAddress!,
-                        inputs: inPtr.baseAddress!,
-                        memory: ctx.getMemory(),
-                        frameCount: frameCount)
-                }
-            }
-
-            let lossVal = outputBuffer.reduce(0, +) / Float(frameCount)
+            let lossVal = ctx.runStepGPU()
 
             if epoch % 20 == 0 || epoch == epochs - 1 {
-                // Get raw gradients for each element
-                var grads: [Float] = [0, 0]
-                if let baseGradId = amps.baseGradId {
-                    let gradPtr = runtime.getGradientsBuffer()
-                    for elem in 0..<2 {
-                        for f in 0..<frameCount {
-                            grads[elem] += gradPtr[frameCount * (baseGradId + elem) + f]
-                        }
-                        grads[elem] /= Float(frameCount)
-                    }
-                }
+                let grads = amps.grads
                 let ampsStr = amps.data.map { String(format: "%.4f", $0) }.joined(separator: ", ")
                 let gradsStr = grads.map { String(format: "%.4e", $0) }.joined(separator: ", ")
-                print("Epoch \(epoch): loss=\(String(format: "%.6f", lossVal)), amps=[\(ampsStr)], grads=[\(gradsStr)]")
+                print(
+                    "Epoch \(epoch): loss=\(String(format: "%.6f", lossVal)), amps=[\(ampsStr)], grads=[\(gradsStr)]"
+                )
             }
-
-            ctx.step()
         }
 
         print("Final amps: \(amps.data)")
         print("Target amps: \(targetAmps)")
 
-        XCTAssertEqual(amps.data[0], targetAmps[0], accuracy: 0.15, "Amp 0 should be close to target")
-        XCTAssertEqual(amps.data[1], targetAmps[1], accuracy: 0.15, "Amp 1 should be close to target")
+        XCTAssertEqual(
+            amps.data[0], targetAmps[0], accuracy: 0.15, "Amp 0 should be close to target")
+        XCTAssertEqual(
+            amps.data[1], targetAmps[1], accuracy: 0.15, "Amp 1 should be close to target")
     }
 
     // MARK: - Test 1e: Learn Harmonic Amplitudes (No MLP)
@@ -663,7 +689,7 @@ final class NeuralSynthTests: XCTestCase {
 
         print("Learn harmonic amplitudes: target = \(targetAmps)")
 
-        let g = Graph()
+        let g = Graph(sampleRate: sampleRate)
 
         // Learnable amplitudes (start at uniform 0.5)
         let amps = TensorParameter(
@@ -677,9 +703,10 @@ final class NeuralSynthTests: XCTestCase {
         // Generate shared oscillators (same phase for synth and target)
         var oscillators: [NodeID] = []
         for k in 1...numHarmonics {
-            let freqNorm = g.n(.constant(f0 * Float(k) / sampleRate))
+            // phasor expects frequency in Hz (Graph uses sampleRate internally)
+            let freqHz = g.n(.constant(f0 * Float(k)))
             let phaseCell = g.alloc()
-            let phase = g.n(.phasor(phaseCell), freqNorm, zero)
+            let phase = g.n(.phasor(phaseCell), freqHz, zero)
             let sine = g.n(.sin, g.n(.mul, twoPi, phase))
             oscillators.append(sine)
         }
@@ -736,9 +763,6 @@ final class NeuralSynthTests: XCTestCase {
             frameCount: frameCount,
             graph: g)
 
-        let inputBuffer = [Float](repeating: 0.0, count: frameCount)
-        var outputBuffer = [Float](repeating: 0.0, count: frameCount)
-
         print("Initial amps: \(amps.data)")
         print("amps.nodeId: \(amps.nodeId)")
         print("amps.baseGradId: \(amps.baseGradId.map { String($0) } ?? "nil")")
@@ -749,40 +773,17 @@ final class NeuralSynthTests: XCTestCase {
         // Train
         let epochs = 100
         for epoch in 0..<epochs {
-            ctx.zeroGrad()
-            inputBuffer.withUnsafeBufferPointer { inPtr in
-                outputBuffer.withUnsafeMutableBufferPointer { outPtr in
-                    runtime.runWithMemory(
-                        outputs: outPtr.baseAddress!,
-                        inputs: inPtr.baseAddress!,
-                        memory: ctx.getMemory(),
-                        frameCount: frameCount)
-                }
-            }
-
-            let lossVal = outputBuffer.reduce(0, +) / Float(frameCount)
+            let lossVal = ctx.runStepGPU()
 
             if epoch % 20 == 0 || epoch == epochs - 1 {
                 let ampsStr = amps.data.map { String(format: "%.3f", $0) }.joined(separator: ", ")
                 print("Epoch \(epoch): loss=\(String(format: "%.6f", lossVal)), amps=[\(ampsStr)]")
 
                 // Debug: print raw gradient values for each element
-                if let baseGradId = amps.baseGradId {
-                    let gradPtr = runtime.getGradientsBuffer()
-                    var elemGrads: [Float] = []
-                    for elem in 0..<amps.size {
-                        var total: Float = 0
-                        for f in 0..<frameCount {
-                            total += gradPtr[frameCount * (baseGradId + elem) + f]
-                        }
-                        elemGrads.append(total / Float(frameCount))
-                    }
-                    let gradsStr = elemGrads.map { String(format: "%.6e", $0) }.joined(separator: ", ")
-                    print("  Element gradients: [\(gradsStr)]")
-                }
+                let gradsStr = amps.grads.map { String(format: "%.6e", $0) }.joined(
+                    separator: ", ")
+                print("  Element gradients: [\(gradsStr)]")
             }
-
-            ctx.step()
         }
 
         print("Final amps: \(amps.data)")
@@ -790,7 +791,8 @@ final class NeuralSynthTests: XCTestCase {
 
         // Check each amplitude is close to target
         for i in 0..<numHarmonics {
-            XCTAssertEqual(amps.data[i], targetAmps[i], accuracy: 0.1,
+            XCTAssertEqual(
+                amps.data[i], targetAmps[i], accuracy: 0.1,
                 "Harmonic \(i+1) amplitude should be close to target")
         }
     }
@@ -907,28 +909,15 @@ final class NeuralSynthTests: XCTestCase {
 
         let pitchCellPhysical =
             compileResult.cellAllocations.cellMappings[pitchInputCell] ?? pitchInputCell
-        let memoryRaw = ctx.getMemory()
-        let memory = memoryRaw.assumingMemoryBound(to: Float.self)
-
-        let inputBuffer = [Float](repeating: 0.0, count: frameCount)
-        var outputBuffer = [Float](repeating: 0.0, count: frameCount)
 
         // Get initial loss on training pitches
         var initialAvgLoss: Float = 0
         for pitch in trainingPitches {
             let pitchNormalized = (pitch - 100.0) / 400.0
-            memory[pitchCellPhysical] = pitchNormalized
-            ctx.zeroGrad()
-            inputBuffer.withUnsafeBufferPointer { inPtr in
-                outputBuffer.withUnsafeMutableBufferPointer { outPtr in
-                    runtime.runWithMemory(
-                        outputs: outPtr.baseAddress!,
-                        inputs: inPtr.baseAddress!,
-                        memory: memoryRaw,
-                        frameCount: frameCount)
-                }
+            let lossVal = ctx.runStepGPU { mem in
+                mem[pitchCellPhysical] = pitchNormalized
             }
-            initialAvgLoss += outputBuffer.reduce(0, +) / Float(frameCount)
+            initialAvgLoss += lossVal
         }
         initialAvgLoss /= Float(trainingPitches.count)
         print("Initial avg training loss: \(initialAvgLoss)")
@@ -936,74 +925,34 @@ final class NeuralSynthTests: XCTestCase {
         // Train
         let epochs = 100
         for epoch in 0..<epochs {
+            var totalLoss: Float = 0
             for pitch in trainingPitches {
                 let pitchNormalized = (pitch - 100.0) / 400.0
-                memory[pitchCellPhysical] = pitchNormalized
-                ctx.zeroGrad()
-                inputBuffer.withUnsafeBufferPointer { inPtr in
-                    outputBuffer.withUnsafeMutableBufferPointer { outPtr in
-                        runtime.runWithMemory(
-                            outputs: outPtr.baseAddress!,
-                            inputs: inPtr.baseAddress!,
-                            memory: memoryRaw,
-                            frameCount: frameCount)
-                    }
+                let lossVal = ctx.runStepGPU { mem in
+                    mem[pitchCellPhysical] = pitchNormalized
                 }
-                ctx.step()
+                totalLoss += lossVal
             }
 
             if epoch % 25 == 0 || epoch == epochs - 1 {
-                var totalLoss: Float = 0
-                for pitch in trainingPitches {
-                    let pitchNormalized = (pitch - 100.0) / 400.0
-                    memory[pitchCellPhysical] = pitchNormalized
-                    ctx.zeroGrad()
-                    inputBuffer.withUnsafeBufferPointer { inPtr in
-                        outputBuffer.withUnsafeMutableBufferPointer { outPtr in
-                            runtime.runWithMemory(
-                                outputs: outPtr.baseAddress!,
-                                inputs: inPtr.baseAddress!,
-                                memory: memoryRaw,
-                                frameCount: frameCount)
-                        }
-                    }
-                    totalLoss += outputBuffer.reduce(0, +) / Float(frameCount)
-                }
                 print("Epoch \(epoch): avg loss = \(totalLoss / Float(trainingPitches.count))")
             }
         }
 
         // Test generalization on UNSEEN pitch
         let testPitchNorm = (testPitch - 100.0) / 400.0
-        memory[pitchCellPhysical] = testPitchNorm
-        ctx.zeroGrad()
-        inputBuffer.withUnsafeBufferPointer { inPtr in
-            outputBuffer.withUnsafeMutableBufferPointer { outPtr in
-                runtime.runWithMemory(
-                    outputs: outPtr.baseAddress!,
-                    inputs: inPtr.baseAddress!,
-                    memory: memoryRaw,
-                    frameCount: frameCount)
-            }
+        let testLoss = ctx.runStepGPU { mem in
+            mem[pitchCellPhysical] = testPitchNorm
         }
-        let testLoss = outputBuffer.reduce(0, +) / Float(frameCount)
 
         // Final training loss
         var finalTrainLoss: Float = 0
         for pitch in trainingPitches {
             let pitchNormalized = (pitch - 100.0) / 400.0
-            memory[pitchCellPhysical] = pitchNormalized
-            ctx.zeroGrad()
-            inputBuffer.withUnsafeBufferPointer { inPtr in
-                outputBuffer.withUnsafeMutableBufferPointer { outPtr in
-                    runtime.runWithMemory(
-                        outputs: outPtr.baseAddress!,
-                        inputs: inPtr.baseAddress!,
-                        memory: memoryRaw,
-                        frameCount: frameCount)
-                }
+            let lossVal = ctx.runStepGPU { mem in
+                mem[pitchCellPhysical] = pitchNormalized
             }
-            finalTrainLoss += outputBuffer.reduce(0, +) / Float(frameCount)
+            finalTrainLoss += lossVal
         }
         finalTrainLoss /= Float(trainingPitches.count)
 

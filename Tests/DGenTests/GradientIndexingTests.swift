@@ -36,23 +36,9 @@ final class GradientIndexingTests: XCTestCase {
             context: result.context,
             frameCount: frameCount,
             graph: g)
+        _ = ctx.runStepGPU()
 
-        let inputBuffer = [Float](repeating: 0.0, count: frameCount)
-        var outputBuffer = [Float](repeating: 0.0, count: frameCount)
-
-        ctx.zeroGrad()
-
-        inputBuffer.withUnsafeBufferPointer { inPtr in
-            outputBuffer.withUnsafeMutableBufferPointer { outPtr in
-                runtime.runWithMemory(
-                    outputs: outPtr.baseAddress!,
-                    inputs: inPtr.baseAddress!,
-                    memory: ctx.getMemory(),
-                    frameCount: frameCount)
-            }
-        }
-
-        return ctx.extractTensorGradients()
+        return parameters.map { $0.grads }
     }
 
     // MARK: - Diagnostic Test 1: Gradient Index Tracing

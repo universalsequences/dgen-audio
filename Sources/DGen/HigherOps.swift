@@ -15,8 +15,9 @@ extension Graph {
 
     // If freq is constant and reset is constant 0, use deterministic phasor
     if case .constant(_) = freqNode.op,
-       case .constant(let resetVal) = resetNode.op,
-       resetVal == 0.0 {
+      case .constant(let resetVal) = resetNode.op,
+      resetVal == 0.0
+    {
       // Use deterministic phasor - no memory needed, fully parallelizable
       return n(.deterministicPhasor, freq)
     }
@@ -360,7 +361,7 @@ extension Graph {
 
     // Attack and release coefficient calculations
     let log001 = n(.log, n(.constant(0.01)))
-    let sampleRate = n(.constant(44100.0))
+    let sampleRate = n(.constant(self.sampleRate))
 
     let attackSamples = n(.mul, attack, sampleRate)
     let attackCoef = n(.exp, n(.div, log001, attackSamples))
@@ -491,8 +492,9 @@ extension Graph {
   /// of FFT (like conv2d, mul) inherit this hop-based temporality and also only run
   /// every hopSize frames, avoiding redundant computation.
   public func fft(_ signal: NodeID, windowSize: Int, hopSize: Int? = nil) -> NodeID {
-    precondition(windowSize > 0 && (windowSize & (windowSize - 1)) == 0,
-                 "windowSize must be a power of 2")
+    precondition(
+      windowSize > 0 && (windowSize & (windowSize - 1)) == 0,
+      "windowSize must be a power of 2")
 
     // Default hopSize to windowSize/4 (75% overlap) - good balance of efficiency and responsiveness
     let actualHopSize = hopSize ?? max(1, windowSize / 4)
@@ -520,7 +522,9 @@ extension Graph {
     // Allocate counter cell for hop timing (single float, 0 to hopSize-1)
     let counterCell = alloc(vectorWidth: 1)
 
-    let fftNode = n(.fft(windowSize, actualHopSize, scratchCell, ringBufferCell, writePosCell, counterCell), [signal], shape: .tensor([numBins, 2]))
+    let fftNode = n(
+      .fft(windowSize, actualHopSize, scratchCell, ringBufferCell, writePosCell, counterCell),
+      [signal], shape: .tensor([numBins, 2]))
     nodeToTensor[fftNode] = tensorId
 
     // Register hop-based temporality for this FFT node
@@ -536,8 +540,9 @@ extension Graph {
   public func fftMagnitude(_ fftOutput: NodeID) -> NodeID {
     // Get the FFT output tensor info
     guard let fftTensorId = nodeToTensor[fftOutput],
-          let fftTensor = tensors[fftTensorId],
-          fftTensor.shape.count == 2 && fftTensor.shape[1] == 2 else {
+      let fftTensor = tensors[fftTensorId],
+      fftTensor.shape.count == 2 && fftTensor.shape[1] == 2
+    else {
       fatalError("fftMagnitude requires an FFT output tensor with shape [numBins, 2]")
     }
 
@@ -606,8 +611,9 @@ extension Graph {
   /// while the overlap-add output runs every frame. This allows the expensive IFFT
   /// to run only when needed (when counter == 0).
   public func ifft(_ spectrum: NodeID, windowSize: Int, hopSize: Int? = nil) -> NodeID {
-    precondition(windowSize > 0 && (windowSize & (windowSize - 1)) == 0,
-                 "windowSize must be a power of 2")
+    precondition(
+      windowSize > 0 && (windowSize & (windowSize - 1)) == 0,
+      "windowSize must be a power of 2")
 
     // Default hopSize to windowSize/4 (75% overlap) for smooth reconstruction
     let actualHopSize = hopSize ?? max(1, windowSize / 4)
@@ -625,7 +631,9 @@ extension Graph {
     // Allocate counter cell for hop timing (single float, 0 to hopSize-1)
     let counterCell = alloc(vectorWidth: 1)
 
-    let ifftNode = n(.ifft(windowSize, actualHopSize, scratchCell, outputRingCell, readPosCell, counterCell), [spectrum], shape: .scalar)
+    let ifftNode = n(
+      .ifft(windowSize, actualHopSize, scratchCell, outputRingCell, readPosCell, counterCell),
+      [spectrum], shape: .scalar)
 
     // Register hop-based temporality for this IFFT node
     // Note: IFFT output is scalar (one sample per frame via overlap-add),

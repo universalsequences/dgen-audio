@@ -42,43 +42,19 @@ final class TensorParameterTests: XCTestCase {
             context: result.context,
             frameCount: frameCount,
             graph: g)
-
-        let inputBuffer = [Float](repeating: 0.0, count: frameCount)
-        var outputBuffer = [Float](repeating: 0.0, count: frameCount)
-
         // Run forward/backward to get initial state
-        ctx.zeroGrad()
-        inputBuffer.withUnsafeBufferPointer { inPtr in
-            outputBuffer.withUnsafeMutableBufferPointer { outPtr in
-                runtime.runWithMemory(
-                    outputs: outPtr.baseAddress!,
-                    inputs: inPtr.baseAddress!,
-                    memory: ctx.getMemory(),
-                    frameCount: frameCount)
-            }
-        }
-
-        let initialLoss = outputBuffer[0]
-        let initialGrads = ctx.extractTensorGradients()
+        let initialLoss = ctx.runStepGPU()
+        let initialGrads = parameters.map { $0.grads }
 
         // Training loop
+        var finalLoss = initialLoss
         for _ in 0..<epochs {
-            ctx.step()
-            ctx.zeroGrad()
-            inputBuffer.withUnsafeBufferPointer { inPtr in
-                outputBuffer.withUnsafeMutableBufferPointer { outPtr in
-                    runtime.runWithMemory(
-                        outputs: outPtr.baseAddress!,
-                        inputs: inPtr.baseAddress!,
-                        memory: ctx.getMemory(),
-                        frameCount: frameCount)
-                }
-            }
+            finalLoss = ctx.runStepGPU()
         }
 
         return TrainingResult(
             initialLoss: initialLoss,
-            finalLoss: outputBuffer[0],
+            finalLoss: finalLoss,
             gradients: initialGrads)
     }
 
@@ -194,23 +170,10 @@ final class TensorParameterTests: XCTestCase {
             frameCount: frameCount)
 
         // Run forward and backward pass
-        let inputBuffer = [Float](repeating: 0.0, count: frameCount)
-        var outputBuffer = [Float](repeating: 0.0, count: frameCount)
-
-        ctx.zeroGrad()
-
-        inputBuffer.withUnsafeBufferPointer { inPtr in
-            outputBuffer.withUnsafeMutableBufferPointer { outPtr in
-                runtime.runWithMemory(
-                    outputs: outPtr.baseAddress!,
-                    inputs: inPtr.baseAddress!,
-                    memory: ctx.getMemory(),
-                    frameCount: frameCount)
-            }
-        }
+        _ = ctx.runStepGPU()
 
         // Extract and check gradients
-        let grads = ctx.extractTensorGradients()[0]
+        let grads = tensorParam.grads
         print("Sum backward gradients: \(grads)")
 
         // All gradients should be equal (broadcast from sum)
@@ -257,22 +220,8 @@ final class TensorParameterTests: XCTestCase {
             frameCount: frameCount)
 
         // Run forward and backward pass
-        let inputBuffer = [Float](repeating: 0.0, count: frameCount)
-        var outputBuffer = [Float](repeating: 0.0, count: frameCount)
-
-        ctx.zeroGrad()
-
-        inputBuffer.withUnsafeBufferPointer { inPtr in
-            outputBuffer.withUnsafeMutableBufferPointer { outPtr in
-                runtime.runWithMemory(
-                    outputs: outPtr.baseAddress!,
-                    inputs: inPtr.baseAddress!,
-                    memory: ctx.getMemory(),
-                    frameCount: frameCount)
-            }
-        }
-
-        let grads = ctx.extractTensorGradients()[0]
+        _ = ctx.runStepGPU()
+        let grads = tensorParam.grads
         print("SumAxis backward gradients: \(grads)")
 
         // Row 0 elements should all have same gradient (from sumAxis broadcast)
@@ -314,23 +263,8 @@ final class TensorParameterTests: XCTestCase {
             cellAllocations: result.cellAllocations,
             context: result.context,
             frameCount: frameCount)
-
-        ctx.zeroGrad()
-
-        let inputBuffer = [Float](repeating: 0.0, count: frameCount)
-        var outputBuffer = [Float](repeating: 0.0, count: frameCount)
-
-        inputBuffer.withUnsafeBufferPointer { inPtr in
-            outputBuffer.withUnsafeMutableBufferPointer { outPtr in
-                runtime.runWithMemory(
-                    outputs: outPtr.baseAddress!,
-                    inputs: inPtr.baseAddress!,
-                    memory: ctx.getMemory(),
-                    frameCount: frameCount)
-            }
-        }
-
-        let grads = ctx.extractTensorGradients()[0]
+        _ = ctx.runStepGPU()
+        let grads = tensorParam.grads
         print("Reshape backward gradients: \(grads)")
 
         // All gradients should be equal (reshape is 1:1 mapping, sum broadcasts)
@@ -380,27 +314,10 @@ final class TensorParameterTests: XCTestCase {
             frameCount: frameCount,
             graph: g)
 
-        let inputBuffer = [Float](repeating: 0.0, count: frameCount)
-        var outputBuffer = [Float](repeating: 0.0, count: frameCount)
-
         var losses: [Float] = []
-        for epoch in 0..<200 {
-            ctx.zeroGrad()
-
-            inputBuffer.withUnsafeBufferPointer { inPtr in
-                outputBuffer.withUnsafeMutableBufferPointer { outPtr in
-                    runtime.runWithMemory(
-                        outputs: outPtr.baseAddress!,
-                        inputs: inPtr.baseAddress!,
-                        memory: ctx.getMemory(),
-                        frameCount: frameCount)
-                }
-            }
-
-            let currentLoss = outputBuffer[0]
+        for _ in 0..<200 {
+            let currentLoss = ctx.runStepGPU()
             losses.append(currentLoss)
-
-            ctx.step()
         }
 
         // Verify convergence: sum(weights) should approach 20
@@ -452,26 +369,9 @@ final class TensorParameterTests: XCTestCase {
 
         // Train
         var losses: [Float] = []
-        let inputBuffer = [Float](repeating: 0.0, count: frameCount)
-        var outputBuffer = [Float](repeating: 0.0, count: frameCount)
-
         for epoch in 0..<500 {
-            ctx.zeroGrad()
-
-            inputBuffer.withUnsafeBufferPointer { inPtr in
-                outputBuffer.withUnsafeMutableBufferPointer { outPtr in
-                    runtime.runWithMemory(
-                        outputs: outPtr.baseAddress!,
-                        inputs: inPtr.baseAddress!,
-                        memory: ctx.getMemory(),
-                        frameCount: frameCount)
-                }
-            }
-
-            let currentLoss = outputBuffer[0]
+            let currentLoss = ctx.runStepGPU()
             losses.append(currentLoss)
-
-            ctx.step()
 
             if epoch % 100 == 0 {
                 print("Epoch \(epoch): loss = \(currentLoss), weights = \(weights.data)")
@@ -523,24 +423,8 @@ final class TensorParameterTests: XCTestCase {
             cellAllocations: result.cellAllocations,
             context: result.context,
             frameCount: frameCount)
-
-        let inputBuffer = [Float](repeating: 0.0, count: frameCount)
-        var outputBuffer = [Float](repeating: 0.0, count: frameCount)
-
-        for epoch in 0..<50 {
-            ctx.zeroGrad()
-
-            inputBuffer.withUnsafeBufferPointer { inPtr in
-                outputBuffer.withUnsafeMutableBufferPointer { outPtr in
-                    runtime.runWithMemory(
-                        outputs: outPtr.baseAddress!,
-                        inputs: inPtr.baseAddress!,
-                        memory: ctx.getMemory(),
-                        frameCount: frameCount)
-                }
-            }
-
-            ctx.step()
+        for _ in 0..<50 {
+            _ = ctx.runStepGPU()
         }
 
         // Weights should converge towards values that sum to 0
@@ -1108,25 +992,9 @@ final class TensorParameterTests: XCTestCase {
             frameCount: frameCount,
             graph: g)
 
-        let inputBuffer = [Float](repeating: 0.0, count: frameCount)
-        var outputBuffer = [Float](repeating: 0.0, count: frameCount)
-
         var losses: [Float] = []
-        for epoch in 0..<50 {
-            ctx.zeroGrad()
-
-            inputBuffer.withUnsafeBufferPointer { inPtr in
-                outputBuffer.withUnsafeMutableBufferPointer { outPtr in
-                    runtime.runWithMemory(
-                        outputs: outPtr.baseAddress!,
-                        inputs: inPtr.baseAddress!,
-                        memory: ctx.getMemory(),
-                        frameCount: frameCount)
-                }
-            }
-
-            losses.append(outputBuffer[0])
-            ctx.step()
+        for _ in 0..<50 {
+            losses.append(ctx.runStepGPU())
         }
 
         // Should converge to W=[1,1], b=0
@@ -1188,25 +1056,9 @@ final class TensorParameterTests: XCTestCase {
             frameCount: frameCount,
             graph: g)
 
-        let inputBuffer = [Float](repeating: 0.0, count: frameCount)
-        var outputBuffer = [Float](repeating: 0.0, count: frameCount)
-
         var losses: [Float] = []
-        for epoch in 0..<100 {
-            ctx.zeroGrad()
-
-            inputBuffer.withUnsafeBufferPointer { inPtr in
-                outputBuffer.withUnsafeMutableBufferPointer { outPtr in
-                    runtime.runWithMemory(
-                        outputs: outPtr.baseAddress!,
-                        inputs: inPtr.baseAddress!,
-                        memory: ctx.getMemory(),
-                        frameCount: frameCount)
-                }
-            }
-
-            losses.append(outputBuffer[0])
-            ctx.step()
+        for _ in 0..<100 {
+            losses.append(ctx.runStepGPU())
         }
 
         XCTAssertLessThan(
@@ -1326,24 +1178,9 @@ final class TensorParameterTests: XCTestCase {
             frameCount: frameCount,
             graph: g)
 
-        let inputBuffer = [Float](repeating: 0.0, count: frameCount)
-        var outputBuffer = [Float](repeating: 0.0, count: frameCount)
-
         var losses: [Float] = []
-        for epoch in 0..<100 {
-            ctx.zeroGrad()
-
-            inputBuffer.withUnsafeBufferPointer { inPtr in
-                outputBuffer.withUnsafeMutableBufferPointer { outPtr in
-                    runtime.runWithMemory(
-                        outputs: outPtr.baseAddress!,
-                        inputs: inPtr.baseAddress!,
-                        memory: ctx.getMemory(),
-                        frameCount: frameCount)
-                }
-            }
-            losses.append(outputBuffer[0])
-            ctx.step()
+        for _ in 0..<100 {
+            losses.append(ctx.runStepGPU())
         }
 
         XCTAssertLessThan(losses.last!, losses[0] * 0.5, "Two-layer network loss should decrease")
@@ -1423,47 +1260,21 @@ final class TensorParameterTests: XCTestCase {
             context: compiledResult.context,
             frameCount: frameCount,
             graph: g)
-
-        let inputBuffer = [Float](repeating: 0.0, count: frameCount)
-        var outputBuffer = [Float](repeating: 0.0, count: frameCount)
-
         // Initial forward pass
-        ctx.zeroGrad()
-        inputBuffer.withUnsafeBufferPointer { inPtr in
-            outputBuffer.withUnsafeMutableBufferPointer { outPtr in
-                runtime.runWithMemory(
-                    outputs: outPtr.baseAddress!,
-                    inputs: inPtr.baseAddress!,
-                    memory: ctx.getMemory(),
-                    frameCount: frameCount)
-            }
-        }
-        let initialLoss = outputBuffer[0]
+        let initialLoss = ctx.runStepGPU()
 
         // Train for several epochs
         var losses: [Float] = [initialLoss]
 
         for epoch in 0..<400 {
-            ctx.step()
-            ctx.zeroGrad()
-
-            inputBuffer.withUnsafeBufferPointer { inPtr in
-                outputBuffer.withUnsafeMutableBufferPointer { outPtr in
-                    runtime.runWithMemory(
-                        outputs: outPtr.baseAddress!,
-                        inputs: inPtr.baseAddress!,
-                        memory: ctx.getMemory(),
-                        frameCount: frameCount)
-                }
-            }
-
-            losses.append(outputBuffer[0])
+            let lossVal = ctx.runStepGPU()
+            losses.append(lossVal)
             if epoch % 20 == 0 {
-                print("epoch=\(epoch) loss=\(outputBuffer[0])")
+                print("epoch=\(epoch) loss=\(lossVal)")
             }
 
             // Stop early if loss becomes NaN/Inf
-            if outputBuffer[0].isNaN || outputBuffer[0].isInfinite {
+            if lossVal.isNaN || lossVal.isInfinite {
                 break
             }
         }

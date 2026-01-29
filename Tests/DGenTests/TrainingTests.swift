@@ -70,38 +70,12 @@ final class TrainingTests: XCTestCase {
 
         // MARK: - Training Loop
 
-        let inputBuffer = [Float](repeating: 0.0, count: frameCount)  // Dummy input
-        var outputBuffer = [Float](repeating: 0.0, count: frameCount)
-
         let numEpochs = 200
         var finalLoss: Float = 0.0
 
         for epoch in 0..<numEpochs {
-            ctx.zeroGrad()
-
-            // Forward pass
-            inputBuffer.withUnsafeBufferPointer { inPtr in
-                outputBuffer.withUnsafeMutableBufferPointer { outPtr in
-                    runtime.runWithMemory(
-                        outputs: outPtr.baseAddress!,
-                        inputs: inPtr.baseAddress!,
-                        memory: ctx.getMemory(),
-                        frameCount: frameCount
-                    )
-                }
-            }
-
-            // Loss is already computed in the output buffer (we output the MSE)
-            // Average over all frames
-            var loss: Float = 0.0
-            for i in 0..<frameCount {
-                loss += outputBuffer[i]
-            }
-            loss /= Float(frameCount)
+            let loss = ctx.runStepGPU()
             finalLoss = loss
-
-            // Update parameters
-            ctx.step()
 
             // DEBUG: Check memory buffer to confirm parameter was updated
             if epoch % 20 == 0 {
@@ -192,33 +166,8 @@ final class TrainingTests: XCTestCase {
             frameCount: frameCount
         )
 
-        let inputBuffer = [Float](repeating: 0.0, count: frameCount)
-        var outputBuffer = [Float](repeating: 0.0, count: frameCount)
-
         for epoch in 0..<400 {
-            // Forward pass
-            ctx.zeroGrad()
-
-            inputBuffer.withUnsafeBufferPointer { inPtr in
-                outputBuffer.withUnsafeMutableBufferPointer { outPtr in
-                    runtime.runWithMemory(
-                        outputs: outPtr.baseAddress!,
-                        inputs: inPtr.baseAddress!,
-                        memory: ctx.getMemory(),
-                        frameCount: frameCount
-                    )
-                }
-            }
-
-            // Calculate loss from output (output contains MSE)
-            var loss: Float = 0.0
-            for i in 0..<frameCount {
-                loss += outputBuffer[i]
-            }
-            loss /= Float(frameCount)
-
-            // Update parameters based on gradients
-            ctx.step()
+            let loss = ctx.runStepGPU()
 
             if epoch % 100 == 0 || epoch < 5 {
                 let sum = param1.value + param2.value

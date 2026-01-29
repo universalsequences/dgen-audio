@@ -102,7 +102,8 @@ public struct CompilationPipeline {
 
         // Step 1.5: Combine history operations that are not in feedback loops
         time("combineHistoryOps") {
-            combineHistoryOpsNotInFeedback(graph, feedbackClusters: feedbackClusters, options: options)
+            combineHistoryOpsNotInFeedback(
+                graph, feedbackClusters: feedbackClusters, options: options)
         }
 
         // Step 1.6: Fold constant expressions
@@ -112,13 +113,14 @@ public struct CompilationPipeline {
 
         let scalarNodeSet = time("scalarNodes") {
             options.forceScalar
-            ? Set(graph.nodes.keys)
-            : scalarNodes(graph, feedbackClusters: feedbackClusters)
+                ? Set(graph.nodes.keys)
+                : scalarNodes(graph, feedbackClusters: feedbackClusters)
         }
 
         let sortedNodes = time("topoWithCorridors") {
             topoWithCorridors(
-                graph, feedbackClusters: feedbackClusters, scalarNodeSet: scalarNodeSet, debug: false)
+                graph, feedbackClusters: feedbackClusters, scalarNodeSet: scalarNodeSet,
+                debug: false)
         }
 
         try time("inferShapes") {
@@ -212,6 +214,12 @@ public struct CompilationPipeline {
         let temporalityResult = time("inferTemporality") {
             inferTemporality(graph: graph, sortedNodes: sortedNodes)
         }
+
+        // TEMPORARILY DISABLED for testing
+        // finalBlocks = extractStaticOpsIntoBlocks(
+        //     blocks: finalBlocks, frameBasedNodes: temporalityResult.frameBasedNodes,
+        //     hopBasedNodes: temporalityResult.hopBasedNodes)
+
         time("assignTemporality") {
             assignBlockTemporality(
                 blocks: &finalBlocks,
@@ -243,7 +251,8 @@ public struct CompilationPipeline {
                     g: graph,
                     debug: options.debug
                 )
-                uopBlocks.append(BlockUOps(ops: ops, kind: block.kind, temporality: block.temporality))
+                uopBlocks.append(
+                    BlockUOps(ops: ops, kind: block.kind, temporality: block.temporality))
             }
         }
 
@@ -320,11 +329,14 @@ public struct CompilationPipeline {
 
         // Print timing summary
         let pipelineTotal = (CFAbsoluteTimeGetCurrent() - pipelineStart) * 1000
-        print("⏱️ [DGen Pipeline] Total: \(String(format: "%.1f", pipelineTotal))ms | nodes: \(graph.nodes.count)")
+        print(
+            "⏱️ [DGen Pipeline] Total: \(String(format: "%.1f", pipelineTotal))ms | nodes: \(graph.nodes.count)"
+        )
         let sortedTimings = timings.sorted { $0.1 > $1.1 }
         for (label, ms) in sortedTimings.prefix(10) {
             let pct = (ms / pipelineTotal) * 100
-            print("   \(String(format: "%6.1f", ms))ms (\(String(format: "%4.1f", pct))%) - \(label)")
+            print(
+                "   \(String(format: "%6.1f", ms))ms (\(String(format: "%4.1f", pct))%) - \(label)")
         }
 
         return CompilationResult(
@@ -635,9 +647,9 @@ func foldConstants(_ graph: Graph, options: CompilationPipeline.Options) {
     // Initialize worklist with foldable nodes that have all-constant inputs
     var worklist = Set<NodeID>()
     for (nodeId, node) in graph.nodes {
-        if canFoldOp(node.op) &&
-           !node.inputs.isEmpty &&
-           node.inputs.allSatisfy({ constantValues[$0] != nil }) {
+        if canFoldOp(node.op) && !node.inputs.isEmpty
+            && node.inputs.allSatisfy({ constantValues[$0] != nil })
+        {
             worklist.insert(nodeId)
         }
     }
@@ -654,7 +666,8 @@ func foldConstants(_ graph: Graph, options: CompilationPipeline.Options) {
 
         // Evaluate the constant expression
         guard let result = evaluateConstantOp(node.op, inputValues),
-              result.isFinite else { continue }
+            result.isFinite
+        else { continue }
 
         // Replace node with constant (preserves NodeID, no rewiring needed)
         constantValues[nodeId] = result
@@ -664,8 +677,9 @@ func foldConstants(_ graph: Graph, options: CompilationPipeline.Options) {
         // Add newly-eligible consumers to worklist
         for consumer in consumers[nodeId] ?? [] {
             if let consumerNode = graph.nodes[consumer],
-               canFoldOp(consumerNode.op),
-               consumerNode.inputs.allSatisfy({ constantValues[$0] != nil }) {
+                canFoldOp(consumerNode.op),
+                consumerNode.inputs.allSatisfy({ constantValues[$0] != nil })
+            {
                 worklist.insert(consumer)
             }
         }
@@ -689,7 +703,7 @@ private func canFoldOp(_ op: LazyOp) -> Bool {
         return true
     // Unary math
     case .abs, .sign, .sin, .cos, .tan, .tanh, .exp, .log, .log10, .sqrt,
-         .floor, .ceil, .round, .atan2:
+        .floor, .ceil, .round, .atan2:
         return true
     // Control flow (key for biquad)
     case .gswitch, .mix, .selector:
@@ -702,43 +716,44 @@ private func canFoldOp(_ op: LazyOp) -> Bool {
 private func evaluateConstantOp(_ op: LazyOp, _ inputs: [Float]) -> Float? {
     switch op {
     // Unary
-    case .abs:   return inputs.count == 1 ? Swift.abs(inputs[0]) : nil
-    case .sign:  return inputs.count == 1 ? (inputs[0] > 0 ? 1 : (inputs[0] < 0 ? -1 : 0)) : nil
-    case .sin:   return inputs.count == 1 ? sin(inputs[0]) : nil
-    case .cos:   return inputs.count == 1 ? cos(inputs[0]) : nil
-    case .tan:   return inputs.count == 1 ? tan(inputs[0]) : nil
-    case .tanh:  return inputs.count == 1 ? tanh(inputs[0]) : nil
-    case .exp:   return inputs.count == 1 ? exp(inputs[0]) : nil
-    case .log:   return inputs.count == 1 && inputs[0] > 0 ? log(inputs[0]) : nil
+    case .abs: return inputs.count == 1 ? Swift.abs(inputs[0]) : nil
+    case .sign: return inputs.count == 1 ? (inputs[0] > 0 ? 1 : (inputs[0] < 0 ? -1 : 0)) : nil
+    case .sin: return inputs.count == 1 ? sin(inputs[0]) : nil
+    case .cos: return inputs.count == 1 ? cos(inputs[0]) : nil
+    case .tan: return inputs.count == 1 ? tan(inputs[0]) : nil
+    case .tanh: return inputs.count == 1 ? tanh(inputs[0]) : nil
+    case .exp: return inputs.count == 1 ? exp(inputs[0]) : nil
+    case .log: return inputs.count == 1 && inputs[0] > 0 ? log(inputs[0]) : nil
     case .log10: return inputs.count == 1 && inputs[0] > 0 ? log10(inputs[0]) : nil
-    case .sqrt:  return inputs.count == 1 && inputs[0] >= 0 ? sqrt(inputs[0]) : nil
+    case .sqrt: return inputs.count == 1 && inputs[0] >= 0 ? sqrt(inputs[0]) : nil
     case .floor: return inputs.count == 1 ? floor(inputs[0]) : nil
-    case .ceil:  return inputs.count == 1 ? ceil(inputs[0]) : nil
+    case .ceil: return inputs.count == 1 ? ceil(inputs[0]) : nil
     case .round: return inputs.count == 1 ? round(inputs[0]) : nil
 
     // Binary
-    case .add:   return inputs.count == 2 ? inputs[0] + inputs[1] : nil
-    case .sub:   return inputs.count == 2 ? inputs[0] - inputs[1] : nil
-    case .mul:   return inputs.count == 2 ? inputs[0] * inputs[1] : nil
-    case .div:   return inputs.count == 2 && inputs[1] != 0 ? inputs[0] / inputs[1] : nil
-    case .pow:   return inputs.count == 2 ? pow(inputs[0], inputs[1]) : nil
-    case .mod:   return inputs.count == 2 && inputs[1] != 0 ?
-                        inputs[0].truncatingRemainder(dividingBy: inputs[1]) : nil
-    case .min:   return inputs.count == 2 ? Swift.min(inputs[0], inputs[1]) : nil
-    case .max:   return inputs.count == 2 ? Swift.max(inputs[0], inputs[1]) : nil
+    case .add: return inputs.count == 2 ? inputs[0] + inputs[1] : nil
+    case .sub: return inputs.count == 2 ? inputs[0] - inputs[1] : nil
+    case .mul: return inputs.count == 2 ? inputs[0] * inputs[1] : nil
+    case .div: return inputs.count == 2 && inputs[1] != 0 ? inputs[0] / inputs[1] : nil
+    case .pow: return inputs.count == 2 ? pow(inputs[0], inputs[1]) : nil
+    case .mod:
+        return inputs.count == 2 && inputs[1] != 0
+            ? inputs[0].truncatingRemainder(dividingBy: inputs[1]) : nil
+    case .min: return inputs.count == 2 ? Swift.min(inputs[0], inputs[1]) : nil
+    case .max: return inputs.count == 2 ? Swift.max(inputs[0], inputs[1]) : nil
     case .atan2: return inputs.count == 2 ? atan2(inputs[0], inputs[1]) : nil
 
     // Comparisons (return 1.0 for true, 0.0 for false)
-    case .gt:    return inputs.count == 2 ? (inputs[0] > inputs[1] ? 1 : 0) : nil
-    case .gte:   return inputs.count == 2 ? (inputs[0] >= inputs[1] ? 1 : 0) : nil
-    case .lt:    return inputs.count == 2 ? (inputs[0] < inputs[1] ? 1 : 0) : nil
-    case .lte:   return inputs.count == 2 ? (inputs[0] <= inputs[1] ? 1 : 0) : nil
-    case .eq:    return inputs.count == 2 ? (inputs[0] == inputs[1] ? 1 : 0) : nil
+    case .gt: return inputs.count == 2 ? (inputs[0] > inputs[1] ? 1 : 0) : nil
+    case .gte: return inputs.count == 2 ? (inputs[0] >= inputs[1] ? 1 : 0) : nil
+    case .lt: return inputs.count == 2 ? (inputs[0] < inputs[1] ? 1 : 0) : nil
+    case .lte: return inputs.count == 2 ? (inputs[0] <= inputs[1] ? 1 : 0) : nil
+    case .eq: return inputs.count == 2 ? (inputs[0] == inputs[1] ? 1 : 0) : nil
 
     // Logical
-    case .and:   return inputs.count == 2 ? ((inputs[0] != 0 && inputs[1] != 0) ? 1 : 0) : nil
-    case .or:    return inputs.count == 2 ? ((inputs[0] != 0 || inputs[1] != 0) ? 1 : 0) : nil
-    case .xor:   return inputs.count == 2 ? (((inputs[0] != 0) != (inputs[1] != 0)) ? 1 : 0) : nil
+    case .and: return inputs.count == 2 ? ((inputs[0] != 0 && inputs[1] != 0) ? 1 : 0) : nil
+    case .or: return inputs.count == 2 ? ((inputs[0] != 0 || inputs[1] != 0) ? 1 : 0) : nil
+    case .xor: return inputs.count == 2 ? (((inputs[0] != 0) != (inputs[1] != 0)) ? 1 : 0) : nil
 
     // Ternary (key for biquad mode selection)
     case .gswitch:

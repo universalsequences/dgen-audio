@@ -67,25 +67,19 @@ final class SpectralLossBackwardTests: XCTestCase {
             context: result.context
         )
 
-        // Initialize gradient seeds before running forward/backward pass
-        print("   Resetting gradients buffer...")
-        runtime.resetGradientBuffers(numFrames: frameCount)
-
-        // Run forward and backward pass (both happen in runWithMemory)
-        let inputBuffer = [Float](repeating: 0.0, count: frameCount)
-        var outputBuffer = [Float](repeating: 0.0, count: frameCount)
-        let memory = runtime.allocateNodeMemory()!
-
-        inputBuffer.withUnsafeBufferPointer { inPtr in
-            outputBuffer.withUnsafeMutableBufferPointer { outPtr in
-                runtime.runWithMemory(
-                    outputs: outPtr.baseAddress!,
-                    inputs: inPtr.baseAddress!,
-                    memory: memory,
-                    frameCount: frameCount
-                )
-            }
-        }
+        // Training context to run a single forward/backward pass
+        let ctx = TrainingContext(
+            parameters: [],
+            optimizer: SGD(lr: 0.0),
+            lossNode: loss
+        )
+        ctx.initializeMemory(
+            runtime: runtime,
+            cellAllocations: result.cellAllocations,
+            context: result.context,
+            frameCount: frameCount
+        )
+        let initialLoss = ctx.runStepGPU()
 
         // Also check tape buffer to see if loss is computed correctly
         if let tape = runtime.readBuffer(named: "t") {
@@ -95,14 +89,7 @@ final class SpectralLossBackwardTests: XCTestCase {
             )
         }
 
-        let initialLoss = outputBuffer[frameCount - 1]
         print("   Initial loss: \(String(format: "%.6f", initialLoss))")
-        print(
-            "   [DEBUG] Output buffer first 5: \(outputBuffer.prefix(5).map { String(format: "%.2f", $0) }.joined(separator: ", "))"
-        )
-        print(
-            "   [DEBUG] Output buffer last 5: \(outputBuffer.suffix(5).map { String(format: "%.2f", $0) }.joined(separator: ", "))"
-        )
 
         // Check that loss is reasonable (300 vs 440 Hz should have measurable loss)
         XCTAssertGreaterThan(initialLoss, 0.01, "Loss should be measurable for 300 vs 440 Hz")
@@ -142,7 +129,6 @@ final class SpectralLossBackwardTests: XCTestCase {
             XCTFail("Gradients buffer not found")
         }
 
-        runtime.deallocateNodeMemory(memory)
     }
 
     /// Test that spectral loss backward pass can learn to match a target frequency
@@ -209,34 +195,11 @@ final class SpectralLossBackwardTests: XCTestCase {
             frameCount: frameCount
         )
 
-        // Buffers
-        let inputBuffer = [Float](repeating: 0.0, count: frameCount)
-        var outputBuffer = [Float](repeating: 0.0, count: frameCount)
-
         // Training loop using TrainingContext
         let numIterations = 2500
         var lossHistory: [Float] = []
         for iteration in 0..<numIterations {
-            // Zero gradients and reset memory (preserving params)
-            ctx.zeroGrad()
-
-            // Forward + backward pass
-            inputBuffer.withUnsafeBufferPointer { inPtr in
-                outputBuffer.withUnsafeMutableBufferPointer { outPtr in
-                    runtime.runWithMemory(
-                        outputs: outPtr.baseAddress!,
-                        inputs: inPtr.baseAddress!,
-                        memory: ctx.getMemory(),
-                        frameCount: frameCount
-                    )
-                }
-            }
-
-            // Optimizer step updates params and syncs memory
-            ctx.step()
-
-            // Spectral loss is written to the output; use last frame's value as scalar loss
-            let currentLoss = outputBuffer[frameCount - 1]
+            let currentLoss = ctx.runStepGPU()
             lossHistory.append(currentLoss)
 
             if iteration % 100 == 0 || iteration <= 10 {
@@ -324,34 +287,11 @@ final class SpectralLossBackwardTests: XCTestCase {
             frameCount: frameCount
         )
 
-        // Buffers
-        let inputBuffer = [Float](repeating: 0.0, count: frameCount)
-        var outputBuffer = [Float](repeating: 0.0, count: frameCount)
-
         // Training loop using TrainingContext
         let numIterations = 2000
         var lossHistory: [Float] = []
         for iteration in 0..<numIterations {
-            // Zero gradients and reset memory (preserving params)
-            ctx.zeroGrad()
-
-            // Forward + backward pass
-            inputBuffer.withUnsafeBufferPointer { inPtr in
-                outputBuffer.withUnsafeMutableBufferPointer { outPtr in
-                    runtime.runWithMemory(
-                        outputs: outPtr.baseAddress!,
-                        inputs: inPtr.baseAddress!,
-                        memory: ctx.getMemory(),
-                        frameCount: frameCount
-                    )
-                }
-            }
-
-            // Optimizer step updates params and syncs memory
-            ctx.step()
-
-            // Spectral loss is written to the output; use last frame's value as scalar loss
-            let currentLoss = outputBuffer[frameCount - 1]
+            let currentLoss = ctx.runStepGPU()
             lossHistory.append(currentLoss)
 
             if iteration % 100 == 0 || iteration <= 10 {
@@ -481,34 +421,11 @@ final class SpectralLossBackwardTests: XCTestCase {
             frameCount: frameCount
         )
 
-        // Buffers
-        let inputBuffer = [Float](repeating: 0.0, count: frameCount)
-        var outputBuffer = [Float](repeating: 0.0, count: frameCount)
-
         // Training loop using TrainingContext
         let numIterations = 4200
         var lossHistory: [Float] = []
         for iteration in 0..<numIterations {
-            // Zero gradients and reset memory (preserving params)
-            ctx.zeroGrad()
-
-            // Forward + backward pass
-            inputBuffer.withUnsafeBufferPointer { inPtr in
-                outputBuffer.withUnsafeMutableBufferPointer { outPtr in
-                    runtime.runWithMemory(
-                        outputs: outPtr.baseAddress!,
-                        inputs: inPtr.baseAddress!,
-                        memory: ctx.getMemory(),
-                        frameCount: frameCount
-                    )
-                }
-            }
-
-            // Optimizer step updates params and syncs memory
-            ctx.step()
-
-            // Spectral loss is written to the output; use last frame's value as scalar loss
-            let currentLoss = outputBuffer[frameCount - 1]
+            let currentLoss = ctx.runStepGPU()
             lossHistory.append(currentLoss)
 
             if iteration % 10 == 0 || iteration <= 10 {
