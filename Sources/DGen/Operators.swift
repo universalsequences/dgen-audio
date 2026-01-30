@@ -332,6 +332,7 @@ public enum LazyOp {
     case selector  // selector(mode, options[])
     case memoryRead(CellID)
     case memoryWrite(CellID)
+    case memoryAccumulate(CellID)  // Atomic add to memory cell
     case historyWrite(CellID)
     case historyReadWrite(CellID)
     case param(CellID)
@@ -361,6 +362,13 @@ public enum LazyOp {
     case peekRow  // Read entire row from 2D tensor with interpolation - outputs 1D tensor
     case fft(Int, Int, CellID, CellID, CellID, CellID)  // FFT transform: windowSize, hopSize, scratchCell, ringBufferCell, writePosCell, counterCell
     case ifft(Int, Int, CellID, CellID, CellID, CellID)  // IFFT transform: windowSize, hopSize, scratchCell, outputRingCell, readPosCell, counterCell
+
+    // Gradient-specific operations (used by Gradients.swift)
+    case neg  // Unary negation: -x
+    case expand(Shape)  // Broadcast scalar to tensor shape (sum backward)
+    case expandAxis(Shape, Int)  // Broadcast along a specific axis (sumAxis backward)
+    case gradPhasor(NodeID)  // Gradient for phasor: needs frame index context
+    case gradDeterministicPhasor  // Gradient for deterministic phasor
 
     public func emit(ctx: IRContext, g: Graph, nodeId: NodeID) throws -> [UOp] {
         guard let node = g.nodes[nodeId] else { return [] }
@@ -536,6 +544,12 @@ public enum LazyOp {
                     operator: "memoryWrite", expected: 2, actual: inputs.count)
             }
             b.use(val: b.memoryWrite(cellId, b.value(inputs[0]), b.value(inputs[1])))
+        case .memoryAccumulate(let cellId):
+            guard inputs.count == 2 else {
+                throw DGenError.insufficientInputs(
+                    operator: "memoryAccumulate", expected: 2, actual: inputs.count)
+            }
+            b.use(val: b.memoryAccumulate(cellId, b.value(inputs[0]), b.value(inputs[1])))
         case .atan2:
             guard inputs.count == 2 else {
                 throw DGenError.insufficientInputs(
@@ -1598,6 +1612,88 @@ public enum LazyOp {
 
             // Use the output sample
             b.use(val: outputSample)
+
+        // MARK: - Gradient-specific operations
+
+        case .neg:
+            // Unary negation: -x
+            guard inputs.count == 1 else { fatalError("neg requires 1 input") }
+            let x = b.value(inputs[0])
+            b.use(val: b.constant(0.0) - x)
+
+        case .expand(let targetShape):
+            // Broadcast scalar to tensor shape (for sum backward)
+            // Input is scalar, output is tensor where all elements = input
+            guard inputs.count == 1 else { fatalError("expand requires 1 input") }
+            let scalarVal = b.value(inputs[0])
+
+            // Get or create output tensor
+            guard let outTensor = g.nodeToTensor[nodeId].flatMap({ g.tensors[$0] }) else {
+                // Fallback: just pass through the scalar
+                b.use(val: scalarVal)
+                break
+            }
+
+            let size = targetShape.reduce(1, *)
+            b.parallelRange(size) { idx in
+                _ = b.memoryWrite(outTensor.cellId, b.cast(idx, to: .int), scalarVal)
+            }
+
+        case .expandAxis(let targetShape, let axis):
+            // Broadcast along a specific axis (for sumAxis backward)
+            guard inputs.count == 1 else { fatalError("expandAxis requires 1 input") }
+
+            guard let inTensor = g.nodeToTensor[node.inputs[0]].flatMap({ g.tensors[$0] }),
+                  let outTensor = g.nodeToTensor[nodeId].flatMap({ g.tensors[$0] }) else {
+                // Fallback
+                if let s = inputs.first { b.use(val: b.value(s)) }
+                break
+            }
+
+            let outSize = targetShape.reduce(1, *)
+            let normalizedAxis = axis < 0 ? targetShape.count + axis : axis
+
+            // Compute strides for output shape (excluding the expanded axis)
+            var inputShape = targetShape
+            inputShape.remove(at: normalizedAxis)
+            let inputStrides = Tensor.computeRowMajorStrides(inputShape)
+            let outputStrides = Tensor.computeRowMajorStrides(targetShape)
+
+            b.parallelRange(outSize) { outIdx in
+                // Map output index to input index (skip the expanded axis dimension)
+                var inputFlatIdx = b.int(0)
+                var inDim = 0
+                for dim in 0..<targetShape.count {
+                    if dim == normalizedAxis { continue }
+                    let coord = b.mod(b.floorDiv(outIdx, b.int(outputStrides[dim])), b.int(targetShape[dim]))
+                    inputFlatIdx = b.add(inputFlatIdx, b.mul(coord, b.int(inputStrides[inDim])))
+                    inDim += 1
+                }
+
+                let val = b.memoryRead(inTensor.cellId, inputFlatIdx)
+                _ = b.memoryWrite(outTensor.cellId, b.cast(outIdx, to: .int), val)
+            }
+
+        case .gradPhasor(_):
+            // Gradient for phasor: d(phase)/d(freq) = frameIndex / sampleRate
+            // inputs: [gradOutput, sampleRate]
+            // Note: Use threadIndex() for SIMD compatibility (same as gradDeterministicPhasor)
+            guard inputs.count == 2 else { fatalError("gradPhasor requires 2 inputs") }
+            let gradOut = b.value(inputs[0])
+            let sampleRate = b.value(inputs[1])
+            let frameIdx = b.threadIndex()  // Use threadIndex for SIMD compatibility
+            let gradFreq = gradOut * frameIdx / sampleRate
+            b.use(val: gradFreq)
+
+        case .gradDeterministicPhasor:
+            // Gradient for deterministic phasor: d(phase)/d(freq) = threadIndex / sampleRate
+            // inputs: [gradOutput, sampleRate]
+            guard inputs.count == 2 else { fatalError("gradDeterministicPhasor requires 2 inputs") }
+            let gradOut = b.value(inputs[0])
+            let sampleRate = b.value(inputs[1])
+            let frameIdx = b.threadIndex()
+            let gradFreq = gradOut * frameIdx / sampleRate
+            b.use(val: gradFreq)
         }
         ops.append(contentsOf: b.ops)
         return ops
@@ -1867,6 +1963,12 @@ public enum LazyOp {
             let zeroGrad = ctx.useConstant(src: nil, value: 0.0)
             b.grad(node.inputs[0], value: zeroGrad)
             // Gradient for value flows through
+            b.grad(node.inputs[1], value: gradOutput)
+        case .memoryAccumulate(_):
+            // Same as memoryWrite - gradient flows through to value input
+            guard inputs.count == 2 else { fatalError("memoryAccumulate requires 2 inputs") }
+            let zeroGrad = ctx.useConstant(src: nil, value: 0.0)
+            b.grad(node.inputs[0], value: zeroGrad)
             b.grad(node.inputs[1], value: gradOutput)
         case .gt, .gte, .lte, .lt, .eq:
             // Comparisons have zero gradient (non-differentiable)
@@ -2564,6 +2666,40 @@ public enum LazyOp {
             // For now, zero gradients to input spectrum tensor
             guard inputs.count == 1 else { fatalError("ifft requires 1 input") }
             b.grad(node.inputs[0], value: ctx.useConstant(src: nil, value: 0.0))
+
+        // MARK: - Gradient-specific operations (used by graph-based gradient computation)
+        // These ops are generated by Gradients.swift and don't need their own backward pass
+        // since they ARE the backward pass.
+
+        case .neg:
+            // neg is its own inverse for gradients: d(-x)/dx = -1
+            guard inputs.count == 1 else { fatalError("neg requires 1 input") }
+            let negGrad = b.constant(0.0) - b.value(gradOutput)
+            b.grad(node.inputs[0], value: negGrad.lazy)
+
+        case .expand(_):
+            // expand backward is sum (contract back to scalar)
+            guard inputs.count == 1 else { fatalError("expand requires 1 input") }
+            // The gradient of expand is a reduction - sum the incoming gradients
+            // For now, just pass a zero since this is used in graph-based gradients
+            b.grad(node.inputs[0], value: ctx.useConstant(src: nil, value: 0.0))
+
+        case .expandAxis(_, _):
+            // expandAxis backward is sumAxis
+            guard inputs.count == 1 else { fatalError("expandAxis requires 1 input") }
+            b.grad(node.inputs[0], value: ctx.useConstant(src: nil, value: 0.0))
+
+        case .gradPhasor(_):
+            // Gradient ops don't need their own backward (second derivatives not supported)
+            guard inputs.count == 2 else { fatalError("gradPhasor requires 2 inputs") }
+            b.grad(node.inputs[0], value: ctx.useConstant(src: nil, value: 0.0))
+            b.grad(node.inputs[1], value: ctx.useConstant(src: nil, value: 0.0))
+
+        case .gradDeterministicPhasor:
+            // Gradient ops don't need their own backward (second derivatives not supported)
+            guard inputs.count == 2 else { fatalError("gradDeterministicPhasor requires 2 inputs") }
+            b.grad(node.inputs[0], value: ctx.useConstant(src: nil, value: 0.0))
+            b.grad(node.inputs[1], value: ctx.useConstant(src: nil, value: 0.0))
         }
 
         ops.append(contentsOf: b.ops)

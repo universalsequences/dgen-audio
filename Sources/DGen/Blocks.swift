@@ -533,50 +533,78 @@ public func topoWithCorridors(
 }
 
 // Simple topological sort within a corridor
+// If lastForwardNodeId is set, ensures forward nodes (id <= lastForwardNodeId) are processed
+// before gradient nodes (id > lastForwardNodeId) to prevent gradient additions from
+// affecting forward node ordering.
 private func simpleTopoSortWithinCorridor(nodes: [NodeID], g: Graph) -> [NodeID] {
     let nodeSet = Set(nodes)
-    var indegree: [NodeID: Int] = [:]
+    let lastForwardId = g.lastForwardNodeId
 
-    // Calculate in-degrees within corridor
-    for nodeId in nodes {
-        indegree[nodeId] = 0
+    // Separate forward and gradient nodes if applicable
+    let forwardNodes: [NodeID]
+    let gradientNodes: [NodeID]
+    if let lastFwd = lastForwardId {
+        forwardNodes = nodes.filter { $0 <= lastFwd }.sorted()
+        gradientNodes = nodes.filter { $0 > lastFwd }.sorted()
+    } else {
+        forwardNodes = nodes.sorted()
+        gradientNodes = []
     }
 
-    for nodeId in nodes {
-        if let node = g.nodes[nodeId] {
-            for dep in node.allDependencies {
-                if nodeSet.contains(dep) {
-                    indegree[nodeId]! += 1
-                }
-            }
+    // Helper function to topo sort a subset of nodes
+    func topoSort(_ subsetNodes: [NodeID], considerDepsIn fullSet: Set<NodeID>) -> [NodeID] {
+        guard !subsetNodes.isEmpty else { return [] }
+        let subsetSet = Set(subsetNodes)
+        var indegree: [NodeID: Int] = [:]
+
+        // Calculate in-degrees (only counting deps within the subset)
+        for nodeId in subsetNodes {
+            indegree[nodeId] = 0
         }
-    }
 
-    // Kahn's algorithm
-    var queue = indegree.filter { $0.value == 0 }.map { $0.key }.sorted()
-    var result: [NodeID] = []
-
-    while let nodeId = queue.first {
-        queue.removeFirst()
-        result.append(nodeId)
-
-        // Update consumers within corridor
-        for otherNodeId in nodes {
-            if let otherNode = g.nodes[otherNodeId] {
-                if otherNode.allDependencies.contains(nodeId) {
-                    indegree[otherNodeId]! -= 1
-                    if indegree[otherNodeId] == 0 {
-                        let insertIndex = queue.firstIndex { $0 > otherNodeId } ?? queue.count
-                        queue.insert(otherNodeId, at: insertIndex)
+        for nodeId in subsetNodes {
+            if let node = g.nodes[nodeId] {
+                for dep in node.allDependencies {
+                    // Only count dependencies that are in the subset we're sorting
+                    if subsetSet.contains(dep) {
+                        indegree[nodeId]! += 1
                     }
                 }
             }
         }
+
+        // Kahn's algorithm
+        var queue = indegree.filter { $0.value == 0 }.map { $0.key }.sorted()
+        var result: [NodeID] = []
+
+        while let nodeId = queue.first {
+            queue.removeFirst()
+            result.append(nodeId)
+
+            // Update consumers within subset
+            for otherNodeId in subsetNodes {
+                if let otherNode = g.nodes[otherNodeId] {
+                    if otherNode.allDependencies.contains(nodeId) {
+                        indegree[otherNodeId]! -= 1
+                        if indegree[otherNodeId] == 0 {
+                            let insertIndex = queue.firstIndex { $0 > otherNodeId } ?? queue.count
+                            queue.insert(otherNodeId, at: insertIndex)
+                        }
+                    }
+                }
+            }
+        }
+
+        // Add any remaining nodes (cycles)
+        let remaining = subsetSet.subtracting(result)
+        result.append(contentsOf: remaining.sorted())
+
+        return result
     }
 
-    // Add any remaining nodes (cycles within corridor)
-    let remaining = Set(nodes).subtracting(result)
-    result.append(contentsOf: remaining.sorted())
+    // Sort forward nodes first, then gradient nodes
+    var result = topoSort(forwardNodes, considerDepsIn: nodeSet)
+    result.append(contentsOf: topoSort(gradientNodes, considerDepsIn: nodeSet))
 
     return result
 }

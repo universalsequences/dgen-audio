@@ -23,12 +23,15 @@ final class FrontendTests: XCTestCase {
                 let filtered1 = onepole(phase1, cutoff)
                 let sig1 = filtered1
                 let sig2 = onepole(phase1, g.constant(0.2))
-                let loss =
+                let loss = g.mse(sig1, sig2) * 1000
+                /*
                         (g.spectralLoss(sig1, sig2, windowSize: 32)
 
                                 + g.spectralLoss(sig1, sig2, windowSize: 64)
                                 + g.spectralLoss(sig1, sig2, windowSize: 128)) * 1 + 0.1
                         * g.mse(sig1, sig2)
+
+                 */
 
                 let frameCount = 512 * 2
                 let result = try g.compile(

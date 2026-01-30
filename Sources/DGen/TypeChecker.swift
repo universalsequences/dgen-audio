@@ -234,6 +234,23 @@ public func inferShape(op: LazyOp, inputs: [ValueShape], graph: Graph) throws ->
   case .seq:
     return inputs.last ?? .scalar
 
+  // Gradient-specific operations
+  case .neg:
+    // Negation preserves shape
+    return inputs.first ?? .scalar
+
+  case .expand(let targetShape):
+    // Expand broadcasts scalar to tensor
+    return .tensor(targetShape)
+
+  case .expandAxis(let targetShape, _):
+    // ExpandAxis broadcasts along an axis
+    return .tensor(targetShape)
+
+  case .gradPhasor(_), .gradDeterministicPhasor:
+    // Gradient ops produce scalars (per-frame gradients)
+    return .scalar
+
   // everything else is a scalar
   default: return .scalar
   }

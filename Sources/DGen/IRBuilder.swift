@@ -341,6 +341,13 @@ public final class IRBuilder {
     return self.value(dest)
   }
 
+  public func memoryAccumulate(_ cellId: CellID, _ offset: Expr, _ value: Expr) -> Expr {
+    let dest = ctx.useVariable(src: nodeId)
+    let uop = UOp(op: .memoryAccumulate(cellId, offset.lazy, value.lazy), value: dest)
+    ops.append(uop)
+    return self.value(dest)
+  }
+
   // MARK: - Tensor Ops (register-cached)
 
   /// Load from tensor cell - uses cached register if available

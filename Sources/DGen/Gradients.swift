@@ -8,8 +8,21 @@ import Foundation
 // - Gradients are just more LazyOps in the graph
 // - Block scheduling doesn't need to know about "forward" vs "backward"
 // - Parallelization falls out naturally from tensor ops
+//
+// For temporal operations (historyRead/historyWrite), we use gradient carry cells
+// to pass gradients backwards through time, similar to BPTT.
 
 extension Graph {
+
+    /// Get or create a gradient carry cell for a history cell
+    public func getGradCarryCell(for historyCellId: CellID) -> CellID {
+        if let existing = gradCarryCells[historyCellId] {
+            return existing
+        }
+        let carryCell = alloc()
+        gradCarryCells[historyCellId] = carryCell
+        return carryCell
+    }
 
     /// Compute gradients by building new nodes in the graph.
     /// Returns a mapping from original forward nodes to their gradient nodes.
@@ -20,6 +33,7 @@ extension Graph {
     /// - Returns: Dictionary mapping forward NodeID -> gradient NodeID
     public func computeGradients(loss: NodeID, targets: Set<NodeID>) -> [NodeID: NodeID] {
         var grads: [NodeID: NodeID] = [:]
+        gradientSideEffects = []
 
         // Seed: gradient of loss w.r.t. itself = 1.0
         grads[loss] = n(.constant(1.0), [])
@@ -30,6 +44,7 @@ extension Graph {
                   let node = nodes[nodeId] else { continue }
 
             // Apply backward rule -> get gradient NodeIDs for inputs
+            // Also handles side effects like storing to gradient carry cells
             let inputGrads = node.op.backward(graph: self, node: node, gradOutput: upstreamGrad)
 
             // Accumulate gradients (as graph nodes, not values!)
@@ -46,6 +61,11 @@ extension Graph {
         }
 
         return grads
+    }
+
+    /// Add a side-effect node that should execute during gradient computation
+    public func addGradientSideEffect(_ nodeId: NodeID) {
+        gradientSideEffects.append(nodeId)
     }
 
     /// Compute reverse topological order from loss, only including nodes on paths to targets.
@@ -351,7 +371,7 @@ extension LazyOp {
 
         // MARK: Tensor Shape Operations
 
-        case .reshape(let newShape):
+        case .reshape(_):
             // Gradient needs to be reshaped back to original shape
             guard let inputNode = g.nodes[node.inputs[0]],
                   case .tensor(let origShape) = inputNode.shape else {
@@ -428,10 +448,37 @@ extension LazyOp {
             let gradValue = g.n(.gswitch, [g.n(.gt, [cond, zero]), gradOutput, zero])
             return [gradValue, zero]
 
-        case .historyRead(_), .historyWrite(_), .historyReadWrite(_):
-            // Temporal gradient flow - complex, needs special handling
-            // For now, pass through
-            return [gradOutput]
+        case .historyRead(let cellId):
+            // historyRead exposes previous state. The gradient w.r.t. this read's output
+            // must be passed to the previous timestep via the gradient carry cell.
+            // This is like storeGradMemory in the legacy backward.
+            let carryCell = g.getGradCarryCell(for: cellId)
+            let zero = g.n(.constant(0.0), [])
+            // Store gradOutput to carry cell for previous timestep
+            let writeNode = g.n(.memoryWrite(carryCell), [zero, gradOutput])
+            // Register as side effect so it gets scheduled
+            g.addGradientSideEffect(writeNode)
+            return []  // No graph inputs
+
+        case .historyWrite(let cellId):
+            // historyWrite stores current input into the cell.
+            // The gradient for the input comes from future reads via the carry cell.
+            // This is like loadGradMemory in the legacy backward.
+            let carryCell = g.getGradCarryCell(for: cellId)
+            let zero = g.n(.constant(0.0), [])
+            // Read gradient from carry cell (from future timestep)
+            let carryGrad = g.n(.memoryRead(carryCell), [zero])
+            return [carryGrad]
+
+        case .historyReadWrite(let cellId):
+            // Combined read/write - stores gradOutput to carry, reads carry as input gradient
+            let carryCell = g.getGradCarryCell(for: cellId)
+            let zero = g.n(.constant(0.0), [])
+            // Read current carry (from future)
+            let carryGrad = g.n(.memoryRead(carryCell), [zero])
+            // Store gradOutput for previous timestep
+            _ = g.n(.memoryWrite(carryCell), [zero, gradOutput])
+            return [carryGrad]
 
         // MARK: I/O and Constants
 
@@ -471,6 +518,11 @@ extension LazyOp {
 
         case .memoryWrite(_):
             // inputs: [offset, value]
+            let zero = g.n(.constant(0.0), [])
+            return [zero, gradOutput]
+
+        case .memoryAccumulate(_):
+            // inputs: [offset, value] - same as memoryWrite
             let zero = g.n(.constant(0.0), [])
             return [zero, gradOutput]
 

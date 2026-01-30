@@ -621,6 +621,8 @@ func remapVectorMemorySlots(
                 registerCell(cellId, kind: block.kind)
             case .memoryWrite(let cellId, _, _):
                 registerCell(cellId, kind: block.kind)
+            case .memoryAccumulate(let cellId, _, _):
+                registerCell(cellId, kind: block.kind)
             default:
                 break
             }
@@ -708,6 +710,14 @@ func remapVectorMemorySlots(
                 if let newCellId = cellRemapping[cellId] {
                     uopBlocks[blockIndex].ops[uopIndex] = UOp(
                         op: .memoryWrite(newCellId, offset, value),
+                        value: uop.value,
+                        kind: uop.kind
+                    )
+                }
+            case .memoryAccumulate(let cellId, let offset, let value):
+                if let newCellId = cellRemapping[cellId] {
+                    uopBlocks[blockIndex].ops[uopIndex] = UOp(
+                        op: .memoryAccumulate(newCellId, offset, value),
                         value: uop.value,
                         kind: uop.kind
                     )

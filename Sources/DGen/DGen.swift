@@ -32,6 +32,18 @@ open class Graph {
     /// Sample rate for audio processing (default 44100 Hz)
     public var sampleRate: Float = 44100.0
 
+    /// Mapping from history cell IDs to gradient carry cell IDs.
+    /// Used for temporal gradient flow through historyRead/historyWrite.
+    public var gradCarryCells: [CellID: CellID] = [:]
+
+    /// Side-effect nodes created during backward pass (e.g., gradient carry writes)
+    /// These need to be chained with gradient outputs to ensure they execute.
+    public var gradientSideEffects: [NodeID] = []
+
+    /// Last node ID before gradient nodes were added.
+    /// Used to separate forward and gradient node ordering during compilation.
+    public var lastForwardNodeId: NodeID?
+
     public init() {}
 
     public init(sampleRate: Float) {

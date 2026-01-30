@@ -238,7 +238,7 @@ public class MetalRenderer: Renderer, UOpEmitter {
   private func kernelHasSideEffects(_ scheduleItem: ScheduleItem, ctx: IRContext) -> Bool {
     for uop in scheduleItem.ops {
       switch uop.op {
-      case .memoryWrite, .store, .delay1, .output,
+      case .memoryWrite, .memoryAccumulate, .store, .delay1, .output,
         .accumulateGrad, .accumulateTensorGrad, .storeGradMemory:
         return true
       case .beginRange, .endRange, .beginLoop, .endLoop,
@@ -625,7 +625,7 @@ public class MetalRenderer: Renderer, UOpEmitter {
         inputs.insert(varId)
       case let .loadTape(val, _):
         checkLazyForGlobal(val)
-      case .load, .store, .delay1, .memoryRead, .memoryWrite, .noise:
+      case .load, .store, .delay1, .memoryRead, .memoryWrite, .memoryAccumulate, .noise:
         needsMemory = true
       case .defineMemory:
         needsMemory = true
@@ -716,6 +716,9 @@ public class MetalRenderer: Renderer, UOpEmitter {
       return emitAssign(uop, "memory[\(base) + (int)\(g(offset))]", ctx)
     case let .memoryWrite(base, offset, value):
       return "memory[\(base) + (int)\(g(offset))] = \(g(value));"
+    case let .memoryAccumulate(base, offset, value):
+      // Atomic add to memory cell - safe for concurrent accumulation from SIMD threads
+      return "atomic_fetch_add_explicit((device metal::atomic<float>*)&memory[\(base) + (int)\(g(offset))], \(g(value)), metal::memory_order_relaxed);"
     case let .sin(a): return emitAssign(uop, "metal::sin(\(g(a)))", ctx)
     case let .cos(a): return emitAssign(uop, "metal::cos(\(g(a)))", ctx)
     case let .tan(a): return emitAssign(uop, "metal::tan(\(g(a)))", ctx)

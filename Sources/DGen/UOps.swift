@@ -59,6 +59,7 @@ public enum Op {
   case noise(CellID)
   case memoryRead(CellID, Lazy)
   case memoryWrite(CellID, Lazy, Lazy)
+  case memoryAccumulate(CellID, Lazy, Lazy)  // Atomic add to memory cell
   case latch(Lazy, Lazy)
   case beginIf(Lazy)
   case gswitch(Lazy, Lazy, Lazy)
