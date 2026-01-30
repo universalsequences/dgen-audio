@@ -526,6 +526,13 @@ public func assignBlockTemporality(
   hopBasedNodes: [NodeID: (Int, CellID)]
 ) {
   for i in 0..<blocks.count {
+    // Backward blocks are always frame-based - they run in frame loops
+    // and reduceGradientsGPU handles the summation afterward
+    if blocks[i].direction == .backwards {
+      blocks[i].temporality = .frameBased
+      continue
+    }
+
     // Check for frame-based nodes first (takes precedence)
     let hasFrameBasedNode = blocks[i].nodes.contains { frameBasedNodes.contains($0) }
     if hasFrameBasedNode {
@@ -573,36 +580,10 @@ public func splitBlockByStaticIfPossible(
     return b
   }
 
-  // For backward blocks, use simple splitting to preserve gradient reductions
-  // The complex merging logic breaks backward gradient flow
+  // Backward blocks are always frame-based - no splitting needed
+  // They run in frame loops and reduceGradientsGPU handles gradient summation
   if block.direction == .backwards {
-    var blocks: [Block] = []
-    var currentBlock = initBlock(temporality: nil)
-    var currentTemporality: Temporality? = nil
-    for node in block.nodes {
-      if isStatic(node) {
-        if let temporality = currentTemporality, case .static_ = temporality {
-        } else if currentTemporality == nil {
-          currentBlock.temporality = .static_
-        } else {
-          if currentBlock.nodes.count > 0 { blocks.append(currentBlock) }
-          currentBlock = initBlock(temporality: .static_)
-        }
-        currentTemporality = .static_
-      } else {
-        if let temporality = currentTemporality, case .frameBased = temporality {
-        } else if currentTemporality == nil {
-          currentBlock.temporality = .frameBased
-        } else {
-          if currentBlock.nodes.count > 0 { blocks.append(currentBlock) }
-          currentBlock = initBlock(temporality: .frameBased)
-        }
-        currentTemporality = .frameBased
-      }
-      currentBlock.nodes.append(node)
-    }
-    if currentBlock.nodes.count > 0 { blocks.append(currentBlock) }
-    return blocks
+    return [block]
   }
 
   // For forward blocks, use tensor-aware splitting:
@@ -616,11 +597,6 @@ public func splitBlockByStaticIfPossible(
       }
     }
     return false
-  }
-
-  // If block has no tensor ops at all, don't bother splitting - no parallelization benefit
-  if !hasTensorShapedOps(block.nodes) && fusableChains.isEmpty {
-    return [block]
   }
 
   // Build chain node set for fusable chains
@@ -674,8 +650,6 @@ public func splitBlockByStaticIfPossible(
   }
 
   // Second pass: just merge adjacent same-type segments
-  // NOTE: We previously tried merging scalar static ops into frame-based to reduce kernel
-  // overhead, but this breaks gradient flow. Only keep tensor static ops separate.
   var mergedSegments: [(nodes: [NodeID], isStatic: Bool, chain: FrameDependentTensorChain?)] = []
   for segment in segments {
     if segment.chain != nil {
