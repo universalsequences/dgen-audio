@@ -28,6 +28,13 @@ public class IRContext {
   // Nodes that are part of frame-dependent tensor chains (for SIMD-across-frames optimization)
   public var frameTensorChainNodes: Set<NodeID> = []
 
+  // Scratch buffers for frame-dependent tensor chain reductions (sum)
+  public struct FrameTensorChainScratch {
+    public let cellId: CellID
+    public let tensorSize: Int
+  }
+  public var frameTensorChainScratch: [NodeID: FrameTensorChainScratch] = [:]
+
   /// Clear tensor register tracking (call at start of each tensor block)
   public func clearTensorRegisters() {
     tensorCellToVar = [:]

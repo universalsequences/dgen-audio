@@ -1165,14 +1165,111 @@ public func emitFrameTensorChainBlock(
 ) throws -> [UOp] {
     var uops: [UOp] = []
 
-    // For now, we'll emit using the standard path but mark the block as SIMD-optimizable
-    // The key change is that markRequiresScalar is NOT called for chain nodes,
-    // allowing them to stay in a non-scalar block
+    guard let scratch = ctx.frameTensorChainScratch[chain.reductionNodeId] else {
+        return uops
+    }
 
-    // Future enhancement: fully inline tensor operations with thread-local storage
-    // For now, rely on the existing emission but without the scalar forcing
+    let tensorSize = scratch.tensorSize
 
-    return uops  // Return empty - will fall through to standard emission
+    // Flattened (frame, bin) threading
+    let setup = IRBuilder(ctx: ctx, nodeId: chain.reductionNodeId)
+    setup.setThreadCountScale(tensorSize)
+    let flatIdx = setup.threadIndex()
+    let sizeExpr = setup.constant(Float(tensorSize))
+    let frameIdx = setup.floor(flatIdx / sizeExpr)
+    setup.setFrameIndex(frameIdx)
+    let binIdx = flatIdx - frameIdx * sizeExpr
+    uops.append(contentsOf: setup.ops)
+
+    // Use binIdx as the tensor index for all nodes in the chain
+    for nodeId in block.nodes {
+        ctx.tensorIndices[nodeId] = binIdx.lazy
+    }
+
+    // Emit chain nodes (map step)
+    for nodeId in block.nodes {
+        if let node = g.nodes[nodeId] {
+            if case .peekRow = node.op {
+                // Specialized per-bin peekRow: compute only the current column (binIdx)
+                guard node.inputs.count == 2 else {
+                    throw DGenError.insufficientInputs(
+                        operator: "peekRow", expected: 2, actual: node.inputs.count)
+                }
+                let tensorInput = node.inputs[0]
+                guard let inputNode = g.nodes[tensorInput],
+                    case .tensor(let shape) = inputNode.shape,
+                    shape.count == 2
+                else {
+                    throw DGenError.tensorError(op: "peekRow", reason: "requires 2D tensor input")
+                }
+                guard let inTensorId = g.nodeToTensor[tensorInput],
+                    let inTensor = g.tensors[inTensorId],
+                    let outTensorId = g.nodeToTensor[node.id],
+                    let outTensor = g.tensors[outTensorId]
+                else {
+                    throw DGenError.tensorError(op: "peekRow", reason: "missing tensor")
+                }
+
+                let inputs: [Lazy] = node.inputs.compactMap { ctx.values[$0] }
+                let b = IRBuilder(ctx: ctx, nodeId: nodeId)
+                let rowIndex = try b.readInput(node, inputs, at: 1)
+
+                let numRows = shape[0]
+                let numRowsFloat = b.constant(Float(numRows))
+                let zero = b.constant(0.0)
+                let one = b.constant(1.0)
+
+                // Wrap rowIndex using modulo for wrapping behavior
+                let wrappedIndex = b.mod(rowIndex, numRowsFloat)
+                let isNegative = wrappedIndex < zero
+                let positiveIndex = b.gswitch(isNegative, wrappedIndex + numRowsFloat, wrappedIndex)
+
+                // Compute floor and ceil indices for interpolation
+                let floorIndex = b.floor(positiveIndex)
+                let frac = positiveIndex - floorIndex
+
+                let ceilIndex = floorIndex + one
+                let ceilWrapped = b.gswitch(ceilIndex >= numRowsFloat, zero, ceilIndex)
+
+                let colOffset = b.value(binIdx.lazy) * numRowsFloat
+                let floorPos = colOffset + floorIndex
+                let ceilPos = colOffset + ceilWrapped
+
+                let sample1 = b.memoryRead(inTensor.cellId, b.cast(floorPos, to: .int))
+                let sample2 = b.memoryRead(inTensor.cellId, b.cast(ceilPos, to: .int))
+                let interpolated = b.mix(sample1, sample2, frac)
+
+                // Write only this bin to output tensor
+                _ = b.memoryWrite(outTensor.cellId, b.cast(b.value(binIdx.lazy), to: .int), interpolated)
+
+                // Register output value for downstream ops (best-effort)
+                ctx.values[nodeId] = interpolated.lazy
+                uops.append(contentsOf: b.ops)
+            } else {
+                for uop in try node.op.emit(ctx: ctx, g: g, nodeId: nodeId) {
+                    uops.append(uop)
+                }
+            }
+        }
+    }
+
+    // Write the final tensor element into scratch at [frameIdx, binIdx]
+    if let reductionNode = g.nodes[chain.reductionNodeId],
+        let tensorInputId = reductionNode.inputs.first,
+        let inTensorId = g.nodeToTensor[tensorInputId],
+        let inTensor = g.tensors[inTensorId]
+    {
+        let writer = IRBuilder(ctx: ctx, nodeId: chain.reductionNodeId)
+        let frameIdxExpr = writer.value(frameIdx.lazy)
+        let binIdxExpr = writer.value(binIdx.lazy)
+        let val = writer.tensorRead(inTensor, flatIdx: binIdxExpr, shape: chain.tensorShape)
+        let offset = frameIdxExpr * writer.constant(Float(tensorSize)) + binIdxExpr
+        _ = writer.memoryWrite(
+            scratch.cellId, writer.cast(offset, to: .int), val)
+        uops.append(contentsOf: writer.ops)
+    }
+
+    return uops
 }
 
 public func emitBlockUOps(
@@ -1188,22 +1285,30 @@ public func emitBlockUOps(
     ctx.clearTensorRegisters()
 
     // Step 1: Emit all node UOps first (without wrapping in parallelRange yet)
-    for nodeId in block.nodes {
-        if let tensorIndex = block.tensorIndex {
-            ctx.tensorIndices[nodeId] = tensorIndex
-        }
+    if let chain = block.frameTensorChain, case .forward = block.direction,
+        block.tensorIndex == nil,
+        ctx.frameTensorChainScratch[chain.reductionNodeId] != nil
+    {
+        bodyUops = try emitFrameTensorChainBlock(ctx: ctx, chain: chain, block: block, g: g)
+        emittedNodes = Set(block.nodes)
+    } else {
+        for nodeId in block.nodes {
+            if let tensorIndex = block.tensorIndex {
+                ctx.tensorIndices[nodeId] = tensorIndex
+            }
 
-        if let node = g.nodes[nodeId] {
-            if case .forward = block.direction {
-                for uop in try node.op.emit(ctx: ctx, g: g, nodeId: nodeId) {
-                    emittedNodes.insert(nodeId)
-                    bodyUops.append(uop)
-                }
-            } else {
-                let back = try node.op.emitBackward(ctx: ctx, g: g, nodeId: nodeId)
-                for uop in back {
-                    emittedNodes.insert(nodeId)
-                    bodyUops.append(uop)
+            if let node = g.nodes[nodeId] {
+                if case .forward = block.direction {
+                    for uop in try node.op.emit(ctx: ctx, g: g, nodeId: nodeId) {
+                        emittedNodes.insert(nodeId)
+                        bodyUops.append(uop)
+                    }
+                } else {
+                    let back = try node.op.emitBackward(ctx: ctx, g: g, nodeId: nodeId)
+                    for uop in back {
+                        emittedNodes.insert(nodeId)
+                        bodyUops.append(uop)
+                    }
                 }
             }
         }

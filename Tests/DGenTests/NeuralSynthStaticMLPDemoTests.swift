@@ -661,10 +661,10 @@ final class NeuralSynthStaticMLPDemoTests: XCTestCase {
         let synthOutput = g.n(.add, harmonicOut, noiseFiltered)
 
         let targetSample = try g.peek(tensor: targetTensor, index: audioIdx, channel: zero)
-        let spectralLoss = g.spectralLoss(synthOutput, targetSample, windowSize: windowSize)
+        //let spectralLoss = g.spectralLoss(synthOutput, targetSample, windowSize: windowSize)
         let diff = g.n(.sub, synthOutput, targetSample)
         let mse = g.n(.mul, diff, diff)
-        let loss = g.n(.add, spectralLoss, g.n(.mul, mse, g.n(.constant(0.05))))
+        let loss = mse  //g.n(.add, spectralLoss, g.n(.mul, mse, g.n(.constant(0.05))))
         _ = g.n(.output(0), loss)
 
         let compileResult = try CompilationPipeline.compile(
@@ -675,6 +675,8 @@ final class NeuralSynthStaticMLPDemoTests: XCTestCase {
             kernels: compileResult.kernels,
             cellAllocations: compileResult.cellAllocations,
             context: compileResult.context)
+
+        writeKernelsToDisk(compileResult, "/tmp/harmonic_noise_piano.metal")
 
         let ctx = TrainingContext(
             tensorParameters: [W1H, b1H, W2H, b2H, W1N, b1N, W2N, b2N],

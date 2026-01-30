@@ -992,6 +992,18 @@ public enum LazyOp {
             }
 
         case .sum:
+            if let scratch = ctx.frameTensorChainScratch[nodeId] {
+                let acc = b.float(0.0)
+                let frameIdx = b.threadIndex()
+                let sizeExpr = b.constant(Float(scratch.tensorSize))
+                b.loop(scratch.tensorSize) { i in
+                    let idx = frameIdx * sizeExpr + b.cast(i, to: .float)
+                    let val = b.memoryRead(scratch.cellId, b.cast(idx, to: .int))
+                    acc.accumulate(val)
+                }
+                b.use(val: acc.value)
+                break
+            }
             guard case .tensor(let shape) = g.nodes[node.inputs[0]]?.shape,
                 let inTensor = g.nodeToTensor[node.inputs[0]].flatMap({ g.tensors[$0] })
             else {

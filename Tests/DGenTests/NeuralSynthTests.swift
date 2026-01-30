@@ -990,7 +990,7 @@ final class NeuralSynthTests: XCTestCase {
 
     /// Static MLP computes amplitude envelope as tensor ops, then read at audio rate.
     /// Uses real piano samples as target with 12 harmonics and spectral loss.
-    func testStaticMLP_PianoTarget() throws {
+    func testStaticMLP_PianoTargetSimple() throws {
         // Load piano samples
         let samplesURL = URL(fileURLWithPath: #file)
             .deletingLastPathComponent()

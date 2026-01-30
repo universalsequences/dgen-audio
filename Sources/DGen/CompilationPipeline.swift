@@ -248,6 +248,12 @@ public struct CompilationPipeline {
                 fusableChains: fusableChains)
         }
 
+        if backend == .metal {
+            finalBlocks = splitFrameTensorChainBlocks(
+                blocks: finalBlocks, graph: graph, context: context,
+                frameCount: options.frameCount)
+        }
+
         // Upgrade frame-tensor chain blocks to SIMD kind for SIMD-across-frames execution.
         // These blocks contain chains that can be parallelized across frames (not tensor elements).
         time("upgradeChainBlocks") {
@@ -334,6 +340,56 @@ public struct CompilationPipeline {
                 filtered.append(op)
             }
             return (scale, filtered)
+        }
+
+        func splitFrameTensorChainBlocks(
+            blocks: [Block], graph: Graph, context: IRContext, frameCount: Int
+        ) -> [Block] {
+            var result: [Block] = []
+            result.reserveCapacity(blocks.count)
+
+            for block in blocks {
+                guard let chain = block.frameTensorChain, block.direction == .forward else {
+                    result.append(block)
+                    continue
+                }
+
+                let tensorSize = chain.tensorShape.reduce(1, *)
+                if tensorSize <= 0 {
+                    result.append(block)
+                    continue
+                }
+
+                if context.frameTensorChainScratch[chain.reductionNodeId] == nil {
+                    let scratchSize = frameCount * tensorSize
+                    let scratchCell = graph.alloc(vectorWidth: scratchSize)
+                    context.frameTensorChainScratch[chain.reductionNodeId] =
+                        IRContext.FrameTensorChainScratch(cellId: scratchCell, tensorSize: tensorSize)
+                }
+
+                // Map block: all chain nodes except the reduction
+                var mapBlock = block
+                mapBlock.nodes = block.nodes.filter { $0 != chain.reductionNodeId }
+                mapBlock.frameTensorChain = chain
+                mapBlock.tensorIndex = nil
+                mapBlock.shape = nil
+
+                // Reduce block: just the reduction node
+                var reduceBlock = Block(kind: .simd)
+                reduceBlock.nodes = [chain.reductionNodeId]
+                reduceBlock.direction = block.direction
+                reduceBlock.temporality = block.temporality
+                reduceBlock.tensorIndex = nil
+                reduceBlock.shape = nil
+                reduceBlock.frameTensorChain = nil
+
+                if !mapBlock.nodes.isEmpty {
+                    result.append(mapBlock)
+                }
+                result.append(reduceBlock)
+            }
+
+            return result
         }
 
         try time("emitBlockUOps") {
