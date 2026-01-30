@@ -134,16 +134,21 @@ func u_mix(_ x: Expr, _ y: Expr, lerp: Expr) -> (IRBuilder) -> Expr {
 /// frequency magnitudes. For each frequency bin k, computes real/imaginary components via:
 ///   real_k = Σ sample[n] * cos(-2π*k*n/windowSize)
 ///   imag_k = Σ sample[n] * sin(-2π*k*n/windowSize)
-/// Then returns Σ(mag1_k - mag2_k)² across all bins, where mag = sqrt(real² + imag²).
+/// Then computes per-bin squared error (mag1_k - mag2_k)² and writes to scratch.
+/// Pass2 reduces those per-bin errors to a scalar loss.
 ///
 /// Better than MSE for audio: invariant to small time shifts, captures perceptual differences.
-func u_spectralLoss(sig1: Expr, sig2: Expr, windowSize: Int) -> (IRBuilder) -> Expr {
+func u_spectralLoss(sig1: Expr, sig2: Expr, windowSize: Int, scratchCell: CellID) -> (IRBuilder) -> Expr {
   return { b in
     let numBins = windowSize / 2 + 1
-    let totalError = b.float(0.0)
+    let winSize = b.constant(Float(windowSize))
+    let frameIdx = b.threadIndex()
+    let baseOffset = frameIdx * winSize * b.constant(2.0)
 
     // For each frequency bin
-    let bins = b.loop(numBins) { binIndex in
+    b.parallelRange(numBins) { binIndex in
+      let binIndexFloat = b.cast(binIndex, to: .float)
+
       // DFT accumulators (real and imaginary parts)
       let real1 = b.float(0.0)
       let real2 = b.float(0.0)
@@ -152,16 +157,13 @@ func u_spectralLoss(sig1: Expr, sig2: Expr, windowSize: Int) -> (IRBuilder) -> E
 
       // Sum over window samples
       b.loop(windowSize) { n in
-        let idx = b.threadIndex()
-        let winSize = b.constant(Float(windowSize))
-        let j = idx - (winSize - b.constant(1.0)) + b.cast(n, to: .float)
+        let j = frameIdx - (winSize - b.constant(1.0)) + b.cast(n, to: .float)
 
         // Load samples from tape with bounds checking
         let s1 = b.tapeLoad(sig1, at: j)
         let s2 = b.tapeLoad(sig2, at: j)
 
         // DFT basis: e^(-2πi*k*n/N) = cos(angle) - i*sin(angle)
-        let binIndexFloat = b.cast(binIndex, to: .float)
         let nFloat = b.cast(n, to: .float)
         let angle = b.constant(-2.0) * b.pi * binIndexFloat * nFloat / winSize
 
@@ -181,10 +183,12 @@ func u_spectralLoss(sig1: Expr, sig2: Expr, windowSize: Int) -> (IRBuilder) -> E
 
       // Accumulate squared error for this bin
       let diff = mag1 - mag2
-      totalError.accumulate(diff * diff)
+      let binError = diff * diff
+      let offset = baseOffset + binIndexFloat
+      _ = b.memoryWrite(scratchCell, b.cast(offset, to: .int), binError)
     }
-
-    return totalError.value
+    // Pass2 will reduce from scratch to a scalar loss.
+    return b.constant(0.0)
   }
 }
 
@@ -266,6 +270,7 @@ func u_spectralLossBackwardPass2(
     let j = b.threadIndex()  // Sample index
     let grad1 = b.float(0.0)
     let grad2 = b.float(0.0)
+    let frameCount = b.value(.variable(-1, nil))
 
     // Gather from all windows that include sample j
     // Windows ending at i ∈ [j .. j+(windowSize-1)]
@@ -276,16 +281,19 @@ func u_spectralLossBackwardPass2(
       let winSize = b.constant(Float(windowSize))
       let n = j - windowEnd + (winSize - b.constant(1.0))
 
-      // Memory offset: memory[scratchCell + (i * windowSize * 2) + (n * 2) + component]
-      let offset1 = windowEnd * winSize * b.constant(2.0) + n * b.constant(2.0)
-      let offset2 = offset1 + b.constant(1.0)
+      // Only read scratch for valid window ends
+      b.if(windowEnd < frameCount) {
+        // Memory offset: memory[scratchCell + (i * windowSize * 2) + (n * 2) + component]
+        let offset1 = windowEnd * winSize * b.constant(2.0) + n * b.constant(2.0)
+        let offset2 = offset1 + b.constant(1.0)
 
-      // Read contributions from memory
-      let contrib1 = b.memoryRead(scratchCell, b.cast(offset1, to: .int))
-      let contrib2 = b.memoryRead(scratchCell, b.cast(offset2, to: .int))
+        // Read contributions from memory
+        let contrib1 = b.memoryRead(scratchCell, b.cast(offset1, to: .int))
+        let contrib2 = b.memoryRead(scratchCell, b.cast(offset2, to: .int))
 
-      grad1.accumulate(contrib1)
-      grad2.accumulate(contrib2)
+        grad1.accumulate(contrib1)
+        grad2.accumulate(contrib2)
+      }
     }
 
     return (grad1.value, grad2.value)

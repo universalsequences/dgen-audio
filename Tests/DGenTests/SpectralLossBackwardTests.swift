@@ -42,19 +42,9 @@ final class SpectralLossBackwardTests: XCTestCase {
             options: .init(frameCount: frameCount, debug: true, backwards: true)
         )
 
-        print("   Globals array: \(result.context.globals)")
+        writeKernelsToDisk(result, "/tmp/spectral_loss_backward.metal")
 
-        for kernel in result.kernels {
-            if kernel.source.contains("outputs[") {
-                // Print just the output line
-                let lines = kernel.source.components(separatedBy: "\n")
-                for line in lines {
-                    if line.contains("outputs[") {
-                        print("   Output assignment: \(line.trimmingCharacters(in: .whitespaces))")
-                    }
-                }
-            }
-        }
+        print("   Globals array: \(result.context.globals)")
 
         print("   ✅ Compiled with backwards=true")
         print("   Initial frequency: 300 Hz")

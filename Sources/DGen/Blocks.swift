@@ -23,12 +23,9 @@ public struct Block: Equatable {
 
     public static func == (lhs: Block, rhs: Block) -> Bool {
         // Exclude frameTensorChain from equality to avoid issues with Equatable
-        return lhs.kind == rhs.kind &&
-               lhs.nodes == rhs.nodes &&
-               lhs.direction == rhs.direction &&
-               lhs.temporality == rhs.temporality &&
-               lhs.tensorIndex == rhs.tensorIndex &&
-               lhs.shape == rhs.shape
+        return lhs.kind == rhs.kind && lhs.nodes == rhs.nodes && lhs.direction == rhs.direction
+            && lhs.temporality == rhs.temporality && lhs.tensorIndex == rhs.tensorIndex
+            && lhs.shape == rhs.shape
     }
 }
 
@@ -869,6 +866,13 @@ public func isolateSpectralPasses(_ blocks: [Block], _ g: Graph) -> [Block] {
         }
     }
 
+    print("isoloted spectral passes")
+    for (i, block) in result.enumerated() {
+        print("block\(i)")
+        for nodeId in block.nodes {
+            print("nodeId=\(nodeId) \(g.nodes[nodeId]?.op)")
+        }
+    }
     return result
 }
 

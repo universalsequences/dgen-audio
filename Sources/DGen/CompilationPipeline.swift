@@ -177,6 +177,14 @@ public struct CompilationPipeline {
             fuseBlocks(isolatedBlocks, graph)
         }
 
+        print("after refusion passes")
+        for (i, block) in reFusedBlocks.enumerated() {
+            print("block\(i)")
+            for nodeId in block.nodes {
+                print("nodeId=\(nodeId) \(graph.nodes[nodeId]?.op)")
+            }
+        }
+
         let context = IRContext(g: graph)
 
         // finally separate tensor blocks of shared size into their own blocks
@@ -263,6 +271,14 @@ public struct CompilationPipeline {
         // Store frame-based nodes in context for smart gradient buffer allocation
         context.frameBasedNodes = temporalityResult.frameBasedNodes
 
+        print("final blocks")
+        for (i, block) in finalBlocks.enumerated() {
+            print("block\(i)")
+            for nodeId in block.nodes {
+                print("nodeId=\(nodeId) \(graph.nodes[nodeId]?.op)")
+            }
+        }
+
         let finalBlockIndices = Array(0..<finalBlocks.count)
 
         // Step 5: Convert blocks to UOp blocks
@@ -297,8 +313,7 @@ public struct CompilationPipeline {
             return .serial
         }
 
-        func containsSpectralBackwardPass(_ block: Block, _ g: Graph) -> Bool {
-            guard block.direction == .backwards else { return false }
+        func containsSpectralPass(_ block: Block, _ g: Graph) -> Bool {
             return block.nodes.contains { nodeId in
                 guard let node = g.nodes[nodeId] else { return false }
                 if case .spectralLossPass1 = node.op { return true }
@@ -319,8 +334,8 @@ public struct CompilationPipeline {
                 )
                 let parallelPolicy = inferParallelPolicy(
                     kind: block.kind, temporality: block.temporality, ops: ops)
-                // Force new kernel for spectral backward passes to prevent fusion
-                let forceNew = containsSpectralBackwardPass(block, graph)
+                // Force new kernel for spectral passes (forward + backward) to prevent fusion
+                let forceNew = containsSpectralPass(block, graph)
                 uopBlocks.append(
                     BlockUOps(
                         ops: ops, kind: block.kind, temporality: block.temporality,
@@ -443,7 +458,8 @@ extension CompilationResult {
 // MARK: - Debug Helpers
 
 private func printUOpBlocks(_ uopBlocks: [BlockUOps]) {
-    for uopBlock in uopBlocks {
+    for (i, uopBlock) in uopBlocks.enumerated() {
+        print("block #\(i+1)")
         var indentLevel = 0
         for uop in uopBlock.ops {
             switch uop.op {

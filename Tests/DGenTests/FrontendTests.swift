@@ -40,7 +40,7 @@ final class FrontendTests: XCTestCase {
                 // Streamlined training context - handles everything!
                 let ctx = try TrainingContext(
                         parameters: [cutoffParam],
-                        optimizer: SGD(lr: 0.01),
+                        optimizer: SGD(lr: 0.001),
                         lossNode: loss.id,
                         compilationResult: result,
                         frameCount: frameCount
@@ -51,22 +51,13 @@ final class FrontendTests: XCTestCase {
 
                 var lossHistory: [Float] = []
                 for i in 0..<100 {
-                        print("i=\(i)")
                         let currentLoss = ctx.runStepGPU()
                         lossHistory.append(currentLoss)
-
-                        // Debug: print gradient every iteration for first 5
-                        if i < 5 {
-                                print("  grad after step \(i): \(cutoffParam.grad ?? 0)")
-                        }
-
+                        print(
+                                "i=\(i) loss=\(currentLoss) cutoff=\(cutoffParam.value) grad=\(cutoffParam.grad ?? 0)"
+                        )
                         if currentLoss < 0.001 {
                                 break
-                        }
-                        if i % 10 == 0 {
-                                print(
-                                        "i=\(i) loss=\(currentLoss) cutoff=\(cutoffParam.value) grad=\(cutoffParam.grad ?? 0)"
-                                )
                         }
 
                 }

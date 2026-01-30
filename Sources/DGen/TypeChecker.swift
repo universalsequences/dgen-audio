@@ -625,11 +625,12 @@ private func identifyTemporalitySegments(
 
     if currentIsStatic != nil && (currentIsStatic != nodeIsStatic || chainChanged) {
       if !currentNodes.isEmpty {
-        segments.append(TemporalitySegment(
-          nodes: currentNodes,
-          isStatic: currentIsStatic!,
-          chain: currentChain
-        ))
+        segments.append(
+          TemporalitySegment(
+            nodes: currentNodes,
+            isStatic: currentIsStatic!,
+            chain: currentChain
+          ))
       }
       currentNodes = []
     }
@@ -640,7 +641,8 @@ private func identifyTemporalitySegments(
   }
 
   if !currentNodes.isEmpty, let staticFlag = currentIsStatic {
-    segments.append(TemporalitySegment(nodes: currentNodes, isStatic: staticFlag, chain: currentChain))
+    segments.append(
+      TemporalitySegment(nodes: currentNodes, isStatic: staticFlag, chain: currentChain))
   }
 
   return segments
@@ -652,7 +654,8 @@ private func mergeAdjacentNonChainSegments(
   var merged: [TemporalitySegment] = []
 
   for segment in segments {
-    let canMergeWithPrevious = segment.chain == nil
+    let canMergeWithPrevious =
+      segment.chain == nil
       && merged.last?.chain == nil
       && merged.last?.isStatic == segment.isStatic
 

@@ -548,23 +548,36 @@ public enum LazyOp {
             let (a, b2) = b.values(inputs, count: 2)
             b.use(val: u_mse(a, b2)(b))
 
-        case .spectralLossPass1(let windowSize, _):
+        case .spectralLossPass1(let windowSize, let scratchCell):
             guard inputs.count == 2 else {
                 throw DGenError.insufficientInputs(
                     operator: "spectralLossPass1", expected: 2, actual: inputs.count)
             }
             let (sig1, sig2) = b.values(inputs, count: 2)
             // Forward: compute spectral loss normally (Pass1 does the actual work)
-            b.use(val: u_spectralLoss(sig1: sig1, sig2: sig2, windowSize: windowSize)(b))
+            b.use(val: u_spectralLoss(sig1: sig1, sig2: sig2, windowSize: windowSize, scratchCell: scratchCell)(b))
 
-        case .spectralLossPass2(_, _):
+        case .spectralLossPass2(let windowSize, let scratchCell):
             guard inputs.count == 1 else {
                 throw DGenError.insufficientInputs(
                     operator: "spectralLossPass2", expected: 1, actual: inputs.count)
             }
-            // Forward: no-op, just forward the value from Pass1
-            let pass1Result = b.value(inputs[0])
-            b.use(val: pass1Result)
+            // Forward: reduce per-bin errors written by Pass1
+            let _ = b.value(inputs[0])
+            let numBins = windowSize / 2 + 1
+            let winSize = b.constant(Float(windowSize))
+            let frameIdx = b.threadIndex()
+            let baseOffset = frameIdx * winSize * b.constant(2.0)
+            let totalError = b.float(0.0)
+
+            b.loop(numBins) { binIndex in
+                let binIndexFloat = b.cast(binIndex, to: .float)
+                let offset = baseOffset + binIndexFloat
+                let binError = b.memoryRead(scratchCell, b.cast(offset, to: .int))
+                totalError.accumulate(binError)
+            }
+
+            b.use(val: totalError.value)
 
         case .gt:
             guard inputs.count == 2 else {
