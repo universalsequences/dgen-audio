@@ -516,47 +516,48 @@ public func inferTemporality(graph: Graph, sortedNodes: [NodeID]) -> Temporality
 }
 
 /// Assign temporality to blocks based on their nodes.
-/// A block is:
-/// - frameBased if ANY of its nodes is frame-based
-/// - hopBased if ALL non-static nodes share the same hop rate
-/// - static_ otherwise
 public func assignBlockTemporality(
   blocks: inout [Block],
   frameBasedNodes: Set<NodeID>,
   hopBasedNodes: [NodeID: (Int, CellID)]
 ) {
   for i in 0..<blocks.count {
-    // Backward blocks are always frame-based - they run in frame loops
-    // and reduceGradientsGPU handles the summation afterward
-    if blocks[i].direction == .backwards {
-      blocks[i].temporality = .frameBased
-      continue
-    }
-
-    // Check for frame-based nodes first (takes precedence)
-    let hasFrameBasedNode = blocks[i].nodes.contains { frameBasedNodes.contains($0) }
-    if hasFrameBasedNode {
-      blocks[i].temporality = .frameBased
-      continue
-    }
-
-    // Check for hop-based nodes
-    let hopRates = blocks[i].nodes.compactMap { hopBasedNodes[$0] }
-    if let firstRate = hopRates.first {
-      // Check if all hop-based nodes have the same rate
-      let allSameRate = hopRates.allSatisfy { $0.0 == firstRate.0 && $0.1 == firstRate.1 }
-      if allSameRate {
-        blocks[i].temporality = .hopBased(hopSize: firstRate.0, counter: firstRate.1)
-        continue
-      }
-      // Mixed rates - fall back to frame-based
-      blocks[i].temporality = .frameBased
-      continue
-    }
-
-    // No frame-based or hop-based nodes - block is static
-    blocks[i].temporality = .static_
+    blocks[i].temporality = determineBlockTemporality(
+      block: blocks[i],
+      frameBasedNodes: frameBasedNodes,
+      hopBasedNodes: hopBasedNodes
+    )
   }
+}
+
+/// Determine the temporality for a single block.
+/// - Backward blocks are always frame-based (reduceGradientsGPU handles summation)
+/// - Forward blocks with any frame-based node become frame-based
+/// - Forward blocks with uniform hop-based nodes become hop-based
+/// - Otherwise static
+private func determineBlockTemporality(
+  block: Block,
+  frameBasedNodes: Set<NodeID>,
+  hopBasedNodes: [NodeID: (Int, CellID)]
+) -> Temporality {
+  if block.direction == .backwards {
+    return .frameBased
+  }
+
+  if block.nodes.contains(where: { frameBasedNodes.contains($0) }) {
+    return .frameBased
+  }
+
+  let hopRates = block.nodes.compactMap { hopBasedNodes[$0] }
+  if let firstRate = hopRates.first {
+    let allSameRate = hopRates.allSatisfy { $0.0 == firstRate.0 && $0.1 == firstRate.1 }
+    if allSameRate {
+      return .hopBased(hopSize: firstRate.0, counter: firstRate.1)
+    }
+    return .frameBased
+  }
+
+  return .static_
 }
 
 public func splitBlockByStaticIfPossible(
@@ -566,119 +567,119 @@ public func splitBlockByStaticIfPossible(
   graph: Graph,
   fusableChains: [FrameDependentTensorChain] = []
 ) -> [Block] {
-  func isStatic(_ node: NodeID) -> Bool {
-    return hopBasedNodes[node] == nil && !frameBasedNodes.contains(node)
-  }
-  func initBlock(temporality: Temporality?) -> Block {
-    var b = Block(kind: block.kind)
-    if let temporality = temporality {
-      b.temporality = temporality
-    }
-    b.shape = block.shape
-    b.direction = block.direction
-    b.tensorIndex = block.tensorIndex
-    return b
-  }
-
   // Backward blocks are always frame-based - no splitting needed
-  // They run in frame loops and reduceGradientsGPU handles gradient summation
   if block.direction == .backwards {
     return [block]
   }
 
-  // For forward blocks, use tensor-aware splitting:
-  // - Static tensor ops get their own blocks (can be SIMD parallelized)
-  // - Scalar-only blocks don't need splitting (no parallelization benefit)
+  let nodeToChain = buildNodeToChainMap(fusableChains)
+  let segments = identifyTemporalitySegments(
+    block: block,
+    frameBasedNodes: frameBasedNodes,
+    hopBasedNodes: hopBasedNodes,
+    nodeToChain: nodeToChain
+  )
+  let mergedSegments = mergeAdjacentNonChainSegments(segments)
+  let resultBlocks = convertSegmentsToBlocks(mergedSegments, from: block)
 
-  func hasTensorShapedOps(_ nodes: [NodeID]) -> Bool {
-    for nodeId in nodes {
-      if let node = graph.nodes[nodeId], case .tensor = node.shape {
-        return true
-      }
-    }
-    return false
-  }
+  return resultBlocks.isEmpty ? [block] : resultBlocks
+}
 
-  // Build chain node set for fusable chains
+private func buildNodeToChainMap(
+  _ fusableChains: [FrameDependentTensorChain]
+) -> [NodeID: FrameDependentTensorChain] {
   var nodeToChain: [NodeID: FrameDependentTensorChain] = [:]
   for chain in fusableChains {
     for nodeId in chain.chainNodes {
       nodeToChain[nodeId] = chain
     }
   }
+  return nodeToChain
+}
 
-  // First pass: identify segments
-  var segments: [(nodes: [NodeID], isStatic: Bool, chain: FrameDependentTensorChain?)] = []
+private struct TemporalitySegment {
+  var nodes: [NodeID]
+  let isStatic: Bool
+  let chain: FrameDependentTensorChain?
+}
+
+private func identifyTemporalitySegments(
+  block: Block,
+  frameBasedNodes: Set<NodeID>,
+  hopBasedNodes: [NodeID: (Int, CellID)],
+  nodeToChain: [NodeID: FrameDependentTensorChain]
+) -> [TemporalitySegment] {
+  func isStatic(_ node: NodeID) -> Bool {
+    return hopBasedNodes[node] == nil && !frameBasedNodes.contains(node)
+  }
+
+  var segments: [TemporalitySegment] = []
   var currentNodes: [NodeID] = []
   var currentIsStatic: Bool? = nil
   var currentChain: FrameDependentTensorChain? = nil
 
   for node in block.nodes {
-    if let chain = nodeToChain[node] {
-      // Chain nodes are frame-based
-      let nodeIsStatic = false
-      if currentIsStatic != nil
-        && (currentIsStatic != nodeIsStatic
-          || currentChain?.transitionNodeId != chain.transitionNodeId)
-      {
-        if !currentNodes.isEmpty {
-          segments.append((nodes: currentNodes, isStatic: currentIsStatic!, chain: currentChain))
-        }
-        currentNodes = []
+    let chain = nodeToChain[node]
+    let nodeIsStatic = chain == nil && isStatic(node)
+    let chainChanged = chain?.transitionNodeId != currentChain?.transitionNodeId
+
+    if currentIsStatic != nil && (currentIsStatic != nodeIsStatic || chainChanged) {
+      if !currentNodes.isEmpty {
+        segments.append(TemporalitySegment(
+          nodes: currentNodes,
+          isStatic: currentIsStatic!,
+          chain: currentChain
+        ))
       }
-      currentIsStatic = nodeIsStatic
-      currentChain = chain
-      currentNodes.append(node)
-    } else {
-      let nodeIsStatic = isStatic(node)
-      if currentIsStatic == nil {
-        currentIsStatic = nodeIsStatic
-        currentChain = nil
-      } else if currentIsStatic != nodeIsStatic || currentChain != nil {
-        if !currentNodes.isEmpty {
-          segments.append((nodes: currentNodes, isStatic: currentIsStatic!, chain: currentChain))
-        }
-        currentNodes = []
-        currentIsStatic = nodeIsStatic
-        currentChain = nil
-      }
-      currentNodes.append(node)
+      currentNodes = []
     }
-  }
-  if !currentNodes.isEmpty, let isStatic = currentIsStatic {
-    segments.append((nodes: currentNodes, isStatic: isStatic, chain: currentChain))
+
+    currentIsStatic = nodeIsStatic
+    currentChain = chain
+    currentNodes.append(node)
   }
 
-  // Second pass: just merge adjacent same-type segments
-  var mergedSegments: [(nodes: [NodeID], isStatic: Bool, chain: FrameDependentTensorChain?)] = []
+  if !currentNodes.isEmpty, let staticFlag = currentIsStatic {
+    segments.append(TemporalitySegment(nodes: currentNodes, isStatic: staticFlag, chain: currentChain))
+  }
+
+  return segments
+}
+
+private func mergeAdjacentNonChainSegments(
+  _ segments: [TemporalitySegment]
+) -> [TemporalitySegment] {
+  var merged: [TemporalitySegment] = []
+
   for segment in segments {
-    if segment.chain != nil {
-      mergedSegments.append(segment)
-      continue
-    }
+    let canMergeWithPrevious = segment.chain == nil
+      && merged.last?.chain == nil
+      && merged.last?.isStatic == segment.isStatic
 
-    // Merge adjacent same-type segments
-    if let lastIdx = mergedSegments.indices.last,
-      mergedSegments[lastIdx].isStatic == segment.isStatic && mergedSegments[lastIdx].chain == nil
-    {
-      mergedSegments[lastIdx].nodes.append(contentsOf: segment.nodes)
+    if canMergeWithPrevious {
+      merged[merged.count - 1].nodes.append(contentsOf: segment.nodes)
     } else {
-      mergedSegments.append(segment)
+      merged.append(segment)
     }
   }
 
-  // Convert to blocks
-  var blocks: [Block] = []
-  for segment in mergedSegments {
-    var b = initBlock(temporality: segment.isStatic ? .static_ : .frameBased)
+  return merged
+}
+
+private func convertSegmentsToBlocks(
+  _ segments: [TemporalitySegment],
+  from block: Block
+) -> [Block] {
+  return segments.map { segment in
+    var b = Block(kind: block.kind)
+    b.temporality = segment.isStatic ? .static_ : .frameBased
+    b.shape = block.shape
+    b.direction = block.direction
+    b.tensorIndex = block.tensorIndex
     b.nodes = segment.nodes
-    if let chain = segment.chain {
-      b.frameTensorChain = chain
-    }
-    blocks.append(b)
+    b.frameTensorChain = segment.chain
+    return b
   }
-
-  return blocks.isEmpty ? [block] : blocks
 }
 
 public func extractStaticOpsIntoBlocks(
@@ -741,12 +742,6 @@ public func detectFrameDependentTensorChains(
       consumers[inputId, default: []].append(nodeId)
     }
   }
-
-  // Element-wise ops that can be part of a fusable chain
-  let elementWiseOps: Set<String> = [
-    "mul", "add", "sub", "div", "sin", "cos", "tan", "tanh", "exp", "log", "sqrt",
-    "abs", "sign", "floor", "ceil", "round", "pow", "min", "max", "gswitch",
-  ]
 
   func isElementWise(_ op: LazyOp) -> Bool {
     switch op {

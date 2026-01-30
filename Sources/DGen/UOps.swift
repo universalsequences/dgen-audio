@@ -110,6 +110,11 @@ public enum Op {
 
   // Marker for SIMD-across-frames optimization (frame-tensor chain detected)
   case frameTensorChainMarker([Int])         // Marks block as frame-tensor chain with tensor shape
+
+  public var isDefineGlobal: Bool {
+    if case .defineGlobal = self { return true }
+    return false
+  }
 }
 
 public struct UOp {

@@ -1,5 +1,3 @@
-// the beauty is this doesn't need to even know if its forward or backward
-
 import Foundation
 
 public struct BlockUOps {
@@ -7,10 +5,13 @@ public struct BlockUOps {
     public let kind: Kind
     public let temporality: Temporality
     public var parallelPolicy: ParallelPolicy
-    public var forceNewKernel: Bool  // When true, this block starts a new kernel (no fusion)
+    /// When true, this block starts a new kernel (prevents fusion with previous block)
+    public var forceNewKernel: Bool
 
     public init(
-        ops: [UOp], kind: Kind, temporality: Temporality = .static_,
+        ops: [UOp],
+        kind: Kind,
+        temporality: Temporality = .static_,
         parallelPolicy: ParallelPolicy = .serial,
         forceNewKernel: Bool = false
     ) {
@@ -287,14 +288,6 @@ public class CRenderer: Renderer {
         totalMemorySlots: Int
     ) -> String {
         var code: [String] = []
-
-        // Generate a unique UUID for this kernel
-        let kernelUUID = UUID().uuidString
-
-        // Sanitize kernel name to be a valid C identifier
-        // Replace invalid characters with underscores
-        let sanitizedName = name.replacingOccurrences(
-            of: "[^a-zA-Z0-9_]", with: "_", options: .regularExpression)
 
         // C includes and function signature
         code.append(

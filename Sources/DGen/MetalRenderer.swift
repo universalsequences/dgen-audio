@@ -353,99 +353,89 @@ public class MetalRenderer: Renderer, UOpEmitter {
     _ ctx: IRContext,
     _ frameCount: Int
   ) {
-    // Define frameCount UOp for Metal kernels
-    let frameCountUOp = Lazy.variable(-1, nil)  // Special variable ID for frameCount
+    let frameCountUOp = Lazy.variable(-1, nil)
 
-    // Group adjacent blocks of the same kind into a single kernel.
-    // This is critical for correctness when operations need to see per-frame
-    // state (e.g., history read followed by sum must happen within the same frame loop).
     var currentSchedule: ScheduleItem? = nil
     var currentKind: Kind? = nil
     var currentTemporality: Temporality? = nil
     var currentPolicy: ParallelPolicy? = nil
     var loopOpened = false
-    var hasFrameLoop = false  // Track if we opened a frame loop (static blocks don't have one)
+    var hasFrameLoop = false
+
+    func closeCurrentKernel() {
+      guard let schedule = currentSchedule, loopOpened else { return }
+      if hasFrameLoop && currentKind == .scalar {
+        schedule.ops.append(UOp(op: .endLoop, value: .empty))
+      }
+      schedule.ops.append(UOp(op: .endRange, value: .empty))
+      scheduleItems.append(schedule)
+    }
+
+    func blockHasGradMemoryCalls(_ block: BlockUOps) -> Bool {
+      return block.ops.contains { uop in
+        switch uop.op {
+        case .storeGradMemory, .loadGradMemory:
+          return true
+        default:
+          return false
+        }
+      }
+    }
 
     for block in uopBlocks {
-      let blockPolicy = block.parallelPolicy
-      // Check if we need to start a new kernel (different block kind or temporality)
-      // Also force new kernel for spectral backward passes to prevent race conditions
-      let needsNewKernel =
-        currentKind != block.kind || currentTemporality != block.temporality
-        || currentPolicy != blockPolicy || block.forceNewKernel
-      if needsNewKernel {
-        // Close previous kernel if open
-        if let schedule = currentSchedule {
-          if loopOpened {
-            // Only close the frame loop if we opened one (not for static blocks)
-            if hasFrameLoop && currentKind == .scalar {
-              schedule.ops.append(UOp(op: .endLoop, value: .empty))
-            }
-            schedule.ops.append(UOp(op: .endRange, value: .empty))
-          }
-          scheduleItems.append(schedule)
-        }
+      let needsNewKernel = currentKind != block.kind
+        || currentTemporality != block.temporality
+        || currentPolicy != block.parallelPolicy
+        || block.forceNewKernel
 
-        // Start new kernel
+      if needsNewKernel {
+        closeCurrentKernel()
+
         let scheduleItem = ScheduleItem(kind: block.kind, temporality: block.temporality)
-        scheduleItem.parallelPolicy = blockPolicy
+        scheduleItem.parallelPolicy = block.parallelPolicy
         scheduleItem.ops.append(UOp(op: .frameCount, value: .empty))
 
-        // Extract defineGlobals early
         for uop in block.ops {
           if case .defineGlobal = uop.op {
             scheduleItem.ops.append(uop)
           }
         }
 
-        if case .static_ = block.temporality, block.kind == .scalar {
-          // Static SCALAR blocks: run once, no frame loop needed
-          // Single thread executes, no looping over frames
-          // NOTE: Static SIMD blocks still need parallel execution over tensor elements
-          var beginRange = UOp(
-            op: .beginRange(.constant(0, 0), .constant(0, 1)), value: .empty)
+        let isStaticScalar = block.temporality == .static_ && block.kind == .scalar
+        let isScalar = block.kind == .scalar
+
+        if isStaticScalar {
+          // Static scalar blocks: run once, no frame loop needed
+          var beginRange = UOp(op: .beginRange(.constant(0, 0), .constant(0, 1)), value: .empty)
           beginRange.kind = block.kind
           scheduleItem.ops.append(beginRange)
-          // No beginLoop for static blocks - they execute once
           hasFrameLoop = false
-        } else if block.kind == .scalar {
-          // Scalar kernels: only thread 0 executes, then loops through frameCount
-          var beginRange = UOp(
-            op: .beginRange(.constant(0, 0), .constant(0, 1)), value: .empty)
+        } else if isScalar {
+          // Scalar kernels: thread 0 loops through frameCount
+          var beginRange = UOp(op: .beginRange(.constant(0, 0), .constant(0, 1)), value: .empty)
           beginRange.kind = block.kind
           scheduleItem.ops.append(beginRange)
 
-          var hasGradMemoryCalls = false
-          for n in block.ops {
-            if case .storeGradMemory(_, _) = n.op {
-              hasGradMemoryCalls = true
-              break
-            } else if case .loadGradMemory(_) = n.op {
-              hasGradMemoryCalls = true
-              break
-            }
-          }
-          let incr = hasGradMemoryCalls ? -1 : 1
+          let incr = blockHasGradMemoryCalls(block) ? -1 : 1
           var beginLoop = UOp(op: .beginLoop(frameCountUOp, incr), value: .empty)
           beginLoop.kind = block.kind
           scheduleItem.ops.append(beginLoop)
           hasFrameLoop = true
         } else {
-          // SIMD kernels: each thread processes one frame, bound by frameCount
+          // SIMD kernels: each thread processes one frame
           var beginRange = UOp(op: .beginRange(.constant(0, 0), frameCountUOp), value: .empty)
           beginRange.kind = block.kind
           scheduleItem.ops.append(beginRange)
-          hasFrameLoop = true  // SIMD uses thread range as frame loop
+          hasFrameLoop = true
         }
 
         currentSchedule = scheduleItem
         currentKind = block.kind
         currentTemporality = block.temporality
-        currentPolicy = blockPolicy
+        currentPolicy = block.parallelPolicy
         loopOpened = true
       }
 
-      // Add this block's ops to the current kernel (within the existing frame loop)
       if let schedule = currentSchedule {
         for uop in block.ops {
           if case .defineGlobal = uop.op { continue }
@@ -456,17 +446,7 @@ public class MetalRenderer: Renderer, UOpEmitter {
       }
     }
 
-    // Close the last kernel
-    if let schedule = currentSchedule {
-      if loopOpened {
-        // Only close the frame loop if we opened one (not for static blocks)
-        if hasFrameLoop && currentKind == .scalar {
-          schedule.ops.append(UOp(op: .endLoop, value: .empty))
-        }
-        schedule.ops.append(UOp(op: .endRange, value: .empty))
-      }
-      scheduleItems.append(schedule)
-    }
+    closeCurrentKernel()
   }
 
   public override func render(
@@ -476,12 +456,7 @@ public class MetalRenderer: Renderer, UOpEmitter {
     var kernels = ""
     parallelRangeVars.removeAll()  // Reset parallel range tracking for new kernel
     currentTemporality = scheduleItem.temporality  // Set temporality for gradient indexing
-    var (inputs, outputs) = analyzeDependencies(scheduleItem: scheduleItem, ctx: ctx)
-
-    let hasOutputOps = scheduleItem.ops.contains { uop in
-      if case .output = uop.op { return true }
-      return false
-    }
+    let (inputs, outputs) = analyzeDependencies(scheduleItem: scheduleItem, ctx: ctx)
 
     let allBuffers = Set(inputs + outputs)
 
@@ -775,7 +750,7 @@ public class MetalRenderer: Renderer, UOpEmitter {
 
     case let .load(cell): return emitAssign(uop, "memory[\(cell)]", ctx)
     case let .loadGradMemory(cellId): return emitAssign(uop, "grad_memory[\(cellId)]", ctx)
-    case let .frameIndex: return emitAssign(uop, "i", ctx)
+    case .frameIndex: return emitAssign(uop, "i", ctx)
     case let .loadTape(val, offset):
       let varId = ctx.getGlobalId(extractVarId(val))
       let boundedFetch =
@@ -906,7 +881,7 @@ public class MetalRenderer: Renderer, UOpEmitter {
 
     // Parallel range - for Metal, could be thread-parallel for static tensors
     // For now, render as a loop (future: check block.temporality and use thread-parallel for static)
-    case let .beginParallelRange(count, incr):
+    case let .beginParallelRange(count, _):
       guard case .variable(let varId, _) = uop.value else {
         fatalError("beginParallelRange requires variable")
       }

@@ -279,11 +279,9 @@ public class MetalCompiledKernel: CompiledKernelRuntime {
 
     // Set all seed gradients to 1.0 (typically loss nodes)
     // Each seed gets a region of numFrames values set to 1.0
-    print("   [DEBUG] Seeding gradients for \(context.seedGradients.count) seeds: \(context.seedGradients)")
     for seedId in context.seedGradients {
       let startIdx = numFrames * seedId
       let endIdx = numFrames * (seedId + 1)
-      print("   [DEBUG] Setting gradId=\(seedId) range [\(startIdx)..<\(endIdx)] to 1.0")
       for i in startIdx..<endIdx {
         bufferContents[i] = 1.0
       }
@@ -291,12 +289,7 @@ public class MetalCompiledKernel: CompiledKernelRuntime {
       // Verify it was set
       let firstVal = bufferContents[startIdx]
       let lastVal = bufferContents[endIdx - 1]
-      print("   [DEBUG] Verification: gradients[\(startIdx)]=\(firstVal), gradients[\(endIdx-1)]=\(lastVal)")
     }
-
-    // Debug: print gradId 7 values before kernels run
-    let grad7Start = numFrames * 7
-    print("   [DEBUG] gradId 7 before kernels: [\(bufferContents[grad7Start]), \(bufferContents[grad7Start+1]), \(bufferContents[grad7Start+2]), \(bufferContents[grad7Start+3])]")
 
     // Reset grad_memory buffer (used for spectralLoss ring buffers and phasor gradient accumulation)
     if let gradMemBuffer = bufferPool["grad_memory"] {
@@ -492,15 +485,6 @@ public class MetalCompiledKernel: CompiledKernelRuntime {
           debugPrintGradStats(label: "kernel \(index)")
           if let cb = commandQueue.makeCommandBuffer() { commandBuffer = cb }
         }
-        /*
-        pending += 1
-        if pending == 5 {
-          print("FLUSHING at kernel=\(index)")
-          // old flush path no longer used
-          print("finished flush")
-        }  // tune 4 to taste
-
-         */
       }
     }
 
@@ -514,27 +498,6 @@ public class MetalCompiledKernel: CompiledKernelRuntime {
       commandBuffer.waitUntilCompleted()
     }
     firstDebug = false
-
-    // Debug: check gradients[7] after kernels complete
-    if let gradBuffer = bufferPool["gradients"] {
-      let gradPtr = gradBuffer.contents().assumingMemoryBound(to: Float.self)
-      let grad7Start = frameCount * 7
-      let grad24Start = frameCount * 24
-      var sum24: Float = 0.0
-      for i in 0..<frameCount {
-        sum24 += gradPtr[grad24Start + i]
-      }
-      print("   [DEBUG] gradId 24 sum across \(frameCount) frames: \(sum24), mean: \(sum24 / Float(frameCount))")
-    }
-    // Debug: check tape slots 1 and 2 (phasor and history)
-    if let tapeBuffer = bufferPool["t"] {
-      let tapePtr = tapeBuffer.contents().assumingMemoryBound(to: Float.self)
-      let t1Start = frameCount * 1
-      let t2Start = frameCount * 2
-      print("   [DEBUG] tape[1] (phasor): [\(tapePtr[t1Start]), \(tapePtr[t1Start+1]), \(tapePtr[t1Start+2]), \(tapePtr[t1Start+3])]")
-      print("   [DEBUG] tape[2] (history): [\(tapePtr[t2Start]), \(tapePtr[t2Start+1]), \(tapePtr[t2Start+2]), \(tapePtr[t2Start+3])]")
-      print("   [DEBUG] t[2]-t[1]: [\(tapePtr[t2Start]-tapePtr[t1Start]), \(tapePtr[t2Start+1]-tapePtr[t1Start+1]), \(tapePtr[t2Start+2]-tapePtr[t1Start+2]), \(tapePtr[t2Start+3]-tapePtr[t1Start+3])]")
-    }
 
     // Copy results back to outputs
     copyResultsToOutputs(outputs: outputs, frameCount: frameCount, volumeScale: volumeScale)
@@ -935,7 +898,9 @@ public class MetalCompiledKernel: CompiledKernelRuntime {
       for i in 0..<numGradIds {
         ptr[i] = -999999.0  // Sentinel value to detect if kernel runs
       }
-      print("   [DEBUG] reduceGradientsGPU: zeroed buffer with sentinel, numGradIds=\(numGradIds), frameCount=\(frameCount)")
+      print(
+        "   [DEBUG] reduceGradientsGPU: zeroed buffer with sentinel, numGradIds=\(numGradIds), frameCount=\(frameCount)"
+      )
     }
 
     // Create command buffer and encoder
@@ -952,7 +917,9 @@ public class MetalCompiledKernel: CompiledKernelRuntime {
     }
 
     if debugGradients {
-      print("   [DEBUG] reduceGradientsGPU: pipelineState exists, maxThreads=\(pipelineState.maxTotalThreadsPerThreadgroup)")
+      print(
+        "   [DEBUG] reduceGradientsGPU: pipelineState exists, maxThreads=\(pipelineState.maxTotalThreadsPerThreadgroup)"
+      )
     }
 
     computeEncoder.setComputePipelineState(pipelineState)
@@ -973,8 +940,12 @@ public class MetalCompiledKernel: CompiledKernelRuntime {
       width: min(numGradIds, pipelineState.maxTotalThreadsPerThreadgroup), height: 1, depth: 1)
 
     if debugGradients {
-      print("   [DEBUG] reduceGradientsGPU: dispatching \(threadsPerGrid.width) threads, tpg=\(threadsPerThreadgroup.width)")
-      print("   [DEBUG] reduceGradientsGPU: gradientsBuffer.length=\(gradientsBuffer.length), reducedGradsBuffer.length=\(reducedGradsBuffer.length)")
+      print(
+        "   [DEBUG] reduceGradientsGPU: dispatching \(threadsPerGrid.width) threads, tpg=\(threadsPerThreadgroup.width)"
+      )
+      print(
+        "   [DEBUG] reduceGradientsGPU: gradientsBuffer.length=\(gradientsBuffer.length), reducedGradsBuffer.length=\(reducedGradsBuffer.length)"
+      )
     }
 
     computeEncoder.dispatchThreads(threadsPerGrid, threadsPerThreadgroup: threadsPerThreadgroup)
@@ -1007,7 +978,9 @@ public class MetalCompiledKernel: CompiledKernelRuntime {
         let expected = sum / Float(frameCount)
         let actual = reducedPtr[gid]
         if abs(expected - actual) > 0.0001 || gid == 24 {
-          print("      gid=\(gid) expected=\(expected) actual=\(actual) match=\(abs(expected - actual) < 0.0001)")
+          print(
+            "      gid=\(gid) expected=\(expected) actual=\(actual) match=\(abs(expected - actual) < 0.0001)"
+          )
         }
       }
     }

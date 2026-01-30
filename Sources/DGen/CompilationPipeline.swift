@@ -262,11 +262,6 @@ public struct CompilationPipeline {
 
         let finalBlockIndices = Array(0..<finalBlocks.count)
 
-        var blockId: Int = 0
-        for block in finalBlocks {
-            blockId += 1
-        }
-
         // Step 5: Convert blocks to UOp blocks
         var uopBlocks = [BlockUOps]()
 
@@ -299,20 +294,14 @@ public struct CompilationPipeline {
             return .serial
         }
 
-        // Helper to detect if block contains spectral backward passes
         func containsSpectralBackwardPass(_ block: Block, _ g: Graph) -> Bool {
             guard block.direction == .backwards else { return false }
-            for nodeId in block.nodes {
-                if let node = g.nodes[nodeId] {
-                    switch node.op {
-                    case .spectralLossPass1, .spectralLossPass2:
-                        return true
-                    default:
-                        break
-                    }
-                }
+            return block.nodes.contains { nodeId in
+                guard let node = g.nodes[nodeId] else { return false }
+                if case .spectralLossPass1 = node.op { return true }
+                if case .spectralLossPass2 = node.op { return true }
+                return false
             }
-            return false
         }
 
         try time("emitBlockUOps") {
@@ -336,40 +325,10 @@ public struct CompilationPipeline {
             }
         }
 
-        // Remove empty UOp blocks prior to vector memory remap and lowering
         uopBlocks.removeAll { $0.ops.isEmpty }
 
-        // Step 5.5: Fuse consecutive parallelRange loops with producer-consumer relationships.
-        // This reduces redundant memory traffic and makes the generated code cleaner.
-        for i in 0..<uopBlocks.count {
-            //uopBlocks[i].ops = fuseParallelRanges(uopBlocks[i].ops)
-        }
-
-        // Debug: print UOps after fusion
         if options.debug {
-            var i = 1
-            for uopBlock in uopBlocks {
-                i += 1
-                var indentLevel = 0
-                for uop in uopBlock.ops {
-                    switch uop.op {
-                    case .beginIf, .beginForLoop, .beginParallelRange, .beginLoop, .beginRange:
-                        print(
-                            "\(String(repeating: "  ", count: indentLevel))\(uop.prettyDescription())"
-                        )
-                        indentLevel += 1
-                    case .endIf, .endLoop, .endParallelRange, .endRange:
-                        indentLevel = max(0, indentLevel - 1)
-                        print(
-                            "\(String(repeating: "  ", count: indentLevel))\(uop.prettyDescription())"
-                        )
-                    default:
-                        print(
-                            "\(String(repeating: "  ", count: indentLevel))\(uop.prettyDescription())"
-                        )
-                    }
-                }
-            }
+            printUOpBlocks(uopBlocks)
         }
 
         // Step 7: Lower UOp blocks to compiled kernels
@@ -475,6 +434,26 @@ extension CompilationResult {
     /// Check if compilation produced any kernels
     public var hasKernels: Bool {
         !kernels.isEmpty
+    }
+}
+
+// MARK: - Debug Helpers
+
+private func printUOpBlocks(_ uopBlocks: [BlockUOps]) {
+    for uopBlock in uopBlocks {
+        var indentLevel = 0
+        for uop in uopBlock.ops {
+            switch uop.op {
+            case .beginIf, .beginForLoop, .beginParallelRange, .beginLoop, .beginRange:
+                print("\(String(repeating: "  ", count: indentLevel))\(uop.prettyDescription())")
+                indentLevel += 1
+            case .endIf, .endLoop, .endParallelRange, .endRange:
+                indentLevel = max(0, indentLevel - 1)
+                print("\(String(repeating: "  ", count: indentLevel))\(uop.prettyDescription())")
+            default:
+                print("\(String(repeating: "  ", count: indentLevel))\(uop.prettyDescription())")
+            }
+        }
     }
 }
 
@@ -677,7 +656,7 @@ func combineHistoryOpsNotInFeedback(
             if !nodesInFeedback.contains(readNodeId) && !nodesInFeedback.contains(writeInfo.nodeId)
             {
                 // Replace the historyRead node with historyReadWrite using the write's inputs
-                if let readNode = graph.nodes[readNodeId] {
+                if graph.nodes[readNodeId] != nil {
                     // Create new node with historyReadWrite operation at the read node's ID
                     let newNode = Node(
                         id: readNodeId,
