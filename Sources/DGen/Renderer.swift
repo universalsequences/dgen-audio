@@ -7,19 +7,23 @@ public struct BlockUOps {
     public var parallelPolicy: ParallelPolicy
     /// When true, this block starts a new kernel (prevents fusion with previous block)
     public var forceNewKernel: Bool
+    /// Optional: dispatch threads = frameCount * scale for this block
+    public var threadCountScale: Int?
 
     public init(
         ops: [UOp],
         kind: Kind,
         temporality: Temporality = .static_,
         parallelPolicy: ParallelPolicy = .serial,
-        forceNewKernel: Bool = false
+        forceNewKernel: Bool = false,
+        threadCountScale: Int? = nil
     ) {
         self.ops = ops
         self.kind = kind
         self.temporality = temporality
         self.parallelPolicy = parallelPolicy
         self.forceNewKernel = forceNewKernel
+        self.threadCountScale = threadCountScale
     }
 }
 
@@ -40,6 +44,7 @@ public struct CompiledKernel {
     public let buffers: [String]  // names of inputs/outputs
     public let threadGroupSize: Int?  // for Metal: nil means runtime-determined, 1 for scalar
     public let threadCount: Int?  // for Metal: override total threads (non-frame dispatch)
+    public let threadCountScale: Int?  // for Metal: total threads = frameCount * scale
     public let needsReducedGradsSum: Bool
     public let memorySize: Int  // Required memory allocation size in floats
 }
@@ -49,6 +54,7 @@ public class ScheduleItem {
     public let kind: Kind
     public var temporality: Temporality = .frameBased
     public var parallelPolicy: ParallelPolicy = .serial
+    public var threadCountScale: Int? = nil
 
     init(kind: Kind, temporality: Temporality = .frameBased) {
         self.kind = kind
@@ -132,6 +138,8 @@ public class CRenderer: Renderer {
     public var voiceCellIdOpt: Int? = nil
     public var loadedGlobal: [Int: Bool] = [:]
     private var staticGlobalVars: Set<VarID> = []
+    private var frameIndexOverride: String? = nil
+    private var currentThreadCountScale: Int? = nil
 
     // Track the emitted type of each variable in current scope
     public enum EmittedType {
@@ -181,6 +189,7 @@ public class CRenderer: Renderer {
                 buffers: buffers,
                 threadGroupSize: 1,  // C execution is scalar for now
                 threadCount: nil,
+                threadCountScale: nil,
                 needsReducedGradsSum: false,
                 memorySize: computedMem  // Ensure at least enough for voiceCellId
             )
@@ -213,11 +222,23 @@ public class CRenderer: Renderer {
         // Merge adjacent blocks of the same kind into a single loop to reduce passes
         var currentKind: Kind? = nil
         var currentTemporality: Temporality? = nil
+        var currentThreadCountScale: Int? = nil
         var hopCheckOpen = false  // Track if we have an open hop check conditional
         var loopOpen = false
 
+        func scaledFrameCount(_ scale: Int?) -> Lazy {
+            guard let scale, scale != 1 else { return frameCountUOp }
+            let scaleConst = ctx.useConstant(src: nil, value: Float(scale))
+            let dest = ctx.useVariable(src: nil, trackInValues: false)
+            scheduleItem.ops.append(UOp(op: .mul(frameCountUOp, scaleConst), value: dest))
+            return dest
+        }
+
         for block in uopBlocks {
-            let needsNewLoop = currentKind != block.kind || currentTemporality != block.temporality
+            let needsNewLoop =
+                currentKind != block.kind
+                || currentTemporality != block.temporality
+                || currentThreadCountScale != block.threadCountScale
 
             if needsNewLoop {
                 // Close previous hop check if open
@@ -236,9 +257,10 @@ public class CRenderer: Renderer {
                 switch block.temporality {
                 case .frameBased:
                     // Frame-based: standard frame loop
+                    let loopCount = scaledFrameCount(block.threadCountScale)
                     scheduleItem.ops.append(
                         UOp(
-                            op: .beginLoop(frameCountUOp, block.kind == .scalar ? 1 : 4),
+                            op: .beginLoop(loopCount, block.kind == .scalar ? 1 : 4),
                             value: .empty)
                     )
                     loopOpen = true
@@ -264,6 +286,7 @@ public class CRenderer: Renderer {
 
                 currentKind = block.kind
                 currentTemporality = block.temporality
+                currentThreadCountScale = block.threadCountScale
             }
 
             for uop in block.ops {
@@ -287,6 +310,8 @@ public class CRenderer: Renderer {
         name: String, scheduleItem: ScheduleItem, ctx: IRContext, graph: Graph,
         totalMemorySlots: Int
     ) -> String {
+        frameIndexOverride = nil
+        currentThreadCountScale = scheduleItem.threadCountScale
         var code: [String] = []
 
         // C includes and function signature
@@ -881,22 +906,33 @@ public class CRenderer: Renderer {
             return "\(emitLazy(a, ctx: ctx, kind: uop.kind, isOut: true)) = \(g(b));"
 
         case .input(let channel):
+            let idxExpr = frameIndexOverride ?? "i"
             if uop.kind == .simd {
                 // For SIMD: load 4 consecutive memory slots into vector
                 let ptr = "in[\(channel)] + i"
                 return emitAssign(uop, "vld1q_f32(\(ptr))", ctx)
             } else {
-                let addr = "in[\(channel)][i]"
+                let addr = "in[\(channel)][\(idxExpr)]"
                 return emitAssign(uop, "\(addr)", ctx)
             }
         case .output(let channel, let val):
+            let idxExpr = frameIndexOverride ?? "i"
             if uop.kind == .simd {
-                // For audiograph compatibility: use out[channel] directly
-                let ptr = "out[\(channel)] + i"
-                return "vst1q_f32(\(ptr), \(g(val)));"
+                // When overriding frame index, fall back to scalar stores for correctness
+                if frameIndexOverride != nil {
+                    let idx = "(int)(\(idxExpr))"
+                    return "out[\(channel)][\(idx)] = \(g(val));"
+                } else {
+                    // For audiograph compatibility: use out[channel] directly
+                    let ptr = "out[\(channel)] + i"
+                    return "vst1q_f32(\(ptr), \(g(val)));"
+                }
             } else {
                 // For audiograph compatibility: use out[channel][i] directly
-                let addr = "out[\(channel)][i]"
+                let baseIdx = "i"
+                let idx = frameIndexOverride
+                    ?? (currentThreadCountScale == nil ? baseIdx : "(\(baseIdx) / \(currentThreadCountScale!))")
+                let addr = "out[\(channel)][\(idx)]"
                 return "\(addr) = \(g(val));"
             }
 
@@ -927,6 +963,14 @@ public class CRenderer: Renderer {
             } else {
                 return emitAssign(uop, "i", ctx)
             }
+
+        case .setThreadCountScale:
+            return "/* setThreadCountScale - handled in scheduler */"
+
+        case .setFrameIndex(let idx):
+            let expr = g(idx)
+            frameIndexOverride = "_frameIndex"
+            return "int _frameIndex = (int)(\(expr));"
 
         case .cast(let expr, let castType):
             let typeStr = castType == .int ? "int" : "float"
@@ -987,18 +1031,32 @@ public class CRenderer: Renderer {
             return emitAssign(uop, "_pr\(varId)", ctx, forceFloatType: true)
 
         case .loadGrad(let gradId):
-            return emitAssign(uop, "gradients[\(gradId) * frameCount + i]", ctx)
+            let baseIdx = "i"
+            let idxExpr = frameIndexOverride
+                ?? (currentThreadCountScale == nil ? baseIdx : "(\(baseIdx) / \(currentThreadCountScale!))")
+            return emitAssign(uop, "gradients[\(gradId) * frameCount + (int)(\(idxExpr))]", ctx)
 
         case .accumulateGrad(let gradId, let val):
-            return "gradients[\(gradId) * frameCount + i] += \(g(val));"
+            let baseIdx = "i"
+            let idxExpr = frameIndexOverride
+                ?? (currentThreadCountScale == nil ? baseIdx : "(\(baseIdx) / \(currentThreadCountScale!))")
+            return "gradients[\(gradId) * frameCount + (int)(\(idxExpr))] += \(g(val));"
 
         case .loadTensorGrad(let baseGradId, let indexLazy):
+            let baseIdx = "i"
+            let idxExpr = frameIndexOverride
+                ?? (currentThreadCountScale == nil ? baseIdx : "(\(baseIdx) / \(currentThreadCountScale!))")
             return emitAssign(
-                uop, "gradients[(\(baseGradId)+(int)(\(g(indexLazy)))) * frameCount + i]", ctx)
+                uop,
+                "gradients[(\(baseGradId)+(int)(\(g(indexLazy)))) * frameCount + (int)(\(idxExpr))]",
+                ctx)
 
         case .accumulateTensorGrad(let baseGradId, let indexLazy, let valueLazy):
+            let baseIdx = "i"
+            let idxExpr = frameIndexOverride
+                ?? (currentThreadCountScale == nil ? baseIdx : "(\(baseIdx) / \(currentThreadCountScale!))")
             return
-                "gradients[(\(baseGradId)+(int)(\(g(indexLazy)))) * frameCount + i] += \(g(valueLazy));"
+                "gradients[(\(baseGradId)+(int)(\(g(indexLazy)))) * frameCount + (int)(\(idxExpr))] += \(g(valueLazy));"
 
         // Hop-based execution: only run block when counter == 0
         case .beginHopCheck(let counterCell):
@@ -1048,7 +1106,10 @@ public class CRenderer: Renderer {
                     if !isOut, staticGlobalVars.contains(id) {
                         return "t\(id)[0]"
                     }
-                    return "t\(id)[i]"
+                    let baseIdx = "i"
+                    let idx = frameIndexOverride
+                        ?? (currentThreadCountScale == nil ? baseIdx : "(\(baseIdx) / \(currentThreadCountScale!))")
+                    return "t\(id)[\(idx)]"
                 }
             } else {
                 if kind == .simd {
@@ -1065,7 +1126,10 @@ public class CRenderer: Renderer {
                 if !isOut, staticGlobalVars.contains(id) {
                     return "t\(id)[0]"
                 }
-                return "t\(id)[i]"
+                let baseIdx = "i"
+                let idx = frameIndexOverride
+                    ?? (currentThreadCountScale == nil ? baseIdx : "(\(baseIdx) / \(currentThreadCountScale!))")
+                return "t\(id)[\(idx)]"
             }
         default:
             return "/* unknown lazy */"

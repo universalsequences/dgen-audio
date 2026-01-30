@@ -428,7 +428,9 @@ public class MetalCompiledKernel: CompiledKernelRuntime {
         }
 
         let totalThreads: Int
-        if let overrideThreads = kernel.threadCount {
+        if let scale = kernel.threadCountScale {
+          totalThreads = max(1, frameCount * scale)
+        } else if let overrideThreads = kernel.threadCount {
           totalThreads = max(1, overrideThreads)
         } else if kernel.kind == .scalar {
           totalThreads = 1

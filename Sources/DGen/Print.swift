@@ -159,6 +159,10 @@ extension UOp {
             opStr = "\(ANSI.magenta)endParallelRange\(ANSI.reset)"
         case .parallelIndex:
             opStr = "\(ANSI.magenta)parallelIndex\(ANSI.reset)"
+        case let .setThreadCountScale(scale):
+            opStr = "\(ANSI.magenta)setThreadCountScale\(ANSI.reset)(\(scale))"
+        case let .setFrameIndex(idx):
+            opStr = "\(ANSI.magenta)setFrameIndex\(ANSI.reset)(\(idx))"
         case let .beginReduce(size):
             opStr = "\(ANSI.magenta)beginReduce\(ANSI.reset)(\(size))"
         case .endReduce:

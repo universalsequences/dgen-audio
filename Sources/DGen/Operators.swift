@@ -327,6 +327,8 @@ public enum LazyOp {
     case mse  // mean squared error per-sample: (a-b)^2
     case spectralLossPass1(Int, CellID)  // Pass 1: compute loss & store DFT contributions
     case spectralLossPass2(Int, CellID)  // Pass 2: reduce contributions to gradients (no-op in forward)
+    case parallelMap2DTestPass1(Int, CellID)  // Pass 1: write per-bin values to scratch
+    case parallelMap2DTestPass2(Int, CellID)  // Pass 2: reduce per-bin values to scalar
     case selector  // selector(mode, options[])
     case memoryRead(CellID)
     case memoryWrite(CellID)
@@ -578,6 +580,31 @@ public enum LazyOp {
             }
 
             b.use(val: totalError.value)
+
+        case .parallelMap2DTestPass1(let bins, let scratchCell):
+            guard inputs.isEmpty else {
+                throw DGenError.insufficientInputs(
+                    operator: "parallelMap2DTestPass1", expected: 0, actual: inputs.count)
+            }
+            u_parallelMap2DTestPass1(bins: bins, scratchCell: scratchCell)(b)
+            b.use(val: b.constant(0.0))
+
+        case .parallelMap2DTestPass2(let bins, let scratchCell):
+            guard inputs.count == 1 else {
+                throw DGenError.insufficientInputs(
+                    operator: "parallelMap2DTestPass2", expected: 1, actual: inputs.count)
+            }
+            let _ = b.value(inputs[0])
+            let binsFloat = b.constant(Float(bins))
+            let frameIdx = b.threadIndex()
+            let acc = b.float(0.0)
+            b.loop(bins) { binIdx in
+                let binIdxFloat = b.cast(binIdx, to: .float)
+                let offset = frameIdx * binsFloat + binIdxFloat
+                let val = b.memoryRead(scratchCell, b.cast(offset, to: .int))
+                acc.accumulate(val)
+            }
+            b.use(val: acc.value)
 
         case .gt:
             guard inputs.count == 2 else {
@@ -1793,6 +1820,12 @@ public enum LazyOp {
             u_spectralLossBackwardPass1(
                 windowSize, scratchCell, sig1, sig2, b.value(gradOutput)
             )(b)
+        case .parallelMap2DTestPass1(_, _):
+            // No gradients for test op
+            break
+        case .parallelMap2DTestPass2(_, _):
+            // No gradients for test op
+            break
         case .floor:
             // d(floor(x))/dx = 0 (floor is not differentiable, but we set to 0)
             guard inputs.count == 1 else { fatalError("floor requires 1 input") }

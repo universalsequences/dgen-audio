@@ -670,11 +670,40 @@ public final class IRBuilder {
     }
   }
 
+  /// Parallel map over (frame, bin) where total threads = frameCount * bins.
+  /// The body receives (frameIndex, binIndex) as floats.
+  public func parallelMap2D(bins: Int, body: (Expr, Expr) -> Void) {
+    setThreadCountScale(bins)
+    let flatIdx = threadIndex()
+    let binsExpr = constant(Float(bins))
+    let frameIdx = floor(flatIdx / binsExpr)
+    setFrameIndex(frameIdx)
+    let binIdx = flatIdx - frameIdx * binsExpr
+    body(frameIdx, binIdx)
+  }
+
   public func threadIndex() -> Expr {
     let dest = ctx.useVariable(src: nodeId)
     let uop = UOp(op: .threadIndex, value: dest)
     ops.append(uop)
     return value(dest)
+  }
+
+  /// Frame count (runtime parameter)
+  public func frameCount() -> Expr {
+    return value(.variable(-1, nil))
+  }
+
+  /// Override the frame index used for outputs/gradients in this kernel
+  public func setFrameIndex(_ expr: Expr) {
+    let uop = UOp(op: .setFrameIndex(expr.lazy), value: expr.lazy)
+    ops.append(uop)
+  }
+
+  /// Dispatch threads as frameCount * scale for this kernel
+  public func setThreadCountScale(_ scale: Int) {
+    let uop = UOp(op: .setThreadCountScale(scale), value: .empty)
+    ops.append(uop)
   }
 
   public func tapeLoad(_ signal: Expr, at offset: Expr) -> Expr {

@@ -727,12 +727,14 @@ public func fuseBlocks(_ blocks: [Block], _ g: Graph) -> [Block] {
     // Pre-compute which blocks contain Pass1/Pass2 and which scratch cells they touch
     var blockHasPass1: [Bool] = []
     var blockHasPass2: [Bool] = []
+    var blockHasScaledThreads: [Bool] = []
     var blockPass1Cells: [Set<CellID>] = []
     var blockPass2Cells: [Set<CellID>] = []
 
     for b in blocks {
         var hasPass1 = false
         var hasPass2 = false
+        var hasScaled = false
         var p1Cells = Set<CellID>()
         var p2Cells = Set<CellID>()
         for nodeId in b.nodes {
@@ -741,9 +743,15 @@ public func fuseBlocks(_ blocks: [Block], _ g: Graph) -> [Block] {
                 case .spectralLossPass1(_, let scratchCell):
                     hasPass1 = true
                     p1Cells.insert(scratchCell)
+                    hasScaled = true
                 case .spectralLossPass2(_, let scratchCell):
                     hasPass2 = true
                     p2Cells.insert(scratchCell)
+                case .parallelMap2DTestPass1(_, _):
+                    hasScaled = true
+                case .parallelMap2DTestPass2(_, _):
+                    // no-op for scaled flag
+                    break
                 default:
                     break
                 }
@@ -751,6 +759,7 @@ public func fuseBlocks(_ blocks: [Block], _ g: Graph) -> [Block] {
         }
         blockHasPass1.append(hasPass1)
         blockHasPass2.append(hasPass2)
+        blockHasScaledThreads.append(hasScaled)
         blockPass1Cells.append(p1Cells)
         blockPass2Cells.append(p2Cells)
     }
@@ -758,6 +767,7 @@ public func fuseBlocks(_ blocks: [Block], _ g: Graph) -> [Block] {
     var fused: [Block] = []
     var fusedHasPass1: [Bool] = []
     var fusedHasPass2: [Bool] = []
+    var fusedHasScaledThreads: [Bool] = []
     var fusedPass1Cells: [Set<CellID>] = []
     var fusedPass2Cells: [Set<CellID>] = []
 
@@ -773,6 +783,9 @@ public func fuseBlocks(_ blocks: [Block], _ g: Graph) -> [Block] {
             if !conflict && fusedHasPass2[lastIdx] && blockHasPass1[idx] {
                 conflict = !fusedPass2Cells[lastIdx].intersection(blockPass1Cells[idx]).isEmpty
             }
+            if !conflict && (fusedHasScaledThreads[lastIdx] || blockHasScaledThreads[idx]) {
+                conflict = true
+            }
             let canFuse = !conflict
 
             if canFuse {
@@ -783,6 +796,8 @@ public func fuseBlocks(_ blocks: [Block], _ g: Graph) -> [Block] {
                 // Update flags
                 fusedHasPass1[lastIdx] = fusedHasPass1[lastIdx] || blockHasPass1[idx]
                 fusedHasPass2[lastIdx] = fusedHasPass2[lastIdx] || blockHasPass2[idx]
+                fusedHasScaledThreads[lastIdx] =
+                    fusedHasScaledThreads[lastIdx] || blockHasScaledThreads[idx]
                 fusedPass1Cells[lastIdx].formUnion(blockPass1Cells[idx])
                 fusedPass2Cells[lastIdx].formUnion(blockPass2Cells[idx])
             } else {
@@ -796,6 +811,7 @@ public func fuseBlocks(_ blocks: [Block], _ g: Graph) -> [Block] {
                 fused.append(b)
                 fusedHasPass1.append(blockHasPass1[idx])
                 fusedHasPass2.append(blockHasPass2[idx])
+                fusedHasScaledThreads.append(blockHasScaledThreads[idx])
                 fusedPass1Cells.append(blockPass1Cells[idx])
                 fusedPass2Cells.append(blockPass2Cells[idx])
             }
@@ -810,6 +826,7 @@ public func fuseBlocks(_ blocks: [Block], _ g: Graph) -> [Block] {
             fused.append(b)
             fusedHasPass1.append(blockHasPass1[idx])
             fusedHasPass2.append(blockHasPass2[idx])
+            fusedHasScaledThreads.append(blockHasScaledThreads[idx])
             fusedPass1Cells.append(blockPass1Cells[idx])
             fusedPass2Cells.append(blockPass2Cells[idx])
         }
@@ -836,6 +853,8 @@ public func isolateSpectralPasses(_ blocks: [Block], _ g: Graph) -> [Block] {
                 guard let node = g.nodes[nodeId] else { return false }
                 if case .spectralLossPass1 = node.op { return true }
                 if case .spectralLossPass2 = node.op { return true }
+                if case .parallelMap2DTestPass1 = node.op { return true }
+                if case .parallelMap2DTestPass2 = node.op { return true }
                 return false
             }()
 

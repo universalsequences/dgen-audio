@@ -322,6 +322,20 @@ public struct CompilationPipeline {
             }
         }
 
+        func extractThreadCountScale(_ ops: [UOp]) -> (Int?, [UOp]) {
+            var scale: Int? = nil
+            var filtered: [UOp] = []
+            filtered.reserveCapacity(ops.count)
+            for op in ops {
+                if case .setThreadCountScale(let s) = op.op {
+                    scale = s
+                    continue
+                }
+                filtered.append(op)
+            }
+            return (scale, filtered)
+        }
+
         try time("emitBlockUOps") {
             for blockIdx in finalBlockIndices {
                 let block = finalBlocks[blockIdx]
@@ -332,14 +346,26 @@ public struct CompilationPipeline {
                     g: graph,
                     debug: options.debug
                 )
+                let (threadCountScale, filteredOps) = extractThreadCountScale(ops)
+                var finalOps = filteredOps
+                let effectiveKind: Kind
+                if backend == .c, threadCountScale != nil {
+                    for i in 0..<finalOps.count {
+                        finalOps[i].kind = .scalar
+                    }
+                    effectiveKind = .scalar
+                } else {
+                    effectiveKind = block.kind
+                }
                 let parallelPolicy = inferParallelPolicy(
-                    kind: block.kind, temporality: block.temporality, ops: ops)
-                // Force new kernel for spectral passes (forward + backward) to prevent fusion
-                let forceNew = containsSpectralPass(block, graph)
+                    kind: effectiveKind, temporality: block.temporality, ops: finalOps)
+                // Force new kernel for spectral passes (forward + backward) and scaled thread blocks
+                let forceNew = containsSpectralPass(block, graph) || threadCountScale != nil
                 uopBlocks.append(
                     BlockUOps(
-                        ops: ops, kind: block.kind, temporality: block.temporality,
-                        parallelPolicy: parallelPolicy, forceNewKernel: forceNew))
+                        ops: finalOps, kind: effectiveKind, temporality: block.temporality,
+                        parallelPolicy: parallelPolicy, forceNewKernel: forceNew,
+                        threadCountScale: threadCountScale))
             }
         }
 

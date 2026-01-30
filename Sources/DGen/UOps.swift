@@ -76,6 +76,8 @@ public enum Op {
   case beginParallelRange(Int, Int)  // count - iterations are independent, can be parallelized
   case endParallelRange
   case parallelIndex  // current index within parallel range
+  case setThreadCountScale(Int)  // dispatch threads = frameCount * scale
+  case setFrameIndex(Lazy)        // override frame index used for outputs/gradients
   case output(ChannelNumber, Lazy)
   case input(ChannelNumber)
 

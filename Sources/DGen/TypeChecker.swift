@@ -405,6 +405,7 @@ public func isIntrinsicallyFrameBased(_ op: LazyOp) -> Bool {
   case .historyReadWrite(_): return true  // combined temporal operation
   case .latch(_): return true  // conditional state update
   case .click(_): return true  // trigger/event based
+  case .parallelMap2DTestPass1, .parallelMap2DTestPass2: return true
   default: return false
   }
 }

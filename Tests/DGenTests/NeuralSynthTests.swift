@@ -1012,7 +1012,7 @@ final class NeuralSynthTests: XCTestCase {
         let frameCount = 128
         let controlFrames = 32  // Control rate resolution
         let windowSize = 64
-        let numHarmonics = 12
+        let numHarmonics = 6
         let hiddenSize = 16
 
         print(

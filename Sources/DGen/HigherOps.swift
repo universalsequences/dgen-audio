@@ -46,6 +46,18 @@ extension Graph {
     return pass2  // Return Pass2 result (forwards Pass1's loss value)
   }
 
+  /// Parallel map2D test: writes per-bin values using flattened (frame, bin) threads,
+  /// then reduces to a scalar per frame. Used to validate parallelMap2D semantics.
+  public func parallelMap2DTest(bins: Int) -> NodeID {
+    let maxFrameCount = 4096
+    let scratchSize = maxFrameCount * bins
+    let scratchCell = alloc(vectorWidth: scratchSize)
+
+    let pass1 = n(.parallelMap2DTestPass1(bins, scratchCell))
+    let pass2 = n(.parallelMap2DTestPass2(bins, scratchCell), pass1)
+    return pass2
+  }
+
   /// Delta: returns the difference between current and previous input value
   /// delta(input) = input - history(input)
   public func delta(_ input: NodeID) -> NodeID {

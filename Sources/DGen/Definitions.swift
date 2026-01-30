@@ -142,13 +142,8 @@ func u_spectralLoss(sig1: Expr, sig2: Expr, windowSize: Int, scratchCell: CellID
   return { b in
     let numBins = windowSize / 2 + 1
     let winSize = b.constant(Float(windowSize))
-    let frameIdx = b.threadIndex()
-    let baseOffset = frameIdx * winSize * b.constant(2.0)
-
-    // For each frequency bin
-    b.parallelRange(numBins) { binIndex in
-      let binIndexFloat = b.cast(binIndex, to: .float)
-
+    // Dispatch threads as (frameCount * numBins); flatten id -> (frame, bin)
+    b.parallelMap2D(bins: numBins) { frameIdx, binIndexFloat in
       // DFT accumulators (real and imaginary parts)
       let real1 = b.float(0.0)
       let real2 = b.float(0.0)
@@ -181,9 +176,10 @@ func u_spectralLoss(sig1: Expr, sig2: Expr, windowSize: Int, scratchCell: CellID
       let mag1 = b.sqrt(real1.value * real1.value + imag1.value * imag1.value)
       let mag2 = b.sqrt(real2.value * real2.value + imag2.value * imag2.value)
 
-      // Accumulate squared error for this bin
+      // Store squared error for this bin
       let diff = mag1 - mag2
       let binError = diff * diff
+      let baseOffset = frameIdx * winSize * b.constant(2.0)
       let offset = baseOffset + binIndexFloat
       _ = b.memoryWrite(scratchCell, b.cast(offset, to: .int), binError)
     }
@@ -297,5 +293,23 @@ func u_spectralLossBackwardPass2(
     }
 
     return (grad1.value, grad2.value)
+  }
+}
+
+/// Pass1 for parallelMap2D test: writes per-bin values into scratch.
+/// Value = frameIdx * 100 + binIdx
+func u_parallelMap2DTestPass1(
+  bins: Int,
+  scratchCell: CellID
+) -> (IRBuilder) -> Void {
+  return { b in
+    let binsFloat = b.constant(Float(bins))
+    let scale = b.constant(100.0)
+
+    b.parallelMap2D(bins: bins) { frameIdx, binIdx in
+      let value = frameIdx * scale + binIdx
+      let offset = frameIdx * binsFloat + binIdx
+      _ = b.memoryWrite(scratchCell, b.cast(offset, to: .int), value)
+    }
   }
 }
