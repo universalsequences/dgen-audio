@@ -37,6 +37,7 @@ public class GraphParameter {
 /// Optimizer protocol for graph-based training
 public protocol GraphOptimizer {
     mutating func update(parameters: inout [GraphParameter], learningRate: Float)
+    mutating func updateTensors(tensorParameters: inout [TensorParameter], learningRate: Float)
 }
 
 /// Simple SGD optimizer
@@ -46,6 +47,14 @@ public struct GraphSGD: GraphOptimizer {
     public mutating func update(parameters: inout [GraphParameter], learningRate: Float) {
         for param in parameters {
             param.value -= learningRate * param.grad
+        }
+    }
+
+    public mutating func updateTensors(tensorParameters: inout [TensorParameter], learningRate: Float) {
+        for param in tensorParameters {
+            for i in 0..<param.data.count {
+                param.data[i] -= learningRate * param.grads[i]
+            }
         }
     }
 }
@@ -59,6 +68,10 @@ public struct GraphAdam: GraphOptimizer {
     public let beta2: Float
     public let epsilon: Float
 
+    // For tensor parameters - flattened momentum arrays
+    private var tensorM: [[Float]] = []
+    private var tensorV: [[Float]] = []
+
     public init(beta1: Float = 0.9, beta2: Float = 0.999, epsilon: Float = 1e-8) {
         self.beta1 = beta1
         self.beta2 = beta2
@@ -66,7 +79,7 @@ public struct GraphAdam: GraphOptimizer {
     }
 
     public mutating func update(parameters: inout [GraphParameter], learningRate: Float) {
-        if m.isEmpty {
+        if m.isEmpty && !parameters.isEmpty {
             m = Array(repeating: 0.0, count: parameters.count)
             v = Array(repeating: 0.0, count: parameters.count)
         }
@@ -85,6 +98,33 @@ public struct GraphAdam: GraphOptimizer {
             parameters[i].value -= learningRate * mHat / (sqrt(vHat) + epsilon)
         }
     }
+
+    public mutating func updateTensors(tensorParameters: inout [TensorParameter], learningRate: Float) {
+        // Initialize momentum arrays if needed
+        if tensorM.isEmpty && !tensorParameters.isEmpty {
+            tensorM = tensorParameters.map { Array(repeating: Float(0.0), count: $0.data.count) }
+            tensorV = tensorParameters.map { Array(repeating: Float(0.0), count: $0.data.count) }
+        }
+
+        // Note: t is already incremented in update() if called, otherwise increment here
+        if m.isEmpty {
+            t += 1
+        }
+
+        for (pi, param) in tensorParameters.enumerated() {
+            for i in 0..<param.data.count {
+                let grad = param.grads[i]
+
+                tensorM[pi][i] = beta1 * tensorM[pi][i] + (1 - beta1) * grad
+                tensorV[pi][i] = beta2 * tensorV[pi][i] + (1 - beta2) * grad * grad
+
+                let mHat = tensorM[pi][i] / (1 - pow(beta1, Float(t)))
+                let vHat = tensorV[pi][i] / (1 - pow(beta2, Float(t)))
+
+                param.data[i] -= learningRate * mHat / (sqrt(vHat) + epsilon)
+            }
+        }
+    }
 }
 
 // MARK: - Graph Training Context
@@ -92,6 +132,7 @@ public struct GraphAdam: GraphOptimizer {
 /// Manages training using graph-based gradient computation
 public class GraphTrainingContext {
     public var parameters: [GraphParameter]
+    public var tensorParameters: [TensorParameter]
     private var optimizer: GraphOptimizer
     public let learningRate: Float
 
@@ -100,33 +141,44 @@ public class GraphTrainingContext {
     private var runtime: MetalCompiledKernel?
     private var cellAllocations: CellAllocations?
     private var frameCount: Int
+    private var kernelDebugOutput: String?
 
-    // Physical cell indices for fast access
+    // Physical cell indices for fast access (scalar params)
     private var paramPhysicalCells: [Int] = []
     private var gradPhysicalCells: [Int] = []
+
+    // Physical cell indices for tensor params
+    private var tensorPhysicalCells: [(base: Int, size: Int)] = []
+    private var tensorGradPhysicalCells: [(base: Int, size: Int)] = []
 
     /// Initialize training context
     /// - Parameters:
     ///   - graph: The computation graph (will be modified to add gradient nodes)
     ///   - loss: The loss node to compute gradients from
-    ///   - parameters: Trainable parameters
+    ///   - parameters: Trainable scalar parameters
+    ///   - tensorParameters: Trainable tensor parameters
     ///   - optimizer: Optimization algorithm
     ///   - learningRate: Learning rate for optimization
     ///   - frameCount: Number of frames per training step
+    ///   - kernelDebugOutput: Optional path to write generated kernels for debugging
     public init(
         graph: Graph,
         loss: NodeID,
-        parameters: [GraphParameter],
+        parameters: [GraphParameter] = [],
+        tensorParameters: [TensorParameter] = [],
         optimizer: GraphOptimizer = GraphSGD(),
         learningRate: Float = 0.001,
-        frameCount: Int = 64
+        frameCount: Int = 64,
+        kernelDebugOutput: String? = nil
     ) throws {
         self.graph = graph
         self.lossNode = loss
         self.parameters = parameters
+        self.tensorParameters = tensorParameters
         self.optimizer = optimizer
         self.learningRate = learningRate
         self.frameCount = frameCount
+        self.kernelDebugOutput = kernelDebugOutput
 
         // Prepare gradients and compile
         try prepareAndCompile()
@@ -139,12 +191,14 @@ public class GraphTrainingContext {
         let lastForwardNodeId = graph.nodes.keys.max() ?? 0
         graph.lastForwardNodeId = lastForwardNodeId
 
-        // Step 1: Compute gradient nodes for all parameters
-        let targetNodes = Set(parameters.map { $0.nodeId })
+        // Step 1: Compute gradient nodes for all parameters (scalar + tensor)
+        var targetNodes = Set(parameters.map { $0.nodeId })
+        for tp in tensorParameters {
+            targetNodes.insert(tp.nodeId)
+        }
         let gradients = graph.computeGradients(loss: lossNode, targets: targetNodes)
 
-        // Step 2: For each parameter, create atomic accumulator for its gradient
-        // Chain with any side-effect nodes (like gradient carry writes) to ensure they execute
+        // Step 2: For each scalar parameter, create atomic accumulator for its gradient
         let zero = graph.n(.constant(0.0))
         for param in parameters {
             guard var gradNode = gradients[param.nodeId] else {
@@ -166,6 +220,45 @@ public class GraphTrainingContext {
             _ = graph.n(.memoryAccumulate(gradCell), [zero, gradNode])
         }
 
+        // Step 2b: For tensor parameters, create tensorAccumulate ops for gradients
+        // This pulls the lazy gradient tensor nodes into the compilation pipeline
+        for tp in tensorParameters {
+            guard let gradNode = gradients[tp.nodeId] else {
+                print("Warning: No gradient for tensor param \(tp.name ?? "?")")
+                continue
+            }
+
+            // Allocate gradient accumulation cell
+            let gradCell = graph.alloc(vectorWidth: tp.size)
+            graph.tensorGradCells[tp.nodeId] = gradCell
+
+            // Create tensor accumulate op - this pulls gradNode into the graph
+            let accumOp = graph.n(.tensorAccumulate(gradCell), [gradNode])
+            graph.addGradientSideEffect(accumOp)
+        }
+
+        // Ensure gradient side effects are scheduled
+        print("[DEBUG] After computeGradients: gradientSideEffects=\(graph.gradientSideEffects.count), gradCarryCells=\(graph.gradCarryCells)")
+        if !graph.gradientSideEffects.isEmpty {
+            // Find the output node and make it depend on all side effects
+            // This ensures the scatter operations get scheduled
+            if let outputNodeId = graph.nodes.first(where: {
+                if case .output(_) = $0.value.op { return true }
+                return false
+            })?.key {
+                // Chain all side effects before the output
+                var chainedValue = lossNode
+                for sideEffect in graph.gradientSideEffects {
+                    chainedValue = graph.n(.seq, [sideEffect, chainedValue])
+                }
+                // Update the output node to use the chained value
+                // We need to create a new output that depends on the side effects
+                let newOutput = graph.n(.output(0), [chainedValue])
+                // The old output is orphaned, new one will be used
+                _ = newOutput
+            }
+        }
+
         // Clear side effects after use
         graph.gradientSideEffects = []
 
@@ -176,6 +269,15 @@ public class GraphTrainingContext {
             options: .init(frameCount: frameCount)
         )
 
+        // Write kernels to disk if debug output path provided
+        if let outputPath = kernelDebugOutput {
+            let allKernels = result.kernels.enumerated().map {
+                "// KERNEL \($0.offset)\n// ThreadGroupSize \($0.element.threadGroupSize)\n// ThreadCount \($0.element.threadCount)\n\n\($0.element.source)"
+            }.joined(separator: "\n\n// ========================================\n\n")
+            try? allKernels.write(toFile: outputPath, atomically: true, encoding: .utf8)
+            print("Wrote kernels to: \(outputPath)")
+        }
+
         self.cellAllocations = result.cellAllocations
 
         // Step 4: Create runtime
@@ -185,7 +287,7 @@ public class GraphTrainingContext {
             context: result.context
         )
 
-        // Step 5: Cache physical cell indices
+        // Step 5: Cache physical cell indices for scalar params
         for param in parameters {
             let physicalParam = result.cellAllocations.cellMappings[param.cellId] ?? param.cellId
             paramPhysicalCells.append(physicalParam)
@@ -195,6 +297,32 @@ public class GraphTrainingContext {
                 gradPhysicalCells.append(physicalGrad)
             } else {
                 gradPhysicalCells.append(-1)
+            }
+        }
+
+        // Step 5b: Cache physical cell indices for tensor params
+        print("[DEBUG] tensorGradCells: \(graph.tensorGradCells)")
+        print("[DEBUG] gradCarryCells: \(graph.gradCarryCells)")
+        for tp in tensorParameters {
+            let physicalBase = result.cellAllocations.cellMappings[tp.cellId] ?? tp.cellId
+            tensorPhysicalCells.append((base: physicalBase, size: tp.size))
+            print("[DEBUG] TensorParam '\(tp.name ?? "?")' cellId=\(tp.cellId) physicalBase=\(physicalBase)")
+
+            // First: check tensorGradCells (from tensorAccumulate)
+            if let gradCell = graph.tensorGradCells[tp.nodeId] {
+                let physical = result.cellAllocations.cellMappings[gradCell] ?? gradCell
+                tensorGradPhysicalCells.append((base: physical, size: tp.size))
+                print("[DEBUG]   -> tensorGradCells gradCell=\(gradCell) physical=\(physical)")
+            }
+            // Fallback: scatter-based (direct peekRow)
+            else if let gradCellId = graph.gradCarryCells[tp.cellId] {
+                let physicalGradBase = result.cellAllocations.cellMappings[gradCellId] ?? gradCellId
+                tensorGradPhysicalCells.append((base: physicalGradBase, size: tp.size))
+                print("[DEBUG]   -> gradCarryCells gradCellId=\(gradCellId) physicalGradBase=\(physicalGradBase)")
+            } else {
+                // No gradient cell found - tensor wasn't read with gradient-aware ops
+                tensorGradPhysicalCells.append((base: -1, size: tp.size))
+                print("[DEBUG]   -> NO gradient cell found!")
             }
         }
 
@@ -209,8 +337,17 @@ public class GraphTrainingContext {
 
         let memPtr = memBuffer.contents().assumingMemoryBound(to: Float.self)
 
+        // Initialize scalar parameters
         for (i, param) in parameters.enumerated() {
             memPtr[paramPhysicalCells[i]] = param.value
+        }
+
+        // Initialize tensor parameters
+        for (i, tp) in tensorParameters.enumerated() {
+            let base = tensorPhysicalCells[i].base
+            for j in 0..<tp.data.count {
+                memPtr[base + j] = tp.data[j]
+            }
         }
     }
 
@@ -221,9 +358,20 @@ public class GraphTrainingContext {
 
         let memPtr = memBuffer.contents().assumingMemoryBound(to: Float.self)
 
+        // Zero scalar param gradients
         for i in 0..<parameters.count {
             if gradPhysicalCells[i] >= 0 {
                 memPtr[gradPhysicalCells[i]] = 0.0
+            }
+        }
+
+        // Zero tensor param gradients
+        for i in 0..<tensorParameters.count {
+            let gradInfo = tensorGradPhysicalCells[i]
+            if gradInfo.base >= 0 {
+                for j in 0..<gradInfo.size {
+                    memPtr[gradInfo.base + j] = 0.0
+                }
             }
         }
     }
@@ -240,9 +388,20 @@ public class GraphTrainingContext {
         if let memBuffer = runtime.getBuffer(name: "memory") {
             let memPtr = memBuffer.contents().assumingMemoryBound(to: Float.self)
 
+            // Read scalar param gradients
             for (i, param) in parameters.enumerated() {
                 if gradPhysicalCells[i] >= 0 {
                     param.grad = memPtr[gradPhysicalCells[i]]
+                }
+            }
+
+            // Read tensor param gradients
+            for (i, tp) in tensorParameters.enumerated() {
+                let gradInfo = tensorGradPhysicalCells[i]
+                if gradInfo.base >= 0 {
+                    for j in 0..<gradInfo.size {
+                        tp.grads[j] = memPtr[gradInfo.base + j]
+                    }
                 }
             }
         }
@@ -255,8 +414,11 @@ public class GraphTrainingContext {
 
     /// Apply optimizer to update parameters
     public func step() {
-        // Update parameters using optimizer
+        // Update scalar parameters using optimizer
         optimizer.update(parameters: &parameters, learningRate: learningRate)
+
+        // Update tensor parameters using optimizer
+        optimizer.updateTensors(tensorParameters: &tensorParameters, learningRate: learningRate)
 
         // Write updated values back to GPU memory
         guard let runtime = runtime else { return }
@@ -264,8 +426,17 @@ public class GraphTrainingContext {
 
         let memPtr = memBuffer.contents().assumingMemoryBound(to: Float.self)
 
+        // Write scalar params
         for (i, param) in parameters.enumerated() {
             memPtr[paramPhysicalCells[i]] = param.value
+        }
+
+        // Write tensor params
+        for (i, tp) in tensorParameters.enumerated() {
+            let base = tensorPhysicalCells[i].base
+            for j in 0..<tp.data.count {
+                memPtr[base + j] = tp.data[j]
+            }
         }
     }
 

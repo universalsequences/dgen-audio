@@ -39,13 +39,18 @@ extension Graph {
         grads[loss] = n(.constant(1.0), [])
 
         // Walk in reverse topological order
-        for nodeId in reverseTopologicalOrder(from: loss, targets: targets) {
+        let reverseOrder = reverseTopologicalOrder(from: loss, targets: targets)
+        print("[GRAD DEBUG] reverseTopologicalOrder has \(reverseOrder.count) nodes")
+        for nodeId in reverseOrder {
             guard let upstreamGrad = grads[nodeId],
                   let node = nodes[nodeId] else { continue }
+
+            print("[GRAD DEBUG] Processing node \(nodeId): \(node.op), inputs=\(node.inputs)")
 
             // Apply backward rule -> get gradient NodeIDs for inputs
             // Also handles side effects like storing to gradient carry cells
             let inputGrads = node.op.backward(graph: self, node: node, gradOutput: upstreamGrad)
+            print("[GRAD DEBUG]   backward returned \(inputGrads.count) grads: \(inputGrads)")
 
             // Accumulate gradients (as graph nodes, not values!)
             for (inputId, grad) in zip(node.inputs, inputGrads) {
@@ -59,6 +64,7 @@ extension Graph {
                 }
             }
         }
+        print("[GRAD DEBUG] Final grads dict has \(grads.count) entries, sideEffects=\(gradientSideEffects.count)")
 
         return grads
     }
@@ -352,13 +358,12 @@ extension LazyOp {
 
         case .sum:
             // d(sum(x))/dx[i] = grad for all i (broadcast)
-            guard let inputNode = g.nodes[node.inputs[0]],
-                  case .tensor(let shape) = inputNode.shape else {
-                // Scalar: just pass through
-                return [gradOutput]
-            }
-            // Expand scalar gradient to tensor shape
-            return [g.n(.expand(shape), [gradOutput])]
+            // Note: We return the scalar gradient directly instead of using expand.
+            // Downstream ops (like peekRow) that need the gradient for tensor elements
+            // can use this scalar directly since the gradient is uniform across all elements.
+            // This avoids the tensor allocation timing issue where computeGradients runs
+            // before allocateTensorOutputs.
+            return [gradOutput]
 
         case .sumAxis(let axis):
             // Gradient broadcasts back along the reduced axis
@@ -495,7 +500,10 @@ extension LazyOp {
             return []  // Leaf node (but we want gradients FOR these)
 
         case .tensorRef(_):
-            return []  // Reference, no gradient
+            // TensorRef is a tensor parameter
+            // Gradients for tensor parameters are handled via gradCarryCells
+            // which are populated by ops like peekRow that read from this tensor
+            return []  // Leaf node
 
         case .seq:
             // Gradient flows only to the last input
@@ -519,6 +527,11 @@ extension LazyOp {
             // inputs: [offset, value] - same as memoryWrite
             let zero = g.n(.constant(0.0), [])
             return [zero, gradOutput]
+
+        case .tensorAccumulate(_):
+            // tensorAccumulate is a side-effect op for gradient accumulation
+            // No gradients to propagate through it
+            return [nil]
 
         // MARK: Noise (non-differentiable)
 
@@ -544,9 +557,159 @@ extension LazyOp {
             // FFT gradients need special handling
             return node.inputs.map { _ in nil }
 
-        case .peek, .peekRow:
-            // Interpolated reads - complex gradient
-            return node.inputs.map { _ in nil }
+        case .peek:
+            // peek(tensor, index, channel) -> interpolated scalar read
+            // Gradient scatters back to two tensor positions
+            guard node.inputs.count == 3 else {
+                return [nil, nil, nil]
+            }
+
+            let tensorInput = node.inputs[0]
+            guard let inputNode = g.nodes[tensorInput],
+                  case .tensor(let shape) = inputNode.shape,
+                  shape.count >= 2,
+                  let tensorId = g.nodeToTensor[tensorInput],
+                  let tensor = g.tensors[tensorId] else {
+                let zero = g.n(.constant(0.0), [])
+                return [nil, zero, zero]
+            }
+
+            let channelSize = shape[0]
+            let numChannels = shape[1]
+            let totalSize = channelSize * numChannels
+            let tensorCellId = tensor.cellId
+
+            // Get or create gradient cell for this tensor
+            let gradCell: CellID
+            if let existing = g.gradCarryCells[tensorCellId] {
+                gradCell = existing
+            } else {
+                gradCell = g.alloc(vectorWidth: totalSize)
+                g.gradCarryCells[tensorCellId] = gradCell
+            }
+
+            // Recompute interpolation positions (same logic as forward)
+            let index = node.inputs[1]
+            let channel = node.inputs[2]
+
+            let one = g.n(.constant(1.0), [])
+            let zero = g.n(.constant(0.0), [])
+            let channelSizeFloat = g.n(.constant(Float(channelSize)), [])
+
+            // Wrap index within channel using modulo
+            let wrappedIndex = g.n(.mod, [index, channelSizeFloat])
+            let isNegative = g.n(.lt, [wrappedIndex, zero])
+            let positiveIndex = g.n(.gswitch, [isNegative, g.n(.add, [wrappedIndex, channelSizeFloat]), wrappedIndex])
+
+            // Clamp channel to valid range [0, numChannels-1]
+            let numChannelsMinusOne = g.n(.constant(Float(numChannels - 1)), [])
+            let clampedChannel = g.n(.floor, [g.n(.max, [zero, g.n(.min, [channel, numChannelsMinusOne])])])
+            let channelOffset = g.n(.mul, [channelSizeFloat, clampedChannel])
+
+            // Calculate final read position
+            let finalReadPos = g.n(.add, [channelOffset, positiveIndex])
+            let flooredPos = g.n(.floor, [finalReadPos])
+            let frac = g.n(.sub, [finalReadPos, flooredPos])
+
+            // Next position with wrapping at channel boundary
+            let nextPos = g.n(.add, [flooredPos, one])
+            let nextChannelOffset = g.n(.add, [channelOffset, channelSizeFloat])
+            let nextPosWrapped = g.n(.gswitch, [g.n(.gte, [nextPos, nextChannelOffset]), channelOffset, nextPos])
+
+            // Scatter gradients: dL/d(tensor[pos1]) += gradOut * (1-frac)
+            //                    dL/d(tensor[pos2]) += gradOut * frac
+            let oneMinusFrac = g.n(.sub, [one, frac])
+            let grad1 = g.n(.mul, [gradOutput, oneMinusFrac])
+            let grad2 = g.n(.mul, [gradOutput, frac])
+
+            let scatter1 = g.n(.memoryAccumulate(gradCell), [flooredPos, grad1])
+            let scatter2 = g.n(.memoryAccumulate(gradCell), [nextPosWrapped, grad2])
+
+            g.addGradientSideEffect(scatter1)
+            g.addGradientSideEffect(scatter2)
+
+            // Tensor gradient handled via side effects, index/channel gradients are zero
+            return [nil, zero, zero]
+
+        case .peekRow:
+            // peekRow(tensor, rowIndex) -> interpolated row read (outputs 1D tensor)
+            // Gradient scatters back to two rows in the input tensor
+            guard node.inputs.count == 2 else {
+                return [nil, nil]
+            }
+
+            let tensorInput = node.inputs[0]
+            guard let inputNode = g.nodes[tensorInput],
+                  case .tensor(let shape) = inputNode.shape,
+                  shape.count == 2,
+                  let tensorId = g.nodeToTensor[tensorInput],
+                  let tensor = g.tensors[tensorId] else {
+                let zero = g.n(.constant(0.0), [])
+                return [nil, zero]
+            }
+
+            let numRows = shape[0]
+            let numCols = shape[1]
+            let totalSize = numRows * numCols
+            let tensorCellId = tensor.cellId
+
+            // Get or create gradient cell for input tensor
+            let gradCell: CellID
+            if let existing = g.gradCarryCells[tensorCellId] {
+                gradCell = existing
+            } else {
+                gradCell = g.alloc(vectorWidth: totalSize)
+                g.gradCarryCells[tensorCellId] = gradCell
+            }
+
+            // Recompute interpolation positions (same logic as forward)
+            let rowIndex = node.inputs[1]
+
+            let zero = g.n(.constant(0.0), [])
+            let one = g.n(.constant(1.0), [])
+            let numRowsFloat = g.n(.constant(Float(numRows)), [])
+
+            // Wrap rowIndex using modulo
+            let wrappedIndex = g.n(.mod, [rowIndex, numRowsFloat])
+            let isNegative = g.n(.lt, [wrappedIndex, zero])
+            let positiveIndex = g.n(.gswitch, [isNegative, g.n(.add, [wrappedIndex, numRowsFloat]), wrappedIndex])
+
+            // Compute floor and ceil indices for interpolation
+            let floorIndex = g.n(.floor, [positiveIndex])
+            let frac = g.n(.sub, [positiveIndex, floorIndex])
+
+            // Compute ceil index with wrapping
+            let ceilIndex = g.n(.add, [floorIndex, one])
+            let ceilWrapped = g.n(.gswitch, [g.n(.gte, [ceilIndex, numRowsFloat]), zero, ceilIndex])
+
+            // Interpolation weights
+            let oneMinusFrac = g.n(.sub, [one, frac])
+
+            // Scatter gradients for each column
+            // Column-major layout: offset = col * numRows + row
+            for col in 0..<numCols {
+                let colIdx = g.n(.constant(Float(col)), [])
+                let colOffset = g.n(.mul, [colIdx, numRowsFloat])
+
+                // Floor position gradient
+                let floorPos = g.n(.add, [colOffset, floorIndex])
+                let grad1 = g.n(.mul, [gradOutput, oneMinusFrac])
+                let scatter1 = g.n(.memoryAccumulate(gradCell), [floorPos, grad1])
+
+                // Ceil position gradient
+                let ceilPos = g.n(.add, [colOffset, ceilWrapped])
+                let grad2 = g.n(.mul, [gradOutput, frac])
+                let scatter2 = g.n(.memoryAccumulate(gradCell), [ceilPos, grad2])
+
+                g.addGradientSideEffect(scatter1)
+                g.addGradientSideEffect(scatter2)
+            }
+
+            // Create a gradient tensor node to allow backward propagation through
+            // upstream ops (e.g., matmul). This uses expand to broadcast the scalar
+            // gradient to the input tensor shape.
+            let tensorGrad = g.n(.expand(shape), [gradOutput])
+            return [tensorGrad, zero]
 
         case .parallelMap2DTestPass1(_, _), .parallelMap2DTestPass2(_, _):
             // Test ops, no gradient

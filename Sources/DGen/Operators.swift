@@ -333,6 +333,7 @@ public enum LazyOp {
     case memoryRead(CellID)
     case memoryWrite(CellID)
     case memoryAccumulate(CellID)  // Atomic add to memory cell
+    case tensorAccumulate(CellID)  // Atomic add tensor elements to memory region
     case historyWrite(CellID)
     case historyReadWrite(CellID)
     case param(CellID)
@@ -550,6 +551,30 @@ public enum LazyOp {
                     operator: "memoryAccumulate", expected: 2, actual: inputs.count)
             }
             b.use(val: b.memoryAccumulate(cellId, b.value(inputs[0]), b.value(inputs[1])))
+        case .tensorAccumulate(let cellId):
+            // Input is a tensor node - atomically add each element to cell
+            guard node.inputs.count == 1 else {
+                throw DGenError.insufficientInputs(
+                    operator: "tensorAccumulate", expected: 1, actual: node.inputs.count)
+            }
+
+            let tensorInput = node.inputs[0]
+            guard let inputNode = g.nodes[tensorInput],
+                  case .tensor(let shape) = inputNode.shape,
+                  let tensorId = g.nodeToTensor[tensorInput],
+                  let tensor = g.tensors[tensorId] else {
+                throw DGenError.tensorError(op: "tensorAccumulate", reason: "requires tensor input")
+            }
+
+            let size = shape.reduce(1, *)
+
+            // Emit loop that reads each element and accumulates
+            b.parallelRange(size) { idx in
+                let val = b.memoryRead(tensor.cellId, b.cast(idx, to: .int))
+                _ = b.memoryAccumulate(cellId, b.cast(idx, to: .int), val)
+            }
+
+            ctx.values[nodeId] = .empty
         case .atan2:
             guard inputs.count == 2 else {
                 throw DGenError.insufficientInputs(
@@ -1970,6 +1995,10 @@ public enum LazyOp {
             let zeroGrad = ctx.useConstant(src: nil, value: 0.0)
             b.grad(node.inputs[0], value: zeroGrad)
             b.grad(node.inputs[1], value: gradOutput)
+        case .tensorAccumulate(_):
+            // tensorAccumulate is a side-effect op for gradient accumulation
+            // No gradients to propagate through it (it's already at the end of gradient flow)
+            break
         case .gt, .gte, .lte, .lt, .eq:
             // Comparisons have zero gradient (non-differentiable)
             guard node.inputs.count == 2 else { fatalError("comparison requires 2 inputs") }

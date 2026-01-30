@@ -35,6 +35,7 @@ open class Graph {
     /// Mapping from history cell IDs to gradient carry cell IDs.
     /// Used for temporal gradient flow through historyRead/historyWrite.
     public var gradCarryCells: [CellID: CellID] = [:]
+    public var tensorGradCells: [NodeID: CellID] = [:]
 
     /// Side-effect nodes created during backward pass (e.g., gradient carry writes)
     /// These need to be chained with gradient outputs to ensure they execute.

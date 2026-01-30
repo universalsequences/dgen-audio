@@ -234,6 +234,10 @@ public func inferShape(op: LazyOp, inputs: [ValueShape], graph: Graph) throws ->
   case .seq:
     return inputs.last ?? .scalar
 
+  // tensorAccumulate is a side-effect op (output is empty)
+  case .tensorAccumulate(_):
+    return .scalar
+
   // Gradient-specific operations
   case .neg:
     // Negation preserves shape
