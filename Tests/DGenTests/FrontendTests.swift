@@ -45,7 +45,7 @@ final class FrontendTests: XCTestCase {
                 // Streamlined training context - handles everything!
                 let ctx = try TrainingContext(
                         parameters: [cutoffParam],
-                        optimizer: SGD(lr: 0.8),
+                        optimizer: SGD(lr: 0.01),
                         lossNode: loss.id,
                         compilationResult: result,
                         frameCount: frameCount
