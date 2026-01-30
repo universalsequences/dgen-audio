@@ -562,27 +562,6 @@ public func splitBlockByStaticIfPossible(
   func isStatic(_ node: NodeID) -> Bool {
     return hopBasedNodes[node] == nil && !frameBasedNodes.contains(node)
   }
-
-  // Check if a set of nodes contains any tensor-shaped operations worth parallelizing
-  func hasTensorShapedOps(_ nodes: [NodeID]) -> Bool {
-    for nodeId in nodes {
-      if let node = graph.nodes[nodeId], case .tensor = node.shape {
-        return true
-      }
-    }
-    return false
-  }
-
-  // Build a set of all nodes that are part of fusable chains
-  var chainNodeSet = Set<NodeID>()
-  var nodeToChain: [NodeID: FrameDependentTensorChain] = [:]
-  for chain in fusableChains {
-    chainNodeSet.formUnion(chain.chainNodes)
-    for nodeId in chain.chainNodes {
-      nodeToChain[nodeId] = chain
-    }
-  }
-
   func initBlock(temporality: Temporality?) -> Block {
     var b = Block(kind: block.kind)
     if let temporality = temporality {
@@ -594,34 +573,88 @@ public func splitBlockByStaticIfPossible(
     return b
   }
 
-  // First pass: identify static segments and check if they have tensor ops
-  // IMPORTANT: Nodes in fusable chains should stay together and be treated as frame-based
+  // For backward blocks, use simple splitting to preserve gradient reductions
+  // The complex merging logic breaks backward gradient flow
+  if block.direction == .backwards {
+    var blocks: [Block] = []
+    var currentBlock = initBlock(temporality: nil)
+    var currentTemporality: Temporality? = nil
+    for node in block.nodes {
+      if isStatic(node) {
+        if let temporality = currentTemporality, case .static_ = temporality {
+        } else if currentTemporality == nil {
+          currentBlock.temporality = .static_
+        } else {
+          if currentBlock.nodes.count > 0 { blocks.append(currentBlock) }
+          currentBlock = initBlock(temporality: .static_)
+        }
+        currentTemporality = .static_
+      } else {
+        if let temporality = currentTemporality, case .frameBased = temporality {
+        } else if currentTemporality == nil {
+          currentBlock.temporality = .frameBased
+        } else {
+          if currentBlock.nodes.count > 0 { blocks.append(currentBlock) }
+          currentBlock = initBlock(temporality: .frameBased)
+        }
+        currentTemporality = .frameBased
+      }
+      currentBlock.nodes.append(node)
+    }
+    if currentBlock.nodes.count > 0 { blocks.append(currentBlock) }
+    return blocks
+  }
+
+  // For forward blocks, use tensor-aware splitting:
+  // - Static tensor ops get their own blocks (can be SIMD parallelized)
+  // - Scalar-only blocks don't need splitting (no parallelization benefit)
+
+  func hasTensorShapedOps(_ nodes: [NodeID]) -> Bool {
+    for nodeId in nodes {
+      if let node = graph.nodes[nodeId], case .tensor = node.shape {
+        return true
+      }
+    }
+    return false
+  }
+
+  // If block has no tensor ops at all, don't bother splitting - no parallelization benefit
+  if !hasTensorShapedOps(block.nodes) && fusableChains.isEmpty {
+    return [block]
+  }
+
+  // Build chain node set for fusable chains
+  var nodeToChain: [NodeID: FrameDependentTensorChain] = [:]
+  for chain in fusableChains {
+    for nodeId in chain.chainNodes {
+      nodeToChain[nodeId] = chain
+    }
+  }
+
+  // First pass: identify segments
   var segments: [(nodes: [NodeID], isStatic: Bool, chain: FrameDependentTensorChain?)] = []
   var currentNodes: [NodeID] = []
   var currentIsStatic: Bool? = nil
   var currentChain: FrameDependentTensorChain? = nil
 
   for node in block.nodes {
-    // Check if this node is part of a fusable chain
     if let chain = nodeToChain[node] {
-      // Nodes in chains are treated as frame-based (they need to run per-frame)
+      // Chain nodes are frame-based
       let nodeIsStatic = false
-      let nodeChain = chain
-
-      // If we're switching chains or static status, flush current segment
-      if currentIsStatic != nil && (currentIsStatic != nodeIsStatic || currentChain?.transitionNodeId != nodeChain.transitionNodeId) {
+      if currentIsStatic != nil
+        && (currentIsStatic != nodeIsStatic
+          || currentChain?.transitionNodeId != chain.transitionNodeId)
+      {
         if !currentNodes.isEmpty {
           segments.append((nodes: currentNodes, isStatic: currentIsStatic!, chain: currentChain))
         }
         currentNodes = []
       }
       currentIsStatic = nodeIsStatic
-      currentChain = nodeChain
+      currentChain = chain
       currentNodes.append(node)
     } else {
-      // Regular node - not part of a chain
       let nodeIsStatic = isStatic(node)
-
       if currentIsStatic == nil {
         currentIsStatic = nodeIsStatic
         currentChain = nil
@@ -640,55 +673,38 @@ public func splitBlockByStaticIfPossible(
     segments.append((nodes: currentNodes, isStatic: isStatic, chain: currentChain))
   }
 
-  // Second pass: only split out static segments that have tensor-shaped ops
-  // Merge scalar-only static segments into adjacent frame-based segments
-  // Keep chain segments separate
+  // Second pass: just merge adjacent same-type segments
+  // NOTE: We previously tried merging scalar static ops into frame-based to reduce kernel
+  // overhead, but this breaks gradient flow. Only keep tensor static ops separate.
   var mergedSegments: [(nodes: [NodeID], isStatic: Bool, chain: FrameDependentTensorChain?)] = []
   for segment in segments {
-    // Chain segments are kept separate
     if segment.chain != nil {
       mergedSegments.append(segment)
       continue
     }
 
-    if segment.isStatic && !hasTensorShapedOps(segment.nodes) {
-      // Scalar static ops - merge into previous or mark as frame-based
-      if let lastIdx = mergedSegments.indices.last, !mergedSegments[lastIdx].isStatic && mergedSegments[lastIdx].chain == nil {
-        // Merge into previous frame-based segment (if not a chain)
-        mergedSegments[lastIdx].nodes.append(contentsOf: segment.nodes)
-      } else {
-        // Treat as frame-based (will merge with next frame-based segment)
-        mergedSegments.append((nodes: segment.nodes, isStatic: false, chain: nil))
-      }
+    // Merge adjacent same-type segments
+    if let lastIdx = mergedSegments.indices.last,
+      mergedSegments[lastIdx].isStatic == segment.isStatic && mergedSegments[lastIdx].chain == nil
+    {
+      mergedSegments[lastIdx].nodes.append(contentsOf: segment.nodes)
     } else {
-      // Tensor static ops or frame-based ops - keep as-is, but try to merge adjacent same-type
-      if let lastIdx = mergedSegments.indices.last,
-         mergedSegments[lastIdx].isStatic == segment.isStatic &&
-         mergedSegments[lastIdx].chain == nil {
-        mergedSegments[lastIdx].nodes.append(contentsOf: segment.nodes)
-      } else {
-        mergedSegments.append(segment)
-      }
+      mergedSegments.append(segment)
     }
   }
 
-  // Convert merged segments to blocks
+  // Convert to blocks
   var blocks: [Block] = []
   for segment in mergedSegments {
     var b = initBlock(temporality: segment.isStatic ? .static_ : .frameBased)
     b.nodes = segment.nodes
-    // Mark blocks that contain frame-tensor chains
     if let chain = segment.chain {
       b.frameTensorChain = chain
     }
     blocks.append(b)
   }
 
-  if blocks.isEmpty {
-    return [block]
-  }
-
-  return blocks
+  return blocks.isEmpty ? [block] : blocks
 }
 
 public func extractStaticOpsIntoBlocks(
@@ -755,14 +771,14 @@ public func detectFrameDependentTensorChains(
   // Element-wise ops that can be part of a fusable chain
   let elementWiseOps: Set<String> = [
     "mul", "add", "sub", "div", "sin", "cos", "tan", "tanh", "exp", "log", "sqrt",
-    "abs", "sign", "floor", "ceil", "round", "pow", "min", "max", "gswitch"
+    "abs", "sign", "floor", "ceil", "round", "pow", "min", "max", "gswitch",
   ]
 
   func isElementWise(_ op: LazyOp) -> Bool {
     switch op {
     case .mul, .add, .sub, .div, .sin, .cos, .tan, .tanh, .exp, .log, .sqrt,
-         .abs, .sign, .floor, .ceil, .round, .pow, .min, .max, .gswitch,
-         .deterministicPhasor:
+      .abs, .sign, .floor, .ceil, .round, .pow, .min, .max, .gswitch,
+      .deterministicPhasor:
       return true
     default:
       return false
@@ -833,12 +849,13 @@ public func detectFrameDependentTensorChains(
 
     // Valid chain found - must end in reduction
     if let reduction = reductionNode, let shape = tensorShape {
-      chains.append(FrameDependentTensorChain(
-        transitionNodeId: nodeId,
-        reductionNodeId: reduction,
-        chainNodes: chainNodes,
-        tensorShape: shape
-      ))
+      chains.append(
+        FrameDependentTensorChain(
+          transitionNodeId: nodeId,
+          reductionNodeId: reduction,
+          chainNodes: chainNodes,
+          tensorShape: shape
+        ))
     }
   }
 
