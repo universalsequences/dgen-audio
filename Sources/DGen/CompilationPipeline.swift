@@ -354,6 +354,29 @@ public struct CompilationPipeline {
                     continue
                 }
 
+                // Only split when the reduction node is actually in this block.
+                guard block.nodes.contains(chain.reductionNodeId) else {
+                    var cleared = block
+                    cleared.frameTensorChain = nil
+                    result.append(cleared)
+                    continue
+                }
+
+                // Map block: all chain nodes except the reduction
+                var mapBlock = block
+                mapBlock.nodes = block.nodes.filter { $0 != chain.reductionNodeId }
+                mapBlock.frameTensorChain = chain
+                mapBlock.tensorIndex = nil
+                mapBlock.shape = nil
+
+                // If the reduction is the only node in the block, skip frame-tensor optimization.
+                if mapBlock.nodes.isEmpty {
+                    var cleared = block
+                    cleared.frameTensorChain = nil
+                    result.append(cleared)
+                    continue
+                }
+
                 let tensorSize = chain.tensorShape.reduce(1, *)
                 if tensorSize <= 0 {
                     result.append(block)
@@ -366,13 +389,6 @@ public struct CompilationPipeline {
                     context.frameTensorChainScratch[chain.reductionNodeId] =
                         IRContext.FrameTensorChainScratch(cellId: scratchCell, tensorSize: tensorSize)
                 }
-
-                // Map block: all chain nodes except the reduction
-                var mapBlock = block
-                mapBlock.nodes = block.nodes.filter { $0 != chain.reductionNodeId }
-                mapBlock.frameTensorChain = chain
-                mapBlock.tensorIndex = nil
-                mapBlock.shape = nil
 
                 // Reduce block: just the reduction node
                 var reduceBlock = Block(kind: .simd)

@@ -573,7 +573,8 @@ public func splitBlockByStaticIfPossible(
     return [block]
   }
 
-  let nodeToChain = buildNodeToChainMap(fusableChains)
+  let usableChains = filterFusableChainsForBlock(fusableChains, block: block)
+  let nodeToChain = buildNodeToChainMap(usableChains)
   let segments = identifyTemporalitySegments(
     block: block,
     frameBasedNodes: frameBasedNodes,
@@ -584,6 +585,51 @@ public func splitBlockByStaticIfPossible(
   let resultBlocks = convertSegmentsToBlocks(mergedSegments, from: block)
 
   return resultBlocks.isEmpty ? [block] : resultBlocks
+}
+
+private func filterFusableChainsForBlock(
+  _ chains: [FrameDependentTensorChain],
+  block: Block
+) -> [FrameDependentTensorChain] {
+  if chains.isEmpty || block.nodes.isEmpty { return chains }
+
+  let blockNodes = block.nodes
+  let blockNodeSet = Set(blockNodes)
+  var conflicts: Set<NodeID> = []
+
+  // Detect overlapping chains (shared nodes) within this block.
+  var nodeToChains: [NodeID: [FrameDependentTensorChain]] = [:]
+  for chain in chains {
+    for nodeId in chain.chainNodes where blockNodeSet.contains(nodeId) {
+      nodeToChains[nodeId, default: []].append(chain)
+    }
+  }
+  for (_, owners) in nodeToChains where owners.count > 1 {
+    for chain in owners {
+      conflicts.insert(chain.reductionNodeId)
+    }
+  }
+
+  // Detect non-contiguous chains within this block.
+  for chain in chains where !conflicts.contains(chain.reductionNodeId) {
+    var firstIdx: Int? = nil
+    var lastIdx: Int? = nil
+    for (idx, nodeId) in blockNodes.enumerated() where chain.chainNodes.contains(nodeId) {
+      if firstIdx == nil { firstIdx = idx }
+      lastIdx = idx
+    }
+    guard let start = firstIdx, let end = lastIdx else { continue }
+    if start == end { continue }
+    for i in start...end {
+      if !chain.chainNodes.contains(blockNodes[i]) {
+        conflicts.insert(chain.reductionNodeId)
+        break
+      }
+    }
+  }
+
+  if conflicts.isEmpty { return chains }
+  return chains.filter { !conflicts.contains($0.reductionNodeId) }
 }
 
 private func buildNodeToChainMap(

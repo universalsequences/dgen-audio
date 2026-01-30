@@ -1186,6 +1186,13 @@ public func emitFrameTensorChainBlock(
         ctx.tensorIndices[nodeId] = binIdx.lazy
     }
 
+    // Keep chain tensors thread-local (avoid global memory writes)
+    let savedOutbound = ctx.outboundTensorCells
+    ctx.outboundTensorCells = []
+    ctx.clearTensorRegisters()
+
+    let reductionInputId = g.nodes[chain.reductionNodeId]?.inputs.first
+
     // Emit chain nodes (map step)
     for nodeId in block.nodes {
         if let node = g.nodes[nodeId] {
@@ -1239,10 +1246,8 @@ public func emitFrameTensorChainBlock(
                 let sample2 = b.memoryRead(inTensor.cellId, b.cast(ceilPos, to: .int))
                 let interpolated = b.mix(sample1, sample2, frac)
 
-                // Write only this bin to output tensor
-                _ = b.memoryWrite(outTensor.cellId, b.cast(b.value(binIdx.lazy), to: .int), interpolated)
-
-                // Register output value for downstream ops (best-effort)
+                // Register output tensor element in a register (avoid shared memory writes)
+                _ = b.tstore(outTensor.cellId, b.value(binIdx.lazy), interpolated)
                 ctx.values[nodeId] = interpolated.lazy
                 uops.append(contentsOf: b.ops)
             } else if case .deterministicPhasor = node.op {
@@ -1269,24 +1274,27 @@ public func emitFrameTensorChainBlock(
                     uops.append(uop)
                 }
             }
+
+            // If this node feeds the reduction, write its value to scratch immediately
+            if let reductionInputId, nodeId == reductionInputId,
+                let scratch = ctx.frameTensorChainScratch[chain.reductionNodeId],
+                let tensorId = g.nodeToTensor[reductionInputId],
+                let tensor = g.tensors[tensorId]
+            {
+                let writer = IRBuilder(ctx: ctx, nodeId: chain.reductionNodeId)
+                let frameIdxExpr = writer.value(frameIdx.lazy)
+                let binIdxExpr = writer.value(binIdx.lazy)
+                let offset =
+                    frameIdxExpr * writer.constant(Float(scratch.tensorSize)) + binIdxExpr
+                let val = writer.tload(tensor.cellId, binIdxExpr)
+                _ = writer.memoryWrite(scratch.cellId, writer.cast(offset, to: .int), val)
+                uops.append(contentsOf: writer.ops)
+            }
         }
     }
 
-    // Write the final tensor element into scratch at [frameIdx, binIdx]
-    if let reductionNode = g.nodes[chain.reductionNodeId],
-        let tensorInputId = reductionNode.inputs.first,
-        let inTensorId = g.nodeToTensor[tensorInputId],
-        let inTensor = g.tensors[inTensorId]
-    {
-        let writer = IRBuilder(ctx: ctx, nodeId: chain.reductionNodeId)
-        let frameIdxExpr = writer.value(frameIdx.lazy)
-        let binIdxExpr = writer.value(binIdx.lazy)
-        let val = writer.tensorRead(inTensor, flatIdx: binIdxExpr, shape: chain.tensorShape)
-        let offset = frameIdxExpr * writer.constant(Float(tensorSize)) + binIdxExpr
-        _ = writer.memoryWrite(
-            scratch.cellId, writer.cast(offset, to: .int), val)
-        uops.append(contentsOf: writer.ops)
-    }
+    // Restore outbound tensor tracking
+    ctx.outboundTensorCells = savedOutbound
 
     return uops
 }
@@ -1334,6 +1342,7 @@ public func emitBlockUOps(
     }
 
     // Emit marker for frame-tensor chain blocks (SIMD-across-frames optimization)
+    // Used for debugging kernels
     if let chain = block.frameTensorChain {
         bodyUops.insert(UOp(op: .frameTensorChainMarker(chain.tensorShape), value: .empty), at: 0)
     }

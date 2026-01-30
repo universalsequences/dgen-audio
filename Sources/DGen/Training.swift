@@ -963,6 +963,55 @@ public class TrainingContext {
         return runtime.getLastOutput() ?? 0.0
     }
 
+    /// Run forward-only on GPU (no gradients, no parameter updates).
+    /// NOTE: Only use with graphs compiled with backwards: false.
+    public func runForwardGPU(
+        configureMemory: ((UnsafeMutablePointer<Float>) -> Void)? = nil
+    ) -> Float {
+        guard let runtime = runtime else {
+            fatalError("Runtime not initialized")
+        }
+
+        // Restore tensor constants and parameters into device memory
+        if let memBuffer = runtime.getBuffer(name: "memory") {
+            let gpuMemPtr = memBuffer.contents().assumingMemoryBound(to: Float.self)
+
+            if let g = graph {
+                let paramTensorIds = Set(tensorParameters.map { $0.tensorId })
+                for (_, tensor) in g.tensors {
+                    guard let data = tensor.data else { continue }
+                    if paramTensorIds.contains(tensor.id) { continue }
+                    let physicalCell =
+                        cellAllocations?.cellMappings[tensor.cellId] ?? tensor.cellId
+                    let count = min(data.count, tensor.size)
+                    for i in 0..<count {
+                        gpuMemPtr[physicalCell + i] = data[i]
+                    }
+                }
+            }
+
+            if !tensorParameters.isEmpty {
+                for tensorParam in tensorParameters {
+                    let physicalCell =
+                        cellAllocations?.cellMappings[tensorParam.cellId] ?? tensorParam.cellId
+                    for i in 0..<tensorParam.size {
+                        gpuMemPtr[physicalCell + i] = tensorParam.data[i]
+                    }
+                }
+            }
+        }
+
+        if let configureMemory = configureMemory, let memBuffer = runtime.getBuffer(name: "memory")
+        {
+            let memPtr = memBuffer.contents().assumingMemoryBound(to: Float.self)
+            configureMemory(memPtr)
+        }
+
+        runtime.runNoCopy(frameCount: frameCount)
+
+        return runtime.getLastOutput() ?? 0.0
+    }
+
     deinit {
         if let mem = memory, let rt = runtime {
             rt.deallocateNodeMemory(mem)

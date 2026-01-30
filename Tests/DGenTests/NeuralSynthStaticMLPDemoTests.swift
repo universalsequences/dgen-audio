@@ -130,7 +130,7 @@ final class NeuralSynthStaticMLPDemoTests: XCTestCase {
 
         let compileResult = try CompilationPipeline.compile(
             graph: g, backend: .metal,
-            options: .init(frameCount: frameCount, backwards: true))
+            options: .init(frameCount: frameCount, backwards: false))
 
         writeKernelsToDisk(compileResult, "/tmp/harmonic_teacher_student.metal")
 
@@ -151,12 +151,12 @@ final class NeuralSynthStaticMLPDemoTests: XCTestCase {
             frameCount: frameCount,
             graph: g)
 
-        let initialLoss = ctx.runStepGPU()
+        let initialLoss = ctx.runForwardGPU()
 
         let epochs = 40
         var finalLoss = initialLoss
         for i in 0..<epochs {
-            finalLoss = ctx.runStepGPU()
+            finalLoss = ctx.runForwardGPU()
             print("epoch i=\(i) loss=\(finalLoss*10000)")
         }
 
