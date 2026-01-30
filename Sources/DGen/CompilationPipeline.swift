@@ -205,7 +205,10 @@ public struct CompilationPipeline {
                     backwardsBlock.direction = .backwards
                     backwardsBlocks.append(backwardsBlock)
                 }
-                finalBlocks += fuseBlocks(backwardsBlocks, graph)
+                let fusedBackwards = fuseBlocks(backwardsBlocks, graph)
+                // Split any backward blocks that have both Pass1 and Pass2 to avoid race conditions
+                let splitBackwards = splitSpectralBackwardBlocks(fusedBackwards, graph)
+                finalBlocks += splitBackwards
             }
         }
 
@@ -296,6 +299,22 @@ public struct CompilationPipeline {
             return .serial
         }
 
+        // Helper to detect if block contains spectral backward passes
+        func containsSpectralBackwardPass(_ block: Block, _ g: Graph) -> Bool {
+            guard block.direction == .backwards else { return false }
+            for nodeId in block.nodes {
+                if let node = g.nodes[nodeId] {
+                    switch node.op {
+                    case .spectralLossPass1, .spectralLossPass2:
+                        return true
+                    default:
+                        break
+                    }
+                }
+            }
+            return false
+        }
+
         try time("emitBlockUOps") {
             for blockIdx in finalBlockIndices {
                 let block = finalBlocks[blockIdx]
@@ -308,10 +327,12 @@ public struct CompilationPipeline {
                 )
                 let parallelPolicy = inferParallelPolicy(
                     kind: block.kind, temporality: block.temporality, ops: ops)
+                // Force new kernel for spectral backward passes to prevent fusion
+                let forceNew = containsSpectralBackwardPass(block, graph)
                 uopBlocks.append(
                     BlockUOps(
                         ops: ops, kind: block.kind, temporality: block.temporality,
-                        parallelPolicy: parallelPolicy))
+                        parallelPolicy: parallelPolicy, forceNewKernel: forceNew))
             }
         }
 

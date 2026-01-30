@@ -7,15 +7,18 @@ public struct BlockUOps {
     public let kind: Kind
     public let temporality: Temporality
     public var parallelPolicy: ParallelPolicy
+    public var forceNewKernel: Bool  // When true, this block starts a new kernel (no fusion)
 
     public init(
         ops: [UOp], kind: Kind, temporality: Temporality = .static_,
-        parallelPolicy: ParallelPolicy = .serial
+        parallelPolicy: ParallelPolicy = .serial,
+        forceNewKernel: Bool = false
     ) {
         self.ops = ops
         self.kind = kind
         self.temporality = temporality
         self.parallelPolicy = parallelPolicy
+        self.forceNewKernel = forceNewKernel
     }
 }
 

@@ -369,9 +369,10 @@ public class MetalRenderer: Renderer, UOpEmitter {
     for block in uopBlocks {
       let blockPolicy = block.parallelPolicy
       // Check if we need to start a new kernel (different block kind or temporality)
+      // Also force new kernel for spectral backward passes to prevent race conditions
       let needsNewKernel =
         currentKind != block.kind || currentTemporality != block.temporality
-        || currentPolicy != blockPolicy
+        || currentPolicy != blockPolicy || block.forceNewKernel
       if needsNewKernel {
         // Close previous kernel if open
         if let schedule = currentSchedule {
