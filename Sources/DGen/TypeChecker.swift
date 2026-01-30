@@ -210,7 +210,7 @@ public func inferShape(op: LazyOp, inputs: [ValueShape], graph: Graph) throws ->
     .tan, .log, .log10, .abs, .sign, .floor, .ceil, .round,
     .pow, .mod, .min, .max, .atan2, .gt, .gte, .lt, .lte, .eq,
     .and, .or, .xor, .gswitch, .mix,
-    .phasor(_), .accum(_), .latch(_):
+    .phasor(_), .accum(_), .latch(_), .deterministicPhasor:
     let tensors = inputs.filter { x in
       if case .tensor(_) = x { return true }
       return false
@@ -555,11 +555,34 @@ public func assignBlockTemporality(
 public func splitBlockByStaticIfPossible(
   block: Block,
   frameBasedNodes: Set<NodeID>,
-  hopBasedNodes: [NodeID: (Int, CellID)]
+  hopBasedNodes: [NodeID: (Int, CellID)],
+  graph: Graph,
+  fusableChains: [FrameDependentTensorChain] = []
 ) -> [Block] {
   func isStatic(_ node: NodeID) -> Bool {
     return hopBasedNodes[node] == nil && !frameBasedNodes.contains(node)
   }
+
+  // Check if a set of nodes contains any tensor-shaped operations worth parallelizing
+  func hasTensorShapedOps(_ nodes: [NodeID]) -> Bool {
+    for nodeId in nodes {
+      if let node = graph.nodes[nodeId], case .tensor = node.shape {
+        return true
+      }
+    }
+    return false
+  }
+
+  // Build a set of all nodes that are part of fusable chains
+  var chainNodeSet = Set<NodeID>()
+  var nodeToChain: [NodeID: FrameDependentTensorChain] = [:]
+  for chain in fusableChains {
+    chainNodeSet.formUnion(chain.chainNodes)
+    for nodeId in chain.chainNodes {
+      nodeToChain[nodeId] = chain
+    }
+  }
+
   func initBlock(temporality: Temporality?) -> Block {
     var b = Block(kind: block.kind)
     if let temporality = temporality {
@@ -571,71 +594,253 @@ public func splitBlockByStaticIfPossible(
     return b
   }
 
-  var blocks: [Block] = []
-  var currentBlock = initBlock(temporality: nil)
-  var currentTemporality: Temporality? = nil
+  // First pass: identify static segments and check if they have tensor ops
+  // IMPORTANT: Nodes in fusable chains should stay together and be treated as frame-based
+  var segments: [(nodes: [NodeID], isStatic: Bool, chain: FrameDependentTensorChain?)] = []
+  var currentNodes: [NodeID] = []
+  var currentIsStatic: Bool? = nil
+  var currentChain: FrameDependentTensorChain? = nil
+
   for node in block.nodes {
-    if isStatic(node) {
-      if let temporality = currentTemporality,
-        case .static_ = temporality
-      {
-      } else if currentTemporality == nil {
-        // initial case
-        currentBlock.temporality = .static_
-      } else {
-        // temporality changed
-        if currentBlock.nodes.count > 0 {
-          blocks.append(currentBlock)
+    // Check if this node is part of a fusable chain
+    if let chain = nodeToChain[node] {
+      // Nodes in chains are treated as frame-based (they need to run per-frame)
+      let nodeIsStatic = false
+      let nodeChain = chain
+
+      // If we're switching chains or static status, flush current segment
+      if currentIsStatic != nil && (currentIsStatic != nodeIsStatic || currentChain?.transitionNodeId != nodeChain.transitionNodeId) {
+        if !currentNodes.isEmpty {
+          segments.append((nodes: currentNodes, isStatic: currentIsStatic!, chain: currentChain))
         }
-        currentBlock = initBlock(temporality: .static_)
+        currentNodes = []
       }
-      currentTemporality = .static_
+      currentIsStatic = nodeIsStatic
+      currentChain = nodeChain
+      currentNodes.append(node)
     } else {
-      if let temporality = currentTemporality,
-        case .frameBased = temporality
-      {
-      } else if currentTemporality == nil {
-        // initial case
-        currentBlock.temporality = .frameBased
-      } else {
-        if currentBlock.nodes.count > 0 {
-          blocks.append(currentBlock)
+      // Regular node - not part of a chain
+      let nodeIsStatic = isStatic(node)
+
+      if currentIsStatic == nil {
+        currentIsStatic = nodeIsStatic
+        currentChain = nil
+      } else if currentIsStatic != nodeIsStatic || currentChain != nil {
+        if !currentNodes.isEmpty {
+          segments.append((nodes: currentNodes, isStatic: currentIsStatic!, chain: currentChain))
         }
-        currentBlock = initBlock(temporality: .frameBased)
+        currentNodes = []
+        currentIsStatic = nodeIsStatic
+        currentChain = nil
       }
-      currentTemporality = .frameBased
-    }
-    currentBlock.nodes.append(node)
-  }
-
-  if currentBlock.nodes.count > 0 {
-    blocks.append(currentBlock)
-  }
-
-  print("EXTRACTED BLOCK into \(blocks.count)")
-  if blocks.count > 1 {
-    for (i, block) in blocks.enumerated() {
-      print("block \(i)")
-      print(block)
+      currentNodes.append(node)
     }
   }
+  if !currentNodes.isEmpty, let isStatic = currentIsStatic {
+    segments.append((nodes: currentNodes, isStatic: isStatic, chain: currentChain))
+  }
+
+  // Second pass: only split out static segments that have tensor-shaped ops
+  // Merge scalar-only static segments into adjacent frame-based segments
+  // Keep chain segments separate
+  var mergedSegments: [(nodes: [NodeID], isStatic: Bool, chain: FrameDependentTensorChain?)] = []
+  for segment in segments {
+    // Chain segments are kept separate
+    if segment.chain != nil {
+      mergedSegments.append(segment)
+      continue
+    }
+
+    if segment.isStatic && !hasTensorShapedOps(segment.nodes) {
+      // Scalar static ops - merge into previous or mark as frame-based
+      if let lastIdx = mergedSegments.indices.last, !mergedSegments[lastIdx].isStatic && mergedSegments[lastIdx].chain == nil {
+        // Merge into previous frame-based segment (if not a chain)
+        mergedSegments[lastIdx].nodes.append(contentsOf: segment.nodes)
+      } else {
+        // Treat as frame-based (will merge with next frame-based segment)
+        mergedSegments.append((nodes: segment.nodes, isStatic: false, chain: nil))
+      }
+    } else {
+      // Tensor static ops or frame-based ops - keep as-is, but try to merge adjacent same-type
+      if let lastIdx = mergedSegments.indices.last,
+         mergedSegments[lastIdx].isStatic == segment.isStatic &&
+         mergedSegments[lastIdx].chain == nil {
+        mergedSegments[lastIdx].nodes.append(contentsOf: segment.nodes)
+      } else {
+        mergedSegments.append(segment)
+      }
+    }
+  }
+
+  // Convert merged segments to blocks
+  var blocks: [Block] = []
+  for segment in mergedSegments {
+    var b = initBlock(temporality: segment.isStatic ? .static_ : .frameBased)
+    b.nodes = segment.nodes
+    // Mark blocks that contain frame-tensor chains
+    if let chain = segment.chain {
+      b.frameTensorChain = chain
+    }
+    blocks.append(b)
+  }
+
+  if blocks.isEmpty {
+    return [block]
+  }
+
   return blocks
 }
 
 public func extractStaticOpsIntoBlocks(
   blocks: [Block],
   frameBasedNodes: Set<NodeID>,
-  hopBasedNodes: [NodeID: (Int, CellID)]
+  hopBasedNodes: [NodeID: (Int, CellID)],
+  graph: Graph,
+  fusableChains: [FrameDependentTensorChain] = []
 ) -> [Block] {
   var extractedBlocks: [Block] = []
 
   for block in blocks {
     for b in splitBlockByStaticIfPossible(
-      block: block, frameBasedNodes: frameBasedNodes, hopBasedNodes: hopBasedNodes)
+      block: block, frameBasedNodes: frameBasedNodes, hopBasedNodes: hopBasedNodes, graph: graph,
+      fusableChains: fusableChains)
     {
       extractedBlocks.append(b)
     }
-    // find groups of ops that contain static
   }
   return extractedBlocks
+}
+
+// MARK: - Frame-Dependent Tensor Chain Detection
+
+/// Represents a fusable chain from a transition point (where static tensor becomes frame-dependent)
+/// to a terminal scalar reduction. The entire chain can be SIMD-parallelized across frames.
+public struct FrameDependentTensorChain {
+  /// Node where static tensor becomes frame-dependent (e.g., peekRow)
+  public let transitionNodeId: NodeID
+  /// Terminal scalar reduction node (e.g., sum)
+  public let reductionNodeId: NodeID
+  /// All nodes in the chain (including transition and reduction)
+  public let chainNodes: Set<NodeID>
+  /// Shape of the tensor being processed
+  public let tensorShape: [Int]
+}
+
+/// Detect frame-dependent tensor chains that can be fused for SIMD-across-frames execution.
+///
+/// A valid chain:
+/// 1. Starts at a "transition point" - a node with tensor output, frame-based input, and static tensor input
+///    (e.g., peekRow reading from static tensor with frame-dependent row index)
+/// 2. Continues through element-wise tensor operations (mul, add, sin, cos, etc.)
+/// 3. Ends at a scalar reduction (sum)
+/// 4. Has no cross-element dependencies within the chain
+///
+/// When such a chain is detected, each frame can independently compute the entire tensor chain
+/// in thread-local storage, then output the final scalar to a frame-indexed scratch buffer.
+public func detectFrameDependentTensorChains(
+  graph: Graph,
+  sortedNodes: [NodeID],
+  frameBasedNodes: Set<NodeID>
+) -> [FrameDependentTensorChain] {
+  var chains: [FrameDependentTensorChain] = []
+
+  // Build consumer map for forward traversal
+  var consumers: [NodeID: [NodeID]] = [:]
+  for (nodeId, node) in graph.nodes {
+    for inputId in node.inputs {
+      consumers[inputId, default: []].append(nodeId)
+    }
+  }
+
+  // Element-wise ops that can be part of a fusable chain
+  let elementWiseOps: Set<String> = [
+    "mul", "add", "sub", "div", "sin", "cos", "tan", "tanh", "exp", "log", "sqrt",
+    "abs", "sign", "floor", "ceil", "round", "pow", "min", "max", "gswitch"
+  ]
+
+  func isElementWise(_ op: LazyOp) -> Bool {
+    switch op {
+    case .mul, .add, .sub, .div, .sin, .cos, .tan, .tanh, .exp, .log, .sqrt,
+         .abs, .sign, .floor, .ceil, .round, .pow, .min, .max, .gswitch,
+         .deterministicPhasor:
+      return true
+    default:
+      return false
+    }
+  }
+
+  func isTransitionPoint(_ node: Node) -> Bool {
+    // A transition point has:
+    // 1. Tensor output (checked via shape)
+    // 2. At least one frame-based input (checked via frameBasedNodes)
+    // 3. At least one static tensor input (not frame-based, has tensor shape)
+    guard case .tensor = node.shape else { return false }
+
+    let hasFrameBasedInput = node.inputs.contains { frameBasedNodes.contains($0) }
+    let hasStaticTensorInput = node.inputs.contains { inputId in
+      guard let inputNode = graph.nodes[inputId] else { return false }
+      if frameBasedNodes.contains(inputId) { return false }
+      if case .tensor = inputNode.shape { return true }
+      return false
+    }
+
+    // peekRow is the canonical transition point
+    if case .peekRow = node.op {
+      return hasFrameBasedInput && hasStaticTensorInput
+    }
+
+    return false
+  }
+
+  // Find transition points
+  for nodeId in sortedNodes {
+    guard let node = graph.nodes[nodeId] else { continue }
+    guard isTransitionPoint(node) else { continue }
+
+    // Trace forward through element-wise ops to find terminal reduction
+    var chainNodes: Set<NodeID> = [nodeId]
+    var frontier: [NodeID] = [nodeId]
+    var reductionNode: NodeID? = nil
+    var tensorShape: [Int]? = nil
+
+    if case .tensor(let shape) = node.shape {
+      tensorShape = shape
+    }
+
+    while !frontier.isEmpty && reductionNode == nil {
+      let current = frontier.removeFirst()
+
+      for consumerId in consumers[current] ?? [] {
+        guard let consumer = graph.nodes[consumerId] else { continue }
+
+        // Check if this is the terminal reduction
+        if case .sum = consumer.op {
+          chainNodes.insert(consumerId)
+          reductionNode = consumerId
+          break
+        }
+
+        // Check if this is an element-wise op that can be part of the chain
+        if isElementWise(consumer.op) {
+          // Verify it has tensor shape matching our chain
+          if case .tensor(let shape) = consumer.shape, shape == tensorShape {
+            chainNodes.insert(consumerId)
+            frontier.append(consumerId)
+          }
+        }
+      }
+    }
+
+    // Valid chain found - must end in reduction
+    if let reduction = reductionNode, let shape = tensorShape {
+      chains.append(FrameDependentTensorChain(
+        transitionNodeId: nodeId,
+        reductionNodeId: reduction,
+        chainNodes: chainNodes,
+        tensorShape: shape
+      ))
+    }
+  }
+
+  return chains
 }

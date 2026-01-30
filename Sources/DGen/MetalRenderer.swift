@@ -941,6 +941,34 @@ public class MetalRenderer: Renderer, UOpEmitter {
       }
       return emitAssign(uop, "_pr\(varId)", ctx)
 
+    // Local tensor operations for SIMD-across-frames
+    case .declareLocalTensor(let varId, let size):
+      return "float localT\(varId)[\(size)];"
+
+    case .localTensorRead(let varId, let idx):
+      return emitAssign(uop, "localT\(varId)[(int)\(g(idx))]", ctx)
+
+    case .localTensorWrite(let varId, let idx, let val):
+      return "localT\(varId)[(int)\(g(idx))] = \(g(val));"
+
+    case .beginInlineLoop(let count, _):
+      guard case .variable(let varId, _) = uop.value else {
+        fatalError("beginInlineLoop requires variable")
+      }
+      let countStr: String
+      if case .constant(_, let val) = count {
+        countStr = "\(Int(val))"
+      } else {
+        countStr = "(int)\(g(count))"
+      }
+      return "for (int t\(varId) = 0; t\(varId) < \(countStr); t\(varId)++) {"
+
+    case .endInlineLoop:
+      return "}"
+
+    case .frameTensorChainMarker(let shape):
+      return "/* ====== SIMD-ACROSS-FRAMES: Frame-Tensor Chain Block (shape: \(shape)) ====== */"
+
     default:
       return "/* \(uop.prettyDescription()) */"
     }

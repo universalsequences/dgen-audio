@@ -25,9 +25,17 @@ public class IRContext {
     // Frame-based nodes from temporality analysis (set during compilation)
     public var frameBasedNodes: Set<NodeID> = []
 
+    // Nodes that are part of frame-dependent tensor chains (for SIMD-across-frames optimization)
+    public var frameTensorChainNodes: Set<NodeID> = []
+
     /// Clear tensor register tracking (call at start of each tensor block)
     public func clearTensorRegisters() {
         tensorCellToVar = [:]
+    }
+
+    /// Check if a node is part of a frame-dependent tensor chain
+    public func isPartOfFrameTensorChain(_ nodeId: NodeID) -> Bool {
+        return frameTensorChainNodes.contains(nodeId)
     }
 
     public init(g: Graph) {

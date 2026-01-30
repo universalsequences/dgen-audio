@@ -99,6 +99,17 @@ public enum Op {
   // Hop-based execution control (for FFT/spectral processing)
   case beginHopCheck(CellID)  // if (memory[counterCell] == 0.0f) { - runs block only when counter is 0
   case endHopCheck            // } - closes the hop check conditional
+
+  // Local tensor operations for SIMD-across-frames optimization
+  // These enable thread-local tensor storage for frame-dependent tensor chains
+  case declareLocalTensor(VarID, Int)        // float localT<id>[size] - thread-local array
+  case localTensorRead(VarID, Lazy)          // localT<id>[idx] - read from local tensor
+  case localTensorWrite(VarID, Lazy, Lazy)   // localT<id>[idx] = val - write to local tensor
+  case beginInlineLoop(Lazy, Int)            // for (int j = 0; j < count; j++) - non-parallel loop
+  case endInlineLoop                         // } - closes inline loop
+
+  // Marker for SIMD-across-frames optimization (frame-tensor chain detected)
+  case frameTensorChainMarker([Int])         // Marks block as frame-tensor chain with tensor shape
 }
 
 public struct UOp {

@@ -1010,6 +1010,29 @@ public class CRenderer: Renderer {
         case .endHopCheck:
             return "}"
 
+        // Local tensor operations for SIMD-across-frames
+        case .declareLocalTensor(let varId, let size):
+            return "float localT\(varId)[\(size)];"
+
+        case .localTensorRead(let varId, let idx):
+            return emitAssign(uop, "localT\(varId)[(int)\(g(idx))]", ctx)
+
+        case .localTensorWrite(let varId, let idx, let val):
+            return "localT\(varId)[(int)\(g(idx))] = \(g(val));"
+
+        case .beginInlineLoop(let count, let incr):
+            guard case .variable(let varId, _) = uop.value else {
+                fatalError("beginInlineLoop requires variable")
+            }
+            varEmittedTypes[varId] = .int_
+            return "for (int t\(varId) = 0; t\(varId) < (int)\(g(count)); t\(varId) += \(incr)) {"
+
+        case .endInlineLoop:
+            return "}"
+
+        case .frameTensorChainMarker(let shape):
+            return "/* ====== SIMD-ACROSS-FRAMES: Frame-Tensor Chain Block (shape: \(shape)) ====== */"
+
         default:
             return "/* \(uop.prettyDescription()) */"
         }

@@ -548,7 +548,7 @@ public enum LazyOp {
             let (a, b2) = b.values(inputs, count: 2)
             b.use(val: u_mse(a, b2)(b))
 
-        case .spectralLossPass1(let windowSize, let scratchCell):
+        case .spectralLossPass1(let windowSize, _):
             guard inputs.count == 2 else {
                 throw DGenError.insufficientInputs(
                     operator: "spectralLossPass1", expected: 2, actual: inputs.count)
@@ -830,16 +830,16 @@ public enum LazyOp {
                 throw DGenError.insufficientInputs(
                     operator: "deterministicPhasor", expected: 1, actual: inputs.count)
             }
-            let freq = b.value(inputs[0])
-            let sampleRate = b.constant(g.sampleRate)
-            // Use threadIndex (maps to 'id' in Metal) for parallel execution
-            let frameIdx = b.threadIndex()
-
-            // Compute phase directly: (freq / sampleRate * frameIndex) mod 1.0
-            let phaseIncrement = freq / sampleRate
-            let rawPhase = phaseIncrement * frameIdx
-            let phase = rawPhase - b.floor(rawPhase)  // fmod equivalent for positive values
-            b.use(val: phase)
+            // Use emitUnaryOp to handle both scalar and tensor cases
+            try emitUnaryOp(b: b, g: g, node: node, inputs: inputs) { freq in
+                let sampleRate = b.constant(g.sampleRate)
+                // Use threadIndex (maps to 'id' in Metal) for parallel execution across frames
+                let frameIdx = b.threadIndex()
+                // Compute phase directly: (freq / sampleRate * frameIndex) mod 1.0
+                let phaseIncrement = freq / sampleRate
+                let rawPhase = phaseIncrement * frameIdx
+                return rawPhase - b.floor(rawPhase)  // fmod equivalent for positive values
+            }
         case .output(let outputNumber):
             guard inputs.count == 1 else {
                 throw DGenError.insufficientInputs(
@@ -1117,8 +1117,11 @@ public enum LazyOp {
             // Output: 1D tensor [numCols]
             // Memory layout: column-major (offset = col * numRows + row)
 
-            // Mark as scalar to avoid SIMD variable naming collisions in C renderer
-            b.markRequiresScalar()
+            // Mark as scalar ONLY if NOT part of a frame-tensor chain.
+            // When part of a chain, we'll use SIMD-across-frames with thread-local tensors.
+            if !ctx.isPartOfFrameTensorChain(nodeId) {
+                b.markRequiresScalar()
+            }
 
             guard node.inputs.count == 2 else {
                 throw DGenError.insufficientInputs(
@@ -1937,10 +1940,12 @@ public enum LazyOp {
             b.grad(node.inputs[0], value: gradFreq.lazy)
         case .deterministicPhasor:
             // Backward for deterministic phasor: d(phase)/d(freq) = frameIndex / sampleRate
-            let sampleRate = b.constant(g.sampleRate)
-            let frameIdx = b.threadIndex()
-            let gradFreq = b.value(gradOutput) * frameIdx / sampleRate
-            b.grad(node.inputs[0], value: gradFreq.lazy)
+            try emitUnaryOpBackward(b: b, g: g, ctx: ctx, node: node, gradOutput: gradOutput) {
+                gradOut, _ in
+                let sampleRate = b.constant(g.sampleRate)
+                let frameIdx = b.threadIndex()
+                return gradOut * frameIdx / sampleRate
+            }
         case .output(_):
             // Output just passes gradient through to its input
             guard inputs.count == 1 else { fatalError("output requires 1 input") }
@@ -2510,8 +2515,6 @@ public enum LazyOp {
 
 // Two-pass spectral loss backward functions
 
-/// Pass A: Accumulate per-window gradient contributions to memory.
-/// Each thread i (window end) computes DFT for its window and stores per-sample contributions.
 func u_spectralLossBackwardPass1(
     _ windowSize: Int,
     _ scratchCell: CellID,

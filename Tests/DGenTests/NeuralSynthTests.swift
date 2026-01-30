@@ -985,4 +985,200 @@ final class NeuralSynthTests: XCTestCase {
 
         print("SUCCESS: MLP generalizes to unseen pitch!")
     }
+
+    // MARK: - Test: Static MLP with Piano Target (12 Harmonics)
+
+    /// Static MLP computes amplitude envelope as tensor ops, then read at audio rate.
+    /// Uses real piano samples as target with 12 harmonics and spectral loss.
+    func testStaticMLP_PianoTarget() throws {
+        // Load piano samples
+        let samplesURL = URL(fileURLWithPath: #file)
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .appendingPathComponent("Assets/piano_samples_short.json")
+
+        guard FileManager.default.fileExists(atPath: samplesURL.path) else {
+            print("Skipping - piano_samples_short.json not found")
+            return
+        }
+
+        let jsonData = try Data(contentsOf: samplesURL)
+        let json = try JSONSerialization.jsonObject(with: jsonData) as! [String: Any]
+        let targetSamples = (json["samples"] as! [Double]).map { Float($0) }
+        let sampleRate = json["target_sample_rate"] as! Int
+        let f0 = Float(json["detected_pitch_hz"] as! Double)
+
+        let frameCount = 128
+        let controlFrames = 32  // Control rate resolution
+        let windowSize = 64
+        let numHarmonics = 12
+        let hiddenSize = 16
+
+        print(
+            "Static MLP Piano: \(frameCount) frames, \(controlFrames) control frames, f0=\(f0) Hz, \(numHarmonics) harmonics"
+        )
+
+        let g = Graph(sampleRate: Float(sampleRate))
+
+        // Target audio tensor
+        let targetData = Array(targetSamples.prefix(frameCount))
+        let targetTensor = g.tensor(shape: [frameCount, 1], data: targetData)
+
+        // Control-rate time tensor [controlFrames, 1] - normalized 0 to 1
+        let timeData = (0..<controlFrames).map {
+            Float($0) / Float(controlFrames - 1)
+        }
+        let timeTensor = g.tensor(shape: [controlFrames, 1], data: timeData)
+
+        // Learnable MLP weights
+        let W1 = TensorParameter(
+            graph: g, shape: [1, hiddenSize],
+            data: (0..<hiddenSize).map { _ in Float.random(in: -0.5...0.5) }, name: "W1")
+        let b1 = TensorParameter(
+            graph: g, shape: [1, hiddenSize],
+            data: [Float](repeating: 0.0, count: hiddenSize), name: "b1")
+        let W2 = TensorParameter(
+            graph: g, shape: [hiddenSize, numHarmonics],
+            data: (0..<hiddenSize * numHarmonics).map { _ in Float.random(in: -0.3...0.3) },
+            name: "W2")
+        let b2 = TensorParameter(
+            graph: g, shape: [1, numHarmonics],
+            data: (0..<numHarmonics).map { i in 0.5 / Float(i + 1) },  // Harmonic falloff init
+            name: "b2")
+
+        // Static MLP: timeTensor -> amplitude envelope tensor
+        // This runs as tensor ops (matmul) that can be parallelized by shape
+        func mlpAmplitudes(time: NodeID, W1: NodeID, b1: NodeID, W2: NodeID, b2: NodeID)
+            throws -> NodeID
+        {
+            let one = g.n(.constant(1.0))
+            // Hidden layer: tanh(time @ W1 + b1)
+            let h1 = try g.matmul(time, W1)
+            let h1b = g.n(.add, h1, b1)
+            let h1a = g.n(.tanh, h1b)
+            // Output layer: sigmoid(h1 @ W2 + b2)
+            let h2 = try g.matmul(h1a, W2)
+            let h2b = g.n(.add, h2, b2)
+            let neg = g.n(.mul, h2b, g.n(.constant(-1.0)))
+            let expNeg = g.n(.exp, neg)
+            return g.n(.div, one, g.n(.add, one, expNeg))
+        }
+
+        // Compute amplitude envelope as static tensor [controlFrames, numHarmonics]
+        let ampsTensor = try mlpAmplitudes(
+            time: timeTensor, W1: W1.node(), b1: b1.node(), W2: W2.node(), b2: b2.node())
+
+        // Reshape to [numHarmonics, controlFrames] for peek(index=harmonic, channel=time)
+        let ampsView = try g.reshape(ampsTensor, to: [numHarmonics, controlFrames])
+
+        let zero = g.n(.constant(0.0))
+        let twoPi = g.n(.constant(Float.pi * 2.0))
+
+        // Audio-rate playhead: phasor from 0 to 1 over frameCount samples
+        let frameIdx = g.phasor(
+            freq: g.n(.constant(Float(sampleRate) / Float(frameCount))), reset: zero)
+        // Scale to control frame index [0, controlFrames-1]
+        let playhead = g.n(.mul, frameIdx, g.n(.constant(Float(controlFrames - 1))))
+        // Scale to audio frame index [0, frameCount-1] for target lookup
+        let audioIdx = g.n(.mul, frameIdx, g.n(.constant(Float(frameCount - 1))))
+
+        // VECTORIZED HARMONIC SYNTHESIS
+        // 1. Create frequency tensor [numHarmonics] with harmonic frequencies
+        let freqData = (1...numHarmonics).map { f0 * Float($0) }
+        let freqTensor = g.tensor(shape: [numHarmonics], data: freqData)
+
+        // 2. Deterministic phasor on frequency tensor -> phases tensor [numHarmonics]
+        // Using deterministicPhasor directly to enable parallel execution
+        // phase[k] = fmod(freq[k] / sampleRate * frameIndex, 1.0)
+        let phasesTensor = g.n(.deterministicPhasor, freqTensor)
+
+        // 3. sin(2*pi*phases) -> sines tensor [numHarmonics]
+        let sinesTensor = g.n(.sin, g.n(.mul, twoPi, phasesTensor))
+
+        // 4. peekRow to get amplitude row at current playhead -> amplitudes tensor [numHarmonics]
+        // ampsView is [numHarmonics, controlFrames], peekRow reads a row (all columns for given row index)
+        // But we want to read at a specific time (column), so we need the transpose
+        let ampsTransposed = try g.transpose(ampsView, axes: [1, 0])  // [controlFrames, numHarmonics]
+        let ampsAtTime = try g.peekRow(tensor: ampsTransposed, rowIndex: playhead)
+
+        // 5. Element-wise multiply sines * amplitudes -> weighted tensor [numHarmonics]
+        let weightedSines = g.n(.mul, sinesTensor, ampsAtTime)
+
+        // 6. Sum to get final output
+        var synthOutput = g.n(.sum, weightedSines)
+
+        // Normalize output
+        synthOutput = g.n(.mul, synthOutput, g.n(.constant(1.0 / Float(numHarmonics))))
+
+        // Target sample lookup
+        let targetSample = try g.peek(tensor: targetTensor, index: audioIdx, channel: zero)
+
+        // Spectral loss for perceptually meaningful training
+        let spectralLoss = g.spectralLoss(synthOutput, targetSample, windowSize: windowSize)
+
+        // Small MSE term for sample-level accuracy
+        let diff = g.n(.sub, synthOutput, targetSample)
+        let mseLoss = g.n(.mul, diff, diff)
+
+        // Combined loss scaled for meaningful gradients
+        let lossRaw = g.n(.add, spectralLoss, g.n(.mul, mseLoss, g.n(.constant(0.1))))
+        let loss = g.n(.mul, lossRaw, g.n(.constant(1000.0)))
+        _ = g.n(.output(0), loss)
+
+        print("Compiling static MLP piano model...")
+        let compileResult = try CompilationPipeline.compile(
+            graph: g, backend: .metal,
+            options: .init(frameCount: frameCount, backwards: true))
+        print("Compiled \(compileResult.kernels.count) kernels")
+
+        let runtime = try MetalCompiledKernel(
+            kernels: compileResult.kernels,
+            cellAllocations: compileResult.cellAllocations,
+            context: compileResult.context)
+
+        // Dump kernels for analysis
+        var kernelDump = "// Static MLP Piano Kernels - \(compileResult.kernels.count) total\n\n"
+        for (i, kernel) in compileResult.kernels.enumerated() {
+            kernelDump += "// ===== KERNEL \(i): \(kernel.name) =====\n"
+            kernelDump += "// ThreadGroupSize: \(kernel.threadGroupSize)\n"
+            kernelDump += "// Buffers: \(kernel.buffers)\n\n"
+            kernelDump += kernel.source
+            kernelDump += "\n\n"
+        }
+        try kernelDump.write(
+            toFile: "/tmp/static_mlp_piano_kernels.metal", atomically: true, encoding: .utf8)
+        print("Wrote kernels to /tmp/static_mlp_piano_kernels.metal")
+
+        let ctx = TrainingContext(
+            tensorParameters: [W1, b1, W2, b2],
+            optimizer: Adam(lr: 0.1),
+            lossNode: loss)
+
+        ctx.initializeMemory(
+            runtime: runtime,
+            cellAllocations: compileResult.cellAllocations,
+            context: compileResult.context,
+            frameCount: frameCount,
+            graph: g)
+
+        // Training
+        let initialLoss = ctx.runStepGPU()
+        print("Initial loss: \(initialLoss)")
+
+        let epochs = 100
+        var finalLoss = initialLoss
+        for epoch in 0..<epochs {
+            let lossVal = ctx.runStepGPU()
+            finalLoss = lossVal
+            print("Epoch \(epoch): loss = \(lossVal)")
+        }
+
+        let improvement = (1.0 - Double(finalLoss) / Double(initialLoss)) * 100
+        print(
+            "Static MLP Piano: Initial=\(initialLoss), Final=\(finalLoss), Improvement=\(String(format: "%.1f", improvement))%"
+        )
+
+        XCTAssertLessThan(finalLoss, initialLoss * 0.9, "Should improve with spectral loss")
+    }
 }

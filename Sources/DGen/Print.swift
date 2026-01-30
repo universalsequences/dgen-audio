@@ -181,6 +181,18 @@ extension UOp {
             opStr = "\(ANSI.magenta)beginHopCheck\(ANSI.reset)(\(counterCell))"
         case .endHopCheck:
             opStr = "\(ANSI.magenta)endHopCheck\(ANSI.reset)"
+        case let .declareLocalTensor(varId, size):
+            opStr = "\(ANSI.cyan)declareLocalTensor\(ANSI.reset)(\(varId), \(size))"
+        case let .localTensorRead(varId, idx):
+            opStr = "\(ANSI.cyan)localTensorRead\(ANSI.reset)(\(varId), \(idx))"
+        case let .localTensorWrite(varId, idx, val):
+            opStr = "\(ANSI.cyan)localTensorWrite\(ANSI.reset)(\(varId), \(idx), \(val))"
+        case let .beginInlineLoop(count, incr):
+            opStr = "\(ANSI.magenta)beginInlineLoop\(ANSI.reset)(\(count), \(incr))"
+        case .endInlineLoop:
+            opStr = "\(ANSI.magenta)endInlineLoop\(ANSI.reset)"
+        case let .frameTensorChainMarker(shape):
+            opStr = "\(ANSI.bold)\(ANSI.cyan)frameTensorChainMarker\(ANSI.reset)(shape: \(shape))"
         }
 
         return "\(ANSI.bold)UOp\(ANSI.reset)(op: \(opStr), value: \(value))"

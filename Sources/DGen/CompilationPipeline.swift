@@ -215,9 +215,36 @@ public struct CompilationPipeline {
             inferTemporality(graph: graph, sortedNodes: sortedNodes)
         }
 
+        // Step 4.5: Detect frame-dependent tensor chains for SIMD-across-frames optimization
+        let fusableChains = time("detectChains") {
+            detectFrameDependentTensorChains(
+                graph: graph,
+                sortedNodes: sortedNodes,
+                frameBasedNodes: temporalityResult.frameBasedNodes
+            )
+        }
+
+        // Store chain nodes in context for conditional markRequiresScalar
+        for chain in fusableChains {
+            context.frameTensorChainNodes.formUnion(chain.chainNodes)
+        }
+
         finalBlocks = extractStaticOpsIntoBlocks(
             blocks: finalBlocks, frameBasedNodes: temporalityResult.frameBasedNodes,
-            hopBasedNodes: temporalityResult.hopBasedNodes)
+            hopBasedNodes: temporalityResult.hopBasedNodes, graph: graph,
+            fusableChains: fusableChains)
+
+        // Upgrade frame-tensor chain blocks to SIMD kind for SIMD-across-frames execution.
+        // These blocks contain chains that can be parallelized across frames (not tensor elements).
+        time("upgradeChainBlocks") {
+            for i in 0..<finalBlocks.count {
+                if finalBlocks[i].frameTensorChain != nil {
+                    // Frame-tensor chains parallelize across frames, so they should be SIMD
+                    // (each frame is a thread that computes the full tensor chain locally)
+                    finalBlocks[i].kind = .simd
+                }
+            }
+        }
 
         time("assignTemporality") {
             assignBlockTemporality(
