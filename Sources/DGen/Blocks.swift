@@ -1245,6 +1245,25 @@ public func emitFrameTensorChainBlock(
                 // Register output value for downstream ops (best-effort)
                 ctx.values[nodeId] = interpolated.lazy
                 uops.append(contentsOf: b.ops)
+            } else if case .deterministicPhasor = node.op {
+                guard node.inputs.count == 1 else {
+                    throw DGenError.insufficientInputs(
+                        operator: "deterministicPhasor", expected: 1, actual: node.inputs.count)
+                }
+
+                let inputs: [Lazy] = node.inputs.compactMap { ctx.values[$0] }
+                let b = IRBuilder(ctx: ctx, nodeId: nodeId)
+                let freq = try b.readInput(node, inputs, at: 0)
+                let sampleRate = b.constant(g.sampleRate)
+                let frameIdxExpr = b.value(frameIdx.lazy)
+
+                let phaseIncrement = freq / sampleRate
+                let rawPhase = phaseIncrement * frameIdxExpr
+                let phase = rawPhase - b.floor(rawPhase)
+
+                try b.writeOutput(node, phase)
+                ctx.values[nodeId] = phase.lazy
+                uops.append(contentsOf: b.ops)
             } else {
                 for uop in try node.op.emit(ctx: ctx, g: g, nodeId: nodeId) {
                     uops.append(uop)

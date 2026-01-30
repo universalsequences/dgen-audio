@@ -778,6 +778,11 @@ public func detectFrameDependentTensorChains(
       return hasFrameBasedInput && hasStaticTensorInput
     }
 
+    // deterministicPhasor: static tensor -> frame-based tensor (implicit frame input)
+    if case .deterministicPhasor = node.op {
+      return hasStaticTensorInput
+    }
+
     return false
   }
 
@@ -822,11 +827,45 @@ public func detectFrameDependentTensorChains(
 
     // Valid chain found - must end in reduction
     if let reduction = reductionNode, let shape = tensorShape {
+      // Expand chain to include tensor-producing inputs to element-wise ops
+      var expanded = chainNodes
+      var changed = true
+      while changed {
+        changed = false
+        for nodeId in Array(expanded) {
+          guard let node = graph.nodes[nodeId] else { continue }
+          for inputId in node.inputs {
+            guard let inputNode = graph.nodes[inputId] else { continue }
+            guard case .tensor(let inputShape) = inputNode.shape, inputShape == shape else {
+              continue
+            }
+            // Include tensor inputs that feed into the chain
+            switch inputNode.op {
+            case .peekRow, .deterministicPhasor:
+              if !expanded.contains(inputId) {
+                expanded.insert(inputId)
+                changed = true
+              }
+            default:
+              if isElementWise(inputNode.op), !expanded.contains(inputId) {
+                expanded.insert(inputId)
+                changed = true
+              }
+            }
+          }
+        }
+      }
+
+      // Avoid duplicate chains for the same reduction
+      if chains.contains(where: { $0.reductionNodeId == reduction }) {
+        continue
+      }
+
       chains.append(
         FrameDependentTensorChain(
           transitionNodeId: nodeId,
           reductionNodeId: reduction,
-          chainNodes: chainNodes,
+          chainNodes: expanded,
           tensorShape: shape
         ))
     }
