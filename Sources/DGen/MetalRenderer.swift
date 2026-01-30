@@ -625,7 +625,7 @@ public class MetalRenderer: Renderer, UOpEmitter {
         inputs.insert(varId)
       case let .loadTape(val, _):
         checkLazyForGlobal(val)
-      case .load, .store, .delay1, .memoryRead, .memoryWrite:
+      case .load, .store, .delay1, .memoryRead, .memoryWrite, .noise:
         needsMemory = true
       case .defineMemory:
         needsMemory = true
