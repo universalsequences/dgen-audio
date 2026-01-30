@@ -118,6 +118,34 @@ public enum Op {
     if case .defineGlobal = self { return true }
     return false
   }
+
+  /// Returns the memory cell ID if this operation accesses memory, nil otherwise.
+  public var memoryCellId: CellID? {
+    switch self {
+    case .load(let cellId), .store(let cellId, _), .delay1(let cellId, _),
+         .memoryRead(let cellId, _), .memoryWrite(let cellId, _, _),
+         .memoryAccumulate(let cellId, _, _):
+      return cellId
+    default:
+      return nil
+    }
+  }
+
+  /// Returns a new Op with the cell ID remapped, or nil if no remapping is needed.
+  public func withRemappedCellId(_ remapping: [CellID: CellID]) -> Op? {
+    guard let cellId = memoryCellId, let newCellId = remapping[cellId] else {
+      return nil
+    }
+    switch self {
+    case .load: return .load(newCellId)
+    case .store(_, let val): return .store(newCellId, val)
+    case .delay1(_, let a): return .delay1(newCellId, a)
+    case .memoryRead(_, let offset): return .memoryRead(newCellId, offset)
+    case .memoryWrite(_, let offset, let value): return .memoryWrite(newCellId, offset, value)
+    case .memoryAccumulate(_, let offset, let value): return .memoryAccumulate(newCellId, offset, value)
+    default: return nil
+    }
+  }
 }
 
 public struct UOp {

@@ -177,14 +177,6 @@ public struct CompilationPipeline {
             fuseBlocks(isolatedBlocks, graph)
         }
 
-        print("after refusion passes")
-        for (i, block) in reFusedBlocks.enumerated() {
-            print("block\(i)")
-            for nodeId in block.nodes {
-                print("nodeId=\(nodeId) \(graph.nodes[nodeId]?.op)")
-            }
-        }
-
         let context = IRContext(g: graph)
 
         // finally separate tensor blocks of shared size into their own blocks
@@ -276,14 +268,6 @@ public struct CompilationPipeline {
 
         // Store frame-based nodes in context for smart gradient buffer allocation
         context.frameBasedNodes = temporalityResult.frameBasedNodes
-
-        print("final blocks")
-        for (i, block) in finalBlocks.enumerated() {
-            print("block\(i)")
-            for nodeId in block.nodes {
-                print("nodeId=\(nodeId) \(graph.nodes[nodeId]?.op)")
-            }
-        }
 
         let finalBlockIndices = Array(0..<finalBlocks.count)
 
@@ -610,21 +594,8 @@ func remapVectorMemorySlots(
     // First pass: identify which memory cells are used in which execution modes
     for block in uopBlocks {
         for uop in block.ops {
-            switch uop.op {
-            case .load(let cellId):
+            if let cellId = uop.op.memoryCellId {
                 registerCell(cellId, kind: block.kind)
-            case .store(let cellId, _):
-                registerCell(cellId, kind: block.kind)
-            case .delay1(let cellId, _):
-                registerCell(cellId, kind: block.kind)
-            case .memoryRead(let cellId, _):
-                registerCell(cellId, kind: block.kind)
-            case .memoryWrite(let cellId, _, _):
-                registerCell(cellId, kind: block.kind)
-            case .memoryAccumulate(let cellId, _, _):
-                registerCell(cellId, kind: block.kind)
-            default:
-                break
             }
         }
     }
@@ -633,38 +604,22 @@ func remapVectorMemorySlots(
         registerCell(voiceCellId, kind: .simd)
     }
 
-    // Log cells used in multiple modes
-    if !cellUsedInMultipleModes.isEmpty {
-        print(
-            "[REMAP DEBUG] Cells used in multiple execution modes (upgraded to SIMD): \(cellUsedInMultipleModes)"
-        )
-    }
-
     // Second pass: create a remapping for vector cells
     var cellRemapping: [CellID: CellID] = [:]
     var nextAvailableSlot = (allCellIds.max() ?? -1) + 1
 
-    // Reserve space for vector operations and large buffers (sorted for deterministic allocation)
     for (cellId, kind) in memoryUsage.sorted(by: { $0.key < $1.key }) {
-        // Check if this cell has a custom allocation size (like spectral scratch buffer)
         let allocSize = cellSizes[cellId] ?? 1
 
         if kind == .simd {
-            // Find a safe starting position (aligned to 4 and not conflicting)
-            let alignedSlot = ((nextAvailableSlot + 3) / 4) * 4  // Align to 4-byte boundary
+            let alignedSlot = ((nextAvailableSlot + 3) / 4) * 4
             cellRemapping[cellId] = alignedSlot
-            // Reserve space for the full allocation size (e.g., spectral scratch needs windowSize * frameCount * 2)
             nextAvailableSlot = alignedSlot + max(4, allocSize)
+        } else if allocSize > 1 {
+            cellRemapping[cellId] = nextAvailableSlot
+            nextAvailableSlot += allocSize
         } else {
-            // Scalar operations: use allocation size if specified, otherwise keep original slot
-            if allocSize > 1 {
-                // Large scalar buffer (shouldn't happen for spectral, but handle it)
-                cellRemapping[cellId] = nextAvailableSlot
-                nextAvailableSlot += allocSize
-            } else {
-                // Single scalar cell keeps its original slot
-                cellRemapping[cellId] = cellId
-            }
+            cellRemapping[cellId] = cellId
         }
     }
 
@@ -672,66 +627,21 @@ func remapVectorMemorySlots(
     for blockIndex in 0..<uopBlocks.count {
         for uopIndex in 0..<uopBlocks[blockIndex].ops.count {
             let uop = uopBlocks[blockIndex].ops[uopIndex]
-
-            switch uop.op {
-            case .load(let cellId):
-                if let newCellId = cellRemapping[cellId] {
-                    uopBlocks[blockIndex].ops[uopIndex] = UOp(
-                        op: .load(newCellId),
-                        value: uop.value,
-                        kind: uop.kind
-                    )
-                }
-            case .store(let cellId, let val):
-                if let newCellId = cellRemapping[cellId] {
-                    uopBlocks[blockIndex].ops[uopIndex] = UOp(
-                        op: .store(newCellId, val),
-                        value: uop.value,
-                        kind: uop.kind
-                    )
-                }
-            case .delay1(let cellId, let a):
-                if let newCellId = cellRemapping[cellId] {
-                    uopBlocks[blockIndex].ops[uopIndex] = UOp(
-                        op: .delay1(newCellId, a),
-                        value: uop.value,
-                        kind: uop.kind
-                    )
-                }
-            case .memoryRead(let cellId, let offset):
-                if let newCellId = cellRemapping[cellId] {
-                    uopBlocks[blockIndex].ops[uopIndex] = UOp(
-                        op: .memoryRead(newCellId, offset),
-                        value: uop.value,
-                        kind: uop.kind
-                    )
-                }
-            case .memoryWrite(let cellId, let offset, let value):
-                if let newCellId = cellRemapping[cellId] {
-                    uopBlocks[blockIndex].ops[uopIndex] = UOp(
-                        op: .memoryWrite(newCellId, offset, value),
-                        value: uop.value,
-                        kind: uop.kind
-                    )
-                }
-            case .memoryAccumulate(let cellId, let offset, let value):
-                if let newCellId = cellRemapping[cellId] {
-                    uopBlocks[blockIndex].ops[uopIndex] = UOp(
-                        op: .memoryAccumulate(newCellId, offset, value),
-                        value: uop.value,
-                        kind: uop.kind
-                    )
-                }
-            // No remapping needed for tape-based spectral ops
-            default:
-                break
+            if let remappedOp = uop.op.withRemappedCellId(cellRemapping) {
+                uopBlocks[blockIndex].ops[uopIndex] = UOp(
+                    op: remappedOp,
+                    value: uop.value,
+                    kind: uop.kind
+                )
             }
         }
     }
 
-    let cellAllocations = CellAllocations(
-        totalMemorySlots: nextAvailableSlot, cellMappings: cellRemapping, cellKinds: memoryUsage)
-    return cellAllocations
+    return CellAllocations(
+        totalMemorySlots: nextAvailableSlot,
+        cellMappings: cellRemapping,
+        cellKinds: memoryUsage
+    )
 }
 
 public struct CellAllocations {

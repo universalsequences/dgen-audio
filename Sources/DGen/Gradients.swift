@@ -499,16 +499,10 @@ extension LazyOp {
 
         case .seq:
             // Gradient flows only to the last input
-            var grads: [NodeID?] = []
             let zero = g.n(.constant(0.0), [])
-            for i in 0..<node.inputs.count {
-                if i == node.inputs.count - 1 {
-                    grads.append(gradOutput)
-                } else {
-                    grads.append(zero)
-                }
+            return node.inputs.enumerated().map { (i, _) in
+                i == node.inputs.count - 1 ? gradOutput : zero
             }
-            return grads
 
         // MARK: Memory Operations
 

@@ -532,12 +532,11 @@ public func topoWithCorridors(
     return result
 }
 
-// Simple topological sort within a corridor
-// If lastForwardNodeId is set, ensures forward nodes (id <= lastForwardNodeId) are processed
-// before gradient nodes (id > lastForwardNodeId) to prevent gradient additions from
-// affecting forward node ordering.
+/// Topological sort within a corridor that separates forward and gradient nodes.
+/// If lastForwardNodeId is set, forward nodes (id <= lastForwardNodeId) are processed
+/// before gradient nodes (id > lastForwardNodeId) to prevent gradient additions from
+/// affecting forward node ordering.
 private func simpleTopoSortWithinCorridor(nodes: [NodeID], g: Graph) -> [NodeID] {
-    let nodeSet = Set(nodes)
     let lastForwardId = g.lastForwardNodeId
 
     // Separate forward and gradient nodes if applicable
@@ -551,26 +550,21 @@ private func simpleTopoSortWithinCorridor(nodes: [NodeID], g: Graph) -> [NodeID]
         gradientNodes = []
     }
 
-    // Helper function to topo sort a subset of nodes
-    func topoSort(_ subsetNodes: [NodeID], considerDepsIn fullSet: Set<NodeID>) -> [NodeID] {
+    // Topological sort a subset of nodes using Kahn's algorithm
+    func topoSort(_ subsetNodes: [NodeID]) -> [NodeID] {
         guard !subsetNodes.isEmpty else { return [] }
         let subsetSet = Set(subsetNodes)
         var indegree: [NodeID: Int] = [:]
 
         // Calculate in-degrees (only counting deps within the subset)
         for nodeId in subsetNodes {
-            indegree[nodeId] = 0
-        }
-
-        for nodeId in subsetNodes {
+            var count = 0
             if let node = g.nodes[nodeId] {
-                for dep in node.allDependencies {
-                    // Only count dependencies that are in the subset we're sorting
-                    if subsetSet.contains(dep) {
-                        indegree[nodeId]! += 1
-                    }
+                for dep in node.allDependencies where subsetSet.contains(dep) {
+                    count += 1
                 }
             }
+            indegree[nodeId] = count
         }
 
         // Kahn's algorithm
@@ -583,13 +577,13 @@ private func simpleTopoSortWithinCorridor(nodes: [NodeID], g: Graph) -> [NodeID]
 
             // Update consumers within subset
             for otherNodeId in subsetNodes {
-                if let otherNode = g.nodes[otherNodeId] {
-                    if otherNode.allDependencies.contains(nodeId) {
-                        indegree[otherNodeId]! -= 1
-                        if indegree[otherNodeId] == 0 {
-                            let insertIndex = queue.firstIndex { $0 > otherNodeId } ?? queue.count
-                            queue.insert(otherNodeId, at: insertIndex)
-                        }
+                if let otherNode = g.nodes[otherNodeId],
+                    otherNode.allDependencies.contains(nodeId)
+                {
+                    indegree[otherNodeId]! -= 1
+                    if indegree[otherNodeId] == 0 {
+                        let insertIndex = queue.firstIndex { $0 > otherNodeId } ?? queue.count
+                        queue.insert(otherNodeId, at: insertIndex)
                     }
                 }
             }
@@ -603,8 +597,8 @@ private func simpleTopoSortWithinCorridor(nodes: [NodeID], g: Graph) -> [NodeID]
     }
 
     // Sort forward nodes first, then gradient nodes
-    var result = topoSort(forwardNodes, considerDepsIn: nodeSet)
-    result.append(contentsOf: topoSort(gradientNodes, considerDepsIn: nodeSet))
+    var result = topoSort(forwardNodes)
+    result.append(contentsOf: topoSort(gradientNodes))
 
     return result
 }
@@ -913,13 +907,6 @@ public func isolateSpectralPasses(_ blocks: [Block], _ g: Graph) -> [Block] {
         }
     }
 
-    print("isoloted spectral passes")
-    for (i, block) in result.enumerated() {
-        print("block\(i)")
-        for nodeId in block.nodes {
-            print("nodeId=\(nodeId) \(g.nodes[nodeId]?.op)")
-        }
-    }
     return result
 }
 
