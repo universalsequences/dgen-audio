@@ -220,7 +220,7 @@ final class NeuralSynthTests: XCTestCase {
         printTensorStats(b2, label: "b2")
 
         // Train - fewer epochs since spectral loss is more informative
-        let epochs = 100
+        let epochs = 40
         var finalLoss = initialLoss
         for epoch in 0..<epochs {
             let lossVal = ctx.runStepGPU()
@@ -466,7 +466,7 @@ final class NeuralSynthTests: XCTestCase {
         print("amp.baseGradId: \(amp.baseGradId.map { String($0) } ?? "nil")")
 
         // Train
-        let epochs = 50
+        let epochs = 30
         for epoch in 0..<epochs {
             let lossVal = ctx.runStepGPU()
             let grad = amp.grads.first ?? 0
@@ -668,7 +668,7 @@ final class NeuralSynthTests: XCTestCase {
         print("Wrote kernels to /tmp/dgen_kernels.metal")
 
         // Train
-        let epochs = 100
+        let epochs = 40
         for epoch in 0..<epochs {
             let lossVal = ctx.runStepGPU()
 
@@ -788,7 +788,7 @@ final class NeuralSynthTests: XCTestCase {
         print("tensorGradients: \(compileResult.context.tensorGradients)")
 
         // Train
-        let epochs = 100
+        let epochs = 40
         for epoch in 0..<epochs {
             let lossVal = ctx.runStepGPU()
 

@@ -232,10 +232,13 @@ public struct CompilationPipeline {
             context.frameTensorChainNodes.formUnion(chain.chainNodes)
         }
 
-        finalBlocks = extractStaticOpsIntoBlocks(
-            blocks: finalBlocks, frameBasedNodes: temporalityResult.frameBasedNodes,
-            hopBasedNodes: temporalityResult.hopBasedNodes, graph: graph,
-            fusableChains: fusableChains)
+        // this step currently breaks C SIMD blocks (causes duplicate definitions)
+        if backend == .metal {
+            finalBlocks = extractStaticOpsIntoBlocks(
+                blocks: finalBlocks, frameBasedNodes: temporalityResult.frameBasedNodes,
+                hopBasedNodes: temporalityResult.hopBasedNodes, graph: graph,
+                fusableChains: fusableChains)
+        }
 
         // Upgrade frame-tensor chain blocks to SIMD kind for SIMD-across-frames execution.
         // These blocks contain chains that can be parallelized across frames (not tensor elements).

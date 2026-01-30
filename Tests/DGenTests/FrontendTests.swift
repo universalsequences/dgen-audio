@@ -34,14 +34,9 @@ final class FrontendTests: XCTestCase {
                 let result = try g.compile(
                         loss, backend: .metal, frameCount: frameCount, debug: false)
 
-                // Write kernels to disk for inspection
-                let allKernels = result.kernels.enumerated().map {
-                        "// KERNEL \($0.offset)\n\($0.element.source)"
-                }.joined(separator: "\n\n")
-                try! allKernels.write(
-                        toFile: "/tmp/history_backward_kernels.metal", atomically: true,
-                        encoding: .utf8)
-                print("Wrote kernels to /tmp/history_backward_kernels.metal")
+                writeKernelsToDisk(
+                        result, "/tmp/history_backward_kernels.metal")
+
                 // Streamlined training context - handles everything!
                 let ctx = try TrainingContext(
                         parameters: [cutoffParam],
@@ -104,14 +99,8 @@ final class FrontendTests: XCTestCase {
                 let result = try g.compile(
                         loss, backend: .metal, frameCount: frameCount, debug: false)
 
-                // Write kernels to disk for inspection
-                let allKernels = result.kernels.enumerated().map {
-                        "// KERNEL \($0.offset)\n\($0.element.source)"
-                }.joined(separator: "\n\n")
-                try! allKernels.write(
-                        toFile: "/tmp/biquad_backward_kernels.metal", atomically: true,
-                        encoding: .utf8)
-                print("Wrote kernels to /tmp/biquad_backward_kernels.metal")
+                writeKernelsToDisk(
+                        result, "/tmp/biquad_backward_kernels.metal")
 
                 // Streamlined training context - handles everything!
                 let ctx = try TrainingContext(
@@ -123,10 +112,10 @@ final class FrontendTests: XCTestCase {
                 )
 
                 var lossHistory: [Float] = []
-                for i in 0..<20 {
+                for i in 0..<200 {
                         let currentLoss = ctx.runStepGPU()
                         lossHistory.append(currentLoss)
-                        if i % 10 == 0 {
+                        if i % 2 == 0 {
                                 print(
                                         "i=\(i) loss=\(currentLoss) freq=\(freqParam.value) cutoff=\(cutoffParam.value) cutoff.grad=\(cutoffParam.grad) freq.grad=\(freqParam.grad)"
                                 )
@@ -139,7 +128,9 @@ final class FrontendTests: XCTestCase {
                 print("   Final loss: \(String(format: "%.6f", finalLoss))")
 
                 // Assert that gradients are flowing (loss decreased by at least 10%)
-                XCTAssertLessThan(finalLoss, initialLoss * 0.9, "Loss should decrease - gradients must be flowing")
+                XCTAssertLessThan(
+                        finalLoss, initialLoss * 0.9,
+                        "Loss should decrease - gradients must be flowing")
 
         }
 

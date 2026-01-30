@@ -143,7 +143,7 @@ func u_spectralLoss(sig1: Expr, sig2: Expr, windowSize: Int) -> (IRBuilder) -> E
     let totalError = b.float(0.0)
 
     // For each frequency bin
-    b.loop(numBins) { binIndex in
+    let bins = b.loop(numBins) { binIndex in
       // DFT accumulators (real and imaginary parts)
       let real1 = b.float(0.0)
       let real2 = b.float(0.0)
