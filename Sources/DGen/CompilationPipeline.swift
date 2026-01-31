@@ -56,14 +56,12 @@ public struct CompilationPipeline {
         public let forceScalar: Bool
         public let voiceCount: Int
         public let voiceCellId: Int?
-        public let backwards: Bool
 
         public init(
             frameCount: Int = 128,
             debug: Bool = false,
             printBlockStructure: Bool = false,
             forceScalar: Bool = false,
-            backwards: Bool = false,
             voiceCount: Int = 1,
             voiceCellId: Int? = nil
         ) {
@@ -73,7 +71,6 @@ public struct CompilationPipeline {
             self.forceScalar = forceScalar
             self.voiceCount = voiceCount
             self.voiceCellId = voiceCellId
-            self.backwards = backwards
         }
     }
 
@@ -210,22 +207,6 @@ public struct CompilationPipeline {
             }
         }
 
-        if options.backwards {
-            time("backwardsBlocks") {
-                var backwardsBlocks: [Block] = []
-                for block in finalBlocks.reversed() {
-                    var backwardsBlock = Block(kind: block.kind)
-                    backwardsBlock.nodes = block.nodes.reversed()
-                    backwardsBlock.direction = .backwards
-                    backwardsBlocks.append(backwardsBlock)
-                }
-                let fusedBackwards = fuseBlocks(backwardsBlocks, graph)
-                // Split any backward blocks that have both Pass1 and Pass2 to avoid race conditions
-                let splitBackwards = splitSpectralBackwardBlocks(fusedBackwards, graph)
-                finalBlocks += splitBackwards
-            }
-        }
-
         // Step 4: Infer temporality and assign to blocks
         // This now includes hop-based temporality for FFT/IFFT and downstream operations
         let temporalityResult = time("inferTemporality") {
@@ -347,7 +328,7 @@ public struct CompilationPipeline {
             result.reserveCapacity(blocks.count)
 
             for block in blocks {
-                guard let chain = block.frameTensorChain, block.direction == .forward else {
+                guard let chain = block.frameTensorChain else {
                     result.append(block)
                     continue
                 }
@@ -391,7 +372,6 @@ public struct CompilationPipeline {
                 // Reduce block: just the reduction node
                 var reduceBlock = Block(kind: .simd)
                 reduceBlock.nodes = [chain.reductionNodeId]
-                reduceBlock.direction = block.direction
                 reduceBlock.temporality = block.temporality
                 reduceBlock.tensorIndex = nil
                 reduceBlock.shape = nil
@@ -896,7 +876,6 @@ func determineTensorBlocks(_ blocks: [Block], _ graph: Graph, _ ctx: IRContext) 
     // Helper to create a new block preserving original properties
     func makeBlock(from original: Block) -> Block {
         var newBlock = Block(kind: original.kind)
-        newBlock.direction = original.direction
         newBlock.temporality = original.temporality
         return newBlock
     }

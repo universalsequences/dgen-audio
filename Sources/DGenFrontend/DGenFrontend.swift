@@ -180,14 +180,12 @@ public class GraphBuilder: Graph {
     ///   - backend: Compilation backend (default: .metal)
     ///   - frameCount: Number of frames per batch (default: 128)
     ///   - debug: Enable debug output (default: false)
-    ///   - backwards: Enable backwards pass for training (default: true)
     /// - Returns: Compilation result containing kernels and metadata
     public func compile(
         _ loss: Node,
         backend: Backend = .metal,
         frameCount: Int = 128,
-        debug: Bool = false,
-        backwards: Bool = true
+        debug: Bool = false
     ) throws -> CompilationResult {
         // Set the loss as output
         output(loss)
@@ -198,8 +196,7 @@ public class GraphBuilder: Graph {
             backend: backend,
             options: CompilationPipeline.Options(
                 frameCount: frameCount,
-                debug: debug,
-                backwards: backwards
+                debug: debug
             )
         )
     }

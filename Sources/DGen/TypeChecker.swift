@@ -562,10 +562,6 @@ private func determineBlockTemporality(
   frameBasedNodes: Set<NodeID>,
   hopBasedNodes: [NodeID: (Int, CellID)]
 ) -> Temporality {
-  if block.direction == .backwards {
-    return .frameBased
-  }
-
   if block.nodes.contains(where: { frameBasedNodes.contains($0) }) {
     return .frameBased
   }
@@ -589,11 +585,6 @@ public func splitBlockByStaticIfPossible(
   graph: Graph,
   fusableChains: [FrameDependentTensorChain] = []
 ) -> [Block] {
-  // Backward blocks are always frame-based - no splitting needed
-  if block.direction == .backwards {
-    return [block]
-  }
-
   let usableChains = filterFusableChainsForBlock(fusableChains, block: block)
   let nodeToChain = buildNodeToChainMap(usableChains)
   let segments = identifyTemporalitySegments(
@@ -745,7 +736,6 @@ private func convertSegmentsToBlocks(
     var b = Block(kind: block.kind)
     b.temporality = segment.isStatic ? .static_ : .frameBased
     b.shape = block.shape
-    b.direction = block.direction
     b.tensorIndex = block.tensorIndex
     b.nodes = segment.nodes
     b.frameTensorChain = segment.chain

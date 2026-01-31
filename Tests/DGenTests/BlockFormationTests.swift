@@ -58,7 +58,7 @@ final class BlockFormationTests: XCTestCase {
         print(feedbackClusters)
 
         // Step 2: Get scalar nodes
-        let scalarNodeSet = scalarNodes(g, feedbackClusters: feedbackClusters)
+        let scalarNodeSet = scalarNodes(g, feedbackClusters: feedbackClusters, backend: .c)
         print("\n=== Scalar Nodes ===")
         for nodeId in scalarNodeSet.sorted() {
             if let node = g.nodes[nodeId] {
@@ -217,7 +217,7 @@ final class BlockFormationTests: XCTestCase {
 
         // Compile and check
         let feedbackClusters = findFeedbackLoops(g)
-        let scalarNodeSet = scalarNodes(g, feedbackClusters: feedbackClusters)
+        let scalarNodeSet = scalarNodes(g, feedbackClusters: feedbackClusters, backend: .c)
 
         print("\n=== User Patch Scalar Nodes ===")
         for nodeId in scalarNodeSet.sorted() {
@@ -299,7 +299,7 @@ final class BlockFormationTests: XCTestCase {
 
         // Step through compilation
         let feedbackClusters = findFeedbackLoops(g)
-        let scalarNodeSet = scalarNodes(g, feedbackClusters: feedbackClusters)
+        let scalarNodeSet = scalarNodes(g, feedbackClusters: feedbackClusters, backend: .c)
         let sortedNodes = topoWithCorridors(g, feedbackClusters: feedbackClusters, scalarNodeSet: scalarNodeSet, debug: true)
 
         try inferShapes(graph: g, sortedNodes: sortedNodes)
@@ -350,7 +350,7 @@ final class BlockFormationTests: XCTestCase {
 
         // Step through compilation
         let feedbackClusters = findFeedbackLoops(g)
-        let scalarNodeSet = scalarNodes(g, feedbackClusters: feedbackClusters)
+        let scalarNodeSet = scalarNodes(g, feedbackClusters: feedbackClusters, backend: .c)
         let sortedNodes = topoWithCorridors(g, feedbackClusters: feedbackClusters, scalarNodeSet: scalarNodeSet, debug: true)
 
         try inferShapes(graph: g, sortedNodes: sortedNodes)

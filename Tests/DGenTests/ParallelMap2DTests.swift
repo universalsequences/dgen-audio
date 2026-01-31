@@ -15,7 +15,7 @@ final class ParallelMap2DTests: XCTestCase {
         let result = try CompilationPipeline.compile(
             graph: g,
             backend: .metal,
-            options: .init(frameCount: frameCount, debug: false, backwards: false)
+            options: .init(frameCount: frameCount, debug: false)
         )
 
         let runtime = try MetalCompiledKernel(

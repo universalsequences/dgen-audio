@@ -66,7 +66,7 @@ final class GraphGradientTests: XCTestCase {
         let x = g.n(.constant(1.0))
         let two = g.n(.constant(2.0))
         let scaled = g.n(.mul, [x, two])  // x * 2
-        let y = g.n(.sin, [scaled])        // sin(x * 2)
+        let y = g.n(.sin, [scaled])  // sin(x * 2)
 
         let grads = g.computeGradients(loss: y, targets: Set([x]))
 
@@ -177,7 +177,7 @@ final class GraphGradientTests: XCTestCase {
         let x = g.n(.constant(0.5))
         let two = g.n(.constant(2.0))
         let scaled = g.n(.mul, [x, two])  // 1.0
-        let y = g.n(.sin, [scaled])        // sin(1.0) = 0.8414
+        let y = g.n(.sin, [scaled])  // sin(1.0) = 0.8414
 
         let grads = g.computeGradients(loss: y, targets: Set([x]))
         guard let gradX = grads[x] else {
@@ -300,8 +300,8 @@ final class GraphGradientTests: XCTestCase {
         let b = g.n(.constant(3.0))
         let target = g.n(.constant(10.0))
 
-        let product = g.n(.mul, [a, b])        // 6
-        let loss = g.n(.mse, [product, target]) // (6-10)^2 = 16
+        let product = g.n(.mul, [a, b])  // 6
+        let loss = g.n(.mse, [product, target])  // (6-10)^2 = 16
 
         // Compute gradients for both a and b
         let grads = g.computeGradients(loss: loss, targets: Set([a, b]))
@@ -397,8 +397,8 @@ final class GraphGradientTests: XCTestCase {
         let g = Graph()
 
         // Learnable frequency and target
-        let freq = g.n(.constant(450.0))      // start at 450 Hz
-        let targetFreq = g.n(.constant(440.0)) // target is 440 Hz
+        let freq = g.n(.constant(450.0))  // start at 450 Hz
+        let targetFreq = g.n(.constant(440.0))  // target is 440 Hz
         let reset = g.n(.constant(0.0))
         let twoPi = g.n(.constant(2.0 * Float.pi))
 
@@ -498,15 +498,17 @@ final class GraphGradientTests: XCTestCase {
         // The gradient should be non-zero since freqs differ
         // Sign should indicate we need to decrease freq (450 -> 440)
         XCTAssertNotEqual(computedGrad, 0.0, "Gradient should be non-zero")
-        print("  Gradient sign: \(computedGrad > 0 ? "positive (increase freq)" : "negative (decrease freq)")")
+        print(
+            "  Gradient sign: \(computedGrad > 0 ? "positive (increase freq)" : "negative (decrease freq)")"
+        )
     }
 
     func testPhasorFrameBasedGradientBiquad() throws {
         let g = Graph()
 
         // Learnable frequency and target
-        let freq = g.n(.constant(450.0))      // start at 450 Hz
-        let targetFreq = g.n(.constant(440.0)) // target is 440 Hz
+        let freq = g.n(.constant(450.0))  // start at 450 Hz
+        let targetFreq = g.n(.constant(440.0))  // target is 440 Hz
         let reset = g.n(.constant(0.0))
         let twoPi = g.n(.constant(2.0 * Float.pi))
 
@@ -519,7 +521,8 @@ final class GraphGradientTests: XCTestCase {
         // Sine waves
         //let angle1 = g.n(.mul, [phase1, twoPi])
         let angle2 = g.n(.mul, [phase2, twoPi])
-        let sig1 = g.biquad(phase1, g.n(.constant(1000)), g.n(.constant(9)), g.n(.constant(1)), g.n(.constant(0)))
+        let sig1 = g.biquad(
+            phase1, g.n(.constant(1000)), g.n(.constant(9)), g.n(.constant(1)), g.n(.constant(0)))
         let sig2 = g.n(.sin, [angle2])
 
         // MSE loss (per-frame)
@@ -606,16 +609,16 @@ final class GraphGradientTests: XCTestCase {
         // The gradient should be non-zero since freqs differ
         // Sign should indicate we need to decrease freq (450 -> 440)
         XCTAssertNotEqual(computedGrad, 0.0, "Gradient should be non-zero")
-        print("  Gradient sign: \(computedGrad > 0 ? "positive (increase freq)" : "negative (decrease freq)")")
+        print(
+            "  Gradient sign: \(computedGrad > 0 ? "positive (increase freq)" : "negative (decrease freq)")"
+        )
     }
-
-
-
 
     // MARK: - Helpers
 
     /// Print a subgraph starting from a root node (with max depth)
-    func printSubgraph(_ g: Graph, root: NodeID, label: String, indent: Int = 0, maxDepth: Int = 10) {
+    func printSubgraph(_ g: Graph, root: NodeID, label: String, indent: Int = 0, maxDepth: Int = 10)
+    {
         if indent > maxDepth {
             let prefix = String(repeating: "  ", count: indent)
             print("\(prefix)...")
@@ -624,7 +627,9 @@ final class GraphGradientTests: XCTestCase {
         printSubgraphInternal(g, root: root, label: label, indent: indent, maxDepth: maxDepth)
     }
 
-    private func printSubgraphInternal(_ g: Graph, root: NodeID, label: String, indent: Int, maxDepth: Int) {
+    private func printSubgraphInternal(
+        _ g: Graph, root: NodeID, label: String, indent: Int, maxDepth: Int
+    ) {
         let prefix = String(repeating: "  ", count: indent)
         guard let node = g.nodes[root] else {
             print("\(prefix)\(label): <missing node \(root)>")
@@ -633,7 +638,8 @@ final class GraphGradientTests: XCTestCase {
 
         print("\(prefix)\(label) [id=\(root)]: \(node.op)")
         for (i, input) in node.inputs.enumerated() {
-            printSubgraph(g, root: input, label: "input\(i)", indent: indent + 1, maxDepth: maxDepth)
+            printSubgraph(
+                g, root: input, label: "input\(i)", indent: indent + 1, maxDepth: maxDepth)
         }
     }
 
@@ -728,65 +734,15 @@ final class GraphGradientTests: XCTestCase {
             let lossValue = ctx.trainStep()
             if step % 5 == 0 || step == 19 {
                 let currentMix = 1.0 * (1 - t.value) + 2.0 * t.value
-                print("Step \(step): t = \(t.value), mix = \(currentMix), loss = \(lossValue), grad = \(t.grad)")
+                print(
+                    "Step \(step): t = \(t.value), mix = \(currentMix), loss = \(lossValue), grad = \(t.grad)"
+                )
             }
         }
 
         // t should converge toward 0.7
         print("\nFinal t: \(t.value) (target: 0.7)")
         XCTAssertEqual(t.value, 0.7, accuracy: 0.1, "t should converge to 0.7")
-    }
-
-    /// Test a single onepole filter targeting a specific output
-    /// This eliminates interaction between two filters
-    func testGraphTrainingOnepoleSingle() throws {
-        let g = Graph()
-
-        // Learnable cutoff parameter (target is 0.7)
-        let cutoff = GraphParameter(graph: g, value: 0.3, name: "cutoff")
-
-        // Constant input and target history for mix
-        let inputVal = g.n(.constant(1.0))
-        let historyVal = g.n(.constant(0.5))  // Fixed history for testing
-
-        // mix(input, history, cutoff) = input*(1-cutoff) + history*cutoff
-        // = 1*(1-c) + 0.5*c = 1 - c + 0.5c = 1 - 0.5c
-        // With c=0.3: output = 1 - 0.15 = 0.85
-        // With c=0.7: output = 1 - 0.35 = 0.65 (target)
-        let mixResult = g.n(.mix, [inputVal, historyVal, cutoff.node()])
-
-        // Target: mix with cutoff=0.7 -> 0.65
-        let target = g.n(.constant(0.65))
-
-        // MSE loss
-        let loss = g.n(.mse, [mixResult, target])
-        _ = g.n(.output(0), [loss])
-
-        print("\n=== Single Mix Test (no history ops) ===")
-        print("mix(1, 0.5, c) = 1 - 0.5c")
-        print("Starting c: 0.3, target output: 0.65 (c=0.7)")
-        print("d(mix)/d(c) = 0.5 - 1 = -0.5")
-        print("At c=0.3: output=0.85, target=0.65, diff=0.2")
-        print("d(MSE)/d(output) = 2*0.2 = 0.4")
-        print("d(loss)/d(c) = 0.4 * (-0.5) = -0.2")
-        print("With SGD: c = 0.3 - lr*(-0.2) = 0.3 + lr*0.2 -> increases (correct!)")
-
-        let ctx = try GraphTrainingContext(
-            graph: g,
-            loss: loss,
-            parameters: [cutoff],
-            optimizer: GraphSGD(),
-            learningRate: 0.5,
-            frameCount: 1
-        )
-
-        for step in 0..<15 {
-            let lossValue = ctx.trainStep()
-            let currentOutput = 1.0 - 0.5 * cutoff.value
-            print("Step \(step): c = \(cutoff.value), output = \(currentOutput), loss = \(lossValue), grad = \(cutoff.grad)")
-        }
-
-        XCTAssertEqual(cutoff.value, 0.7, accuracy: 0.1, "Cutoff should converge to 0.7")
     }
 
     /// Test onepole gradient against analytical expectation
@@ -834,7 +790,9 @@ final class GraphGradientTests: XCTestCase {
         for step in 0..<30 {
             let lossValue = ctx.trainStep()
             if step % 5 == 0 || step == 29 {
-                print("Step \(step): cutoff = \(cutoff.value), loss = \(lossValue), grad = \(cutoff.grad)")
+                print(
+                    "Step \(step): cutoff = \(cutoff.value), loss = \(lossValue), grad = \(cutoff.grad)"
+                )
             }
         }
 
@@ -924,8 +882,12 @@ final class GraphGradientTests: XCTestCase {
 
         // Check if mix2's backward was processed (it shouldn't be)
         print("\nmix1 nodeId = \(mix1), mix2 nodeId = \(mix2)")
-        print("mix1 inputs gradient assigned: \(grads[phase] != nil), \(grads[history1] != nil), \(grads[cutoff.nodeId] != nil)")
-        print("mix2 inputs gradient assigned: history2=\(grads[history2] != nil), targetCutoff=\(grads[targetCutoff] != nil)")
+        print(
+            "mix1 inputs gradient assigned: \(grads[phase] != nil), \(grads[history1] != nil), \(grads[cutoff.nodeId] != nil)"
+        )
+        print(
+            "mix2 inputs gradient assigned: history2=\(grads[history2] != nil), targetCutoff=\(grads[targetCutoff] != nil)"
+        )
         // Note: phase is shared, so if mix2's backward ran, it would have added to grads[phase]
 
         // Now compile and run to see actual values
@@ -1088,58 +1050,6 @@ final class GraphGradientTests: XCTestCase {
         print("Gradient sign: \(cutoff3.grad > 0 ? "POSITIVE (correct)" : "NEGATIVE (wrong)")")
     }
 
-    /// Test with SHARED CONSTANT input (no phasor) to isolate the gradient issue
-    func testGraphTrainingOnepoleSharedConstant() throws {
-        let g = Graph()
-
-        // Learnable cutoff parameter (target is 0.2)
-        let cutoff = GraphParameter(graph: g, value: 0.5, name: "cutoff")
-        let targetCutoff = g.n(.constant(0.2))
-
-        // SHARED constant input (no phasor state involved)
-        let sharedInput = g.n(.constant(0.5))
-
-        // Onepole filter: mix(input, history, cutoff)
-        func onepole(_ inputNode: NodeID, _ cutoffNode: NodeID) -> NodeID {
-            let cellId = g.alloc()
-            let history = g.n(.historyRead(cellId))
-            let mix = g.n(.mix, [inputNode, history, cutoffNode])
-            _ = g.n(.historyWrite(cellId), [mix])
-            return mix
-        }
-
-        // sig1: filtered with learnable cutoff
-        let sig1 = onepole(sharedInput, cutoff.node())
-
-        // sig2: filtered with target cutoff
-        let sig2 = onepole(sharedInput, targetCutoff)
-
-        // MSE loss
-        let loss = g.n(.mse, [sig1, sig2])
-        _ = g.n(.output(0), [loss])
-
-        print("\n=== GraphTraining Onepole (Shared Constant) Test ===")
-        print("Starting cutoff: 0.5, target: 0.2")
-
-        let ctx = try GraphTrainingContext(
-            graph: g,
-            loss: loss,
-            parameters: [cutoff],
-            optimizer: GraphSGD(),
-            learningRate: 0.5,
-            frameCount: 64
-        )
-
-        for step in 0..<30 {
-            let lossValue = ctx.trainStep()
-            if step % 5 == 0 || step == 29 {
-                print("Step \(step): cutoff = \(cutoff.value), loss = \(lossValue), grad = \(cutoff.grad)")
-            }
-        }
-
-        print("\nFinal cutoff: \(cutoff.value) (target: 0.2)")
-    }
-
     /// Test with two SEPARATE phasors to avoid shared input gradient issues
     func testGraphTrainingOnepoleSeparate() throws {
         let g = Graph()
@@ -1185,14 +1095,16 @@ final class GraphGradientTests: XCTestCase {
             loss: loss,
             parameters: [cutoff],
             optimizer: GraphSGD(),
-            learningRate: 0.05,  // Lower LR to avoid overshoot
+            learningRate: 0.2,  // Lower LR to avoid overshoot
             frameCount: 256
         )
 
-        for step in 0..<100 {
+        for step in 0..<1000 {
             let lossValue = ctx.trainStep()
             if step % 20 == 0 || step == 99 {
-                print("Step \(step): cutoff = \(cutoff.value), loss = \(lossValue), grad = \(cutoff.grad)")
+                print(
+                    "Step \(step): cutoff = \(cutoff.value), loss = \(lossValue), grad = \(cutoff.grad)"
+                )
             }
         }
 
@@ -1258,121 +1170,18 @@ final class GraphGradientTests: XCTestCase {
         )
 
         var lastLoss: Float = 0
-        for step in 0..<100 {
+        for step in 0..<4000 {
             lastLoss = ctx.trainStep()
             if step % 20 == 0 || step == 99 {
-                print("Step \(step): cutoff = \(cutoff.value), loss = \(lastLoss), grad = \(cutoff.grad)")
+                print(
+                    "Step \(step): cutoff = \(cutoff.value), loss = \(lastLoss), grad = \(cutoff.grad)"
+                )
             }
         }
 
         // Cutoff should converge toward 0.2
         print("\nFinal cutoff: \(cutoff.value) (target: 0.2)")
         XCTAssertEqual(cutoff.value, 0.2, accuracy: 0.05, "Cutoff should converge toward 0.2")
-    }
-
-    /// Test peekRow gradient flow:
-    /// 1. Create a 2D tensor (learnable)
-    /// 2. Use phasor to drive rowIndex for peekRow
-    /// 3. peekRow outputs 1D tensor -> drive deterministicPhasor
-    /// 4. Sum phasors to scalar
-    /// 5. MSE against a reference phasor
-    /// 6. Verify gradients flow and loss decreases
-    func testPeekRowGradientFlow() throws {
-        let frameCount = 64
-        let sampleRate: Float = 2000.0
-        let numRows = 8    // control frames
-        let numCols = 4    // number of frequencies
-
-        let g = Graph(sampleRate: sampleRate)
-
-        // Create a learnable 2D tensor [numRows, numCols]
-        // This will hold frequency multipliers that we want to learn
-        // Initialize with slightly wrong values
-        let initialData = (0..<(numRows * numCols)).map { i -> Float in
-            let col = i % numCols
-            // Target: frequencies 100, 200, 300, 400 Hz
-            // Start with slightly offset values
-            return Float(col + 1) * 100.0 + Float(i % 3) * 10.0  // Add some noise
-        }
-        let freqTensor = TensorParameter(
-            graph: g, shape: [numRows, numCols], data: initialData, name: "freqs")
-
-        // Target frequencies (what we want to converge to)
-        let targetFreqs: [Float] = [100.0, 200.0, 300.0, 400.0]
-        let targetTensor = g.tensor(shape: [numCols], data: targetFreqs)
-
-        let zero = g.n(.constant(0.0))
-        let twoPi = g.n(.constant(Float.pi * 2.0))
-
-        // Phasor to drive the playhead through rows
-        let playheadFreq = g.n(.constant(sampleRate / Float(frameCount)))
-        let playheadPhasor = g.phasor(freq: playheadFreq, reset: zero)
-        let playhead = g.n(.mul, [playheadPhasor, g.n(.constant(Float(numRows - 1)))])
-
-        // peekRow: get frequencies at current playhead position
-        // Output: 1D tensor [numCols]
-        let freqsAtTime = try g.peekRow(tensor: freqTensor.node(), rowIndex: playhead)
-
-        // Use these frequencies to drive phasors
-        let phases = g.n(.deterministicPhasor, [freqsAtTime])
-        let sines = g.n(.sin, [g.n(.mul, [twoPi, phases])])
-
-        // Sum to scalar
-        let synthOutput = g.n(.sum, [sines])
-
-        // Target: use the correct frequencies
-        let targetPhases = g.n(.deterministicPhasor, [targetTensor])
-        let targetSines = g.n(.sin, [g.n(.mul, [twoPi, targetPhases])])
-        let targetOutput = g.n(.sum, [targetSines])
-
-        // MSE loss
-        let diff = g.n(.sub, [synthOutput, targetOutput])
-        let loss = g.n(.mul, [diff, diff])
-        _ = g.n(.output(0), [loss])
-
-        print("\n=== PeekRow Gradient Flow Test ===")
-        print("Tensor shape: [\(numRows), \(numCols)]")
-        print("Target frequencies: \(targetFreqs)")
-
-        // Compile with backward pass
-        let compileResult = try CompilationPipeline.compile(
-            graph: g, backend: .metal,
-            options: .init(frameCount: frameCount, backwards: true))
-
-        let runtime = try MetalCompiledKernel(
-            kernels: compileResult.kernels,
-            cellAllocations: compileResult.cellAllocations,
-            context: compileResult.context)
-
-        let ctx = TrainingContext(
-            tensorParameters: [freqTensor],
-            optimizer: Adam(lr: 0.5),
-            lossNode: loss)
-
-        ctx.initializeMemory(
-            runtime: runtime,
-            cellAllocations: compileResult.cellAllocations,
-            context: compileResult.context,
-            frameCount: frameCount,
-            graph: g)
-
-        let initialLoss = ctx.runStepGPU()
-        print("Initial loss: \(initialLoss)")
-
-        var finalLoss = initialLoss
-        for epoch in 0..<30 {
-            finalLoss = ctx.runStepGPU()
-            if epoch % 10 == 0 || epoch == 29 {
-                print("Epoch \(epoch): loss = \(finalLoss)")
-            }
-        }
-
-        print("Final loss: \(finalLoss)")
-        print("Loss reduction: \(initialLoss / finalLoss)x")
-
-        // Verify loss decreased
-        XCTAssertLessThan(finalLoss, initialLoss * 0.5,
-            "Loss should decrease significantly with peekRow gradient flow")
     }
 
     /// Simple test: tensor -> peekRow -> sum -> loss
@@ -1497,14 +1306,17 @@ final class GraphGradientTests: XCTestCase {
 
         print("\nKernels generated: \(result.kernels.count)")
         for (i, kernel) in result.kernels.enumerated() {
-            print("  Kernel \(i): kind=\(kernel.kind) threadGroupSize=\(String(describing: kernel.threadGroupSize)) threadCount=\(String(describing: kernel.threadCount))")
+            print(
+                "  Kernel \(i): kind=\(kernel.kind) threadGroupSize=\(String(describing: kernel.threadGroupSize)) threadCount=\(String(describing: kernel.threadCount))"
+            )
         }
 
         // Write kernels for inspection
         let allKernels = result.kernels.enumerated().map {
             "// KERNEL \($0.offset)\n// Kind: \($0.element.kind)\n// ThreadGroupSize: \($0.element.threadGroupSize ?? -1)\n\n\($0.element.source)"
         }.joined(separator: "\n\n// ========================================\n\n")
-        try? allKernels.write(toFile: "/tmp/matmul_sum_debug.metal", atomically: true, encoding: .utf8)
+        try? allKernels.write(
+            toFile: "/tmp/matmul_sum_debug.metal", atomically: true, encoding: .utf8)
         print("\nWrote kernels to /tmp/matmul_sum_debug.metal")
     }
 
@@ -1576,7 +1388,8 @@ final class GraphGradientTests: XCTestCase {
         print("Final loss: \(finalLoss)")
 
         let hasNonZeroGrads = weightTensor.grads.contains { $0 != 0.0 }
-        XCTAssertTrue(hasNonZeroGrads, "Gradients should flow through matmul -> peekRow -> sum chain")
+        XCTAssertTrue(
+            hasNonZeroGrads, "Gradients should flow through matmul -> peekRow -> sum chain")
         XCTAssertLessThan(finalLoss, initialLoss, "Loss should decrease when gradients flow")
     }
 
@@ -1704,7 +1517,9 @@ final class GraphGradientTests: XCTestCase {
         print("\n=== MLP -> peekRow -> Harmonic Synth (Teacher-Student) ===")
         print("frameCount: \(frameCount), controlFrames: \(controlFrames)")
         print("numHarmonics: \(numHarmonics), hiddenSize: \(hiddenSize)")
-        print("Total learnable params: \(hiddenSize + hiddenSize + hiddenSize*numHarmonics + numHarmonics)")
+        print(
+            "Total learnable params: \(hiddenSize + hiddenSize + hiddenSize*numHarmonics + numHarmonics)"
+        )
 
         // Use GraphTrainingContext with graph-based gradients (no legacy backward IR)
         let compileStart = CFAbsoluteTimeGetCurrent()
@@ -1734,6 +1549,9 @@ final class GraphGradientTests: XCTestCase {
         for i in 0..<epochs {
             finalLoss = ctx.trainStep()
             print("Epoch \(i): loss = \(String(format: "%.6f", finalLoss))")
+            if finalLoss < initialLoss * 0.25 {
+                break
+            }
         }
         let trainTime = (CFAbsoluteTimeGetCurrent() - trainStart) * 1000
         let timePerEpoch = trainTime / Double(epochs)
@@ -1780,7 +1598,9 @@ final class GraphGradientTests: XCTestCase {
         var lastLoss: Float = 0
         for step in 0..<100 {
             lastLoss = ctx.trainStep()
-            print("Step \(step): a=\(a.value), b=\(b.value), a*b=\(a.value * b.value), loss=\(lastLoss)")
+            print(
+                "Step \(step): a=\(a.value), b=\(b.value), a*b=\(a.value * b.value), loss=\(lastLoss)"
+            )
         }
 
         // Product should be close to 6

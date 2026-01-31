@@ -251,51 +251,6 @@ func u_accum(_ cellId: CellID, incr: Expr, reset: Expr, min: Expr, max: Expr) ->
   }
 }
 
-/// Pass B: Reduce from memory to gradients.
-/// Each thread j (sample index) gathers contributions from all windows that include sample j.
-func u_spectralLossBackwardPass2(
-  _ windowSize: Int,
-  _ scratchCell: CellID,
-  _ sig1: Expr,
-  _ sig2: Expr,
-  _ upstreamGrad: Expr,
-  _ gradId1: GradID,
-  _ gradId2: GradID
-) -> (IRBuilder) -> (Expr, Expr) {
-  return { b in
-    let j = b.threadIndex()  // Sample index
-    let grad1 = b.float(0.0)
-    let grad2 = b.float(0.0)
-    let frameCount = b.value(.variable(-1, nil))
-
-    // Gather from all windows that include sample j
-    // Windows ending at i ∈ [j .. j+(windowSize-1)]
-    b.loop(windowSize) { offsetFromJ in
-      let windowEnd = j + b.cast(offsetFromJ, to: .float)  // i
-
-      // Window offset: n = j - i + (windowSize - 1)
-      let winSize = b.constant(Float(windowSize))
-      let n = j - windowEnd + (winSize - b.constant(1.0))
-
-      // Only read scratch for valid window ends
-      b.if(windowEnd < frameCount) {
-        // Memory offset: memory[scratchCell + (i * windowSize * 2) + (n * 2) + component]
-        let offset1 = windowEnd * winSize * b.constant(2.0) + n * b.constant(2.0)
-        let offset2 = offset1 + b.constant(1.0)
-
-        // Read contributions from memory
-        let contrib1 = b.memoryRead(scratchCell, b.cast(offset1, to: .int))
-        let contrib2 = b.memoryRead(scratchCell, b.cast(offset2, to: .int))
-
-        grad1.accumulate(contrib1)
-        grad2.accumulate(contrib2)
-      }
-    }
-
-    return (grad1.value, grad2.value)
-  }
-}
-
 /// Pass1 for parallelMap2D test: writes per-bin values into scratch.
 /// Value = frameIdx * 100 + binIdx
 func u_parallelMap2DTestPass1(

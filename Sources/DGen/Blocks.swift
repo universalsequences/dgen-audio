@@ -3,13 +3,11 @@
 import Foundation
 
 public enum Kind { case simd, scalar }
-public enum Direction { case forward, backwards }
 
 // corresponds to one kernel (metal backends) or for loop (in C backend)
 public struct Block: Equatable {
     public var kind: Kind
     public var nodes: [NodeID] = []
-    public var direction: Direction = .forward
     public var temporality: Temporality = .static_
     public var tensorIndex: Lazy?
     public var shape: Shape?
@@ -23,7 +21,7 @@ public struct Block: Equatable {
 
     public static func == (lhs: Block, rhs: Block) -> Bool {
         // Exclude frameTensorChain from equality to avoid issues with Equatable
-        return lhs.kind == rhs.kind && lhs.nodes == rhs.nodes && lhs.direction == rhs.direction
+        return lhs.kind == rhs.kind && lhs.nodes == rhs.nodes
             && lhs.temporality == rhs.temporality && lhs.tensorIndex == rhs.tensorIndex
             && lhs.shape == rhs.shape
     }
@@ -877,71 +875,6 @@ public func isolateSpectralPasses(_ blocks: [Block], _ g: Graph) -> [Block] {
     return result
 }
 
-/// Split backward blocks that contain both spectralLossPass1 and spectralLossPass2.
-/// In backward pass: Pass2's backward writes to scratch, Pass1's backward reads from scratch.
-/// They must be in separate kernels to avoid race conditions.
-/// This preserves the node order within each split block.
-public func splitSpectralBackwardBlocks(_ blocks: [Block], _ g: Graph) -> [Block] {
-    var result: [Block] = []
-
-    for block in blocks {
-        // Only process backward blocks
-        guard block.direction == .backwards else {
-            result.append(block)
-            continue
-        }
-
-        // Check if block has both Pass1 and Pass2
-        var hasPass1 = false
-        var hasPass2 = false
-        for nodeId in block.nodes {
-            if let node = g.nodes[nodeId] {
-                if case .spectralLossPass1 = node.op { hasPass1 = true }
-                if case .spectralLossPass2 = node.op { hasPass2 = true }
-            }
-        }
-
-        // If block has both, split into: [Pass2 nodes + others before Pass1] and [Pass1 nodes + others after]
-        if hasPass1 && hasPass2 {
-            var pass2Block = Block(kind: block.kind)
-            pass2Block.direction = .backwards
-            var pass1Block = Block(kind: block.kind)
-            pass1Block.direction = .backwards
-
-            var seenPass1 = false
-            for nodeId in block.nodes {
-                var isPass1 = false
-                if let node = g.nodes[nodeId] {
-                    if case .spectralLossPass1 = node.op { isPass1 = true }
-                }
-
-                if isPass1 {
-                    seenPass1 = true
-                }
-
-                // Pass2 backward ops and everything before first Pass1 go in first block
-                // Pass1 backward ops and everything after go in second block
-                if seenPass1 {
-                    pass1Block.nodes.append(nodeId)
-                } else {
-                    pass2Block.nodes.append(nodeId)
-                }
-            }
-
-            if !pass2Block.nodes.isEmpty {
-                result.append(pass2Block)
-            }
-            if !pass1Block.nodes.isEmpty {
-                result.append(pass1Block)
-            }
-        } else {
-            result.append(block)
-        }
-    }
-
-    return result
-}
-
 public func splitBlocksIfNeeded(_ blocks: [Block], backend: Backend) -> [Block] {
     if case .c = backend {
         return blocks
@@ -1296,7 +1229,7 @@ public func emitBlockUOps(
     ctx.clearTensorRegisters()
 
     // Step 1: Emit all node UOps first (without wrapping in parallelRange yet)
-    if let chain = block.frameTensorChain, case .forward = block.direction,
+    if let chain = block.frameTensorChain,
         block.tensorIndex == nil,
         ctx.frameTensorChainScratch[chain.reductionNodeId] != nil
     {
@@ -1309,17 +1242,9 @@ public func emitBlockUOps(
             }
 
             if let node = g.nodes[nodeId] {
-                if case .forward = block.direction {
-                    for uop in try node.op.emit(ctx: ctx, g: g, nodeId: nodeId) {
-                        emittedNodes.insert(nodeId)
-                        bodyUops.append(uop)
-                    }
-                } else {
-                    let back = try node.op.emitBackward(ctx: ctx, g: g, nodeId: nodeId)
-                    for uop in back {
-                        emittedNodes.insert(nodeId)
-                        bodyUops.append(uop)
-                    }
+                for uop in try node.op.emit(ctx: ctx, g: g, nodeId: nodeId) {
+                    emittedNodes.insert(nodeId)
+                    bodyUops.append(uop)
                 }
             }
         }
