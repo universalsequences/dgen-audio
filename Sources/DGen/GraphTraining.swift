@@ -84,7 +84,9 @@ public struct GraphAdam: GraphOptimizer {
             v = Array(repeating: 0.0, count: parameters.count)
         }
 
-        t += 1
+        // Note: t is incremented in updateTensors() which is always called after this
+        // We use (t+1) here to get the correct timestep for this step
+        let currentT = t + 1
 
         for i in 0..<parameters.count {
             let grad = parameters[i].grad
@@ -92,8 +94,8 @@ public struct GraphAdam: GraphOptimizer {
             m[i] = beta1 * m[i] + (1 - beta1) * grad
             v[i] = beta2 * v[i] + (1 - beta2) * grad * grad
 
-            let mHat = m[i] / (1 - pow(beta1, Float(t)))
-            let vHat = v[i] / (1 - pow(beta2, Float(t)))
+            let mHat = m[i] / (1 - pow(beta1, Float(currentT)))
+            let vHat = v[i] / (1 - pow(beta2, Float(currentT)))
 
             parameters[i].value -= learningRate * mHat / (sqrt(vHat) + epsilon)
         }
@@ -106,10 +108,8 @@ public struct GraphAdam: GraphOptimizer {
             tensorV = tensorParameters.map { Array(repeating: Float(0.0), count: $0.data.count) }
         }
 
-        // Note: t is already incremented in update() if called, otherwise increment here
-        if m.isEmpty {
-            t += 1
-        }
+        // Increment timestep for tensor updates
+        t += 1
 
         for (pi, param) in tensorParameters.enumerated() {
             for i in 0..<param.data.count {
@@ -195,11 +195,8 @@ public class GraphTrainingContext {
         var targetNodes = Set(parameters.map { $0.nodeId })
         for tp in tensorParameters {
             targetNodes.insert(tp.nodeId)
-            print("[DEBUG] Target tensor param '\(tp.name ?? "?")' nodeId=\(tp.nodeId)")
         }
-        print("[DEBUG] Computing gradients from loss node \(lossNode) with \(targetNodes.count) targets: \(targetNodes.sorted())")
         let gradients = graph.computeGradients(loss: lossNode, targets: targetNodes)
-        print("[DEBUG] Gradients computed for nodes: \(gradients.keys.sorted())")
 
         // Step 2: For each scalar parameter, create atomic accumulator for its gradient
         let zero = graph.n(.constant(0.0))
@@ -241,7 +238,6 @@ public class GraphTrainingContext {
         }
 
         // Ensure gradient side effects are scheduled
-        print("[DEBUG] After computeGradients: gradientSideEffects=\(graph.gradientSideEffects.count), gradCarryCells=\(graph.gradCarryCells)")
         if !graph.gradientSideEffects.isEmpty {
             // Find the output node and make it depend on all side effects
             // This ensures the scatter operations get scheduled
@@ -304,28 +300,22 @@ public class GraphTrainingContext {
         }
 
         // Step 5b: Cache physical cell indices for tensor params
-        print("[DEBUG] tensorGradCells: \(graph.tensorGradCells)")
-        print("[DEBUG] gradCarryCells: \(graph.gradCarryCells)")
         for tp in tensorParameters {
             let physicalBase = result.cellAllocations.cellMappings[tp.cellId] ?? tp.cellId
             tensorPhysicalCells.append((base: physicalBase, size: tp.size))
-            print("[DEBUG] TensorParam '\(tp.name ?? "?")' cellId=\(tp.cellId) physicalBase=\(physicalBase)")
 
             // First: check tensorGradCells (from tensorAccumulate)
             if let gradCell = graph.tensorGradCells[tp.nodeId] {
                 let physical = result.cellAllocations.cellMappings[gradCell] ?? gradCell
                 tensorGradPhysicalCells.append((base: physical, size: tp.size))
-                print("[DEBUG]   -> tensorGradCells gradCell=\(gradCell) physical=\(physical)")
             }
             // Fallback: scatter-based (direct peekRow)
             else if let gradCellId = graph.gradCarryCells[tp.cellId] {
                 let physicalGradBase = result.cellAllocations.cellMappings[gradCellId] ?? gradCellId
                 tensorGradPhysicalCells.append((base: physicalGradBase, size: tp.size))
-                print("[DEBUG]   -> gradCarryCells gradCellId=\(gradCellId) physicalGradBase=\(physicalGradBase)")
             } else {
                 // No gradient cell found - tensor wasn't read with gradient-aware ops
                 tensorGradPhysicalCells.append((base: -1, size: tp.size))
-                print("[DEBUG]   -> NO gradient cell found!")
             }
         }
 
@@ -402,19 +392,21 @@ public class GraphTrainingContext {
         if let memBuffer = runtime.getBuffer(name: "memory") {
             let memPtr = memBuffer.contents().assumingMemoryBound(to: Float.self)
 
-            // Read scalar param gradients
+            // Read scalar param gradients (normalize by frame count to get mean gradient)
+            let scalarGradScale = 1.0 / Float(frameCount)
             for (i, param) in parameters.enumerated() {
                 if gradPhysicalCells[i] >= 0 {
-                    param.grad = memPtr[gradPhysicalCells[i]]
+                    param.grad = memPtr[gradPhysicalCells[i]] * scalarGradScale
                 }
             }
 
-            // Read tensor param gradients
+            // Read tensor param gradients (normalize by frame count to get mean gradient)
+            let gradScale = 1.0 / Float(frameCount)
             for (i, tp) in tensorParameters.enumerated() {
                 let gradInfo = tensorGradPhysicalCells[i]
                 if gradInfo.base >= 0 {
                     for j in 0..<gradInfo.size {
-                        tp.grads[j] = memPtr[gradInfo.base + j]
+                        tp.grads[j] = memPtr[gradInfo.base + j] * gradScale
                     }
                 }
             }

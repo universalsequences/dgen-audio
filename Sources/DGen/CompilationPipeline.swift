@@ -134,14 +134,28 @@ public struct CompilationPipeline {
         // Step 2: Determine scalar nodes and create blocks
 
         // Step 2.5: Handle seq operators - if any input to seq is scalar, make all inputs scalar
+        // But don't re-add SIMD-safe operations (they use atomics and can run in parallel)
         var finalScalarSet = scalarNodeSet
         time("seqScalarPropagate") {
+            // Build set of SIMD-safe nodes that should never be marked scalar
+            var simdSafe = Set<NodeID>()
+            for (nodeId, node) in graph.nodes {
+                switch node.op {
+                case .memoryAccumulate(_), .tensorAccumulate(_):
+                    simdSafe.insert(nodeId)
+                default: break
+                }
+            }
+
             for (_, node) in graph.nodes {
                 if case .seq = node.op {
                     let hasScalarInput = node.inputs.contains { finalScalarSet.contains($0) }
                     if hasScalarInput {
                         for inputId in node.inputs {
-                            finalScalarSet.insert(inputId)
+                            // Don't add SIMD-safe nodes to scalar set
+                            if !simdSafe.contains(inputId) {
+                                finalScalarSet.insert(inputId)
+                            }
                         }
                     }
                 }

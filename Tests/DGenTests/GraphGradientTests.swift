@@ -1643,7 +1643,7 @@ final class GraphGradientTests: XCTestCase {
             loss: loss,
             tensorParameters: [studentW1, studentB1, studentW2, studentB2],
             optimizer: GraphAdam(),
-            learningRate: 0.05,
+            learningRate: 0.0005,
             frameCount: frameCount,
             kernelDebugOutput: "/tmp/mlp_peekrow_harmonic_graph.metal"
         )

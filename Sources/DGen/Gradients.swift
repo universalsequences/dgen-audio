@@ -40,17 +40,13 @@ extension Graph {
 
         // Walk in reverse topological order
         let reverseOrder = reverseTopologicalOrder(from: loss, targets: targets)
-        print("[GRAD DEBUG] reverseTopologicalOrder has \(reverseOrder.count) nodes")
         for nodeId in reverseOrder {
             guard let upstreamGrad = grads[nodeId],
                   let node = nodes[nodeId] else { continue }
 
-            print("[GRAD DEBUG] Processing node \(nodeId): \(node.op), inputs=\(node.inputs)")
-
             // Apply backward rule -> get gradient NodeIDs for inputs
             // Also handles side effects like storing to gradient carry cells
             let inputGrads = node.op.backward(graph: self, node: node, gradOutput: upstreamGrad)
-            print("[GRAD DEBUG]   backward returned \(inputGrads.count) grads: \(inputGrads)")
 
             // Accumulate gradients (as graph nodes, not values!)
             for (inputId, grad) in zip(node.inputs, inputGrads) {
@@ -64,7 +60,6 @@ extension Graph {
                 }
             }
         }
-        print("[GRAD DEBUG] Final grads dict has \(grads.count) entries, sideEffects=\(gradientSideEffects.count)")
 
         return grads
     }

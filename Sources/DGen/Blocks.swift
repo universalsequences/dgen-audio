@@ -258,6 +258,20 @@ public func determineScalarCorridors(_ g: Graph, feedbackClusters: [[NodeID]]) -
 public func scalarNodes(_ g: Graph, feedbackClusters: [[NodeID]]) -> Set<NodeID> {
     var scalar: Set<NodeID> = []
 
+    // Track nodes that are SIMD-safe due to using atomics (should never be scalar)
+    var simdSafe: Set<NodeID> = []
+    g.nodes.values.forEach {
+        switch $0.op {
+        case .memoryAccumulate(_):
+            // memoryAccumulate uses atomics - safe for SIMD execution
+            simdSafe.insert($0.id)
+        case .tensorAccumulate(_):
+            // tensorAccumulate uses atomics internally - safe for SIMD execution
+            simdSafe.insert($0.id)
+        default: break
+        }
+    }
+
     //return Set(g.nodes.keys)
 
     // First, mark inherently scalar operations
@@ -309,7 +323,10 @@ public func scalarNodes(_ g: Graph, feedbackClusters: [[NodeID]]) -> Set<NodeID>
     }
 
     // Mark nodes with tensor inputs as scalar (they need element-wise loops)
+    // EXCEPT for SIMD-safe operations that handle tensors internally with atomics
     g.nodes.values.forEach {
+        // Skip SIMD-safe operations - they can run in parallel across frames
+        if simdSafe.contains($0.id) { return }
         for inputId in $0.inputs {
             if tensorNodes.contains(inputId) {
                 scalar.insert($0.id)
@@ -324,6 +341,8 @@ public func scalarNodes(_ g: Graph, feedbackClusters: [[NodeID]]) -> Set<NodeID>
     while changed {
         changed = false
         g.nodes.values.forEach { node in
+            // Skip SIMD-safe operations
+            if simdSafe.contains(node.id) { return }
             for inputId in node.inputs {
                 if tensorNodes.contains(inputId) {
                     // Mark as scalar if not already
@@ -365,6 +384,7 @@ public func scalarNodes(_ g: Graph, feedbackClusters: [[NodeID]]) -> Set<NodeID>
     // Propagate frame-based tensor status to downstream tensor consumers.
     // Any tensor op that consumes a frame-based tensor must also be scalar,
     // because its input values change every frame.
+    // EXCEPT for SIMD-safe operations that use atomics.
     // We iterate until no changes, checking ALL inputs (not just direct ones).
     changed = true
     var iteration = 0
@@ -372,6 +392,8 @@ public func scalarNodes(_ g: Graph, feedbackClusters: [[NodeID]]) -> Set<NodeID>
         changed = false
         iteration += 1
         for (nodeId, node) in g.nodes {
+            // Skip SIMD-safe operations - they can run in parallel across frames
+            if simdSafe.contains(nodeId) { continue }
             // Skip if already marked as frame-based tensor
             if frameBasedTensorNodes.contains(nodeId) { continue }
 
@@ -402,6 +424,9 @@ public func scalarNodes(_ g: Graph, feedbackClusters: [[NodeID]]) -> Set<NodeID>
             scalar.insert(nodeId)
         }
     }
+
+    // Remove SIMD-safe nodes from scalar set - these use atomics and are safe for parallel execution
+    scalar.subtract(simdSafe)
 
     return scalar
 }
