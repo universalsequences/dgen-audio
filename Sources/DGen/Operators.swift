@@ -111,6 +111,28 @@ public enum LazyOp {
         windowSize: Int,
         gradTime2Cell: CellID
     )
+    // selectRow: extract a single row from a 2D tensor using dynamic index
+    // Input: [tensor2D, rowIndex] where rowIndex is floored to int
+    // Output: 1D tensor [numCols]
+    case selectRow
+    // peekRowInline: interpolated row extraction with frame-local computation
+    // Input: [tensor2D, rowIndex] where rowIndex is interpolated between floor and ceil
+    // Output: 1D tensor [numCols] - uses frame-indexed storage for SIMD safety
+    // scratchCell stores frame-indexed outputs: frame * numCols + col
+    case peekRowInline(scratchCell: CellID, numRows: Int, numCols: Int)
+    // peekRowGradWrite: write gradients for both floor and ceil rows to frame-indexed storage
+    // Input: [gradOutput (1D tensor), rowIndex]
+    case peekRowGradWrite(floorGradCell: CellID, ceilGradCell: CellID, rowIdxCell: CellID, fracCell: CellID, numRows: Int, numCols: Int)
+    // peekRowGradReduce: sum gradient contributions from all frames for each tensor position
+    case peekRowGradReduce(floorGradCell: CellID, ceilGradCell: CellID, rowIdxCell: CellID, fracCell: CellID, gradCell: CellID, numRows: Int, numCols: Int, maxFrameCount: Int)
+    // selectRowGradWrite: write gradient to frame-indexed storage (deterministic, no atomics)
+    // Input: [gradOutput (1D tensor), rowIndex]
+    // Writes to gradWriteCell[frame * numCols + col] and rowIdxCell[frame]
+    case selectRowGradWrite(gradWriteCell: CellID, rowIdxCell: CellID, numRows: Int, numCols: Int)
+    // selectRowGradReduce: sum contributions from all frames for each tensor position
+    // Input: [gradWritePass] (for ordering)
+    // Reads from frame-indexed storage and accumulates to gradCell
+    case selectRowGradReduce(gradWriteCell: CellID, rowIdxCell: CellID, gradCell: CellID, numRows: Int, numCols: Int, maxFrameCount: Int)
     case parallelMap2DTestPass1(Int, CellID)  // Pass 1: write per-bin values to scratch
     case parallelMap2DTestPass2(Int, CellID)  // Pass 2: reduce per-bin values to scalar
     case selector  // selector(mode, options[])
@@ -145,7 +167,6 @@ public enum LazyOp {
     case shrink([(Int, Int)?])  // Shrink/slice tensor (metadata only, no data movement)
     case pad([(Int, Int)])  // Pad tensor with zeros (virtual view, conditional reads)
     case peek  // Read from 2D tensor at (index, channel) with interpolation - lazy version
-    case peekRow  // Read entire row from 2D tensor with interpolation - outputs 1D tensor
     case fft(Int, Int, CellID, CellID, CellID, CellID)  // FFT transform: windowSize, hopSize, scratchCell, ringBufferCell, writePosCell, counterCell
     case ifft(Int, Int, CellID, CellID, CellID, CellID)  // IFFT transform: windowSize, hopSize, scratchCell, outputRingCell, readPosCell, counterCell
 
@@ -949,6 +970,355 @@ public enum LazyOp {
             }
             b.use(val: gradSum.value)
 
+        case .selectRow:
+            // selectRow: extract a single row from a 2D tensor using dynamic index
+            // Inputs: [tensor2D, rowIndex]
+            // Output: 1D tensor [numCols]
+            guard node.inputs.count == 2 else {
+                throw DGenError.insufficientInputs(
+                    operator: "selectRow", expected: 2, actual: node.inputs.count)
+            }
+
+            let tensorInput = node.inputs[0]
+
+            // Get tensor shape from the input node
+            guard let inputNode = g.nodes[tensorInput],
+                case .tensor(let shape) = inputNode.shape,
+                shape.count == 2
+            else {
+                throw DGenError.tensorError(op: "selectRow", reason: "requires 2D tensor input")
+            }
+
+            let numRows = shape[0]
+            let numCols = shape[1]
+
+            // Get input and output tensors
+            guard let inTensorId = g.nodeToTensor[tensorInput],
+                let inTensor = g.tensors[inTensorId],
+                let outTensorId = g.nodeToTensor[node.id],
+                let outTensor = g.tensors[outTensorId]
+            else {
+                throw DGenError.tensorError(op: "selectRow", reason: "missing tensor")
+            }
+
+            // Read rowIndex input and floor it
+            let rowIndex = try b.readInput(node, inputs, at: 1)
+            let numRowsFloat = b.constant(Float(numRows))
+            let zero = b.constant(0.0)
+
+            // Wrap rowIndex using modulo for wrapping behavior, then floor
+            let wrappedIndex = b.mod(rowIndex, numRowsFloat)
+            let isNegative = wrappedIndex < zero
+            let positiveIndex = b.gswitch(isNegative, wrappedIndex + numRowsFloat, wrappedIndex)
+            let floorIndex = b.floor(positiveIndex)
+
+            // Read the selected row and write to output
+            // Column-major layout: offset = col * numRows + row
+            b.parallelRange(numCols) { colIdx in
+                let colIdxFloat = b.cast(colIdx, to: .float)
+                let readPos = colIdxFloat * numRowsFloat + floorIndex
+                let value = b.memoryRead(inTensor.cellId, b.cast(readPos, to: .int))
+                _ = b.memoryWrite(outTensor.cellId, b.cast(colIdx, to: .int), value)
+            }
+
+            ctx.values[nodeId] = .empty
+
+        case .peekRowInline(let scratchCell, let numRows, let numCols):
+            // Interpolated row extraction with frame-indexed storage for SIMD safety
+            // Inputs: [tensor2D, rowIndex]
+            // Output: 1D tensor [numCols] stored at scratchCell[frame * numCols + col]
+            guard node.inputs.count == 2 else {
+                throw DGenError.insufficientInputs(
+                    operator: "peekRowInline", expected: 2, actual: node.inputs.count)
+            }
+
+            let tensorInput = node.inputs[0]
+
+            // Get input tensor
+            guard let inTensorId = g.nodeToTensor[tensorInput],
+                let inTensor = g.tensors[inTensorId],
+                let outTensorId = g.nodeToTensor[node.id],
+                let outTensor = g.tensors[outTensorId]
+            else {
+                throw DGenError.tensorError(op: "peekRowInline", reason: "missing tensor")
+            }
+
+            // Read rowIndex input
+            let rowIndex = try b.readInput(node, inputs, at: 1)
+            let numRowsFloat = b.constant(Float(numRows))
+            let numColsFloat = b.constant(Float(numCols))
+            let zero = b.constant(0.0)
+            let one = b.constant(1.0)
+
+            // Wrap rowIndex using modulo for wrapping behavior
+            let wrappedIndex = b.mod(rowIndex, numRowsFloat)
+            let isNegative = wrappedIndex < zero
+            let positiveIndex = b.gswitch(isNegative, wrappedIndex + numRowsFloat, wrappedIndex)
+
+            // Compute floor and ceil indices
+            let floorIndex = b.floor(positiveIndex)
+            let ceilIndex = floorIndex + one
+            let ceilWrapped = b.gswitch(ceilIndex >= numRowsFloat, zero, ceilIndex)
+
+            // Compute frac for interpolation
+            let frac = positiveIndex - floorIndex
+            let oneMinusFrac = one - frac
+
+            // Get frame index for frame-indexed output storage
+            let frameIdx = b.threadIndex()
+            let frameBase = frameIdx * numColsFloat
+
+            // Compute interpolated values and write to frame-indexed positions
+            // Column-major layout for input: offset = col * numRows + row
+            b.parallelRange(numCols) { colIdx in
+                let colIdxFloat = b.cast(colIdx, to: .float)
+                // Read floor row value
+                let floorPos = colIdxFloat * numRowsFloat + floorIndex
+                let floorValue = b.memoryRead(inTensor.cellId, b.cast(floorPos, to: .int))
+                // Read ceil row value
+                let ceilPos = colIdxFloat * numRowsFloat + ceilWrapped
+                let ceilValue = b.memoryRead(inTensor.cellId, b.cast(ceilPos, to: .int))
+                // Interpolate: (1 - frac) * floor + frac * ceil
+                let interpolated = oneMinusFrac * floorValue + frac * ceilValue
+                // Write to frame-indexed position in scratch cell
+                let writePos = frameBase + colIdxFloat
+                _ = b.memoryWrite(scratchCell, b.cast(writePos, to: .int), interpolated)
+                // Also write to output tensor for compatibility (will be overwritten each frame)
+                _ = b.memoryWrite(outTensor.cellId, b.cast(colIdx, to: .int), interpolated)
+            }
+
+            ctx.values[nodeId] = .empty
+
+        case .selectRowGradWrite(let gradWriteCell, let rowIdxCell, let numRows, let numCols):
+            // Write gradient to frame-indexed storage (deterministic, no atomics)
+            // Inputs: [gradOutput (1D tensor), rowIndex]
+            // Writes to gradWriteCell[frame * numCols + col] and rowIdxCell[frame]
+            guard node.inputs.count == 2 else {
+                throw DGenError.insufficientInputs(
+                    operator: "selectRowGradWrite", expected: 2, actual: node.inputs.count)
+            }
+
+            let gradTensorInput = node.inputs[0]
+
+            // Get the gradient tensor's cell
+            guard let gradTensorId = g.nodeToTensor[gradTensorInput],
+                let gradTensor = g.tensors[gradTensorId]
+            else {
+                throw DGenError.tensorError(op: "selectRowGradWrite", reason: "missing gradient tensor")
+            }
+
+            // Read rowIndex input and floor it
+            let rowIndex = try b.readInput(node, inputs, at: 1)
+            let numRowsFloat = b.constant(Float(numRows))
+            let numColsFloat = b.constant(Float(numCols))
+            let zero = b.constant(0.0)
+
+            // Wrap rowIndex using modulo for wrapping behavior, then floor
+            let wrappedIndex = b.mod(rowIndex, numRowsFloat)
+            let isNegative = wrappedIndex < zero
+            let positiveIndex = b.gswitch(isNegative, wrappedIndex + numRowsFloat, wrappedIndex)
+            let floorIndex = b.floor(positiveIndex)
+
+            // Get frame index for frame-indexed storage
+            let frameIdx = b.threadIndex()
+
+            // Write the floored row index for this frame
+            _ = b.memoryWrite(rowIdxCell, b.cast(frameIdx, to: .int), floorIndex)
+
+            // Write each gradient element to frame-indexed position
+            // Layout: gradWriteCell[frame * numCols + col]
+            let frameBase = frameIdx * numColsFloat
+            b.parallelRange(numCols) { colIdx in
+                let colIdxFloat = b.cast(colIdx, to: .float)
+                // Read gradient element from gradOutput tensor
+                let gradValue = b.memoryRead(gradTensor.cellId, b.cast(colIdx, to: .int))
+                // Write to frame-indexed position
+                let writePos = frameBase + colIdxFloat
+                _ = b.memoryWrite(gradWriteCell, b.cast(writePos, to: .int), gradValue)
+            }
+
+            b.use(val: zero)  // Side-effect only
+
+        case .selectRowGradReduce(let gradWriteCell, let rowIdxCell, let gradCell,
+                                   let numRows, let numCols, let maxFrameCount):
+            // Sum contributions from all frames for each tensor position
+            // Input: [gradWritePass] (for ordering)
+            // Reads from frame-indexed storage and accumulates to gradCell
+            guard node.inputs.count == 1 else {
+                throw DGenError.insufficientInputs(
+                    operator: "selectRowGradReduce", expected: 1, actual: node.inputs.count)
+            }
+
+            // Force dependency on write pass
+            let _ = b.value(inputs[0])
+
+            let numColsFloat = b.constant(Float(numCols))
+            let zero = b.constant(0.0)
+
+            // For each position in the 2D tensor, sum contributions from all frames
+            // that selected this row
+            // Column-major layout: offset = col * numRows + row
+            b.parallelRange(numRows) { rowIdx in
+                let rowFloat = b.cast(rowIdx, to: .float)
+
+                b.parallelRange(numCols) { colIdx in
+                    let colFloat = b.cast(colIdx, to: .float)
+                    let gradSum = b.float(0.0)
+
+                    // Loop over all frames
+                    b.loop(maxFrameCount) { frameIdx in
+                        let frameFloat = b.cast(frameIdx, to: .float)
+                        // Read which row this frame selected
+                        let selectedRow = b.memoryRead(rowIdxCell, b.cast(frameIdx, to: .int))
+                        // Check if this frame selected the current row
+                        let isMatch = b.abs(selectedRow - rowFloat) < b.constant(0.5)
+                        // Read gradient value from frame-indexed storage
+                        let readPos = frameFloat * numColsFloat + colFloat
+                        let gradValue = b.memoryRead(gradWriteCell, b.cast(readPos, to: .int))
+                        // Conditionally accumulate
+                        let contribution = b.gswitch(isMatch, gradValue, zero)
+                        gradSum.accumulate(contribution)
+                    }
+
+                    // Write accumulated gradient to output cell
+                    // Column-major layout: offset = col * numRows + row
+                    let destPos = colFloat * b.constant(Float(numRows)) + rowFloat
+                    _ = b.memoryAccumulate(gradCell, b.cast(destPos, to: .int), gradSum.value)
+                }
+            }
+
+            b.use(val: zero)  // Side-effect only
+
+        case .peekRowGradWrite(let floorGradCell, let ceilGradCell, let rowIdxCell, let fracCell,
+                               let numRows, let numCols):
+            // Write gradients for both floor and ceil rows to frame-indexed storage
+            // Inputs: [gradOutput (scalar or 1D tensor), rowIndex]
+            // Note: gradOutput can be scalar (from sum reduction) - same value for all elements
+            guard node.inputs.count == 2 else {
+                throw DGenError.insufficientInputs(
+                    operator: "peekRowGradWrite", expected: 2, actual: node.inputs.count)
+            }
+
+            let gradTensorInput = node.inputs[0]
+
+            // Check if gradient input is a tensor or scalar
+            let gradCellId: CellID?
+            if let gradTensorId = g.nodeToTensor[gradTensorInput],
+               let gradTensor = g.tensors[gradTensorId] {
+                gradCellId = gradTensor.cellId
+            } else {
+                gradCellId = nil  // Scalar gradient - will use b.value()
+            }
+
+            // Read gradient as scalar (works for both scalar and will be used as broadcast value)
+            let scalarGrad = b.value(inputs[0])
+
+            // Read rowIndex input
+            let rowIndex = try b.readInput(node, inputs, at: 1)
+            let numRowsFloat = b.constant(Float(numRows))
+            let numColsFloat = b.constant(Float(numCols))
+            let zero = b.constant(0.0)
+            let one = b.constant(1.0)
+
+            // Wrap rowIndex using modulo
+            let wrappedIndex = b.mod(rowIndex, numRowsFloat)
+            let isNegative = wrappedIndex < zero
+            let positiveIndex = b.gswitch(isNegative, wrappedIndex + numRowsFloat, wrappedIndex)
+
+            // Compute floor and ceil indices
+            let floorIndex = b.floor(positiveIndex)
+            let ceilIndex = floorIndex + one
+            let ceilWrapped = b.gswitch(ceilIndex >= numRowsFloat, zero, ceilIndex)
+
+            // Compute frac
+            let frac = positiveIndex - floorIndex
+
+            // Get frame index
+            let frameIdx = b.threadIndex()
+
+            // Write row indices and frac for this frame
+            _ = b.memoryWrite(rowIdxCell, b.cast(frameIdx, to: .int), floorIndex)
+            _ = b.memoryWrite(fracCell, b.cast(frameIdx, to: .int), frac)
+            // Write ceil index to a separate slot (frame + maxFrameCount)
+            let ceilSlot = frameIdx + b.constant(4096.0)  // maxFrameCount offset
+            _ = b.memoryWrite(rowIdxCell, b.cast(ceilSlot, to: .int), ceilWrapped)
+
+            // Write weighted gradients for floor and ceil
+            // floor gets grad * (1 - frac), ceil gets grad * frac
+            let oneMinusFrac = one - frac
+            let frameBase = frameIdx * numColsFloat
+
+            b.parallelRange(numCols) { colIdx in
+                let colIdxFloat = b.cast(colIdx, to: .float)
+                // Get gradient value - from tensor cell if available, otherwise use scalar
+                let gradValue: Expr
+                if let cellId = gradCellId {
+                    gradValue = b.memoryRead(cellId, b.cast(colIdx, to: .int))
+                } else {
+                    gradValue = scalarGrad  // Broadcast scalar to all elements
+                }
+                let writePos = frameBase + colIdxFloat
+                // Floor gradient: grad * (1 - frac)
+                let floorGrad = gradValue * oneMinusFrac
+                _ = b.memoryWrite(floorGradCell, b.cast(writePos, to: .int), floorGrad)
+                // Ceil gradient: grad * frac
+                let ceilGrad = gradValue * frac
+                _ = b.memoryWrite(ceilGradCell, b.cast(writePos, to: .int), ceilGrad)
+            }
+
+            b.use(val: zero)
+
+        case .peekRowGradReduce(let floorGradCell, let ceilGradCell, let rowIdxCell, _,
+                                 let gradCell, let numRows, let numCols, let maxFrameCount):
+            // Sum gradient contributions from all frames for each tensor position
+            guard node.inputs.count == 1 else {
+                throw DGenError.insufficientInputs(
+                    operator: "peekRowGradReduce", expected: 1, actual: node.inputs.count)
+            }
+
+            // Force dependency on write pass
+            let _ = b.value(inputs[0])
+
+            let numColsFloat = b.constant(Float(numCols))
+            let zero = b.constant(0.0)
+            let maxFrameCountFloat = b.constant(Float(maxFrameCount))
+
+            // For each position in the 2D tensor, sum contributions from all frames
+            b.parallelRange(numRows) { rowIdx in
+                let rowFloat = b.cast(rowIdx, to: .float)
+
+                b.parallelRange(numCols) { colIdx in
+                    let colFloat = b.cast(colIdx, to: .float)
+                    let gradSum = b.float(0.0)
+
+                    // Check both floor and ceil contributions from each frame
+                    b.loop(maxFrameCount) { frameIdx in
+                        let frameFloat = b.cast(frameIdx, to: .float)
+                        // Check floor row match
+                        let floorRow = b.memoryRead(rowIdxCell, b.cast(frameIdx, to: .int))
+                        let isFloorMatch = b.abs(floorRow - rowFloat) < b.constant(0.5)
+                        let readPos = frameFloat * numColsFloat + colFloat
+                        let floorGrad = b.memoryRead(floorGradCell, b.cast(readPos, to: .int))
+                        let floorContrib = b.gswitch(isFloorMatch, floorGrad, zero)
+                        gradSum.accumulate(floorContrib)
+
+                        // Check ceil row match (stored at frame + maxFrameCount)
+                        let ceilSlot = frameFloat + maxFrameCountFloat
+                        let ceilRow = b.memoryRead(rowIdxCell, b.cast(ceilSlot, to: .int))
+                        let isCeilMatch = b.abs(ceilRow - rowFloat) < b.constant(0.5)
+                        let ceilGrad = b.memoryRead(ceilGradCell, b.cast(readPos, to: .int))
+                        let ceilContrib = b.gswitch(isCeilMatch, ceilGrad, zero)
+                        gradSum.accumulate(ceilContrib)
+                    }
+
+                    // Write to gradient cell (column-major layout)
+                    let destPos = colFloat * b.constant(Float(numRows)) + rowFloat
+                    _ = b.memoryAccumulate(gradCell, b.cast(destPos, to: .int), gradSum.value)
+                }
+            }
+
+            b.use(val: zero)
+
         case .parallelMap2DTestPass1(let bins, let scratchCell):
             guard inputs.isEmpty else {
                 throw DGenError.insufficientInputs(
@@ -1530,87 +1900,6 @@ public enum LazyOp {
             // Linear interpolation: (1-frac)*sample1 + frac*sample2
             let interpolated = b.mix(sample1, sample2, frac)
             b.use(val: interpolated)
-
-        case .peekRow:
-            // PeekRow: read entire row from 2D tensor with linear interpolation
-            // Inputs: [tensor, rowIndex]
-            // Output: 1D tensor [numCols]
-            // Memory layout: column-major (offset = col * numRows + row)
-
-            // Mark as scalar ONLY if NOT part of a frame-tensor chain.
-            // When part of a chain, we'll use SIMD-across-frames with thread-local tensors.
-            if !ctx.isPartOfFrameTensorChain(nodeId) {
-                b.markRequiresScalar()
-            }
-
-            guard node.inputs.count == 2 else {
-                throw DGenError.insufficientInputs(
-                    operator: "peekRow", expected: 2, actual: node.inputs.count)
-            }
-
-            let tensorInput = node.inputs[0]
-
-            // Get tensor shape from the input node
-            guard let inputNode = g.nodes[tensorInput],
-                case .tensor(let shape) = inputNode.shape,
-                shape.count == 2
-            else {
-                throw DGenError.tensorError(op: "peekRow", reason: "requires 2D tensor input")
-            }
-
-            let numRows = shape[0]
-            let numCols = shape[1]
-
-            // Get input and output tensors
-            guard let inTensorId = g.nodeToTensor[tensorInput],
-                let inTensor = g.tensors[inTensorId],
-                let outTensorId = g.nodeToTensor[node.id],
-                let outTensor = g.tensors[outTensorId]
-            else {
-                throw DGenError.tensorError(op: "peekRow", reason: "missing tensor")
-            }
-
-            // Read rowIndex input
-            let rowIndex = try b.readInput(node, inputs, at: 1)
-
-            let zero = b.constant(0.0)
-            let one = b.constant(1.0)
-            let numRowsFloat = b.constant(Float(numRows))
-
-            // Wrap rowIndex using modulo for wrapping behavior
-            let wrappedIndex = b.mod(rowIndex, numRowsFloat)
-            let isNegative = wrappedIndex < zero
-            let positiveIndex = b.gswitch(isNegative, wrappedIndex + numRowsFloat, wrappedIndex)
-
-            // Compute floor and ceil indices for interpolation
-            let floorIndex = b.floor(positiveIndex)
-            let frac = positiveIndex - floorIndex
-
-            // Compute ceil index with wrapping
-            let ceilIndex = floorIndex + one
-            let ceilWrapped = b.gswitch(ceilIndex >= numRowsFloat, zero, ceilIndex)
-
-            // Iterate over columns and compute interpolated values
-            b.parallelRange(numCols) { colIdx in
-                // Column-major layout: offset = col * numRows + row
-                let colOffset = colIdx * numRowsFloat
-
-                // Read floor and ceil samples
-                let floorPos = colOffset + floorIndex
-                let ceilPos = colOffset + ceilWrapped
-
-                let sample1 = b.memoryRead(inTensor.cellId, b.cast(floorPos, to: .int))
-                let sample2 = b.memoryRead(inTensor.cellId, b.cast(ceilPos, to: .int))
-
-                // Linear interpolation: (1-frac)*sample1 + frac*sample2
-                let interpolated = b.mix(sample1, sample2, frac)
-
-                // Write to output tensor (1D, so just use colIdx)
-                _ = b.memoryWrite(outTensor.cellId, b.cast(colIdx, to: .int), interpolated)
-            }
-
-            // Register the output tensor
-            ctx.values[nodeId] = .empty
 
         case .fft(
             let windowSize, let hopSize, let scratchCell, let ringBufferCell, let writePosCell,

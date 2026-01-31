@@ -1511,7 +1511,9 @@ final class GraphGradientTests: XCTestCase {
         let teacherOut = g.n(.mul, [synthTeacher, norm])
 
         let diff = g.n(.sub, [studentOut, teacherOut])
-        let loss = g.n(.mul, [diff, diff])
+        let loss = g.n(
+            .add, g.spectralLossFFT(studentOut, teacherOut, windowSize: 64),
+            g.n(.mul, g.n(.constant(0.001)), g.n(.mul, [diff, diff])))
         _ = g.n(.output(0), [loss])
 
         print("\n=== MLP -> peekRow -> Harmonic Synth (Teacher-Student) ===")
@@ -1528,7 +1530,7 @@ final class GraphGradientTests: XCTestCase {
             loss: loss,
             tensorParameters: [studentW1, studentB1, studentW2, studentB2],
             optimizer: GraphSGD(),
-            learningRate: 0.00001,
+            learningRate: 0.000001,
             frameCount: frameCount,
             kernelDebugOutput: "/tmp/mlp_peekrow_harmonic_graph.metal"
         )

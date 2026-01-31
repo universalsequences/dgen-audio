@@ -182,15 +182,19 @@ public func inferShape(op: LazyOp, inputs: [ValueShape], graph: Graph) throws ->
     // Peek always outputs scalar - it reads one value from the tensor
     return .scalar
 
-  // PeekRow - reads an entire row from a 2D tensor with interpolation
-  case .peekRow:
+  // selectRow - extracts a single row from a 2D tensor using dynamic index
+  case .selectRow:
     guard let firstInput = inputs.first,
       case .tensor(let shape) = firstInput,
       shape.count == 2
     else {
-      throw DGenError.shapeInferenceFailed(op: "peekRow", reason: "requires 2D tensor input")
+      throw DGenError.shapeInferenceFailed(op: "selectRow", reason: "requires 2D tensor input")
     }
     return .tensor([shape[1]])  // Output is [numCols]
+
+  // peekRowInline - interpolated row extraction with frame-indexed storage
+  case .peekRowInline(_, let numRows, let numCols):
+    return .tensor([numCols])  // Output is [numCols]
 
   // FFT - outputs [numBins, 2] tensor where numBins = windowSize/2 + 1
   // Note: FFT is a bulk operation that handles all tensor writes internally,
@@ -768,7 +772,7 @@ public func extractStaticOpsIntoBlocks(
 /// Represents a fusable chain from a transition point (where static tensor becomes frame-dependent)
 /// to a terminal scalar reduction. The entire chain can be SIMD-parallelized across frames.
 public struct FrameDependentTensorChain {
-  /// Node where static tensor becomes frame-dependent (e.g., peekRow)
+  /// Node where static tensor becomes frame-dependent (e.g., selectRow)
   public let transitionNodeId: NodeID
   /// Terminal scalar reduction node (e.g., sum)
   public let reductionNodeId: NodeID
@@ -782,7 +786,7 @@ public struct FrameDependentTensorChain {
 ///
 /// A valid chain:
 /// 1. Starts at a "transition point" - a node with tensor output, frame-based input, and static tensor input
-///    (e.g., peekRow reading from static tensor with frame-dependent row index)
+///    (e.g., selectRow reading from static tensor with frame-dependent row index)
 /// 2. Continues through element-wise tensor operations (mul, add, sin, cos, etc.)
 /// 3. Ends at a scalar reduction (sum)
 /// 4. Has no cross-element dependencies within the chain
@@ -830,8 +834,8 @@ public func detectFrameDependentTensorChains(
       return false
     }
 
-    // peekRow is the canonical transition point
-    if case .peekRow = node.op {
+    // selectRow is the canonical transition point
+    if case .selectRow = node.op {
       return hasFrameBasedInput && hasStaticTensorInput
     }
 
@@ -898,7 +902,7 @@ public func detectFrameDependentTensorChains(
             }
             // Include tensor inputs that feed into the chain
             switch inputNode.op {
-            case .peekRow, .deterministicPhasor:
+            case .selectRow, .deterministicPhasor:
               if !expanded.contains(inputId) {
                 expanded.insert(inputId)
                 changed = true

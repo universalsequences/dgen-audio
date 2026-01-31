@@ -1113,25 +1113,25 @@ public func emitFrameTensorChainBlock(
     // Emit chain nodes (map step)
     for nodeId in block.nodes {
         if let node = g.nodes[nodeId] {
-            if case .peekRow = node.op {
-                // Specialized per-bin peekRow: compute only the current column (binIdx)
+            if case .selectRow = node.op {
+                // Specialized per-bin selectRow: compute only the current column (binIdx)
                 guard node.inputs.count == 2 else {
                     throw DGenError.insufficientInputs(
-                        operator: "peekRow", expected: 2, actual: node.inputs.count)
+                        operator: "selectRow", expected: 2, actual: node.inputs.count)
                 }
                 let tensorInput = node.inputs[0]
                 guard let inputNode = g.nodes[tensorInput],
                     case .tensor(let shape) = inputNode.shape,
                     shape.count == 2
                 else {
-                    throw DGenError.tensorError(op: "peekRow", reason: "requires 2D tensor input")
+                    throw DGenError.tensorError(op: "selectRow", reason: "requires 2D tensor input")
                 }
                 guard let inTensorId = g.nodeToTensor[tensorInput],
                     let inTensor = g.tensors[inTensorId],
                     let outTensorId = g.nodeToTensor[node.id],
                     let outTensor = g.tensors[outTensorId]
                 else {
-                    throw DGenError.tensorError(op: "peekRow", reason: "missing tensor")
+                    throw DGenError.tensorError(op: "selectRow", reason: "missing tensor")
                 }
 
                 let inputs: [Lazy] = node.inputs.compactMap { ctx.values[$0] }
@@ -1141,31 +1141,21 @@ public func emitFrameTensorChainBlock(
                 let numRows = shape[0]
                 let numRowsFloat = b.constant(Float(numRows))
                 let zero = b.constant(0.0)
-                let one = b.constant(1.0)
 
-                // Wrap rowIndex using modulo for wrapping behavior
+                // Wrap rowIndex using modulo for wrapping behavior, then floor
                 let wrappedIndex = b.mod(rowIndex, numRowsFloat)
                 let isNegative = wrappedIndex < zero
                 let positiveIndex = b.gswitch(isNegative, wrappedIndex + numRowsFloat, wrappedIndex)
-
-                // Compute floor and ceil indices for interpolation
                 let floorIndex = b.floor(positiveIndex)
-                let frac = positiveIndex - floorIndex
 
-                let ceilIndex = floorIndex + one
-                let ceilWrapped = b.gswitch(ceilIndex >= numRowsFloat, zero, ceilIndex)
-
+                // Read the selected row element for this column
                 let colOffset = b.value(binIdx.lazy) * numRowsFloat
-                let floorPos = colOffset + floorIndex
-                let ceilPos = colOffset + ceilWrapped
-
-                let sample1 = b.memoryRead(inTensor.cellId, b.cast(floorPos, to: .int))
-                let sample2 = b.memoryRead(inTensor.cellId, b.cast(ceilPos, to: .int))
-                let interpolated = b.mix(sample1, sample2, frac)
+                let readPos = colOffset + floorIndex
+                let value = b.memoryRead(inTensor.cellId, b.cast(readPos, to: .int))
 
                 // Register output tensor element in a register (avoid shared memory writes)
-                _ = b.tstore(outTensor.cellId, b.value(binIdx.lazy), interpolated)
-                ctx.values[nodeId] = interpolated.lazy
+                _ = b.tstore(outTensor.cellId, b.value(binIdx.lazy), value)
+                ctx.values[nodeId] = value.lazy
                 uops.append(contentsOf: b.ops)
             } else if case .deterministicPhasor = node.op {
                 guard node.inputs.count == 1 else {
