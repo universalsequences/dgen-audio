@@ -560,6 +560,11 @@ extension LazyOp {
             let zero = g.n(.constant(0.0), [])
             return [zero, gradOutput]
 
+        case .memoryCellSum(_, _):
+            // memoryCellSum is a reduction op - no input nodes to propagate gradients to
+            // The gradient flows to the memory cell contents which are handled separately
+            return []
+
         case .tensorAccumulate(_):
             // tensorAccumulate is a side-effect op for gradient accumulation
             // No gradients to propagate through it
@@ -583,6 +588,69 @@ extension LazyOp {
         case .spectralLossPass1(_, _), .spectralLossPass2(_, _):
             // Spectral loss has complex multi-pass gradient
             // Not yet supported in pure graph form
+            return node.inputs.map { _ in nil }
+
+        case .spectralLossFFT(let windowSize, let useHann, let windowCell,
+                               _, _, _, _, _):
+            // FFT-based spectral loss backward pass
+            // Recompute DFT inline to avoid race conditions from shared FFT cells
+            let sig1 = node.inputs[0]
+            let sig2 = node.inputs[1]
+
+            // Allocate per-frame time-domain gradient cells to avoid race conditions
+            // Layout: frame0: [0..windowSize), frame1: [windowSize..2*windowSize), etc.
+            let maxFrameCount = 4096
+            let gradTime1Cell = g.alloc(vectorWidth: maxFrameCount * windowSize)
+            let gradTime2Cell = g.alloc(vectorWidth: maxFrameCount * windowSize)
+
+            // Single gradient pass that recomputes DFT inline and scatters to time domain
+            // Uses frame-indexed storage to avoid race conditions
+            let gradPass = g.n(.spectralLossFFTGradInline(
+                windowSize: windowSize,
+                useHann: useHann,
+                windowCell: windowCell,
+                gradTime1Cell: gradTime1Cell,
+                gradTime2Cell: gradTime2Cell
+            ), [gradOutput, sig1, sig2])
+
+            g.addGradientSideEffect(gradPass)
+
+            // Read the gradient for the current frame's sample from frame-indexed storage
+            // The gradient at position (frame * windowSize + windowSize - 1) is the gradient
+            // for the current frame's input (the newest sample in the window)
+            let gradPassResult = g.n(.spectralLossFFTGradRead(
+                windowSize: windowSize,
+                gradTime1Cell: gradTime1Cell,
+                gradTime2Cell: gradTime2Cell
+            ), [gradPass])
+
+            // Split the result into two separate gradient values
+            // The gradPassResult returns grad1, we need another node for grad2
+            let grad2Node = g.n(.spectralLossFFTGradRead2(
+                windowSize: windowSize,
+                gradTime2Cell: gradTime2Cell
+            ), [gradPass])
+
+            return [gradPassResult, grad2Node]
+
+        case .spectralLossFFTGradSpec(_, _, _, _, _, _, _):
+            // Gradient ops don't need their own gradients
+            return node.inputs.map { _ in nil }
+
+        case .spectralLossFFTGradIFFT(_, _, _, _, _, _):
+            // Gradient ops don't need their own gradients
+            return node.inputs.map { _ in nil }
+
+        case .spectralLossFFTGradInline(_, _, _, _, _):
+            // Gradient ops don't need their own gradients
+            return node.inputs.map { _ in nil }
+
+        case .spectralLossFFTGradRead(_, _, _):
+            // Gradient read ops don't need their own gradients
+            return node.inputs.map { _ in nil }
+
+        case .spectralLossFFTGradRead2(_, _):
+            // Gradient read ops don't need their own gradients
             return node.inputs.map { _ in nil }
 
         case .fft(_, _, _, _, _, _), .ifft(_, _, _, _, _, _):

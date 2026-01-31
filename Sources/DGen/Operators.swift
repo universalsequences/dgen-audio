@@ -63,12 +63,61 @@ public enum LazyOp {
     case mse  // mean squared error per-sample: (a-b)^2
     case spectralLossPass1(Int, CellID)  // Pass 1: compute loss & store DFT contributions
     case spectralLossPass2(Int, CellID)  // Pass 2: reduce contributions to gradients (no-op in forward)
+
+    // FFT-based spectral loss with backprop support
+    case spectralLossFFT(
+        windowSize: Int,
+        useHann: Bool,
+        windowCell: CellID,
+        fft1Cell: CellID,
+        fft2Cell: CellID,
+        mag1Cell: CellID,
+        mag2Cell: CellID,
+        scratchCell: CellID
+    )
+    case spectralLossFFTGradSpec(
+        windowSize: Int,
+        fft1Cell: CellID,
+        fft2Cell: CellID,
+        mag1Cell: CellID,
+        mag2Cell: CellID,
+        gradSpec1Cell: CellID,
+        gradSpec2Cell: CellID
+    )
+    case spectralLossFFTGradIFFT(
+        windowSize: Int,
+        gradSpec1Cell: CellID,
+        gradSpec2Cell: CellID,
+        gradTime1Cell: CellID,
+        gradTime2Cell: CellID,
+        windowCell: CellID
+    )
+    // Inline gradient computation for spectralLossFFT - recomputes DFT to avoid race conditions
+    case spectralLossFFTGradInline(
+        windowSize: Int,
+        useHann: Bool,
+        windowCell: CellID,
+        gradTime1Cell: CellID,
+        gradTime2Cell: CellID
+    )
+    // Read gradient from frame-indexed storage (returns grad1)
+    case spectralLossFFTGradRead(
+        windowSize: Int,
+        gradTime1Cell: CellID,
+        gradTime2Cell: CellID
+    )
+    // Read second gradient from frame-indexed storage (returns grad2)
+    case spectralLossFFTGradRead2(
+        windowSize: Int,
+        gradTime2Cell: CellID
+    )
     case parallelMap2DTestPass1(Int, CellID)  // Pass 1: write per-bin values to scratch
     case parallelMap2DTestPass2(Int, CellID)  // Pass 2: reduce per-bin values to scalar
     case selector  // selector(mode, options[])
     case memoryRead(CellID)
     case memoryWrite(CellID)
     case memoryAccumulate(CellID)  // Atomic add to memory cell
+    case memoryCellSum(CellID, Int)  // Sum all elements in a memory cell (cell, size)
     case tensorAccumulate(CellID)  // Atomic add tensor elements to memory region
     case historyWrite(CellID)
     case historyReadWrite(CellID)
@@ -287,6 +336,14 @@ public enum LazyOp {
                     operator: "memoryAccumulate", expected: 2, actual: inputs.count)
             }
             b.use(val: b.memoryAccumulate(cellId, b.value(inputs[0]), b.value(inputs[1])))
+        case .memoryCellSum(let cellId, let size):
+            // Sum all elements in a memory cell
+            let acc = b.float(0.0)
+            b.loop(size) { i in
+                let val = b.memoryRead(cellId, b.cast(i, to: .int))
+                acc.accumulate(val)
+            }
+            b.use(val: acc.value)
         case .tensorAccumulate(let cellId):
             // Input is a tensor node - atomically add each element to cell
             guard node.inputs.count == 1 else {
@@ -355,6 +412,542 @@ public enum LazyOp {
             }
 
             b.use(val: totalError.value)
+
+        case .spectralLossFFT(let windowSize, let useHann, let windowCell,
+                               let fft1Cell, let fft2Cell, let mag1Cell, let mag2Cell, let scratchCell):
+            // FFT-based spectral loss: forward pass
+            // 1. Apply optional Hann window
+            // 2. Compute FFT of both signals via Cooley-Tukey
+            // 3. Compute magnitudes
+            // 4. Sum squared differences as loss
+            guard inputs.count == 2 else {
+                throw DGenError.insufficientInputs(
+                    operator: "spectralLossFFT", expected: 2, actual: inputs.count)
+            }
+
+            b.markRequiresScalar()
+
+            let numBins = windowSize / 2 + 1
+            let numStages = Int(log2(Double(windowSize)))
+            let imagOffset = windowSize  // Scratch layout: real[0..<N], imag[N..<2N]
+
+            let sig1 = b.value(inputs[0])
+            let sig2 = b.value(inputs[1])
+            let winSizeFloat = b.constant(Float(windowSize))
+            let zero = b.constant(0.0)
+            let one = b.constant(1.0)
+            let frameIdx = b.threadIndex()
+
+            // Use b.if_ to force scalar mode for the entire computation block
+            // This prevents SIMD variable generation issues in nested loops
+            let alwaysTrue = one > zero
+            let loss = b.float(0.0)
+            b.if_(alwaysTrue) {
+                // 1. Generate Hann window coefficients (parallelizable - each index is independent)
+                if useHann {
+                    b.parallelRange(windowSize) { n in
+                        let nFloat = b.cast(n, to: .float)
+                        // w[n] = 0.5 * (1 - cos(2*pi*n / (N-1)))
+                        let angle = b.constant(2.0) * b.pi * nFloat / b.constant(Float(windowSize - 1))
+                        let w = b.constant(0.5) * (one - b.cos(angle))
+                        _ = b.memoryWrite(windowCell, b.cast(n, to: .int), w)
+                    }
+                } else {
+                    // Rectangular window (all ones)
+                    b.parallelRange(windowSize) { n in
+                        _ = b.memoryWrite(windowCell, b.cast(n, to: .int), one)
+                    }
+                }
+
+                // 2. Load windowed samples from tape into FFT scratch cells (parallelizable)
+                b.parallelRange(windowSize) { n in
+                    let nFloat = b.cast(n, to: .float)
+                    let w = b.memoryRead(windowCell, b.cast(n, to: .int))
+
+                    // Load from tape: samples from frameIdx - windowSize + 1 + n to frameIdx
+                    let j = frameIdx - (winSizeFloat - one) + nFloat
+
+                    let s1 = b.tapeLoad(sig1, at: j)
+                    let s2 = b.tapeLoad(sig2, at: j)
+
+                    // Apply window and store as real part; imag = 0
+                    _ = b.memoryWrite(fft1Cell, b.cast(n, to: .int), s1 * w)
+                    _ = b.memoryWrite(fft1Cell, b.cast(n, to: .int) + b.constant(Float(imagOffset)), zero)
+                    _ = b.memoryWrite(fft2Cell, b.cast(n, to: .int), s2 * w)
+                    _ = b.memoryWrite(fft2Cell, b.cast(n, to: .int) + b.constant(Float(imagOffset)), zero)
+                }
+
+                // 3. In-place FFT via Cooley-Tukey (bit-reversal + butterfly stages)
+                // Helper function to emit FFT for a single cell
+                func emitFFTInPlace(_ fftCell: CellID) {
+                // Bit-reversal permutation
+                b.loop(windowSize) { i in
+                    var rev = b.constant(0.0)
+                    var n = b.cast(i, to: .float)
+                    for _ in 0..<numStages {
+                        rev = rev * b.constant(2.0) + (n % b.constant(2.0))
+                        n = b.floor(n / b.constant(2.0))
+                    }
+
+                    let iFloat = b.cast(i, to: .float)
+                    let shouldSwap = iFloat < rev
+                    let iInt = b.cast(i, to: .int)
+                    let revInt = b.cast(rev, to: .int)
+
+                    let tempRealI = b.memoryRead(fftCell, iInt)
+                    let tempImagI = b.memoryRead(fftCell, iInt + b.constant(Float(imagOffset)))
+                    let tempRealRev = b.memoryRead(fftCell, revInt)
+                    let tempImagRev = b.memoryRead(fftCell, revInt + b.constant(Float(imagOffset)))
+
+                    let newRealI = b.gswitch(shouldSwap, tempRealRev, tempRealI)
+                    let newImagI = b.gswitch(shouldSwap, tempImagRev, tempImagI)
+                    let newRealRev = b.gswitch(shouldSwap, tempRealI, tempRealRev)
+                    let newImagRev = b.gswitch(shouldSwap, tempImagI, tempImagRev)
+
+                    _ = b.memoryWrite(fftCell, iInt, newRealI)
+                    _ = b.memoryWrite(fftCell, iInt + b.constant(Float(imagOffset)), newImagI)
+                    _ = b.memoryWrite(fftCell, revInt, newRealRev)
+                    _ = b.memoryWrite(fftCell, revInt + b.constant(Float(imagOffset)), newImagRev)
+                }
+
+                // Butterfly stages - each stage must complete before the next
+                // But within each stage, all butterflies are independent and parallelizable
+                for stage in 0..<numStages {
+                    let butterflySize = 1 << (stage + 1)
+                    let halfSize = butterflySize / 2
+                    let numGroups = windowSize / butterflySize
+                    let numButterflies = numGroups * halfSize  // Total butterflies in this stage
+
+                    // Parallelize all butterflies in this stage
+                    b.parallelRange(numButterflies) { flatIdx in
+                        // Compute group and k from flat index
+                        let flatFloat = b.cast(flatIdx, to: .float)
+                        let halfSizeFloat = b.constant(Float(halfSize))
+                        let butterflySizeFloat = b.constant(Float(butterflySize))
+
+                        let group = b.floor(flatFloat / halfSizeFloat)
+                        let k = flatFloat - (group * halfSizeFloat)
+
+                        let i = group * butterflySizeFloat + k
+                        let j = i + halfSizeFloat
+
+                        // Twiddle factor: W = e^(-2*pi*i*k/butterflySize)
+                        let angle = b.constant(-2.0) * b.pi * k / butterflySizeFloat
+                        let wr = b.cos(angle)
+                        let wi = b.sin(angle)
+
+                        let iInt = b.cast(i, to: .int)
+                        let jInt = b.cast(j, to: .int)
+
+                        let ar = b.memoryRead(fftCell, iInt)
+                        let ai = b.memoryRead(fftCell, iInt + b.constant(Float(imagOffset)))
+                        let br = b.memoryRead(fftCell, jInt)
+                        let bi = b.memoryRead(fftCell, jInt + b.constant(Float(imagOffset)))
+
+                        // Butterfly: (ar,ai) + W*(br,bi) and (ar,ai) - W*(br,bi)
+                        let tr = wr * br - wi * bi
+                        let ti = wr * bi + wi * br
+
+                        _ = b.memoryWrite(fftCell, iInt, ar + tr)
+                        _ = b.memoryWrite(fftCell, iInt + b.constant(Float(imagOffset)), ai + ti)
+                        _ = b.memoryWrite(fftCell, jInt, ar - tr)
+                        _ = b.memoryWrite(fftCell, jInt + b.constant(Float(imagOffset)), ai - ti)
+                    }
+                }
+                }
+
+                // Apply FFT to both cells
+                emitFFTInPlace(fft1Cell)
+                emitFFTInPlace(fft2Cell)
+
+                // 4. Compute magnitudes in parallel and store for backward pass
+                // This loop is fully parallelizable - each bin is independent
+                b.parallelRange(numBins) { k in
+                    let kInt = b.cast(k, to: .int)
+
+                    let real1 = b.memoryRead(fft1Cell, kInt)
+                    let imag1 = b.memoryRead(fft1Cell, kInt + b.constant(Float(imagOffset)))
+                    let mag1 = b.sqrt(real1 * real1 + imag1 * imag1)
+                    _ = b.memoryWrite(mag1Cell, kInt, mag1)
+
+                    let real2 = b.memoryRead(fft2Cell, kInt)
+                    let imag2 = b.memoryRead(fft2Cell, kInt + b.constant(Float(imagOffset)))
+                    let mag2 = b.sqrt(real2 * real2 + imag2 * imag2)
+                    _ = b.memoryWrite(mag2Cell, kInt, mag2)
+
+                    // Store squared difference in scratch for parallel reduction
+                    let diff = mag1 - mag2
+                    _ = b.memoryWrite(scratchCell, kInt, diff * diff)
+                }
+
+                // 5. Sequential reduction of loss (could be improved with parallel reduction)
+                b.loop(numBins) { k in
+                    let kInt = b.cast(k, to: .int)
+                    let diffSq = b.memoryRead(scratchCell, kInt)
+                    loss.accumulate(diffSq)
+                }
+            }
+
+            b.use(val: loss.value)
+
+        case .spectralLossFFTGradSpec(let windowSize, let fft1Cell, let fft2Cell,
+                                       let mag1Cell, let mag2Cell, let gradSpec1Cell, let gradSpec2Cell):
+            // Compute gradient w.r.t. complex spectrum
+            // ∂L/∂X.real = ∂L/∂mag * (real / mag)
+            // ∂L/∂X.imag = ∂L/∂mag * (imag / mag)
+            guard inputs.count == 1 else {
+                throw DGenError.insufficientInputs(
+                    operator: "spectralLossFFTGradSpec", expected: 1, actual: inputs.count)
+            }
+
+            b.markRequiresScalar()
+
+            let numBins = windowSize / 2 + 1
+            let imagOffset = windowSize
+            let gradOutput = b.value(inputs[0])
+            let eps = b.constant(1e-8)
+
+            // Compute gradient spectrum in parallel (each bin is independent)
+            b.parallelRange(numBins) { k in
+                let kInt = b.cast(k, to: .int)
+
+                // Read stored values
+                let mag1 = b.memoryRead(mag1Cell, kInt)
+                let mag2 = b.memoryRead(mag2Cell, kInt)
+                let real1 = b.memoryRead(fft1Cell, kInt)
+                let imag1 = b.memoryRead(fft1Cell, kInt + b.constant(Float(imagOffset)))
+                let real2 = b.memoryRead(fft2Cell, kInt)
+                let imag2 = b.memoryRead(fft2Cell, kInt + b.constant(Float(imagOffset)))
+
+                // ∂L/∂mag = 2 * (mag1 - mag2) * gradOutput
+                let gradMag1 = b.constant(2.0) * (mag1 - mag2) * gradOutput
+                let gradMag2 = b.constant(-2.0) * (mag1 - mag2) * gradOutput
+
+                // Handle division by zero with epsilon
+                let safeMag1 = b.max(mag1, eps)
+                let safeMag2 = b.max(mag2, eps)
+
+                // ∂L/∂X = gradMag * (X / |X|) = gradMag * (real/mag, imag/mag)
+                let gradReal1 = gradMag1 * real1 / safeMag1
+                let gradImag1 = gradMag1 * imag1 / safeMag1
+                let gradReal2 = gradMag2 * real2 / safeMag2
+                let gradImag2 = gradMag2 * imag2 / safeMag2
+
+                // Store gradient spectrum
+                _ = b.memoryWrite(gradSpec1Cell, kInt, gradReal1)
+                _ = b.memoryWrite(gradSpec1Cell, kInt + b.constant(Float(imagOffset)), gradImag1)
+                _ = b.memoryWrite(gradSpec2Cell, kInt, gradReal2)
+                _ = b.memoryWrite(gradSpec2Cell, kInt + b.constant(Float(imagOffset)), gradImag2)
+            }
+
+            // Fill in conjugate symmetric part for IFFT (bins numBins to windowSize-1)
+            // X[N-k] = conj(X[k]) for k = 1 to N/2-1
+            // This is parallelizable since each k writes to a unique index
+            b.parallelRange(windowSize / 2 - 1) { k in
+                let kPlusOne = b.cast(k, to: .float) + b.constant(1.0)
+                let kIdx = b.cast(kPlusOne, to: .int)
+                let conjIdx = b.constant(Float(windowSize)) - kPlusOne
+
+                // Signal 1
+                let real1 = b.memoryRead(gradSpec1Cell, kIdx)
+                let imag1 = b.memoryRead(gradSpec1Cell, kIdx + b.constant(Float(imagOffset)))
+                _ = b.memoryWrite(gradSpec1Cell, b.cast(conjIdx, to: .int), real1)
+                _ = b.memoryWrite(gradSpec1Cell, b.cast(conjIdx, to: .int) + b.constant(Float(imagOffset)), b.constant(0.0) - imag1)
+
+                // Signal 2
+                let real2 = b.memoryRead(gradSpec2Cell, kIdx)
+                let imag2 = b.memoryRead(gradSpec2Cell, kIdx + b.constant(Float(imagOffset)))
+                _ = b.memoryWrite(gradSpec2Cell, b.cast(conjIdx, to: .int), real2)
+                _ = b.memoryWrite(gradSpec2Cell, b.cast(conjIdx, to: .int) + b.constant(Float(imagOffset)), b.constant(0.0) - imag2)
+            }
+
+            b.use(val: b.constant(0.0))  // Side-effect only
+
+        case .spectralLossFFTGradIFFT(let windowSize, let gradSpec1Cell, let gradSpec2Cell,
+                                       let gradTime1Cell, let gradTime2Cell, let windowCell):
+            // IFFT to scatter frequency-domain gradients back to time domain
+            // Then multiply by window coefficients for Hann backprop
+            guard inputs.count == 1 else {
+                throw DGenError.insufficientInputs(
+                    operator: "spectralLossFFTGradIFFT", expected: 1, actual: inputs.count)
+            }
+
+            b.markRequiresScalar()
+
+            let numStages = Int(log2(Double(windowSize)))
+            let imagOffset = windowSize
+            let invN = b.constant(1.0 / Float(windowSize))
+
+            // Helper function to emit IFFT for a single gradient spectrum cell
+            func emitIFFTInPlace(_ gradSpecCell: CellID, _ gradTimeCell: CellID) {
+                // Bit-reversal permutation (has data dependencies - keep sequential)
+                b.loop(windowSize) { i in
+                    var rev = b.constant(0.0)
+                    var n = b.cast(i, to: .float)
+                    for _ in 0..<numStages {
+                        rev = rev * b.constant(2.0) + (n % b.constant(2.0))
+                        n = b.floor(n / b.constant(2.0))
+                    }
+
+                    let iFloat = b.cast(i, to: .float)
+                    let shouldSwap = iFloat < rev
+                    let iInt = b.cast(i, to: .int)
+                    let revInt = b.cast(rev, to: .int)
+
+                    let tempR = b.memoryRead(gradSpecCell, iInt)
+                    let tempI = b.memoryRead(gradSpecCell, iInt + b.constant(Float(imagOffset)))
+                    let revR = b.memoryRead(gradSpecCell, revInt)
+                    let revI = b.memoryRead(gradSpecCell, revInt + b.constant(Float(imagOffset)))
+
+                    let newIR = b.gswitch(shouldSwap, revR, tempR)
+                    let newII = b.gswitch(shouldSwap, revI, tempI)
+                    let newRevR = b.gswitch(shouldSwap, tempR, revR)
+                    let newRevI = b.gswitch(shouldSwap, tempI, revI)
+
+                    _ = b.memoryWrite(gradSpecCell, iInt, newIR)
+                    _ = b.memoryWrite(gradSpecCell, iInt + b.constant(Float(imagOffset)), newII)
+                    _ = b.memoryWrite(gradSpecCell, revInt, newRevR)
+                    _ = b.memoryWrite(gradSpecCell, revInt + b.constant(Float(imagOffset)), newRevI)
+                }
+
+                // Butterfly stages with POSITIVE twiddle angles (IFFT)
+                // Stages are sequential but butterflies within each stage are parallel
+                var butterflySize = 2
+                for _ in 0..<numStages {
+                    let halfSize = butterflySize / 2
+                    let numGroups = windowSize / butterflySize
+                    let numButterflies = numGroups * halfSize
+
+                    b.parallelRange(numButterflies) { flatIdx in
+                        let flatFloat = b.cast(flatIdx, to: .float)
+                        let halfSizeFloat = b.constant(Float(halfSize))
+                        let butterflySizeFloat = b.constant(Float(butterflySize))
+
+                        let group = b.floor(flatFloat / halfSizeFloat)
+                        let k = flatFloat - (group * halfSizeFloat)
+
+                        let i = group * butterflySizeFloat + k
+                        let j = i + halfSizeFloat
+
+                        // IFFT twiddle: W = e^(+2πi*k/butterflySize) - POSITIVE angle
+                        let angle = b.constant(2.0) * b.pi * k / butterflySizeFloat
+                        let wr = b.cos(angle)
+                        let wi = b.sin(angle)
+
+                        let iInt = b.cast(i, to: .int)
+                        let jInt = b.cast(j, to: .int)
+
+                        let ar = b.memoryRead(gradSpecCell, iInt)
+                        let ai = b.memoryRead(gradSpecCell, iInt + b.constant(Float(imagOffset)))
+                        let br = b.memoryRead(gradSpecCell, jInt)
+                        let bi = b.memoryRead(gradSpecCell, jInt + b.constant(Float(imagOffset)))
+
+                        // Complex multiply and butterfly
+                        let tr = wr * br - wi * bi
+                        let ti = wr * bi + wi * br
+
+                        _ = b.memoryWrite(gradSpecCell, iInt, ar + tr)
+                        _ = b.memoryWrite(gradSpecCell, iInt + b.constant(Float(imagOffset)), ai + ti)
+                        _ = b.memoryWrite(gradSpecCell, jInt, ar - tr)
+                        _ = b.memoryWrite(gradSpecCell, jInt + b.constant(Float(imagOffset)), ai - ti)
+                    }
+                    butterflySize *= 2
+                }
+
+                // Scale by 1/N and multiply by window (Hann backprop), write to time-domain gradient cell
+                // This is fully parallelizable - each index is independent
+                b.parallelRange(windowSize) { n in
+                    let nInt = b.cast(n, to: .int)
+                    let realVal = b.memoryRead(gradSpecCell, nInt) * invN
+                    let w = b.memoryRead(windowCell, nInt)
+                    _ = b.memoryWrite(gradTimeCell, nInt, realVal * w)
+                }
+            }
+
+            // Apply IFFT to both gradient cells
+            emitIFFTInPlace(gradSpec1Cell, gradTime1Cell)
+            emitIFFTInPlace(gradSpec2Cell, gradTime2Cell)
+
+            b.use(val: b.constant(0.0))  // Side-effect only
+
+        case .spectralLossFFTGradInline(let windowSize, let useHann, let windowCell,
+                                        let gradTime1Cell, let gradTime2Cell):
+            // Inline gradient computation that recomputes DFT to avoid race conditions
+            // Uses frame-indexed storage to prevent race conditions between parallel frames
+            // Inputs: [gradOutput, sig1, sig2]
+            guard inputs.count == 3 else {
+                throw DGenError.insufficientInputs(
+                    operator: "spectralLossFFTGradInline", expected: 3, actual: inputs.count)
+            }
+
+            b.markRequiresScalar()
+
+            let numBins = windowSize / 2 + 1
+            let gradOutput = b.value(inputs[0])
+            let sig1 = b.value(inputs[1])
+            let sig2 = b.value(inputs[2])
+            let winSizeFloat = b.constant(Float(windowSize))
+            let zero = b.constant(0.0)
+            let one = b.constant(1.0)
+            let eps = b.constant(1e-8)
+            let frameIdx = b.threadIndex()
+
+            // Frame-indexed base offset for this frame's gradient storage
+            let frameBase = frameIdx * winSizeFloat
+
+            // Use if_ to force scalar mode
+            let alwaysTrue = one > zero
+            b.if_(alwaysTrue) {
+                // 1. Generate Hann window coefficients (same as forward)
+                if useHann {
+                    b.parallelRange(windowSize) { n in
+                        let nFloat = b.cast(n, to: .float)
+                        let angle = b.constant(2.0) * b.pi * nFloat / b.constant(Float(windowSize - 1))
+                        let w = b.constant(0.5) * (one - b.cos(angle))
+                        _ = b.memoryWrite(windowCell, b.cast(n, to: .int), w)
+                    }
+                } else {
+                    b.parallelRange(windowSize) { n in
+                        _ = b.memoryWrite(windowCell, b.cast(n, to: .int), one)
+                    }
+                }
+
+                // 2. Zero the gradient cells at frame-indexed positions
+                b.loop(windowSize) { n in
+                    let idx = b.cast(frameBase + b.cast(n, to: .float), to: .int)
+                    _ = b.memoryWrite(gradTime1Cell, idx, zero)
+                    _ = b.memoryWrite(gradTime2Cell, idx, zero)
+                }
+
+                // 3. For each bin, recompute DFT and accumulate gradients to time domain
+                // This is the key: we compute the DFT inline using tapeLoad, avoiding shared cells
+                b.loop(numBins) { kIdx in
+                    let k = b.cast(kIdx, to: .float)
+
+                    // Recompute DFT for this bin
+                    let real1 = b.float(0.0)
+                    let imag1 = b.float(0.0)
+                    let real2 = b.float(0.0)
+                    let imag2 = b.float(0.0)
+
+                    b.loop(windowSize) { n in
+                        let nFloat = b.cast(n, to: .float)
+                        let j = frameIdx - (winSizeFloat - one) + nFloat
+                        let w = b.memoryRead(windowCell, b.cast(n, to: .int))
+
+                        let s1 = b.tapeLoad(sig1, at: j) * w
+                        let s2 = b.tapeLoad(sig2, at: j) * w
+
+                        // DFT basis: e^(-2πi*k*n/N)
+                        let angle = b.constant(-2.0) * b.pi * k * nFloat / winSizeFloat
+                        let c = b.cos(angle)
+                        let s = b.sin(angle)
+
+                        real1.accumulate(s1 * c)
+                        imag1.accumulate(s1 * s)
+                        real2.accumulate(s2 * c)
+                        imag2.accumulate(s2 * s)
+                    }
+
+                    // Compute magnitudes
+                    let mag1 = b.sqrt(real1.value * real1.value + imag1.value * imag1.value)
+                    let mag2 = b.sqrt(real2.value * real2.value + imag2.value * imag2.value)
+
+                    // Gradient: ∂L/∂mag = 2 * (mag1 - mag2) * gradOutput
+                    let gradMag1 = b.constant(2.0) * (mag1 - mag2) * gradOutput
+                    let gradMag2 = b.constant(-2.0) * (mag1 - mag2) * gradOutput
+
+                    // Handle division by zero
+                    let safeMag1 = b.max(mag1, eps)
+                    let safeMag2 = b.max(mag2, eps)
+
+                    // ∂L/∂X = gradMag * (real/mag, imag/mag)
+                    let gradReal1 = gradMag1 * real1.value / safeMag1
+                    let gradImag1 = gradMag1 * imag1.value / safeMag1
+                    let gradReal2 = gradMag2 * real2.value / safeMag2
+                    let gradImag2 = gradMag2 * imag2.value / safeMag2
+
+                    // Scatter gradient to time domain: ∂L/∂x[n] += gradReal * cos + gradImag * sin
+                    // This is the transpose of the DFT (IDFT without normalization)
+                    // Uses frame-indexed storage to avoid race conditions
+                    b.loop(windowSize) { n in
+                        let nFloat = b.cast(n, to: .float)
+                        let angle = b.constant(-2.0) * b.pi * k * nFloat / winSizeFloat
+                        let c = b.cos(angle)
+                        let s = b.sin(angle)
+                        let w = b.memoryRead(windowCell, b.cast(n, to: .int))
+
+                        // Frame-indexed position
+                        let idx = b.cast(frameBase + nFloat, to: .int)
+
+                        // Accumulate gradient (window backprop included)
+                        let grad1Contrib = (gradReal1 * c + gradImag1 * s) * w
+                        let grad2Contrib = (gradReal2 * c + gradImag2 * s) * w
+                        _ = b.memoryAccumulate(gradTime1Cell, idx, grad1Contrib)
+                        _ = b.memoryAccumulate(gradTime2Cell, idx, grad2Contrib)
+                    }
+                }
+            }
+
+            b.use(val: zero)  // Side-effect only
+
+        case .spectralLossFFTGradRead(let windowSize, let gradTime1Cell, _):
+            // Read gradient for signal 1 from frame-indexed storage
+            // Sample at position p appears in windows at frames p, p+1, ..., p+windowSize-1
+            // We must sum contributions from all these windows
+            guard inputs.count == 1 else {
+                throw DGenError.insufficientInputs(
+                    operator: "spectralLossFFTGradRead", expected: 1, actual: inputs.count)
+            }
+            // Force dependency on gradPass by reading its value (should be 0, just for ordering)
+            let _ = b.value(inputs[0])
+
+            let frameIdx = b.threadIndex()
+            let winSizeFloat = b.constant(Float(windowSize))
+            let p = frameIdx  // absolute sample position
+
+            // Sum contributions from all windows that contain sample p
+            // Window at frame w contains sample p at offset (p - w + windowSize - 1)
+            // Gradient stored at w * windowSize + (p - w + windowSize - 1)
+            let gradSum = b.float(0.0)
+            b.loop(windowSize) { i in
+                let iFloat = b.cast(i, to: .float)
+                let w = p + iFloat  // window frame index
+                let offset = winSizeFloat - b.constant(1.0) - iFloat  // offset in that window
+                let idx = w * winSizeFloat + offset
+                let contrib = b.memoryRead(gradTime1Cell, b.cast(idx, to: .int))
+                gradSum.accumulate(contrib)
+            }
+            b.use(val: gradSum.value)
+
+        case .spectralLossFFTGradRead2(let windowSize, let gradTime2Cell):
+            // Read gradient for signal 2 from frame-indexed storage
+            // Sample at position p appears in windows at frames p, p+1, ..., p+windowSize-1
+            // We must sum contributions from all these windows
+            guard inputs.count == 1 else {
+                throw DGenError.insufficientInputs(
+                    operator: "spectralLossFFTGradRead2", expected: 1, actual: inputs.count)
+            }
+            // Force dependency on gradPass by reading its value (should be 0, just for ordering)
+            let _ = b.value(inputs[0])
+
+            let frameIdx = b.threadIndex()
+            let winSizeFloat = b.constant(Float(windowSize))
+            let p = frameIdx  // absolute sample position
+
+            // Sum contributions from all windows that contain sample p
+            // Window at frame w contains sample p at offset (p - w + windowSize - 1)
+            // Gradient stored at w * windowSize + (p - w + windowSize - 1)
+            let gradSum = b.float(0.0)
+            b.loop(windowSize) { i in
+                let iFloat = b.cast(i, to: .float)
+                let w = p + iFloat  // window frame index
+                let offset = winSizeFloat - b.constant(1.0) - iFloat  // offset in that window
+                let idx = w * winSizeFloat + offset
+                let contrib = b.memoryRead(gradTime2Cell, b.cast(idx, to: .int))
+                gradSum.accumulate(contrib)
+            }
+            b.use(val: gradSum.value)
 
         case .parallelMap2DTestPass1(let bins, let scratchCell):
             guard inputs.isEmpty else {

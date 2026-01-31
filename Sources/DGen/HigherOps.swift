@@ -46,6 +46,62 @@ extension Graph {
     return pass2  // Return Pass2 result (forwards Pass1's loss value)
   }
 
+  /// FFT-based spectral loss with backpropagation support.
+  ///
+  /// Computes spectral loss using Cooley-Tukey FFT and provides gradients via IFFT.
+  /// The backward pass uses IFFT (the adjoint of FFT) to scatter frequency-domain
+  /// gradients back to time domain - fully parallelizable via butterfly stages.
+  ///
+  /// Mathematical formulation:
+  /// - Forward: Apply optional Hann window, compute FFT, compute magnitudes, sum squared differences
+  /// - Backward: Chain rule through magnitude, scale by unit vector, IFFT to time domain, multiply by window
+  ///
+  /// - Parameters:
+  ///   - sig1: First input signal
+  ///   - sig2: Second input signal (reference/target)
+  ///   - windowSize: FFT window size (must be power of 2)
+  ///   - useHannWindow: Whether to apply Hann window before FFT (default: true)
+  /// - Returns: Scalar loss value per frame
+  public func spectralLossFFT(
+    _ sig1: NodeID,
+    _ sig2: NodeID,
+    windowSize: Int,
+    useHannWindow: Bool = true
+  ) -> NodeID {
+    precondition(windowSize > 0 && (windowSize & (windowSize - 1)) == 0,
+                 "windowSize must be a power of 2")
+
+    let numBins = windowSize / 2 + 1
+
+    // Allocate window coefficients (shared between both signals)
+    let windowCell = alloc(vectorWidth: windowSize)
+
+    // Allocate FFT scratch cells for storing complex spectrum
+    // Layout: real[0..<windowSize], imag[windowSize..<windowSize*2]
+    let fft1Cell = alloc(vectorWidth: windowSize * 2)
+    let fft2Cell = alloc(vectorWidth: windowSize * 2)
+
+    // Allocate magnitude cells (only positive frequencies: numBins)
+    let mag1Cell = alloc(vectorWidth: numBins)
+    let mag2Cell = alloc(vectorWidth: numBins)
+
+    // Allocate scratch for per-frame intermediate values
+    let maxFrameCount = 4096
+    let scratchCell = alloc(vectorWidth: maxFrameCount)
+
+    // Create the spectralLossFFT node with all resources
+    return n(.spectralLossFFT(
+      windowSize: windowSize,
+      useHann: useHannWindow,
+      windowCell: windowCell,
+      fft1Cell: fft1Cell,
+      fft2Cell: fft2Cell,
+      mag1Cell: mag1Cell,
+      mag2Cell: mag2Cell,
+      scratchCell: scratchCell
+    ), [sig1, sig2])
+  }
+
   /// Parallel map2D test: writes per-bin values using flattened (frame, bin) threads,
   /// then reduces to a scalar per frame. Used to validate parallelMap2D semantics.
   public func parallelMap2DTest(bins: Int) -> NodeID {
