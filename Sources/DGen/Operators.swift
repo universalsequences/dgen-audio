@@ -1,3 +1,5 @@
+import Foundation
+
 public typealias NodeID = Int
 public typealias VarID = Int
 public typealias ConstantID = Int
@@ -52,11 +54,6 @@ func emitTernaryOp(
     try b.writeOutput(node, result)
 }
 
-public struct BackwardsEmitResult {
-    let ops: [UOp]
-    let dependencies: [NodeID]
-}
-
 // frontend
 public enum LazyOp {
     case add, sub, div, mul, abs, sign, sin, cos, tan, tanh, exp, log, log10, sqrt, atan2, gt, gte,
@@ -66,9 +63,13 @@ public enum LazyOp {
     case mse  // mean squared error per-sample: (a-b)^2
     case spectralLossPass1(Int, CellID)  // Pass 1: compute loss & store DFT contributions
     case spectralLossPass2(Int, CellID)  // Pass 2: reduce contributions to gradients (no-op in forward)
+    case parallelMap2DTestPass1(Int, CellID)  // Pass 1: write per-bin values to scratch
+    case parallelMap2DTestPass2(Int, CellID)  // Pass 2: reduce per-bin values to scalar
     case selector  // selector(mode, options[])
     case memoryRead(CellID)
     case memoryWrite(CellID)
+    case memoryAccumulate(CellID)  // Atomic add to memory cell
+    case tensorAccumulate(CellID)  // Atomic add tensor elements to memory region
     case historyWrite(CellID)
     case historyReadWrite(CellID)
     case param(CellID)
@@ -76,6 +77,7 @@ public enum LazyOp {
     case click(CellID)
     case historyRead(CellID)
     case phasor(CellID)
+    case deterministicPhasor  // Stateless phasor for constant frequency - parallelizable
     case accum(CellID)
     case noise(CellID)
     case constant(Float)
@@ -85,15 +87,25 @@ public enum LazyOp {
     case seq  // Sequential execution - returns value of last input
 
     // Tensor operations (historyRead/historyWrite handle tensors automatically based on cell size)
-    case conv1d(Int)    // 1D convolution, Int is kernel size
+    case conv1d(Int)  // 1D convolution, Int is kernel size
     case conv2d(Shape)  // 2D convolution, Shape is kernel shape [kH, kW]
     case sum  // Reduce tensor to scalar by summing all elements
     case sumAxis(Int)  // Reduce along a specific axis
     case reshape(Shape)  // Reshape tensor (metadata only, no data movement)
     case transpose([Int])  // Transpose/permute axes (metadata only)
     case shrink([(Int, Int)?])  // Shrink/slice tensor (metadata only, no data movement)
-    case pad([(Int, Int)])      // Pad tensor with zeros (virtual view, conditional reads)
+    case pad([(Int, Int)])  // Pad tensor with zeros (virtual view, conditional reads)
     case peek  // Read from 2D tensor at (index, channel) with interpolation - lazy version
+    case peekRow  // Read entire row from 2D tensor with interpolation - outputs 1D tensor
+    case fft(Int, Int, CellID, CellID, CellID, CellID)  // FFT transform: windowSize, hopSize, scratchCell, ringBufferCell, writePosCell, counterCell
+    case ifft(Int, Int, CellID, CellID, CellID, CellID)  // IFFT transform: windowSize, hopSize, scratchCell, outputRingCell, readPosCell, counterCell
+
+    // Gradient-specific operations (used by Gradients.swift)
+    case neg  // Unary negation: -x
+    case expand(Shape)  // Broadcast scalar to tensor shape (sum backward)
+    case expandAxis(Shape, Int)  // Broadcast along a specific axis (sumAxis backward)
+    case gradPhasor(NodeID)  // Gradient for phasor: needs frame index context
+    case gradDeterministicPhasor  // Gradient for deterministic phasor
 
     public func emit(ctx: IRContext, g: Graph, nodeId: NodeID) throws -> [UOp] {
         guard let node = g.nodes[nodeId] else { return [] }
@@ -269,6 +281,36 @@ public enum LazyOp {
                     operator: "memoryWrite", expected: 2, actual: inputs.count)
             }
             b.use(val: b.memoryWrite(cellId, b.value(inputs[0]), b.value(inputs[1])))
+        case .memoryAccumulate(let cellId):
+            guard inputs.count == 2 else {
+                throw DGenError.insufficientInputs(
+                    operator: "memoryAccumulate", expected: 2, actual: inputs.count)
+            }
+            b.use(val: b.memoryAccumulate(cellId, b.value(inputs[0]), b.value(inputs[1])))
+        case .tensorAccumulate(let cellId):
+            // Input is a tensor node - atomically add each element to cell
+            guard node.inputs.count == 1 else {
+                throw DGenError.insufficientInputs(
+                    operator: "tensorAccumulate", expected: 1, actual: node.inputs.count)
+            }
+
+            let tensorInput = node.inputs[0]
+            guard let inputNode = g.nodes[tensorInput],
+                  case .tensor(let shape) = inputNode.shape,
+                  let tensorId = g.nodeToTensor[tensorInput],
+                  let tensor = g.tensors[tensorId] else {
+                throw DGenError.tensorError(op: "tensorAccumulate", reason: "requires tensor input")
+            }
+
+            let size = shape.reduce(1, *)
+
+            // Emit loop that reads each element and accumulates
+            b.parallelRange(size) { idx in
+                let val = b.memoryRead(tensor.cellId, b.cast(idx, to: .int))
+                _ = b.memoryAccumulate(cellId, b.cast(idx, to: .int), val)
+            }
+
+            ctx.values[nodeId] = .empty
         case .atan2:
             guard inputs.count == 2 else {
                 throw DGenError.insufficientInputs(
@@ -283,23 +325,61 @@ public enum LazyOp {
             let (a, b2) = b.values(inputs, count: 2)
             b.use(val: u_mse(a, b2)(b))
 
-        case let .spectralLossPass1(windowSize, scratchCell):
+        case .spectralLossPass1(let windowSize, let scratchCell):
             guard inputs.count == 2 else {
                 throw DGenError.insufficientInputs(
                     operator: "spectralLossPass1", expected: 2, actual: inputs.count)
             }
             let (sig1, sig2) = b.values(inputs, count: 2)
             // Forward: compute spectral loss normally (Pass1 does the actual work)
-            b.use(val: u_spectralLoss(sig1: sig1, sig2: sig2, windowSize: windowSize)(b))
+            b.use(val: u_spectralLoss(sig1: sig1, sig2: sig2, windowSize: windowSize, scratchCell: scratchCell)(b))
 
-        case .spectralLossPass2(_, _):
+        case .spectralLossPass2(let windowSize, let scratchCell):
             guard inputs.count == 1 else {
                 throw DGenError.insufficientInputs(
                     operator: "spectralLossPass2", expected: 1, actual: inputs.count)
             }
-            // Forward: no-op, just forward the value from Pass1
-            let pass1Result = b.value(inputs[0])
-            b.use(val: pass1Result)
+            // Forward: reduce per-bin errors written by Pass1
+            let _ = b.value(inputs[0])
+            let numBins = windowSize / 2 + 1
+            let winSize = b.constant(Float(windowSize))
+            let frameIdx = b.threadIndex()
+            let baseOffset = frameIdx * winSize * b.constant(2.0)
+            let totalError = b.float(0.0)
+
+            b.loop(numBins) { binIndex in
+                let binIndexFloat = b.cast(binIndex, to: .float)
+                let offset = baseOffset + binIndexFloat
+                let binError = b.memoryRead(scratchCell, b.cast(offset, to: .int))
+                totalError.accumulate(binError)
+            }
+
+            b.use(val: totalError.value)
+
+        case .parallelMap2DTestPass1(let bins, let scratchCell):
+            guard inputs.isEmpty else {
+                throw DGenError.insufficientInputs(
+                    operator: "parallelMap2DTestPass1", expected: 0, actual: inputs.count)
+            }
+            u_parallelMap2DTestPass1(bins: bins, scratchCell: scratchCell)(b)
+            b.use(val: b.constant(0.0))
+
+        case .parallelMap2DTestPass2(let bins, let scratchCell):
+            guard inputs.count == 1 else {
+                throw DGenError.insufficientInputs(
+                    operator: "parallelMap2DTestPass2", expected: 1, actual: inputs.count)
+            }
+            let _ = b.value(inputs[0])
+            let binsFloat = b.constant(Float(bins))
+            let frameIdx = b.threadIndex()
+            let acc = b.float(0.0)
+            b.loop(bins) { binIdx in
+                let binIdxFloat = b.cast(binIdx, to: .float)
+                let offset = frameIdx * binsFloat + binIdxFloat
+                let val = b.memoryRead(scratchCell, b.cast(offset, to: .int))
+                acc.accumulate(val)
+            }
+            b.use(val: acc.value)
 
         case .gt:
             guard inputs.count == 2 else {
@@ -527,7 +607,7 @@ public enum LazyOp {
 
                 // Phasor accumulator logic with indexed state
                 // Uses gswitch instead of if statements for SIMD compatibility
-                let sampleRate = b.constant(44100.0)
+                let sampleRate = b.constant(b.ctx.g.sampleRate)
                 let incr = freq / sampleRate
                 let zero = b.constant(0.0)
                 let one = b.constant(1.0)
@@ -557,6 +637,23 @@ public enum LazyOp {
                 // Scalar phasor: use original implementation
                 let (freq, reset) = b.values(inputs, count: 2)
                 b.use(val: u_phasor(cellId, freq: freq, reset: reset)(b))
+            }
+        case .deterministicPhasor:
+            // Stateless phasor for constant frequency - fully parallelizable
+            // phase = fmod(freq / sampleRate * threadIndex, 1.0)
+            guard inputs.count == 1 else {
+                throw DGenError.insufficientInputs(
+                    operator: "deterministicPhasor", expected: 1, actual: inputs.count)
+            }
+            // Use emitUnaryOp to handle both scalar and tensor cases
+            try emitUnaryOp(b: b, g: g, node: node, inputs: inputs) { freq in
+                let sampleRate = b.constant(g.sampleRate)
+                // Use threadIndex (maps to 'id' in Metal) for parallel execution across frames
+                let frameIdx = b.threadIndex()
+                // Compute phase directly: (freq / sampleRate * frameIndex) mod 1.0
+                let phaseIncrement = freq / sampleRate
+                let rawPhase = phaseIncrement * frameIdx
+                return rawPhase - b.floor(rawPhase)  // fmod equivalent for positive values
             }
         case .output(let outputNumber):
             guard inputs.count == 1 else {
@@ -595,7 +692,8 @@ public enum LazyOp {
                 let inTensor = g.nodeToTensor[node.inputs[0]].flatMap({ g.tensors[$0] }),
                 let kTensor = g.nodeToTensor[node.inputs[1]].flatMap({ g.tensors[$0] })
             else {
-                throw DGenError.tensorError(op: "conv1d", reason: "requires 1D input/output tensors")
+                throw DGenError.tensorError(
+                    op: "conv1d", reason: "requires 1D input/output tensors")
             }
 
             let inLen = inShape[0]
@@ -611,7 +709,8 @@ public enum LazyOp {
 
                     let rawIdx = b.tensorMemoryIndex(inTensor, indices: [b.cast(inX, to: .int)])
                     let safeIdx = b.gswitch(inBounds, rawIdx, b.constant(0))
-                    let inVal = b.gswitch(inBounds, b.memoryRead(inTensor.cellId, safeIdx), b.constant(0))
+                    let inVal = b.gswitch(
+                        inBounds, b.memoryRead(inTensor.cellId, safeIdx), b.constant(0))
 
                     let kMemIdx = b.tensorMemoryIndex(kTensor, indices: [b.cast(kx, to: .int)])
                     let kVal = b.memoryRead(kTensor.cellId, kMemIdx)
@@ -651,11 +750,14 @@ public enum LazyOp {
                             (inY >= b.constant(0)) * (inY < b.constant(Float(inH)))
                             * (inX >= b.constant(0)) * (inX < b.constant(Float(inW)))
 
-                        let rawIdx = b.tensorMemoryIndex(inTensor, indices: [b.cast(inY, to: .int), b.cast(inX, to: .int)])
+                        let rawIdx = b.tensorMemoryIndex(
+                            inTensor, indices: [b.cast(inY, to: .int), b.cast(inX, to: .int)])
                         let safeIdx = b.gswitch(inBounds, rawIdx, b.constant(0))
-                        let inVal = b.gswitch(inBounds, b.memoryRead(inTensor.cellId, safeIdx), b.constant(0))
+                        let inVal = b.gswitch(
+                            inBounds, b.memoryRead(inTensor.cellId, safeIdx), b.constant(0))
 
-                        let kMemIdx = b.tensorMemoryIndex(kTensor, indices: [b.cast(ky, to: .int), b.cast(kx, to: .int)])
+                        let kMemIdx = b.tensorMemoryIndex(
+                            kTensor, indices: [b.cast(ky, to: .int), b.cast(kx, to: .int)])
                         let kVal = b.memoryRead(kTensor.cellId, kMemIdx)
 
                         acc.accumulate(inVal * kVal)
@@ -665,6 +767,18 @@ public enum LazyOp {
             }
 
         case .sum:
+            if let scratch = ctx.frameTensorChainScratch[nodeId] {
+                let acc = b.float(0.0)
+                let frameIdx = b.threadIndex()
+                let sizeExpr = b.constant(Float(scratch.tensorSize))
+                b.loop(scratch.tensorSize) { i in
+                    let idx = frameIdx * sizeExpr + b.cast(i, to: .float)
+                    let val = b.memoryRead(scratch.cellId, b.cast(idx, to: .int))
+                    acc.accumulate(val)
+                }
+                b.use(val: acc.value)
+                break
+            }
             guard case .tensor(let shape) = g.nodes[node.inputs[0]]?.shape,
                 let inTensor = g.nodeToTensor[node.inputs[0]].flatMap({ g.tensors[$0] })
             else {
@@ -755,15 +869,17 @@ public enum LazyOp {
             // Lazy peek: read from 2D tensor at (index, channel) with linear interpolation
             // Inputs: [tensor, index, channel]
             guard node.inputs.count == 3 else {
-                throw DGenError.insufficientInputs(operator: "peek", expected: 3, actual: node.inputs.count)
+                throw DGenError.insufficientInputs(
+                    operator: "peek", expected: 3, actual: node.inputs.count)
             }
 
             let tensorInput = node.inputs[0]
 
             // Get tensor shape from the input node
             guard let inputNode = g.nodes[tensorInput],
-                  case .tensor(let shape) = inputNode.shape,
-                  shape.count >= 2 else {
+                case .tensor(let shape) = inputNode.shape,
+                shape.count >= 2
+            else {
                 throw DGenError.tensorError(op: "peek", reason: "requires 2D tensor input")
             }
 
@@ -785,7 +901,8 @@ public enum LazyOp {
             let positiveIndex = b.gswitch(isNegative, wrappedIndex + channelSizeFloat, wrappedIndex)
 
             // Clamp channel to valid range [0, numChannels-1]
-            let clampedChannel = b.floor(b.max(zero, b.min(channel, b.constant(Float(numChannels - 1)))))
+            let clampedChannel = b.floor(
+                b.max(zero, b.min(channel, b.constant(Float(numChannels - 1)))))
             let channelOffset = channelSizeFloat * clampedChannel
 
             // Calculate final read position
@@ -798,10 +915,13 @@ public enum LazyOp {
             // Get tensor cellId - either from concrete tensor or from input tensor
             let cellId: CellID
             if let tensorId = g.nodeToTensor[tensorInput],
-               let tensor = g.tensors[tensorId] {
+                let tensor = g.tensors[tensorId]
+            {
                 cellId = tensor.cellId
             } else {
-                throw DGenError.tensorError(op: "peek", reason: "frame-based tensor peek requires tensor context - not yet implemented")
+                throw DGenError.tensorError(
+                    op: "peek",
+                    reason: "frame-based tensor peek requires tensor context - not yet implemented")
             }
 
             // Read two samples for interpolation
@@ -817,570 +937,566 @@ public enum LazyOp {
             // Linear interpolation: (1-frac)*sample1 + frac*sample2
             let interpolated = b.mix(sample1, sample2, frac)
             b.use(val: interpolated)
+
+        case .peekRow:
+            // PeekRow: read entire row from 2D tensor with linear interpolation
+            // Inputs: [tensor, rowIndex]
+            // Output: 1D tensor [numCols]
+            // Memory layout: column-major (offset = col * numRows + row)
+
+            // Mark as scalar ONLY if NOT part of a frame-tensor chain.
+            // When part of a chain, we'll use SIMD-across-frames with thread-local tensors.
+            if !ctx.isPartOfFrameTensorChain(nodeId) {
+                b.markRequiresScalar()
+            }
+
+            guard node.inputs.count == 2 else {
+                throw DGenError.insufficientInputs(
+                    operator: "peekRow", expected: 2, actual: node.inputs.count)
+            }
+
+            let tensorInput = node.inputs[0]
+
+            // Get tensor shape from the input node
+            guard let inputNode = g.nodes[tensorInput],
+                case .tensor(let shape) = inputNode.shape,
+                shape.count == 2
+            else {
+                throw DGenError.tensorError(op: "peekRow", reason: "requires 2D tensor input")
+            }
+
+            let numRows = shape[0]
+            let numCols = shape[1]
+
+            // Get input and output tensors
+            guard let inTensorId = g.nodeToTensor[tensorInput],
+                let inTensor = g.tensors[inTensorId],
+                let outTensorId = g.nodeToTensor[node.id],
+                let outTensor = g.tensors[outTensorId]
+            else {
+                throw DGenError.tensorError(op: "peekRow", reason: "missing tensor")
+            }
+
+            // Read rowIndex input
+            let rowIndex = try b.readInput(node, inputs, at: 1)
+
+            let zero = b.constant(0.0)
+            let one = b.constant(1.0)
+            let numRowsFloat = b.constant(Float(numRows))
+
+            // Wrap rowIndex using modulo for wrapping behavior
+            let wrappedIndex = b.mod(rowIndex, numRowsFloat)
+            let isNegative = wrappedIndex < zero
+            let positiveIndex = b.gswitch(isNegative, wrappedIndex + numRowsFloat, wrappedIndex)
+
+            // Compute floor and ceil indices for interpolation
+            let floorIndex = b.floor(positiveIndex)
+            let frac = positiveIndex - floorIndex
+
+            // Compute ceil index with wrapping
+            let ceilIndex = floorIndex + one
+            let ceilWrapped = b.gswitch(ceilIndex >= numRowsFloat, zero, ceilIndex)
+
+            // Iterate over columns and compute interpolated values
+            b.parallelRange(numCols) { colIdx in
+                // Column-major layout: offset = col * numRows + row
+                let colOffset = colIdx * numRowsFloat
+
+                // Read floor and ceil samples
+                let floorPos = colOffset + floorIndex
+                let ceilPos = colOffset + ceilWrapped
+
+                let sample1 = b.memoryRead(inTensor.cellId, b.cast(floorPos, to: .int))
+                let sample2 = b.memoryRead(inTensor.cellId, b.cast(ceilPos, to: .int))
+
+                // Linear interpolation: (1-frac)*sample1 + frac*sample2
+                let interpolated = b.mix(sample1, sample2, frac)
+
+                // Write to output tensor (1D, so just use colIdx)
+                _ = b.memoryWrite(outTensor.cellId, b.cast(colIdx, to: .int), interpolated)
+            }
+
+            // Register the output tensor
+            ctx.values[nodeId] = .empty
+
+        case .fft(
+            let windowSize, let hopSize, let scratchCell, let ringBufferCell, let writePosCell,
+            let counterCell):
+            // FFT using Cooley-Tukey algorithm with ring buffer for sample history
+            // Input: signal (scalar per frame)
+            // Output: tensor [numBins, 2] where numBins = windowSize/2 + 1
+            // hopSize: only compute FFT every hopSize frames (reduces CPU)
+
+            // Mark as scalar to avoid SIMD variable naming collisions in C renderer
+            b.markRequiresScalar()
+
+            guard inputs.count == 1 else {
+                throw DGenError.insufficientInputs(
+                    operator: "fft", expected: 1, actual: inputs.count)
+            }
+            guard windowSize > 0 && (windowSize & (windowSize - 1)) == 0 else {
+                throw DGenError.tensorError(op: "fft", reason: "windowSize must be a power of 2")
+            }
+
+            let numBins = windowSize / 2 + 1
+            let numStages = Int(log2(Double(windowSize)))
+
+            // Get output tensor
+            guard let outTensorId = g.nodeToTensor[node.id],
+                let outTensor = g.tensors[outTensorId]
+            else {
+                throw DGenError.tensorError(op: "fft", reason: "missing output tensor")
+            }
+
+            let sig = b.value(inputs[0])
+
+            // Scratch memory layout:
+            // scratch[0..<windowSize] = real components
+            // scratch[windowSize..<windowSize*2] = imaginary components
+            let imagOffset = windowSize
+
+            let winSizeFloat = b.constant(Float(windowSize))
+            let hopSizeFloat = b.constant(Float(hopSize))
+            let zero = b.constant(0.0)
+            let one = b.constant(1.0)
+
+            // Load write position and hop counter
+            let writePos = b.memoryRead(writePosCell, zero)
+            let counter = b.memoryRead(counterCell, zero)
+
+            // Write current sample to ring buffer at writePos
+            _ = b.memoryWrite(ringBufferCell, b.cast(writePos, to: .int), sig)
+
+            // Update write position: (writePos + 1) % windowSize
+            let nextWritePos = writePos + one
+            let wrappedWritePos = b.gswitch(nextWritePos >= winSizeFloat, zero, nextWritePos)
+            _ = b.memoryWrite(writePosCell, zero, wrappedWritePos)
+
+            // Update counter: (counter + 1) % hopSize
+            let nextCounter = counter + one
+            let wrappedCounter = b.gswitch(nextCounter >= hopSizeFloat, zero, nextCounter)
+            _ = b.memoryWrite(counterCell, zero, wrappedCounter)
+
+            // Only compute FFT when counter == 0 (every hopSize frames)
+            let shouldCompute = counter == zero
+
+            // Wrap entire FFT computation in if-statement for efficiency
+            // This skips all expensive loops when shouldCompute is false
+            b.if_(shouldCompute) {
+                // 1. Load samples from ring buffer into scratch (imaginary = 0)
+                // Read from oldest to newest: start from wrappedWritePos (oldest) and go around
+                b.loop(windowSize) { n in
+                    let nFloat = b.cast(n, to: .float)
+                    // Read position: (writePos + n) % windowSize gives oldest to newest
+                    // Use wrappedWritePos which now points to oldest sample
+                    let readIdx = wrappedWritePos + nFloat
+                    let wrappedReadIdx = b.gswitch(
+                        readIdx >= winSizeFloat, readIdx - winSizeFloat, readIdx)
+                    let sample = b.memoryRead(ringBufferCell, b.cast(wrappedReadIdx, to: .int))
+                    _ = b.memoryWrite(scratchCell, b.cast(n, to: .int), sample)
+                    _ = b.memoryWrite(
+                        scratchCell, b.cast(n, to: .int) + b.constant(Float(imagOffset)),
+                        b.constant(0.0))
+                }
+
+                // 2. Bit-reversal permutation
+                b.loop(windowSize) { i in
+                    // Compute bit-reversed index
+                    var rev = b.constant(0.0)
+                    var n = b.cast(i, to: .float)
+                    for _ in 0..<numStages {
+                        rev = rev * b.constant(2.0) + (n % b.constant(2.0))
+                        n = b.floor(n / b.constant(2.0))
+                    }
+
+                    let iFloat = b.cast(i, to: .float)
+                    // Swap if i < rev (avoid double-swap)
+                    let shouldSwap = iFloat < rev
+                    let iInt = b.cast(i, to: .int)
+                    let revInt = b.cast(rev, to: .int)
+
+                    // Load values at i and rev
+                    let tempRealI = b.memoryRead(scratchCell, iInt)
+                    let tempImagI = b.memoryRead(scratchCell, iInt + b.constant(Float(imagOffset)))
+                    let tempRealRev = b.memoryRead(scratchCell, revInt)
+                    let tempImagRev = b.memoryRead(
+                        scratchCell, revInt + b.constant(Float(imagOffset)))
+
+                    // Conditionally swap
+                    let newRealI = b.gswitch(shouldSwap, tempRealRev, tempRealI)
+                    let newImagI = b.gswitch(shouldSwap, tempImagRev, tempImagI)
+                    let newRealRev = b.gswitch(shouldSwap, tempRealI, tempRealRev)
+                    let newImagRev = b.gswitch(shouldSwap, tempImagI, tempImagRev)
+
+                    _ = b.memoryWrite(scratchCell, iInt, newRealI)
+                    _ = b.memoryWrite(scratchCell, iInt + b.constant(Float(imagOffset)), newImagI)
+                    _ = b.memoryWrite(scratchCell, revInt, newRealRev)
+                    _ = b.memoryWrite(
+                        scratchCell, revInt + b.constant(Float(imagOffset)), newImagRev)
+                }
+
+                // 3. Butterfly stages
+                for stage in 0..<numStages {
+                    let butterflySize = 1 << (stage + 1)  // 2, 4, 8, ...
+                    let halfSize = butterflySize / 2
+                    let numGroups = windowSize / butterflySize
+
+                    b.loop(numGroups) { group in
+                        b.loop(halfSize) { k in
+                            let groupFloat = b.cast(group, to: .float)
+                            let kFloat = b.cast(k, to: .float)
+                            let butterflySizeFloat = b.constant(Float(butterflySize))
+                            let halfSizeFloat = b.constant(Float(halfSize))
+
+                            let i = groupFloat * butterflySizeFloat + kFloat
+                            let j = i + halfSizeFloat
+
+                            // Twiddle factor: W = e^(-2*pi*i*k/butterflySize)
+                            let angle = b.constant(-2.0) * b.pi * kFloat / butterflySizeFloat
+                            let wr = b.cos(angle)
+                            let wi = b.sin(angle)
+
+                            let iInt = b.cast(i, to: .int)
+                            let jInt = b.cast(j, to: .int)
+
+                            // Load values
+                            let ar = b.memoryRead(scratchCell, iInt)
+                            let ai = b.memoryRead(scratchCell, iInt + b.constant(Float(imagOffset)))
+                            let br = b.memoryRead(scratchCell, jInt)
+                            let bi = b.memoryRead(scratchCell, jInt + b.constant(Float(imagOffset)))
+
+                            // Butterfly: (ar,ai) + W*(br,bi) and (ar,ai) - W*(br,bi)
+                            // W*(br,bi) = (wr*br - wi*bi, wr*bi + wi*br)
+                            let tr = wr * br - wi * bi
+                            let ti = wr * bi + wi * br
+
+                            _ = b.memoryWrite(scratchCell, iInt, ar + tr)
+                            _ = b.memoryWrite(
+                                scratchCell, iInt + b.constant(Float(imagOffset)), ai + ti)
+                            _ = b.memoryWrite(scratchCell, jInt, ar - tr)
+                            _ = b.memoryWrite(
+                                scratchCell, jInt + b.constant(Float(imagOffset)), ai - ti)
+                        }
+                    }
+                }
+
+                // 4. Copy first numBins to output tensor [numBins, 2]
+                // Output layout: column-major for peek compatibility
+                // Channel 0 (real): offsets 0, 1, 2, ... numBins-1
+                // Channel 1 (imag): offsets numBins, numBins+1, ... 2*numBins-1
+                b.loop(numBins) { k in
+                    let kInt = b.cast(k, to: .int)
+                    let real = b.memoryRead(scratchCell, kInt)
+                    let imag = b.memoryRead(scratchCell, kInt + b.constant(Float(imagOffset)))
+                    _ = b.memoryWrite(outTensor.cellId, kInt, real)
+                    _ = b.memoryWrite(outTensor.cellId, kInt + b.constant(Float(numBins)), imag)
+                }
+            }
+
+            // Register output for downstream ops
+            ctx.values[nodeId] = .empty
+
+        case .ifft(
+            let windowSize, let hopSize, let scratchCell, let outputRingCell, let readPosCell,
+            let counterCell):
+            // IFFT using Cooley-Tukey algorithm with overlap-add for reconstruction
+            // Input: spectrum tensor [numBins, 2] where numBins = windowSize/2 + 1
+            // Output: scalar (one sample per frame via overlap-add)
+
+            b.markRequiresScalar()
+
+            guard inputs.count == 1 else {
+                throw DGenError.insufficientInputs(
+                    operator: "ifft", expected: 1, actual: inputs.count)
+            }
+            guard windowSize > 0 && (windowSize & (windowSize - 1)) == 0 else {
+                throw DGenError.tensorError(op: "ifft", reason: "windowSize must be a power of 2")
+            }
+
+            let numBins = windowSize / 2 + 1
+            let numStages = Int(log2(Double(windowSize)))
+            let imagOffset = windowSize  // Scratch layout: real[0..<N], imag[N..<2N]
+
+            // Get input tensor (spectrum)
+            guard let inputNodeId = node.inputs.first,
+                let inputTensorId = g.nodeToTensor[inputNodeId],
+                let inputTensor = g.tensors[inputTensorId]
+            else {
+                throw DGenError.tensorError(op: "ifft", reason: "missing input spectrum tensor")
+            }
+
+            let winSizeFloat = b.constant(Float(windowSize))
+            let hopSizeFloat = b.constant(Float(hopSize))
+            let zero = b.constant(0.0)
+            let one = b.constant(1.0)
+            let numBinsFloat = b.constant(Float(numBins))
+
+            // Load read position and hop counter
+            let readPos = b.memoryRead(readPosCell, zero)
+            let counter = b.memoryRead(counterCell, zero)
+
+            // Output current sample from ring buffer, then clear it for next overlap-add cycle
+            let outputSample = b.memoryRead(outputRingCell, b.cast(readPos, to: .int))
+            _ = b.memoryWrite(outputRingCell, b.cast(readPos, to: .int), zero)
+
+            // Update read position: (readPos + 1) % windowSize
+            let nextReadPos = readPos + one
+            let wrappedReadPos = b.gswitch(nextReadPos >= winSizeFloat, zero, nextReadPos)
+            _ = b.memoryWrite(readPosCell, zero, wrappedReadPos)
+
+            // Update counter: (counter + 1) % hopSize
+            let nextCounter = counter + one
+            let wrappedCounter = b.gswitch(nextCounter >= hopSizeFloat, zero, nextCounter)
+            _ = b.memoryWrite(counterCell, zero, wrappedCounter)
+
+            // Only compute IFFT when counter == 0
+            let shouldCompute = counter == zero
+            b.if_(shouldCompute) {
+                // 1. Load spectrum into scratch with conjugate symmetry to get full N points
+                // Input layout (column-major): real[0..<numBins], imag[numBins..<2*numBins]
+                // For real signal: X[N-k] = conj(X[k]) for k = 1 to N/2-1
+                // DC (k=0) and Nyquist (k=N/2) have no imaginary part in output
+
+                b.loop(windowSize) { n in
+                    let nInt = b.cast(n, to: .int)
+                    let halfN = b.constant(Float(windowSize / 2))
+
+                    // Determine which input bin to read from
+                    let isFirstHalf = n <= halfN
+                    let inputBin = b.gswitch(isFirstHalf, n, winSizeFloat - n)
+                    let inputBinInt = b.cast(inputBin, to: .int)
+
+                    // Read real and imag from input tensor (column-major layout)
+                    let inReal = b.memoryRead(inputTensor.cellId, inputBinInt)
+                    let inImag = b.memoryRead(
+                        inputTensor.cellId, inputBinInt + b.constant(Float(numBins)))
+
+                    // For second half (conjugate), negate imaginary part
+                    let realVal = inReal
+                    let imagVal = b.gswitch(isFirstHalf, inImag, zero - inImag)
+
+                    // Write to scratch
+                    _ = b.memoryWrite(scratchCell, nInt, realVal)
+                    _ = b.memoryWrite(scratchCell, nInt + b.constant(Float(imagOffset)), imagVal)
+                }
+
+                // 2. Bit-reversal permutation (same as FFT)
+                b.loop(windowSize) { i in
+                    var rev = b.constant(0.0)
+                    var n = i
+                    for _ in 0..<numStages {
+                        rev = rev * b.constant(2.0) + b.mod(n, b.constant(2.0))
+                        n = b.floor(n / b.constant(2.0))
+                    }
+
+                    let iFloat = i
+                    let shouldSwap = b.and(iFloat < rev, shouldCompute)
+
+                    let iInt = b.cast(i, to: .int)
+                    let revInt = b.cast(rev, to: .int)
+
+                    let tempR = b.memoryRead(scratchCell, iInt)
+                    let tempI = b.memoryRead(scratchCell, iInt + b.constant(Float(imagOffset)))
+                    let revR = b.memoryRead(scratchCell, revInt)
+                    let revI = b.memoryRead(scratchCell, revInt + b.constant(Float(imagOffset)))
+
+                    let newIR = b.gswitch(shouldSwap, revR, tempR)
+                    let newII = b.gswitch(shouldSwap, revI, tempI)
+                    let newRevR = b.gswitch(shouldSwap, tempR, revR)
+                    let newRevI = b.gswitch(shouldSwap, tempI, revI)
+
+                    _ = b.memoryWrite(scratchCell, iInt, newIR)
+                    _ = b.memoryWrite(scratchCell, iInt + b.constant(Float(imagOffset)), newII)
+                    _ = b.memoryWrite(scratchCell, revInt, newRevR)
+                    _ = b.memoryWrite(scratchCell, revInt + b.constant(Float(imagOffset)), newRevI)
+                }
+
+                // 3. Butterfly stages (IFFT uses POSITIVE twiddle angles)
+                var butterflySize = 2
+                for stage in 0..<numStages {
+                    let halfSize = butterflySize / 2
+                    let numGroups = windowSize / butterflySize
+
+                    b.loop(numGroups) { group in
+                        b.loop(halfSize) { k in
+                            let i = group * b.constant(Float(butterflySize)) + k
+                            let j = i + b.constant(Float(halfSize))
+
+                            // IFFT twiddle: W = e^(+2πi*k/butterflySize) - POSITIVE angle
+                            let angle =
+                                b.constant(2.0) * b.constant(Float.pi) * k
+                                / b.constant(Float(butterflySize))
+                            let wr = b.cos(angle)
+                            let wi = b.sin(angle)
+
+                            let iInt = b.cast(i, to: .int)
+                            let jInt = b.cast(j, to: .int)
+
+                            let ar = b.memoryRead(scratchCell, iInt)
+                            let ai = b.memoryRead(scratchCell, iInt + b.constant(Float(imagOffset)))
+                            let br = b.memoryRead(scratchCell, jInt)
+                            let bi = b.memoryRead(scratchCell, jInt + b.constant(Float(imagOffset)))
+
+                            // Complex multiply: (wr + i*wi) * (br + i*bi)
+                            let tr = wr * br - wi * bi
+                            let ti = wr * bi + wi * br
+
+                            // Butterfly
+                            _ = b.memoryWrite(scratchCell, iInt, ar + tr)
+                            _ = b.memoryWrite(
+                                scratchCell, iInt + b.constant(Float(imagOffset)), ai + ti)
+                            _ = b.memoryWrite(scratchCell, jInt, ar - tr)
+                            _ = b.memoryWrite(
+                                scratchCell, jInt + b.constant(Float(imagOffset)), ai - ti)
+                        }
+                    }
+                    butterflySize *= 2
+                }
+
+                // 4. Divide by N and add to output ring buffer (overlap-add)
+                let invN = b.constant(1.0 / Float(windowSize))
+                b.loop(windowSize) { n in
+                    let nInt = b.cast(n, to: .int)
+                    let realVal = b.memoryRead(scratchCell, nInt) * invN
+
+                    // Calculate output position with wrap-around
+                    let outPos = readPos + n
+                    let wrappedOutPos = b.gswitch(
+                        outPos >= winSizeFloat, outPos - winSizeFloat, outPos)
+                    let outPosInt = b.cast(wrappedOutPos, to: .int)
+
+                    // Overlap-add: accumulate into output buffer
+                    let existing = b.memoryRead(outputRingCell, outPosInt)
+                    _ = b.memoryWrite(outputRingCell, outPosInt, existing + realVal)
+                }
+            }
+
+            // Use the output sample
+            b.use(val: outputSample)
+
+        // MARK: - Gradient-specific operations
+
+        case .neg:
+            // Unary negation: -x
+            guard inputs.count == 1 else { fatalError("neg requires 1 input") }
+
+            // Check if input is a tensor
+            let inputNodeId = node.inputs[0]
+            if let inputNode = g.nodes[inputNodeId],
+               case .tensor(let inputShape) = inputNode.shape,
+               let inTensorId = g.nodeToTensor[inputNodeId],
+               let inTensor = g.tensors[inTensorId] {
+                // Tensor input: negate each element
+                guard let outTensor = g.nodeToTensor[nodeId].flatMap({ g.tensors[$0] }) else {
+                    ctx.values[nodeId] = .empty
+                    break
+                }
+                let size = inputShape.reduce(1, *)
+                b.parallelRange(size) { idx in
+                    let val = b.memoryRead(inTensor.cellId, b.cast(idx, to: .int))
+                    let negVal = b.constant(0.0) - val
+                    _ = b.memoryWrite(outTensor.cellId, b.cast(idx, to: .int), negVal)
+                }
+                ctx.values[nodeId] = .empty
+            } else {
+                // Scalar input: simple negation
+                let x = b.value(inputs[0])
+                b.use(val: b.constant(0.0) - x)
+            }
+
+        case .expand(let targetShape):
+            // Broadcast scalar to tensor shape (for sum backward)
+            // Input is scalar, output is tensor where all elements = input
+            guard inputs.count == 1 else { fatalError("expand requires 1 input") }
+
+            // Get or create output tensor
+            guard let outTensor = g.nodeToTensor[nodeId].flatMap({ g.tensors[$0] }) else {
+                // Fallback: just pass through the scalar
+                b.use(val: b.value(inputs[0]))
+                break
+            }
+
+            let size = targetShape.reduce(1, *)
+            let inputNodeId = node.inputs[0]
+
+            // Check if input has a tensor cell we can read from (for cross-scope access)
+            if let inputTensorId = g.nodeToTensor[inputNodeId],
+               let inputTensor = g.tensors[inputTensorId] {
+                // Input is a tensor - read element 0 (assumes scalar stored in tensor)
+                b.parallelRange(size) { idx in
+                    let scalarVal = b.memoryRead(inputTensor.cellId, b.int(0))
+                    _ = b.memoryWrite(outTensor.cellId, b.cast(idx, to: .int), scalarVal)
+                }
+            } else {
+                // Input is a scalar computed in current scope
+                // First, store the scalar to element 0 of output to capture it
+                let scalarVal = b.value(inputs[0])
+                _ = b.memoryWrite(outTensor.cellId, b.int(0), scalarVal)
+
+                // Then fill all elements by reading from the stored value
+                b.parallelRange(size) { idx in
+                    let storedVal = b.memoryRead(outTensor.cellId, b.int(0))
+                    _ = b.memoryWrite(outTensor.cellId, b.cast(idx, to: .int), storedVal)
+                }
+            }
+
+        case .expandAxis(let targetShape, let axis):
+            // Broadcast along a specific axis (for sumAxis backward)
+            guard inputs.count == 1 else { fatalError("expandAxis requires 1 input") }
+
+            guard let inTensor = g.nodeToTensor[node.inputs[0]].flatMap({ g.tensors[$0] }),
+                  let outTensor = g.nodeToTensor[nodeId].flatMap({ g.tensors[$0] }) else {
+                // Fallback
+                if let s = inputs.first { b.use(val: b.value(s)) }
+                break
+            }
+
+            let outSize = targetShape.reduce(1, *)
+            let normalizedAxis = axis < 0 ? targetShape.count + axis : axis
+
+            // Compute strides for output shape (excluding the expanded axis)
+            var inputShape = targetShape
+            inputShape.remove(at: normalizedAxis)
+            let inputStrides = Tensor.computeRowMajorStrides(inputShape)
+            let outputStrides = Tensor.computeRowMajorStrides(targetShape)
+
+            b.parallelRange(outSize) { outIdx in
+                // Map output index to input index (skip the expanded axis dimension)
+                var inputFlatIdx = b.int(0)
+                var inDim = 0
+                for dim in 0..<targetShape.count {
+                    if dim == normalizedAxis { continue }
+                    let coord = b.mod(b.floorDiv(outIdx, b.int(outputStrides[dim])), b.int(targetShape[dim]))
+                    inputFlatIdx = b.add(inputFlatIdx, b.mul(coord, b.int(inputStrides[inDim])))
+                    inDim += 1
+                }
+
+                let val = b.memoryRead(inTensor.cellId, inputFlatIdx)
+                _ = b.memoryWrite(outTensor.cellId, b.cast(outIdx, to: .int), val)
+            }
+
+        case .gradPhasor(_):
+            // Gradient for phasor: d(phase)/d(freq) = frameIndex / sampleRate
+            // inputs: [gradOutput, sampleRate]
+            // Note: Use threadIndex() for SIMD compatibility (same as gradDeterministicPhasor)
+            guard inputs.count == 2 else { fatalError("gradPhasor requires 2 inputs") }
+            let gradOut = b.value(inputs[0])
+            let sampleRate = b.value(inputs[1])
+            let frameIdx = b.threadIndex()  // Use threadIndex for SIMD compatibility
+            let gradFreq = gradOut * frameIdx / sampleRate
+            b.use(val: gradFreq)
+
+        case .gradDeterministicPhasor:
+            // Gradient for deterministic phasor: d(phase)/d(freq) = threadIndex / sampleRate
+            // inputs: [gradOutput, sampleRate]
+            guard inputs.count == 2 else { fatalError("gradDeterministicPhasor requires 2 inputs") }
+            let gradOut = b.value(inputs[0])
+            let sampleRate = b.value(inputs[1])
+            let frameIdx = b.threadIndex()
+            let gradFreq = gradOut * frameIdx / sampleRate
+            b.use(val: gradFreq)
         }
         ops.append(contentsOf: b.ops)
         return ops
-    }
-
-    func emitBackward(ctx: IRContext, g: Graph, nodeId: NodeID) throws
-        -> [UOp]
-    {
-        guard let node = g.nodes[nodeId] else {
-            return []
-        }
-
-        var ops: [UOp] = []
-        let b = IRBuilder(ctx: ctx, nodeId: nodeId)
-
-        // we'll assume that gradient seeds are set to 1 before running an epoch, and everything else is 0
-        var gradOutput = ctx.useConstant(src: nil, value: 1.0)
-        if let gradCellId = ctx.gradients[nodeId] {
-            gradOutput = b.loadGrad(gradCellId).lazy
-        } else {
-            // Allocate a gradient ID for this node (not a seed).
-            // Only explicit loss nodes should be seeds.
-            let gradCellId = ctx.useGradient(src: nodeId, seed: false)
-            gradOutput = b.loadGrad(gradCellId).lazy
-        }
-
-        // Collect operands
-        let inputs: [Lazy] = node.inputs.compactMap { ctx.values[$0] }
-
-        switch self {
-        case .constant(_):
-            // Constants have no gradients to propagate
-            // should we return 0 so that it can actually propagate?
-            // constant is a leaf so it'd be at the very end anyway so probably fine
-            return []
-        case .tensorRef(_):
-            return []
-        case .and, .or, .xor:
-            return []
-        case .click:
-            // TODO - implement backprop for click
-            break
-        case .noise:
-            // Noise is non-differentiable (random values have zero gradient)
-            break
-        case .add:
-            // d(x+y)/dx = 1, d(x+y)/dy = 1
-            guard node.inputs.count == 2 else { fatalError("add requires 2 inputs") }
-            b.grad(node.inputs[0], value: gradOutput)
-            b.grad(node.inputs[1], value: gradOutput)
-        case .sub:
-            // z = x - y  =>  dz/dx = 1, dz/dy = -1
-            guard node.inputs.count == 2 else { fatalError("sub requires 2 inputs") }
-            b.grad(node.inputs[0], value: gradOutput)
-            // negate grad for second input
-            let negGrad = (b.constant(0.0) - b.value(gradOutput)).lazy
-            b.grad(node.inputs[1], value: negGrad)
-        case .mod:
-            // z = fmod(a, b) ≈ a - b*trunc(a/b). Treat trunc grad as 0 almost everywhere.
-            // -> dz/da ≈ 1, dz/db ≈ 0 (stable choice for DSP wrapping)
-            guard node.inputs.count == 2 else { fatalError("mod requires 2 inputs") }
-            b.grad(node.inputs[0], value: gradOutput)
-            b.grad(node.inputs[1], value: ctx.useConstant(src: nil, value: 0.0))
-        case .param(_):
-            // the canonical gradient for the param already lives in gradients, in the row for that param’s gradId.
-            // There’s nothing left to push. It’s a leaf.
-            break
-        case .min:
-            // d(min(x,y))/dx = (x <= y) ? 1 : 0, d(min(x,y))/dy = (y < x) ? 1 : 0
-            guard inputs.count == 2 else { fatalError("min requires 2 inputs") }
-            let x = b.tapeValue(node.inputs[0])
-            let y = b.tapeValue(node.inputs[1])
-            let xIsMin = x <= y
-            let yIsMin = y < x
-            let gradX = b.gswitch(xIsMin, b.value(gradOutput), b.constant(0.0))
-            let gradY = b.gswitch(yIsMin, b.value(gradOutput), b.constant(0.0))
-            b.grad(node.inputs[0], value: gradX.lazy)
-            b.grad(node.inputs[1], value: gradY.lazy)
-        case .max:
-            // d(max(x,y))/dx = (x >= y) ? 1 : 0, d(max(x,y))/dy = (y > x) ? 1 : 0
-            guard inputs.count == 2 else { fatalError("max requires 2 inputs") }
-            let x = b.tapeValue(node.inputs[0])
-            let y = b.tapeValue(node.inputs[1])
-            let xIsMax = x >= y
-            let yIsMax = y > x
-            let gradX = b.gswitch(xIsMax, b.value(gradOutput), b.constant(0.0))
-            let gradY = b.gswitch(yIsMax, b.value(gradOutput), b.constant(0.0))
-            b.grad(node.inputs[0], value: gradX.lazy)
-            b.grad(node.inputs[1], value: gradY.lazy)
-        case .mul:
-            // d(x*y)/dx = y, d(x*y)/dy = x
-            guard inputs.count == 2 else { fatalError("mul \(node.id) requires 2 inputs") }
-            let rhs = b.tapeValue(node.inputs[1])
-            let lhs = b.tapeValue(node.inputs[0])
-            let gradX = b.value(gradOutput) * rhs
-            let gradY = b.value(gradOutput) * lhs
-            b.grad(node.inputs[0], value: gradX.lazy)
-            b.grad(node.inputs[1], value: gradY.lazy)
-        case .div:
-            // z = x / y  =>  dz/dx = 1/y, dz/dy = -x / y^2
-            guard inputs.count == 2 else { fatalError("div \(node.id) requires 2 inputs") }
-            let x = b.tapeValue(node.inputs[0])
-            let y = b.tapeValue(node.inputs[1])
-            let gradX = b.value(gradOutput) / y
-            let gradY = (b.constant(0.0) - b.value(gradOutput)) * (x / (y * y))
-            b.grad(node.inputs[0], value: gradX.lazy)
-            b.grad(node.inputs[1], value: gradY.lazy)
-        case .abs:
-            // d(abs(x))/dx = sign(x), but zero at x=0
-            guard inputs.count == 1 else { fatalError("abs requires 1 input") }
-            let input = b.tapeValue(node.inputs[0])
-            let grad = b.value(gradOutput) * b.sign(input)
-            b.grad(node.inputs[0], value: grad.lazy)
-        case .sign:
-            // d(sign(x))/dx = 0 everywhere except at x=0 where it's undefined
-            guard inputs.count == 1 else { fatalError("sign requires 1 input") }
-            let zero = ctx.useConstant(src: nil, value: 0.0)
-            b.grad(node.inputs[0], value: zero)
-        case .sin:
-            // d(sin(x))/dx = cos(x)
-            guard inputs.count == 1 else { fatalError("sin requires 1 input") }
-            let input = b.tapeValue(node.inputs[0])
-            let grad = b.value(gradOutput) * b.cos(input)
-            b.grad(node.inputs[0], value: grad.lazy)
-        case .cos:
-            // d(cos(x))/dx = -sin(x)
-            guard inputs.count == 1 else { fatalError("cos requires 1 input") }
-            let input = b.tapeValue(node.inputs[0])
-            let grad = b.value(gradOutput) * (b.constant(0.0) - b.sin(input))
-            b.grad(node.inputs[0], value: grad.lazy)
-        case .tan:
-            // d(tan(x))/dx = sec²(x) = 1/cos²(x)
-            guard inputs.count == 1 else { fatalError("tan requires 1 input") }
-            let input = b.tapeValue(node.inputs[0])
-            let cosInput = b.cos(input)
-            let sec2 = b.constant(1.0) / (cosInput * cosInput)
-            let grad = b.value(gradOutput) * sec2
-            b.grad(node.inputs[0], value: grad.lazy)
-        case .tanh:
-            // d(tanh(x))/dx = 1 - tanh(x)^2
-            guard inputs.count == 1 else { fatalError("tanh requires 1 input") }
-            let input = b.tapeValue(node.inputs[0])
-            let t = b.tanh(input)
-            let grad = b.value(gradOutput) * (b.constant(1.0) - t * t)
-            b.grad(node.inputs[0], value: grad.lazy)
-        case .exp:
-            // d(exp(x))/dx = exp(x)
-            guard inputs.count == 1 else { fatalError("exp requires 1 input") }
-            let input = b.tapeValue(node.inputs[0])
-            let grad = b.value(gradOutput) * b.exp(input)
-            b.grad(node.inputs[0], value: grad.lazy)
-        case .log:
-            // d(log(x))/dx = 1/x
-            guard inputs.count == 1 else { fatalError("log requires 1 input") }
-            let input = b.tapeValue(node.inputs[0])
-            let grad = b.value(gradOutput) / input
-            b.grad(node.inputs[0], value: grad.lazy)
-        case .log10:
-            // d(log10(x))/dx = 1 / (x * ln(10))
-            guard inputs.count == 1 else { fatalError("log10 requires 1 input") }
-            let input = b.tapeValue(node.inputs[0])
-            let ln10 = b.constant(2.302585092994046)  // natural log of 10
-            let grad = b.value(gradOutput) / (input * ln10)
-            b.grad(node.inputs[0], value: grad.lazy)
-        case .sqrt:
-            // d(sqrt(x))/dx = 1/(2*sqrt(x))
-            guard inputs.count == 1 else { fatalError("sqrt requires 1 input") }
-            let input = b.tapeValue(node.inputs[0])
-            let grad = b.value(gradOutput) / (b.constant(2.0) * b.sqrt(input))
-            b.grad(node.inputs[0], value: grad.lazy)
-        case .pow:
-            // d(x^y)/dx = y * x^(y-1), d(x^y)/dy = x^y * ln(x)
-            guard inputs.count == 2 else { fatalError("pow requires 2 inputs") }
-            let base = b.tapeValue(node.inputs[0])
-            let exponent = b.tapeValue(node.inputs[1])
-            let result = b.pow(base, exponent)
-
-            // Gradient w.r.t. base: y * x^(y-1)
-            let baseGrad = b.value(gradOutput) * exponent * b.pow(base, exponent - b.constant(1.0))
-            b.grad(node.inputs[0], value: baseGrad.lazy)
-
-            // Gradient w.r.t. exponent: x^y * ln(x)
-            let expGrad = b.value(gradOutput) * result * b.log(base)
-            b.grad(node.inputs[1], value: expGrad.lazy)
-        case .atan2:
-            // d(atan2(y,x))/dy = x/(x²+y²), d(atan2(y,x))/dx = -y/(x²+y²)
-            guard inputs.count == 2 else { fatalError("atan2 requires 2 inputs") }
-            let y = b.tapeValue(node.inputs[0])
-            let x = b.tapeValue(node.inputs[1])
-            let denom = x * x + y * y
-            let gradY = b.value(gradOutput) * (x / denom)
-            let gradX = b.value(gradOutput) * (b.constant(0.0) - y / denom)
-            b.grad(node.inputs[0], value: gradY.lazy)
-            b.grad(node.inputs[1], value: gradX.lazy)
-        case .mse:
-            // loss = (a - b)^2; grads: d/da = 2*(a-b)*go, d/db = -2*(a-b)*go
-            guard inputs.count == 2 else { fatalError("mse requires 2 inputs") }
-            let a = b.tapeValue(node.inputs[0])
-            let c = b.tapeValue(node.inputs[1])
-            let diff = a - c
-            let two = b.constant(2.0)
-            let gradA = b.value(gradOutput) * two * diff
-            let gradB = b.value(gradOutput) * (b.constant(0.0) - two * diff)
-            b.grad(node.inputs[0], value: gradA.lazy)
-            b.grad(node.inputs[1], value: gradB.lazy)
-
-        case let .spectralLossPass1(windowSize, scratchCell):
-            guard inputs.count == 2 else { fatalError("spectralLossPass1 requires 2 inputs") }
-            let sig1 = b.tapeValue(node.inputs[0])
-            let sig2 = b.tapeValue(node.inputs[1])
-            let gradId1 = b.ctx.useGradient(src: node.inputs[0])
-            let gradId2 = b.ctx.useGradient(src: node.inputs[1])
-
-            // Pass B: Reduce from memory to gradients (READ)
-            // This runs SECOND in backward (after Pass2), so memory has been written
-            let (grad1, grad2) = u_spectralLossBackwardPass2(
-                windowSize, scratchCell, sig1, sig2, b.value(gradOutput), gradId1, gradId2
-            )(b)
-
-            // Propagate gradients to original signals
-            b.grad(node.inputs[0], value: grad1.lazy)
-            b.grad(node.inputs[1], value: grad2.lazy)
-
-        case let .spectralLossPass2(windowSize, scratchCell):
-            guard inputs.count == 1 else { fatalError("spectralLossPass2 requires 1 input") }
-
-            // Get the original signal inputs from Pass1's node
-            let pass1Node = g.nodes[node.inputs[0]]!
-            guard pass1Node.inputs.count == 2 else { fatalError("Expected Pass1 to have 2 inputs") }
-
-            let sig1 = b.tapeValue(pass1Node.inputs[0])
-            let sig2 = b.tapeValue(pass1Node.inputs[1])
-
-            // Pass A: Accumulate per-window gradient contributions to memory (WRITE)
-            // This runs FIRST in backward (before Pass1), writing data that Pass1 will read
-            // Don't propagate gradients - Pass1 will handle that
-            u_spectralLossBackwardPass1(
-                windowSize, scratchCell, sig1, sig2, b.value(gradOutput)
-            )(b)
-        case .floor:
-            // d(floor(x))/dx = 0 (floor is not differentiable, but we set to 0)
-            guard inputs.count == 1 else { fatalError("floor requires 1 input") }
-            let zeroGrad = ctx.useConstant(src: nil, value: 0.0)
-            b.grad(node.inputs[0], value: zeroGrad)
-        case .ceil:
-            // d(ceil(x))/dx = 0 (floor is not differentiable, but we set to 0)
-            guard inputs.count == 1 else { fatalError("floor requires 1 input") }
-            let zeroGrad = ctx.useConstant(src: nil, value: 0.0)
-            b.grad(node.inputs[0], value: zeroGrad)
-        case .round:
-            // d(ceil(x))/dx = 0 (floor is not differentiable, but we set to 0)
-            guard inputs.count == 1 else { fatalError("floor requires 1 input") }
-            let zeroGrad = ctx.useConstant(src: nil, value: 0.0)
-            b.grad(node.inputs[0], value: zeroGrad)
-        case .memoryRead(_):
-            // For memoryRead, gradient flows through to the values written to memory
-            // This is complex and depends on the memory write operations
-            guard inputs.count == 1 else { fatalError("memoryRead requires 1 input") }
-            // For now, treat as zero gradient for the offset
-            let zeroGrad = ctx.useConstant(src: nil, value: 0.0)
-            b.grad(node.inputs[0], value: zeroGrad)
-        case .memoryWrite(_):
-            // For memoryWrite, gradient flows through to both offset and value inputs
-            guard inputs.count == 2 else { fatalError("memoryWrite requires 2 inputs") }
-            // Gradient for offset is typically zero (address computation)
-            let zeroGrad = ctx.useConstant(src: nil, value: 0.0)
-            b.grad(node.inputs[0], value: zeroGrad)
-            // Gradient for value flows through
-            b.grad(node.inputs[1], value: gradOutput)
-        case .gt, .gte, .lte, .lt, .eq:
-            // Comparisons have zero gradient (non-differentiable)
-            guard node.inputs.count == 2 else { fatalError("comparison requires 2 inputs") }
-            let zero = ctx.useConstant(src: nil, value: 0.0)
-            b.grad(node.inputs[0], value: zero)
-            b.grad(node.inputs[1], value: zero)
-
-        case .gswitch:
-            // gswitch(cond, x, y) = cond ? x : y
-            guard inputs.count == 3 else { fatalError("gswitch requires 3 inputs") }
-            let cond = b.tapeValue(node.inputs[0])
-            let gradX = b.gswitch(cond, b.value(gradOutput), b.constant(0.0))
-            let gradY = b.gswitch(cond, b.constant(0.0), b.value(gradOutput))
-            b.grad(node.inputs[0], value: ctx.useConstant(src: nil, value: 0.0))
-            b.grad(node.inputs[1], value: gradX.lazy)
-            b.grad(node.inputs[2], value: gradY.lazy)
-
-        case .selector:
-            // selector(mode, options[]) -> gradient flows only to the selected option
-            guard inputs.count >= 2 else { fatalError("selector requires at least 2 inputs") }
-
-            // Gradient for mode is always zero (index is non-differentiable)
-            b.grad(node.inputs[0], value: ctx.useConstant(src: nil, value: 0.0))
-
-            // For each option, gradient is non-zero only if it was selected
-            let mode = b.tapeValue(node.inputs[0])
-            for i in 1..<node.inputs.count {
-                let optionIndex = b.constant(Float(i - 1))
-                let isSelected = mode == optionIndex
-                let gradOption = b.gswitch(isSelected, b.value(gradOutput), b.constant(0.0))
-                b.grad(node.inputs[i], value: gradOption.lazy)
-            }
-
-        case .mix:
-            // mix(x, y, t) = x * (1-t) + y * t
-            guard inputs.count == 3 else { fatalError("mix requires 3 inputs") }
-            let x = b.tapeValue(node.inputs[0])
-            let y = b.tapeValue(node.inputs[1])
-            let t = b.tapeValue(node.inputs[2])
-
-            // d/dx = (1-t)
-            let gradX = b.value(gradOutput) * (b.constant(1.0) - t)
-            // d/dy = t
-            let gradY = b.value(gradOutput) * t
-            // d/dt = y - x
-            let gradT = b.value(gradOutput) * (y - x)
-
-            b.grad(node.inputs[0], value: gradX.lazy)
-            b.grad(node.inputs[1], value: gradY.lazy)
-            b.grad(node.inputs[2], value: gradT.lazy)
-
-        case .historyReadWrite(let cellId):
-            // Combined read (returns previous state) and write (stores current input)
-            // Backward:
-            //  - Carry to previous timestep must be the gradient w.r.t. y[i] (the read output),
-            //    not the input gradient. Do not re-add existing carry here; that causes runaway.
-            //  - The input only receives gradient from the future via the carry.
-            guard inputs.count == 1 else { fatalError("historyReadWrite requires 1 input") }
-            let carry = b.loadGradMemory(cellId)
-            // Set next carry for i-1 to the upstream grad at this read
-            _ = b.storeGradMemory(cellId, b.value(gradOutput))
-            // Gradient to the written input is only the carry from future
-            b.grad(node.inputs[0], value: carry.lazy)
-
-        case .historyWrite(let cellId):
-            // Write stores current input into the cell; its forward output is the previous value.
-            // Backward: input only gets gradient from future reads (the carry). There is no
-            // local gradient path from this op's output to its input.
-            guard inputs.count == 1 else { fatalError("history write requires 1 input") }
-            let carry = b.loadGradMemory(cellId)
-            b.grad(node.inputs[0], value: carry.lazy)
-        case .historyRead(let cellId):
-            // Read exposes previous state; the carry for the previous timestep must equal
-            // the gradient w.r.t. this read's output at the current time.
-            // Do not add the existing carry here — that was already used to form gradOutput.
-            _ = b.storeGradMemory(cellId, b.value(gradOutput))
-        case .latch(_):
-            // Gradient flows through value input only when condition was true
-            guard inputs.count == 2 else { fatalError("latch requires 2 inputs") }
-            let cond = b.tapeValue(node.inputs[1])
-            let gradValue = b.gswitch(cond > b.constant(0), b.value(gradOutput), b.constant(0.0))
-            b.grad(node.inputs[0], value: gradValue.lazy)
-            b.grad(node.inputs[1], value: ctx.useConstant(src: nil, value: 0.0))
-
-        case .accum(let cellId):
-            let reset = b.tapeValue(node.inputs[1])
-
-            // Gradient for increment (blocked by reset)
-            let gradIncr = b.gswitch(reset > b.constant(0), b.constant(0.0), b.value(gradOutput))
-
-            // handle temporal gradient flow:
-            // The gradient also flows to the previous accumulated value
-            let gradFromFuture = b.loadGradMemory(cellId)
-
-            // The total gradient flowing backward through time
-            let gradToPrev = b.value(gradOutput) + gradFromFuture
-
-            // Store for previous timestep's accum
-            _ = b.storeGradMemory(cellId, gradToPrev)
-
-            b.grad(node.inputs[0], value: gradIncr.lazy)
-            b.grad(node.inputs[1], value: ctx.useConstant(src: nil, value: 0.0))
-            b.grad(node.inputs[2], value: ctx.useConstant(src: nil, value: 0.0))
-            b.grad(node.inputs[3], value: ctx.useConstant(src: nil, value: 0.0))
-
-        case .phasor(_):
-            // NOTE ON GRADIENT SCALE VS frameCount
-            // ------------------------------------------------------------
-            // The phasor’s backward pass produces a gradient proportional
-            // to the current frame index (time). Even though Training.swift
-            // averages gradients across frames, the mean of i/sampleRate over
-            // i = 0..(frameCount-1) grows with the time horizon (~O(frameCount)).
-            // As a result, increasing frameCount increases the effective
-            // gradient scale for frequency parameters, requiring a smaller
-            // learning rate to maintain stability. This is independent of the
-            // particular loss (e.g., spectral loss) and comes from the time-
-            // weighted nature of d(phase)/d(freq).
-            //
-            // TODO - use actual sampleRate in system
-            let sampleRate = b.constant(44100.0)
-            let currentTime = b.frameIndex(nodeId)
-
-            // Compute this timestep's frequency gradient
-            // d(phase)/d(freq) = time / sampleRate (since phase accumulates as: phase += freq/sampleRate)
-            let gradFreq = b.value(gradOutput) * currentTime / sampleRate
-
-            // Write gradient directly (no accumulation needed - test will sum across frames)
-            b.grad(node.inputs[0], value: gradFreq.lazy)
-        case .output(_):
-            // Output just passes gradient through to its input
-            guard inputs.count == 1 else { fatalError("output requires 1 input") }
-            b.grad(node.inputs[0], value: gradOutput)
-        case .input(_):
-            break
-        case .seq:
-            // TODO: take another look at this, all the computation in each input is executed, even though the final one is returned
-            // Gradient flows only to the last input (the one whose value is returned)
-            guard node.inputs.count >= 2 else { fatalError("seq requires at least 2 inputs") }
-            // Zero gradients for all inputs except the last
-            for i in 0..<(node.inputs.count - 1) {
-                b.grad(node.inputs[i], value: ctx.useConstant(src: nil, value: 0.0))
-            }
-            // Pass gradient to the last input
-            if let lastInput = node.inputs.last {
-                b.grad(lastInput, value: gradOutput)
-            }
-
-        // MARK: - Tensor Operation Gradients
-
-        case .conv1d(_):
-            // Conv1d gradient: similar to conv2d, would require transposed convolution
-            // For now, we provide zero gradients (TODO: implement full backprop)
-            guard inputs.count == 2 else { fatalError("conv1d requires 2 inputs") }
-            b.grad(node.inputs[0], value: ctx.useConstant(src: nil, value: 0.0))
-            b.grad(node.inputs[1], value: ctx.useConstant(src: nil, value: 0.0))
-
-        case .conv2d(_):
-            // Conv2d gradient: gradient w.r.t. input = conv2d(grad_output, flipped_kernel)
-            // gradient w.r.t. kernel = conv2d(input, grad_output)
-            // This is complex - for now, we provide zero gradients (TODO: implement full backprop)
-            guard inputs.count == 2 else { fatalError("conv2d requires 2 inputs") }
-            // For membrane simulation, we often don't need kernel gradients (fixed Laplacian)
-            // Input gradient would require transposed convolution
-            b.grad(node.inputs[0], value: ctx.useConstant(src: nil, value: 0.0))
-            b.grad(node.inputs[1], value: ctx.useConstant(src: nil, value: 0.0))
-
-        case .sum:
-            // d(sum(x))/dx[i] = 1 for all i
-            // Gradient broadcasts from scalar back to tensor
-            guard inputs.count == 1 else { fatalError("sum requires 1 input") }
-            // Pass gradient through (it will be broadcast to all elements)
-            b.grad(node.inputs[0], value: gradOutput)
-
-        case .sumAxis(_):
-            // TODO: implement proper backprop for sumAxis
-            // For now, pass gradient through (will need broadcasting logic)
-            guard inputs.count == 1 else { fatalError("sumAxis requires 1 input") }
-            b.grad(node.inputs[0], value: gradOutput)
-
-        case .reshape(_):
-            // Reshape is metadata-only, gradient flows through unchanged
-            guard inputs.count == 1 else { fatalError("reshape requires 1 input") }
-            b.grad(node.inputs[0], value: gradOutput)
-
-        case .transpose(_):
-            // Transpose is metadata-only, gradient flows through unchanged
-            guard inputs.count == 1 else { fatalError("transpose requires 1 input") }
-            b.grad(node.inputs[0], value: gradOutput)
-
-        case .shrink(_):
-            // Shrink is metadata-only, gradient flows through unchanged
-            guard inputs.count == 1 else { fatalError("shrink requires 1 input") }
-            b.grad(node.inputs[0], value: gradOutput)
-
-        case .pad(_):
-            // Pad is a virtual view, gradient flows through unchanged
-            // (padded regions have zero gradient contribution)
-            guard inputs.count == 1 else { fatalError("pad requires 1 input") }
-            b.grad(node.inputs[0], value: gradOutput)
-
-        case .peek:
-            // Peek reads a single value from tensor - gradient only affects that position
-            // For now, zero gradients (TODO: implement scatter gradient back to tensor position)
-            guard inputs.count == 3 else { fatalError("peek requires 3 inputs") }
-            b.grad(node.inputs[0], value: ctx.useConstant(src: nil, value: 0.0))
-            b.grad(node.inputs[1], value: ctx.useConstant(src: nil, value: 0.0))
-            b.grad(node.inputs[2], value: ctx.useConstant(src: nil, value: 0.0))
-        }
-
-        ops.append(contentsOf: b.ops)
-        return ops
-    }
-}
-
-// Two-pass spectral loss backward functions
-
-/// Pass A: Accumulate per-window gradient contributions to memory.
-/// Each thread i (window end) computes DFT for its window and stores per-sample contributions.
-func u_spectralLossBackwardPass1(
-    _ windowSize: Int,
-    _ scratchCell: CellID,
-    _ sig1: Expr,
-    _ sig2: Expr,
-    _ upstreamGrad: Expr
-) -> (IRBuilder) -> Void {
-    return { b in
-        let numBins = windowSize / 2 + 1
-        let i = b.threadIndex()  // Current frame (window end)
-
-        // For each frequency bin
-        b.loop(numBins) { binIndex in
-            // DFT accumulators (real and imaginary parts)
-            let real1 = b.float(0.0)
-            let imag1 = b.float(0.0)
-            let real2 = b.float(0.0)
-            let imag2 = b.float(0.0)
-
-            // Compute DFT over window samples
-            b.loop(windowSize) { n in
-                let winSize = b.constant(Float(windowSize))
-                let j = i - (winSize - b.constant(1.0)) + b.cast(n, to: .float)
-
-                // Load samples from tape with bounds checking
-                let s1 = b.tapeLoad(sig1, at: j)
-                let s2 = b.tapeLoad(sig2, at: j)
-
-                // DFT basis: e^(-2πi*k*n/N) = cos(angle) - i*sin(angle)
-                let binIndexFloat = b.cast(binIndex, to: .float)
-                let nFloat = b.cast(n, to: .float)
-                let angle = b.constant(-2.0) * b.pi * binIndexFloat * nFloat / winSize
-                let c = b.cos(angle)
-                let s = b.sin(angle)
-
-                // Accumulate DFT: Real(X[k]) += x[n]*cos, Imag(X[k]) += x[n]*sin
-                real1.accumulate(s1 * c)
-                imag1.accumulate(s1 * s)
-                real2.accumulate(s2 * c)
-                imag2.accumulate(s2 * s)
-            }
-
-            // Magnitude: |X[k]| = sqrt(Real² + Imag²)
-            let mag1 = b.sqrt(real1.value * real1.value + imag1.value * imag1.value)
-            let mag2 = b.sqrt(real2.value * real2.value + imag2.value * imag2.value)
-
-            // Loss gradient for this bin: d/d(mag1) of (mag1-mag2)²
-            let magDiff = mag1 - mag2
-            let lossGrad = b.constant(2.0) * magDiff
-
-            // For each window offset, compute and store contribution
-            b.loop(windowSize) { n in
-                let binIndexFloat = b.cast(binIndex, to: .float)
-                let nFloat = b.cast(n, to: .float)
-                let winSize = b.constant(Float(windowSize))
-                let angle_n = b.constant(-2.0) * b.pi * binIndexFloat * nFloat / winSize
-                let c_n = b.cos(angle_n)
-                let s_n = b.sin(angle_n)
-
-                // ∂mag/∂s[n] = (real*cos + imag*sin) / mag
-                let eps = b.constant(1e-8)
-                let sampleGrad1 = (real1.value * c_n + imag1.value * s_n) / (mag1 + eps)
-                let sampleGrad2 = (real2.value * c_n + imag2.value * s_n) / (mag2 + eps)
-
-                // Chain rule: ∂L/∂s = (∂L/∂mag) * (∂mag/∂s) * upstreamGrad
-                let contrib1 = lossGrad * sampleGrad1 * upstreamGrad
-                let contrib2 = (b.constant(0.0) - lossGrad) * sampleGrad2 * upstreamGrad
-
-                // Write to memory: memory[scratchCell + (i * windowSize * 2) + (n * 2) + component]
-                let winSizeConst = b.constant(Float(windowSize))
-                let offset1 =
-                    i * winSizeConst * b.constant(2.0) + b.cast(n, to: .float) * b.constant(2.0)
-                let offset2 = offset1 + b.constant(1.0)
-
-                _ = b.memoryWrite(scratchCell, b.cast(offset1, to: .int), contrib1)
-                _ = b.memoryWrite(scratchCell, b.cast(offset2, to: .int), contrib2)
-            }
-        }
     }
 }

@@ -58,7 +58,7 @@ print("Wrote C WAV to \(cURL.path)")
 // Compile and render with Metal backend to WAV
 let mResult = try CompilationPipeline.compile(
   graph: g, backend: .metal,
-  options: .init(frameCount: 128, debug: true, forceScalar: false, backwards: false))
+  options: .init(frameCount: 128, debug: true, forceScalar: false))
 for kernel in mResult.kernels {
   print(kernel.source)
 

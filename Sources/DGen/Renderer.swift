@@ -1,17 +1,35 @@
-// the beauty is this doesn't need to even know if its forward or backward
-
 import Foundation
 
 public struct BlockUOps {
     public var ops: [UOp]
     public let kind: Kind
     public let temporality: Temporality
+    public var parallelPolicy: ParallelPolicy
+    /// When true, this block starts a new kernel (prevents fusion with previous block)
+    public var forceNewKernel: Bool
+    /// Optional: dispatch threads = frameCount * scale for this block
+    public var threadCountScale: Int?
 
-    public init(ops: [UOp], kind: Kind, temporality: Temporality = .static_) {
+    public init(
+        ops: [UOp],
+        kind: Kind,
+        temporality: Temporality = .static_,
+        parallelPolicy: ParallelPolicy = .serial,
+        forceNewKernel: Bool = false,
+        threadCountScale: Int? = nil
+    ) {
         self.ops = ops
         self.kind = kind
         self.temporality = temporality
+        self.parallelPolicy = parallelPolicy
+        self.forceNewKernel = forceNewKernel
+        self.threadCountScale = threadCountScale
     }
+}
+
+public enum ParallelPolicy {
+    case serial
+    case threadParallel
 }
 
 public enum Device {
@@ -25,15 +43,22 @@ public struct CompiledKernel {
     public let kind: Kind
     public let buffers: [String]  // names of inputs/outputs
     public let threadGroupSize: Int?  // for Metal: nil means runtime-determined, 1 for scalar
+    public let threadCount: Int?  // for Metal: override total threads (non-frame dispatch)
+    public let threadCountScale: Int?  // for Metal: total threads = frameCount * scale
+    public let needsReducedGradsSum: Bool
     public let memorySize: Int  // Required memory allocation size in floats
 }
 
 public class ScheduleItem {
     public var ops: [UOp] = []
     public let kind: Kind
+    public var temporality: Temporality = .frameBased
+    public var parallelPolicy: ParallelPolicy = .serial
+    public var threadCountScale: Int? = nil
 
-    init(kind: Kind) {
+    init(kind: Kind, temporality: Temporality = .frameBased) {
         self.kind = kind
+        self.temporality = temporality
     }
 }
 
@@ -112,6 +137,9 @@ public class CRenderer: Renderer {
     public var voiceCount: Int = 1
     public var voiceCellIdOpt: Int? = nil
     public var loadedGlobal: [Int: Bool] = [:]
+    private var staticGlobalVars: Set<VarID> = []
+    private var frameIndexOverride: String? = nil
+    private var currentThreadCountScale: Int? = nil
 
     // Track the emitted type of each variable in current scope
     public enum EmittedType {
@@ -160,6 +188,9 @@ public class CRenderer: Renderer {
                 kind: scheduleItem.kind,
                 buffers: buffers,
                 threadGroupSize: 1,  // C execution is scalar for now
+                threadCount: nil,
+                threadCountScale: nil,
+                needsReducedGradsSum: false,
                 memorySize: computedMem  // Ensure at least enough for voiceCellId
             )
         }
@@ -171,6 +202,16 @@ public class CRenderer: Renderer {
         _ ctx: IRContext,
         _ frameCount: Int
     ) {
+        staticGlobalVars.removeAll()
+        for block in uopBlocks {
+            guard block.temporality == .static_ else { continue }
+            for uop in block.ops {
+                if case let .defineGlobal(varId) = uop.op {
+                    staticGlobalVars.insert(varId)
+                }
+            }
+        }
+
         let scheduleItem = ScheduleItem(kind: .scalar)
         scheduleItems.append(scheduleItem)
 
@@ -181,30 +222,86 @@ public class CRenderer: Renderer {
         // Merge adjacent blocks of the same kind into a single loop to reduce passes
         var currentKind: Kind? = nil
         var currentTemporality: Temporality? = nil
+        var currentThreadCountScale: Int? = nil
+        var hopCheckOpen = false  // Track if we have an open hop check conditional
+        var loopOpen = false
+
+        func scaledFrameCount(_ scale: Int?) -> Lazy {
+            guard let scale, scale != 1 else { return frameCountUOp }
+            let scaleConst = ctx.useConstant(src: nil, value: Float(scale))
+            let dest = ctx.useVariable(src: nil, trackInValues: false)
+            scheduleItem.ops.append(UOp(op: .mul(frameCountUOp, scaleConst), value: dest))
+            return dest
+        }
+
         for block in uopBlocks {
-            if currentKind != block.kind || currentTemporality != block.temporality {
-                // Close previous loop if open
-                if currentKind != nil {
-                    scheduleItem.ops.append(UOp(op: .endLoop, value: .empty))
+            let needsNewLoop =
+                currentKind != block.kind
+                || currentTemporality != block.temporality
+                || currentThreadCountScale != block.threadCountScale
+
+            if needsNewLoop {
+                // Close previous hop check if open
+                if hopCheckOpen {
+                    scheduleItem.ops.append(UOp(op: .endHopCheck, value: .empty))
+                    hopCheckOpen = false
                 }
-                // Open new loop for this kind
-                scheduleItem.ops.append(
-                    UOp(
-                        op: .beginLoop(frameCountUOp, block.kind == .scalar ? 1 : 4),
-                        value: .empty)
-                )
+
+                // Close previous loop if open
+                if loopOpen {
+                    scheduleItem.ops.append(UOp(op: .endLoop, value: .empty))
+                    loopOpen = false
+                }
+
+                // Open new loop based on temporality
+                switch block.temporality {
+                case .frameBased:
+                    // Frame-based: standard frame loop
+                    let loopCount = scaledFrameCount(block.threadCountScale)
+                    scheduleItem.ops.append(
+                        UOp(
+                            op: .beginLoop(loopCount, block.kind == .scalar ? 1 : 4),
+                            value: .empty)
+                    )
+                    loopOpen = true
+
+                case .hopBased(_, let counterCell):
+                    // Hop-based: frame loop with conditional check inside
+                    // The block only executes when counter == 0
+                    scheduleItem.ops.append(
+                        UOp(
+                            op: .beginLoop(frameCountUOp, block.kind == .scalar ? 1 : 4),
+                            value: .empty)
+                    )
+                    scheduleItem.ops.append(
+                        UOp(op: .beginHopCheck(counterCell), value: .empty)
+                    )
+                    hopCheckOpen = true
+                    loopOpen = true
+
+                case .static_:
+                    // Static: no frame loop
+                    loopOpen = false
+                }
+
                 currentKind = block.kind
                 currentTemporality = block.temporality
+                currentThreadCountScale = block.threadCountScale
             }
 
             for uop in block.ops {
-                if case .defineGlobal = uop.op { continue }
+                // Don't skip defineGlobal - it needs to run through emit to mark loadedGlobal
                 scheduleItem.ops.append(UOp(op: uop.op, value: uop.value, kind: uop.kind))
             }
         }
 
+        // Close any open hop check
+        if hopCheckOpen {
+            scheduleItem.ops.append(UOp(op: .endHopCheck, value: .empty))
+        }
+
         // Close any open loop
-        if currentKind != nil {
+        if loopOpen {
             scheduleItem.ops.append(UOp(op: .endLoop, value: .empty))
         }
     }
@@ -213,15 +310,9 @@ public class CRenderer: Renderer {
         name: String, scheduleItem: ScheduleItem, ctx: IRContext, graph: Graph,
         totalMemorySlots: Int
     ) -> String {
+        frameIndexOverride = nil
+        currentThreadCountScale = scheduleItem.threadCountScale
         var code: [String] = []
-
-        // Generate a unique UUID for this kernel
-        let kernelUUID = UUID().uuidString
-
-        // Sanitize kernel name to be a valid C identifier
-        // Replace invalid characters with underscores
-        let sanitizedName = name.replacingOccurrences(
-            of: "[^a-zA-Z0-9_]", with: "_", options: .regularExpression)
 
         // C includes and function signature
         code.append(
@@ -310,6 +401,7 @@ public class CRenderer: Renderer {
 
         // Use audiograph parameters directly - no mapping needed
         code.append("  int frameCount = nframes;  // Use audiograph frame count parameter")
+        code.append("  int i = 0;")
 
         loadedGlobal = [:]
         varEmittedTypes = [:]
@@ -339,7 +431,7 @@ public class CRenderer: Renderer {
         for uop in scheduleItem.ops {
             var diff = 0
             switch uop.op {
-            case .beginIf, .beginForLoop:
+            case .beginIf, .beginForLoop, .beginHopCheck:
                 diff = 1
             case .beginLoop:
                 diff = 1
@@ -348,7 +440,7 @@ public class CRenderer: Renderer {
                 varEmittedTypes = [:]
             case .beginParallelRange:
                 diff = 1
-            case .endIf, .endLoop, .endParallelRange:
+            case .endIf, .endLoop, .endParallelRange, .endHopCheck:
                 indent -= 1
             default:
                 break
@@ -373,6 +465,8 @@ public class CRenderer: Renderer {
         case .defineConstant(let constantId, let val):
             return "float32x4_t c\(constantId) = vdupq_n_f32(\(val)f);"
         case .defineGlobal(let varId):
+            // Mark as loaded so subsequent loadGlobal is skipped (variable will be defined by actual computation)
+            loadedGlobal[varId] = true
             return "/* t\(varId) declared globally */"
         case .defineMemory(let length):
             return "float memory[\(length)] __attribute__((aligned(16)));"
@@ -812,22 +906,33 @@ public class CRenderer: Renderer {
             return "\(emitLazy(a, ctx: ctx, kind: uop.kind, isOut: true)) = \(g(b));"
 
         case .input(let channel):
+            let idxExpr = frameIndexOverride ?? "i"
             if uop.kind == .simd {
                 // For SIMD: load 4 consecutive memory slots into vector
                 let ptr = "in[\(channel)] + i"
                 return emitAssign(uop, "vld1q_f32(\(ptr))", ctx)
             } else {
-                let addr = "in[\(channel)][i]"
+                let addr = "in[\(channel)][\(idxExpr)]"
                 return emitAssign(uop, "\(addr)", ctx)
             }
         case .output(let channel, let val):
+            let idxExpr = frameIndexOverride ?? "i"
             if uop.kind == .simd {
-                // For audiograph compatibility: use out[channel] directly
-                let ptr = "out[\(channel)] + i"
-                return "vst1q_f32(\(ptr), \(g(val)));"
+                // When overriding frame index, fall back to scalar stores for correctness
+                if frameIndexOverride != nil {
+                    let idx = "(int)(\(idxExpr))"
+                    return "out[\(channel)][\(idx)] = \(g(val));"
+                } else {
+                    // For audiograph compatibility: use out[channel] directly
+                    let ptr = "out[\(channel)] + i"
+                    return "vst1q_f32(\(ptr), \(g(val)));"
+                }
             } else {
                 // For audiograph compatibility: use out[channel][i] directly
-                let addr = "out[\(channel)][i]"
+                let baseIdx = "i"
+                let idx = frameIndexOverride
+                    ?? (currentThreadCountScale == nil ? baseIdx : "(\(baseIdx) / \(currentThreadCountScale!))")
+                let addr = "out[\(channel)][\(idx)]"
                 return "\(addr) = \(g(val));"
             }
 
@@ -849,7 +954,23 @@ public class CRenderer: Renderer {
 
         case .threadIndex:
             // In C, threadIndex maps to the loop variable 'i'
-            return emitAssign(uop, "i", ctx)
+            // For SIMD, create a vector of sequential indices: {i, i+1, i+2, i+3}
+            if uop.kind == .simd {
+                let varId = extractVarId(uop.value)
+                varEmittedTypes[varId] = .float32x4
+                let lhs = emitLazy(uop.value, ctx: ctx, kind: uop.kind, isOut: true)
+                return "float32x4_t \(lhs) = (float32x4_t){(float)i, (float)(i+1), (float)(i+2), (float)(i+3)};"
+            } else {
+                return emitAssign(uop, "i", ctx)
+            }
+
+        case .setThreadCountScale:
+            return "/* setThreadCountScale - handled in scheduler */"
+
+        case .setFrameIndex(let idx):
+            let expr = g(idx)
+            frameIndexOverride = "_frameIndex"
+            return "int _frameIndex = (int)(\(expr));"
 
         case .cast(let expr, let castType):
             let typeStr = castType == .int ? "int" : "float"
@@ -869,13 +990,22 @@ public class CRenderer: Renderer {
             loadedGlobal[id] = true
             if uop.kind == .simd {
                 // Create a proper SIMD variable declaration for loadGlobal
+                if staticGlobalVars.contains(id) {
+                    return "float32x4_t simd\(id) = vdupq_n_f32(t\(id)[0]);"
+                }
                 return "float32x4_t simd\(id) = vld1q_f32(t\(id) + i);"
             } else {
                 // if this global is required by a beginParallelRange element then we need
                 // a simd version where we
-                let simdVersion =
-                    "float32x4_t simd\(id) = vdupq_n_f32(t\(id)[i]); "
-                let scalarVersion = emitAssign(uop, "t\(id)[i]", ctx)
+                let simdVersion: String
+                let scalarVersion: String
+                if staticGlobalVars.contains(id) {
+                    simdVersion = "float32x4_t simd\(id) = vdupq_n_f32(t\(id)[0]); /* extra */"
+                    scalarVersion = emitAssign(uop, "t\(id)[0]", ctx)
+                } else {
+                    simdVersion = "float32x4_t simd\(id) = vdupq_n_f32(t\(id)[i]); /* extra */"
+                    scalarVersion = emitAssign(uop, "t\(id)[i]", ctx)
+                }
                 return simdVersion + "\n    " + scalarVersion
             }
 
@@ -900,6 +1030,63 @@ public class CRenderer: Renderer {
             }
             return emitAssign(uop, "_pr\(varId)", ctx, forceFloatType: true)
 
+        case .loadGrad(let gradId):
+            let baseIdx = "i"
+            let idxExpr = frameIndexOverride
+                ?? (currentThreadCountScale == nil ? baseIdx : "(\(baseIdx) / \(currentThreadCountScale!))")
+            return emitAssign(uop, "gradients[\(gradId) * frameCount + (int)(\(idxExpr))]", ctx)
+
+        case .accumulateGrad(let gradId, let val):
+            let baseIdx = "i"
+            let idxExpr = frameIndexOverride
+                ?? (currentThreadCountScale == nil ? baseIdx : "(\(baseIdx) / \(currentThreadCountScale!))")
+            return "gradients[\(gradId) * frameCount + (int)(\(idxExpr))] += \(g(val));"
+
+        case .loadTensorGrad(let baseGradId, let indexLazy):
+            let baseIdx = "i"
+            let idxExpr = frameIndexOverride
+                ?? (currentThreadCountScale == nil ? baseIdx : "(\(baseIdx) / \(currentThreadCountScale!))")
+            return emitAssign(
+                uop,
+                "gradients[(\(baseGradId)+(int)(\(g(indexLazy)))) * frameCount + (int)(\(idxExpr))]",
+                ctx)
+
+        case .accumulateTensorGrad(let baseGradId, let indexLazy, let valueLazy):
+            let baseIdx = "i"
+            let idxExpr = frameIndexOverride
+                ?? (currentThreadCountScale == nil ? baseIdx : "(\(baseIdx) / \(currentThreadCountScale!))")
+            return
+                "gradients[(\(baseGradId)+(int)(\(g(indexLazy)))) * frameCount + (int)(\(idxExpr))] += \(g(valueLazy));"
+
+        // Hop-based execution: only run block when counter == 0
+        case .beginHopCheck(let counterCell):
+            return "if (memory[\(counterCell)] == 0.0f) {"
+        case .endHopCheck:
+            return "}"
+
+        // Local tensor operations for SIMD-across-frames
+        case .declareLocalTensor(let varId, let size):
+            return "float localT\(varId)[\(size)];"
+
+        case .localTensorRead(let varId, let idx):
+            return emitAssign(uop, "localT\(varId)[(int)\(g(idx))]", ctx)
+
+        case .localTensorWrite(let varId, let idx, let val):
+            return "localT\(varId)[(int)\(g(idx))] = \(g(val));"
+
+        case .beginInlineLoop(let count, let incr):
+            guard case .variable(let varId, _) = uop.value else {
+                fatalError("beginInlineLoop requires variable")
+            }
+            varEmittedTypes[varId] = .int_
+            return "for (int t\(varId) = 0; t\(varId) < (int)\(g(count)); t\(varId) += \(incr)) {"
+
+        case .endInlineLoop:
+            return "}"
+
+        case .frameTensorChainMarker(let shape):
+            return "/* ====== SIMD-ACROSS-FRAMES: Frame-Tensor Chain Block (shape: \(shape)) ====== */"
+
         default:
             return "/* \(uop.prettyDescription()) */"
         }
@@ -916,7 +1103,13 @@ public class CRenderer: Renderer {
                 if kind == .simd {
                     return isOut ? "t\(id) + i" : "simd\(id)"
                 } else {
-                    return "t\(id)[i]"
+                    if !isOut, staticGlobalVars.contains(id) {
+                        return "t\(id)[0]"
+                    }
+                    let baseIdx = "i"
+                    let idx = frameIndexOverride
+                        ?? (currentThreadCountScale == nil ? baseIdx : "(\(baseIdx) / \(currentThreadCountScale!))")
+                    return "t\(id)[\(idx)]"
                 }
             } else {
                 if kind == .simd {
@@ -930,7 +1123,13 @@ public class CRenderer: Renderer {
             if kind == .simd {
                 return isOut ? "t\(id) + i" : "simd\(id)"
             } else {
-                return "t\(id)[i]"
+                if !isOut, staticGlobalVars.contains(id) {
+                    return "t\(id)[0]"
+                }
+                let baseIdx = "i"
+                let idx = frameIndexOverride
+                    ?? (currentThreadCountScale == nil ? baseIdx : "(\(baseIdx) / \(currentThreadCountScale!))")
+                return "t\(id)[\(idx)]"
             }
         default:
             return "/* unknown lazy */"

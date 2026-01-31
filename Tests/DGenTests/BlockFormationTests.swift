@@ -58,7 +58,7 @@ final class BlockFormationTests: XCTestCase {
         print(feedbackClusters)
 
         // Step 2: Get scalar nodes
-        let scalarNodeSet = scalarNodes(g, feedbackClusters: feedbackClusters)
+        let scalarNodeSet = scalarNodes(g, feedbackClusters: feedbackClusters, backend: .c)
         print("\n=== Scalar Nodes ===")
         for nodeId in scalarNodeSet.sorted() {
             if let node = g.nodes[nodeId] {
@@ -114,7 +114,8 @@ final class BlockFormationTests: XCTestCase {
         printBlockStructure(blocks: tensorBlocks, graph: g, scalarSet: scalarNodeSet, title: "After determineTensorBlocks")
 
         // Step 10: Infer temporality
-        let frameBasedNodes = inferTemporality(graph: g, sortedNodes: sortedNodes)
+        let temporalityResult = inferTemporality(graph: g, sortedNodes: sortedNodes)
+        let frameBasedNodes = temporalityResult.frameBasedNodes
         print("\n=== Frame-Based Nodes ===")
         for nodeId in frameBasedNodes.sorted() {
             if let node = g.nodes[nodeId] {
@@ -123,7 +124,11 @@ final class BlockFormationTests: XCTestCase {
         }
 
         var finalBlocks = tensorBlocks
-        assignBlockTemporality(blocks: &finalBlocks, frameBasedNodes: frameBasedNodes)
+        assignBlockTemporality(
+            blocks: &finalBlocks,
+            frameBasedNodes: frameBasedNodes,
+            hopBasedNodes: temporalityResult.hopBasedNodes
+        )
         printBlockStructure(blocks: finalBlocks, graph: g, scalarSet: scalarNodeSet, title: "Final Blocks")
 
         // CRITICAL ASSERTIONS:
@@ -212,7 +217,7 @@ final class BlockFormationTests: XCTestCase {
 
         // Compile and check
         let feedbackClusters = findFeedbackLoops(g)
-        let scalarNodeSet = scalarNodes(g, feedbackClusters: feedbackClusters)
+        let scalarNodeSet = scalarNodes(g, feedbackClusters: feedbackClusters, backend: .c)
 
         print("\n=== User Patch Scalar Nodes ===")
         for nodeId in scalarNodeSet.sorted() {
@@ -294,7 +299,7 @@ final class BlockFormationTests: XCTestCase {
 
         // Step through compilation
         let feedbackClusters = findFeedbackLoops(g)
-        let scalarNodeSet = scalarNodes(g, feedbackClusters: feedbackClusters)
+        let scalarNodeSet = scalarNodes(g, feedbackClusters: feedbackClusters, backend: .c)
         let sortedNodes = topoWithCorridors(g, feedbackClusters: feedbackClusters, scalarNodeSet: scalarNodeSet, debug: true)
 
         try inferShapes(graph: g, sortedNodes: sortedNodes)
@@ -308,9 +313,13 @@ final class BlockFormationTests: XCTestCase {
         let context = IRContext(g: g)
         let tensorBlocks = determineTensorBlocks(reFusedBlocks, g, context)
 
-        let frameBasedNodes = inferTemporality(graph: g, sortedNodes: sortedNodes)
+        let temporalityResult = inferTemporality(graph: g, sortedNodes: sortedNodes)
         var finalBlocks = tensorBlocks
-        assignBlockTemporality(blocks: &finalBlocks, frameBasedNodes: frameBasedNodes)
+        assignBlockTemporality(
+            blocks: &finalBlocks,
+            frameBasedNodes: temporalityResult.frameBasedNodes,
+            hopBasedNodes: temporalityResult.hopBasedNodes
+        )
 
         printBlockStructure(blocks: finalBlocks, graph: g, scalarSet: scalarNodeSet, title: "TensorHistory Final Blocks")
 
@@ -341,7 +350,7 @@ final class BlockFormationTests: XCTestCase {
 
         // Step through compilation
         let feedbackClusters = findFeedbackLoops(g)
-        let scalarNodeSet = scalarNodes(g, feedbackClusters: feedbackClusters)
+        let scalarNodeSet = scalarNodes(g, feedbackClusters: feedbackClusters, backend: .c)
         let sortedNodes = topoWithCorridors(g, feedbackClusters: feedbackClusters, scalarNodeSet: scalarNodeSet, debug: true)
 
         try inferShapes(graph: g, sortedNodes: sortedNodes)
@@ -355,9 +364,13 @@ final class BlockFormationTests: XCTestCase {
         let context = IRContext(g: g)
         let tensorBlocks = determineTensorBlocks(reFusedBlocks, g, context)
 
-        let frameBasedNodes = inferTemporality(graph: g, sortedNodes: sortedNodes)
+        let temporalityResult = inferTemporality(graph: g, sortedNodes: sortedNodes)
         var finalBlocks = tensorBlocks
-        assignBlockTemporality(blocks: &finalBlocks, frameBasedNodes: frameBasedNodes)
+        assignBlockTemporality(
+            blocks: &finalBlocks,
+            frameBasedNodes: temporalityResult.frameBasedNodes,
+            hopBasedNodes: temporalityResult.hopBasedNodes
+        )
 
         printBlockStructure(blocks: finalBlocks, graph: g, scalarSet: scalarNodeSet, title: "Pure Tensor Final Blocks")
 

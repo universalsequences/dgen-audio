@@ -47,6 +47,8 @@ extension UOp {
             opStr = "\(ANSI.cyan)memoryRead\(ANSI.reset)(\(base), \(offset))"
         case let .memoryWrite(base, offset, value):
             opStr = "\(ANSI.cyan)memoryWrite\(ANSI.reset)(\(base), \(offset), \(value))"
+        case let .memoryAccumulate(base, offset, value):
+            opStr = "\(ANSI.cyan)memoryAccumulate\(ANSI.reset)(\(base), \(offset), \(value))"
         case let .concatShift(a, b, c):
             opStr = "\(ANSI.cyan)concatShift\(ANSI.reset)(\(a), \(b), \(c))"
         case let .sin(a):
@@ -135,6 +137,10 @@ extension UOp {
             opStr = "\(ANSI.magenta)storeGrad\(ANSI.reset)(\(a), \(b))"
         case let .accumulateGrad(a, b):
             opStr = "\(ANSI.magenta)accumulateGrad\(ANSI.reset)(\(a), \(b))"
+        case let .loadTensorGrad(baseGradId, indexLazy):
+            opStr = "\(ANSI.magenta)loadTensorGrad\(ANSI.reset)(\(baseGradId), \(indexLazy))"
+        case let .accumulateTensorGrad(baseGradId, indexLazy, valueLazy):
+            opStr = "\(ANSI.magenta)accumulateTensorGrad\(ANSI.reset)(\(baseGradId), \(indexLazy), \(valueLazy))"
         case let .loadTape(val, offset):
             opStr = "\(ANSI.magenta)loadTape\(ANSI.reset)(\(val), \(offset))"
         case let .mse(a, b):
@@ -155,6 +161,10 @@ extension UOp {
             opStr = "\(ANSI.magenta)endParallelRange\(ANSI.reset)"
         case .parallelIndex:
             opStr = "\(ANSI.magenta)parallelIndex\(ANSI.reset)"
+        case let .setThreadCountScale(scale):
+            opStr = "\(ANSI.magenta)setThreadCountScale\(ANSI.reset)(\(scale))"
+        case let .setFrameIndex(idx):
+            opStr = "\(ANSI.magenta)setFrameIndex\(ANSI.reset)(\(idx))"
         case let .beginReduce(size):
             opStr = "\(ANSI.magenta)beginReduce\(ANSI.reset)(\(size))"
         case .endReduce:
@@ -173,6 +183,22 @@ extension UOp {
             opStr = "\(ANSI.cyan)broadcastAccess\(ANSI.reset)"
         case .requiresScalar:
             opStr = "\(ANSI.cyan)requiresScalar\(ANSI.reset)"
+        case let .beginHopCheck(counterCell):
+            opStr = "\(ANSI.magenta)beginHopCheck\(ANSI.reset)(\(counterCell))"
+        case .endHopCheck:
+            opStr = "\(ANSI.magenta)endHopCheck\(ANSI.reset)"
+        case let .declareLocalTensor(varId, size):
+            opStr = "\(ANSI.cyan)declareLocalTensor\(ANSI.reset)(\(varId), \(size))"
+        case let .localTensorRead(varId, idx):
+            opStr = "\(ANSI.cyan)localTensorRead\(ANSI.reset)(\(varId), \(idx))"
+        case let .localTensorWrite(varId, idx, val):
+            opStr = "\(ANSI.cyan)localTensorWrite\(ANSI.reset)(\(varId), \(idx), \(val))"
+        case let .beginInlineLoop(count, incr):
+            opStr = "\(ANSI.magenta)beginInlineLoop\(ANSI.reset)(\(count), \(incr))"
+        case .endInlineLoop:
+            opStr = "\(ANSI.magenta)endInlineLoop\(ANSI.reset)"
+        case let .frameTensorChainMarker(shape):
+            opStr = "\(ANSI.bold)\(ANSI.cyan)frameTensorChainMarker\(ANSI.reset)(shape: \(shape))"
         }
 
         return "\(ANSI.bold)UOp\(ANSI.reset)(op: \(opStr), value: \(value))"

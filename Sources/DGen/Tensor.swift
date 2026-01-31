@@ -553,62 +553,30 @@ extension Graph {
             throw DGenError.shapeMismatch(op: "peek", shape1: shape, shape2: shape)
         }
 
-        // Check if we have a concrete tensor with known cellId
-        if let tensorId = nodeToTensor[tensorNode],
-            let tensor = tensors[tensorId]
-        {
+        // Always use lazy .peek node so backward pass can properly handle tensor gradients
+        // The eager memoryRead path doesn't support tensor gradient accumulation
+        return n(.peek, tensorNode, index, channel)
+    }
 
-            let originalTensorShape = tensor.shape
-            let tensorShape =
-                originalTensorShape.count == 1 ? [originalTensorShape[0], 1] : originalTensorShape
-
-            // Concrete tensor: use eager implementation with direct memory access
-            let one = n(.constant(1.0))
-            let zero = n(.constant(0.0))
-            let channelSizeFloat = n(.constant(Float(tensorShape[0])))
-
-            // Properly wrap the index within the channel using modulo for true wrapping
-            let wrappedIndex = n(.mod, index, channelSizeFloat)
-
-            // Handle negative modulo results: if wrappedIndex < 0, add channelSize
-            let isNegative = n(.lt, wrappedIndex, zero)
-            let positiveIndex = n(
-                .gswitch, isNegative,
-                n(.add, wrappedIndex, channelSizeFloat),
-                wrappedIndex)
-
-            // Clamp channel to valid range [0, numChannels-1]
-            let clampedChannel = n(
-                .floor,
-                n(
-                    .max, zero,
-                    n(.min, channel, n(.constant(Float(tensorShape[1] - 1))))))
-
-            let channelOffset = n(.mul, channelSizeFloat, clampedChannel)
-            let finalReadPos = n(.add, channelOffset, positiveIndex)
-
-            let bufferBase = tensor.cellId
-
-            // Read with linear interpolation for fractional indices
-            let flooredPos = n(.floor, finalReadPos)
-            let frac = n(.sub, finalReadPos, flooredPos)
-
-            let sample1 = n(.memoryRead(bufferBase), flooredPos)
-            let nextPos = n(.add, flooredPos, one)
-
-            let nextChannelOffset = n(.add, channelOffset, channelSizeFloat)
-            let nextPosWrapped = n(
-                .gswitch, n(.gte, nextPos, nextChannelOffset), channelOffset, nextPos)
-
-            let sample2 = n(.memoryRead(bufferBase), nextPosWrapped)
-
-            // Linear interpolation: (1-frac)*sample1 + frac*sample2
-            let interpolated = n(.mix, sample1, sample2, frac)
-            return interpolated
-        } else {
-            // Frame-based tensor (e.g., phasor(tensor) or tensor ops): use lazy peek node
-            // The lazy peek will be resolved during emit when tensor context is available
-            return n(.peek, tensorNode, index, channel)
+    /// Read an entire row from a 2D tensor with interpolation.
+    /// - Parameters:
+    ///   - tensorNode: A 2D tensor [numRows, numCols]
+    ///   - rowIndex: Scalar index (can be fractional, wraps via modulo)
+    /// - Returns: A 1D tensor [numCols] with interpolated values
+    ///
+    /// Memory layout is column-major for compatibility with peek:
+    /// offset = col * numRows + row
+    ///
+    /// For each column c:
+    /// output[c] = lerp(tensor[floor(idx), c], tensor[ceil(idx), c], frac)
+    public func peekRow(tensor tensorNode: NodeID, rowIndex: NodeID) throws -> NodeID {
+        guard let inputNode = nodes[tensorNode],
+              case .tensor(let shape) = inputNode.shape,
+              shape.count == 2 else {
+            throw DGenError.tensorError(op: "peekRow", reason: "requires 2D tensor input")
         }
+
+        // Create the lazy peekRow node - resolved during emit
+        return n(.peekRow, tensorNode, rowIndex)
     }
 }

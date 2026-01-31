@@ -1,5 +1,4 @@
 import AVFoundation
-import AudioToolbox  // kAudioUnitProperty_MaximumFramesPerSlice
 import Foundation
 import Metal
 
@@ -20,9 +19,11 @@ public class MetalCompiledKernel: CompiledKernelRuntime {
 
   // Training kernel functions
   private var reduceGradientsFunction: MTLFunction?
+  private var reduceGradientsSumFunction: MTLFunction?
   private var updateParametersSGDFunction: MTLFunction?
   private var updateParametersAdamFunction: MTLFunction?
   private var reduceGradientsPSO: MTLComputePipelineState?
+  private var reduceGradientsSumPSO: MTLComputePipelineState?
   private var updateParametersSGDPSO: MTLComputePipelineState?
   private var updateParametersAdamPSO: MTLComputePipelineState?
 
@@ -78,6 +79,25 @@ public class MetalCompiledKernel: CompiledKernelRuntime {
               sum += g;
           }
           reducedGrads[gradId] = sum / float(frameCount);
+      }
+
+      kernel void reduceGradientsSum(
+          device const float* gradients [[buffer(0)]],
+          device float* reducedGradsSum [[buffer(1)]],
+          constant uint& frameCount [[buffer(2)]],
+          constant uint& numGradIds [[buffer(3)]],
+          uint gradId [[thread_position_in_grid]]
+      ) {
+          if (gradId >= numGradIds) return;
+
+          float sum = 0.0;
+          uint baseIdx = frameCount * gradId;
+          for (uint i = 0; i < frameCount; i++) {
+              float g = gradients[baseIdx + i];
+              if (!isfinite(g)) { g = 0.0; }
+              sum += g;
+          }
+          reducedGradsSum[gradId] = sum;
       }
 
       kernel void updateParametersSGD(
@@ -157,6 +177,7 @@ public class MetalCompiledKernel: CompiledKernelRuntime {
 
     // Get training kernel function references
     reduceGradientsFunction = library.makeFunction(name: "reduceGradients")
+    reduceGradientsSumFunction = library.makeFunction(name: "reduceGradientsSum")
     updateParametersSGDFunction = library.makeFunction(name: "updateParametersSGD")
     updateParametersAdamFunction = library.makeFunction(name: "updateParametersAdam")
 
@@ -171,6 +192,9 @@ public class MetalCompiledKernel: CompiledKernelRuntime {
     if let f = reduceGradientsFunction {
       reduceGradientsPSO = try device.makeComputePipelineState(function: f)
     }
+    if let f = reduceGradientsSumFunction {
+      reduceGradientsSumPSO = try device.makeComputePipelineState(function: f)
+    }
     if let f = updateParametersSGDFunction {
       updateParametersSGDPSO = try device.makeComputePipelineState(function: f)
     }
@@ -182,16 +206,20 @@ public class MetalCompiledKernel: CompiledKernelRuntime {
   }
 
   private func getElementCount(_ bufferName: String) -> Int {
-    return bufferName == "frameCount"
-      ? 1
-      : bufferName == "memory" || bufferName == "grad_memory"
-        ? getMemorySize()
-        : bufferName == "t"
-          ? maxFrameCount * context.globals.count
-          : bufferName == "gradients"
-            // Use maxGradId + 1 to ensure we have enough slots (gradIds start at 1)
-            ? 2 * maxFrameCount * (context.maxGradId + 1) : maxFrameCount
-
+    switch bufferName {
+    case "frameCount":
+      return 1
+    case "memory", "grad_memory":
+      return getMemorySize()
+    case "t":
+      return maxFrameCount * context.globals.count
+    case "gradients":
+      return context.computeGradientBufferSize(frameCount: maxFrameCount)
+    case "reducedGradsSum", "reducedGrads":
+      return max(1, context.maxGradId + 1)
+    default:
+      return maxFrameCount
+    }
   }
 
   private func initializeBuffers() throws {
@@ -211,13 +239,9 @@ public class MetalCompiledKernel: CompiledKernelRuntime {
           domain: "MetalError", code: 4,
           userInfo: [NSLocalizedDescriptionKey: "Failed to create buffer \(bufferName)"])
       }
-      print("name=\(bufferName) buffer size = \(bufferSize)")
 
-      // Initialize buffer contents to zero
-      let bufferContents = buffer.contents().assumingMemoryBound(to: Float.self)
-      for i in 0..<(bufferSize / MemoryLayout<Float>.size) {
-        bufferContents[i] = 0.0
-      }
+      // Initialize buffer contents to zero using memset (much faster than a loop)
+      memset(buffer.contents(), 0, bufferSize)
       bufferPool[bufferName] = buffer
     }
 
@@ -254,20 +278,12 @@ public class MetalCompiledKernel: CompiledKernelRuntime {
     }
 
     // Set all seed gradients to 1.0 (typically loss nodes)
-    // Each seed gets a region of numFrames values set to 1.0
-    //print("   [DEBUG] Seeding gradients for \(context.seedGradients.count) seeds: \(context.seedGradients)")
     for seedId in context.seedGradients {
       let startIdx = numFrames * seedId
       let endIdx = numFrames * (seedId + 1)
-      //   print("   [DEBUG] Setting gradId=\(seedId) range [\(startIdx)..<\(endIdx)] to 1.0")
       for i in startIdx..<endIdx {
         bufferContents[i] = 1.0
       }
-
-      // Verify it was set
-      let firstVal = bufferContents[startIdx]
-      let lastVal = bufferContents[endIdx - 1]
-      //print("   [DEBUG] Verification: gradients[\(startIdx)]=\(firstVal), gradients[\(endIdx-1)]=\(lastVal)")
     }
 
     // Reset grad_memory buffer (used for spectralLoss ring buffers and phasor gradient accumulation)
@@ -328,10 +344,8 @@ public class MetalCompiledKernel: CompiledKernelRuntime {
       }
     }
 
-    //resetGradientBuffers(numFrames: frameCount)
-
     // Execute kernels in sequence
-    // In non-debug mode, reuse a single compute encoder across all kernels to reduce CPU overhead
+    // In non-debug mode, reuse a single encoder to reduce CPU overhead
     var sharedEncoder: MTLComputeCommandEncoder? = nil
     if !debugGradients {
       sharedEncoder = commandBuffer.makeComputeCommandEncoder()
@@ -339,6 +353,16 @@ public class MetalCompiledKernel: CompiledKernelRuntime {
     for (index, kernel) in kernels.enumerated() {
       if firstDebug {
         print("   [DEBUG] Executing kernel \(index): \(kernel.name)  \(kernel.kind)")
+      }
+      if kernel.needsReducedGradsSum {
+        if let enc = sharedEncoder {
+          enc.endEncoding()
+          sharedEncoder = nil
+        }
+        encodeReduceGradientsSum(commandBuffer: commandBuffer, frameCount: frameCount)
+        if !debugGradients {
+          sharedEncoder = commandBuffer.makeComputeCommandEncoder()
+        }
       }
       // Pick encoder: shared if available (non-debug), otherwise one per kernel
       let computeEncoder: MTLComputeCommandEncoder
@@ -353,12 +377,9 @@ public class MetalCompiledKernel: CompiledKernelRuntime {
       let pipelineState = pipelineStates[index]
       computeEncoder.setComputePipelineState(pipelineState)
 
-      // Detect segmented kernel by presence of segmentLen buffer
-      let isSegmented = kernel.buffers.contains("segmentLen")
-      let segmentCapacity = MIN_FRAME_COUNT
-
-      // isSegments is true when we use delay1 which requires dividing up a simd kernel into batches of 4
-      if isSegmented {
+      // Segmented kernels (e.g., delay1) require processing in batches
+      if kernel.buffers.contains("segmentLen") {
+        let segmentCapacity = MIN_FRAME_COUNT
         // We'll reuse the same encoder for multiple segment dispatches
         var base = 0
         while base < frameCount {
@@ -375,24 +396,9 @@ public class MetalCompiledKernel: CompiledKernelRuntime {
             basePtr[0] = UInt32(base)
           }
 
-          // Bind buffers with per-segment offsets
           for (bufferIndex, bufferName) in kernel.buffers.enumerated() {
-            if firstDebug {
-              //print(
-              //  "kernel[\(index) setting buffer=\(bufferName) index=\(bufferIndex)"
-              // )
-            }
-
             guard let buffer = bufferPool[bufferName] else { continue }
             computeEncoder.setBuffer(buffer, offset: 0, index: bufferIndex)
-
-            /*
-            // Offset per-frame buffers (t*, outputs); never offset memory or frameCount/segmentLen
-            let needsOffset = (bufferName.hasPrefix("t") || bufferName == "outputs")
-            let byteOffset = needsOffset ? base * MemoryLayout<Float>.size : 0
-            computeEncoder.setBuffer(buffer, offset: byteOffset, index: bufferIndex)
-
-             */
           }
 
           let threadsPerGroup = MTLSize(width: thisLen, height: 1, depth: 1)
@@ -406,38 +412,40 @@ public class MetalCompiledKernel: CompiledKernelRuntime {
           // Execute this kernel now so shared-memory buffers are visible for debug
           commandBuffer.commit()
           commandBuffer.waitUntilCompleted()
+          // Check for GPU errors
+          if let error = commandBuffer.error {
+            print("   [GPU ERROR] kernel \(index) (\(kernel.name)): \(error.localizedDescription)")
+          }
           debugPrintGradStats(label: "kernel \(index)")
           // Start a new command buffer for next kernel
           if let cb = commandQueue.makeCommandBuffer() { commandBuffer = cb }
         }
       } else {
-        // Non-segmented kernel: single dispatch as before
         for (bufferIndex, bufferName) in kernel.buffers.enumerated() {
           if let buffer = bufferPool[bufferName] {
-            if firstDebug {
-              // print(
-              //   "kernel[\(index) setting buffer=\(bufferName) index=\(bufferIndex)]"
-              //)
-            }
             computeEncoder.setBuffer(buffer, offset: 0, index: bufferIndex)
           }
         }
 
-        let tgMax = pipelineState.maxTotalThreadsPerThreadgroup
-
-        if kernel.kind == .scalar {
-          // exactly one thread
-          let threads = MTLSize(width: 1, height: 1, depth: 1)
-          let tpg = MTLSize(width: 1, height: 1, depth: 1)
-          computeEncoder.dispatchThreads(threads, threadsPerThreadgroup: tpg)
+        let totalThreads: Int
+        if let scale = kernel.threadCountScale {
+          totalThreads = max(1, frameCount * scale)
+        } else if let overrideThreads = kernel.threadCount {
+          totalThreads = max(1, overrideThreads)
+        } else if kernel.kind == .scalar {
+          totalThreads = 1
         } else {
-          // 1D over frames
-          let tpgW = min(kernel.threadGroupSize ?? 64, tgMax)  // pick a sane default, clamp to device cap
-          // Round up total threads to a multiple of tpgW
-          let total = MTLSize(width: frameCount, height: 1, depth: 1)
-          let tpg = MTLSize(width: tpgW, height: 1, depth: 1)
-          computeEncoder.dispatchThreads(total, threadsPerThreadgroup: tpg)
+          totalThreads = frameCount
         }
+        let maxThreadsPerGroup = pipelineState.maxTotalThreadsPerThreadgroup
+
+        let threadGroupWidth =
+          totalThreads == 1
+          ? 1
+          : min(kernel.threadGroupSize ?? 64, maxThreadsPerGroup, totalThreads)
+        let threads = MTLSize(width: totalThreads, height: 1, depth: 1)
+        let threadsPerGroup = MTLSize(width: threadGroupWidth, height: 1, depth: 1)
+        computeEncoder.dispatchThreads(threads, threadsPerThreadgroup: threadsPerGroup)
         if sharedEncoder == nil { computeEncoder.endEncoding() }
         if debugGradients {
           // Execute this kernel now so shared-memory buffers are visible for debug
@@ -446,15 +454,6 @@ public class MetalCompiledKernel: CompiledKernelRuntime {
           debugPrintGradStats(label: "kernel \(index)")
           if let cb = commandQueue.makeCommandBuffer() { commandBuffer = cb }
         }
-        /*
-        pending += 1
-        if pending == 5 {
-          print("FLUSHING at kernel=\(index)")
-          // old flush path no longer used
-          print("finished flush")
-        }  // tune 4 to taste
-
-         */
       }
     }
 
@@ -476,24 +475,10 @@ public class MetalCompiledKernel: CompiledKernelRuntime {
   private func copyResultsToOutputs(
     outputs: UnsafeMutablePointer<Float>, frameCount: Int, volumeScale: Float
   ) {
-    // Find output buffers and copy their contents
-    // First check for dedicated "outputs" buffer
-    if let memory = bufferPool["grad_memory"] {
-      let bufferContents = memory.contents().assumingMemoryBound(to: Float.self)
-      // Copy all frameCount frames (not limited to MIN_FRAME_COUNT)
-      for i in 0..<frameCount {
-        if bufferContents[i] > 0 {
-          //print("memory[\(i)] = \(bufferContents[i])")
-        }
-      }
-
-    }
     if let outputBuffer = bufferPool["outputs"] {
       let bufferContents = outputBuffer.contents().assumingMemoryBound(to: Float.self)
-      // Copy all frameCount frames (not limited to MIN_FRAME_COUNT)
       for i in 0..<frameCount {
         outputs[i] = bufferContents[i] * volumeScale
-        //print("outputs[\(i)] = \(outputs[i])")
       }
       return
     }
@@ -501,15 +486,13 @@ public class MetalCompiledKernel: CompiledKernelRuntime {
     // Fallback to other buffers if no dedicated outputs buffer
     for kernel in kernels {
       for bufferName in kernel.buffers {
-        // Check if this buffer contains output data
         if bufferName.hasPrefix("t") || bufferName == "memory" {
           if let buffer = bufferPool[bufferName] {
             let bufferContents = buffer.contents().assumingMemoryBound(to: Float.self)
-            // Copy all frameCount frames (not limited to MIN_FRAME_COUNT)
             for i in 0..<frameCount {
               outputs[i] = bufferContents[i] * volumeScale
             }
-            break  // Take first matching buffer as output
+            return
           }
         }
       }
@@ -603,19 +586,10 @@ public class MetalCompiledKernel: CompiledKernelRuntime {
       return noErr
     }
 
-    //------------------------------------------------------------------
-    // 4 ‧ Spin the engine
-    //------------------------------------------------------------------
     engine.attach(sourceNode)
     engine.connect(sourceNode, to: engine.mainMixerNode, format: format)
     try engine.start()
     return sourceNode
-
-    //  print("🟢 Playing Metal kernels for \(durationSeconds) seconds …")
-    //Thread.sleep(forTimeInterval: durationSeconds)
-    //engine.stop()
-
-    //     interleavedScratch?.deallocate()
   }
 
   // Default implementation for backwards compatibility
@@ -648,29 +622,22 @@ public class MetalCompiledKernel: CompiledKernelRuntime {
     print("=== METAL BUFFER DEBUG ===")
     for (name, buffer) in bufferPool.sorted(by: { $0.key < $1.key }) {
       let values: [Float]
-      let count: Int
 
-      // Special handling for frameCount buffer which stores Int32
       if name == "frameCount" {
         let intContents = buffer.contents().assumingMemoryBound(to: Int32.self)
-        let intValue = intContents[0]
-        values = [Float(intValue)]
-        count = 1
+        values = [Float(intContents[0])]
       } else {
+        let elementCount = buffer.length / MemoryLayout<Float>.size
         let bufferContents = buffer.contents().assumingMemoryBound(to: Float.self)
-        count = buffer.length / MemoryLayout<Float>.size  // Use actual buffer size
-        values = Array(UnsafeBufferPointer(start: bufferContents, count: count))
+        values = Array(UnsafeBufferPointer(start: bufferContents, count: elementCount))
       }
 
-      // Show first 10 and last 10 values for large buffers
-      if count > 20 {
+      if values.count > 20 {
         let first10 = Array(values.prefix(10))
-        let last10 = Array(values.suffix(10))
         print(
-          "\(name): [\(first10.map { String(format: "%.3f", $0) }.joined(separator: ", "))...] (length: \(count))"
+          "\(name): [\(first10.map { String(format: "%.3f", $0) }.joined(separator: ", "))...] (length: \(values.count))"
         )
         if name == "memory" {
-          // Show specific memory indices used in kernels
           print("  memory[0]: \(String(format: "%.6f", values[0]))")
           print("  memory[1]: \(String(format: "%.6f", values[1]))")
           print("  memory[2]: \(String(format: "%.6f", values[2]))")
@@ -685,23 +652,17 @@ public class MetalCompiledKernel: CompiledKernelRuntime {
   }
 
   public func cleanup() {
-    // Reset all buffers to zero
     for (name, buffer) in bufferPool {
       if name == "frameCount" {
-        // Special handling for frameCount buffer
         let intContents = buffer.contents().assumingMemoryBound(to: Int32.self)
         intContents[0] = 0
       } else {
-        // Zero out float buffers
-        let bufferSize = name == "memory" ? 512 : 2048
-        memset(buffer.contents(), 0, bufferSize * MemoryLayout<Float>.size)
+        memset(buffer.contents(), 0, buffer.length)
       }
     }
 
-    // Clear function references
     functions.removeAll()
 
-    // Ensure all GPU work is complete by creating and waiting for a command buffer
     if let commandBuffer = commandQueue.makeCommandBuffer() {
       commandBuffer.commit()
       commandBuffer.waitUntilCompleted()
@@ -717,11 +678,8 @@ public class MetalCompiledKernel: CompiledKernelRuntime {
 
   public func allocateNodeMemory() -> UnsafeMutableRawPointer? {
     let byteSize = getMemorySize() * MemoryLayout<Float>.size
-    let ptr = malloc(byteSize)
-    if let ptr = ptr {
-      // Zero initialize the memory
-      memset(ptr, 0, byteSize)
-    }
+    guard let ptr = malloc(byteSize) else { return nil }
+    memset(ptr, 0, byteSize)
     return ptr
   }
 
@@ -763,13 +721,12 @@ public class MetalCompiledKernel: CompiledKernelRuntime {
       currentFrameCount = frameCount
     }
 
-    // Use internal buffers
-    guard var inputBuf = internalInputBuffer, var outputBuf = internalOutputBuffer else {
-      fatalError("Failed to allocate internal buffers")
+    guard let inputBuf = internalInputBuffer else {
+      fatalError("Failed to allocate internal input buffer")
     }
 
     inputBuf.withUnsafeBufferPointer { inPtr in
-      outputBuf.withUnsafeMutableBufferPointer { outPtr in
+      internalOutputBuffer!.withUnsafeMutableBufferPointer { outPtr in
         runWithMemory(
           outputs: outPtr.baseAddress!,
           inputs: inPtr.baseAddress!,
@@ -778,9 +735,6 @@ public class MetalCompiledKernel: CompiledKernelRuntime {
         )
       }
     }
-
-    // Store output for later retrieval
-    internalOutputBuffer = outputBuf
   }
 
   /// Get a copy of the output buffer from the last run
@@ -802,12 +756,12 @@ public class MetalCompiledKernel: CompiledKernelRuntime {
       currentFrameCount = frameCount
     }
 
-    guard var inputBuf = internalInputBuffer, var outputBuf = internalOutputBuffer else {
-      fatalError("Failed to allocate internal buffers")
+    guard let inputBuf = internalInputBuffer else {
+      fatalError("Failed to allocate internal input buffer")
     }
 
     inputBuf.withUnsafeBufferPointer { inPtr in
-      outputBuf.withUnsafeMutableBufferPointer { outPtr in
+      internalOutputBuffer!.withUnsafeMutableBufferPointer { outPtr in
         run(
           outputs: outPtr.baseAddress!,
           inputs: inPtr.baseAddress!,
@@ -816,8 +770,6 @@ public class MetalCompiledKernel: CompiledKernelRuntime {
         )
       }
     }
-
-    internalOutputBuffer = outputBuf
   }
 
   /// Get the last output value (useful for scalar loss values)
@@ -831,73 +783,152 @@ public class MetalCompiledKernel: CompiledKernelRuntime {
 
   // MARK: - Training Kernel Dispatch
 
-  /// Reduce gradients across frames on GPU
-  /// - Parameters:
-  ///   - frameCount: Number of frames per gradient
-  ///   - numGradIds: Total number of gradient IDs
-  /// - Returns: Buffer containing reduced gradients
   public func reduceGradientsGPU(frameCount: Int, numGradIds: Int) -> MTLBuffer? {
-    guard let function = reduceGradientsFunction else {
-      print("⚠️ reduceGradients function not found")
+    guard reduceGradientsFunction != nil else {
+      print("reduceGradients function not found")
       return nil
     }
 
     guard let gradientsBuffer = bufferPool["gradients"] else {
-      print("⚠️ gradients buffer not found")
+      print("gradients buffer not found")
       return nil
     }
 
-    // Create or get reducedGrads buffer
     let reducedGradsSize = numGradIds * MemoryLayout<Float>.size
     if bufferPool["reducedGrads"] == nil {
       guard let buffer = device.makeBuffer(length: reducedGradsSize, options: .storageModeShared)
       else {
-        print("⚠️ Failed to create reducedGrads buffer")
+        print("Failed to create reducedGrads buffer")
         return nil
       }
       bufferPool["reducedGrads"] = buffer
     }
 
-    guard let reducedGradsBuffer = bufferPool["reducedGrads"] else {
-      return nil
+    guard let reducedGradsBuffer = bufferPool["reducedGrads"] else { return nil }
+
+    if debugGradients {
+      let ptr = reducedGradsBuffer.contents().assumingMemoryBound(to: Float.self)
+      for i in 0..<numGradIds {
+        ptr[i] = -999999.0
+      }
+      print(
+        "   [DEBUG] reduceGradientsGPU: zeroed buffer with sentinel, numGradIds=\(numGradIds), frameCount=\(frameCount)"
+      )
     }
 
-    // Create command buffer and encoder
     guard let commandBuffer = commandQueue.makeCommandBuffer(),
       let computeEncoder = commandBuffer.makeComputeCommandEncoder()
     else {
-      print("⚠️ Failed to create command buffer or encoder")
+      print("Failed to create command buffer or encoder")
       return nil
     }
 
     guard let pipelineState = reduceGradientsPSO else {
-      print("⚠️ Failed to create reduceGradients pipeline state")
+      print("reduceGradients pipeline state not found")
       return nil
     }
 
-    computeEncoder.setComputePipelineState(pipelineState)
+    if debugGradients {
+      print(
+        "   [DEBUG] reduceGradientsGPU: pipelineState maxThreads=\(pipelineState.maxTotalThreadsPerThreadgroup)"
+      )
+    }
 
-    // Set buffers
+    computeEncoder.setComputePipelineState(pipelineState)
     computeEncoder.setBuffer(gradientsBuffer, offset: 0, index: 0)
     computeEncoder.setBuffer(reducedGradsBuffer, offset: 0, index: 1)
 
-    // Set scalar parameters
     var frameCountUInt = UInt32(frameCount)
     var numGradIdsUInt = UInt32(numGradIds)
     computeEncoder.setBytes(&frameCountUInt, length: MemoryLayout<UInt32>.size, index: 2)
     computeEncoder.setBytes(&numGradIdsUInt, length: MemoryLayout<UInt32>.size, index: 3)
 
-    // Dispatch one thread per gradient ID
     let threadsPerGrid = MTLSize(width: numGradIds, height: 1, depth: 1)
     let threadsPerThreadgroup = MTLSize(
       width: min(numGradIds, pipelineState.maxTotalThreadsPerThreadgroup), height: 1, depth: 1)
+
+    if debugGradients {
+      print(
+        "   [DEBUG] reduceGradientsGPU: dispatching \(threadsPerGrid.width) threads, tpg=\(threadsPerThreadgroup.width)"
+      )
+      print(
+        "   [DEBUG] reduceGradientsGPU: gradientsBuffer.length=\(gradientsBuffer.length), reducedGradsBuffer.length=\(reducedGradsBuffer.length)"
+      )
+    }
+
     computeEncoder.dispatchThreads(threadsPerGrid, threadsPerThreadgroup: threadsPerThreadgroup)
 
     computeEncoder.endEncoding()
     commandBuffer.commit()
     commandBuffer.waitUntilCompleted()
 
+    if debugGradients {
+      if let error = commandBuffer.error {
+        print("   [DEBUG] reduceGradientsGPU: command buffer error: \(error)")
+      } else {
+        print("   [DEBUG] reduceGradientsGPU: command buffer completed successfully")
+      }
+
+      // Verify reduction result
+      let reducedPtr = reducedGradsBuffer.contents().assumingMemoryBound(to: Float.self)
+      let gradPtr = gradientsBuffer.contents().assumingMemoryBound(to: Float.self)
+      print("   [DEBUG] reduceGradientsGPU completed:")
+      for gid in 0..<min(numGradIds, 30) {
+        // Compute expected value manually
+        var sum: Float = 0.0
+        let base = gid * frameCount
+        for i in 0..<frameCount {
+          sum += gradPtr[base + i]
+        }
+        let expected = sum / Float(frameCount)
+        let actual = reducedPtr[gid]
+        if abs(expected - actual) > 0.0001 || gid == 24 {
+          print(
+            "      gid=\(gid) expected=\(expected) actual=\(actual) match=\(abs(expected - actual) < 0.0001)"
+          )
+        }
+      }
+    }
+
     return reducedGradsBuffer
+  }
+
+  private func encodeReduceGradientsSum(commandBuffer: MTLCommandBuffer, frameCount: Int) {
+    guard let pipelineState = reduceGradientsSumPSO else { return }
+    guard let gradientsBuffer = bufferPool["gradients"] else { return }
+
+    let numGradIds = max(0, context.maxGradId + 1)
+    if numGradIds == 0 { return }
+
+    // Create or get reducedGradsSum buffer
+    let reducedGradsSize = numGradIds * MemoryLayout<Float>.size
+    if bufferPool["reducedGradsSum"] == nil
+      || bufferPool["reducedGradsSum"]!.length < reducedGradsSize
+    {
+      guard let buffer = device.makeBuffer(length: reducedGradsSize, options: .storageModeShared)
+      else {
+        return
+      }
+      bufferPool["reducedGradsSum"] = buffer
+    }
+
+    guard let reducedGradsSumBuffer = bufferPool["reducedGradsSum"] else { return }
+
+    guard let computeEncoder = commandBuffer.makeComputeCommandEncoder() else { return }
+    computeEncoder.setComputePipelineState(pipelineState)
+    computeEncoder.setBuffer(gradientsBuffer, offset: 0, index: 0)
+    computeEncoder.setBuffer(reducedGradsSumBuffer, offset: 0, index: 1)
+
+    var frameCountUInt = UInt32(frameCount)
+    var numGradIdsUInt = UInt32(numGradIds)
+    computeEncoder.setBytes(&frameCountUInt, length: MemoryLayout<UInt32>.size, index: 2)
+    computeEncoder.setBytes(&numGradIdsUInt, length: MemoryLayout<UInt32>.size, index: 3)
+
+    let threadsPerGrid = MTLSize(width: numGradIds, height: 1, depth: 1)
+    let threadsPerThreadgroup = MTLSize(
+      width: min(numGradIds, pipelineState.maxTotalThreadsPerThreadgroup), height: 1, depth: 1)
+    computeEncoder.dispatchThreads(threadsPerGrid, threadsPerThreadgroup: threadsPerThreadgroup)
+    computeEncoder.endEncoding()
   }
 
   // MARK: - Parameter + Memory helpers
@@ -920,102 +951,57 @@ public class MetalCompiledKernel: CompiledKernelRuntime {
     writeParameters(physicalCells: physicalCells, values: values)
   }
 
-  /// Update parameters using SGD on GPU
-  /// - Parameters:
-  ///   - gradIds: Array mapping parameter index to gradient ID
-  ///   - physicalCells: Array mapping parameter index to memory cell
-  ///   - learningRate: Learning rate for SGD
   public func updateParametersSGDGPU(
     gradIds: [UInt32], physicalCells: [UInt32], learningRate: Float
   ) {
-    guard let function = updateParametersSGDFunction else {
-      print("⚠️ updateParametersSGD function not found")
+    guard updateParametersSGDFunction != nil else {
+      print("updateParametersSGD function not found")
       return
     }
 
     guard let memoryBuffer = bufferPool["memory"],
       let reducedGradsBuffer = bufferPool["reducedGrads"]
     else {
-      print("⚠️ Required buffers not found")
+      print("Required buffers not found for SGD update")
       return
     }
 
     let paramCount = gradIds.count
+    guard paramCount > 0 else { return }
 
-    // Create or update gradIds buffer
-    let gradIdsSize = paramCount * MemoryLayout<UInt32>.size
-    if bufferPool["gradIds"] == nil || bufferPool["gradIds"]!.length < gradIdsSize {
-      guard let buffer = device.makeBuffer(length: gradIdsSize, options: .storageModeShared)
-      else {
-        print("⚠️ Failed to create gradIds buffer")
-        return
-      }
-      bufferPool["gradIds"] = buffer
-    }
+    ensureBuffer(named: "gradIds", minimumSize: paramCount * MemoryLayout<UInt32>.size)
+    ensureBuffer(named: "physicalCells", minimumSize: paramCount * MemoryLayout<UInt32>.size)
 
-    // Create or update physicalCells buffer
-    let physicalCellsSize = paramCount * MemoryLayout<UInt32>.size
-    if bufferPool["physicalCells"] == nil
-      || bufferPool["physicalCells"]!.length < physicalCellsSize
-    {
-      guard
-        let buffer = device.makeBuffer(length: physicalCellsSize, options: .storageModeShared)
-      else {
-        print("⚠️ Failed to create physicalCells buffer")
-        return
-      }
-      bufferPool["physicalCells"] = buffer
-    }
-
-    // Copy data to buffers
-    if let gradIdsBuffer = bufferPool["gradIds"] {
-      let ptr = gradIdsBuffer.contents().assumingMemoryBound(to: UInt32.self)
-      for i in 0..<paramCount {
-        ptr[i] = gradIds[i]
-      }
-    }
-
-    if let physicalCellsBuffer = bufferPool["physicalCells"] {
-      let ptr = physicalCellsBuffer.contents().assumingMemoryBound(to: UInt32.self)
-      for i in 0..<paramCount {
-        ptr[i] = physicalCells[i]
-      }
-    }
+    copyToBuffer(named: "gradIds", values: gradIds)
+    copyToBuffer(named: "physicalCells", values: physicalCells)
 
     guard let gradIdsBuffer = bufferPool["gradIds"],
       let physicalCellsBuffer = bufferPool["physicalCells"]
-    else {
-      return
-    }
+    else { return }
 
-    // Create command buffer and encoder
     guard let commandBuffer = commandQueue.makeCommandBuffer(),
       let computeEncoder = commandBuffer.makeComputeCommandEncoder()
     else {
-      print("⚠️ Failed to create command buffer or encoder")
+      print("Failed to create command buffer or encoder")
       return
     }
 
     guard let pipelineState = updateParametersSGDPSO else {
-      print("⚠️ Failed to create updateParametersSGD pipeline state")
+      print("updateParametersSGD pipeline state not found")
       return
     }
 
     computeEncoder.setComputePipelineState(pipelineState)
-
-    // Set buffers
     computeEncoder.setBuffer(memoryBuffer, offset: 0, index: 0)
     computeEncoder.setBuffer(reducedGradsBuffer, offset: 0, index: 1)
     computeEncoder.setBuffer(gradIdsBuffer, offset: 0, index: 2)
     computeEncoder.setBuffer(physicalCellsBuffer, offset: 0, index: 3)
 
-    // Set scalar parameters
     var lr = learningRate
     var pc = UInt32(paramCount)
     computeEncoder.setBytes(&lr, length: MemoryLayout<Float>.size, index: 4)
     computeEncoder.setBytes(&pc, length: MemoryLayout<UInt32>.size, index: 5)
 
-    // Dispatch one thread per parameter
     let threadsPerGrid = MTLSize(width: paramCount, height: 1, depth: 1)
     let threadsPerThreadgroup = MTLSize(
       width: min(paramCount, pipelineState.maxTotalThreadsPerThreadgroup), height: 1, depth: 1)
@@ -1026,120 +1012,53 @@ public class MetalCompiledKernel: CompiledKernelRuntime {
     commandBuffer.waitUntilCompleted()
   }
 
-  /// Update parameters using Adam on GPU
-  /// - Parameters:
-  ///   - gradIds: Array mapping parameter index to gradient ID
-  ///   - physicalCells: Array mapping parameter index to memory cell
-  ///   - learningRate: Learning rate for Adam
-  ///   - beta1: Exponential decay rate for first moment estimates
-  ///   - beta2: Exponential decay rate for second moment estimates
-  ///   - epsilon: Small constant for numerical stability
-  ///   - timestep: Current training timestep (for bias correction)
   public func updateParametersAdamGPU(
     gradIds: [UInt32], physicalCells: [UInt32], learningRate: Float, beta1: Float, beta2: Float,
     epsilon: Float, timestep: Int
   ) {
-    guard let function = updateParametersAdamFunction else {
-      print("⚠️ updateParametersAdam function not found")
+    guard updateParametersAdamFunction != nil else {
+      print("updateParametersAdam function not found")
       return
     }
 
     guard let memoryBuffer = bufferPool["memory"],
       let reducedGradsBuffer = bufferPool["reducedGrads"]
     else {
-      print("⚠️ Required buffers not found")
+      print("Required buffers not found for Adam update")
       return
     }
 
     let paramCount = gradIds.count
+    guard paramCount > 0 else { return }
 
-    // Create or update momentum buffers (m and v)
     let momentumSize = paramCount * MemoryLayout<Float>.size
-    if bufferPool["adam_m"] == nil || bufferPool["adam_m"]!.length < momentumSize {
-      guard let buffer = device.makeBuffer(length: momentumSize, options: .storageModeShared)
-      else {
-        print("⚠️ Failed to create adam_m buffer")
-        return
-      }
-      // Initialize to zero
-      memset(buffer.contents(), 0, momentumSize)
-      bufferPool["adam_m"] = buffer
-    }
+    ensureBuffer(named: "adam_m", minimumSize: momentumSize, zeroInitialize: true)
+    ensureBuffer(named: "adam_v", minimumSize: momentumSize, zeroInitialize: true)
+    ensureBuffer(named: "gradIds", minimumSize: paramCount * MemoryLayout<UInt32>.size)
+    ensureBuffer(named: "physicalCells", minimumSize: paramCount * MemoryLayout<UInt32>.size)
 
-    if bufferPool["adam_v"] == nil || bufferPool["adam_v"]!.length < momentumSize {
-      guard let buffer = device.makeBuffer(length: momentumSize, options: .storageModeShared)
-      else {
-        print("⚠️ Failed to create adam_v buffer")
-        return
-      }
-      // Initialize to zero
-      memset(buffer.contents(), 0, momentumSize)
-      bufferPool["adam_v"] = buffer
-    }
-
-    // Create or update gradIds and physicalCells buffers (same as SGD)
-    let gradIdsSize = paramCount * MemoryLayout<UInt32>.size
-    if bufferPool["gradIds"] == nil || bufferPool["gradIds"]!.length < gradIdsSize {
-      guard let buffer = device.makeBuffer(length: gradIdsSize, options: .storageModeShared)
-      else {
-        print("⚠️ Failed to create gradIds buffer")
-        return
-      }
-      bufferPool["gradIds"] = buffer
-    }
-
-    let physicalCellsSize = paramCount * MemoryLayout<UInt32>.size
-    if bufferPool["physicalCells"] == nil
-      || bufferPool["physicalCells"]!.length < physicalCellsSize
-    {
-      guard
-        let buffer = device.makeBuffer(length: physicalCellsSize, options: .storageModeShared)
-      else {
-        print("⚠️ Failed to create physicalCells buffer")
-        return
-      }
-      bufferPool["physicalCells"] = buffer
-    }
-
-    // Copy data to buffers
-    if let gradIdsBuffer = bufferPool["gradIds"] {
-      let ptr = gradIdsBuffer.contents().assumingMemoryBound(to: UInt32.self)
-      for i in 0..<paramCount {
-        ptr[i] = gradIds[i]
-      }
-    }
-
-    if let physicalCellsBuffer = bufferPool["physicalCells"] {
-      let ptr = physicalCellsBuffer.contents().assumingMemoryBound(to: UInt32.self)
-      for i in 0..<paramCount {
-        ptr[i] = physicalCells[i]
-      }
-    }
+    copyToBuffer(named: "gradIds", values: gradIds)
+    copyToBuffer(named: "physicalCells", values: physicalCells)
 
     guard let gradIdsBuffer = bufferPool["gradIds"],
       let physicalCellsBuffer = bufferPool["physicalCells"],
       let mBuffer = bufferPool["adam_m"],
       let vBuffer = bufferPool["adam_v"]
-    else {
-      return
-    }
+    else { return }
 
-    // Create command buffer and encoder
     guard let commandBuffer = commandQueue.makeCommandBuffer(),
       let computeEncoder = commandBuffer.makeComputeCommandEncoder()
     else {
-      print("⚠️ Failed to create command buffer or encoder")
+      print("Failed to create command buffer or encoder")
       return
     }
 
     guard let pipelineState = updateParametersAdamPSO else {
-      print("⚠️ Failed to create updateParametersAdam pipeline state")
+      print("updateParametersAdam pipeline state not found")
       return
     }
 
     computeEncoder.setComputePipelineState(pipelineState)
-
-    // Set buffers
     computeEncoder.setBuffer(memoryBuffer, offset: 0, index: 0)
     computeEncoder.setBuffer(reducedGradsBuffer, offset: 0, index: 1)
     computeEncoder.setBuffer(mBuffer, offset: 0, index: 2)
@@ -1147,7 +1066,6 @@ public class MetalCompiledKernel: CompiledKernelRuntime {
     computeEncoder.setBuffer(gradIdsBuffer, offset: 0, index: 4)
     computeEncoder.setBuffer(physicalCellsBuffer, offset: 0, index: 5)
 
-    // Set scalar parameters
     var lr = learningRate
     var b1 = beta1
     var b2 = beta2
@@ -1162,7 +1080,6 @@ public class MetalCompiledKernel: CompiledKernelRuntime {
     computeEncoder.setBytes(&t, length: MemoryLayout<UInt32>.size, index: 10)
     computeEncoder.setBytes(&pc, length: MemoryLayout<UInt32>.size, index: 11)
 
-    // Dispatch one thread per parameter
     let threadsPerGrid = MTLSize(width: paramCount, height: 1, depth: 1)
     let threadsPerThreadgroup = MTLSize(
       width: min(paramCount, pipelineState.maxTotalThreadsPerThreadgroup), height: 1, depth: 1)
@@ -1171,6 +1088,28 @@ public class MetalCompiledKernel: CompiledKernelRuntime {
     computeEncoder.endEncoding()
     commandBuffer.commit()
     commandBuffer.waitUntilCompleted()
+  }
+
+  // MARK: - Buffer Helpers
+
+  private func ensureBuffer(named name: String, minimumSize: Int, zeroInitialize: Bool = false) {
+    if bufferPool[name] == nil || bufferPool[name]!.length < minimumSize {
+      guard let buffer = device.makeBuffer(length: minimumSize, options: .storageModeShared) else {
+        return
+      }
+      if zeroInitialize {
+        memset(buffer.contents(), 0, minimumSize)
+      }
+      bufferPool[name] = buffer
+    }
+  }
+
+  private func copyToBuffer(named name: String, values: [UInt32]) {
+    guard let buffer = bufferPool[name] else { return }
+    let ptr = buffer.contents().assumingMemoryBound(to: UInt32.self)
+    for i in 0..<values.count {
+      ptr[i] = values[i]
+    }
   }
 
   deinit {

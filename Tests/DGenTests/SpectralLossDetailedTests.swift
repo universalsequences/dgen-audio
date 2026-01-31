@@ -32,7 +32,7 @@ final class SpectralLossDetailedTests: XCTestCase {
             let result = try CompilationPipeline.compile(
                 graph: g,
                 backend: .metal,
-                options: .init(frameCount: frameCount, debug: false, backwards: false)
+                options: .init(frameCount: frameCount, debug: false)
             )
 
             let runtime = try MetalCompiledKernel(
@@ -104,7 +104,7 @@ final class SpectralLossDetailedTests: XCTestCase {
         let frameCount = 128
         let result1 = try CompilationPipeline.compile(
             graph: g1, backend: .metal,
-            options: .init(frameCount: frameCount, debug: false, backwards: false)
+            options: .init(frameCount: frameCount, debug: false)
         )
         let runtime1 = try MetalCompiledKernel(
             kernels: result1.kernels,
@@ -142,7 +142,7 @@ final class SpectralLossDetailedTests: XCTestCase {
 
         let result2 = try CompilationPipeline.compile(
             graph: g2, backend: .metal,
-            options: .init(frameCount: frameCount, debug: false, backwards: false)
+            options: .init(frameCount: frameCount, debug: false)
         )
         let runtime2 = try MetalCompiledKernel(
             kernels: result2.kernels,
@@ -198,7 +198,7 @@ final class SpectralLossDetailedTests: XCTestCase {
         let frameCount = 128
         let result = try CompilationPipeline.compile(
             graph: g, backend: .metal,
-            options: .init(frameCount: frameCount, debug: false, backwards: false)
+            options: .init(frameCount: frameCount, debug: false)
         )
 
         let runtime = try MetalCompiledKernel(
@@ -263,7 +263,7 @@ final class SpectralLossDetailedTests: XCTestCase {
             let frameCount = max(256, windowSize * 2)
             let result = try CompilationPipeline.compile(
                 graph: g, backend: .metal,
-                options: .init(frameCount: frameCount, debug: false, backwards: false)
+                options: .init(frameCount: frameCount, debug: false)
             )
 
             let runtime = try MetalCompiledKernel(
@@ -341,7 +341,7 @@ final class SpectralLossDetailedTests: XCTestCase {
             let frameCount = 128
             let result = try CompilationPipeline.compile(
                 graph: g, backend: .metal,
-                options: .init(frameCount: frameCount, debug: false, backwards: false)
+                options: .init(frameCount: frameCount, debug: false)
             )
 
             let runtime = try MetalCompiledKernel(
@@ -400,7 +400,7 @@ final class SpectralLossDetailedTests: XCTestCase {
         let frameCount = 256  // More frames for stability
         let result = try CompilationPipeline.compile(
             graph: g, backend: .metal,
-            options: .init(frameCount: frameCount, debug: false, backwards: false)
+            options: .init(frameCount: frameCount, debug: false)
         )
 
         let runtime = try MetalCompiledKernel(

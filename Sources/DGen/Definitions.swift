@@ -101,7 +101,7 @@ let u_max = binaryOp(Op.max)
 
 func u_phasor(_ cellId: CellID, freq: Expr, reset: Expr) -> (IRBuilder) -> Expr {
   return { b in
-    let b_sr = b.constant(44100)
+    let b_sr = b.constant(b.ctx.g.sampleRate)
     return u_accum(
       cellId, incr: freq / b_sr, reset: reset, min: b.constant(0), max: b.constant(1))(b)
   }
@@ -134,16 +134,16 @@ func u_mix(_ x: Expr, _ y: Expr, lerp: Expr) -> (IRBuilder) -> Expr {
 /// frequency magnitudes. For each frequency bin k, computes real/imaginary components via:
 ///   real_k = Σ sample[n] * cos(-2π*k*n/windowSize)
 ///   imag_k = Σ sample[n] * sin(-2π*k*n/windowSize)
-/// Then returns Σ(mag1_k - mag2_k)² across all bins, where mag = sqrt(real² + imag²).
+/// Then computes per-bin squared error (mag1_k - mag2_k)² and writes to scratch.
+/// Pass2 reduces those per-bin errors to a scalar loss.
 ///
 /// Better than MSE for audio: invariant to small time shifts, captures perceptual differences.
-func u_spectralLoss(sig1: Expr, sig2: Expr, windowSize: Int) -> (IRBuilder) -> Expr {
+func u_spectralLoss(sig1: Expr, sig2: Expr, windowSize: Int, scratchCell: CellID) -> (IRBuilder) -> Expr {
   return { b in
     let numBins = windowSize / 2 + 1
-    let totalError = b.float(0.0)
-
-    // For each frequency bin
-    b.loop(numBins) { binIndex in
+    let winSize = b.constant(Float(windowSize))
+    // Dispatch threads as (frameCount * numBins); flatten id -> (frame, bin)
+    b.parallelMap2D(bins: numBins) { frameIdx, binIndexFloat in
       // DFT accumulators (real and imaginary parts)
       let real1 = b.float(0.0)
       let real2 = b.float(0.0)
@@ -152,16 +152,13 @@ func u_spectralLoss(sig1: Expr, sig2: Expr, windowSize: Int) -> (IRBuilder) -> E
 
       // Sum over window samples
       b.loop(windowSize) { n in
-        let idx = b.threadIndex()
-        let winSize = b.constant(Float(windowSize))
-        let j = idx - (winSize - b.constant(1.0)) + b.cast(n, to: .float)
+        let j = frameIdx - (winSize - b.constant(1.0)) + b.cast(n, to: .float)
 
         // Load samples from tape with bounds checking
         let s1 = b.tapeLoad(sig1, at: j)
         let s2 = b.tapeLoad(sig2, at: j)
 
         // DFT basis: e^(-2πi*k*n/N) = cos(angle) - i*sin(angle)
-        let binIndexFloat = b.cast(binIndex, to: .float)
         let nFloat = b.cast(n, to: .float)
         let angle = b.constant(-2.0) * b.pi * binIndexFloat * nFloat / winSize
 
@@ -179,12 +176,15 @@ func u_spectralLoss(sig1: Expr, sig2: Expr, windowSize: Int) -> (IRBuilder) -> E
       let mag1 = b.sqrt(real1.value * real1.value + imag1.value * imag1.value)
       let mag2 = b.sqrt(real2.value * real2.value + imag2.value * imag2.value)
 
-      // Accumulate squared error for this bin
+      // Store squared error for this bin
       let diff = mag1 - mag2
-      totalError.accumulate(diff * diff)
+      let binError = diff * diff
+      let baseOffset = frameIdx * winSize * b.constant(2.0)
+      let offset = baseOffset + binIndexFloat
+      _ = b.memoryWrite(scratchCell, b.cast(offset, to: .int), binError)
     }
-
-    return totalError.value
+    // Pass2 will reduce from scratch to a scalar loss.
+    return b.constant(0.0)
   }
 }
 
@@ -251,43 +251,20 @@ func u_accum(_ cellId: CellID, incr: Expr, reset: Expr, min: Expr, max: Expr) ->
   }
 }
 
-/// Pass B: Reduce from memory to gradients.
-/// Each thread j (sample index) gathers contributions from all windows that include sample j.
-func u_spectralLossBackwardPass2(
-  _ windowSize: Int,
-  _ scratchCell: CellID,
-  _ sig1: Expr,
-  _ sig2: Expr,
-  _ upstreamGrad: Expr,
-  _ gradId1: GradID,
-  _ gradId2: GradID
-) -> (IRBuilder) -> (Expr, Expr) {
+/// Pass1 for parallelMap2D test: writes per-bin values into scratch.
+/// Value = frameIdx * 100 + binIdx
+func u_parallelMap2DTestPass1(
+  bins: Int,
+  scratchCell: CellID
+) -> (IRBuilder) -> Void {
   return { b in
-    let j = b.threadIndex()  // Sample index
-    let grad1 = b.float(0.0)
-    let grad2 = b.float(0.0)
+    let binsFloat = b.constant(Float(bins))
+    let scale = b.constant(100.0)
 
-    // Gather from all windows that include sample j
-    // Windows ending at i ∈ [j .. j+(windowSize-1)]
-    b.loop(windowSize) { offsetFromJ in
-      let windowEnd = j + b.cast(offsetFromJ, to: .float)  // i
-
-      // Window offset: n = j - i + (windowSize - 1)
-      let winSize = b.constant(Float(windowSize))
-      let n = j - windowEnd + (winSize - b.constant(1.0))
-
-      // Memory offset: memory[scratchCell + (i * windowSize * 2) + (n * 2) + component]
-      let offset1 = windowEnd * winSize * b.constant(2.0) + n * b.constant(2.0)
-      let offset2 = offset1 + b.constant(1.0)
-
-      // Read contributions from memory
-      let contrib1 = b.memoryRead(scratchCell, b.cast(offset1, to: .int))
-      let contrib2 = b.memoryRead(scratchCell, b.cast(offset2, to: .int))
-
-      grad1.accumulate(contrib1)
-      grad2.accumulate(contrib2)
+    b.parallelMap2D(bins: bins) { frameIdx, binIdx in
+      let value = frameIdx * scale + binIdx
+      let offset = frameIdx * binsFloat + binIdx
+      _ = b.memoryWrite(scratchCell, b.cast(offset, to: .int), value)
     }
-
-    return (grad1.value, grad2.value)
   }
 }

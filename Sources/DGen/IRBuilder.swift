@@ -136,6 +136,45 @@ public final class IRBuilder {
     return value(dest)
   }
 
+  /// Load tensor gradient at baseGradId + index
+  public func loadTensorGrad(_ nodeId: NodeID, index: Expr) -> Expr {
+    guard let baseGradId = ctx.tensorGradients[nodeId] else {
+      fatalError("No tensor gradient allocated for node \(nodeId)")
+    }
+    let dest = ctx.useVariable(src: nil)
+    let uop = UOp(op: .loadTensorGrad(baseGradId, index.lazy), value: dest)
+    ops.append(uop)
+    return value(dest)
+  }
+
+  /// Accumulate gradient to tensor element at baseGradId + index
+  public func tensorGrad(_ nodeId: NodeID, index: Expr, value: Lazy) {
+    guard let baseGradId = ctx.tensorGradients[nodeId] else {
+      fatalError("No tensor gradient allocated for node \(nodeId)")
+    }
+    let uop = UOp(op: .accumulateTensorGrad(baseGradId, index.lazy, value), value: .empty)
+    ops.append(uop)
+  }
+
+  /// Read a tensor element at flat index from memory (for backward pass)
+  public func readTensorElement(cellId: CellID, at index: Expr) -> Expr {
+    return memoryRead(cellId, index)
+  }
+
+  /// Read a tensor element using proper strides (for view tensors with non-contiguous layout)
+  /// Converts flat output index -> multi-dim coords -> strided memory access
+  public func readTensorWithStrides(tensor: Tensor, flatIdx: Expr, shape: [Int]) -> Expr {
+    // Fast path: contiguous tensor with no offset
+    if tensor.isContiguous && tensor.offset == 0 {
+      return memoryRead(tensor.cellId, flatIdx)
+    }
+
+    // Slow path: use strides to compute memory offset
+    let multiIdx = flatToMultiIndex(flatIdx, shape)
+    let memOffset = stridedIndex(indices: multiIdx, strides: tensor.strides, offset: tensor.offset)
+    return memoryRead(tensor.cellId, memOffset)
+  }
+
   func storeGradMemory(_ cellId: CellID, _ val: Expr) -> Expr {
     let dest = ctx.useVariable(src: nil)
     let uop = UOp(op: .storeGradMemory(cellId, val.lazy), value: dest)
@@ -298,6 +337,13 @@ public final class IRBuilder {
   public func memoryWrite(_ cellId: CellID, _ offset: Expr, _ value: Expr) -> Expr {
     let dest = ctx.useVariable(src: nodeId)
     let uop = UOp(op: .memoryWrite(cellId, offset.lazy, value.lazy), value: dest)
+    ops.append(uop)
+    return self.value(dest)
+  }
+
+  public func memoryAccumulate(_ cellId: CellID, _ offset: Expr, _ value: Expr) -> Expr {
+    let dest = ctx.useVariable(src: nodeId)
+    let uop = UOp(op: .memoryAccumulate(cellId, offset.lazy, value.lazy), value: dest)
     ops.append(uop)
     return self.value(dest)
   }
@@ -556,12 +602,56 @@ public final class IRBuilder {
     return MutableVar(dest, ctx: ctx, nodeId: nodeId, builder: self)
   }
 
+  /// Create an integer constant expression (for index calculations)
+  public func int(_ value: Int) -> Expr {
+    let constLazy = ctx.useConstant(src: nodeId, value: Float(value))
+    return Expr(constLazy, ctx: ctx, nodeId: nodeId, builder: self)
+  }
+
+  /// Add two expressions
+  public func add(_ a: Expr, _ b: Expr) -> Expr {
+    let dest = ctx.useVariable(src: nodeId)
+    let uop = UOp(op: .add(a.lazy, b.lazy), value: dest)
+    ops.append(uop)
+    return value(dest)
+  }
+
+  /// Multiply two expressions
+  public func mul(_ a: Expr, _ b: Expr) -> Expr {
+    let dest = ctx.useVariable(src: nodeId)
+    let uop = UOp(op: .mul(a.lazy, b.lazy), value: dest)
+    ops.append(uop)
+    return value(dest)
+  }
+
+  /// Divide two expressions
+  public func div(_ a: Expr, _ b: Expr) -> Expr {
+    let dest = ctx.useVariable(src: nodeId)
+    let uop = UOp(op: .div(a.lazy, b.lazy), value: dest)
+    ops.append(uop)
+    return value(dest)
+  }
+
+  /// Floor division: floor(a / b)
+  /// Use this for integer index calculations where we need truncation toward negative infinity.
+  public func floorDiv(_ a: Expr, _ b: Expr) -> Expr {
+    return floor(div(a, b))
+  }
+
   public func loop(_ count: Int, body: (Expr) -> Void) {
     let loopVar = ctx.useVariable(src: nodeId)
     let countLazy = ctx.useConstant(src: nodeId, value: Float(count))
     ops.append(UOp(op: .beginForLoop(loopVar, countLazy), value: loopVar))
     body(value(loopVar))
     ops.append(UOp(op: .endLoop, value: ctx.useVariable(src: nil)))
+  }
+
+  /// Conditional execution block.
+  /// The body is only executed when condition is true (non-zero).
+  public func if_(_ condition: Expr, body: () -> Void) {
+    ops.append(UOp(op: .beginIf(condition.lazy), value: ctx.useVariable(src: nil)))
+    body()
+    ops.append(UOp(op: .endIf, value: ctx.useVariable(src: nil)))
   }
 
   /// Parallel range for tensor operations.
@@ -587,11 +677,40 @@ public final class IRBuilder {
     }
   }
 
+  /// Parallel map over (frame, bin) where total threads = frameCount * bins.
+  /// The body receives (frameIndex, binIndex) as floats.
+  public func parallelMap2D(bins: Int, body: (Expr, Expr) -> Void) {
+    setThreadCountScale(bins)
+    let flatIdx = threadIndex()
+    let binsExpr = constant(Float(bins))
+    let frameIdx = floor(flatIdx / binsExpr)
+    setFrameIndex(frameIdx)
+    let binIdx = flatIdx - frameIdx * binsExpr
+    body(frameIdx, binIdx)
+  }
+
   public func threadIndex() -> Expr {
     let dest = ctx.useVariable(src: nodeId)
     let uop = UOp(op: .threadIndex, value: dest)
     ops.append(uop)
     return value(dest)
+  }
+
+  /// Frame count (runtime parameter)
+  public func frameCount() -> Expr {
+    return value(.variable(-1, nil))
+  }
+
+  /// Override the frame index used for outputs/gradients in this kernel
+  public func setFrameIndex(_ expr: Expr) {
+    let uop = UOp(op: .setFrameIndex(expr.lazy), value: expr.lazy)
+    ops.append(uop)
+  }
+
+  /// Dispatch threads as frameCount * scale for this kernel
+  public func setThreadCountScale(_ scale: Int) {
+    let uop = UOp(op: .setThreadCountScale(scale), value: .empty)
+    ops.append(uop)
   }
 
   public func tapeLoad(_ signal: Expr, at offset: Expr) -> Expr {

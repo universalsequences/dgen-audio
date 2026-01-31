@@ -38,7 +38,7 @@ final class SpectralLossTests: XCTestCase {
                 let result = try CompilationPipeline.compile(
                         graph: g,
                         backend: .metal,
-                        options: .init(frameCount: frameCount, debug: false, backwards: false)
+                        options: .init(frameCount: frameCount, debug: true)
                 )
 
                 let runtime = try MetalCompiledKernel(
@@ -132,7 +132,7 @@ final class SpectralLossTests: XCTestCase {
                 let result = try CompilationPipeline.compile(
                         graph: g,
                         backend: .metal,
-                        options: .init(frameCount: frameCount, debug: false, backwards: false)
+                        options: .init(frameCount: frameCount, debug: false)
                 )
 
                 let runtime = try MetalCompiledKernel(
@@ -214,7 +214,7 @@ final class SpectralLossTests: XCTestCase {
                 let result = try CompilationPipeline.compile(
                         graph: g,
                         backend: .metal,
-                        options: .init(frameCount: frameCount, debug: false, backwards: false)
+                        options: .init(frameCount: frameCount, debug: false)
                 )
 
                 let runtime = try MetalCompiledKernel(
@@ -286,7 +286,7 @@ final class SpectralLossTests: XCTestCase {
                 let frameCount = 128
                 let result = try CompilationPipeline.compile(
                         graph: g, backend: .metal,
-                        options: .init(frameCount: frameCount, debug: false, backwards: false)
+                        options: .init(frameCount: frameCount, debug: false)
                 )
 
                 let runtime = try MetalCompiledKernel(
@@ -351,7 +351,7 @@ final class SpectralLossTests: XCTestCase {
                 let frameCount = 128
                 let result = try CompilationPipeline.compile(
                         graph: g, backend: .metal,
-                        options: .init(frameCount: frameCount, debug: false, backwards: false)
+                        options: .init(frameCount: frameCount, debug: false)
                 )
 
                 let runtime = try MetalCompiledKernel(

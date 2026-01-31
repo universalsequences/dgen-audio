@@ -56,14 +56,12 @@ public struct CompilationPipeline {
         public let forceScalar: Bool
         public let voiceCount: Int
         public let voiceCellId: Int?
-        public let backwards: Bool
 
         public init(
             frameCount: Int = 128,
             debug: Bool = false,
             printBlockStructure: Bool = false,
             forceScalar: Bool = false,
-            backwards: Bool = false,
             voiceCount: Int = 1,
             voiceCellId: Int? = nil
         ) {
@@ -73,7 +71,6 @@ public struct CompilationPipeline {
             self.forceScalar = forceScalar
             self.voiceCount = voiceCount
             self.voiceCellId = voiceCellId
-            self.backwards = backwards
         }
     }
 
@@ -102,7 +99,8 @@ public struct CompilationPipeline {
 
         // Step 1.5: Combine history operations that are not in feedback loops
         time("combineHistoryOps") {
-            combineHistoryOpsNotInFeedback(graph, feedbackClusters: feedbackClusters, options: options)
+            combineHistoryOpsNotInFeedback(
+                graph, feedbackClusters: feedbackClusters, options: options)
         }
 
         // Step 1.6: Fold constant expressions
@@ -112,13 +110,14 @@ public struct CompilationPipeline {
 
         let scalarNodeSet = time("scalarNodes") {
             options.forceScalar
-            ? Set(graph.nodes.keys)
-            : scalarNodes(graph, feedbackClusters: feedbackClusters)
+                ? Set(graph.nodes.keys)
+                : scalarNodes(graph, feedbackClusters: feedbackClusters, backend: backend)
         }
 
         let sortedNodes = time("topoWithCorridors") {
             topoWithCorridors(
-                graph, feedbackClusters: feedbackClusters, scalarNodeSet: scalarNodeSet, debug: false)
+                graph, feedbackClusters: feedbackClusters, scalarNodeSet: scalarNodeSet,
+                debug: false)
         }
 
         try time("inferShapes") {
@@ -132,14 +131,28 @@ public struct CompilationPipeline {
         // Step 2: Determine scalar nodes and create blocks
 
         // Step 2.5: Handle seq operators - if any input to seq is scalar, make all inputs scalar
+        // But don't re-add SIMD-safe operations (they use atomics and can run in parallel)
         var finalScalarSet = scalarNodeSet
         time("seqScalarPropagate") {
+            // Build set of SIMD-safe nodes that should never be marked scalar
+            var simdSafe = Set<NodeID>()
+            for (nodeId, node) in graph.nodes {
+                switch node.op {
+                case .memoryAccumulate(_), .tensorAccumulate(_):
+                    simdSafe.insert(nodeId)
+                default: break
+                }
+            }
+
             for (_, node) in graph.nodes {
                 if case .seq = node.op {
                     let hasScalarInput = node.inputs.contains { finalScalarSet.contains($0) }
                     if hasScalarInput {
                         for inputId in node.inputs {
-                            finalScalarSet.insert(inputId)
+                            // Don't add SIMD-safe nodes to scalar set
+                            if !simdSafe.contains(inputId) {
+                                finalScalarSet.insert(inputId)
+                            }
                         }
                     }
                 }
@@ -194,36 +207,184 @@ public struct CompilationPipeline {
             }
         }
 
-        if options.backwards {
-            time("backwardsBlocks") {
-                var backwardsBlocks: [Block] = []
-                for block in finalBlocks.reversed() {
-                    var backwardsBlock = Block(kind: block.kind)
-                    backwardsBlock.nodes = block.nodes.reversed()
-                    backwardsBlock.direction = .backwards
-                    backwardsBlocks.append(backwardsBlock)
+        // Step 4: Infer temporality and assign to blocks
+        // This now includes hop-based temporality for FFT/IFFT and downstream operations
+        let temporalityResult = time("inferTemporality") {
+            inferTemporality(graph: graph, sortedNodes: sortedNodes)
+        }
+
+        // Step 4.5: Detect frame-dependent tensor chains for SIMD-across-frames optimization
+        let fusableChains = time("detectChains") {
+            detectFrameDependentTensorChains(
+                graph: graph,
+                sortedNodes: sortedNodes,
+                frameBasedNodes: temporalityResult.frameBasedNodes
+            )
+        }
+
+        // Store chain nodes in context for conditional markRequiresScalar
+        for chain in fusableChains {
+            context.frameTensorChainNodes.formUnion(chain.chainNodes)
+        }
+
+        // this step currently breaks C SIMD blocks (causes duplicate definitions)
+        if backend == .metal {
+            finalBlocks = extractStaticOpsIntoBlocks(
+                blocks: finalBlocks, frameBasedNodes: temporalityResult.frameBasedNodes,
+                hopBasedNodes: temporalityResult.hopBasedNodes, graph: graph,
+                fusableChains: fusableChains)
+        }
+
+        if backend == .metal {
+            finalBlocks = splitFrameTensorChainBlocks(
+                blocks: finalBlocks, graph: graph, context: context,
+                frameCount: options.frameCount)
+        }
+
+        // Upgrade frame-tensor chain blocks to SIMD kind for SIMD-across-frames execution.
+        // These blocks contain chains that can be parallelized across frames (not tensor elements).
+        time("upgradeChainBlocks") {
+            for i in 0..<finalBlocks.count {
+                if finalBlocks[i].frameTensorChain != nil {
+                    // Frame-tensor chains parallelize across frames, so they should be SIMD
+                    // (each frame is a thread that computes the full tensor chain locally)
+                    finalBlocks[i].kind = .simd
                 }
-                finalBlocks += fuseBlocks(backwardsBlocks, graph)
             }
         }
 
-        // Step 4: Infer temporality and assign to blocks
-        let frameBasedNodes = time("inferTemporality") {
-            inferTemporality(graph: graph, sortedNodes: sortedNodes)
-        }
         time("assignTemporality") {
-            assignBlockTemporality(blocks: &finalBlocks, frameBasedNodes: frameBasedNodes)
+            assignBlockTemporality(
+                blocks: &finalBlocks,
+                frameBasedNodes: temporalityResult.frameBasedNodes,
+                hopBasedNodes: temporalityResult.hopBasedNodes
+            )
         }
+
+        // Store frame-based nodes in context for smart gradient buffer allocation
+        context.frameBasedNodes = temporalityResult.frameBasedNodes
 
         let finalBlockIndices = Array(0..<finalBlocks.count)
 
-        var blockId: Int = 0
-        for block in finalBlocks {
-            blockId += 1
-        }
-
         // Step 5: Convert blocks to UOp blocks
         var uopBlocks = [BlockUOps]()
+
+        func inferParallelPolicy(
+            kind: Kind, temporality: Temporality, ops: [UOp]
+        ) -> ParallelPolicy {
+            guard temporality == .static_, kind == .scalar else { return .serial }
+
+            var hasParallelRange = false
+            var hasBlockingOps = false
+            var hasGradOps = false
+
+            for uop in ops {
+                switch uop.op {
+                case .beginParallelRange:
+                    hasParallelRange = true
+                case .loadGrad, .accumulateGrad, .loadTensorGrad, .accumulateTensorGrad,
+                    .loadGradMemory, .storeGradMemory:
+                    hasGradOps = true
+                case .beginReduce, .endReduce, .reduceAccumulate, .requiresScalar:
+                    hasBlockingOps = true
+                default:
+                    break
+                }
+            }
+
+            if hasGradOps { return .serial }
+            if hasBlockingOps { return .serial }
+            if hasParallelRange { return .threadParallel }
+            return .serial
+        }
+
+        func containsSpectralPass(_ block: Block, _ g: Graph) -> Bool {
+            return block.nodes.contains { nodeId in
+                guard let node = g.nodes[nodeId] else { return false }
+                if case .spectralLossPass1 = node.op { return true }
+                if case .spectralLossPass2 = node.op { return true }
+                return false
+            }
+        }
+
+        func extractThreadCountScale(_ ops: [UOp]) -> (Int?, [UOp]) {
+            var scale: Int? = nil
+            var filtered: [UOp] = []
+            filtered.reserveCapacity(ops.count)
+            for op in ops {
+                if case .setThreadCountScale(let s) = op.op {
+                    scale = s
+                    continue
+                }
+                filtered.append(op)
+            }
+            return (scale, filtered)
+        }
+
+        func splitFrameTensorChainBlocks(
+            blocks: [Block], graph: Graph, context: IRContext, frameCount: Int
+        ) -> [Block] {
+            var result: [Block] = []
+            result.reserveCapacity(blocks.count)
+
+            for block in blocks {
+                guard let chain = block.frameTensorChain else {
+                    result.append(block)
+                    continue
+                }
+
+                // Only split when the reduction node is actually in this block.
+                guard block.nodes.contains(chain.reductionNodeId) else {
+                    var cleared = block
+                    cleared.frameTensorChain = nil
+                    result.append(cleared)
+                    continue
+                }
+
+                // Map block: all chain nodes except the reduction
+                var mapBlock = block
+                mapBlock.nodes = block.nodes.filter { $0 != chain.reductionNodeId }
+                mapBlock.frameTensorChain = chain
+                mapBlock.tensorIndex = nil
+                mapBlock.shape = nil
+
+                // If the reduction is the only node in the block, skip frame-tensor optimization.
+                if mapBlock.nodes.isEmpty {
+                    var cleared = block
+                    cleared.frameTensorChain = nil
+                    result.append(cleared)
+                    continue
+                }
+
+                let tensorSize = chain.tensorShape.reduce(1, *)
+                if tensorSize <= 0 {
+                    result.append(block)
+                    continue
+                }
+
+                if context.frameTensorChainScratch[chain.reductionNodeId] == nil {
+                    let scratchSize = frameCount * tensorSize
+                    let scratchCell = graph.alloc(vectorWidth: scratchSize)
+                    context.frameTensorChainScratch[chain.reductionNodeId] =
+                        IRContext.FrameTensorChainScratch(cellId: scratchCell, tensorSize: tensorSize)
+                }
+
+                // Reduce block: just the reduction node
+                var reduceBlock = Block(kind: .simd)
+                reduceBlock.nodes = [chain.reductionNodeId]
+                reduceBlock.temporality = block.temporality
+                reduceBlock.tensorIndex = nil
+                reduceBlock.shape = nil
+                reduceBlock.frameTensorChain = nil
+
+                if !mapBlock.nodes.isEmpty {
+                    result.append(mapBlock)
+                }
+                result.append(reduceBlock)
+            }
+
+            return result
+        }
 
         try time("emitBlockUOps") {
             for blockIdx in finalBlockIndices {
@@ -233,46 +394,36 @@ public struct CompilationPipeline {
                     block: block,
                     blocks: finalBlocks,
                     g: graph,
+                    backend: backend,
                     debug: options.debug
                 )
-                uopBlocks.append(BlockUOps(ops: ops, kind: block.kind, temporality: block.temporality))
+                let (threadCountScale, filteredOps) = extractThreadCountScale(ops)
+                var finalOps = filteredOps
+                let effectiveKind: Kind
+                if backend == .c, threadCountScale != nil {
+                    for i in 0..<finalOps.count {
+                        finalOps[i].kind = .scalar
+                    }
+                    effectiveKind = .scalar
+                } else {
+                    effectiveKind = block.kind
+                }
+                let parallelPolicy = inferParallelPolicy(
+                    kind: effectiveKind, temporality: block.temporality, ops: finalOps)
+                // Force new kernel for spectral passes (forward + backward) and scaled thread blocks
+                let forceNew = containsSpectralPass(block, graph) || threadCountScale != nil
+                uopBlocks.append(
+                    BlockUOps(
+                        ops: finalOps, kind: effectiveKind, temporality: block.temporality,
+                        parallelPolicy: parallelPolicy, forceNewKernel: forceNew,
+                        threadCountScale: threadCountScale))
             }
         }
 
-        // Remove empty UOp blocks prior to vector memory remap and lowering
         uopBlocks.removeAll { $0.ops.isEmpty }
 
-        // Step 5.5: Fuse consecutive parallelRange loops with producer-consumer relationships.
-        // This reduces redundant memory traffic and makes the generated code cleaner.
-        for i in 0..<uopBlocks.count {
-            //uopBlocks[i].ops = fuseParallelRanges(uopBlocks[i].ops)
-        }
-
-        // Debug: print UOps after fusion
         if options.debug {
-            var i = 1
-            for uopBlock in uopBlocks {
-                i += 1
-                var indentLevel = 0
-                for uop in uopBlock.ops {
-                    switch uop.op {
-                    case .beginIf, .beginForLoop, .beginParallelRange, .beginLoop, .beginRange:
-                        print(
-                            "\(String(repeating: "  ", count: indentLevel))\(uop.prettyDescription())"
-                        )
-                        indentLevel += 1
-                    case .endIf, .endLoop, .endParallelRange, .endRange:
-                        indentLevel = max(0, indentLevel - 1)
-                        print(
-                            "\(String(repeating: "  ", count: indentLevel))\(uop.prettyDescription())"
-                        )
-                    default:
-                        print(
-                            "\(String(repeating: "  ", count: indentLevel))\(uop.prettyDescription())"
-                        )
-                    }
-                }
-            }
+            printUOpBlocks(uopBlocks)
         }
 
         // Step 7: Lower UOp blocks to compiled kernels
@@ -312,11 +463,14 @@ public struct CompilationPipeline {
 
         // Print timing summary
         let pipelineTotal = (CFAbsoluteTimeGetCurrent() - pipelineStart) * 1000
-        print("⏱️ [DGen Pipeline] Total: \(String(format: "%.1f", pipelineTotal))ms | nodes: \(graph.nodes.count)")
+        print(
+            "⏱️ [DGen Pipeline] Total: \(String(format: "%.1f", pipelineTotal))ms | nodes: \(graph.nodes.count)"
+        )
         let sortedTimings = timings.sorted { $0.1 > $1.1 }
         for (label, ms) in sortedTimings.prefix(10) {
             let pct = (ms / pipelineTotal) * 100
-            print("   \(String(format: "%6.1f", ms))ms (\(String(format: "%4.1f", pct))%) - \(label)")
+            print(
+                "   \(String(format: "%6.1f", ms))ms (\(String(format: "%4.1f", pct))%) - \(label)")
         }
 
         return CompilationResult(
@@ -378,6 +532,27 @@ extension CompilationResult {
     }
 }
 
+// MARK: - Debug Helpers
+
+private func printUOpBlocks(_ uopBlocks: [BlockUOps]) {
+    for (i, uopBlock) in uopBlocks.enumerated() {
+        print("block #\(i+1)")
+        var indentLevel = 0
+        for uop in uopBlock.ops {
+            switch uop.op {
+            case .beginIf, .beginForLoop, .beginParallelRange, .beginLoop, .beginRange:
+                print("\(String(repeating: "  ", count: indentLevel))\(uop.prettyDescription())")
+                indentLevel += 1
+            case .endIf, .endLoop, .endParallelRange, .endRange:
+                indentLevel = max(0, indentLevel - 1)
+                print("\(String(repeating: "  ", count: indentLevel))\(uop.prettyDescription())")
+            default:
+                print("\(String(repeating: "  ", count: indentLevel))\(uop.prettyDescription())")
+            }
+        }
+    }
+}
+
 // MARK: - Memory Layout Remapping
 
 /// Remap memory slots to avoid conflicts between scalar and vector operations
@@ -414,19 +589,8 @@ func remapVectorMemorySlots(
     // First pass: identify which memory cells are used in which execution modes
     for block in uopBlocks {
         for uop in block.ops {
-            switch uop.op {
-            case .load(let cellId):
+            if let cellId = uop.op.memoryCellId {
                 registerCell(cellId, kind: block.kind)
-            case .store(let cellId, _):
-                registerCell(cellId, kind: block.kind)
-            case .delay1(let cellId, _):
-                registerCell(cellId, kind: block.kind)
-            case .memoryRead(let cellId, _):
-                registerCell(cellId, kind: block.kind)
-            case .memoryWrite(let cellId, _, _):
-                registerCell(cellId, kind: block.kind)
-            default:
-                break
             }
         }
     }
@@ -435,38 +599,22 @@ func remapVectorMemorySlots(
         registerCell(voiceCellId, kind: .simd)
     }
 
-    // Log cells used in multiple modes
-    if !cellUsedInMultipleModes.isEmpty {
-        print(
-            "[REMAP DEBUG] Cells used in multiple execution modes (upgraded to SIMD): \(cellUsedInMultipleModes)"
-        )
-    }
-
     // Second pass: create a remapping for vector cells
     var cellRemapping: [CellID: CellID] = [:]
     var nextAvailableSlot = (allCellIds.max() ?? -1) + 1
 
-    // Reserve space for vector operations and large buffers (sorted for deterministic allocation)
     for (cellId, kind) in memoryUsage.sorted(by: { $0.key < $1.key }) {
-        // Check if this cell has a custom allocation size (like spectral scratch buffer)
         let allocSize = cellSizes[cellId] ?? 1
 
         if kind == .simd {
-            // Find a safe starting position (aligned to 4 and not conflicting)
-            let alignedSlot = ((nextAvailableSlot + 3) / 4) * 4  // Align to 4-byte boundary
+            let alignedSlot = ((nextAvailableSlot + 3) / 4) * 4
             cellRemapping[cellId] = alignedSlot
-            // Reserve space for the full allocation size (e.g., spectral scratch needs windowSize * frameCount * 2)
             nextAvailableSlot = alignedSlot + max(4, allocSize)
+        } else if allocSize > 1 {
+            cellRemapping[cellId] = nextAvailableSlot
+            nextAvailableSlot += allocSize
         } else {
-            // Scalar operations: use allocation size if specified, otherwise keep original slot
-            if allocSize > 1 {
-                // Large scalar buffer (shouldn't happen for spectral, but handle it)
-                cellRemapping[cellId] = nextAvailableSlot
-                nextAvailableSlot += allocSize
-            } else {
-                // Single scalar cell keeps its original slot
-                cellRemapping[cellId] = cellId
-            }
+            cellRemapping[cellId] = cellId
         }
     }
 
@@ -474,58 +622,21 @@ func remapVectorMemorySlots(
     for blockIndex in 0..<uopBlocks.count {
         for uopIndex in 0..<uopBlocks[blockIndex].ops.count {
             let uop = uopBlocks[blockIndex].ops[uopIndex]
-
-            switch uop.op {
-            case .load(let cellId):
-                if let newCellId = cellRemapping[cellId] {
-                    uopBlocks[blockIndex].ops[uopIndex] = UOp(
-                        op: .load(newCellId),
-                        value: uop.value,
-                        kind: uop.kind
-                    )
-                }
-            case .store(let cellId, let val):
-                if let newCellId = cellRemapping[cellId] {
-                    uopBlocks[blockIndex].ops[uopIndex] = UOp(
-                        op: .store(newCellId, val),
-                        value: uop.value,
-                        kind: uop.kind
-                    )
-                }
-            case .delay1(let cellId, let a):
-                if let newCellId = cellRemapping[cellId] {
-                    uopBlocks[blockIndex].ops[uopIndex] = UOp(
-                        op: .delay1(newCellId, a),
-                        value: uop.value,
-                        kind: uop.kind
-                    )
-                }
-            case .memoryRead(let cellId, let offset):
-                if let newCellId = cellRemapping[cellId] {
-                    uopBlocks[blockIndex].ops[uopIndex] = UOp(
-                        op: .memoryRead(newCellId, offset),
-                        value: uop.value,
-                        kind: uop.kind
-                    )
-                }
-            case .memoryWrite(let cellId, let offset, let value):
-                if let newCellId = cellRemapping[cellId] {
-                    uopBlocks[blockIndex].ops[uopIndex] = UOp(
-                        op: .memoryWrite(newCellId, offset, value),
-                        value: uop.value,
-                        kind: uop.kind
-                    )
-                }
-            // No remapping needed for tape-based spectral ops
-            default:
-                break
+            if let remappedOp = uop.op.withRemappedCellId(cellRemapping) {
+                uopBlocks[blockIndex].ops[uopIndex] = UOp(
+                    op: remappedOp,
+                    value: uop.value,
+                    kind: uop.kind
+                )
             }
         }
     }
 
-    let cellAllocations = CellAllocations(
-        totalMemorySlots: nextAvailableSlot, cellMappings: cellRemapping, cellKinds: memoryUsage)
-    return cellAllocations
+    return CellAllocations(
+        totalMemorySlots: nextAvailableSlot,
+        cellMappings: cellRemapping,
+        cellKinds: memoryUsage
+    )
 }
 
 public struct CellAllocations {
@@ -577,7 +688,7 @@ func combineHistoryOpsNotInFeedback(
             if !nodesInFeedback.contains(readNodeId) && !nodesInFeedback.contains(writeInfo.nodeId)
             {
                 // Replace the historyRead node with historyReadWrite using the write's inputs
-                if let readNode = graph.nodes[readNodeId] {
+                if graph.nodes[readNodeId] != nil {
                     // Create new node with historyReadWrite operation at the read node's ID
                     let newNode = Node(
                         id: readNodeId,
@@ -627,9 +738,9 @@ func foldConstants(_ graph: Graph, options: CompilationPipeline.Options) {
     // Initialize worklist with foldable nodes that have all-constant inputs
     var worklist = Set<NodeID>()
     for (nodeId, node) in graph.nodes {
-        if canFoldOp(node.op) &&
-           !node.inputs.isEmpty &&
-           node.inputs.allSatisfy({ constantValues[$0] != nil }) {
+        if canFoldOp(node.op) && !node.inputs.isEmpty
+            && node.inputs.allSatisfy({ constantValues[$0] != nil })
+        {
             worklist.insert(nodeId)
         }
     }
@@ -646,7 +757,8 @@ func foldConstants(_ graph: Graph, options: CompilationPipeline.Options) {
 
         // Evaluate the constant expression
         guard let result = evaluateConstantOp(node.op, inputValues),
-              result.isFinite else { continue }
+            result.isFinite
+        else { continue }
 
         // Replace node with constant (preserves NodeID, no rewiring needed)
         constantValues[nodeId] = result
@@ -656,8 +768,9 @@ func foldConstants(_ graph: Graph, options: CompilationPipeline.Options) {
         // Add newly-eligible consumers to worklist
         for consumer in consumers[nodeId] ?? [] {
             if let consumerNode = graph.nodes[consumer],
-               canFoldOp(consumerNode.op),
-               consumerNode.inputs.allSatisfy({ constantValues[$0] != nil }) {
+                canFoldOp(consumerNode.op),
+                consumerNode.inputs.allSatisfy({ constantValues[$0] != nil })
+            {
                 worklist.insert(consumer)
             }
         }
@@ -681,7 +794,7 @@ private func canFoldOp(_ op: LazyOp) -> Bool {
         return true
     // Unary math
     case .abs, .sign, .sin, .cos, .tan, .tanh, .exp, .log, .log10, .sqrt,
-         .floor, .ceil, .round, .atan2:
+        .floor, .ceil, .round, .atan2:
         return true
     // Control flow (key for biquad)
     case .gswitch, .mix, .selector:
@@ -694,43 +807,44 @@ private func canFoldOp(_ op: LazyOp) -> Bool {
 private func evaluateConstantOp(_ op: LazyOp, _ inputs: [Float]) -> Float? {
     switch op {
     // Unary
-    case .abs:   return inputs.count == 1 ? Swift.abs(inputs[0]) : nil
-    case .sign:  return inputs.count == 1 ? (inputs[0] > 0 ? 1 : (inputs[0] < 0 ? -1 : 0)) : nil
-    case .sin:   return inputs.count == 1 ? sin(inputs[0]) : nil
-    case .cos:   return inputs.count == 1 ? cos(inputs[0]) : nil
-    case .tan:   return inputs.count == 1 ? tan(inputs[0]) : nil
-    case .tanh:  return inputs.count == 1 ? tanh(inputs[0]) : nil
-    case .exp:   return inputs.count == 1 ? exp(inputs[0]) : nil
-    case .log:   return inputs.count == 1 && inputs[0] > 0 ? log(inputs[0]) : nil
+    case .abs: return inputs.count == 1 ? Swift.abs(inputs[0]) : nil
+    case .sign: return inputs.count == 1 ? (inputs[0] > 0 ? 1 : (inputs[0] < 0 ? -1 : 0)) : nil
+    case .sin: return inputs.count == 1 ? sin(inputs[0]) : nil
+    case .cos: return inputs.count == 1 ? cos(inputs[0]) : nil
+    case .tan: return inputs.count == 1 ? tan(inputs[0]) : nil
+    case .tanh: return inputs.count == 1 ? tanh(inputs[0]) : nil
+    case .exp: return inputs.count == 1 ? exp(inputs[0]) : nil
+    case .log: return inputs.count == 1 && inputs[0] > 0 ? log(inputs[0]) : nil
     case .log10: return inputs.count == 1 && inputs[0] > 0 ? log10(inputs[0]) : nil
-    case .sqrt:  return inputs.count == 1 && inputs[0] >= 0 ? sqrt(inputs[0]) : nil
+    case .sqrt: return inputs.count == 1 && inputs[0] >= 0 ? sqrt(inputs[0]) : nil
     case .floor: return inputs.count == 1 ? floor(inputs[0]) : nil
-    case .ceil:  return inputs.count == 1 ? ceil(inputs[0]) : nil
+    case .ceil: return inputs.count == 1 ? ceil(inputs[0]) : nil
     case .round: return inputs.count == 1 ? round(inputs[0]) : nil
 
     // Binary
-    case .add:   return inputs.count == 2 ? inputs[0] + inputs[1] : nil
-    case .sub:   return inputs.count == 2 ? inputs[0] - inputs[1] : nil
-    case .mul:   return inputs.count == 2 ? inputs[0] * inputs[1] : nil
-    case .div:   return inputs.count == 2 && inputs[1] != 0 ? inputs[0] / inputs[1] : nil
-    case .pow:   return inputs.count == 2 ? pow(inputs[0], inputs[1]) : nil
-    case .mod:   return inputs.count == 2 && inputs[1] != 0 ?
-                        inputs[0].truncatingRemainder(dividingBy: inputs[1]) : nil
-    case .min:   return inputs.count == 2 ? Swift.min(inputs[0], inputs[1]) : nil
-    case .max:   return inputs.count == 2 ? Swift.max(inputs[0], inputs[1]) : nil
+    case .add: return inputs.count == 2 ? inputs[0] + inputs[1] : nil
+    case .sub: return inputs.count == 2 ? inputs[0] - inputs[1] : nil
+    case .mul: return inputs.count == 2 ? inputs[0] * inputs[1] : nil
+    case .div: return inputs.count == 2 && inputs[1] != 0 ? inputs[0] / inputs[1] : nil
+    case .pow: return inputs.count == 2 ? pow(inputs[0], inputs[1]) : nil
+    case .mod:
+        return inputs.count == 2 && inputs[1] != 0
+            ? inputs[0].truncatingRemainder(dividingBy: inputs[1]) : nil
+    case .min: return inputs.count == 2 ? Swift.min(inputs[0], inputs[1]) : nil
+    case .max: return inputs.count == 2 ? Swift.max(inputs[0], inputs[1]) : nil
     case .atan2: return inputs.count == 2 ? atan2(inputs[0], inputs[1]) : nil
 
     // Comparisons (return 1.0 for true, 0.0 for false)
-    case .gt:    return inputs.count == 2 ? (inputs[0] > inputs[1] ? 1 : 0) : nil
-    case .gte:   return inputs.count == 2 ? (inputs[0] >= inputs[1] ? 1 : 0) : nil
-    case .lt:    return inputs.count == 2 ? (inputs[0] < inputs[1] ? 1 : 0) : nil
-    case .lte:   return inputs.count == 2 ? (inputs[0] <= inputs[1] ? 1 : 0) : nil
-    case .eq:    return inputs.count == 2 ? (inputs[0] == inputs[1] ? 1 : 0) : nil
+    case .gt: return inputs.count == 2 ? (inputs[0] > inputs[1] ? 1 : 0) : nil
+    case .gte: return inputs.count == 2 ? (inputs[0] >= inputs[1] ? 1 : 0) : nil
+    case .lt: return inputs.count == 2 ? (inputs[0] < inputs[1] ? 1 : 0) : nil
+    case .lte: return inputs.count == 2 ? (inputs[0] <= inputs[1] ? 1 : 0) : nil
+    case .eq: return inputs.count == 2 ? (inputs[0] == inputs[1] ? 1 : 0) : nil
 
     // Logical
-    case .and:   return inputs.count == 2 ? ((inputs[0] != 0 && inputs[1] != 0) ? 1 : 0) : nil
-    case .or:    return inputs.count == 2 ? ((inputs[0] != 0 || inputs[1] != 0) ? 1 : 0) : nil
-    case .xor:   return inputs.count == 2 ? (((inputs[0] != 0) != (inputs[1] != 0)) ? 1 : 0) : nil
+    case .and: return inputs.count == 2 ? ((inputs[0] != 0 && inputs[1] != 0) ? 1 : 0) : nil
+    case .or: return inputs.count == 2 ? ((inputs[0] != 0 || inputs[1] != 0) ? 1 : 0) : nil
+    case .xor: return inputs.count == 2 ? (((inputs[0] != 0) != (inputs[1] != 0)) ? 1 : 0) : nil
 
     // Ternary (key for biquad mode selection)
     case .gswitch:
@@ -762,7 +876,6 @@ func determineTensorBlocks(_ blocks: [Block], _ graph: Graph, _ ctx: IRContext) 
     // Helper to create a new block preserving original properties
     func makeBlock(from original: Block) -> Block {
         var newBlock = Block(kind: original.kind)
-        newBlock.direction = original.direction
         newBlock.temporality = original.temporality
         return newBlock
     }
@@ -812,6 +925,36 @@ func determineTensorBlocks(_ blocks: [Block], _ graph: Graph, _ ctx: IRContext) 
                     }
                     currentShape = nil
 
+                } else if case .fft = node.op {
+                    // FFT is a bulk tensor operation that handles all tensor writes internally
+                    // It needs its own scalar block - don't mix with SIMD ops
+                    if currentBlock.nodes.count > 0 {
+                        innerBlocks.append(currentBlock)
+                    }
+                    // Create isolated block for FFT
+                    currentBlock = makeBlock(from: block)
+                    currentBlock.kind = .scalar  // Force scalar execution
+                    currentBlock.nodes.append(nodeId)
+                    innerBlocks.append(currentBlock)
+                    // Start fresh block for nodes after FFT
+                    currentBlock = makeBlock(from: block)
+                    currentShape = nil
+                    continue  // Skip the append at end of loop
+                } else if case .ifft = node.op {
+                    // IFFT is a bulk operation that handles spectrum-to-time conversion
+                    // It needs its own scalar block - don't mix with SIMD ops
+                    if currentBlock.nodes.count > 0 {
+                        innerBlocks.append(currentBlock)
+                    }
+                    // Create isolated block for IFFT
+                    currentBlock = makeBlock(from: block)
+                    currentBlock.kind = .scalar  // Force scalar execution
+                    currentBlock.nodes.append(nodeId)
+                    innerBlocks.append(currentBlock)
+                    // Start fresh block for nodes after IFFT
+                    currentBlock = makeBlock(from: block)
+                    currentShape = nil
+                    continue  // Skip the append at end of loop
                 } else if case .tensor(let shape) = node.shape {
                     if shape != currentShape {
                         if currentBlock.nodes.count > 0 {

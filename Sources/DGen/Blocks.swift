@@ -3,19 +3,27 @@
 import Foundation
 
 public enum Kind { case simd, scalar }
-public enum Direction { case forward, backwards }
 
 // corresponds to one kernel (metal backends) or for loop (in C backend)
 public struct Block: Equatable {
     public var kind: Kind
     public var nodes: [NodeID] = []
-    public var direction: Direction = .forward
     public var temporality: Temporality = .static_
     public var tensorIndex: Lazy?
     public var shape: Shape?
+    /// If set, this block contains a frame-dependent tensor chain that can be
+    /// SIMD-parallelized across frames with thread-local tensor storage.
+    public var frameTensorChain: FrameDependentTensorChain? = nil
 
     public init(kind: Kind) {
         self.kind = kind
+    }
+
+    public static func == (lhs: Block, rhs: Block) -> Bool {
+        // Exclude frameTensorChain from equality to avoid issues with Equatable
+        return lhs.kind == rhs.kind && lhs.nodes == rhs.nodes
+            && lhs.temporality == rhs.temporality && lhs.tensorIndex == rhs.tensorIndex
+            && lhs.shape == rhs.shape
     }
 }
 
@@ -245,12 +253,24 @@ public func determineScalarCorridors(_ g: Graph, feedbackClusters: [[NodeID]]) -
     return nodeToCorridorId
 }
 
-public func scalarNodes(_ g: Graph, feedbackClusters: [[NodeID]]) -> Set<NodeID> {
+public func scalarNodes(_ g: Graph, feedbackClusters: [[NodeID]], backend: Backend = .metal) -> Set<NodeID> {
     var scalar: Set<NodeID> = []
 
-    //return Set(g.nodes.keys)
+    // Track nodes that are SIMD-safe due to using atomics (should never be scalar)
+    var simdSafe: Set<NodeID> = []
+    g.nodes.values.forEach {
+        switch $0.op {
+        case .memoryAccumulate(_):
+            // memoryAccumulate uses atomics - safe for SIMD execution
+            simdSafe.insert($0.id)
+        case .tensorAccumulate(_):
+            // tensorAccumulate uses atomics internally - safe for SIMD execution
+            simdSafe.insert($0.id)
+        default: break
+        }
+    }
 
-    // First, mark inherently scalar operations
+    // First, mark inherently scalar operations (stateful ops with frame-to-frame dependencies)
     g.nodes.values.forEach {
         switch $0.op {
         case .accum(_):
@@ -259,32 +279,11 @@ public func scalarNodes(_ g: Graph, feedbackClusters: [[NodeID]]) -> Set<NodeID>
             scalar.insert($0.id)  // Latch operations need to be scalar (stateful)
         case .phasor(_):
             scalar.insert($0.id)  // Phasor operations need to be scalar (stateful)
-        //case .seq:
-        //    scalar.insert($0.id)  // Seq operations need to be scalar (ordering dependent)
-
-        // Tensor operations must be scalar because they have internal loops
-        case .historyRead(let cellId):
-            // Tensor history reads are scalar (they use parallelRange internally)
-            if g.cellToTensor[cellId] != nil {
-                scalar.insert($0.id)
-            }
-        case .historyWrite(let cellId):
-            // Tensor history writes are scalar (they use parallelRange internally)
-            if g.cellToTensor[cellId] != nil {
-                scalar.insert($0.id)
-            }
-        case .conv2d(_):
-            scalar.insert($0.id)
-        case .sum:
-            scalar.insert($0.id)
-        case .peek:
-            scalar.insert($0.id)  // Peek operations must be scalar (reads from tensor)
         default: break
         }
     }
 
-    // Also mark nodes with tensor inputs as scalar (they use parallelRange internally)
-    // First, identify all tensor source nodes (tensorRef produces tensors, historyRead with tensor cell)
+    // Identify tensor source nodes for tracking
     var tensorNodes: Set<NodeID> = []
     g.nodes.values.forEach {
         switch $0.op {
@@ -298,100 +297,76 @@ public func scalarNodes(_ g: Graph, feedbackClusters: [[NodeID]]) -> Set<NodeID>
         }
     }
 
-    // Mark nodes with tensor inputs as scalar (they need element-wise loops)
-    g.nodes.values.forEach {
-        for inputId in $0.inputs {
-            if tensorNodes.contains(inputId) {
-                scalar.insert($0.id)
-                // If this node consumes a tensor and produces something, it's also a tensor producer
-                tensorNodes.insert($0.id)
-            }
-        }
-    }
-
-    // Repeat to propagate through chains of tensor ops
+    // Propagate tensor status through the graph (needed for both backends)
     var changed = true
     while changed {
         changed = false
         g.nodes.values.forEach { node in
             for inputId in node.inputs {
+                if tensorNodes.contains(inputId) && !tensorNodes.contains(node.id) {
+                    tensorNodes.insert(node.id)
+                    changed = true
+                }
+            }
+        }
+    }
+
+    // For C backend: Mark tensor ops as scalar (they need sequential element loops)
+    // For Metal: Tensor ops can run SIMD across frames with internal parallelRange loops
+    if case .c = backend {
+        // C backend: conservative approach - tensor ops are scalar
+        g.nodes.values.forEach {
+            switch $0.op {
+            case .historyRead(let cellId):
+                if g.cellToTensor[cellId] != nil {
+                    scalar.insert($0.id)
+                }
+            case .historyWrite(let cellId):
+                if g.cellToTensor[cellId] != nil {
+                    scalar.insert($0.id)
+                }
+            case .conv2d(_), .sum, .peek:
+                scalar.insert($0.id)
+            default: break
+            }
+        }
+
+        // Mark nodes with tensor inputs as scalar for C
+        g.nodes.values.forEach {
+            if simdSafe.contains($0.id) { return }
+            for inputId in $0.inputs {
                 if tensorNodes.contains(inputId) {
-                    // Mark as scalar if not already
-                    if !scalar.contains(node.id) {
+                    scalar.insert($0.id)
+                }
+            }
+        }
+
+        // Propagate scalar status through tensor chains for C
+        changed = true
+        while changed {
+            changed = false
+            g.nodes.values.forEach { node in
+                if simdSafe.contains(node.id) { return }
+                for inputId in node.inputs {
+                    if tensorNodes.contains(inputId) && !scalar.contains(node.id) {
                         scalar.insert(node.id)
                         changed = true
                     }
-                    // Also propagate tensorNodes status (separate from scalar check)
-                    // This ensures cos(tensor) is in tensorNodes even if already scalar
-                    if !tensorNodes.contains(node.id) {
-                        tensorNodes.insert(node.id)
-                        changed = true
-                    }
                 }
             }
         }
     }
 
-    // Track frame-based tensor producers (phasor/accum/latch with tensor input).
-    // These produce tensors whose values change every frame, so downstream tensor ops
-    // must also run per-frame (scalar) to stay synchronized.
-    // Note: We check if any input is a tensor node (since shape inference hasn't run yet)
-    var frameBasedTensorNodes: Set<NodeID> = []
-    for (nodeId, node) in g.nodes {
-        switch node.op {
-        case .phasor(_), .accum(_), .latch(_):
-            // Check if this stateful op has a tensor input
-            let hasTensorInput = node.inputs.contains { tensorNodes.contains($0) }
-            if hasTensorInput {
-                frameBasedTensorNodes.insert(nodeId)
-                // Also add to tensorNodes since it produces a tensor
-                tensorNodes.insert(nodeId)
-            }
-        default:
-            break
-        }
-    }
-
-    // Propagate frame-based tensor status to downstream tensor consumers.
-    // Any tensor op that consumes a frame-based tensor must also be scalar,
-    // because its input values change every frame.
-    // We iterate until no changes, checking ALL inputs (not just direct ones).
-    changed = true
-    var iteration = 0
-    while changed {
-        changed = false
-        iteration += 1
-        for (nodeId, node) in g.nodes {
-            // Skip if already marked as frame-based tensor
-            if frameBasedTensorNodes.contains(nodeId) { continue }
-
-            // Check if any input is a frame-based tensor
-            for inputId in node.inputs {
-                if frameBasedTensorNodes.contains(inputId) {
-                    // This node consumes a frame-based tensor
-                    // Mark as scalar (must run per-frame)
-                    if !scalar.contains(nodeId) {
-                        scalar.insert(nodeId)
-                        changed = true
-                    }
-                    // If this node is a tensor op, it's also a frame-based tensor producer
-                    // (so downstream tensor ops will also be marked)
-                    if tensorNodes.contains(nodeId) {
-                        frameBasedTensorNodes.insert(nodeId)
-                        changed = true
-                    }
-                    break
-                }
-            }
-        }
-    }
-
-    // Use the new feedback loop detection to mark all nodes in feedback loops as scalar
+    // Use feedback loop detection to mark all nodes in feedback loops as scalar
+    // This is the core reason for scalar execution - frame-to-frame state dependencies
     for loop in feedbackClusters {
         for nodeId in loop {
             scalar.insert(nodeId)
         }
     }
+
+    // Remove SIMD-safe nodes from scalar set - these use atomics and are safe for parallel execution
+    scalar.subtract(simdSafe)
 
     return scalar
 }
@@ -522,38 +497,54 @@ public func topoWithCorridors(
     return result
 }
 
-// Simple topological sort within a corridor
+/// Topological sort within a corridor that separates forward and gradient nodes.
+/// If lastForwardNodeId is set, forward nodes (id <= lastForwardNodeId) are processed
+/// before gradient nodes (id > lastForwardNodeId) to prevent gradient additions from
+/// affecting forward node ordering.
 private func simpleTopoSortWithinCorridor(nodes: [NodeID], g: Graph) -> [NodeID] {
-    let nodeSet = Set(nodes)
-    var indegree: [NodeID: Int] = [:]
+    let lastForwardId = g.lastForwardNodeId
 
-    // Calculate in-degrees within corridor
-    for nodeId in nodes {
-        indegree[nodeId] = 0
+    // Separate forward and gradient nodes if applicable
+    let forwardNodes: [NodeID]
+    let gradientNodes: [NodeID]
+    if let lastFwd = lastForwardId {
+        forwardNodes = nodes.filter { $0 <= lastFwd }.sorted()
+        gradientNodes = nodes.filter { $0 > lastFwd }.sorted()
+    } else {
+        forwardNodes = nodes.sorted()
+        gradientNodes = []
     }
 
-    for nodeId in nodes {
-        if let node = g.nodes[nodeId] {
-            for dep in node.allDependencies {
-                if nodeSet.contains(dep) {
-                    indegree[nodeId]! += 1
+    // Topological sort a subset of nodes using Kahn's algorithm
+    func topoSort(_ subsetNodes: [NodeID]) -> [NodeID] {
+        guard !subsetNodes.isEmpty else { return [] }
+        let subsetSet = Set(subsetNodes)
+        var indegree: [NodeID: Int] = [:]
+
+        // Calculate in-degrees (only counting deps within the subset)
+        for nodeId in subsetNodes {
+            var count = 0
+            if let node = g.nodes[nodeId] {
+                for dep in node.allDependencies where subsetSet.contains(dep) {
+                    count += 1
                 }
             }
+            indegree[nodeId] = count
         }
-    }
 
-    // Kahn's algorithm
-    var queue = indegree.filter { $0.value == 0 }.map { $0.key }.sorted()
-    var result: [NodeID] = []
+        // Kahn's algorithm
+        var queue = indegree.filter { $0.value == 0 }.map { $0.key }.sorted()
+        var result: [NodeID] = []
 
-    while let nodeId = queue.first {
-        queue.removeFirst()
-        result.append(nodeId)
+        while let nodeId = queue.first {
+            queue.removeFirst()
+            result.append(nodeId)
 
-        // Update consumers within corridor
-        for otherNodeId in nodes {
-            if let otherNode = g.nodes[otherNodeId] {
-                if otherNode.allDependencies.contains(nodeId) {
+            // Update consumers within subset
+            for otherNodeId in subsetNodes {
+                if let otherNode = g.nodes[otherNodeId],
+                    otherNode.allDependencies.contains(nodeId)
+                {
                     indegree[otherNodeId]! -= 1
                     if indegree[otherNodeId] == 0 {
                         let insertIndex = queue.firstIndex { $0 > otherNodeId } ?? queue.count
@@ -562,11 +553,17 @@ private func simpleTopoSortWithinCorridor(nodes: [NodeID], g: Graph) -> [NodeID]
                 }
             }
         }
+
+        // Add any remaining nodes (cycles)
+        let remaining = subsetSet.subtracting(result)
+        result.append(contentsOf: remaining.sorted())
+
+        return result
     }
 
-    // Add any remaining nodes (cycles within corridor)
-    let remaining = Set(nodes).subtracting(result)
-    result.append(contentsOf: remaining.sorted())
+    // Sort forward nodes first, then gradient nodes
+    var result = topoSort(forwardNodes)
+    result.append(contentsOf: topoSort(gradientNodes))
 
     return result
 }
@@ -717,12 +714,14 @@ public func fuseBlocks(_ blocks: [Block], _ g: Graph) -> [Block] {
     // Pre-compute which blocks contain Pass1/Pass2 and which scratch cells they touch
     var blockHasPass1: [Bool] = []
     var blockHasPass2: [Bool] = []
+    var blockHasScaledThreads: [Bool] = []
     var blockPass1Cells: [Set<CellID>] = []
     var blockPass2Cells: [Set<CellID>] = []
 
     for b in blocks {
         var hasPass1 = false
         var hasPass2 = false
+        var hasScaled = false
         var p1Cells = Set<CellID>()
         var p2Cells = Set<CellID>()
         for nodeId in b.nodes {
@@ -731,9 +730,15 @@ public func fuseBlocks(_ blocks: [Block], _ g: Graph) -> [Block] {
                 case .spectralLossPass1(_, let scratchCell):
                     hasPass1 = true
                     p1Cells.insert(scratchCell)
+                    hasScaled = true
                 case .spectralLossPass2(_, let scratchCell):
                     hasPass2 = true
                     p2Cells.insert(scratchCell)
+                case .parallelMap2DTestPass1(_, _):
+                    hasScaled = true
+                case .parallelMap2DTestPass2(_, _):
+                    // no-op for scaled flag
+                    break
                 default:
                     break
                 }
@@ -741,6 +746,7 @@ public func fuseBlocks(_ blocks: [Block], _ g: Graph) -> [Block] {
         }
         blockHasPass1.append(hasPass1)
         blockHasPass2.append(hasPass2)
+        blockHasScaledThreads.append(hasScaled)
         blockPass1Cells.append(p1Cells)
         blockPass2Cells.append(p2Cells)
     }
@@ -748,6 +754,7 @@ public func fuseBlocks(_ blocks: [Block], _ g: Graph) -> [Block] {
     var fused: [Block] = []
     var fusedHasPass1: [Bool] = []
     var fusedHasPass2: [Bool] = []
+    var fusedHasScaledThreads: [Bool] = []
     var fusedPass1Cells: [Set<CellID>] = []
     var fusedPass2Cells: [Set<CellID>] = []
 
@@ -763,6 +770,9 @@ public func fuseBlocks(_ blocks: [Block], _ g: Graph) -> [Block] {
             if !conflict && fusedHasPass2[lastIdx] && blockHasPass1[idx] {
                 conflict = !fusedPass2Cells[lastIdx].intersection(blockPass1Cells[idx]).isEmpty
             }
+            if !conflict && (fusedHasScaledThreads[lastIdx] || blockHasScaledThreads[idx]) {
+                conflict = true
+            }
             let canFuse = !conflict
 
             if canFuse {
@@ -773,6 +783,8 @@ public func fuseBlocks(_ blocks: [Block], _ g: Graph) -> [Block] {
                 // Update flags
                 fusedHasPass1[lastIdx] = fusedHasPass1[lastIdx] || blockHasPass1[idx]
                 fusedHasPass2[lastIdx] = fusedHasPass2[lastIdx] || blockHasPass2[idx]
+                fusedHasScaledThreads[lastIdx] =
+                    fusedHasScaledThreads[lastIdx] || blockHasScaledThreads[idx]
                 fusedPass1Cells[lastIdx].formUnion(blockPass1Cells[idx])
                 fusedPass2Cells[lastIdx].formUnion(blockPass2Cells[idx])
             } else {
@@ -786,6 +798,7 @@ public func fuseBlocks(_ blocks: [Block], _ g: Graph) -> [Block] {
                 fused.append(b)
                 fusedHasPass1.append(blockHasPass1[idx])
                 fusedHasPass2.append(blockHasPass2[idx])
+                fusedHasScaledThreads.append(blockHasScaledThreads[idx])
                 fusedPass1Cells.append(blockPass1Cells[idx])
                 fusedPass2Cells.append(blockPass2Cells[idx])
             }
@@ -800,6 +813,7 @@ public func fuseBlocks(_ blocks: [Block], _ g: Graph) -> [Block] {
             fused.append(b)
             fusedHasPass1.append(blockHasPass1[idx])
             fusedHasPass2.append(blockHasPass2[idx])
+            fusedHasScaledThreads.append(blockHasScaledThreads[idx])
             fusedPass1Cells.append(blockPass1Cells[idx])
             fusedPass2Cells.append(blockPass2Cells[idx])
         }
@@ -826,6 +840,8 @@ public func isolateSpectralPasses(_ blocks: [Block], _ g: Graph) -> [Block] {
                 guard let node = g.nodes[nodeId] else { return false }
                 if case .spectralLossPass1 = node.op { return true }
                 if case .spectralLossPass2 = node.op { return true }
+                if case .parallelMap2DTestPass1 = node.op { return true }
+                if case .parallelMap2DTestPass2 = node.op { return true }
                 return false
             }()
 
@@ -1034,17 +1050,19 @@ public func findOutboundTensorCells(_ blks: [Block], _ g: Graph, block: Block) -
 
 /// Check if any UOps contain patterns that prevent SIMD optimization:
 /// - Inner loops (beginLoop, beginForLoop)
-/// - View operations (reshape, transpose, shrink) that require complex index arithmetic
-/// - Broadcast access (non-contiguous strides or shape mismatch)
-private func containsSIMDBlockers(_ uops: [UOp]) -> Bool {
+/// - View operations (reshape, transpose, shrink) that require complex index arithmetic (C only)
+/// - Broadcast access (non-contiguous strides or shape mismatch) (C only)
+private func containsSIMDBlockers(_ uops: [UOp], backend: Backend) -> Bool {
     for uop in uops {
         switch uop.op {
         case .beginLoop, .beginForLoop:
             return true
         case .reshape, .transpose, .shrink, .pad:
-            return true
+            // Metal handles these fine with per-thread execution
+            if case .c = backend { return true }
         case .broadcastAccess:
-            return true
+            // Metal handles broadcast access fine with per-thread execution
+            if case .c = backend { return true }
         case .requiresScalar:
             return true  // Stateful ops (phasor, accum, latch) need sample-by-sample execution
         default:
@@ -1054,8 +1072,152 @@ private func containsSIMDBlockers(_ uops: [UOp]) -> Bool {
     return false
 }
 
+/// Emit UOps for a frame-dependent tensor chain block.
+/// This generates SIMD-across-frames code where each frame/thread:
+/// 1. Declares thread-local tensor storage
+/// 2. Computes the entire tensor chain using inline loops
+/// 3. Outputs the final scalar to frame-indexed scratch buffer
+public func emitFrameTensorChainBlock(
+    ctx: IRContext, chain: FrameDependentTensorChain, block: Block, g: Graph
+) throws -> [UOp] {
+    var uops: [UOp] = []
+
+    guard let scratch = ctx.frameTensorChainScratch[chain.reductionNodeId] else {
+        return uops
+    }
+
+    let tensorSize = scratch.tensorSize
+
+    // Flattened (frame, bin) threading
+    let setup = IRBuilder(ctx: ctx, nodeId: chain.reductionNodeId)
+    setup.setThreadCountScale(tensorSize)
+    let flatIdx = setup.threadIndex()
+    let sizeExpr = setup.constant(Float(tensorSize))
+    let frameIdx = setup.floor(flatIdx / sizeExpr)
+    setup.setFrameIndex(frameIdx)
+    let binIdx = flatIdx - frameIdx * sizeExpr
+    uops.append(contentsOf: setup.ops)
+
+    // Use binIdx as the tensor index for all nodes in the chain
+    for nodeId in block.nodes {
+        ctx.tensorIndices[nodeId] = binIdx.lazy
+    }
+
+    // Keep chain tensors thread-local (avoid global memory writes)
+    let savedOutbound = ctx.outboundTensorCells
+    ctx.outboundTensorCells = []
+    ctx.clearTensorRegisters()
+
+    let reductionInputId = g.nodes[chain.reductionNodeId]?.inputs.first
+
+    // Emit chain nodes (map step)
+    for nodeId in block.nodes {
+        if let node = g.nodes[nodeId] {
+            if case .peekRow = node.op {
+                // Specialized per-bin peekRow: compute only the current column (binIdx)
+                guard node.inputs.count == 2 else {
+                    throw DGenError.insufficientInputs(
+                        operator: "peekRow", expected: 2, actual: node.inputs.count)
+                }
+                let tensorInput = node.inputs[0]
+                guard let inputNode = g.nodes[tensorInput],
+                    case .tensor(let shape) = inputNode.shape,
+                    shape.count == 2
+                else {
+                    throw DGenError.tensorError(op: "peekRow", reason: "requires 2D tensor input")
+                }
+                guard let inTensorId = g.nodeToTensor[tensorInput],
+                    let inTensor = g.tensors[inTensorId],
+                    let outTensorId = g.nodeToTensor[node.id],
+                    let outTensor = g.tensors[outTensorId]
+                else {
+                    throw DGenError.tensorError(op: "peekRow", reason: "missing tensor")
+                }
+
+                let inputs: [Lazy] = node.inputs.compactMap { ctx.values[$0] }
+                let b = IRBuilder(ctx: ctx, nodeId: nodeId)
+                let rowIndex = try b.readInput(node, inputs, at: 1)
+
+                let numRows = shape[0]
+                let numRowsFloat = b.constant(Float(numRows))
+                let zero = b.constant(0.0)
+                let one = b.constant(1.0)
+
+                // Wrap rowIndex using modulo for wrapping behavior
+                let wrappedIndex = b.mod(rowIndex, numRowsFloat)
+                let isNegative = wrappedIndex < zero
+                let positiveIndex = b.gswitch(isNegative, wrappedIndex + numRowsFloat, wrappedIndex)
+
+                // Compute floor and ceil indices for interpolation
+                let floorIndex = b.floor(positiveIndex)
+                let frac = positiveIndex - floorIndex
+
+                let ceilIndex = floorIndex + one
+                let ceilWrapped = b.gswitch(ceilIndex >= numRowsFloat, zero, ceilIndex)
+
+                let colOffset = b.value(binIdx.lazy) * numRowsFloat
+                let floorPos = colOffset + floorIndex
+                let ceilPos = colOffset + ceilWrapped
+
+                let sample1 = b.memoryRead(inTensor.cellId, b.cast(floorPos, to: .int))
+                let sample2 = b.memoryRead(inTensor.cellId, b.cast(ceilPos, to: .int))
+                let interpolated = b.mix(sample1, sample2, frac)
+
+                // Register output tensor element in a register (avoid shared memory writes)
+                _ = b.tstore(outTensor.cellId, b.value(binIdx.lazy), interpolated)
+                ctx.values[nodeId] = interpolated.lazy
+                uops.append(contentsOf: b.ops)
+            } else if case .deterministicPhasor = node.op {
+                guard node.inputs.count == 1 else {
+                    throw DGenError.insufficientInputs(
+                        operator: "deterministicPhasor", expected: 1, actual: node.inputs.count)
+                }
+
+                let inputs: [Lazy] = node.inputs.compactMap { ctx.values[$0] }
+                let b = IRBuilder(ctx: ctx, nodeId: nodeId)
+                let freq = try b.readInput(node, inputs, at: 0)
+                let sampleRate = b.constant(g.sampleRate)
+                let frameIdxExpr = b.value(frameIdx.lazy)
+
+                let phaseIncrement = freq / sampleRate
+                let rawPhase = phaseIncrement * frameIdxExpr
+                let phase = rawPhase - b.floor(rawPhase)
+
+                try b.writeOutput(node, phase)
+                ctx.values[nodeId] = phase.lazy
+                uops.append(contentsOf: b.ops)
+            } else {
+                for uop in try node.op.emit(ctx: ctx, g: g, nodeId: nodeId) {
+                    uops.append(uop)
+                }
+            }
+
+            // If this node feeds the reduction, write its value to scratch immediately
+            if let reductionInputId, nodeId == reductionInputId,
+                let scratch = ctx.frameTensorChainScratch[chain.reductionNodeId],
+                let tensorId = g.nodeToTensor[reductionInputId],
+                let tensor = g.tensors[tensorId]
+            {
+                let writer = IRBuilder(ctx: ctx, nodeId: chain.reductionNodeId)
+                let frameIdxExpr = writer.value(frameIdx.lazy)
+                let binIdxExpr = writer.value(binIdx.lazy)
+                let offset =
+                    frameIdxExpr * writer.constant(Float(scratch.tensorSize)) + binIdxExpr
+                let val = writer.tload(tensor.cellId, binIdxExpr)
+                _ = writer.memoryWrite(scratch.cellId, writer.cast(offset, to: .int), val)
+                uops.append(contentsOf: writer.ops)
+            }
+        }
+    }
+
+    // Restore outbound tensor tracking
+    ctx.outboundTensorCells = savedOutbound
+
+    return uops
+}
+
 public func emitBlockUOps(
-    ctx: IRContext, block: Block, blocks: [Block], g: Graph, debug: Bool = false
+    ctx: IRContext, block: Block, blocks: [Block], g: Graph, backend: Backend = .metal, debug: Bool = false
 ) throws -> [UOp] {
     var emittedNodes: Set<NodeID> = []
     var bodyUops: [UOp] = []
@@ -1067,20 +1229,20 @@ public func emitBlockUOps(
     ctx.clearTensorRegisters()
 
     // Step 1: Emit all node UOps first (without wrapping in parallelRange yet)
-    for nodeId in block.nodes {
-        if let tensorIndex = block.tensorIndex {
-            ctx.tensorIndices[nodeId] = tensorIndex
-        }
+    if let chain = block.frameTensorChain,
+        block.tensorIndex == nil,
+        ctx.frameTensorChainScratch[chain.reductionNodeId] != nil
+    {
+        bodyUops = try emitFrameTensorChainBlock(ctx: ctx, chain: chain, block: block, g: g)
+        emittedNodes = Set(block.nodes)
+    } else {
+        for nodeId in block.nodes {
+            if let tensorIndex = block.tensorIndex {
+                ctx.tensorIndices[nodeId] = tensorIndex
+            }
 
-        if let node = g.nodes[nodeId] {
-            if case .forward = block.direction {
+            if let node = g.nodes[nodeId] {
                 for uop in try node.op.emit(ctx: ctx, g: g, nodeId: nodeId) {
-                    emittedNodes.insert(nodeId)
-                    bodyUops.append(uop)
-                }
-            } else {
-                let back = try node.op.emitBackward(ctx: ctx, g: g, nodeId: nodeId)
-                for uop in back {
                     emittedNodes.insert(nodeId)
                     bodyUops.append(uop)
                 }
@@ -1088,9 +1250,15 @@ public func emitBlockUOps(
         }
     }
 
+    // Emit marker for frame-tensor chain blocks (SIMD-across-frames optimization)
+    // Used for debugging kernels
+    if let chain = block.frameTensorChain {
+        bodyUops.insert(UOp(op: .frameTensorChainMarker(chain.tensorShape), value: .empty), at: 0)
+    }
+
     // Step 2: Analyze emitted UOps to determine if SIMD is safe
     // SIMD is safe if: tensor block + size divisible by 4 + no SIMD blockers + not frame-based
-    let hasSIMDBlockers = containsSIMDBlockers(bodyUops)
+    let hasSIMDBlockers = containsSIMDBlockers(bodyUops, backend: backend)
     let canUseSIMD: Bool
     let simdIncrement: Int
 

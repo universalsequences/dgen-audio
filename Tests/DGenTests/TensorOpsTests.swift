@@ -3464,4 +3464,95 @@ final class CTensorOpsTests: XCTestCase {
                 XCTAssertGreaterThan(output[10], 0, "Peek should return non-zero from phasor tensor")
         }
 
+        // MARK: - Static to FrameBased Tests
+
+        func testStaticMatmulIntoFrameBasedPeek() throws {
+                // Test that static tensor operations (matmul) correctly flow into frame-based operations
+                // This verifies that:
+                // 1. Static blocks compute correctly (matmul on constant data)
+                // 2. Static -> frameBased boundary works (result read by frame-based op)
+                // 3. Tape buffer is properly included for static blocks
+                // 4. defineGlobal/loadGlobal don't cause duplicate variable definitions
+                let g = Graph()
+
+                // Static: matmul [1,4] x [4,1] -> [1,1] = scalar
+                // Result: 1*0.5 + 2*0.5 + 3*0.5 + 4*0.5 = 5.0
+                let weights = g.tensor(shape: [1, 4], data: [1.0, 2.0, 3.0, 4.0])
+                let bias = g.tensor(shape: [4, 1], data: [0.5, 0.5, 0.5, 0.5])
+                let matmulResult = try g.matmul(weights, bias)  // [1, 1] = [[5.0]]
+
+                // Sum to get scalar (still static)
+                let summed = g.n(.sum, matmulResult)  // 5.0
+
+                // Frame-based: use audio input to modulate the static result
+                // This forces a static -> frameBased boundary
+                let inputNode = g.n(.input(0))  // Frame-varying input
+                let one = g.n(.constant(1.0))
+                let scaledInput = g.n(.add, inputNode, one)  // input + 1 (so we get non-zero even with zero input)
+
+                // Multiply static matmul result by frame-based input
+                let output = g.n(.mul, summed, scaledInput)  // 5.0 * (input + 1)
+
+                _ = g.n(.output(0), output)
+
+                let frameCount = 64
+
+                // Compile with C backend
+                let cResult = try CompilationPipeline.compile(
+                        graph: g,
+                        backend: .c,
+                        options: .init(frameCount: frameCount, debug: true)
+                )
+
+                print("=== Static Matmul into FrameBased - Generated Source ===")
+                print(cResult.source)
+
+                // Create runtime
+                let cRuntime = CCompiledKernel(
+                        source: cResult.source,
+                        cellAllocations: cResult.cellAllocations,
+                        memorySize: cResult.totalMemorySlots
+                )
+                try cRuntime.compileAndLoad()
+
+                guard let mem = cRuntime.allocateNodeMemory() else {
+                        XCTFail("Failed to allocate memory")
+                        return
+                }
+                defer { cRuntime.deallocateNodeMemory(mem) }
+
+                injectTensorData(result: cResult, memory: mem.assumingMemoryBound(to: Float.self))
+
+                var output_ = [Float](repeating: 0, count: frameCount)
+                // Input that varies: 0, 0.1, 0.2, ... (representing audio samples)
+                var input = (0..<frameCount).map { Float($0) * 0.1 }
+
+                output_.withUnsafeMutableBufferPointer { outPtr in
+                        input.withUnsafeMutableBufferPointer { inPtr in
+                                cRuntime.runWithMemory(
+                                        outputs: outPtr.baseAddress!,
+                                        inputs: inPtr.baseAddress!,
+                                        memory: mem,
+                                        frameCount: frameCount
+                                )
+                        }
+                }
+
+                print("=== Static -> FrameBased Results ===")
+                print("First 10 outputs: \(Array(output_.prefix(10)))")
+                print("Input was: \(Array(input.prefix(10)))")
+
+                // At frame 0: output = 5.0 * (0.0 + 1.0) = 5.0
+                XCTAssertEqual(output_[0], 5.0, accuracy: 0.01, "Frame 0: 5.0 * (0+1) = 5.0")
+
+                // At frame 10: output = 5.0 * (1.0 + 1.0) = 10.0
+                XCTAssertEqual(output_[10], 10.0, accuracy: 0.01, "Frame 10: 5.0 * (1.0+1) = 10.0")
+
+                // At frame 20: output = 5.0 * (2.0 + 1.0) = 15.0
+                XCTAssertEqual(output_[20], 15.0, accuracy: 0.01, "Frame 20: 5.0 * (2.0+1) = 15.0")
+
+                // Verify output increases (frame-based modulation working)
+                XCTAssertGreaterThan(output_[10], output_[0], "Output should increase with input")
+        }
+
 }

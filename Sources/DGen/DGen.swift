@@ -1,96 +1,5 @@
 import Foundation
 
-public class IRContext {
-    public var g: Graph
-    private var varIdx = 0
-    private var gradIdx = 0
-    private var constantIdx = 0
-
-    // Maps node ids to what the current "index" is for tensor-based computation
-    // E.g we are on the 2nd element in tensor in a loop
-    public var tensorIndices: [NodeID: Lazy] = [:]
-
-    // Maximum gradient ID allocated (for buffer sizing)
-    public var maxGradId: Int { return gradIdx }
-    // Reuse constant IDs for identical values to reduce duplicate vdupq constants
-    private var constantIdByValue: [Float: ConstantID] = [:]
-
-    // Tensor register optimization:
-    // - outboundTensorCells: tensor cells that must be written to memory (needed by later blocks)
-    // - tensorCellToVar: maps cell IDs to computed Lazy values (register variables) within current block
-    // This allows intermediate tensor values to stay in registers instead of going through memory.
-    public var outboundTensorCells: Set<CellID> = []
-    public var tensorCellToVar: [CellID: Lazy] = [:]
-
-    /// Clear tensor register tracking (call at start of each tensor block)
-    public func clearTensorRegisters() {
-        tensorCellToVar = [:]
-    }
-
-    public init(g: Graph) {
-        self.g = g
-    }
-
-    // Use Array instead of Set to maintain stable ordering for tape slot assignment
-    public var globals: [VarID] = []
-
-    // map of nodeId -> Lazy value (variable or constant)
-    public var values: [NodeID: Lazy] = [:]
-    public var gradients: [NodeID: GradID] = [:]
-    public var constants: [ConstantID: Float] = [:]
-    public var variables: [VarID: NodeID] = [:]
-    public var tapeIndex: [NodeID: Int] = [:]
-    public var seedGradients: [GradID] = []
-
-    public func getGlobalId(_ varId: VarID) -> Int {
-        if let index = globals.firstIndex(of: varId) {
-            return index
-        }
-        return 0
-    }
-
-    public func useConstant(src: NodeID?, value: Float) -> Lazy {
-        if let existing = constantIdByValue[value] {
-            let constant = Lazy.constant(existing, value)
-            if let srcId = src { self.values[srcId] = constant }
-            return constant
-        }
-
-        let constantId = self.constantIdx + 1
-        self.constantIdx = constantId
-        self.constants[constantId] = value
-        constantIdByValue[value] = constantId
-
-        let constant = Lazy.constant(constantId, value)
-        if let srcId = src { self.values[srcId] = constant }
-        return constant
-    }
-
-    public func useGradient(src: NodeID, seed: Bool = false) -> GradID {
-        if let gradId = self.gradients[src] {
-            return gradId
-        }
-        let gradId = self.gradIdx + 1
-        self.gradIdx = gradId
-        self.gradients[src] = gradId
-        if seed {
-            self.seedGradients.append(gradId)
-        }
-        return gradId
-    }
-
-    public func useVariable(src: NodeID?, trackInValues: Bool = true) -> Lazy {
-        let varId = self.varIdx + 1
-        self.varIdx = varId
-        let variable = Lazy.variable(varId, src)
-        if let srcNodeId = src, trackInValues {
-            self.values[srcNodeId] = variable
-            self.variables[varId] = srcNodeId
-        }
-        return variable
-    }
-}
-
 public struct Node {
     public let id: NodeID
     public var op: LazyOp
@@ -116,7 +25,31 @@ open class Graph {
     /// Track allocation sizes for memory cells (especially large buffers like spectral scratch)
     public var cellAllocationSizes: [CellID: Int] = [:]
 
+    /// Tracks hop-based update rate for nodes (hopSize, counterCell)
+    /// Used for FFT/IFFT nodes and operations that inherit hop-based temporality
+    public var nodeHopRate: [NodeID: (Int, CellID)] = [:]
+
+    /// Sample rate for audio processing (default 44100 Hz)
+    public var sampleRate: Float = 44100.0
+
+    /// Mapping from history cell IDs to gradient carry cell IDs.
+    /// Used for temporal gradient flow through historyRead/historyWrite.
+    public var gradCarryCells: [CellID: CellID] = [:]
+    public var tensorGradCells: [NodeID: CellID] = [:]
+
+    /// Side-effect nodes created during backward pass (e.g., gradient carry writes)
+    /// These need to be chained with gradient outputs to ensure they execute.
+    public var gradientSideEffects: [NodeID] = []
+
+    /// Last node ID before gradient nodes were added.
+    /// Used to separate forward and gradient node ordering during compilation.
+    public var lastForwardNodeId: NodeID?
+
     public init() {}
+
+    public init(sampleRate: Float) {
+        self.sampleRate = sampleRate
+    }
 
     /// Returns the total number of allocated memory cells
     public var totalMemoryCells: Int { nextCellId }
@@ -202,7 +135,7 @@ open class Graph {
 extension Lazy {
     public var varId: VarID? {
         switch self {
-        case let .variable(id, _):
+        case .variable(let id, _):
             return id
         default:
             return nil
@@ -213,29 +146,29 @@ extension Lazy {
 extension Op {
     public var operands: [Lazy] {
         switch self {
-        case let .add(a, b):
+        case .add(let a, let b):
             return [a, b]
-        case let .mul(a, b):
+        case .mul(let a, let b):
             return [a, b]
-        case let .sub(a, b):
+        case .sub(let a, let b):
             return [a, b]
-        case let .div(a, b):
+        case .div(let a, let b):
             return [a, b]
-        case let .abs(a):
+        case .abs(let a):
             return [a]
-        case let .sign(a):
+        case .sign(let a):
             return [a]
-        case let .gt(a, b):
+        case .gt(let a, let b):
             return [a, b]
-        case let .lt(a, b):
+        case .lt(let a, let b):
             return [a, b]
-        case let .store(_, b):
+        case .store(_, let b):
             return [b]
         case .load(_):
             return []
-        case let .beginIf(a):
+        case .beginIf(let a):
             return [a]
-        case let .mutate(a, b):
+        case .mutate(let a, let b):
             return [a, b]
         default:
             return []

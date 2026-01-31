@@ -22,6 +22,8 @@ public enum Op {
   case storeGradMemory(CellID, Lazy)
   case accumulateGrad(GradID, Lazy)
   case loadGrad(GradID)
+  case loadTensorGrad(GradID, Lazy)  // Load gradient at baseGradId + index
+  case accumulateTensorGrad(GradID, Lazy, Lazy)  // Accumulate to baseGradId + index
   case mse(Lazy, Lazy)
   case mutate(Lazy, Lazy)
   case add(Lazy, Lazy)
@@ -57,6 +59,7 @@ public enum Op {
   case noise(CellID)
   case memoryRead(CellID, Lazy)
   case memoryWrite(CellID, Lazy, Lazy)
+  case memoryAccumulate(CellID, Lazy, Lazy)  // Atomic add to memory cell
   case latch(Lazy, Lazy)
   case beginIf(Lazy)
   case gswitch(Lazy, Lazy, Lazy)
@@ -74,6 +77,8 @@ public enum Op {
   case beginParallelRange(Int, Int)  // count - iterations are independent, can be parallelized
   case endParallelRange
   case parallelIndex  // current index within parallel range
+  case setThreadCountScale(Int)  // dispatch threads = frameCount * scale
+  case setFrameIndex(Lazy)        // override frame index used for outputs/gradients
   case output(ChannelNumber, Lazy)
   case input(ChannelNumber)
 
@@ -93,6 +98,54 @@ public enum Op {
   case pad([(Int, Int)])      // View op: pad with zeros - renders to nothing but prevents SIMD
   case broadcastAccess  // Marker: broadcast indexing used - renders to nothing but prevents SIMD
   case requiresScalar   // Marker: stateful accumulation requires scalar (sample-by-sample) execution
+
+  // Hop-based execution control (for FFT/spectral processing)
+  case beginHopCheck(CellID)  // if (memory[counterCell] == 0.0f) { - runs block only when counter is 0
+  case endHopCheck            // } - closes the hop check conditional
+
+  // Local tensor operations for SIMD-across-frames optimization
+  // These enable thread-local tensor storage for frame-dependent tensor chains
+  case declareLocalTensor(VarID, Int)        // float localT<id>[size] - thread-local array
+  case localTensorRead(VarID, Lazy)          // localT<id>[idx] - read from local tensor
+  case localTensorWrite(VarID, Lazy, Lazy)   // localT<id>[idx] = val - write to local tensor
+  case beginInlineLoop(Lazy, Int)            // for (int j = 0; j < count; j++) - non-parallel loop
+  case endInlineLoop                         // } - closes inline loop
+
+  // Marker for SIMD-across-frames optimization (frame-tensor chain detected)
+  case frameTensorChainMarker([Int])         // Marks block as frame-tensor chain with tensor shape
+
+  public var isDefineGlobal: Bool {
+    if case .defineGlobal = self { return true }
+    return false
+  }
+
+  /// Returns the memory cell ID if this operation accesses memory, nil otherwise.
+  public var memoryCellId: CellID? {
+    switch self {
+    case .load(let cellId), .store(let cellId, _), .delay1(let cellId, _),
+         .memoryRead(let cellId, _), .memoryWrite(let cellId, _, _),
+         .memoryAccumulate(let cellId, _, _):
+      return cellId
+    default:
+      return nil
+    }
+  }
+
+  /// Returns a new Op with the cell ID remapped, or nil if no remapping is needed.
+  public func withRemappedCellId(_ remapping: [CellID: CellID]) -> Op? {
+    guard let cellId = memoryCellId, let newCellId = remapping[cellId] else {
+      return nil
+    }
+    switch self {
+    case .load: return .load(newCellId)
+    case .store(_, let val): return .store(newCellId, val)
+    case .delay1(_, let a): return .delay1(newCellId, a)
+    case .memoryRead(_, let offset): return .memoryRead(newCellId, offset)
+    case .memoryWrite(_, let offset, let value): return .memoryWrite(newCellId, offset, value)
+    case .memoryAccumulate(_, let offset, let value): return .memoryAccumulate(newCellId, offset, value)
+    default: return nil
+    }
+  }
 }
 
 public struct UOp {

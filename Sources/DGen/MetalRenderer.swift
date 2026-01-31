@@ -4,6 +4,16 @@ public class MetalRenderer: Renderer, UOpEmitter {
   let memoryVarID = -1  // Virtual ID for the global memory buffer
   var needsSegmenting = false
   var parallelRangeVars: Set<VarID> = []  // Track parallel range loop variable IDs
+  var currentTemporality: Temporality = .frameBased  // Track temporality for gradient indexing
+  var frameIndexOverride: String? = nil
+  private enum ParallelRangeMode {
+    case loop      // Render as a for-loop (default)
+    case thread    // Render as a single-thread index (thread-parallel kernel)
+  }
+  private var parallelRangeMode: ParallelRangeMode = .loop
+  private var useReducedGradsSum = false
+  private var staticGlobalVars: Set<VarID> = []
+  private var currentThreadCountScale: Int? = nil
 
   public override init() {
   }
@@ -15,16 +25,51 @@ public class MetalRenderer: Renderer, UOpEmitter {
     totalMemorySlots: Int,
     name: String = "kernel"
   ) -> [CompiledKernel] {
-    return scheduleItems.enumerated().map { (i, scheduleItem) in
+    staticGlobalVars.removeAll()
+    for item in scheduleItems {
+      guard item.temporality == .static_ else { continue }
+      for uop in item.ops {
+        if case let .defineGlobal(varId) = uop.op {
+          staticGlobalVars.insert(varId)
+        }
+      }
+    }
+
+    let expanded = scheduleItems.flatMap { item in
+      if item.parallelPolicy == .threadParallel {
+        return splitStaticParallelRanges(item)
+      }
+      return [SplitScheduleItem(item: item, threadCount: nil)]
+    }
+    let filtered = expanded.filter { !isNoOpStaticKernel($0.item, ctx: ctx) }
+    let fused = fuseStaticThreadParallel(filtered)
+
+    return fused.enumerated().map { (i, entry) in
+      let scheduleItem = entry.item
+      let parallelCount = entry.threadCount
+
       // Always use _0, _1 suffix to avoid 'kernel' being a reserved word in Metal
       let kernelName = "\(name)_\(i)"
+
+      let bufferRequirements = analyzeRequiredBuffers(scheduleItem: scheduleItem)
+      let hasGradWrites = scheduleItem.ops.contains { uop in
+        if case .accumulateGrad = uop.op { return true }
+        if case .accumulateTensorGrad = uop.op { return true }
+        return false
+      }
+      let useReduced = bufferRequirements.needsReducedGradsSum && !hasGradWrites
+      useReducedGradsSum = useReduced
+
+      // Render parallelRange loops as thread-parallel only for split static kernels
+      parallelRangeMode = parallelCount == nil ? .loop : .thread
       let source = render(
         name: kernelName, scheduleItem: scheduleItem, ctx: ctx, graph: graph,
         totalMemorySlots: totalMemorySlots)
+      parallelRangeMode = .loop
+      useReducedGradsSum = false
+
       let deps = analyzeDependencies(scheduleItem: scheduleItem, ctx: ctx)
       let allBuffers = Set(deps.inputs + deps.outputs)
-
-      let bufferRequirements = analyzeRequiredBuffers(scheduleItem: scheduleItem)
 
       var bufferNames: [String] = []
       if bufferRequirements.hasOutputOps {
@@ -68,15 +113,243 @@ public class MetalRenderer: Renderer, UOpEmitter {
         bufferNames.append("gradients")
       }
 
+      if bufferRequirements.needsReducedGradsSum {
+        if useReduced {
+          bufferNames.append("reducedGradsSum")
+        }
+      }
+
+      let threadGroupSize: Int? =
+        (scheduleItem.kind == .scalar && parallelCount == nil) ? 1 : nil
+
       return CompiledKernel(
         name: kernelName,
         source: source,
         kind: scheduleItem.kind,
         buffers: bufferNames,
-        threadGroupSize: scheduleItem.kind == .scalar ? 1 : nil,
+        threadGroupSize: threadGroupSize,
+        threadCount: parallelCount,
+        threadCountScale: scheduleItem.threadCountScale,
+        needsReducedGradsSum: useReduced,
         memorySize: max(totalMemorySlots, 1024)  // Match memory size calculation from render method
       )
     }
+  }
+
+  private struct SplitScheduleItem {
+    let item: ScheduleItem
+    let threadCount: Int?
+  }
+
+  private func splitStaticParallelRanges(_ scheduleItem: ScheduleItem) -> [SplitScheduleItem] {
+    guard scheduleItem.temporality == .static_, scheduleItem.kind == .scalar else {
+      return [SplitScheduleItem(item: scheduleItem, threadCount: nil)]
+    }
+
+    let ops = scheduleItem.ops
+    guard let beginRangeIdx = ops.firstIndex(where: {
+      if case .beginRange = $0.op { return true }
+      return false
+    }),
+      let endRangeIdx = ops.lastIndex(where: {
+        if case .endRange = $0.op { return true }
+        return false
+      }),
+      beginRangeIdx < endRangeIdx
+    else {
+      return [SplitScheduleItem(item: scheduleItem, threadCount: nil)]
+    }
+
+    let prefixOps = Array(ops[0..<beginRangeIdx])
+    let coreOps = Array(ops[(beginRangeIdx + 1)..<endRangeIdx])
+
+    var segments: [(ops: [UOp], parallelCount: Int?)] = []
+    var current: [UOp] = []
+    var parallelDepth = 0
+    var currentParallelCount: Int? = nil
+
+    for op in coreOps {
+      switch op.op {
+      case let .beginParallelRange(count, _):
+        if parallelDepth == 0 {
+          if !current.isEmpty {
+            segments.append((ops: current, parallelCount: nil))
+            current.removeAll(keepingCapacity: true)
+          }
+          currentParallelCount = count
+        }
+        parallelDepth += 1
+        current.append(op)
+      case .endParallelRange:
+        current.append(op)
+        parallelDepth -= 1
+        if parallelDepth == 0 {
+          segments.append((ops: current, parallelCount: currentParallelCount))
+          current.removeAll(keepingCapacity: true)
+          currentParallelCount = nil
+        }
+      default:
+        current.append(op)
+      }
+    }
+
+    // Unbalanced parallel range - fall back to original kernel
+    if parallelDepth != 0 {
+      return [SplitScheduleItem(item: scheduleItem, threadCount: nil)]
+    }
+    if !current.isEmpty {
+      segments.append((ops: current, parallelCount: nil))
+    }
+
+    let hasParallel = segments.contains { $0.parallelCount != nil }
+    guard hasParallel else {
+      return [SplitScheduleItem(item: scheduleItem, threadCount: nil)]
+    }
+
+    let beginRangeOp = ops[beginRangeIdx]
+    let endRangeOp = ops[endRangeIdx]
+
+    var splitItems: [SplitScheduleItem] = []
+    for segment in segments {
+      if segment.ops.isEmpty { continue }
+      let item = ScheduleItem(kind: scheduleItem.kind, temporality: scheduleItem.temporality)
+      item.threadCountScale = scheduleItem.threadCountScale
+      item.ops.append(contentsOf: prefixOps)
+      if segment.parallelCount == nil {
+        item.ops.append(beginRangeOp)
+      }
+      item.ops.append(contentsOf: segment.ops)
+      if segment.parallelCount == nil {
+        item.ops.append(endRangeOp)
+      }
+      splitItems.append(SplitScheduleItem(item: item, threadCount: segment.parallelCount))
+    }
+
+    return splitItems.isEmpty
+      ? [SplitScheduleItem(item: scheduleItem, threadCount: nil)]
+      : splitItems
+  }
+
+  private func isNoOpStaticKernel(_ scheduleItem: ScheduleItem, ctx: IRContext) -> Bool {
+    guard scheduleItem.temporality == .static_ else { return false }
+    return !kernelHasSideEffects(scheduleItem, ctx: ctx)
+  }
+
+  private func kernelHasSideEffects(_ scheduleItem: ScheduleItem, ctx: IRContext) -> Bool {
+    for uop in scheduleItem.ops {
+      switch uop.op {
+      case .memoryWrite, .memoryAccumulate, .store, .delay1, .output,
+        .accumulateGrad, .accumulateTensorGrad, .storeGradMemory:
+        return true
+      case .beginRange, .endRange, .beginLoop, .endLoop,
+        .beginForLoop, .beginParallelRange, .endParallelRange,
+        .beginIf, .endIf, .frameCount:
+        break
+      case .defineGlobal:
+        // Only a definition, not a write
+        break
+      default:
+        break
+      }
+
+      switch uop.value {
+      case .variable(let varId, _):
+        if ctx.globals.contains(varId) {
+          return true
+        }
+      case .global(let varId):
+        if ctx.globals.contains(varId) {
+          return true
+        }
+      default:
+        break
+      }
+    }
+    return false
+  }
+
+  private struct KernelAccessInfo {
+    var reads: Set<CellID> = []
+    var writes: Set<CellID> = []
+    var readsGlobals: Bool = false
+    var writesGlobals: Bool = false
+    var usesGradMemory: Bool = false
+  }
+
+  private func kernelAccessInfo(_ scheduleItem: ScheduleItem) -> KernelAccessInfo {
+    var info = KernelAccessInfo()
+    for uop in scheduleItem.ops {
+      switch uop.op {
+      case let .memoryRead(base, _):
+        info.reads.insert(base)
+      case let .memoryWrite(base, _, _):
+        info.writes.insert(base)
+      case let .load(cellId):
+        info.reads.insert(cellId)
+      case let .store(cellId, _):
+        info.writes.insert(cellId)
+      case let .delay1(cellId, _):
+        info.reads.insert(cellId)
+        info.writes.insert(cellId)
+      case .loadGradMemory:
+        info.usesGradMemory = true
+      case .storeGradMemory:
+        info.usesGradMemory = true
+      case .defineGlobal:
+        info.writesGlobals = true
+      case .loadGlobal:
+        info.readsGlobals = true
+      default:
+        break
+      }
+    }
+    return info
+  }
+
+  private func canFuseStaticThreadParallel(_ a: SplitScheduleItem, _ b: SplitScheduleItem)
+    -> Bool
+  {
+    guard let countA = a.threadCount, let countB = b.threadCount, countA == countB else {
+      return false
+    }
+    if a.item.threadCountScale != b.item.threadCountScale { return false }
+    guard a.item.temporality == .static_, b.item.temporality == .static_ else { return false }
+    guard a.item.kind == .scalar, b.item.kind == .scalar else { return false }
+
+    let accA = kernelAccessInfo(a.item)
+    let accB = kernelAccessInfo(b.item)
+
+    if accA.usesGradMemory || accB.usesGradMemory { return false }
+
+    // If the first kernel writes globals, don't fuse if the next reads/writes globals.
+    if accA.writesGlobals && (accB.readsGlobals || accB.writesGlobals) { return false }
+
+    // Conservative: avoid fusing if the first kernel writes to any base
+    // that the second kernel reads or writes.
+    if !accA.writes.isDisjoint(with: accB.reads) { return false }
+    if !accA.writes.isDisjoint(with: accB.writes) { return false }
+
+    return true
+  }
+
+  private func fuseStaticThreadParallel(_ items: [SplitScheduleItem]) -> [SplitScheduleItem] {
+    guard !items.isEmpty else { return [] }
+    var fused: [SplitScheduleItem] = []
+    var current = items[0]
+
+    for next in items.dropFirst() {
+      if canFuseStaticThreadParallel(current, next) {
+        let merged = ScheduleItem(kind: current.item.kind, temporality: current.item.temporality)
+        merged.ops.append(contentsOf: current.item.ops)
+        merged.ops.append(contentsOf: next.item.ops)
+        current = SplitScheduleItem(item: merged, threadCount: current.threadCount)
+      } else {
+        fused.append(current)
+        current = next
+      }
+    }
+    fused.append(current)
+    return fused
   }
 
   public override func prepareSchedule(
@@ -85,75 +358,103 @@ public class MetalRenderer: Renderer, UOpEmitter {
     _ ctx: IRContext,
     _ frameCount: Int
   ) {
-    // Define frameCount UOp for Metal kernels
-    let frameCountUOp = Lazy.variable(-1, nil)  // Special variable ID for frameCount
+    let frameCountUOp = Lazy.variable(-1, nil)
 
-    // Group adjacent blocks of the same kind into a single kernel.
-    // This is critical for correctness when operations need to see per-frame
-    // state (e.g., history read followed by sum must happen within the same frame loop).
     var currentSchedule: ScheduleItem? = nil
     var currentKind: Kind? = nil
+    var currentTemporality: Temporality? = nil
+    var currentPolicy: ParallelPolicy? = nil
+    var currentThreadCountScale: Int? = nil
     var loopOpened = false
+    var hasFrameLoop = false
+
+    func closeCurrentKernel() {
+      guard let schedule = currentSchedule, loopOpened else { return }
+      if hasFrameLoop && currentKind == .scalar {
+        schedule.ops.append(UOp(op: .endLoop, value: .empty))
+      }
+      schedule.ops.append(UOp(op: .endRange, value: .empty))
+      scheduleItems.append(schedule)
+    }
+
+    func scaledFrameCount(_ scale: Int?, _ schedule: ScheduleItem) -> Lazy {
+      guard let scale, scale != 1 else { return frameCountUOp }
+      let scaleConst = ctx.useConstant(src: nil, value: Float(scale))
+      let dest = ctx.useVariable(src: nil, trackInValues: false)
+      schedule.ops.append(UOp(op: .mul(frameCountUOp, scaleConst), value: dest))
+      return dest
+    }
+
+    func blockHasGradMemoryCalls(_ block: BlockUOps) -> Bool {
+      return block.ops.contains { uop in
+        switch uop.op {
+        case .storeGradMemory, .loadGradMemory:
+          return true
+        default:
+          return false
+        }
+      }
+    }
 
     for block in uopBlocks {
-      // Check if we need to start a new kernel (different block kind)
-      if currentKind != block.kind {
-        // Close previous kernel if open
-        if let schedule = currentSchedule {
-          if loopOpened {
-            if currentKind == .scalar {
-              schedule.ops.append(UOp(op: .endLoop, value: .empty))
-            }
-            schedule.ops.append(UOp(op: .endRange, value: .empty))
-          }
-          scheduleItems.append(schedule)
-        }
+      let needsNewKernel = currentKind != block.kind
+        || currentTemporality != block.temporality
+        || currentPolicy != block.parallelPolicy
+        || currentThreadCountScale != block.threadCountScale
+        || block.forceNewKernel
 
-        // Start new kernel
-        let scheduleItem = ScheduleItem(kind: block.kind)
+      if needsNewKernel {
+        closeCurrentKernel()
+
+        let scheduleItem = ScheduleItem(kind: block.kind, temporality: block.temporality)
+        scheduleItem.parallelPolicy = block.parallelPolicy
+        scheduleItem.threadCountScale = block.threadCountScale
         scheduleItem.ops.append(UOp(op: .frameCount, value: .empty))
 
-        // Extract defineGlobals early
         for uop in block.ops {
           if case .defineGlobal = uop.op {
             scheduleItem.ops.append(uop)
           }
         }
 
-        if block.kind == .scalar {
-          // Scalar kernels: only thread 0 executes, then loops through frameCount
-          var beginRange = UOp(
-            op: .beginRange(.constant(0, 0), .constant(0, 1)), value: .empty)
+        let isStaticScalar = block.temporality == .static_ && block.kind == .scalar
+        let isScalar = block.kind == .scalar
+
+        if isStaticScalar {
+          // Static scalar blocks: run once, no frame loop needed
+          var beginRange = UOp(op: .beginRange(.constant(0, 0), .constant(0, 1)), value: .empty)
+          beginRange.kind = block.kind
+          scheduleItem.ops.append(beginRange)
+          hasFrameLoop = false
+        } else if isScalar {
+          // Scalar kernels: thread 0 loops through frameCount
+          var beginRange = UOp(op: .beginRange(.constant(0, 0), .constant(0, 1)), value: .empty)
           beginRange.kind = block.kind
           scheduleItem.ops.append(beginRange)
 
-          var hasGradMemoryCalls = false
-          for n in block.ops {
-            if case .storeGradMemory(_, _) = n.op {
-              hasGradMemoryCalls = true
-              break
-            } else if case .loadGradMemory(_) = n.op {
-              hasGradMemoryCalls = true
-              break
-            }
-          }
-          let incr = hasGradMemoryCalls ? -1 : 1
-          var beginLoop = UOp(op: .beginLoop(frameCountUOp, incr), value: .empty)
+          let incr = blockHasGradMemoryCalls(block) ? -1 : 1
+          let loopCount = scaledFrameCount(block.threadCountScale, scheduleItem)
+          var beginLoop = UOp(op: .beginLoop(loopCount, incr), value: .empty)
           beginLoop.kind = block.kind
           scheduleItem.ops.append(beginLoop)
+          hasFrameLoop = true
         } else {
-          // SIMD kernels: each thread processes one frame, bound by frameCount
-          var beginRange = UOp(op: .beginRange(.constant(0, 0), frameCountUOp), value: .empty)
+          // SIMD kernels: each thread processes one frame
+          let rangeEnd = scaledFrameCount(block.threadCountScale, scheduleItem)
+          var beginRange = UOp(op: .beginRange(.constant(0, 0), rangeEnd), value: .empty)
           beginRange.kind = block.kind
           scheduleItem.ops.append(beginRange)
+          hasFrameLoop = true
         }
 
         currentSchedule = scheduleItem
         currentKind = block.kind
+        currentTemporality = block.temporality
+        currentPolicy = block.parallelPolicy
+        currentThreadCountScale = block.threadCountScale
         loopOpened = true
       }
 
-      // Add this block's ops to the current kernel (within the existing frame loop)
       if let schedule = currentSchedule {
         for uop in block.ops {
           if case .defineGlobal = uop.op { continue }
@@ -164,16 +465,7 @@ public class MetalRenderer: Renderer, UOpEmitter {
       }
     }
 
-    // Close the last kernel
-    if let schedule = currentSchedule {
-      if loopOpened {
-        if currentKind == .scalar {
-          schedule.ops.append(UOp(op: .endLoop, value: .empty))
-        }
-        schedule.ops.append(UOp(op: .endRange, value: .empty))
-      }
-      scheduleItems.append(schedule)
-    }
+    closeCurrentKernel()
   }
 
   public override func render(
@@ -182,12 +474,10 @@ public class MetalRenderer: Renderer, UOpEmitter {
   ) -> String {
     var kernels = ""
     parallelRangeVars.removeAll()  // Reset parallel range tracking for new kernel
-    var (inputs, outputs) = analyzeDependencies(scheduleItem: scheduleItem, ctx: ctx)
-
-    let hasOutputOps = scheduleItem.ops.contains { uop in
-      if case .output = uop.op { return true }
-      return false
-    }
+    frameIndexOverride = nil
+    currentThreadCountScale = scheduleItem.threadCountScale
+    currentTemporality = scheduleItem.temporality  // Set temporality for gradient indexing
+    let (inputs, outputs) = analyzeDependencies(scheduleItem: scheduleItem, ctx: ctx)
 
     let allBuffers = Set(inputs + outputs)
 
@@ -244,6 +534,11 @@ public class MetalRenderer: Renderer, UOpEmitter {
       bufferIndex += 1
     }
 
+    if bufferRequirements.needsReducedGradsSum {
+      parameters.append("    device float *reducedGradsSum [[buffer(\(bufferIndex))]]")
+      bufferIndex += 1
+    }
+
     parameters.append("    uint id [[thread_position_in_grid]]")
     if bufferRequirements.needsSegmenting {
       parameters.append("    uint tid [[thread_index_in_threadgroup]]")
@@ -266,6 +561,11 @@ public class MetalRenderer: Renderer, UOpEmitter {
     }
 
     self.needsSegmenting = bufferRequirements.needsSegmenting
+
+    // For static blocks, define i=0 since there's no frame loop
+    if case .static_ = currentTemporality {
+      kernels += "  uint i = 0; // Static block - no frame loop\n"
+    }
 
     for uop in scheduleItem.ops {
       var diff = 0
@@ -296,13 +596,36 @@ public class MetalRenderer: Renderer, UOpEmitter {
     var outputs: Set<VarID> = []
     var needsMemory = false
 
+    // Helper to check if a Lazy value contains a global reference
+    func checkLazyForGlobal(_ lazy: Lazy) {
+      switch lazy {
+      case let .global(id):
+        // Global values need the tape buffer
+        inputs.insert(id)
+        outputs.insert(id)
+      case let .variable(id, _):
+        // Check if this variable is a global in the context
+        if ctx.globals.contains(id) {
+          inputs.insert(id)
+          outputs.insert(id)
+        }
+      default:
+        break
+      }
+    }
+
     for uop in scheduleItem.ops {
+      // Check the uop's value for global references
+      checkLazyForGlobal(uop.value)
+
       switch uop.op {
       case let .defineGlobal(varId):
         outputs.insert(varId)
       case let .loadGlobal(varId):
         inputs.insert(varId)
-      case .load, .store, .delay1, .memoryRead, .memoryWrite:
+      case let .loadTape(val, _):
+        checkLazyForGlobal(val)
+      case .load, .store, .delay1, .memoryRead, .memoryWrite, .memoryAccumulate, .noise:
         needsMemory = true
       case .defineMemory:
         needsMemory = true
@@ -393,6 +716,9 @@ public class MetalRenderer: Renderer, UOpEmitter {
       return emitAssign(uop, "memory[\(base) + (int)\(g(offset))]", ctx)
     case let .memoryWrite(base, offset, value):
       return "memory[\(base) + (int)\(g(offset))] = \(g(value));"
+    case let .memoryAccumulate(base, offset, value):
+      // Atomic add to memory cell - safe for concurrent accumulation from SIMD threads
+      return "atomic_fetch_add_explicit((device metal::atomic<float>*)&memory[\(base) + (int)\(g(offset))], \(g(value)), metal::memory_order_relaxed);"
     case let .sin(a): return emitAssign(uop, "metal::sin(\(g(a)))", ctx)
     case let .cos(a): return emitAssign(uop, "metal::cos(\(g(a)))", ctx)
     case let .tan(a): return emitAssign(uop, "metal::tan(\(g(a)))", ctx)
@@ -450,7 +776,8 @@ public class MetalRenderer: Renderer, UOpEmitter {
 
     case let .load(cell): return emitAssign(uop, "memory[\(cell)]", ctx)
     case let .loadGradMemory(cellId): return emitAssign(uop, "grad_memory[\(cellId)]", ctx)
-    case let .frameIndex: return emitAssign(uop, "i", ctx)
+    case .frameIndex:
+      return emitAssign(uop, frameIndexOverride ?? "i", ctx)
     case let .loadTape(val, offset):
       let varId = ctx.getGlobalId(extractVarId(val))
       let boundedFetch =
@@ -459,15 +786,81 @@ public class MetalRenderer: Renderer, UOpEmitter {
     case let .store(cell, val): return "memory[\(cell)] = \(g(val));"
     case let .storeGradMemory(cell, val): return "grad_memory[\(cell)] = \(g(val));"
     case let .loadGrad(gradId):
-      return emitAssign(
-        uop, "gradients[frameCount * \(gradId) + \(uop.kind == .scalar ? "i" : "id")]", ctx)
+      let hasOverride = frameIndexOverride != nil
+      if case .static_ = currentTemporality, !hasOverride {
+        if useReducedGradsSum {
+          return emitAssign(uop, "reducedGradsSum[\(gradId)]", ctx)
+        } else {
+          // Static blocks must sum gradients from all frames
+          let varName = emitLazy(uop.value, ctx: ctx, kind: uop.kind, isOut: true)
+          return """
+            float \(varName) = 0.0;
+            for (uint _gfi = 0; _gfi < frameCount; _gfi++) {
+              \(varName) += gradients[frameCount * \(gradId) + _gfi];
+            }
+          """
+        }
+      } else {
+        let baseIdx = uop.kind == .scalar ? "i" : "id"
+        let idx = frameIndexOverride
+          ?? (currentThreadCountScale == nil ? baseIdx : "(\(baseIdx) / \(currentThreadCountScale!))")
+        return emitAssign(uop, "gradients[frameCount * \(gradId) + \(idx)]", ctx)
+      }
     case let .accumulateGrad(gradId, val):
-      return
-        "gradients[frameCount*\(gradId)+\(uop.kind == .scalar ? "i" : "id")] += \(g(val));"
+      let idx: String
+      if case .static_ = currentTemporality, frameIndexOverride == nil {
+        idx = "0"
+      } else {
+        let baseIdx = uop.kind == .scalar ? "i" : "id"
+        idx = frameIndexOverride
+          ?? (currentThreadCountScale == nil ? baseIdx : "(\(baseIdx) / \(currentThreadCountScale!))")
+      }
+      return "gradients[frameCount*\(gradId)+\(idx)] += \(g(val));"
+    case let .loadTensorGrad(baseGradId, indexLazy):
+      let hasOverride = frameIndexOverride != nil
+      if case .static_ = currentTemporality, !hasOverride {
+        if useReducedGradsSum {
+          return emitAssign(
+            uop,
+            "reducedGradsSum[(\(baseGradId)+(int)(\(g(indexLazy))))]",
+            ctx)
+        } else {
+          // Static blocks must sum gradients from all frames
+          let varName = emitLazy(uop.value, ctx: ctx, kind: uop.kind, isOut: true)
+          return """
+            float \(varName) = 0.0;
+            for (uint _gfi = 0; _gfi < frameCount; _gfi++) {
+              \(varName) += gradients[frameCount*(\(baseGradId)+(int)(\(g(indexLazy))))+_gfi];
+            }
+          """
+        }
+      } else {
+        let baseIdx = uop.kind == .scalar ? "i" : "id"
+        let idx = frameIndexOverride
+          ?? (currentThreadCountScale == nil ? baseIdx : "(\(baseIdx) / \(currentThreadCountScale!))")
+        return emitAssign(uop, "gradients[frameCount*(\(baseGradId)+(int)(\(g(indexLazy))))+\(idx)]", ctx)
+      }
+    case let .accumulateTensorGrad(baseGradId, indexLazy, valueLazy):
+      let idx: String
+      if case .static_ = currentTemporality, frameIndexOverride == nil {
+        idx = "0"
+      } else {
+        let baseIdx = uop.kind == .scalar ? "i" : "id"
+        idx = frameIndexOverride
+          ?? (currentThreadCountScale == nil ? baseIdx : "(\(baseIdx) / \(currentThreadCountScale!))")
+      }
+      return "gradients[frameCount*(\(baseGradId)+(int)(\(g(indexLazy))))+\(idx)] += \(g(valueLazy));"
     case let .mutate(a, b):
       return "\(emitLazy(a, ctx: ctx, kind: uop.kind, isOut: true)) = \(g(b));"
     case let .beginIf(cond): return "if (\(g(cond))) {"
     case .endIf: return "}"
+
+    case .setThreadCountScale:
+      return "/* setThreadCountScale - handled in scheduler */"
+
+    case let .setFrameIndex(idx):
+      frameIndexOverride = "_frameIndex"
+      return "uint _frameIndex = (uint)(\(g(idx)));"
 
     case let .beginLoop(iters, step):
       if step < 0 {
@@ -503,25 +896,32 @@ public class MetalRenderer: Renderer, UOpEmitter {
       return emitAssign(uop, g(value), ctx)
 
     case let .beginRange(start, end):
-
-      var startInt: Int = 0
+      let startExpr: String
       if case let .constant(_, val) = start {
-        startInt = Int(val)
+        startExpr = "\(Int(val))"
+      } else {
+        startExpr = "\(g(start))"
       }
-      var endInt: Int = 0
+
+      let endExpr: String
       if case let .constant(_, val) = end {
-        endInt = Int(val)
-      } else if case let .variable(id, _) = end {
-        if id == -1 {  // Special case for frameCount
-          return "if (id >= \(startInt) && id < frameCount) {"
-        }
+        endExpr = "\(Int(val))"
+      } else if case let .variable(id, _) = end, id == -1 {
+        endExpr = "frameCount"  // Special case for frameCount
+      } else {
+        endExpr = "\(g(end))"
       }
-      return "if (id >= \(startInt) && id < \(endInt)) {"
+
+      return "if (id >= \(startExpr) && id < (uint)(\(endExpr))) {"
     case .endRange: return "}"
 
     case let .output(channel, val):
       // Store output value to a device buffer that can be read back
-      let idx = (uop.kind == .simd) ? "id" : "i"
+      let baseIdx = (uop.kind == .simd) ? "id" : "i"
+      let idx = frameIndexOverride
+        ?? (currentThreadCountScale == nil
+          ? baseIdx
+          : "(\(baseIdx) / \(currentThreadCountScale!))")
       return "outputs[\(channel) * frameCount + \(idx)] = \(g(val));"
     case .input(_):
       return ""
@@ -532,11 +932,14 @@ public class MetalRenderer: Renderer, UOpEmitter {
 
     // Parallel range - for Metal, could be thread-parallel for static tensors
     // For now, render as a loop (future: check block.temporality and use thread-parallel for static)
-    case let .beginParallelRange(count, incr):
+    case let .beginParallelRange(count, _):
       guard case .variable(let varId, _) = uop.value else {
         fatalError("beginParallelRange requires variable")
       }
       parallelRangeVars.insert(varId)  // Track this as a parallel range loop variable
+      if parallelRangeMode == .thread {
+        return "if (id < \(count)) { uint _pr\(varId) = id;"
+      }
       return "for (uint _pr\(varId) = 0; _pr\(varId) < \(count); _pr\(varId)++) {"
     case .endParallelRange:
       // IMPORTANT: Memory fence required for correctness on Metal.
@@ -554,6 +957,9 @@ public class MetalRenderer: Renderer, UOpEmitter {
       //
       // The fence ensures writes complete and are visible before the next frame's reads.
       // This matches how the C backend behaves (sequential consistency on CPU).
+      if parallelRangeMode == .thread {
+        return "}"
+      }
       return "} atomic_thread_fence(metal::mem_flags::mem_device, metal::memory_order_seq_cst);"
     case .parallelIndex:
       // Return the loop variable from the enclosing parallelRange
@@ -561,6 +967,34 @@ public class MetalRenderer: Renderer, UOpEmitter {
         fatalError("parallelIndex requires variable")
       }
       return emitAssign(uop, "_pr\(varId)", ctx)
+
+    // Local tensor operations for SIMD-across-frames
+    case .declareLocalTensor(let varId, let size):
+      return "float localT\(varId)[\(size)];"
+
+    case .localTensorRead(let varId, let idx):
+      return emitAssign(uop, "localT\(varId)[(int)\(g(idx))]", ctx)
+
+    case .localTensorWrite(let varId, let idx, let val):
+      return "localT\(varId)[(int)\(g(idx))] = \(g(val));"
+
+    case .beginInlineLoop(let count, _):
+      guard case .variable(let varId, _) = uop.value else {
+        fatalError("beginInlineLoop requires variable")
+      }
+      let countStr: String
+      if case .constant(_, let val) = count {
+        countStr = "\(Int(val))"
+      } else {
+        countStr = "(int)\(g(count))"
+      }
+      return "for (int t\(varId) = 0; t\(varId) < \(countStr); t\(varId)++) {"
+
+    case .endInlineLoop:
+      return "}"
+
+    case .frameTensorChainMarker(let shape):
+      return "/* ====== SIMD-ACROSS-FRAMES: Frame-Tensor Chain Block (shape: \(shape)) ====== */"
 
     default:
       return "/* \(uop.prettyDescription()) */"
@@ -578,7 +1012,11 @@ public class MetalRenderer: Renderer, UOpEmitter {
         return "_pr\(id)"
       } else if ctx.globals.contains(id) {
         let tapeSlot = ctx.getGlobalId(id)
-        let idx = (kind == .simd) ? "id" : "i"
+        let baseIdx = (kind == .simd) ? "id" : "i"
+        let idx = staticGlobalVars.contains(id)
+          ? "0"
+          : (frameIndexOverride
+            ?? (currentThreadCountScale == nil ? baseIdx : "(\(baseIdx) / \(currentThreadCountScale!))"))
         return
           "t[\(tapeSlot)*frameCount + \(needsSegmenting ? "segmentBase + " : "") \(idx)]"
       } else {
@@ -587,7 +1025,11 @@ public class MetalRenderer: Renderer, UOpEmitter {
     case let .global(id):
       // Global variables are accessed through global buffers
       let tapeSlot = ctx.getGlobalId(id)
-      let idx = (kind == .simd) ? "id" : "i"
+      let baseIdx = (kind == .simd) ? "id" : "i"
+      let idx = staticGlobalVars.contains(id)
+        ? "0"
+        : (frameIndexOverride
+          ?? (currentThreadCountScale == nil ? baseIdx : "(\(baseIdx) / \(currentThreadCountScale!))"))
       return
         "t[\(tapeSlot)*frameCount + \(needsSegmenting ? "segmentBase + " : "")\(idx)]"
     default: return "/* unknown lazy */"
@@ -612,6 +1054,7 @@ struct RequiredBuffers {
   let needsSegmenting: Bool
   let needsGradMemory: Bool
   let needsGrad: Bool
+  let needsReducedGradsSum: Bool
 }
 
 func analyzeRequiredBuffers(scheduleItem: ScheduleItem) -> RequiredBuffers {
@@ -633,17 +1076,25 @@ func analyzeRequiredBuffers(scheduleItem: ScheduleItem) -> RequiredBuffers {
     return false
   }
 
-  let needsGrad: Bool = scheduleItem.ops.contains { uop in
-    if case .loadGrad = uop.op {
-      return true
-    } else if case .accumulateGrad = uop.op {
-      return true
-    }
+  let hasGradReads: Bool = scheduleItem.ops.contains { uop in
+    if case .loadGrad = uop.op { return true }
+    if case .loadTensorGrad = uop.op { return true }
     return false
   }
 
+  let hasGradWrites: Bool = scheduleItem.ops.contains { uop in
+    if case .accumulateGrad = uop.op { return true }
+    if case .accumulateTensorGrad = uop.op { return true }
+    return false
+  }
+
+  let needsGrad: Bool = hasGradReads || hasGradWrites
+
+  let needsReducedGradsSum: Bool = false
+
   return RequiredBuffers(
     hasOutputOps: hasOutputOps, needsSegmenting: needsSegmenting,
-    needsGradMemory: needsGradMemory, needsGrad: needsGrad
+    needsGradMemory: needsGradMemory, needsGrad: needsGrad,
+    needsReducedGradsSum: needsReducedGradsSum
   )
 }

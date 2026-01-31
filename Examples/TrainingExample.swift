@@ -46,8 +46,7 @@ func trainingExample() throws {
         backend: .metal,
         options: .init(
             frameCount: frameCount,
-            debug: true,
-            backwards: true  // ⚠️ CRITICAL: Enable gradient computation
+            debug: true
         )
     )
 
@@ -188,7 +187,7 @@ func simpleScalarExample() throws {
     let result = try CompilationPipeline.compile(
         graph: g,
         backend: .metal,
-        options: .init(frameCount: frameCount, backwards: true)
+        options: .init(frameCount: frameCount)
     )
 
     let runtime = try MetalCompiledKernel(
