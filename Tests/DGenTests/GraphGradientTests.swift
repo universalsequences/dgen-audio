@@ -1505,15 +1505,9 @@ final class GraphGradientTests: XCTestCase {
 
         print("Final loss: \(finalLoss)")
 
-        // NOTE: This test verifies the tensorAccumulate mechanism is in place.
-        // The gradient tensor nodes are now being pulled into compilation via tensorAccumulate.
-        // However, full matmul gradient flow requires proper broadcast reduction in mul backward -
-        // when A[M,1,K] * B[1,N,K] -> C[M,N,K], the gradient for B needs to be summed along M.
-        // This is a separate issue from tensorAccumulate (which is working correctly).
         let hasNonZeroGrads = weightTensor.grads.contains { $0 != 0.0 }
-        print("tensorAccumulate working: gradient tensor compiled, hasNonZeroGrads=\(hasNonZeroGrads)")
-        // TODO: Once mul backward handles broadcast reduction, enable this assertion:
-        // XCTAssertLessThan(finalLoss, initialLoss, "Loss should decrease")
+        XCTAssertTrue(hasNonZeroGrads, "Gradients should flow through matmul -> peekRow -> sum chain")
+        XCTAssertLessThan(finalLoss, initialLoss, "Loss should decrease when gradients flow")
     }
 
     /// MLP -> peekRow -> Harmonic Synth teacher-student test
@@ -1669,9 +1663,7 @@ final class GraphGradientTests: XCTestCase {
         let trainStart = CFAbsoluteTimeGetCurrent()
         for i in 0..<epochs {
             finalLoss = ctx.trainStep()
-            if i % 10 == 0 {
-                print("Epoch \(i): loss = \(String(format: "%.6f", finalLoss))")
-            }
+            print("Epoch \(i): loss = \(String(format: "%.6f", finalLoss))")
         }
         let trainTime = (CFAbsoluteTimeGetCurrent() - trainStart) * 1000
         let timePerEpoch = trainTime / Double(epochs)

@@ -128,33 +128,70 @@ extension LazyOp {
 
         case .add:
             // d(x+y)/dx = 1, d(x+y)/dy = 1
-            // Gradient passes through unchanged to both inputs
-            return [gradOutput, gradOutput]
+            // When broadcasting, need to sum along broadcast dimensions
+            let lhs = node.inputs[0]
+            let rhs = node.inputs[1]
+            var gradLhs = gradOutput
+            var gradRhs = gradOutput
+
+            if let lhsNode = g.nodes[lhs], let rhsNode = g.nodes[rhs] {
+                gradLhs = reduceBroadcastGradient(g, grad: gradOutput, toShape: lhsNode.shape)
+                gradRhs = reduceBroadcastGradient(g, grad: gradOutput, toShape: rhsNode.shape)
+            }
+
+            return [gradLhs, gradRhs]
 
         case .sub:
             // d(x-y)/dx = 1, d(x-y)/dy = -1
+            // When broadcasting, need to sum along broadcast dimensions
+            let lhs = node.inputs[0]
+            let rhs = node.inputs[1]
             let negGrad = g.n(.neg, [gradOutput])
-            return [gradOutput, negGrad]
+            var gradLhs = gradOutput
+            var gradRhs = negGrad
+
+            if let lhsNode = g.nodes[lhs], let rhsNode = g.nodes[rhs] {
+                gradLhs = reduceBroadcastGradient(g, grad: gradOutput, toShape: lhsNode.shape)
+                gradRhs = reduceBroadcastGradient(g, grad: negGrad, toShape: rhsNode.shape)
+            }
+
+            return [gradLhs, gradRhs]
 
         case .mul:
             // d(x*y)/dx = y * grad, d(x*y)/dy = x * grad
+            // When broadcasting, need to sum along broadcast dimensions
             let lhs = node.inputs[0]
             let rhs = node.inputs[1]
-            let gradLhs = g.n(.mul, [rhs, gradOutput])
-            let gradRhs = g.n(.mul, [lhs, gradOutput])
+            var gradLhs = g.n(.mul, [rhs, gradOutput])
+            var gradRhs = g.n(.mul, [lhs, gradOutput])
+
+            // Reduce gradients to match input shapes (handles broadcasting)
+            if let lhsNode = g.nodes[lhs], let rhsNode = g.nodes[rhs] {
+                gradLhs = reduceBroadcastGradient(g, grad: gradLhs, toShape: lhsNode.shape)
+                gradRhs = reduceBroadcastGradient(g, grad: gradRhs, toShape: rhsNode.shape)
+            }
+
             return [gradLhs, gradRhs]
 
         case .div:
             // d(x/y)/dx = grad / y
             // d(x/y)/dy = -grad * x / y^2 = -grad * (x/y) / y
+            // When broadcasting, need to sum along broadcast dimensions
             let lhs = node.inputs[0]
             let rhs = node.inputs[1]
-            let gradLhs = g.n(.div, [gradOutput, rhs])
+            var gradLhs = g.n(.div, [gradOutput, rhs])
             // For rhs: -grad * lhs / (rhs * rhs)
             let rhsSquared = g.n(.mul, [rhs, rhs])
             let lhsOverRhsSq = g.n(.div, [lhs, rhsSquared])
             let negGrad = g.n(.neg, [gradOutput])
-            let gradRhs = g.n(.mul, [negGrad, lhsOverRhsSq])
+            var gradRhs = g.n(.mul, [negGrad, lhsOverRhsSq])
+
+            // Reduce gradients to match input shapes (handles broadcasting)
+            if let lhsNode = g.nodes[lhs], let rhsNode = g.nodes[rhs] {
+                gradLhs = reduceBroadcastGradient(g, grad: gradLhs, toShape: lhsNode.shape)
+                gradRhs = reduceBroadcastGradient(g, grad: gradRhs, toShape: rhsNode.shape)
+            }
+
             return [gradLhs, gradRhs]
 
         case .mod:
@@ -641,9 +678,7 @@ extension LazyOp {
             let tensorInput = node.inputs[0]
             guard let inputNode = g.nodes[tensorInput],
                   case .tensor(let shape) = inputNode.shape,
-                  shape.count == 2,
-                  let tensorId = g.nodeToTensor[tensorInput],
-                  let tensor = g.tensors[tensorId] else {
+                  shape.count == 2 else {
                 let zero = g.n(.constant(0.0), [])
                 return [nil, zero]
             }
@@ -651,63 +686,71 @@ extension LazyOp {
             let numRows = shape[0]
             let numCols = shape[1]
             let totalSize = numRows * numCols
-            let tensorCellId = tensor.cellId
 
-            // Get or create gradient cell for input tensor
-            let gradCell: CellID
-            if let existing = g.gradCarryCells[tensorCellId] {
-                gradCell = existing
-            } else {
-                gradCell = g.alloc(vectorWidth: totalSize)
-                g.gradCarryCells[tensorCellId] = gradCell
-            }
+            // Only create scatter side effects if the input is a direct tensorRef
+            // (i.e., has a cellId we can scatter to). For computed tensors,
+            // we still propagate gradients through the graph.
+            if let tensorId = g.nodeToTensor[tensorInput],
+               let tensor = g.tensors[tensorId] {
+                let tensorCellId = tensor.cellId
 
-            // Recompute interpolation positions (same logic as forward)
-            let rowIndex = node.inputs[1]
+                // Get or create gradient cell for input tensor
+                let gradCell: CellID
+                if let existing = g.gradCarryCells[tensorCellId] {
+                    gradCell = existing
+                } else {
+                    gradCell = g.alloc(vectorWidth: totalSize)
+                    g.gradCarryCells[tensorCellId] = gradCell
+                }
 
-            let zero = g.n(.constant(0.0), [])
-            let one = g.n(.constant(1.0), [])
-            let numRowsFloat = g.n(.constant(Float(numRows)), [])
+                // Recompute interpolation positions (same logic as forward)
+                let rowIndex = node.inputs[1]
 
-            // Wrap rowIndex using modulo
-            let wrappedIndex = g.n(.mod, [rowIndex, numRowsFloat])
-            let isNegative = g.n(.lt, [wrappedIndex, zero])
-            let positiveIndex = g.n(.gswitch, [isNegative, g.n(.add, [wrappedIndex, numRowsFloat]), wrappedIndex])
+                let zero = g.n(.constant(0.0), [])
+                let one = g.n(.constant(1.0), [])
+                let numRowsFloat = g.n(.constant(Float(numRows)), [])
 
-            // Compute floor and ceil indices for interpolation
-            let floorIndex = g.n(.floor, [positiveIndex])
-            let frac = g.n(.sub, [positiveIndex, floorIndex])
+                // Wrap rowIndex using modulo
+                let wrappedIndex = g.n(.mod, [rowIndex, numRowsFloat])
+                let isNegative = g.n(.lt, [wrappedIndex, zero])
+                let positiveIndex = g.n(.gswitch, [isNegative, g.n(.add, [wrappedIndex, numRowsFloat]), wrappedIndex])
 
-            // Compute ceil index with wrapping
-            let ceilIndex = g.n(.add, [floorIndex, one])
-            let ceilWrapped = g.n(.gswitch, [g.n(.gte, [ceilIndex, numRowsFloat]), zero, ceilIndex])
+                // Compute floor and ceil indices for interpolation
+                let floorIndex = g.n(.floor, [positiveIndex])
+                let frac = g.n(.sub, [positiveIndex, floorIndex])
 
-            // Interpolation weights
-            let oneMinusFrac = g.n(.sub, [one, frac])
+                // Compute ceil index with wrapping
+                let ceilIndex = g.n(.add, [floorIndex, one])
+                let ceilWrapped = g.n(.gswitch, [g.n(.gte, [ceilIndex, numRowsFloat]), zero, ceilIndex])
 
-            // Scatter gradients for each column
-            // Column-major layout: offset = col * numRows + row
-            for col in 0..<numCols {
-                let colIdx = g.n(.constant(Float(col)), [])
-                let colOffset = g.n(.mul, [colIdx, numRowsFloat])
+                // Interpolation weights
+                let oneMinusFrac = g.n(.sub, [one, frac])
 
-                // Floor position gradient
-                let floorPos = g.n(.add, [colOffset, floorIndex])
-                let grad1 = g.n(.mul, [gradOutput, oneMinusFrac])
-                let scatter1 = g.n(.memoryAccumulate(gradCell), [floorPos, grad1])
+                // Scatter gradients for each column
+                // Column-major layout: offset = col * numRows + row
+                for col in 0..<numCols {
+                    let colIdx = g.n(.constant(Float(col)), [])
+                    let colOffset = g.n(.mul, [colIdx, numRowsFloat])
 
-                // Ceil position gradient
-                let ceilPos = g.n(.add, [colOffset, ceilWrapped])
-                let grad2 = g.n(.mul, [gradOutput, frac])
-                let scatter2 = g.n(.memoryAccumulate(gradCell), [ceilPos, grad2])
+                    // Floor position gradient
+                    let floorPos = g.n(.add, [colOffset, floorIndex])
+                    let grad1 = g.n(.mul, [gradOutput, oneMinusFrac])
+                    let scatter1 = g.n(.memoryAccumulate(gradCell), [floorPos, grad1])
 
-                g.addGradientSideEffect(scatter1)
-                g.addGradientSideEffect(scatter2)
+                    // Ceil position gradient
+                    let ceilPos = g.n(.add, [colOffset, ceilWrapped])
+                    let grad2 = g.n(.mul, [gradOutput, frac])
+                    let scatter2 = g.n(.memoryAccumulate(gradCell), [ceilPos, grad2])
+
+                    g.addGradientSideEffect(scatter1)
+                    g.addGradientSideEffect(scatter2)
+                }
             }
 
             // Create a gradient tensor node to allow backward propagation through
             // upstream ops (e.g., matmul). This uses expand to broadcast the scalar
             // gradient to the input tensor shape.
+            let zero = g.n(.constant(0.0), [])
             let tensorGrad = g.n(.expand(shape), [gradOutput])
             return [tensorGrad, zero]
 
@@ -736,6 +779,86 @@ extension LazyOp {
             inverse[p] = i
         }
         return inverse
+    }
+
+    /// Reduce gradient along broadcast dimensions to match target shape.
+    /// When A[M,1,K] * B[1,N,K] -> C[M,N,K], the gradient for A needs to be summed
+    /// along axis 1 (where A had size 1 but C has size N).
+    private func reduceBroadcastGradient(_ g: Graph, grad: NodeID, toShape targetShape: ValueShape?) -> NodeID {
+        guard let gradNode = g.nodes[grad],
+              case .tensor(let gradShape) = gradNode.shape,
+              case .tensor(let targetShapeArray) = targetShape else {
+            // Scalar or unknown shape - no reduction needed
+            return grad
+        }
+
+        // If shapes already match, no reduction needed
+        if gradShape == targetShapeArray {
+            return grad
+        }
+
+        // Handle case where target has fewer dimensions (sum over leading dims)
+        let gradRank = gradShape.count
+        let targetRank = targetShapeArray.count
+
+        var result = grad
+
+        // If gradient has more dimensions, we need to sum over leading dimensions first
+        if gradRank > targetRank {
+            // Sum over the extra leading dimensions
+            for axis in 0..<(gradRank - targetRank) {
+                result = g.n(.sumAxis(0), [result])
+            }
+            // Update shape tracking for the result
+            if let newNode = g.nodes[result], case .tensor(let newShape) = newNode.shape {
+                // Now newShape should have same rank as targetShapeArray
+                // Continue to check for broadcast dimensions
+                return reduceSameSizeGradient(g, grad: result, gradShape: newShape, targetShape: targetShapeArray)
+            }
+        }
+
+        return reduceSameSizeGradient(g, grad: result, gradShape: gradShape, targetShape: targetShapeArray)
+    }
+
+    /// Helper to reduce gradient when shapes have same rank but different sizes (broadcast case)
+    private func reduceSameSizeGradient(_ g: Graph, grad: NodeID, gradShape: [Int], targetShape: [Int]) -> NodeID {
+        // Right-align shapes for comparison (NumPy-style broadcasting)
+        let gradRank = gradShape.count
+        let targetRank = targetShape.count
+
+        if gradRank != targetRank {
+            // Shapes should have same rank at this point
+            return grad
+        }
+
+        var result = grad
+
+        // Find axes where target has size 1 but grad has size > 1
+        // We need to sum along these axes, going from highest to lowest
+        // to preserve axis indices
+        var axesToReduce: [Int] = []
+        for i in 0..<gradRank {
+            if targetShape[i] == 1 && gradShape[i] > 1 {
+                axesToReduce.append(i)
+            }
+        }
+
+        // Sum along axes in reverse order (highest first) to preserve indices
+        for axis in axesToReduce.reversed() {
+            result = g.n(.sumAxis(axis), [result])
+        }
+
+        // After summing, the reduced dimensions become size 1
+        // We may need to reshape to ensure the shape matches exactly
+        if !axesToReduce.isEmpty {
+            // The result should now have shape matching targetShape
+            // sumAxis removes the axis, so we might need to reshape
+            // Actually, sumAxis removes the dimension, so we need to add it back with size 1
+            // Let's reshape to target shape
+            result = g.n(.reshape(targetShape), [result])
+        }
+
+        return result
     }
 }
 

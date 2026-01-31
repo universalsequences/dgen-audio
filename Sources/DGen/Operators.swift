@@ -1643,25 +1643,65 @@ public enum LazyOp {
         case .neg:
             // Unary negation: -x
             guard inputs.count == 1 else { fatalError("neg requires 1 input") }
-            let x = b.value(inputs[0])
-            b.use(val: b.constant(0.0) - x)
+
+            // Check if input is a tensor
+            let inputNodeId = node.inputs[0]
+            if let inputNode = g.nodes[inputNodeId],
+               case .tensor(let inputShape) = inputNode.shape,
+               let inTensorId = g.nodeToTensor[inputNodeId],
+               let inTensor = g.tensors[inTensorId] {
+                // Tensor input: negate each element
+                guard let outTensor = g.nodeToTensor[nodeId].flatMap({ g.tensors[$0] }) else {
+                    ctx.values[nodeId] = .empty
+                    break
+                }
+                let size = inputShape.reduce(1, *)
+                b.parallelRange(size) { idx in
+                    let val = b.memoryRead(inTensor.cellId, b.cast(idx, to: .int))
+                    let negVal = b.constant(0.0) - val
+                    _ = b.memoryWrite(outTensor.cellId, b.cast(idx, to: .int), negVal)
+                }
+                ctx.values[nodeId] = .empty
+            } else {
+                // Scalar input: simple negation
+                let x = b.value(inputs[0])
+                b.use(val: b.constant(0.0) - x)
+            }
 
         case .expand(let targetShape):
             // Broadcast scalar to tensor shape (for sum backward)
             // Input is scalar, output is tensor where all elements = input
             guard inputs.count == 1 else { fatalError("expand requires 1 input") }
-            let scalarVal = b.value(inputs[0])
 
             // Get or create output tensor
             guard let outTensor = g.nodeToTensor[nodeId].flatMap({ g.tensors[$0] }) else {
                 // Fallback: just pass through the scalar
-                b.use(val: scalarVal)
+                b.use(val: b.value(inputs[0]))
                 break
             }
 
             let size = targetShape.reduce(1, *)
-            b.parallelRange(size) { idx in
-                _ = b.memoryWrite(outTensor.cellId, b.cast(idx, to: .int), scalarVal)
+            let inputNodeId = node.inputs[0]
+
+            // Check if input has a tensor cell we can read from (for cross-scope access)
+            if let inputTensorId = g.nodeToTensor[inputNodeId],
+               let inputTensor = g.tensors[inputTensorId] {
+                // Input is a tensor - read element 0 (assumes scalar stored in tensor)
+                b.parallelRange(size) { idx in
+                    let scalarVal = b.memoryRead(inputTensor.cellId, b.int(0))
+                    _ = b.memoryWrite(outTensor.cellId, b.cast(idx, to: .int), scalarVal)
+                }
+            } else {
+                // Input is a scalar computed in current scope
+                // First, store the scalar to element 0 of output to capture it
+                let scalarVal = b.value(inputs[0])
+                _ = b.memoryWrite(outTensor.cellId, b.int(0), scalarVal)
+
+                // Then fill all elements by reading from the stored value
+                b.parallelRange(size) { idx in
+                    let storedVal = b.memoryRead(outTensor.cellId, b.int(0))
+                    _ = b.memoryWrite(outTensor.cellId, b.cast(idx, to: .int), storedVal)
+                }
             }
 
         case .expandAxis(let targetShape, let axis):

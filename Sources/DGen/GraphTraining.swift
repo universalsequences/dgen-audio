@@ -195,8 +195,11 @@ public class GraphTrainingContext {
         var targetNodes = Set(parameters.map { $0.nodeId })
         for tp in tensorParameters {
             targetNodes.insert(tp.nodeId)
+            print("[DEBUG] Target tensor param '\(tp.name ?? "?")' nodeId=\(tp.nodeId)")
         }
+        print("[DEBUG] Computing gradients from loss node \(lossNode) with \(targetNodes.count) targets: \(targetNodes.sorted())")
         let gradients = graph.computeGradients(loss: lossNode, targets: targetNodes)
+        print("[DEBUG] Gradients computed for nodes: \(gradients.keys.sorted())")
 
         // Step 2: For each scalar parameter, create atomic accumulator for its gradient
         let zero = graph.n(.constant(0.0))
@@ -334,6 +337,7 @@ public class GraphTrainingContext {
     private func initializeMemory() {
         guard let runtime = runtime else { return }
         guard let memBuffer = runtime.getBuffer(name: "memory") else { return }
+        guard let cellAllocs = cellAllocations else { return }
 
         let memPtr = memBuffer.contents().assumingMemoryBound(to: Float.self)
 
@@ -347,6 +351,16 @@ public class GraphTrainingContext {
             let base = tensorPhysicalCells[i].base
             for j in 0..<tp.data.count {
                 memPtr[base + j] = tp.data[j]
+            }
+        }
+
+        // Initialize all tensors with initial data (not just TensorParameters)
+        for (_, tensor) in graph.tensors {
+            if let data = tensor.data {
+                let physicalBase = cellAllocs.cellMappings[tensor.cellId] ?? tensor.cellId
+                for j in 0..<data.count {
+                    memPtr[physicalBase + j] = data[j]
+                }
             }
         }
     }
