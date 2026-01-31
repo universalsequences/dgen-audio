@@ -114,7 +114,7 @@ public struct CompilationPipeline {
         let scalarNodeSet = time("scalarNodes") {
             options.forceScalar
                 ? Set(graph.nodes.keys)
-                : scalarNodes(graph, feedbackClusters: feedbackClusters)
+                : scalarNodes(graph, feedbackClusters: feedbackClusters, backend: backend)
         }
 
         let sortedNodes = time("topoWithCorridors") {
@@ -414,6 +414,7 @@ public struct CompilationPipeline {
                     block: block,
                     blocks: finalBlocks,
                     g: graph,
+                    backend: backend,
                     debug: options.debug
                 )
                 let (threadCountScale, filteredOps) = extractThreadCountScale(ops)

@@ -1438,6 +1438,76 @@ final class GraphGradientTests: XCTestCase {
         XCTAssertLessThan(finalLoss, initialLoss, "Loss should decrease")
     }
 
+    /// Simple test: matmul -> sum -> loss (no peekRow, static tensors)
+    /// Used to debug kernel scheduling for matmul backward
+    func testMatmulSumLoss_Debug() throws {
+        let frameCount = 1  // Static - no frame variation
+        let m = 4  // rows of A
+        let k = 3  // cols of A, rows of B
+        let n = 2  // cols of B
+
+        let g = Graph(sampleRate: 1000.0)
+
+        // Input tensor A [m, k] - fixed
+        let aData = (0..<(m * k)).map { Float($0) * 0.1 }
+        let aTensor = g.tensor(shape: [m, k], data: aData)
+
+        // Learnable weight tensor B [k, n]
+        let bData = (0..<(k * n)).map { Float($0 + 1) * 0.1 }
+        let bTensor = TensorParameter(
+            graph: g, shape: [k, n], data: bData, name: "B")
+
+        // matmul: [m, k] x [k, n] -> [m, n]
+        let matmulOut = try g.matmul(aTensor, bTensor.node())
+
+        // Sum all elements to scalar
+        let sumOut = g.n(.sum, [matmulOut])
+
+        // Simple loss: (sum - target)^2
+        let target = g.n(.constant(10.0))
+        let diff = g.n(.sub, [sumOut, target])
+        let loss = g.n(.mul, [diff, diff])
+        _ = g.n(.output(0), [loss])
+
+        print("\n=== Simple Matmul -> Sum -> Loss Debug ===")
+        print("A: [\(m), \(k)], B: [\(k), \(n)], Output: [\(m), \(n)]")
+
+        // Compute gradients manually to see the nodes
+        let gradients = g.computeGradients(loss: loss, targets: Set([bTensor.nodeId]))
+        print("Gradient nodes created: \(gradients.count)")
+
+        // Check scalar nodes
+        let feedbackClusters = findFeedbackLoops(g)
+        let scalarSet = scalarNodes(g, feedbackClusters: feedbackClusters)
+
+        print("\nNode analysis:")
+        for (nodeId, node) in g.nodes.sorted(by: { $0.key < $1.key }) {
+            let isScalar = scalarSet.contains(nodeId)
+            let hasGrad = gradients[nodeId] != nil
+            let marker = isScalar ? "SCALAR" : "SIMD"
+            print("  \(nodeId): \(node.op) [\(marker)]\(hasGrad ? " (has grad)" : "")")
+        }
+
+        // Now compile and check blocks
+        let result = try CompilationPipeline.compile(
+            graph: g,
+            backend: .metal,
+            options: .init(frameCount: frameCount, debug: false)
+        )
+
+        print("\nKernels generated: \(result.kernels.count)")
+        for (i, kernel) in result.kernels.enumerated() {
+            print("  Kernel \(i): kind=\(kernel.kind) threadGroupSize=\(String(describing: kernel.threadGroupSize)) threadCount=\(String(describing: kernel.threadCount))")
+        }
+
+        // Write kernels for inspection
+        let allKernels = result.kernels.enumerated().map {
+            "// KERNEL \($0.offset)\n// Kind: \($0.element.kind)\n// ThreadGroupSize: \($0.element.threadGroupSize ?? -1)\n\n\($0.element.source)"
+        }.joined(separator: "\n\n// ========================================\n\n")
+        try? allKernels.write(toFile: "/tmp/matmul_sum_debug.metal", atomically: true, encoding: .utf8)
+        print("\nWrote kernels to /tmp/matmul_sum_debug.metal")
+    }
+
     /// Test: matmul -> peekRow -> sum -> loss
     func testMatmulPeekRowSumLoss() throws {
         let frameCount = 64
