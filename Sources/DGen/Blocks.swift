@@ -1444,6 +1444,12 @@ public func splitReduceBlocks(g: Graph, blocks: [Block]) -> [Block] {
             var reductionBlock = Block(kind: .simd)  // still SIMD w.r.t frame count
             reductionBlock.nodes = [block.nodes[reductionOpIndex]]
             reductionBlock.temporality = block.temporality
+            // For reduction ops that output tensors (like sumAxis), set the output shape
+            // This enables emitThreadCountScaleOpIfNeeded to set up tensorIndices
+            if let reductionNode = g.nodes[block.nodes[reductionOpIndex]],
+               case .tensor(let outputShape) = reductionNode.shape {
+                reductionBlock.shape = outputShape
+            }
             splitBlocks.append(reductionBlock)
             if reductionOpIndex < block.nodes.count - 1 {
                 var postReductionBlock = Block(kind: .simd)
