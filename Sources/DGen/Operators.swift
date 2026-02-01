@@ -394,7 +394,6 @@ public enum LazyOp {
                 let tensorId = g.nodeToTensor[tensorInput],
                 let tensor = g.tensors[tensorId]
             else {
-                print("INPUT THAT SHOULD BE A TENSOR=\(node.inputs)")
                 throw DGenError.tensorError(op: "tensorAccumulate", reason: "requires tensor input")
             }
 

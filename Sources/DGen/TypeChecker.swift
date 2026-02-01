@@ -496,45 +496,29 @@ public func allocateTensorMemory(
     let needsFrameAwareAlloc = isFrameBased &&
       (isOutbound || intraBlockFrameAwareCells.contains(lazyCellId))
 
+    // Only allocate if outbound or needs frame-aware storage
+    guard isOutbound || needsFrameAwareAlloc else { continue }
+
+    let allocSize = needsFrameAwareAlloc ? tensorSize * frameCount : tensorSize
+    let realCellId = graph.allocateLazyCell(lazyCellId, vectorWidth: allocSize)
+
     if needsFrameAwareAlloc {
-      // Frame-based tensor (outbound or intra-block consumed): needs tensorSize * frameCount
-      let allocSize = tensorSize * frameCount
-      let realCellId = graph.allocateLazyCell(lazyCellId, vectorWidth: allocSize)
       graph.frameAwareCells[realCellId] = (tensorSize: tensorSize, frameCount: frameCount)
-
-      // Update tensor with real cell ID
-      graph.tensors[tensorId] = Tensor(
-        id: tensor.id,
-        shape: tensor.shape,
-        cellId: realCellId,
-        data: tensor.data,
-        strides: tensor.strides,
-        offset: tensor.offset,
-        isView: tensor.isView,
-        padding: tensor.padding,
-        isLazy: false
-      )
-      graph.cellToTensor[realCellId] = tensorId
-    } else if isOutbound {
-      // Static outbound tensor: just needs tensorSize
-      let allocSize = tensorSize
-      let realCellId = graph.allocateLazyCell(lazyCellId, vectorWidth: allocSize)
-
-      // Update tensor with real cell ID
-      graph.tensors[tensorId] = Tensor(
-        id: tensor.id,
-        shape: tensor.shape,
-        cellId: realCellId,
-        data: tensor.data,
-        strides: tensor.strides,
-        offset: tensor.offset,
-        isView: tensor.isView,
-        padding: tensor.padding,
-        isLazy: false
-      )
-      graph.cellToTensor[realCellId] = tensorId
     }
-    // Non-outbound, non-intra-block lazy tensors stay lazy (register-only, no memory needed)
+
+    // Update tensor with real cell ID
+    graph.tensors[tensorId] = Tensor(
+      id: tensor.id,
+      shape: tensor.shape,
+      cellId: realCellId,
+      data: tensor.data,
+      strides: tensor.strides,
+      offset: tensor.offset,
+      isView: tensor.isView,
+      padding: tensor.padding,
+      isLazy: false
+    )
+    graph.cellToTensor[realCellId] = tensorId
   }
 }
 

@@ -917,24 +917,6 @@ public func findOutputNodeNeeds(_ b: Block, _ g: Graph) -> Set<NodeID> {
     return outputNodeNeeds
 }
 
-/// Find tensor nodes with outbound dependencies in frame-based blocks.
-/// These tensors need frame-aware allocation (tensorSize × frameCount cells)
-/// to enable parallelization across frames without race conditions.
-public func findFrameAwareTensors(_ blocks: [Block], _ g: Graph) -> Set<NodeID> {
-    var result = Set<NodeID>()
-    for block in blocks where block.temporality == .frameBased {
-        // Only consider blocks with tensor shapes (tensor SIMD blocks)
-        guard block.shape != nil else { continue }
-
-        for nodeId in findNodesWithOutboundDependencies(blocks, g, block: block) {
-            if let node = g.nodes[nodeId], case .tensor = node.shape {
-                result.insert(nodeId)
-            }
-        }
-    }
-    return result
-}
-
 // ─── 3. decide which nodes need cross-block scratch buffers ─────
 // in the case of metal, these are transmitted via buffers
 public func findNodesWithOutboundDependencies(_ blks: [Block], _ g: Graph, block: Block) -> [NodeID]

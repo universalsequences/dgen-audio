@@ -190,61 +190,14 @@ public struct CompilationPipeline {
 
         var finalBlocks = seperatedBlocks.compactMap { $0 }
         if backend == .metal {
-            finalBlocks = splitReduceBlocks(g: graph, blocks: seperatedBlocks.compactMap { $0 })
+            finalBlocks = splitReduceBlocks(g: graph, blocks: finalBlocks)
         }
-        print("split reduced shapes=\(finalBlocks.map({$0.shape}))")
-        print("split reduced blocks=\(finalBlocks.compactMap{$0.nodes})")
 
         // Step 4: Infer temporality and assign to blocks
         // This now includes hop-based temporality for FFT/IFFT and downstream operations
         let temporalityResult = time("inferTemporality") {
             inferTemporality(graph: graph, sortedNodes: sortedNodes)
         }
-
-        /*
-        // Step 4.5: Detect frame-dependent tensor chains for SIMD-across-frames optimization
-        let fusableChains = time("detectChains") {
-            detectFrameDependentTensorChains(
-                graph: graph,
-                sortedNodes: sortedNodes,
-                frameBasedNodes: temporalityResult.frameBasedNodes
-            )
-        }
-
-        // Store chain nodes in context for conditional markRequiresScalar
-        for chain in fusableChains {
-            context.frameTensorChainNodes.formUnion(chain.chainNodes)
-        }
-
-         */
-
-        /*
-        // this step currently breaks C SIMD blocks (causes duplicate definitions)
-        if backend == .metal {
-            finalBlocks = extractStaticOpsIntoBlocks(
-                blocks: finalBlocks, frameBasedNodes: temporalityResult.frameBasedNodes,
-                hopBasedNodes: temporalityResult.hopBasedNodes, graph: graph,
-                fusableChains: fusableChains)
-        }
-
-        if backend == .metal {
-            finalBlocks = splitFrameTensorChainBlocks(
-                blocks: finalBlocks, graph: graph, context: context,
-                frameCount: options.frameCount)
-        }
-
-        // Upgrade frame-tensor chain blocks to SIMD kind for SIMD-across-frames execution.
-        // These blocks contain chains that can be parallelized across frames (not tensor elements).
-        time("upgradeChainBlocks") {
-            for i in 0..<finalBlocks.count {
-                if finalBlocks[i].frameTensorChain != nil {
-                    // Frame-tensor chains parallelize across frames, so they should be SIMD
-                    // (each frame is a thread that computes the full tensor chain locally)
-                    finalBlocks[i].kind = .simd
-                }
-            }
-        }
-         */
 
         time("assignTemporality") {
             assignBlockTemporality(
@@ -253,9 +206,6 @@ public struct CompilationPipeline {
                 hopBasedNodes: temporalityResult.hopBasedNodes
             )
         }
-
-        // Store frame-based nodes in context for smart gradient buffer allocation
-        //context.frameBasedNodes = temporalityResult.frameBasedNodes
 
         // Step 4.6: Allocate real memory for lazy tensor cells
         // Now that we know temporality, we can allocate the right sizes:
@@ -275,53 +225,6 @@ public struct CompilationPipeline {
                 context.frameAwareTensorCells.insert(cellId)
             }
         }
-
-        // Step 4.7: Detect frame-aware tensors and update their allocations
-        // Frame-aware tensors have outbound dependencies in frame-based blocks
-        // and need tensorSize × frameCount cells for parallel execution
-        // TEMPORARILY DISABLED: Frame-aware tensor allocation causes issues with gradient flow
-        // when the corresponding isFrameAwareTensorBlock flag is disabled in Blocks.swift.
-        // Both must be enabled together for the optimization to work correctly.
-        // See plan file: ethereal-purring-wren.md for implementation details.
-        /*
-        if false && backend == .metal {
-            time("frameAwareTensors") {
-                let frameAwareTensorNodes = findFrameAwareTensors(finalBlocks, graph)
-                context.frameAwareTensorNodes = frameAwareTensorNodes
-
-                // Update tensor allocations to use frame-aware storage
-                for nodeId in frameAwareTensorNodes {
-                    guard let tensorId = graph.nodeToTensor[nodeId],
-                        let tensor = graph.tensors[tensorId],
-                        case .tensor(let shape) = graph.nodes[nodeId]?.shape
-                    else { continue }
-
-                    let tensorSize = shape.reduce(1, *)
-                    let oldCellId = tensor.cellId
-
-                    // Allocate new frame-aware storage
-                    let newCellId = graph.allocFrameAware(
-                        tensorSize: tensorSize, frameCount: options.frameCount)
-                    context.frameAwareTensorCells.insert(newCellId)
-
-                    // Update tensor to use new cell
-                    graph.tensors[tensorId] = Tensor(
-                        id: tensor.id,
-                        shape: tensor.shape,
-                        cellId: newCellId,
-                        strides: tensor.strides,
-                        offset: tensor.offset,
-                        isView: tensor.isView,
-                        padding: tensor.padding
-                    )
-
-                    // Update cellToTensor mapping
-                    graph.cellToTensor[oldCellId] = nil
-                    graph.cellToTensor[newCellId] = tensorId
-                }
-            }
-        }
-         */
 
         let finalBlockIndices = Array(0..<finalBlocks.count)
 
@@ -378,72 +281,6 @@ public struct CompilationPipeline {
                 filtered.append(op)
             }
             return (scale, filtered)
-        }
-
-        func splitFrameTensorChainBlocks(
-            blocks: [Block], graph: Graph, context: IRContext, frameCount: Int
-        ) -> [Block] {
-            var result: [Block] = []
-            result.reserveCapacity(blocks.count)
-
-            for block in blocks {
-                guard let chain = block.frameTensorChain else {
-                    result.append(block)
-                    continue
-                }
-
-                // Only split when the reduction node is actually in this block.
-                guard block.nodes.contains(chain.reductionNodeId) else {
-                    var cleared = block
-                    cleared.frameTensorChain = nil
-                    result.append(cleared)
-                    continue
-                }
-
-                // Map block: all chain nodes except the reduction
-                var mapBlock = block
-                mapBlock.nodes = block.nodes.filter { $0 != chain.reductionNodeId }
-                mapBlock.frameTensorChain = chain
-                mapBlock.tensorIndex = nil
-                mapBlock.shape = nil
-
-                // If the reduction is the only node in the block, skip frame-tensor optimization.
-                if mapBlock.nodes.isEmpty {
-                    var cleared = block
-                    cleared.frameTensorChain = nil
-                    result.append(cleared)
-                    continue
-                }
-
-                let tensorSize = chain.tensorShape.reduce(1, *)
-                if tensorSize <= 0 {
-                    result.append(block)
-                    continue
-                }
-
-                if context.frameTensorChainScratch[chain.reductionNodeId] == nil {
-                    let scratchSize = frameCount * tensorSize
-                    let scratchCell = graph.alloc(vectorWidth: scratchSize)
-                    context.frameTensorChainScratch[chain.reductionNodeId] =
-                        IRContext.FrameTensorChainScratch(
-                            cellId: scratchCell, tensorSize: tensorSize)
-                }
-
-                // Reduce block: just the reduction node
-                var reduceBlock = Block(kind: .simd)
-                reduceBlock.nodes = [chain.reductionNodeId]
-                reduceBlock.temporality = block.temporality
-                reduceBlock.tensorIndex = nil
-                reduceBlock.shape = nil
-                reduceBlock.frameTensorChain = nil
-
-                if !mapBlock.nodes.isEmpty {
-                    result.append(mapBlock)
-                }
-                result.append(reduceBlock)
-            }
-
-            return result
         }
 
         for (i, block) in finalBlocks.enumerated() {
