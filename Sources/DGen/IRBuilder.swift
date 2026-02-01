@@ -759,6 +759,15 @@ public final class IRBuilder {
     return threadIndex()
   }
 
+  /// Returns the frame index using the .frameIndex UOp.
+  /// This returns _frameIndex if setFrameIndex was called, otherwise falls back to thread index.
+  public func frameIndex() -> Expr {
+    let dest = ctx.useVariable(src: nodeId)
+    let uop = UOp(op: .frameIndex, value: dest)
+    ops.append(uop)
+    return value(dest)
+  }
+
   /// Frame count (runtime parameter)
   public func frameCount() -> Expr {
     return value(.variable(-1, nil))

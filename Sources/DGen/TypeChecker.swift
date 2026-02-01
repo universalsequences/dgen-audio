@@ -483,6 +483,9 @@ public func allocateTensorMemory(
   }
 
   // Now allocate real memory for lazy tensors
+  // Build mapping from lazy cellId to real cellId
+  var lazyToReal: [CellID: CellID] = [:]
+
   for (tensorId, tensor) in graph.tensors {
     guard tensor.isLazy else { continue }
 
@@ -501,6 +504,7 @@ public func allocateTensorMemory(
 
     let allocSize = needsFrameAwareAlloc ? tensorSize * frameCount : tensorSize
     let realCellId = graph.allocateLazyCell(lazyCellId, vectorWidth: allocSize)
+    lazyToReal[lazyCellId] = realCellId
 
     if needsFrameAwareAlloc {
       graph.frameAwareCells[realCellId] = (tensorSize: tensorSize, frameCount: frameCount)
@@ -519,6 +523,25 @@ public func allocateTensorMemory(
       isLazy: false
     )
     graph.cellToTensor[realCellId] = tensorId
+  }
+
+  // Update views that point to lazy cells that were just allocated
+  // Views share the lazy cellId of their base tensor, but weren't updated when the base was allocated
+  for (tensorId, tensor) in graph.tensors {
+    guard tensor.isView, let realCellId = lazyToReal[tensor.cellId] else { continue }
+
+    // Update view to use real cell ID
+    graph.tensors[tensorId] = Tensor(
+      id: tensor.id,
+      shape: tensor.shape,
+      cellId: realCellId,
+      data: tensor.data,
+      strides: tensor.strides,
+      offset: tensor.offset,
+      isView: tensor.isView,
+      padding: tensor.padding,
+      isLazy: false
+    )
   }
 }
 

@@ -1302,8 +1302,8 @@ public enum LazyOp {
             // Compute frac
             let frac = positiveIndex - floorIndex
 
-            // Get frame index - use currentFrameIndex for frame-aware tensor blocks
-            let frameIdx = b.currentFrameIndex()
+            // Get frame index - use frameIndex() which respects setFrameIndex
+            let frameIdx = b.frameIndex()
 
             // Write row indices and frac for this frame
             _ = b.memoryWrite(rowIdxCell, b.cast(frameIdx, to: .int), floorIndex)
@@ -1322,7 +1322,9 @@ public enum LazyOp {
                 // Get gradient value - from tensor cell if available, otherwise use scalar
                 let gradValue: Expr
                 if let cellId = gradCellId {
-                    gradValue = b.memoryRead(cellId, b.cast(colIdx, to: .int))
+                    // Frame-aware tensor: read from frameIdx * numCols + colIdx
+                    let readPos = frameBase + colIdxFloat
+                    gradValue = b.memoryRead(cellId, b.cast(readPos, to: .int))
                 } else {
                     gradValue = scalarGrad  // Broadcast scalar to all elements
                 }

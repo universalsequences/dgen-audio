@@ -689,53 +689,64 @@ extension LazyOp {
             let totalSize = numRows * numCols
             let maxFrameCount = 4096  // Same as spectralLossFFTGrad
 
-            // Only create gradient ops if the input is a direct tensorRef
+            // Get or create gradient cell - works for both direct tensorRefs and intermediate results
+            let gradCell: CellID
             if let tensorId = g.nodeToTensor[tensorInput],
                 let tensor = g.tensors[tensorId]
             {
-                let tensorCellId = tensor.cellId
-
-                // Get or create gradient cell for input tensor
-                let gradCell: CellID
-                if let existing = g.gradCarryCells[tensorCellId] {
+                // Direct tensorRef - use or create gradCarryCells entry
+                if let existing = g.gradCarryCells[tensor.cellId] {
                     gradCell = existing
                 } else {
                     gradCell = g.alloc(vectorWidth: totalSize)
-                    g.gradCarryCells[tensorCellId] = gradCell
+                    g.gradCarryCells[tensor.cellId] = gradCell
                 }
-
-                // Allocate frame-indexed storage for deterministic gradient accumulation
-                let gradWriteCell = g.alloc(vectorWidth: maxFrameCount * numCols)
-                let rowIdxCell = g.alloc(vectorWidth: maxFrameCount)
-
-                // Phase 1: Write gradients to frame-indexed storage (no atomics)
-                let rowIndex = node.inputs[1]
-                let writeOp = g.n(
-                    .selectRowGradWrite(
-                        gradWriteCell: gradWriteCell,
-                        rowIdxCell: rowIdxCell,
-                        numRows: numRows,
-                        numCols: numCols
-                    ), [gradOutput, rowIndex])
-                g.addGradientSideEffect(writeOp)
-
-                // Phase 2: Reduce across frames (sums to gradCell)
-                let reduceOp = g.n(
-                    .selectRowGradReduce(
-                        gradWriteCell: gradWriteCell,
-                        rowIdxCell: rowIdxCell,
-                        gradCell: gradCell,
-                        numRows: numRows,
-                        numCols: numCols,
-                        maxFrameCount: maxFrameCount
-                    ), [writeOp])
-                g.addGradientSideEffect(reduceOp)
+            } else {
+                // Intermediate result (e.g., matmul output) - create a fresh gradCell
+                gradCell = g.alloc(vectorWidth: totalSize)
             }
 
-            // Return gradient for tensor (expanded) and zero for rowIndex
+            // Allocate frame-indexed storage for deterministic gradient accumulation
+            let gradWriteCell = g.alloc(vectorWidth: maxFrameCount * numCols)
+            let rowIdxCell = g.alloc(vectorWidth: maxFrameCount)
+
+            // Phase 1: Write gradients to frame-indexed storage (no atomics)
+            let rowIndex = node.inputs[1]
+            let writeOp = g.n(
+                .selectRowGradWrite(
+                    gradWriteCell: gradWriteCell,
+                    rowIdxCell: rowIdxCell,
+                    numRows: numRows,
+                    numCols: numCols
+                ), [gradOutput, rowIndex])
+            g.addGradientSideEffect(writeOp)
+
+            // Phase 2: Reduce across frames (sums to gradCell)
+            let reduceOp = g.n(
+                .selectRowGradReduce(
+                    gradWriteCell: gradWriteCell,
+                    rowIdxCell: rowIdxCell,
+                    gradCell: gradCell,
+                    numRows: numRows,
+                    numCols: numCols,
+                    maxFrameCount: maxFrameCount
+                ), [writeOp])
+            g.addGradientSideEffect(reduceOp)
+
+            // Create a tensor backed by gradCell and return tensorRef sequenced after reduceOp
+            let gradTensorId = g.nextTensorId
+            g.nextTensorId += 1
+            g.tensors[gradTensorId] = Tensor(id: gradTensorId, shape: shape, cellId: gradCell)
+            g.cellToTensor[gradCell] = gradTensorId
+            let gradTensorRef = g.n(.tensorRef(gradTensorId), [], shape: .tensor(shape))
+            g.nodeToTensor[gradTensorRef] = gradTensorId
+
+            // Sequence reduceOp -> tensorRef to ensure gradient is computed before reading
+            let sequencedGrad = g.n(.seq, reduceOp, gradTensorRef)
+            g.nodeToTensor[sequencedGrad] = gradTensorId
+
             let zero = g.n(.constant(0.0), [])
-            let tensorGrad = g.n(.expand(shape), [gradOutput])
-            return [tensorGrad, zero]
+            return [sequencedGrad, zero]
 
         case .selectRowGradWrite(_, _, _, _), .selectRowGradReduce(_, _, _, _, _, _):
             // Gradient ops don't need their own gradients
@@ -760,59 +771,70 @@ extension LazyOp {
             let totalSize = numRows * numCols
             let maxFrameCount = 4096
 
-            // Only create gradient ops if the input is a direct tensorRef
+            // Get or create gradient cell - works for both direct tensorRefs and intermediate results
+            let gradCell: CellID
             if let tensorId = g.nodeToTensor[tensorInput],
                 let tensor = g.tensors[tensorId]
             {
-                let tensorCellId = tensor.cellId
-
-                // Get or create gradient cell for input tensor
-                let gradCell: CellID
-                if let existing = g.gradCarryCells[tensorCellId] {
+                // Direct tensorRef - use or create gradCarryCells entry
+                if let existing = g.gradCarryCells[tensor.cellId] {
                     gradCell = existing
                 } else {
                     gradCell = g.alloc(vectorWidth: totalSize)
-                    g.gradCarryCells[tensorCellId] = gradCell
+                    g.gradCarryCells[tensor.cellId] = gradCell
                 }
-
-                // Allocate frame-indexed storage
-                let floorGradCell = g.alloc(vectorWidth: maxFrameCount * numCols)
-                let ceilGradCell = g.alloc(vectorWidth: maxFrameCount * numCols)
-                let rowIdxCell = g.alloc(vectorWidth: maxFrameCount * 2)  // floor and ceil indices
-                let fracCell = g.alloc(vectorWidth: maxFrameCount)
-
-                // Phase 1: Write weighted gradients to frame-indexed storage
-                let rowIndex = node.inputs[1]
-                let writeOp = g.n(
-                    .peekRowGradWrite(
-                        floorGradCell: floorGradCell,
-                        ceilGradCell: ceilGradCell,
-                        rowIdxCell: rowIdxCell,
-                        fracCell: fracCell,
-                        numRows: numRows,
-                        numCols: numCols
-                    ), [gradOutput, rowIndex])
-                g.addGradientSideEffect(writeOp)
-
-                // Phase 2: Reduce across frames
-                let reduceOp = g.n(
-                    .peekRowGradReduce(
-                        floorGradCell: floorGradCell,
-                        ceilGradCell: ceilGradCell,
-                        rowIdxCell: rowIdxCell,
-                        fracCell: fracCell,
-                        gradCell: gradCell,
-                        numRows: numRows,
-                        numCols: numCols,
-                        maxFrameCount: maxFrameCount
-                    ), [writeOp])
-                g.addGradientSideEffect(reduceOp)
+            } else {
+                // Intermediate result (e.g., matmul output) - create a fresh gradCell
+                gradCell = g.alloc(vectorWidth: totalSize)
             }
 
-            // Return gradient for tensor and zero for rowIndex
+            // Allocate frame-indexed storage
+            let floorGradCell = g.alloc(vectorWidth: maxFrameCount * numCols)
+            let ceilGradCell = g.alloc(vectorWidth: maxFrameCount * numCols)
+            let rowIdxCell = g.alloc(vectorWidth: maxFrameCount * 2)  // floor and ceil indices
+            let fracCell = g.alloc(vectorWidth: maxFrameCount)
+
+            // Phase 1: Write weighted gradients to frame-indexed storage
+            let rowIndex = node.inputs[1]
+            let writeOp = g.n(
+                .peekRowGradWrite(
+                    floorGradCell: floorGradCell,
+                    ceilGradCell: ceilGradCell,
+                    rowIdxCell: rowIdxCell,
+                    fracCell: fracCell,
+                    numRows: numRows,
+                    numCols: numCols
+                ), [gradOutput, rowIndex])
+            g.addGradientSideEffect(writeOp)
+
+            // Phase 2: Reduce across frames
+            let reduceOp = g.n(
+                .peekRowGradReduce(
+                    floorGradCell: floorGradCell,
+                    ceilGradCell: ceilGradCell,
+                    rowIdxCell: rowIdxCell,
+                    fracCell: fracCell,
+                    gradCell: gradCell,
+                    numRows: numRows,
+                    numCols: numCols,
+                    maxFrameCount: maxFrameCount
+                ), [writeOp])
+            g.addGradientSideEffect(reduceOp)
+
+            // Create a tensor backed by gradCell and return tensorRef sequenced after reduceOp
+            let gradTensorId = g.nextTensorId
+            g.nextTensorId += 1
+            g.tensors[gradTensorId] = Tensor(id: gradTensorId, shape: shape, cellId: gradCell)
+            g.cellToTensor[gradCell] = gradTensorId
+            let gradTensorRef = g.n(.tensorRef(gradTensorId), [], shape: .tensor(shape))
+            g.nodeToTensor[gradTensorRef] = gradTensorId
+
+            // Sequence reduceOp -> tensorRef to ensure gradient is computed before reading
+            let sequencedGrad = g.n(.seq, reduceOp, gradTensorRef)
+            g.nodeToTensor[sequencedGrad] = gradTensorId
+
             let zero = g.n(.constant(0.0), [])
-            let tensorGrad = g.n(.expand(shape), [gradOutput])
-            return [tensorGrad, zero]
+            return [sequencedGrad, zero]
 
         case .peekRowGradWrite(_, _, _, _, _, _), .peekRowGradReduce(_, _, _, _, _, _, _, _):
             // Gradient ops don't need their own gradients

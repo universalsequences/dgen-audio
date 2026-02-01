@@ -1333,8 +1333,8 @@ final class GraphGradientTests: XCTestCase {
         let inputData = (0..<(numRows * inputSize)).map { Float($0) * 0.1 }
         let inputTensor = g.tensor(shape: [numRows, inputSize], data: inputData)
 
-        // Learnable weight tensor [inputSize, numCols]
-        let weightData = (0..<(inputSize * numCols)).map { _ in Float.random(in: -0.5...0.5) }
+        // Learnable weight tensor [inputSize, numCols] - deterministic initialization
+        let weightData = (0..<(inputSize * numCols)).map { Float($0) * 0.1 }
         let weightTensor = TensorParameter(
             graph: g, shape: [inputSize, numCols], data: weightData, name: "weights")
 
