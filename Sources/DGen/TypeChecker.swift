@@ -428,7 +428,10 @@ public func allocateTensorMemory(
   }
 
   // Find all outbound cells across all blocks
+  // Also track which cells are produced in frame-based tensor blocks and consumed within them
   var outboundCells: Set<CellID> = []
+  var intraBlockFrameAwareCells: Set<CellID> = []
+
   for (blockIdx, block) in blocks.enumerated() {
     // Collect cells produced by this block
     var producedCells: Set<CellID> = []
@@ -455,6 +458,28 @@ public func allocateTensorMemory(
         }
       }
     }
+
+    // Check for intra-block consumption in frame-based tensor blocks
+    // Tensors produced and consumed within a frame-based tensor block need frame-aware storage
+    // because each frame runs in parallel and needs its own copy
+    let isFrameBasedBlock = block.temporality == .frameBased &&
+      block.shape != nil  // Tensor block
+
+    if isFrameBasedBlock {
+      for nodeId in block.nodes {
+        guard let node = graph.nodes[nodeId] else { continue }
+        for inputId in node.inputs {
+          if let inputNode = graph.nodes[inputId], case .tensor = inputNode.shape {
+            if let tensorId = graph.nodeToTensor[inputId], let tensor = graph.tensors[tensorId] {
+              // Only add if produced in this same block and is frame-based
+              if producedCells.contains(tensor.cellId) && frameBasedNodes.contains(inputId) {
+                intraBlockFrameAwareCells.insert(tensor.cellId)
+              }
+            }
+          }
+        }
+      }
+    }
   }
 
   // Now allocate real memory for lazy tensors
@@ -467,48 +492,49 @@ public func allocateTensorMemory(
     let isOutbound = outboundCells.contains(lazyCellId)
     let isFrameBased = nodeId.map { frameBasedNodes.contains($0) } ?? false
 
-    if isOutbound {
-      let allocSize: Int
-      if isFrameBased {
-        // Frame-based outbound tensor: needs tensorSize * frameCount
-        allocSize = tensorSize * frameCount
-        let realCellId = graph.allocateLazyCell(lazyCellId, vectorWidth: allocSize)
-        graph.frameAwareCells[realCellId] = (tensorSize: tensorSize, frameCount: frameCount)
+    // Determine if this tensor needs frame-aware allocation
+    let needsFrameAwareAlloc = isFrameBased &&
+      (isOutbound || intraBlockFrameAwareCells.contains(lazyCellId))
 
-        // Update tensor with real cell ID
-        graph.tensors[tensorId] = Tensor(
-          id: tensor.id,
-          shape: tensor.shape,
-          cellId: realCellId,
-          data: tensor.data,
-          strides: tensor.strides,
-          offset: tensor.offset,
-          isView: tensor.isView,
-          padding: tensor.padding,
-          isLazy: false
-        )
-        graph.cellToTensor[realCellId] = tensorId
-      } else {
-        // Static outbound tensor: just needs tensorSize
-        allocSize = tensorSize
-        let realCellId = graph.allocateLazyCell(lazyCellId, vectorWidth: allocSize)
+    if needsFrameAwareAlloc {
+      // Frame-based tensor (outbound or intra-block consumed): needs tensorSize * frameCount
+      let allocSize = tensorSize * frameCount
+      let realCellId = graph.allocateLazyCell(lazyCellId, vectorWidth: allocSize)
+      graph.frameAwareCells[realCellId] = (tensorSize: tensorSize, frameCount: frameCount)
 
-        // Update tensor with real cell ID
-        graph.tensors[tensorId] = Tensor(
-          id: tensor.id,
-          shape: tensor.shape,
-          cellId: realCellId,
-          data: tensor.data,
-          strides: tensor.strides,
-          offset: tensor.offset,
-          isView: tensor.isView,
-          padding: tensor.padding,
-          isLazy: false
-        )
-        graph.cellToTensor[realCellId] = tensorId
-      }
+      // Update tensor with real cell ID
+      graph.tensors[tensorId] = Tensor(
+        id: tensor.id,
+        shape: tensor.shape,
+        cellId: realCellId,
+        data: tensor.data,
+        strides: tensor.strides,
+        offset: tensor.offset,
+        isView: tensor.isView,
+        padding: tensor.padding,
+        isLazy: false
+      )
+      graph.cellToTensor[realCellId] = tensorId
+    } else if isOutbound {
+      // Static outbound tensor: just needs tensorSize
+      let allocSize = tensorSize
+      let realCellId = graph.allocateLazyCell(lazyCellId, vectorWidth: allocSize)
+
+      // Update tensor with real cell ID
+      graph.tensors[tensorId] = Tensor(
+        id: tensor.id,
+        shape: tensor.shape,
+        cellId: realCellId,
+        data: tensor.data,
+        strides: tensor.strides,
+        offset: tensor.offset,
+        isView: tensor.isView,
+        padding: tensor.padding,
+        isLazy: false
+      )
+      graph.cellToTensor[realCellId] = tensorId
     }
-    // Non-outbound lazy tensors stay lazy (register-only, no memory needed)
+    // Non-outbound, non-intra-block lazy tensors stay lazy (register-only, no memory needed)
   }
 }
 

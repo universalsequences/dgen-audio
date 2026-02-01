@@ -400,10 +400,28 @@ public enum LazyOp {
 
             let size = shape.reduce(1, *)
 
-            // Emit loop that reads each element and accumulates
-            b.parallelRange(size) { idx in
-                let val = b.memoryRead(tensor.cellId, b.cast(idx, to: .int))
-                _ = b.memoryAccumulate(cellId, b.cast(idx, to: .int), val)
+            // Check if input tensor is frame-aware (has per-frame storage)
+            if ctx.frameAwareTensorCells.contains(tensor.cellId),
+               let (tensorSize, frameCount) = ctx.g.frameAwareCells[tensor.cellId]
+            {
+                // Frame-aware: sum across all frames into the accumulation cell
+                // Each frame has its own copy at frameIdx * tensorSize + elemIdx
+                let tensorSizeFloat = b.constant(Float(tensorSize))
+                b.parallelRange(size) { elemIdx in
+                    let elemIdxFloat = b.cast(elemIdx, to: .float)
+                    b.loop(frameCount) { frameIdx in
+                        let frameIdxFloat = b.cast(frameIdx, to: .float)
+                        let readPos = frameIdxFloat * tensorSizeFloat + elemIdxFloat
+                        let val = b.memoryRead(tensor.cellId, b.cast(readPos, to: .int))
+                        _ = b.memoryAccumulate(cellId, b.cast(elemIdx, to: .int), val)
+                    }
+                }
+            } else {
+                // Non-frame-aware: existing linear read
+                b.parallelRange(size) { idx in
+                    let val = b.memoryRead(tensor.cellId, b.cast(idx, to: .int))
+                    _ = b.memoryAccumulate(cellId, b.cast(idx, to: .int), val)
+                }
             }
 
             ctx.values[nodeId] = .empty
@@ -2336,25 +2354,50 @@ public enum LazyOp {
             let size = targetShape.reduce(1, *)
             let inputNodeId = node.inputs[0]
 
+            // Check if output tensor is frame-aware (needs per-frame storage)
+            let isFrameAware = ctx.frameAwareTensorCells.contains(outTensor.cellId)
+
             // Check if input has a tensor cell we can read from (for cross-scope access)
             if let inputTensorId = g.nodeToTensor[inputNodeId],
                 let inputTensor = g.tensors[inputTensorId]
             {
                 // Input is a tensor - read element 0 (assumes scalar stored in tensor)
-                b.parallelRange(size) { idx in
-                    let scalarVal = b.memoryRead(inputTensor.cellId, b.int(0))
-                    _ = b.memoryWrite(outTensor.cellId, b.cast(idx, to: .int), scalarVal)
+                if isFrameAware {
+                    // Frame-aware output: write to frame-indexed positions
+                    let frameIdx = b.currentFrameIndex()
+                    let frameBase = frameIdx * b.constant(Float(size))
+                    b.parallelRange(size) { idx in
+                        let scalarVal = b.memoryRead(inputTensor.cellId, b.int(0))
+                        let writePos = frameBase + b.cast(idx, to: .float)
+                        _ = b.memoryWrite(outTensor.cellId, b.cast(writePos, to: .int), scalarVal)
+                    }
+                } else {
+                    // Non-frame-aware: existing linear write
+                    b.parallelRange(size) { idx in
+                        let scalarVal = b.memoryRead(inputTensor.cellId, b.int(0))
+                        _ = b.memoryWrite(outTensor.cellId, b.cast(idx, to: .int), scalarVal)
+                    }
                 }
             } else {
                 // Input is a scalar computed in current scope
-                // First, store the scalar to element 0 of output to capture it
                 let scalarVal = b.value(inputs[0])
-                _ = b.memoryWrite(outTensor.cellId, b.int(0), scalarVal)
 
-                // Then fill all elements by reading from the stored value
-                b.parallelRange(size) { idx in
-                    let storedVal = b.memoryRead(outTensor.cellId, b.int(0))
-                    _ = b.memoryWrite(outTensor.cellId, b.cast(idx, to: .int), storedVal)
+                if isFrameAware {
+                    // Frame-aware output: write to frame-indexed positions
+                    // Use scalar directly without write-read-back to avoid race condition
+                    let frameIdx = b.currentFrameIndex()
+                    let frameBase = frameIdx * b.constant(Float(size))
+                    b.parallelRange(size) { idx in
+                        let writePos = frameBase + b.cast(idx, to: .float)
+                        _ = b.memoryWrite(outTensor.cellId, b.cast(writePos, to: .int), scalarVal)
+                    }
+                } else {
+                    // Non-frame-aware: use write-read-back pattern for scope capture
+                    _ = b.memoryWrite(outTensor.cellId, b.int(0), scalarVal)
+                    b.parallelRange(size) { idx in
+                        let storedVal = b.memoryRead(outTensor.cellId, b.int(0))
+                        _ = b.memoryWrite(outTensor.cellId, b.cast(idx, to: .int), storedVal)
+                    }
                 }
             }
 
