@@ -687,24 +687,9 @@ extension LazyOp {
             let numRows = shape[0]
             let numCols = shape[1]
             let totalSize = numRows * numCols
-            let maxFrameCount = 4096  // Same as spectralLossFFTGrad
+            let maxFrameCount = 4096
 
-            // Get or create gradient cell - works for both direct tensorRefs and intermediate results
-            let gradCell: CellID
-            if let tensorId = g.nodeToTensor[tensorInput],
-                let tensor = g.tensors[tensorId]
-            {
-                // Direct tensorRef - use or create gradCarryCells entry
-                if let existing = g.gradCarryCells[tensor.cellId] {
-                    gradCell = existing
-                } else {
-                    gradCell = g.alloc(vectorWidth: totalSize)
-                    g.gradCarryCells[tensor.cellId] = gradCell
-                }
-            } else {
-                // Intermediate result (e.g., matmul output) - create a fresh gradCell
-                gradCell = g.alloc(vectorWidth: totalSize)
-            }
+            let gradCell = getOrCreateGradCell(g, tensorInput: tensorInput, totalSize: totalSize)
 
             // Allocate frame-indexed storage for deterministic gradient accumulation
             let gradWriteCell = g.alloc(vectorWidth: maxFrameCount * numCols)
@@ -733,18 +718,7 @@ extension LazyOp {
                 ), [writeOp])
             g.addGradientSideEffect(reduceOp)
 
-            // Create a tensor backed by gradCell and return tensorRef sequenced after reduceOp
-            let gradTensorId = g.nextTensorId
-            g.nextTensorId += 1
-            g.tensors[gradTensorId] = Tensor(id: gradTensorId, shape: shape, cellId: gradCell)
-            g.cellToTensor[gradCell] = gradTensorId
-            let gradTensorRef = g.n(.tensorRef(gradTensorId), [], shape: .tensor(shape))
-            g.nodeToTensor[gradTensorRef] = gradTensorId
-
-            // Sequence reduceOp -> tensorRef to ensure gradient is computed before reading
-            let sequencedGrad = g.n(.seq, reduceOp, gradTensorRef)
-            g.nodeToTensor[sequencedGrad] = gradTensorId
-
+            let sequencedGrad = createSequencedGradTensor(g, gradCell: gradCell, shape: shape, afterOp: reduceOp)
             let zero = g.n(.constant(0.0), [])
             return [sequencedGrad, zero]
 
@@ -752,7 +726,7 @@ extension LazyOp {
             // Gradient ops don't need their own gradients
             return node.inputs.map { _ in nil }
 
-        case .peekRowInline(let scratchCell, let numRows, let numCols):
+        case .peekRowInline(_, let numRows, let numCols):
             // peekRowInline(tensor2D, rowIndex) -> 1D tensor [numCols]
             // Gradient scatters to both floor and ceil rows with interpolation weights
             guard node.inputs.count == 2 else {
@@ -771,22 +745,7 @@ extension LazyOp {
             let totalSize = numRows * numCols
             let maxFrameCount = 4096
 
-            // Get or create gradient cell - works for both direct tensorRefs and intermediate results
-            let gradCell: CellID
-            if let tensorId = g.nodeToTensor[tensorInput],
-                let tensor = g.tensors[tensorId]
-            {
-                // Direct tensorRef - use or create gradCarryCells entry
-                if let existing = g.gradCarryCells[tensor.cellId] {
-                    gradCell = existing
-                } else {
-                    gradCell = g.alloc(vectorWidth: totalSize)
-                    g.gradCarryCells[tensor.cellId] = gradCell
-                }
-            } else {
-                // Intermediate result (e.g., matmul output) - create a fresh gradCell
-                gradCell = g.alloc(vectorWidth: totalSize)
-            }
+            let gradCell = getOrCreateGradCell(g, tensorInput: tensorInput, totalSize: totalSize)
 
             // Allocate frame-indexed storage
             let floorGradCell = g.alloc(vectorWidth: maxFrameCount * numCols)
@@ -821,18 +780,7 @@ extension LazyOp {
                 ), [writeOp])
             g.addGradientSideEffect(reduceOp)
 
-            // Create a tensor backed by gradCell and return tensorRef sequenced after reduceOp
-            let gradTensorId = g.nextTensorId
-            g.nextTensorId += 1
-            g.tensors[gradTensorId] = Tensor(id: gradTensorId, shape: shape, cellId: gradCell)
-            g.cellToTensor[gradCell] = gradTensorId
-            let gradTensorRef = g.n(.tensorRef(gradTensorId), [], shape: .tensor(shape))
-            g.nodeToTensor[gradTensorRef] = gradTensorId
-
-            // Sequence reduceOp -> tensorRef to ensure gradient is computed before reading
-            let sequencedGrad = g.n(.seq, reduceOp, gradTensorRef)
-            g.nodeToTensor[sequencedGrad] = gradTensorId
-
+            let sequencedGrad = createSequencedGradTensor(g, gradCell: gradCell, shape: shape, afterOp: reduceOp)
             let zero = g.n(.constant(0.0), [])
             return [sequencedGrad, zero]
 
@@ -949,6 +897,46 @@ extension LazyOp {
         return inverse
     }
 
+    /// Get or create a gradient cell for a tensor input.
+    /// For direct tensorRefs, uses gradCarryCells to share gradient storage.
+    /// For intermediate results, allocates a fresh cell.
+    private func getOrCreateGradCell(
+        _ g: Graph,
+        tensorInput: NodeID,
+        totalSize: Int
+    ) -> CellID {
+        if let tensorId = g.nodeToTensor[tensorInput],
+            let tensor = g.tensors[tensorId]
+        {
+            if let existing = g.gradCarryCells[tensor.cellId] {
+                return existing
+            }
+            let gradCell = g.alloc(vectorWidth: totalSize)
+            g.gradCarryCells[tensor.cellId] = gradCell
+            return gradCell
+        }
+        return g.alloc(vectorWidth: totalSize)
+    }
+
+    /// Create a tensor backed by gradCell and return a tensorRef sequenced after the given op.
+    /// This ensures the gradient is computed before reading.
+    private func createSequencedGradTensor(
+        _ g: Graph,
+        gradCell: CellID,
+        shape: [Int],
+        afterOp: NodeID
+    ) -> NodeID {
+        let gradTensorId = g.nextTensorId
+        g.nextTensorId += 1
+        g.tensors[gradTensorId] = Tensor(id: gradTensorId, shape: shape, cellId: gradCell)
+        g.cellToTensor[gradCell] = gradTensorId
+        let gradTensorRef = g.n(.tensorRef(gradTensorId), [], shape: .tensor(shape))
+        g.nodeToTensor[gradTensorRef] = gradTensorId
+        let sequencedGrad = g.n(.seq, afterOp, gradTensorRef)
+        g.nodeToTensor[sequencedGrad] = gradTensorId
+        return sequencedGrad
+    }
+
     /// Reduce gradient along broadcast dimensions to match target shape.
     /// When A[M,1,K] * B[1,N,K] -> C[M,N,K], the gradient for A needs to be summed
     /// along axis 1 (where A had size 1 but C has size N).
@@ -977,7 +965,7 @@ extension LazyOp {
         // If gradient has more dimensions, we need to sum over leading dimensions first
         if gradRank > targetRank {
             // Sum over the extra leading dimensions
-            for axis in 0..<(gradRank - targetRank) {
+            for _ in 0..<(gradRank - targetRank) {
                 result = g.n(.sumAxis(0), [result])
             }
             // Update shape tracking for the result
