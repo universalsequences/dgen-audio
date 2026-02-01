@@ -120,6 +120,8 @@ public struct CompilationPipeline {
                 debug: false)
         }
 
+        print("\(ANSI.red)SORTED NODES=\(sortedNodes)\(ANSI.reset)")
+
         try time("inferShapes") {
             try inferShapes(graph: graph, sortedNodes: sortedNodes)
         }
@@ -169,6 +171,8 @@ public struct CompilationPipeline {
             )
         }
 
+        print("SIMPLE BLOCKS DETERMINED=\(blocks.compactMap{$0.nodes})")
+
         // Since we're using corridor-aware topological sort, blocks are already properly ordered
         // Fuse adjacent blocks of the same kind to reduce cross-block communication
 
@@ -177,35 +181,19 @@ public struct CompilationPipeline {
             fuseBlocks(blocks, graph)
         }
 
-        // Isolate spectralLossPass1 and Pass2 into their own kernels to avoid dependency issues
-        let isolatedBlocks = time("isolateSpectral") {
-            isolateSpectralPasses(fusedBlocks, graph)
-        }
-
-        // Re-run fusion after isolation, to merge any adjacent same-kind blocks that were split
-        // by isolation but do not straddle Pass1/Pass2 boundaries.
-        let reFusedBlocks = time("fuseBlocks2") {
-            fuseBlocks(isolatedBlocks, graph)
-        }
-
         let context = IRContext(g: graph)
 
         // finally separate tensor blocks of shared size into their own blocks
         let seperatedBlocks = time("tensorBlocks") {
-            determineTensorBlocks(reFusedBlocks, graph, context)
+            determineTensorBlocks(fusedBlocks, graph, context)
         }
 
         var finalBlocks = seperatedBlocks.compactMap { $0 }
-
-        // Re-check block kinds after tensor block splitting.
-        time("recheckBlockKinds") {
-            for i in 0..<finalBlocks.count {
-                let allNodesScalar = finalBlocks[i].nodes.allSatisfy { finalScalarSet.contains($0) }
-                if allNodesScalar && finalBlocks[i].kind == .simd {
-                    finalBlocks[i].kind = .scalar
-                }
-            }
+        if backend == .metal {
+            finalBlocks = splitReduceBlocks(g: graph, blocks: seperatedBlocks.compactMap { $0 })
         }
+        print("split reduced shapes=\(finalBlocks.map({$0.shape}))")
+        print("split reduced blocks=\(finalBlocks.compactMap{$0.nodes})")
 
         // Step 4: Infer temporality and assign to blocks
         // This now includes hop-based temporality for FFT/IFFT and downstream operations
@@ -213,6 +201,7 @@ public struct CompilationPipeline {
             inferTemporality(graph: graph, sortedNodes: sortedNodes)
         }
 
+        /*
         // Step 4.5: Detect frame-dependent tensor chains for SIMD-across-frames optimization
         let fusableChains = time("detectChains") {
             detectFrameDependentTensorChains(
@@ -227,6 +216,9 @@ public struct CompilationPipeline {
             context.frameTensorChainNodes.formUnion(chain.chainNodes)
         }
 
+         */
+
+        /*
         // this step currently breaks C SIMD blocks (causes duplicate definitions)
         if backend == .metal {
             finalBlocks = extractStaticOpsIntoBlocks(
@@ -252,6 +244,7 @@ public struct CompilationPipeline {
                 }
             }
         }
+         */
 
         time("assignTemporality") {
             assignBlockTemporality(
@@ -262,7 +255,54 @@ public struct CompilationPipeline {
         }
 
         // Store frame-based nodes in context for smart gradient buffer allocation
-        context.frameBasedNodes = temporalityResult.frameBasedNodes
+        //context.frameBasedNodes = temporalityResult.frameBasedNodes
+
+        // Step 4.6: Detect frame-aware tensors and update their allocations
+        // Frame-aware tensors have outbound dependencies in frame-based blocks
+        // and need tensorSize × frameCount cells for parallel execution
+        // TEMPORARILY DISABLED: Frame-aware tensor allocation causes issues with gradient flow
+        // when the corresponding isFrameAwareTensorBlock flag is disabled in Blocks.swift.
+        // Both must be enabled together for the optimization to work correctly.
+        // See plan file: ethereal-purring-wren.md for implementation details.
+        /*
+        if false && backend == .metal {
+            time("frameAwareTensors") {
+                let frameAwareTensorNodes = findFrameAwareTensors(finalBlocks, graph)
+                context.frameAwareTensorNodes = frameAwareTensorNodes
+
+                // Update tensor allocations to use frame-aware storage
+                for nodeId in frameAwareTensorNodes {
+                    guard let tensorId = graph.nodeToTensor[nodeId],
+                        let tensor = graph.tensors[tensorId],
+                        case .tensor(let shape) = graph.nodes[nodeId]?.shape
+                    else { continue }
+
+                    let tensorSize = shape.reduce(1, *)
+                    let oldCellId = tensor.cellId
+
+                    // Allocate new frame-aware storage
+                    let newCellId = graph.allocFrameAware(
+                        tensorSize: tensorSize, frameCount: options.frameCount)
+                    context.frameAwareTensorCells.insert(newCellId)
+
+                    // Update tensor to use new cell
+                    graph.tensors[tensorId] = Tensor(
+                        id: tensor.id,
+                        shape: tensor.shape,
+                        cellId: newCellId,
+                        strides: tensor.strides,
+                        offset: tensor.offset,
+                        isView: tensor.isView,
+                        padding: tensor.padding
+                    )
+
+                    // Update cellToTensor mapping
+                    graph.cellToTensor[oldCellId] = nil
+                    graph.cellToTensor[newCellId] = tensorId
+                }
+            }
+        }
+         */
 
         let finalBlockIndices = Array(0..<finalBlocks.count)
 
@@ -366,7 +406,8 @@ public struct CompilationPipeline {
                     let scratchSize = frameCount * tensorSize
                     let scratchCell = graph.alloc(vectorWidth: scratchSize)
                     context.frameTensorChainScratch[chain.reductionNodeId] =
-                        IRContext.FrameTensorChainScratch(cellId: scratchCell, tensorSize: tensorSize)
+                        IRContext.FrameTensorChainScratch(
+                            cellId: scratchCell, tensorSize: tensorSize)
                 }
 
                 // Reduce block: just the reduction node
@@ -386,9 +427,14 @@ public struct CompilationPipeline {
             return result
         }
 
+        for (i, block) in finalBlocks.enumerated() {
+
+            print("\(ANSI.red)NODES in block \(i+1)\(ANSI.reset) -> \(block.nodes) ")
+        }
         try time("emitBlockUOps") {
             for blockIdx in finalBlockIndices {
                 let block = finalBlocks[blockIdx]
+                print("emitting block with shape=\(block.shape)")
                 let ops = try emitBlockUOps(
                     ctx: context,
                     block: block,
@@ -397,7 +443,9 @@ public struct CompilationPipeline {
                     backend: backend,
                     debug: options.debug
                 )
+                print("extracting thread count")
                 let (threadCountScale, filteredOps) = extractThreadCountScale(ops)
+                print("threadCoutnScale we extracted=\(threadCountScale)")
                 var finalOps = filteredOps
                 let effectiveKind: Kind
                 if backend == .c, threadCountScale != nil {
@@ -423,7 +471,7 @@ public struct CompilationPipeline {
         uopBlocks.removeAll { $0.ops.isEmpty }
 
         if options.debug {
-            printUOpBlocks(uopBlocks)
+            printUOpBlocks(uopBlocks, blocks: finalBlocks)
         }
 
         // Step 7: Lower UOp blocks to compiled kernels
@@ -534,9 +582,11 @@ extension CompilationResult {
 
 // MARK: - Debug Helpers
 
-private func printUOpBlocks(_ uopBlocks: [BlockUOps]) {
+private func printUOpBlocks(_ uopBlocks: [BlockUOps], blocks: [Block]) {
     for (i, uopBlock) in uopBlocks.enumerated() {
-        print("block #\(i+1)")
+        print(
+            "block #\(i+1) kind=\(uopBlock.kind) threadCountScale\(uopBlock.threadCountScale) shape=\(blocks[i].shape) tensorIndex=\(blocks[i].tensorIndex)"
+        )
         var indentLevel = 0
         for uop in uopBlock.ops {
             switch uop.op {
@@ -896,6 +946,11 @@ func determineTensorBlocks(_ blocks: [Block], _ graph: Graph, _ ctx: IRContext) 
                 // trigger new tensor block creation. The actual tensor OPERATIONS (mul, add, etc.)
                 // that process tensor data will create the tensor blocks.
                 if case .tensorRef = node.op {
+                    if case .tensor(let shape) = node.shape {
+                        currentBlock.shape = shape
+                        currentBlock.tensorIndex = ctx.useVariable(src: nil)
+                        currentShape = shape
+                    }
                     currentBlock.nodes.append(nodeId)
                     continue
                 }
@@ -940,6 +995,8 @@ func determineTensorBlocks(_ blocks: [Block], _ graph: Graph, _ ctx: IRContext) 
                     currentBlock = makeBlock(from: block)
                     currentShape = nil
                     continue  // Skip the append at end of loop
+                } else if case .constant = node.op {
+                    // do nothing
                 } else if case .ifft = node.op {
                     // IFFT is a bulk operation that handles spectrum-to-time conversion
                     // It needs its own scalar block - don't mix with SIMD ops

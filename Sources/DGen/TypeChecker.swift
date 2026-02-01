@@ -214,7 +214,7 @@ public func inferShape(op: LazyOp, inputs: [ValueShape], graph: Graph) throws ->
     .tan, .log, .log10, .abs, .sign, .floor, .ceil, .round,
     .pow, .mod, .min, .max, .atan2, .gt, .gte, .lt, .lte, .eq,
     .and, .or, .xor, .gswitch, .mix,
-    .phasor(_), .accum(_), .latch(_), .deterministicPhasor:
+    .phasor(_), .accum(_), .latch(_), .deterministicPhasor, .gradPhasor, .gradDeterministicPhasor:
     let tensors = inputs.filter { x in
       if case .tensor(_) = x { return true }
       return false
@@ -254,10 +254,6 @@ public func inferShape(op: LazyOp, inputs: [ValueShape], graph: Graph) throws ->
   case .expandAxis(let targetShape, _):
     // ExpandAxis broadcasts along an axis
     return .tensor(targetShape)
-
-  case .gradPhasor(_), .gradDeterministicPhasor:
-    // Gradient ops produce scalars (per-frame gradients)
-    return .scalar
 
   // everything else is a scalar
   default: return .scalar
@@ -780,157 +776,4 @@ public struct FrameDependentTensorChain {
   public let chainNodes: Set<NodeID>
   /// Shape of the tensor being processed
   public let tensorShape: [Int]
-}
-
-/// Detect frame-dependent tensor chains that can be fused for SIMD-across-frames execution.
-///
-/// A valid chain:
-/// 1. Starts at a "transition point" - a node with tensor output, frame-based input, and static tensor input
-///    (e.g., selectRow reading from static tensor with frame-dependent row index)
-/// 2. Continues through element-wise tensor operations (mul, add, sin, cos, etc.)
-/// 3. Ends at a scalar reduction (sum)
-/// 4. Has no cross-element dependencies within the chain
-///
-/// When such a chain is detected, each frame can independently compute the entire tensor chain
-/// in thread-local storage, then output the final scalar to a frame-indexed scratch buffer.
-public func detectFrameDependentTensorChains(
-  graph: Graph,
-  sortedNodes: [NodeID],
-  frameBasedNodes: Set<NodeID>
-) -> [FrameDependentTensorChain] {
-  var chains: [FrameDependentTensorChain] = []
-
-  // Build consumer map for forward traversal
-  var consumers: [NodeID: [NodeID]] = [:]
-  for (nodeId, node) in graph.nodes {
-    for inputId in node.inputs {
-      consumers[inputId, default: []].append(nodeId)
-    }
-  }
-
-  func isElementWise(_ op: LazyOp) -> Bool {
-    switch op {
-    case .mul, .add, .sub, .div, .sin, .cos, .tan, .tanh, .exp, .log, .sqrt,
-      .abs, .sign, .floor, .ceil, .round, .pow, .min, .max, .gswitch,
-      .deterministicPhasor:
-      return true
-    default:
-      return false
-    }
-  }
-
-  func isTransitionPoint(_ node: Node) -> Bool {
-    // A transition point has:
-    // 1. Tensor output (checked via shape)
-    // 2. At least one frame-based input (checked via frameBasedNodes)
-    // 3. At least one static tensor input (not frame-based, has tensor shape)
-    guard case .tensor = node.shape else { return false }
-
-    let hasFrameBasedInput = node.inputs.contains { frameBasedNodes.contains($0) }
-    let hasStaticTensorInput = node.inputs.contains { inputId in
-      guard let inputNode = graph.nodes[inputId] else { return false }
-      if frameBasedNodes.contains(inputId) { return false }
-      if case .tensor = inputNode.shape { return true }
-      return false
-    }
-
-    // selectRow is the canonical transition point
-    if case .selectRow = node.op {
-      return hasFrameBasedInput && hasStaticTensorInput
-    }
-
-    // deterministicPhasor: static tensor -> frame-based tensor (implicit frame input)
-    if case .deterministicPhasor = node.op {
-      return hasStaticTensorInput
-    }
-
-    return false
-  }
-
-  // Find transition points
-  for nodeId in sortedNodes {
-    guard let node = graph.nodes[nodeId] else { continue }
-    guard isTransitionPoint(node) else { continue }
-
-    // Trace forward through element-wise ops to find terminal reduction
-    var chainNodes: Set<NodeID> = [nodeId]
-    var frontier: [NodeID] = [nodeId]
-    var reductionNode: NodeID? = nil
-    var tensorShape: [Int]? = nil
-
-    if case .tensor(let shape) = node.shape {
-      tensorShape = shape
-    }
-
-    while !frontier.isEmpty && reductionNode == nil {
-      let current = frontier.removeFirst()
-
-      for consumerId in consumers[current] ?? [] {
-        guard let consumer = graph.nodes[consumerId] else { continue }
-
-        // Check if this is the terminal reduction
-        if case .sum = consumer.op {
-          chainNodes.insert(consumerId)
-          reductionNode = consumerId
-          break
-        }
-
-        // Check if this is an element-wise op that can be part of the chain
-        if isElementWise(consumer.op) {
-          // Verify it has tensor shape matching our chain
-          if case .tensor(let shape) = consumer.shape, shape == tensorShape {
-            chainNodes.insert(consumerId)
-            frontier.append(consumerId)
-          }
-        }
-      }
-    }
-
-    // Valid chain found - must end in reduction
-    if let reduction = reductionNode, let shape = tensorShape {
-      // Expand chain to include tensor-producing inputs to element-wise ops
-      var expanded = chainNodes
-      var changed = true
-      while changed {
-        changed = false
-        for nodeId in Array(expanded) {
-          guard let node = graph.nodes[nodeId] else { continue }
-          for inputId in node.inputs {
-            guard let inputNode = graph.nodes[inputId] else { continue }
-            guard case .tensor(let inputShape) = inputNode.shape, inputShape == shape else {
-              continue
-            }
-            // Include tensor inputs that feed into the chain
-            switch inputNode.op {
-            case .selectRow, .deterministicPhasor:
-              if !expanded.contains(inputId) {
-                expanded.insert(inputId)
-                changed = true
-              }
-            default:
-              if isElementWise(inputNode.op), !expanded.contains(inputId) {
-                expanded.insert(inputId)
-                changed = true
-              }
-            }
-          }
-        }
-      }
-
-      // Avoid duplicate chains for the same reduction
-      if chains.contains(where: { $0.reductionNodeId == reduction }) {
-        continue
-      }
-
-      chains.append(
-        FrameDependentTensorChain(
-          transitionNodeId: nodeId,
-          reductionNodeId: reduction,
-          chainNodes: expanded,
-          tensorShape: shape
-        ))
-    }
-  }
-
-  return chains
 }

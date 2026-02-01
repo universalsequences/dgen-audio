@@ -14,7 +14,7 @@ public struct Node {
 }
 
 open class Graph {
-    private var next = 0
+    public var next = 0
     public var nodes: [NodeID: Node] = [:]
     private var nextCellId = 0
     public var nextTensorId = 0
@@ -36,6 +36,10 @@ open class Graph {
     /// Used for temporal gradient flow through historyRead/historyWrite.
     public var gradCarryCells: [CellID: CellID] = [:]
     public var tensorGradCells: [NodeID: CellID] = [:]
+
+    /// Track frame-aware tensor allocations: cellId -> (tensorSize, frameCount)
+    /// Used for tensors with outbound dependencies that need tensorSize * frameCount cells.
+    public var frameAwareCells: [CellID: (tensorSize: Int, frameCount: Int)] = [:]
 
     /// Side-effect nodes created during backward pass (e.g., gradient carry writes)
     /// These need to be chained with gradient outputs to ensure they execute.
@@ -125,6 +129,16 @@ open class Graph {
     /// Allocate a single cell (backward compatibility)
     public func alloc() -> CellID {
         return alloc(vectorWidth: 1)
+    }
+
+    /// Allocate frame-aware tensor storage: tensorSize * frameCount cells.
+    /// Used for tensors with outbound dependencies in frame-based blocks.
+    /// Memory layout: memory[cellId + frameIdx * tensorSize + elemIdx]
+    public func allocFrameAware(tensorSize: Int, frameCount: Int) -> CellID {
+        let totalSize = tensorSize * frameCount
+        let cellId = alloc(vectorWidth: totalSize)
+        frameAwareCells[cellId] = (tensorSize: tensorSize, frameCount: frameCount)
+        return cellId
     }
 
     public func seq(a: NodeID, b: NodeID) -> NodeID {

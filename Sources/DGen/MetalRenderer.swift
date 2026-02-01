@@ -7,8 +7,8 @@ public class MetalRenderer: Renderer, UOpEmitter {
   var currentTemporality: Temporality = .frameBased  // Track temporality for gradient indexing
   var frameIndexOverride: String? = nil
   private enum ParallelRangeMode {
-    case loop      // Render as a for-loop (default)
-    case thread    // Render as a single-thread index (thread-parallel kernel)
+    case loop  // Render as a for-loop (default)
+    case thread  // Render as a single-thread index (thread-parallel kernel)
   }
   private var parallelRangeMode: ParallelRangeMode = .loop
   private var useReducedGradsSum = false
@@ -29,7 +29,7 @@ public class MetalRenderer: Renderer, UOpEmitter {
     for item in scheduleItems {
       guard item.temporality == .static_ else { continue }
       for uop in item.ops {
-        if case let .defineGlobal(varId) = uop.op {
+        if case .defineGlobal(let varId) = uop.op {
           staticGlobalVars.insert(varId)
         }
       }
@@ -147,10 +147,11 @@ public class MetalRenderer: Renderer, UOpEmitter {
     }
 
     let ops = scheduleItem.ops
-    guard let beginRangeIdx = ops.firstIndex(where: {
-      if case .beginRange = $0.op { return true }
-      return false
-    }),
+    guard
+      let beginRangeIdx = ops.firstIndex(where: {
+        if case .beginRange = $0.op { return true }
+        return false
+      }),
       let endRangeIdx = ops.lastIndex(where: {
         if case .endRange = $0.op { return true }
         return false
@@ -170,7 +171,7 @@ public class MetalRenderer: Renderer, UOpEmitter {
 
     for op in coreOps {
       switch op.op {
-      case let .beginParallelRange(count, _):
+      case .beginParallelRange(let count, _):
         if parallelDepth == 0 {
           if !current.isEmpty {
             segments.append((ops: current, parallelCount: nil))
@@ -280,15 +281,15 @@ public class MetalRenderer: Renderer, UOpEmitter {
     var info = KernelAccessInfo()
     for uop in scheduleItem.ops {
       switch uop.op {
-      case let .memoryRead(base, _):
+      case .memoryRead(let base, _):
         info.reads.insert(base)
-      case let .memoryWrite(base, _, _):
+      case .memoryWrite(let base, _, _):
         info.writes.insert(base)
-      case let .load(cellId):
+      case .load(let cellId):
         info.reads.insert(cellId)
-      case let .store(cellId, _):
+      case .store(let cellId, _):
         info.writes.insert(cellId)
-      case let .delay1(cellId, _):
+      case .delay1(let cellId, _):
         info.reads.insert(cellId)
         info.writes.insert(cellId)
       case .loadGradMemory:
@@ -397,11 +398,14 @@ public class MetalRenderer: Renderer, UOpEmitter {
     }
 
     for block in uopBlocks {
+      let needsNewKernel = true
+      /*
       let needsNewKernel = currentKind != block.kind
         || currentTemporality != block.temporality
         || currentPolicy != block.parallelPolicy
         || currentThreadCountScale != block.threadCountScale
         || block.forceNewKernel
+       */
 
       if needsNewKernel {
         closeCurrentKernel()
@@ -599,11 +603,11 @@ public class MetalRenderer: Renderer, UOpEmitter {
     // Helper to check if a Lazy value contains a global reference
     func checkLazyForGlobal(_ lazy: Lazy) {
       switch lazy {
-      case let .global(id):
+      case .global(let id):
         // Global values need the tape buffer
         inputs.insert(id)
         outputs.insert(id)
-      case let .variable(id, _):
+      case .variable(let id, _):
         // Check if this variable is a global in the context
         if ctx.globals.contains(id) {
           inputs.insert(id)
@@ -619,11 +623,11 @@ public class MetalRenderer: Renderer, UOpEmitter {
       checkLazyForGlobal(uop.value)
 
       switch uop.op {
-      case let .defineGlobal(varId):
+      case .defineGlobal(let varId):
         outputs.insert(varId)
-      case let .loadGlobal(varId):
+      case .loadGlobal(let varId):
         inputs.insert(varId)
-      case let .loadTape(val, _):
+      case .loadTape(let val, _):
         checkLazyForGlobal(val)
       case .load, .store, .delay1, .memoryRead, .memoryWrite, .memoryAccumulate, .noise:
         needsMemory = true
@@ -649,21 +653,21 @@ public class MetalRenderer: Renderer, UOpEmitter {
     switch uop.op {
     case .defineMemory: return ""
 
-    case let .add(a, b): return emitAssign(uop, "\(g(a)) + \(g(b))", ctx)
-    case let .mul(a, b): return emitAssign(uop, "\(g(a)) * \(g(b))", ctx)
-    case let .sub(a, b): return emitAssign(uop, "\(g(a)) - \(g(b))", ctx)
-    case let .div(a, b):
+    case .add(let a, let b): return emitAssign(uop, "\(g(a)) + \(g(b))", ctx)
+    case .mul(let a, let b): return emitAssign(uop, "\(g(a)) * \(g(b))", ctx)
+    case .sub(let a, let b): return emitAssign(uop, "\(g(a)) - \(g(b))", ctx)
+    case .div(let a, let b):
       // Strength-reduce division by constant to multiply by reciprocal
       switch b {
-      case let .constant(_, val):
+      case .constant(_, let val):
         return emitAssign(uop, "(\(g(a)) * \(1.0/val))", ctx)
       default:
         return emitAssign(uop, "\(g(a)) / \(g(b))", ctx)
       }
-    case let .mod(a, b):
+    case .mod(let a, let b):
       // Fast modulo for constant denominator: a - floor(a / b) * b
       switch b {
-      case let .constant(_, val):
+      case .constant(_, let val):
         if val == 1.0 {
           return emitAssign(uop, "(\(g(a)) - metal::floor(\(g(a))))", ctx)
         } else {
@@ -672,10 +676,10 @@ public class MetalRenderer: Renderer, UOpEmitter {
       default:
         return emitAssign(uop, "metal::fmod(\(g(a)), \(g(b)))", ctx)
       }
-    case let .pow(a, b):
+    case .pow(let a, let b):
       // Specialize common exponents to avoid expensive pow
       switch b {
-      case let .constant(_, val):
+      case .constant(_, let val):
         if val == 1.0 { return emitAssign(uop, "\(g(a))", ctx) }
         if val == 2.0 { return emitAssign(uop, "(\(g(a)) * \(g(a)))", ctx) }
         if val == 3.0 { return emitAssign(uop, "(\(g(a)) * \(g(a)) * \(g(a)))", ctx) }
@@ -687,20 +691,20 @@ public class MetalRenderer: Renderer, UOpEmitter {
         return emitAssign(uop, "metal::pow(\(g(a)), \(g(b)))", ctx)
       default:
         // If base is constant: exp(b * log(base))
-        if case let .constant(_, baseVal) = a {
+        if case .constant(_, let baseVal) = a {
           return emitAssign(uop, "metal::exp(\(g(b)) * metal::log(\(baseVal)))", ctx)
         }
         return emitAssign(uop, "metal::pow(\(g(a)), \(g(b)))", ctx)
       }
-    case let .min(a, b): return emitAssign(uop, "metal::min(\(g(a)), \(g(b)))", ctx)
-    case let .max(a, b): return emitAssign(uop, "metal::max(\(g(a)), \(g(b)))", ctx)
+    case .min(let a, let b): return emitAssign(uop, "metal::min(\(g(a)), \(g(b)))", ctx)
+    case .max(let a, let b): return emitAssign(uop, "metal::max(\(g(a)), \(g(b)))", ctx)
 
-    case let .abs(a): return emitAssign(uop, "metal::abs(\(g(a)))", ctx)
-    case let .sign(a): return emitAssign(uop, "metal::sign(\(g(a)))", ctx)
-    case let .floor(a): return emitAssign(uop, "metal::floor(\(g(a)))", ctx)
-    case let .ceil(a): return emitAssign(uop, "metal::ceil(\(g(a)))", ctx)
-    case let .round(a): return emitAssign(uop, "metal::round\(g(a)))", ctx)
-    case let .noise(cellId):
+    case .abs(let a): return emitAssign(uop, "metal::abs(\(g(a)))", ctx)
+    case .sign(let a): return emitAssign(uop, "metal::sign(\(g(a)))", ctx)
+    case .floor(let a): return emitAssign(uop, "metal::floor(\(g(a)))", ctx)
+    case .ceil(let a): return emitAssign(uop, "metal::ceil(\(g(a)))", ctx)
+    case .round(let a): return emitAssign(uop, "metal::round\(g(a)))", ctx)
+    case .noise(let cellId):
       // Xorshift32 PRNG - better spectral properties than LCG
       let expr = """
         ({
@@ -712,32 +716,33 @@ public class MetalRenderer: Renderer, UOpEmitter {
         })
         """
       return emitAssign(uop, expr, ctx)
-    case let .memoryRead(base, offset):
+    case .memoryRead(let base, let offset):
       return emitAssign(uop, "memory[\(base) + (int)\(g(offset))]", ctx)
-    case let .memoryWrite(base, offset, value):
+    case .memoryWrite(let base, let offset, let value):
       return "memory[\(base) + (int)\(g(offset))] = \(g(value));"
-    case let .memoryAccumulate(base, offset, value):
+    case .memoryAccumulate(let base, let offset, let value):
       // Atomic add to memory cell - safe for concurrent accumulation from SIMD threads
-      return "atomic_fetch_add_explicit((device metal::atomic<float>*)&memory[\(base) + (int)\(g(offset))], \(g(value)), metal::memory_order_relaxed);"
-    case let .sin(a): return emitAssign(uop, "metal::sin(\(g(a)))", ctx)
-    case let .cos(a): return emitAssign(uop, "metal::cos(\(g(a)))", ctx)
-    case let .tan(a): return emitAssign(uop, "metal::tan(\(g(a)))", ctx)
-    case let .tanh(a): return emitAssign(uop, "metal::tanh(\(g(a)))", ctx)
-    case let .exp(a): return emitAssign(uop, "metal::exp(\(g(a)))", ctx)
-    case let .log(a): return emitAssign(uop, "metal::log(\(g(a)))", ctx)
-    case let .log10(a): return emitAssign(uop, "metal::log10(\(g(a)))", ctx)
-    case let .sqrt(a): return emitAssign(uop, "metal::sqrt(\(g(a)))", ctx)
-    case let .atan2(y, x): return emitAssign(uop, "metal::atan2(\(g(y)), \(g(x)))", ctx)
+      return
+        "atomic_fetch_add_explicit((device metal::atomic<float>*)&memory[\(base) + (int)\(g(offset))], \(g(value)), metal::memory_order_relaxed);"
+    case .sin(let a): return emitAssign(uop, "metal::sin(\(g(a)))", ctx)
+    case .cos(let a): return emitAssign(uop, "metal::cos(\(g(a)))", ctx)
+    case .tan(let a): return emitAssign(uop, "metal::tan(\(g(a)))", ctx)
+    case .tanh(let a): return emitAssign(uop, "metal::tanh(\(g(a)))", ctx)
+    case .exp(let a): return emitAssign(uop, "metal::exp(\(g(a)))", ctx)
+    case .log(let a): return emitAssign(uop, "metal::log(\(g(a)))", ctx)
+    case .log10(let a): return emitAssign(uop, "metal::log10(\(g(a)))", ctx)
+    case .sqrt(let a): return emitAssign(uop, "metal::sqrt(\(g(a)))", ctx)
+    case .atan2(let y, let x): return emitAssign(uop, "metal::atan2(\(g(y)), \(g(x)))", ctx)
 
-    case let .gt(a, b): return emitAssign(uop, "\(g(a)) > \(g(b))", ctx)
-    case let .gte(a, b): return emitAssign(uop, "\(g(a)) >= \(g(b))", ctx)
-    case let .lte(a, b): return emitAssign(uop, "\(g(a)) <= \(g(b))", ctx)
-    case let .lt(a, b): return emitAssign(uop, "\(g(a)) < \(g(b))", ctx)
-    case let .eq(a, b): return emitAssign(uop, "\(g(a)) == \(g(b))", ctx)
-    case let .gswitch(cond, a, b):
+    case .gt(let a, let b): return emitAssign(uop, "\(g(a)) > \(g(b))", ctx)
+    case .gte(let a, let b): return emitAssign(uop, "\(g(a)) >= \(g(b))", ctx)
+    case .lte(let a, let b): return emitAssign(uop, "\(g(a)) <= \(g(b))", ctx)
+    case .lt(let a, let b): return emitAssign(uop, "\(g(a)) < \(g(b))", ctx)
+    case .eq(let a, let b): return emitAssign(uop, "\(g(a)) == \(g(b))", ctx)
+    case .gswitch(let cond, let a, let b):
       let expr = "metal::select(\(g(b)), \(g(a)), \(g(cond)) > 0.0)"
       return emitAssign(uop, expr, ctx)
-    case let .delay1(cell, a):
+    case .delay1(let cell, let a):
       // Metal thread-per-sample delay-by-1 using threadgroup neighbor exchange.
       // Also persists the last 4 current values to memory[cell..cell+3] at the end of the segment.
       // Relies on segmented dispatch so all threads in a group hit barriers.
@@ -760,7 +765,7 @@ public class MetalRenderer: Renderer, UOpEmitter {
     /**
      delay1 implemented via threadgroup neighbor exchange
      */
-    case let .selector(mode, options):
+    case .selector(let mode, let options):
       // Metal: if mode <= 0 return 0, if mode <= 1 return options[0], etc.
       var expr = "0.0f"  // Default value
 
@@ -774,18 +779,20 @@ public class MetalRenderer: Renderer, UOpEmitter {
 
       return emitAssign(uop, expr, ctx)
 
-    case let .load(cell): return emitAssign(uop, "memory[\(cell)]", ctx)
-    case let .loadGradMemory(cellId): return emitAssign(uop, "grad_memory[\(cellId)]", ctx)
+    case .load(let cell): return emitAssign(uop, "memory[\(cell)]", ctx)
+    case .loadGradMemory(let cellId): return emitAssign(uop, "grad_memory[\(cellId)]", ctx)
     case .frameIndex:
-      return emitAssign(uop, frameIndexOverride ?? "i", ctx)
-    case let .loadTape(val, offset):
+      // Use id for SIMD blocks, i for scalar blocks
+      let baseIdx = (uop.kind == .simd) ? "id" : "i"
+      return emitAssign(uop, frameIndexOverride ?? baseIdx, ctx)
+    case .loadTape(let val, let offset):
       let varId = ctx.getGlobalId(extractVarId(val))
       let boundedFetch =
         "(\(g(offset)) < 0 || \(g(offset)) >= frameCount) ? 0.0 : t[\(varId) * frameCount + (int)\(g(offset))]"
       return emitAssign(uop, boundedFetch, ctx)
-    case let .store(cell, val): return "memory[\(cell)] = \(g(val));"
-    case let .storeGradMemory(cell, val): return "grad_memory[\(cell)] = \(g(val));"
-    case let .loadGrad(gradId):
+    case .store(let cell, let val): return "memory[\(cell)] = \(g(val));"
+    case .storeGradMemory(let cell, let val): return "grad_memory[\(cell)] = \(g(val));"
+    case .loadGrad(let gradId):
       let hasOverride = frameIndexOverride != nil
       if case .static_ = currentTemporality, !hasOverride {
         if useReducedGradsSum {
@@ -794,29 +801,33 @@ public class MetalRenderer: Renderer, UOpEmitter {
           // Static blocks must sum gradients from all frames
           let varName = emitLazy(uop.value, ctx: ctx, kind: uop.kind, isOut: true)
           return """
-            float \(varName) = 0.0;
-            for (uint _gfi = 0; _gfi < frameCount; _gfi++) {
-              \(varName) += gradients[frameCount * \(gradId) + _gfi];
-            }
-          """
+              float \(varName) = 0.0;
+              for (uint _gfi = 0; _gfi < frameCount; _gfi++) {
+                \(varName) += gradients[frameCount * \(gradId) + _gfi];
+              }
+            """
         }
       } else {
         let baseIdx = uop.kind == .scalar ? "i" : "id"
-        let idx = frameIndexOverride
-          ?? (currentThreadCountScale == nil ? baseIdx : "(\(baseIdx) / \(currentThreadCountScale!))")
+        let idx =
+          frameIndexOverride
+          ?? (currentThreadCountScale == nil
+            ? baseIdx : "(\(baseIdx) / \(currentThreadCountScale!))")
         return emitAssign(uop, "gradients[frameCount * \(gradId) + \(idx)]", ctx)
       }
-    case let .accumulateGrad(gradId, val):
+    case .accumulateGrad(let gradId, let val):
       let idx: String
       if case .static_ = currentTemporality, frameIndexOverride == nil {
         idx = "0"
       } else {
         let baseIdx = uop.kind == .scalar ? "i" : "id"
-        idx = frameIndexOverride
-          ?? (currentThreadCountScale == nil ? baseIdx : "(\(baseIdx) / \(currentThreadCountScale!))")
+        idx =
+          frameIndexOverride
+          ?? (currentThreadCountScale == nil
+            ? baseIdx : "(\(baseIdx) / \(currentThreadCountScale!))")
       }
       return "gradients[frameCount*\(gradId)+\(idx)] += \(g(val));"
-    case let .loadTensorGrad(baseGradId, indexLazy):
+    case .loadTensorGrad(let baseGradId, let indexLazy):
       let hasOverride = frameIndexOverride != nil
       if case .static_ = currentTemporality, !hasOverride {
         if useReducedGradsSum {
@@ -828,47 +839,53 @@ public class MetalRenderer: Renderer, UOpEmitter {
           // Static blocks must sum gradients from all frames
           let varName = emitLazy(uop.value, ctx: ctx, kind: uop.kind, isOut: true)
           return """
-            float \(varName) = 0.0;
-            for (uint _gfi = 0; _gfi < frameCount; _gfi++) {
-              \(varName) += gradients[frameCount*(\(baseGradId)+(int)(\(g(indexLazy))))+_gfi];
-            }
-          """
+              float \(varName) = 0.0;
+              for (uint _gfi = 0; _gfi < frameCount; _gfi++) {
+                \(varName) += gradients[frameCount*(\(baseGradId)+(int)(\(g(indexLazy))))+_gfi];
+              }
+            """
         }
       } else {
         let baseIdx = uop.kind == .scalar ? "i" : "id"
-        let idx = frameIndexOverride
-          ?? (currentThreadCountScale == nil ? baseIdx : "(\(baseIdx) / \(currentThreadCountScale!))")
-        return emitAssign(uop, "gradients[frameCount*(\(baseGradId)+(int)(\(g(indexLazy))))+\(idx)]", ctx)
+        let idx =
+          frameIndexOverride
+          ?? (currentThreadCountScale == nil
+            ? baseIdx : "(\(baseIdx) / \(currentThreadCountScale!))")
+        return emitAssign(
+          uop, "gradients[frameCount*(\(baseGradId)+(int)(\(g(indexLazy))))+\(idx)]", ctx)
       }
-    case let .accumulateTensorGrad(baseGradId, indexLazy, valueLazy):
+    case .accumulateTensorGrad(let baseGradId, let indexLazy, let valueLazy):
       let idx: String
       if case .static_ = currentTemporality, frameIndexOverride == nil {
         idx = "0"
       } else {
         let baseIdx = uop.kind == .scalar ? "i" : "id"
-        idx = frameIndexOverride
-          ?? (currentThreadCountScale == nil ? baseIdx : "(\(baseIdx) / \(currentThreadCountScale!))")
+        idx =
+          frameIndexOverride
+          ?? (currentThreadCountScale == nil
+            ? baseIdx : "(\(baseIdx) / \(currentThreadCountScale!))")
       }
-      return "gradients[frameCount*(\(baseGradId)+(int)(\(g(indexLazy))))+\(idx)] += \(g(valueLazy));"
-    case let .mutate(a, b):
+      return
+        "gradients[frameCount*(\(baseGradId)+(int)(\(g(indexLazy))))+\(idx)] += \(g(valueLazy));"
+    case .mutate(let a, let b):
       return "\(emitLazy(a, ctx: ctx, kind: uop.kind, isOut: true)) = \(g(b));"
-    case let .beginIf(cond): return "if (\(g(cond))) {"
+    case .beginIf(let cond): return "if (\(g(cond))) {"
     case .endIf: return "}"
 
     case .setThreadCountScale:
       return "/* setThreadCountScale - handled in scheduler */"
 
-    case let .setFrameIndex(idx):
+    case .setFrameIndex(let idx):
       frameIndexOverride = "_frameIndex"
       return "uint _frameIndex = (uint)(\(g(idx)));"
 
-    case let .beginLoop(iters, step):
+    case .beginLoop(let iters, let step):
       if step < 0 {
         return "for (int i = \(g(iters)) - 1; i >= 0; i += \(step)) {"
       } else {
         return "for (uint i = 0; i < \(g(iters)); i += \(step)) {"
       }
-    case let .beginForLoop(loopVar, count):
+    case .beginForLoop(let loopVar, let count):
       guard case .variable(let varId, _) = loopVar else {
         fatalError("beginForLoop requires variable")
       }
@@ -887,26 +904,26 @@ public class MetalRenderer: Renderer, UOpEmitter {
       let idx = (uop.kind == .simd) ? "id" : "i"
       return emitAssign(uop, idx, ctx)
 
-    case let .cast(expr, castType):
+    case .cast(let expr, let castType):
       let typeStr = castType == .int ? "int" : "float"
       return emitAssign(uop, "(\(typeStr))\(g(expr))", ctx)
 
-    case let .declareVar(value):
+    case .declareVar(let value):
       // Declares and initializes a variable: float t = value;
       return emitAssign(uop, g(value), ctx)
 
-    case let .beginRange(start, end):
+    case .beginRange(let start, let end):
       let startExpr: String
-      if case let .constant(_, val) = start {
+      if case .constant(_, let val) = start {
         startExpr = "\(Int(val))"
       } else {
         startExpr = "\(g(start))"
       }
 
       let endExpr: String
-      if case let .constant(_, val) = end {
+      if case .constant(_, let val) = end {
         endExpr = "\(Int(val))"
-      } else if case let .variable(id, _) = end, id == -1 {
+      } else if case .variable(let id, _) = end, id == -1 {
         endExpr = "frameCount"  // Special case for frameCount
       } else {
         endExpr = "\(g(end))"
@@ -915,24 +932,25 @@ public class MetalRenderer: Renderer, UOpEmitter {
       return "if (id >= \(startExpr) && id < (uint)(\(endExpr))) {"
     case .endRange: return "}"
 
-    case let .output(channel, val):
+    case .output(let channel, let val):
       // Store output value to a device buffer that can be read back
       let baseIdx = (uop.kind == .simd) ? "id" : "i"
-      let idx = frameIndexOverride
+      let idx =
+        frameIndexOverride
         ?? (currentThreadCountScale == nil
           ? baseIdx
           : "(\(baseIdx) / \(currentThreadCountScale!))")
       return "outputs[\(channel) * frameCount + \(idx)] = \(g(val));"
     case .input(_):
       return ""
-    case let .loadGlobal(id):
+    case .loadGlobal(let id):
       // For Metal, loadGlobal is handled transparently through direct buffer access
       // The actual variable access happens in emitLazy
       return "/* loadGlobal(\(id)) - handled in variable access */"
 
     // Parallel range - for Metal, could be thread-parallel for static tensors
     // For now, render as a loop (future: check block.temporality and use thread-parallel for static)
-    case let .beginParallelRange(count, _):
+    case .beginParallelRange(let count, _):
       guard case .variable(let varId, _) = uop.value else {
         fatalError("beginParallelRange requires variable")
       }
@@ -1003,8 +1021,8 @@ public class MetalRenderer: Renderer, UOpEmitter {
 
   func emitLazy(_ lazy: Lazy, ctx: IRContext, kind: Kind?, isOut: Bool) -> String {
     switch lazy {
-    case let .constant(_, val): return "\(val)"
-    case let .variable(id, _):
+    case .constant(_, let val): return "\(val)"
+    case .variable(let id, _):
       if id == -1 {  // Special case for frameCount
         return "frameCount"
       } else if parallelRangeVars.contains(id) {
@@ -1013,23 +1031,27 @@ public class MetalRenderer: Renderer, UOpEmitter {
       } else if ctx.globals.contains(id) {
         let tapeSlot = ctx.getGlobalId(id)
         let baseIdx = (kind == .simd) ? "id" : "i"
-        let idx = staticGlobalVars.contains(id)
+        let idx =
+          staticGlobalVars.contains(id)
           ? "0"
           : (frameIndexOverride
-            ?? (currentThreadCountScale == nil ? baseIdx : "(\(baseIdx) / \(currentThreadCountScale!))"))
+            ?? (currentThreadCountScale == nil
+              ? baseIdx : "(\(baseIdx) / \(currentThreadCountScale!))"))
         return
           "t[\(tapeSlot)*frameCount + \(needsSegmenting ? "segmentBase + " : "") \(idx)]"
       } else {
         return "t\(id)"
       }
-    case let .global(id):
+    case .global(let id):
       // Global variables are accessed through global buffers
       let tapeSlot = ctx.getGlobalId(id)
       let baseIdx = (kind == .simd) ? "id" : "i"
-      let idx = staticGlobalVars.contains(id)
+      let idx =
+        staticGlobalVars.contains(id)
         ? "0"
         : (frameIndexOverride
-          ?? (currentThreadCountScale == nil ? baseIdx : "(\(baseIdx) / \(currentThreadCountScale!))"))
+          ?? (currentThreadCountScale == nil
+            ? baseIdx : "(\(baseIdx) / \(currentThreadCountScale!))"))
       return
         "t[\(tapeSlot)*frameCount + \(needsSegmenting ? "segmentBase + " : "")\(idx)]"
     default: return "/* unknown lazy */"

@@ -50,7 +50,9 @@ public struct GraphSGD: GraphOptimizer {
         }
     }
 
-    public mutating func updateTensors(tensorParameters: inout [TensorParameter], learningRate: Float) {
+    public mutating func updateTensors(
+        tensorParameters: inout [TensorParameter], learningRate: Float
+    ) {
         for param in tensorParameters {
             for i in 0..<param.data.count {
                 param.data[i] -= learningRate * param.grads[i]
@@ -101,7 +103,9 @@ public struct GraphAdam: GraphOptimizer {
         }
     }
 
-    public mutating func updateTensors(tensorParameters: inout [TensorParameter], learningRate: Float) {
+    public mutating func updateTensors(
+        tensorParameters: inout [TensorParameter], learningRate: Float
+    ) {
         // Initialize momentum arrays if needed
         if tensorM.isEmpty && !tensorParameters.isEmpty {
             tensorM = tensorParameters.map { Array(repeating: Float(0.0), count: $0.data.count) }
@@ -270,11 +274,7 @@ public class GraphTrainingContext {
 
         // Write kernels to disk if debug output path provided
         if let outputPath = kernelDebugOutput {
-            let allKernels = result.kernels.enumerated().map {
-                "// KERNEL \($0.offset)\n// ThreadGroupSize \($0.element.threadGroupSize)\n// ThreadCount \($0.element.threadCount)\n\n\($0.element.source)"
-            }.joined(separator: "\n\n// ========================================\n\n")
-            try? allKernels.write(toFile: outputPath, atomically: true, encoding: .utf8)
-            print("Wrote kernels to: \(outputPath)")
+            writeKernelsToDisk(result, outputPath)
         }
 
         self.cellAllocations = result.cellAllocations

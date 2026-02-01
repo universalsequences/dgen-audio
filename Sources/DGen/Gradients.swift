@@ -42,7 +42,8 @@ extension Graph {
         let reverseOrder = reverseTopologicalOrder(from: loss, targets: targets)
         for nodeId in reverseOrder {
             guard let upstreamGrad = grads[nodeId],
-                  let node = nodes[nodeId] else { continue }
+                let node = nodes[nodeId]
+            else { continue }
 
             // Apply backward rule -> get gradient NodeIDs for inputs
             // Also handles side effects like storing to gradient carry cells
@@ -286,7 +287,8 @@ extension LazyOp {
             let x = node.inputs[0]
             let sinX = g.n(.sin, [x])
             let negSinX = g.n(.neg, [sinX])
-            return [g.n(.mul, [negSinX, gradOutput])]
+            let grad = g.n(.mul, [negSinX, gradOutput])
+            return [grad]
 
         case .tan:
             // d(tan(x))/dx = 1/cos^2(x) * grad = sec^2(x) * grad
@@ -395,12 +397,18 @@ extension LazyOp {
             // can use this scalar directly since the gradient is uniform across all elements.
             // This avoids the tensor allocation timing issue where computeGradients runs
             // before allocateTensorOutputs.
+            if let nodeInput = g.nodes[node.inputs[0]],
+                case .tensor(let shape) = nodeInput.shape
+            {
+                let expand = g.n(.expand(shape), [gradOutput])
+                return [expand]
+            }
             return [gradOutput]
-
         case .sumAxis(let axis):
             // Gradient broadcasts back along the reduced axis
             guard let inputNode = g.nodes[node.inputs[0]],
-                  case .tensor(let inputShape) = inputNode.shape else {
+                case .tensor(let inputShape) = inputNode.shape
+            else {
                 return [gradOutput]
             }
             // Expand gradient back to input shape along the reduced axis
@@ -411,7 +419,8 @@ extension LazyOp {
         case .reshape(_):
             // Gradient needs to be reshaped back to original shape
             guard let inputNode = g.nodes[node.inputs[0]],
-                  case .tensor(let origShape) = inputNode.shape else {
+                case .tensor(let origShape) = inputNode.shape
+            else {
                 return [gradOutput]
             }
             return [g.n(.reshape(origShape), [gradOutput])]
@@ -424,7 +433,8 @@ extension LazyOp {
         case .shrink(let ranges):
             // Gradient needs to be padded back
             guard let inputNode = g.nodes[node.inputs[0]],
-                  case .tensor(let origShape) = inputNode.shape else {
+                case .tensor(let origShape) = inputNode.shape
+            else {
                 return [gradOutput]
             }
             // Convert shrink ranges to pad amounts
@@ -440,7 +450,8 @@ extension LazyOp {
         case .pad(let amounts):
             // Gradient needs to be shrunk
             guard let inputNode = g.nodes[node.inputs[0]],
-                  case .tensor(let origShape) = inputNode.shape else {
+                case .tensor(let origShape) = inputNode.shape
+            else {
                 return [gradOutput]
             }
             // Convert pad amounts to shrink ranges
@@ -590,8 +601,9 @@ extension LazyOp {
             // Not yet supported in pure graph form
             return node.inputs.map { _ in nil }
 
-        case .spectralLossFFT(let windowSize, let useHann, let windowCell,
-                               _, _, _, _, _):
+        case .spectralLossFFT(
+            let windowSize, let useHann, let windowCell,
+            _, _, _, _, _):
             // FFT-based spectral loss backward pass
             // Recompute DFT inline to avoid race conditions from shared FFT cells
             let sig1 = node.inputs[0]
@@ -605,31 +617,34 @@ extension LazyOp {
 
             // Single gradient pass that recomputes DFT inline and scatters to time domain
             // Uses frame-indexed storage to avoid race conditions
-            let gradPass = g.n(.spectralLossFFTGradInline(
-                windowSize: windowSize,
-                useHann: useHann,
-                windowCell: windowCell,
-                gradTime1Cell: gradTime1Cell,
-                gradTime2Cell: gradTime2Cell
-            ), [gradOutput, sig1, sig2])
+            let gradPass = g.n(
+                .spectralLossFFTGradInline(
+                    windowSize: windowSize,
+                    useHann: useHann,
+                    windowCell: windowCell,
+                    gradTime1Cell: gradTime1Cell,
+                    gradTime2Cell: gradTime2Cell
+                ), [gradOutput, sig1, sig2])
 
             g.addGradientSideEffect(gradPass)
 
             // Read the gradient for the current frame's sample from frame-indexed storage
             // The gradient at position (frame * windowSize + windowSize - 1) is the gradient
             // for the current frame's input (the newest sample in the window)
-            let gradPassResult = g.n(.spectralLossFFTGradRead(
-                windowSize: windowSize,
-                gradTime1Cell: gradTime1Cell,
-                gradTime2Cell: gradTime2Cell
-            ), [gradPass])
+            let gradPassResult = g.n(
+                .spectralLossFFTGradRead(
+                    windowSize: windowSize,
+                    gradTime1Cell: gradTime1Cell,
+                    gradTime2Cell: gradTime2Cell
+                ), [gradPass])
 
             // Split the result into two separate gradient values
             // The gradPassResult returns grad1, we need another node for grad2
-            let grad2Node = g.n(.spectralLossFFTGradRead2(
-                windowSize: windowSize,
-                gradTime2Cell: gradTime2Cell
-            ), [gradPass])
+            let grad2Node = g.n(
+                .spectralLossFFTGradRead2(
+                    windowSize: windowSize,
+                    gradTime2Cell: gradTime2Cell
+                ), [gradPass])
 
             return [gradPassResult, grad2Node]
 
@@ -662,8 +677,9 @@ extension LazyOp {
 
             let tensorInput = node.inputs[0]
             guard let inputNode = g.nodes[tensorInput],
-                  case .tensor(let shape) = inputNode.shape,
-                  shape.count == 2 else {
+                case .tensor(let shape) = inputNode.shape,
+                shape.count == 2
+            else {
                 let zero = g.n(.constant(0.0), [])
                 return [nil, zero]
             }
@@ -675,7 +691,8 @@ extension LazyOp {
 
             // Only create gradient ops if the input is a direct tensorRef
             if let tensorId = g.nodeToTensor[tensorInput],
-               let tensor = g.tensors[tensorId] {
+                let tensor = g.tensors[tensorId]
+            {
                 let tensorCellId = tensor.cellId
 
                 // Get or create gradient cell for input tensor
@@ -693,23 +710,25 @@ extension LazyOp {
 
                 // Phase 1: Write gradients to frame-indexed storage (no atomics)
                 let rowIndex = node.inputs[1]
-                let writeOp = g.n(.selectRowGradWrite(
-                    gradWriteCell: gradWriteCell,
-                    rowIdxCell: rowIdxCell,
-                    numRows: numRows,
-                    numCols: numCols
-                ), [gradOutput, rowIndex])
+                let writeOp = g.n(
+                    .selectRowGradWrite(
+                        gradWriteCell: gradWriteCell,
+                        rowIdxCell: rowIdxCell,
+                        numRows: numRows,
+                        numCols: numCols
+                    ), [gradOutput, rowIndex])
                 g.addGradientSideEffect(writeOp)
 
                 // Phase 2: Reduce across frames (sums to gradCell)
-                let reduceOp = g.n(.selectRowGradReduce(
-                    gradWriteCell: gradWriteCell,
-                    rowIdxCell: rowIdxCell,
-                    gradCell: gradCell,
-                    numRows: numRows,
-                    numCols: numCols,
-                    maxFrameCount: maxFrameCount
-                ), [writeOp])
+                let reduceOp = g.n(
+                    .selectRowGradReduce(
+                        gradWriteCell: gradWriteCell,
+                        rowIdxCell: rowIdxCell,
+                        gradCell: gradCell,
+                        numRows: numRows,
+                        numCols: numCols,
+                        maxFrameCount: maxFrameCount
+                    ), [writeOp])
                 g.addGradientSideEffect(reduceOp)
             }
 
@@ -731,8 +750,9 @@ extension LazyOp {
 
             let tensorInput = node.inputs[0]
             guard let inputNode = g.nodes[tensorInput],
-                  case .tensor(let shape) = inputNode.shape,
-                  shape.count == 2 else {
+                case .tensor(let shape) = inputNode.shape,
+                shape.count == 2
+            else {
                 let zero = g.n(.constant(0.0), [])
                 return [nil, zero]
             }
@@ -742,7 +762,8 @@ extension LazyOp {
 
             // Only create gradient ops if the input is a direct tensorRef
             if let tensorId = g.nodeToTensor[tensorInput],
-               let tensor = g.tensors[tensorId] {
+                let tensor = g.tensors[tensorId]
+            {
                 let tensorCellId = tensor.cellId
 
                 // Get or create gradient cell for input tensor
@@ -762,27 +783,29 @@ extension LazyOp {
 
                 // Phase 1: Write weighted gradients to frame-indexed storage
                 let rowIndex = node.inputs[1]
-                let writeOp = g.n(.peekRowGradWrite(
-                    floorGradCell: floorGradCell,
-                    ceilGradCell: ceilGradCell,
-                    rowIdxCell: rowIdxCell,
-                    fracCell: fracCell,
-                    numRows: numRows,
-                    numCols: numCols
-                ), [gradOutput, rowIndex])
+                let writeOp = g.n(
+                    .peekRowGradWrite(
+                        floorGradCell: floorGradCell,
+                        ceilGradCell: ceilGradCell,
+                        rowIdxCell: rowIdxCell,
+                        fracCell: fracCell,
+                        numRows: numRows,
+                        numCols: numCols
+                    ), [gradOutput, rowIndex])
                 g.addGradientSideEffect(writeOp)
 
                 // Phase 2: Reduce across frames
-                let reduceOp = g.n(.peekRowGradReduce(
-                    floorGradCell: floorGradCell,
-                    ceilGradCell: ceilGradCell,
-                    rowIdxCell: rowIdxCell,
-                    fracCell: fracCell,
-                    gradCell: gradCell,
-                    numRows: numRows,
-                    numCols: numCols,
-                    maxFrameCount: maxFrameCount
-                ), [writeOp])
+                let reduceOp = g.n(
+                    .peekRowGradReduce(
+                        floorGradCell: floorGradCell,
+                        ceilGradCell: ceilGradCell,
+                        rowIdxCell: rowIdxCell,
+                        fracCell: fracCell,
+                        gradCell: gradCell,
+                        numRows: numRows,
+                        numCols: numCols,
+                        maxFrameCount: maxFrameCount
+                    ), [writeOp])
                 g.addGradientSideEffect(reduceOp)
             }
 
@@ -808,10 +831,11 @@ extension LazyOp {
 
             let tensorInput = node.inputs[0]
             guard let inputNode = g.nodes[tensorInput],
-                  case .tensor(let shape) = inputNode.shape,
-                  shape.count >= 2,
-                  let tensorId = g.nodeToTensor[tensorInput],
-                  let tensor = g.tensors[tensorId] else {
+                case .tensor(let shape) = inputNode.shape,
+                shape.count >= 2,
+                let tensorId = g.nodeToTensor[tensorInput],
+                let tensor = g.tensors[tensorId]
+            else {
                 let zero = g.n(.constant(0.0), [])
                 return [nil, zero, zero]
             }
@@ -841,11 +865,13 @@ extension LazyOp {
             // Wrap index within channel using modulo
             let wrappedIndex = g.n(.mod, [index, channelSizeFloat])
             let isNegative = g.n(.lt, [wrappedIndex, zero])
-            let positiveIndex = g.n(.gswitch, [isNegative, g.n(.add, [wrappedIndex, channelSizeFloat]), wrappedIndex])
+            let positiveIndex = g.n(
+                .gswitch, [isNegative, g.n(.add, [wrappedIndex, channelSizeFloat]), wrappedIndex])
 
             // Clamp channel to valid range [0, numChannels-1]
             let numChannelsMinusOne = g.n(.constant(Float(numChannels - 1)), [])
-            let clampedChannel = g.n(.floor, [g.n(.max, [zero, g.n(.min, [channel, numChannelsMinusOne])])])
+            let clampedChannel = g.n(
+                .floor, [g.n(.max, [zero, g.n(.min, [channel, numChannelsMinusOne])])])
             let channelOffset = g.n(.mul, [channelSizeFloat, clampedChannel])
 
             // Calculate final read position
@@ -856,7 +882,8 @@ extension LazyOp {
             // Next position with wrapping at channel boundary
             let nextPos = g.n(.add, [flooredPos, one])
             let nextChannelOffset = g.n(.add, [channelOffset, channelSizeFloat])
-            let nextPosWrapped = g.n(.gswitch, [g.n(.gte, [nextPos, nextChannelOffset]), channelOffset, nextPos])
+            let nextPosWrapped = g.n(
+                .gswitch, [g.n(.gte, [nextPos, nextChannelOffset]), channelOffset, nextPos])
 
             // Scatter gradients: dL/d(tensor[pos1]) += gradOut * (1-frac)
             //                    dL/d(tensor[pos2]) += gradOut * frac
@@ -903,10 +930,13 @@ extension LazyOp {
     /// Reduce gradient along broadcast dimensions to match target shape.
     /// When A[M,1,K] * B[1,N,K] -> C[M,N,K], the gradient for A needs to be summed
     /// along axis 1 (where A had size 1 but C has size N).
-    private func reduceBroadcastGradient(_ g: Graph, grad: NodeID, toShape targetShape: ValueShape?) -> NodeID {
+    private func reduceBroadcastGradient(_ g: Graph, grad: NodeID, toShape targetShape: ValueShape?)
+        -> NodeID
+    {
         guard let gradNode = g.nodes[grad],
-              case .tensor(let gradShape) = gradNode.shape,
-              case .tensor(let targetShapeArray) = targetShape else {
+            case .tensor(let gradShape) = gradNode.shape,
+            case .tensor(let targetShapeArray) = targetShape
+        else {
             // Scalar or unknown shape - no reduction needed
             return grad
         }
@@ -932,15 +962,19 @@ extension LazyOp {
             if let newNode = g.nodes[result], case .tensor(let newShape) = newNode.shape {
                 // Now newShape should have same rank as targetShapeArray
                 // Continue to check for broadcast dimensions
-                return reduceSameSizeGradient(g, grad: result, gradShape: newShape, targetShape: targetShapeArray)
+                return reduceSameSizeGradient(
+                    g, grad: result, gradShape: newShape, targetShape: targetShapeArray)
             }
         }
 
-        return reduceSameSizeGradient(g, grad: result, gradShape: gradShape, targetShape: targetShapeArray)
+        return reduceSameSizeGradient(
+            g, grad: result, gradShape: gradShape, targetShape: targetShapeArray)
     }
 
     /// Helper to reduce gradient when shapes have same rank but different sizes (broadcast case)
-    private func reduceSameSizeGradient(_ g: Graph, grad: NodeID, gradShape: [Int], targetShape: [Int]) -> NodeID {
+    private func reduceSameSizeGradient(
+        _ g: Graph, grad: NodeID, gradShape: [Int], targetShape: [Int]
+    ) -> NodeID {
         // Right-align shapes for comparison (NumPy-style broadcasting)
         let gradRank = gradShape.count
         let targetRank = targetShape.count

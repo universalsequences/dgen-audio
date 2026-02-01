@@ -253,7 +253,9 @@ public func determineScalarCorridors(_ g: Graph, feedbackClusters: [[NodeID]]) -
     return nodeToCorridorId
 }
 
-public func scalarNodes(_ g: Graph, feedbackClusters: [[NodeID]], backend: Backend = .metal) -> Set<NodeID> {
+public func scalarNodes(_ g: Graph, feedbackClusters: [[NodeID]], backend: Backend = .metal) -> Set<
+    NodeID
+> {
     var scalar: Set<NodeID> = []
 
     // Track nodes that are SIMD-safe due to using atomics (should never be scalar)
@@ -915,6 +917,24 @@ public func findOutputNodeNeeds(_ b: Block, _ g: Graph) -> Set<NodeID> {
     return outputNodeNeeds
 }
 
+/// Find tensor nodes with outbound dependencies in frame-based blocks.
+/// These tensors need frame-aware allocation (tensorSize × frameCount cells)
+/// to enable parallelization across frames without race conditions.
+public func findFrameAwareTensors(_ blocks: [Block], _ g: Graph) -> Set<NodeID> {
+    var result = Set<NodeID>()
+    for block in blocks where block.temporality == .frameBased {
+        // Only consider blocks with tensor shapes (tensor SIMD blocks)
+        guard block.shape != nil else { continue }
+
+        for nodeId in findNodesWithOutboundDependencies(blocks, g, block: block) {
+            if let node = g.nodes[nodeId], case .tensor = node.shape {
+                result.insert(nodeId)
+            }
+        }
+    }
+    return result
+}
+
 // ─── 3. decide which nodes need cross-block scratch buffers ─────
 // in the case of metal, these are transmitted via buffers
 public func findNodesWithOutboundDependencies(_ blks: [Block], _ g: Graph, block: Block) -> [NodeID]
@@ -1072,6 +1092,31 @@ private func containsSIMDBlockers(_ uops: [UOp], backend: Backend) -> Bool {
     return false
 }
 
+public func emitThreadCountScaleOpIfNeeded(ctx: IRContext, block: Block, g: Graph) -> [UOp] {
+    guard let shape = block.shape else { return [] }
+
+    // todo temporality check (are we frameCount*size or size)
+
+    let tensorSize = shape.reduce(1, *)
+
+    var uops: [UOp] = []
+    // Flattened (frame, bin) threading
+    let setup = IRBuilder(ctx: ctx, nodeId: block.nodes[block.nodes.count - 1])
+    setup.setThreadCountScale(tensorSize)
+    let flatIdx = setup.threadIndex()
+    let sizeExpr = setup.constant(Float(tensorSize))
+    let frameIdx = setup.floor(flatIdx / sizeExpr)
+    setup.setFrameIndex(frameIdx)
+    let binIdx = flatIdx - frameIdx * sizeExpr
+    uops.append(contentsOf: setup.ops)
+
+    // Use binIdx as the tensor index for all nodes in the chain
+    for nodeId in block.nodes {
+        ctx.tensorIndices[nodeId] = binIdx.lazy
+    }
+    return uops
+}
+
 /// Emit UOps for a frame-dependent tensor chain block.
 /// This generates SIMD-across-frames code where each frame/thread:
 /// 1. Declares thread-local tensor storage
@@ -1207,7 +1252,8 @@ public func emitFrameTensorChainBlock(
 }
 
 public func emitBlockUOps(
-    ctx: IRContext, block: Block, blocks: [Block], g: Graph, backend: Backend = .metal, debug: Bool = false
+    ctx: IRContext, block: Block, blocks: [Block], g: Graph, backend: Backend = .metal,
+    debug: Bool = false
 ) throws -> [UOp] {
     var emittedNodes: Set<NodeID> = []
     var bodyUops: [UOp] = []
@@ -1218,41 +1264,40 @@ public func emitBlockUOps(
     ctx.outboundTensorCells = findOutboundTensorCells(blocks, g, block: block)
     ctx.clearTensorRegisters()
 
-    // Step 1: Emit all node UOps first (without wrapping in parallelRange yet)
-    if let chain = block.frameTensorChain,
-        block.tensorIndex == nil,
-        ctx.frameTensorChainScratch[chain.reductionNodeId] != nil
-    {
-        bodyUops = try emitFrameTensorChainBlock(ctx: ctx, chain: chain, block: block, g: g)
-        emittedNodes = Set(block.nodes)
-    } else {
-        for nodeId in block.nodes {
+    var emitted = false
+    for uop in emitThreadCountScaleOpIfNeeded(ctx: ctx, block: block, g: g) {
+        emitted = true
+        bodyUops.append(uop)
+    }
+    for nodeId in block.nodes {
+        if !emitted {
             if let tensorIndex = block.tensorIndex {
                 ctx.tensorIndices[nodeId] = tensorIndex
             }
+        }
 
-            if let node = g.nodes[nodeId] {
-                for uop in try node.op.emit(ctx: ctx, g: g, nodeId: nodeId) {
-                    emittedNodes.insert(nodeId)
-                    bodyUops.append(uop)
-                }
+        if let node = g.nodes[nodeId] {
+            for uop in try node.op.emit(ctx: ctx, g: g, nodeId: nodeId) {
+                emittedNodes.insert(nodeId)
+                bodyUops.append(uop)
             }
         }
     }
 
-    // Emit marker for frame-tensor chain blocks (SIMD-across-frames optimization)
-    // Used for debugging kernels
-    if let chain = block.frameTensorChain {
-        bodyUops.insert(UOp(op: .frameTensorChainMarker(chain.tensorShape), value: .empty), at: 0)
-    }
-
     // Step 2: Analyze emitted UOps to determine if SIMD is safe
     // SIMD is safe if: tensor block + size divisible by 4 + no SIMD blockers + not frame-based
+    // Note: frame-aware tensor blocks already handle parallelism via flat threading
     let hasSIMDBlockers = containsSIMDBlockers(bodyUops, backend: backend)
     let canUseSIMD: Bool
     let simdIncrement: Int
 
-    if let shape = block.shape, block.tensorIndex != nil {
+    let isFrameAwareTensorBlock = false
+
+    if isFrameAwareTensorBlock {
+        // Frame-aware blocks use flat threading, no loop needed
+        canUseSIMD = false
+        simdIncrement = 1
+    } else if let shape = block.shape, block.tensorIndex != nil {
         let size = shape.reduce(1, *)
         // Frame-based tensor blocks must run element-by-element per frame
         // because their values change every frame (e.g., downstream of phasor(tensor))
@@ -1266,7 +1311,10 @@ public func emitBlockUOps(
 
     // Step 3: Determine the effective kind for this block's ops
     let effectiveKind: Kind
-    if block.tensorIndex != nil {
+    if isFrameAwareTensorBlock {
+        // Frame-aware tensor blocks are always SIMD (flat threading)
+        effectiveKind = .simd
+    } else if block.tensorIndex != nil {
         effectiveKind = canUseSIMD ? .simd : .scalar
     } else {
         effectiveKind = block.kind
@@ -1278,13 +1326,17 @@ public func emitBlockUOps(
     }
 
     // Step 5: Build final UOps array with parallelRange wrapper if needed
+    // Note: frame-aware tensor blocks DON'T use parallelRange (no loop)
     var uops: [UOp] = []
 
-    if let tensorIndex = block.tensorIndex,
-        let shape = block.shape
-    {
-        let count = shape.reduce(1, *)
-        uops.append(UOp(op: .beginParallelRange(count, simdIncrement), value: tensorIndex))
+    if backend == .c {
+        if !isFrameAwareTensorBlock,
+            let tensorIndex = block.tensorIndex,
+            let shape = block.shape
+        {
+            let count = shape.reduce(1, *)
+            uops.append(UOp(op: .beginParallelRange(count, simdIncrement), value: tensorIndex))
+        }
     }
 
     uops.append(contentsOf: bodyUops)
@@ -1352,9 +1404,58 @@ public func emitBlockUOps(
         }
     }
 
-    if block.tensorIndex != nil {
-        uops.append(UOp(op: .endParallelRange, value: ctx.useVariable(src: nil)))
+    // Only emit endParallelRange for non-frame-aware tensor blocks
+    if backend == .c {
+        if !isFrameAwareTensorBlock && block.tensorIndex != nil {
+            uops.append(UOp(op: .endParallelRange, value: ctx.useVariable(src: nil)))
+        }
     }
 
     return uops
+}
+
+public func isReductionOp(_ op: LazyOp) -> Bool {
+    switch op {
+    case .sum:
+        return true
+    case .sumAxis(_):
+        return true
+    case .tensorAccumulate(_):
+        return true
+    default:
+        return false
+    }
+}
+
+public func splitReduceBlocks(g: Graph, blocks: [Block]) -> [Block] {
+    var splitBlocks: [Block] = []
+    for block in blocks {
+        if let reductionOpIndex = block.nodes.firstIndex { nodeId in
+            guard let node = g.nodes[nodeId] else { return false }
+            return isReductionOp(node.op)
+        } {
+            if reductionOpIndex > 0 {
+                var preReductionBlock = Block(kind: .simd)
+                preReductionBlock.nodes = Array(block.nodes[0..<reductionOpIndex])
+                preReductionBlock.shape = block.shape
+                preReductionBlock.temporality = block.temporality
+                splitBlocks.append(preReductionBlock)
+            }
+            var reductionBlock = Block(kind: .simd)  // still SIMD w.r.t frame count
+            reductionBlock.nodes = [block.nodes[reductionOpIndex]]
+            reductionBlock.temporality = block.temporality
+            splitBlocks.append(reductionBlock)
+            if reductionOpIndex < block.nodes.count - 1 {
+                var postReductionBlock = Block(kind: .simd)
+                postReductionBlock.nodes = Array(
+                    block.nodes[reductionOpIndex + 1..<block.nodes.count])
+                postReductionBlock.shape = block.shape
+                postReductionBlock.temporality = block.temporality
+                splitBlocks.append(postReductionBlock)
+            }
+        } else {
+            splitBlocks.append(block)
+        }
+    }
+    return splitBlocks
 }

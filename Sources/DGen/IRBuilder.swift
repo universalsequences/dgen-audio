@@ -122,40 +122,6 @@ public final class IRBuilder {
     ops.append(u_end_if()(ctx, nil))
   }
 
-  func loadGradMemory(_ cellId: CellID) -> Expr {
-    let dest = ctx.useVariable(src: nil)
-    let uop = UOp(op: .loadGradMemory(cellId), value: dest)
-    ops.append(uop)
-    return value(dest)
-  }
-
-  func loadGrad(_ gradId: GradID) -> Expr {
-    let dest = ctx.useVariable(src: nil)
-    let uop = UOp(op: .loadGrad(gradId), value: dest)
-    ops.append(uop)
-    return value(dest)
-  }
-
-  /// Load tensor gradient at baseGradId + index
-  public func loadTensorGrad(_ nodeId: NodeID, index: Expr) -> Expr {
-    guard let baseGradId = ctx.tensorGradients[nodeId] else {
-      fatalError("No tensor gradient allocated for node \(nodeId)")
-    }
-    let dest = ctx.useVariable(src: nil)
-    let uop = UOp(op: .loadTensorGrad(baseGradId, index.lazy), value: dest)
-    ops.append(uop)
-    return value(dest)
-  }
-
-  /// Accumulate gradient to tensor element at baseGradId + index
-  public func tensorGrad(_ nodeId: NodeID, index: Expr, value: Lazy) {
-    guard let baseGradId = ctx.tensorGradients[nodeId] else {
-      fatalError("No tensor gradient allocated for node \(nodeId)")
-    }
-    let uop = UOp(op: .accumulateTensorGrad(baseGradId, index.lazy, value), value: .empty)
-    ops.append(uop)
-  }
-
   /// Read a tensor element at flat index from memory (for backward pass)
   public func readTensorElement(cellId: CellID, at index: Expr) -> Expr {
     return memoryRead(cellId, index)
@@ -173,13 +139,6 @@ public final class IRBuilder {
     let multiIdx = flatToMultiIndex(flatIdx, shape)
     let memOffset = stridedIndex(indices: multiIdx, strides: tensor.strides, offset: tensor.offset)
     return memoryRead(tensor.cellId, memOffset)
-  }
-
-  func storeGradMemory(_ cellId: CellID, _ val: Expr) -> Expr {
-    let dest = ctx.useVariable(src: nil)
-    let uop = UOp(op: .storeGradMemory(cellId, val.lazy), value: dest)
-    ops.append(uop)
-    return value(dest)
   }
 
   // Read a forward intermediate value for a given nodeId from the tape (intermediates buffer)
@@ -216,6 +175,15 @@ public final class IRBuilder {
 
     let dest = ctx.useVariable(src: nodeId)
     let uop = UOp(op: .sin(val.lazy), value: dest)
+    ops.append(uop)
+    return value(dest)
+  }
+
+  public func neg(_ val: Expr) -> Expr {
+    let dest = ctx.useVariable(src: nodeId)
+    let negativeConstant = constant(-1)
+    print("negative constant=\(negativeConstant)")
+    let uop = UOp(op: .mul(val.lazy, negativeConstant.lazy), value: dest)
     ops.append(uop)
     return value(dest)
   }
@@ -351,21 +319,71 @@ public final class IRBuilder {
   // MARK: - Tensor Ops (register-cached)
 
   /// Load from tensor cell - uses cached register if available
+  /// For frame-aware cells, uses frame-indexed access pattern
   public func tload(_ cell: CellID, _ idx: Expr) -> Expr {
     if let v = ctx.tensorCellToVar[cell] { return value(v) }
+    // Frame-aware cells use frame-indexed storage
+    if ctx.frameAwareTensorCells.contains(cell),
+      let (tensorSize, _) = ctx.g.frameAwareCells[cell]
+    {
+      return frameAwareTensorRead(cellId: cell, tensorSize: tensorSize, elemIdx: idx)
+    }
     return memoryRead(cell, cast(idx, to: .int))
   }
 
   /// Store to tensor cell - caches in register, only writes memory if outbound
+  /// For frame-aware cells, uses frame-indexed access pattern
   public func tstore(_ cell: CellID, _ idx: Expr, _ val: Expr) -> Expr {
     ctx.tensorCellToVar[cell] = val.lazy
     guard ctx.outboundTensorCells.contains(cell) else { return val }
+    // Frame-aware cells use frame-indexed storage
+    if ctx.frameAwareTensorCells.contains(cell),
+      let (tensorSize, _) = ctx.g.frameAwareCells[cell]
+    {
+      return frameAwareTensorWrite(cellId: cell, tensorSize: tensorSize, elemIdx: idx, value: val)
+    }
     return memoryWrite(cell, cast(idx, to: .int), val)
+  }
+
+  // MARK: - Frame-Aware Tensor Ops
+
+  /// Read from frame-aware tensor: memory[cellId + frameIdx * tensorSize + elemIdx]
+  /// Used for tensors that need per-frame storage to enable parallelism
+  public func frameAwareTensorRead(cellId: CellID, tensorSize: Int, elemIdx: Expr) -> Expr {
+    let frameIdx = frameIndex(nodeId)
+    let offset = frameIdx * constant(Float(tensorSize)) + elemIdx
+    return memoryRead(cellId, cast(offset, to: .int))
+  }
+
+  /// Read from frame-aware tensor with explicit frame index
+  public func frameAwareTensorRead(cellId: CellID, tensorSize: Int, frameIdx: Expr, elemIdx: Expr)
+    -> Expr
+  {
+    let offset = frameIdx * constant(Float(tensorSize)) + elemIdx
+    return memoryRead(cellId, cast(offset, to: .int))
+  }
+
+  /// Write to frame-aware tensor: memory[cellId + frameIdx * tensorSize + elemIdx]
+  public func frameAwareTensorWrite(cellId: CellID, tensorSize: Int, elemIdx: Expr, value: Expr)
+    -> Expr
+  {
+    let frameIdx = frameIndex(nodeId)
+    let offset = frameIdx * constant(Float(tensorSize)) + elemIdx
+    return memoryWrite(cellId, cast(offset, to: .int), value)
+  }
+
+  /// Write to frame-aware tensor with explicit frame index
+  public func frameAwareTensorWrite(
+    cellId: CellID, tensorSize: Int, frameIdx: Expr, elemIdx: Expr, value: Expr
+  ) -> Expr {
+    let offset = frameIdx * constant(Float(tensorSize)) + elemIdx
+    return memoryWrite(cellId, cast(offset, to: .int), value)
   }
 
   // MARK: - High-level tensor I/O
 
   public func readInput(_ node: Node, _ inputs: [Lazy], at idx: Int) throws -> Expr {
+    print("node.op=\(node.op) reading input for node=\(node.id) inputs=\(node.inputs) idx=\(idx)")
     let inputId = node.inputs[idx]
     guard let inputNode = ctx.g.nodes[inputId] else { throw DGenError.missingTensorID }
 
@@ -376,12 +394,22 @@ public final class IRBuilder {
     guard case .tensor(let outShape) = node.shape,
       let tensor = ctx.g.nodeToTensor[inputId].flatMap({ ctx.g.tensors[$0] }),
       let loopIdx = ctx.tensorIndices[node.id]
-    else { throw DGenError.missingTensorID }
+    else {
+      print(
+        "ctx.tesnorIndices -> \(ctx.tensorIndices[node.id]) tensor=\(ctx.g.nodeToTensor[inputId].flatMap({ctx.g.tensors[$0]}))"
+      )
+      throw DGenError.missingTensorID
+    }
+
+    print("loopIdx for input node=\(node.op) loopIdx=\(loopIdx)")
 
     // For padded tensors, use tensorRead which handles bounds checking
     if tensor.padding != nil {
       let indices = flatToMultiIndex(value(loopIdx), outShape)
-      return tensorRead(tensor, indices: broadcastIndices(outputIndices: indices, outputShape: outShape, inputTensor: tensor))
+      return tensorRead(
+        tensor,
+        indices: broadcastIndices(
+          outputIndices: indices, outputShape: outShape, inputTensor: tensor))
     }
 
     let memOffset = broadcastIndex(
@@ -403,11 +431,18 @@ public final class IRBuilder {
   }
 
   public func writeOutput(_ node: Node, _ result: Expr) throws {
+    print(
+      "\(ANSI.green)write output \(ANSI.red)node=\(node.op)\(ANSI.reset) node.id=\(node.id) result=\(result) \(ANSI.green)tensor=\(ctx.g.nodeToTensor[node.id])\(ANSI.reset) tensorIndices=\(ctx.tensorIndices[node.id]) node.shape=\(node.shape)"
+    )
     use(val: result)
     guard case .tensor = node.shape,
       let tensor = ctx.g.nodeToTensor[node.id].flatMap({ ctx.g.tensors[$0] }),
       let loopIdx = ctx.tensorIndices[node.id]
-    else { return }
+    else {
+      print("somethings missing")
+      return
+    }
+    print("gonna run tstore")
     _ = tstore(tensor.cellId, value(loopIdx), result)
   }
 
@@ -477,11 +512,17 @@ public final class IRBuilder {
   }
 
   /// Read from tensor using flat index with padding support.
+  /// For frame-aware cells, uses frame-indexed addressing.
   public func tensorRead(_ tensor: Tensor, flatIdx: Expr, shape: [Int]) -> Expr {
     if tensor.padding != nil {
       // Need multi-dim indices for padding check
       let indices = flatToMultiIndex(flatIdx, shape)
       return tensorRead(tensor, indices: indices)
+    } else if ctx.frameAwareTensorCells.contains(tensor.cellId),
+      let (tensorSize, _) = ctx.g.frameAwareCells[tensor.cellId]
+    {
+      // Frame-aware tensor: use frame-indexed addressing
+      return frameAwareTensorRead(cellId: tensor.cellId, tensorSize: tensorSize, elemIdx: flatIdx)
     } else {
       // Non-padded: use fast path
       let memIdx = tensorMemoryIndex(tensor, flatIdx: flatIdx, shape: shape)
@@ -657,7 +698,18 @@ public final class IRBuilder {
   /// Parallel range for tensor operations.
   /// Iterations are independent and can be parallelized.
   /// Renderer decides: C emits a loop, Metal static emits thread-parallel.
+  ///
+  /// When in a frame-aware tensor block (ctx.isInFrameAwareTensorBlock == true),
+  /// the block already handles parallelism via flat threading (frameCount × tensorSize threads).
+  /// In this case, we skip emitting a loop and use the pre-computed element index directly.
   public func parallelRange(_ count: Int, body: (Expr) -> Void, kind: Kind? = .scalar) {
+    // In frame-aware tensor blocks, the parallelism is already handled by flat threading.
+    // Use the pre-computed element index instead of creating a loop.
+    if ctx.isInFrameAwareTensorBlock, let elemIdx = ctx.frameAwareTensorElementIndex {
+      body(value(elemIdx))
+      return
+    }
+
     let indexVar = ctx.useVariable(src: nodeId)
 
     var incr = 1
@@ -694,6 +746,17 @@ public final class IRBuilder {
     let uop = UOp(op: .threadIndex, value: dest)
     ops.append(uop)
     return value(dest)
+  }
+
+  /// Returns the current frame index. In normal blocks, this is the thread index.
+  /// In frame-aware tensor blocks, this returns the pre-computed frame index from
+  /// the flat thread decomposition (flat index / tensor size).
+  public func currentFrameIndex() -> Expr {
+    if ctx.isInFrameAwareTensorBlock, let frameIdx = ctx.frameAwareTensorFrameIndex {
+      return value(frameIdx)
+    }
+    // Fall back to thread index for normal blocks
+    return threadIndex()
   }
 
   /// Frame count (runtime parameter)

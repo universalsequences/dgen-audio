@@ -35,6 +35,20 @@ public class IRContext {
   }
   public var frameTensorChainScratch: [NodeID: FrameTensorChainScratch] = [:]
 
+  // Frame-aware tensor nodes: tensors with outbound dependencies in frame-based blocks
+  // These get tensorSize × frameCount memory allocation
+  public var frameAwareTensorNodes: Set<NodeID> = []
+  public var frameAwareTensorCells: Set<CellID> = []
+
+  // Frame-aware tensor block context:
+  // When true, we're in a frame-aware tensor block with flat threading (frameCount × tensorSize threads).
+  // In this mode, parallelRange should use the pre-computed element index instead of emitting loops.
+  public var isInFrameAwareTensorBlock: Bool = false
+  // The pre-computed element index for the current frame-aware tensor block
+  public var frameAwareTensorElementIndex: Lazy?
+  // The pre-computed frame index for the current frame-aware tensor block
+  public var frameAwareTensorFrameIndex: Lazy?
+
   /// Clear tensor register tracking (call at start of each tensor block)
   public func clearTensorRegisters() {
     tensorCellToVar = [:]
@@ -70,6 +84,10 @@ public class IRContext {
 
   // Track scalar gradients that are frame-based
   public var frameBasedScalarGradients: Set<GradID> = []
+
+  // Track tensor gradients that are frame-aware (need tensorSize × frameCount allocation)
+  // Used for gradients of tensors with outbound dependencies in frame-based blocks
+  public var frameAwareTensorGradients: Set<GradID> = []
 
   public func getGlobalId(_ varId: VarID) -> Int {
     if let index = globals.firstIndex(of: varId) {
@@ -112,35 +130,6 @@ public class IRContext {
     return gradId
   }
 
-  /// Allocate contiguous block of GradIDs for tensor gradients.
-  /// Each tensor element gets its own GradID: baseGradId, baseGradId+1, ..., baseGradId+(size-1)
-  /// - Parameters:
-  ///   - src: The tensor node ID
-  ///   - size: Number of elements in the tensor
-  ///   - seed: If true, add all GradIDs to seedGradients
-  /// - Returns: The base GradID for this tensor
-  public func useTensorGradient(src: NodeID, size: Int, seed: Bool = false) -> GradID {
-    if let existing = tensorGradients[src] {
-      return existing
-    }
-    let baseGradId = gradIdx + 1
-    // Auto-detect if this node is frame-based from temporality analysis
-    let isFrameBased = frameBasedNodes.contains(src)
-    gradIdx += size  // Reserve `size` contiguous IDs
-    tensorGradients[src] = baseGradId
-    tensorGradientSizes[src] = size
-    if isFrameBased {
-      frameBasedGradients.insert(baseGradId)
-    }
-    if seed {
-      for i in 0..<size {
-        seedGradients.append(baseGradId + i)
-      }
-    }
-    return baseGradId
-  }
-
-  /// Compute total gradient buffer size.
   /// Current layout: gradients[(gradId) * frameCount + threadIndex]
   /// So total buffer size = (maxGradId + 1) * frameCount
   public func computeGradientBufferSize(frameCount: Int) -> Int {
