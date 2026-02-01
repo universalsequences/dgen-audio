@@ -257,7 +257,26 @@ public struct CompilationPipeline {
         // Store frame-based nodes in context for smart gradient buffer allocation
         //context.frameBasedNodes = temporalityResult.frameBasedNodes
 
-        // Step 4.6: Detect frame-aware tensors and update their allocations
+        // Step 4.6: Allocate real memory for lazy tensor cells
+        // Now that we know temporality, we can allocate the right sizes:
+        // - Frame-based outbound tensors: tensorSize * frameCount
+        // - Static outbound tensors: tensorSize
+        // - Non-outbound tensors: no allocation (register-only)
+        time("allocateTensorMemory") {
+            allocateTensorMemory(
+                graph: graph,
+                blocks: finalBlocks,
+                frameBasedNodes: temporalityResult.frameBasedNodes,
+                frameCount: options.frameCount
+            )
+            // Populate IRContext's frameAwareTensorCells from graph.frameAwareCells
+            // This is needed for tstore/tload to use frame-indexed addressing
+            for cellId in graph.frameAwareCells.keys {
+                context.frameAwareTensorCells.insert(cellId)
+            }
+        }
+
+        // Step 4.7: Detect frame-aware tensors and update their allocations
         // Frame-aware tensors have outbound dependencies in frame-based blocks
         // and need tensorSize × frameCount cells for parallel execution
         // TEMPORARILY DISABLED: Frame-aware tensor allocation causes issues with gradient flow

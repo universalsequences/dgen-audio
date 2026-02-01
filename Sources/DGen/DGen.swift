@@ -17,6 +17,8 @@ open class Graph {
     public var next = 0
     public var nodes: [NodeID: Node] = [:]
     private var nextCellId = 0
+    private var nextLazyCellId = -1  // Lazy cell IDs use negative numbers to avoid collision
+    public var lazyCells: Set<CellID> = []  // Track which cells are lazy (not yet allocated)
     public var nextTensorId = 0
     public var tensors: [TensorID: Tensor] = [:]
     public var nodeToTensor: [NodeID: TensorID] = [:]
@@ -129,6 +131,23 @@ open class Graph {
     /// Allocate a single cell (backward compatibility)
     public func alloc() -> CellID {
         return alloc(vectorWidth: 1)
+    }
+
+    /// Reserve a lazy cell ID (placeholder, no memory allocated yet).
+    /// Used for tensor outputs that will be allocated later once we know temporality.
+    /// Lazy cell IDs use negative numbers to avoid collision with real allocations.
+    public func reserveLazyCellId() -> CellID {
+        let cellId = nextLazyCellId
+        nextLazyCellId -= 1
+        lazyCells.insert(cellId)
+        return cellId
+    }
+
+    /// Allocate real memory for a lazy cell, returning the new real cell ID.
+    /// The tensor should be updated to use the returned cell ID.
+    public func allocateLazyCell(_ lazyCellId: CellID, vectorWidth: Int) -> CellID {
+        lazyCells.remove(lazyCellId)
+        return alloc(vectorWidth: vectorWidth)
     }
 
     /// Allocate frame-aware tensor storage: tensorSize * frameCount cells.

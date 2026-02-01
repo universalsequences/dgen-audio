@@ -3,14 +3,16 @@ public struct Tensor {
     public let shape: Shape
     public let strides: [Int]  // How many elements to skip per dimension
     public let offset: Int  // Starting index in underlying storage (for views like shrink)
-    public let cellId: CellID
+    public var cellId: CellID
     public var data: [Float]?  // Initial data to be injected by runtime
     public let isView: Bool  // True if this is a view of another tensor (reshape/transpose/shrink)
     public let padding: [(left: Int, right: Int)]?  // Per-axis padding for virtual pad views
+    public var isLazy: Bool  // True if cellId is a lazy placeholder, not yet allocated
 
     public init(
         id: TensorID, shape: Shape, cellId: CellID, data: [Float]? = nil, strides: [Int]? = nil,
-        offset: Int = 0, isView: Bool = false, padding: [(left: Int, right: Int)]? = nil
+        offset: Int = 0, isView: Bool = false, padding: [(left: Int, right: Int)]? = nil,
+        isLazy: Bool = false
     ) {
         self.id = id
         self.shape = shape
@@ -19,6 +21,7 @@ public struct Tensor {
         self.offset = offset
         self.isView = isView
         self.padding = padding
+        self.isLazy = isLazy
         // Default to row-major (C-style) strides if not specified
         self.strides = strides ?? Tensor.computeRowMajorStrides(shape)
     }

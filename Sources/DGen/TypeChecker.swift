@@ -400,14 +400,115 @@ public func allocateTensorOutputs(graph: Graph, sortedNodes: [NodeID]) {
       break
     }
 
-    // Allocate new tensor for non-view ops
-    let size = shape.reduce(1, *)
-    let cellId = graph.alloc(vectorWidth: size)
+    // Reserve lazy cell for non-view ops (will be allocated later once temporality is known)
+    let lazyCellId = graph.reserveLazyCellId()
 
     let tensorId = graph.nextTensorId
     graph.nextTensorId += 1
-    graph.tensors[tensorId] = Tensor(id: tensorId, shape: shape, cellId: cellId)
+    graph.tensors[tensorId] = Tensor(id: tensorId, shape: shape, cellId: lazyCellId, isLazy: true)
     graph.nodeToTensor[nodeId] = tensorId
+  }
+}
+
+/// Allocate real memory for lazy tensor cells after temporality is known.
+/// Frame-based tensors with outbound dependencies get tensorSize * frameCount allocation.
+/// Static tensors just get tensorSize allocation.
+public func allocateTensorMemory(
+  graph: Graph,
+  blocks: [Block],
+  frameBasedNodes: Set<NodeID>,
+  frameCount: Int
+) {
+  // Build a map from cellId -> nodeId for quick lookup
+  var cellToNode: [CellID: NodeID] = [:]
+  for (nodeId, tensorId) in graph.nodeToTensor {
+    if let tensor = graph.tensors[tensorId] {
+      cellToNode[tensor.cellId] = nodeId
+    }
+  }
+
+  // Find all outbound cells across all blocks
+  var outboundCells: Set<CellID> = []
+  for (blockIdx, block) in blocks.enumerated() {
+    // Collect cells produced by this block
+    var producedCells: Set<CellID> = []
+    for nodeId in block.nodes {
+      if let node = graph.nodes[nodeId], case .tensor = node.shape {
+        if let tensorId = graph.nodeToTensor[nodeId], let tensor = graph.tensors[tensorId] {
+          producedCells.insert(tensor.cellId)
+        }
+      }
+    }
+
+    // Check which are consumed by later blocks
+    for laterIdx in (blockIdx + 1)..<blocks.count {
+      for nodeId in blocks[laterIdx].nodes {
+        guard let node = graph.nodes[nodeId] else { continue }
+        for inputId in node.inputs {
+          if let inputNode = graph.nodes[inputId], case .tensor = inputNode.shape {
+            if let tensorId = graph.nodeToTensor[inputId], let tensor = graph.tensors[tensorId] {
+              if producedCells.contains(tensor.cellId) {
+                outboundCells.insert(tensor.cellId)
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+
+  // Now allocate real memory for lazy tensors
+  for (tensorId, tensor) in graph.tensors {
+    guard tensor.isLazy else { continue }
+
+    let tensorSize = tensor.shape.reduce(1, *)
+    let lazyCellId = tensor.cellId
+    let nodeId = cellToNode[lazyCellId]
+    let isOutbound = outboundCells.contains(lazyCellId)
+    let isFrameBased = nodeId.map { frameBasedNodes.contains($0) } ?? false
+
+    if isOutbound {
+      let allocSize: Int
+      if isFrameBased {
+        // Frame-based outbound tensor: needs tensorSize * frameCount
+        allocSize = tensorSize * frameCount
+        let realCellId = graph.allocateLazyCell(lazyCellId, vectorWidth: allocSize)
+        graph.frameAwareCells[realCellId] = (tensorSize: tensorSize, frameCount: frameCount)
+
+        // Update tensor with real cell ID
+        graph.tensors[tensorId] = Tensor(
+          id: tensor.id,
+          shape: tensor.shape,
+          cellId: realCellId,
+          data: tensor.data,
+          strides: tensor.strides,
+          offset: tensor.offset,
+          isView: tensor.isView,
+          padding: tensor.padding,
+          isLazy: false
+        )
+        graph.cellToTensor[realCellId] = tensorId
+      } else {
+        // Static outbound tensor: just needs tensorSize
+        allocSize = tensorSize
+        let realCellId = graph.allocateLazyCell(lazyCellId, vectorWidth: allocSize)
+
+        // Update tensor with real cell ID
+        graph.tensors[tensorId] = Tensor(
+          id: tensor.id,
+          shape: tensor.shape,
+          cellId: realCellId,
+          data: tensor.data,
+          strides: tensor.strides,
+          offset: tensor.offset,
+          isView: tensor.isView,
+          padding: tensor.padding,
+          isLazy: false
+        )
+        graph.cellToTensor[realCellId] = tensorId
+      }
+    }
+    // Non-outbound lazy tensors stay lazy (register-only, no memory needed)
   }
 }
 

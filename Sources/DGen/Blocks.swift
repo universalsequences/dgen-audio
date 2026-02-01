@@ -1095,8 +1095,6 @@ private func containsSIMDBlockers(_ uops: [UOp], backend: Backend) -> Bool {
 public func emitThreadCountScaleOpIfNeeded(ctx: IRContext, block: Block, g: Graph) -> [UOp] {
     guard let shape = block.shape else { return [] }
 
-    // todo temporality check (are we frameCount*size or size)
-
     let tensorSize = shape.reduce(1, *)
 
     var uops: [UOp] = []
@@ -1114,6 +1112,25 @@ public func emitThreadCountScaleOpIfNeeded(ctx: IRContext, block: Block, g: Grap
     for nodeId in block.nodes {
         ctx.tensorIndices[nodeId] = binIdx.lazy
     }
+
+    // If this is a frame-based block with frame-aware tensor outputs,
+    // set context flags so currentFrameIndex() returns the correct frame
+    if block.temporality == .frameBased {
+        // Check if any tensor output in this block is frame-aware
+        let hasFrameAwareOutput = block.nodes.contains { nodeId in
+            if let tensorId = g.nodeToTensor[nodeId],
+               let tensor = g.tensors[tensorId] {
+                return ctx.frameAwareTensorCells.contains(tensor.cellId)
+            }
+            return false
+        }
+        if hasFrameAwareOutput {
+            ctx.isInFrameAwareTensorBlock = true
+            ctx.frameAwareTensorFrameIndex = frameIdx.lazy
+            ctx.frameAwareTensorElementIndex = binIdx.lazy
+        }
+    }
+
     return uops
 }
 
@@ -1257,6 +1274,12 @@ public func emitBlockUOps(
 ) throws -> [UOp] {
     var emittedNodes: Set<NodeID> = []
     var bodyUops: [UOp] = []
+
+    // Reset frame-aware tensor block context for each new block
+    // These flags are set per-block in emitThreadCountScaleOpIfNeeded
+    ctx.isInFrameAwareTensorBlock = false
+    ctx.frameAwareTensorFrameIndex = nil
+    ctx.frameAwareTensorElementIndex = nil
 
     // Tensor Register Optimization:
     // Compute which tensor cells need to be written to memory (used by later blocks)
