@@ -369,22 +369,6 @@ public class MetalCompiledKernel: CompiledKernelRuntime {
         }
       }
 
-      // Force memory barrier before spectral gradient reads to ensure writes are visible
-      if kernel.needsMemoryBarrier {
-        if let enc = sharedEncoder {
-          enc.endEncoding()
-          sharedEncoder = nil
-        }
-        // Commit and wait to ensure previous writes are complete
-        commandBuffer.commit()
-        commandBuffer.waitUntilCompleted()
-        // Start new command buffer
-        if let cb = commandQueue.makeCommandBuffer() { commandBuffer = cb }
-        if !debugGradients {
-          sharedEncoder = commandBuffer.makeComputeCommandEncoder()
-        }
-      }
-
       // Pick encoder: shared if available (non-debug), otherwise one per kernel
       let computeEncoder: MTLComputeCommandEncoder
       if let enc = sharedEncoder {

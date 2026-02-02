@@ -14,9 +14,6 @@ public struct Block: Equatable {
   /// If set, this block contains a frame-dependent tensor chain that can be
   /// SIMD-parallelized across frames with thread-local tensor storage.
   public var frameTensorChain: FrameDependentTensorChain? = nil
-  /// If true, this block requires a memory barrier before execution
-  /// (e.g., spectral gradient reads that depend on prior writes)
-  public var needsMemoryBarrier: Bool = false
 
   public init(kind: Kind) {
     self.kind = kind
@@ -26,7 +23,7 @@ public struct Block: Equatable {
     // Exclude frameTensorChain from equality to avoid issues with Equatable
     return lhs.kind == rhs.kind && lhs.nodes == rhs.nodes
       && lhs.temporality == rhs.temporality && lhs.tensorIndex == rhs.tensorIndex
-      && lhs.shape == rhs.shape && lhs.needsMemoryBarrier == rhs.needsMemoryBarrier
+      && lhs.shape == rhs.shape
   }
 }
 
@@ -841,14 +838,6 @@ public func isolateSpectralPasses(_ blocks: [Block], _ g: Graph) -> [Block] {
         return false
       }()
 
-      // Check if this op needs a memory barrier (reads from prior spectral writes)
-      let needsBarrier = { () -> Bool in
-        guard let node = g.nodes[nodeId] else { return false }
-        if case .spectralLossFFTGradRead = node.op { return true }
-        if case .spectralLossFFTGradRead2 = node.op { return true }
-        return false
-      }()
-
       if isSpectralPass {
         // Flush any accumulated nodes before the spectral pass
         if !currentNodes.isEmpty {
@@ -856,9 +845,8 @@ public func isolateSpectralPasses(_ blocks: [Block], _ g: Graph) -> [Block] {
           currentNodes = []
         }
 
-        // Add spectral pass in its own block, with memory barrier flag if needed
-        var spectralBlock = makeBlock(from: block, nodes: [nodeId])
-        spectralBlock.needsMemoryBarrier = needsBarrier
+        // Add spectral pass in its own block
+        let spectralBlock = makeBlock(from: block, nodes: [nodeId])
         result.append(spectralBlock)
       } else {
         // Accumulate non-spectral nodes

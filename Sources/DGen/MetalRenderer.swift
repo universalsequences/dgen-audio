@@ -102,14 +102,8 @@ public class MetalRenderer: Renderer, UOpEmitter {
         bufferNames.append("segmentBase")
       }
 
-      if bufferRequirements.needsGrad {
-        bufferNames.append("gradients")
-      }
-
       if bufferRequirements.needsReducedGradsSum {
-        if useReduced {
-          bufferNames.append("reducedGradsSum")
-        }
+        bufferNames.append("reducedGradsSum")
       }
 
       let threadGroupSize: Int? =
@@ -124,7 +118,6 @@ public class MetalRenderer: Renderer, UOpEmitter {
         threadCount: parallelCount,
         threadCountScale: scheduleItem.threadCountScale,
         needsReducedGradsSum: useReduced,
-        needsMemoryBarrier: scheduleItem.needsMemoryBarrier,
         memorySize: max(totalMemorySlots, 1024)  // Match memory size calculation from render method
       )
     }
@@ -267,7 +260,6 @@ public class MetalRenderer: Renderer, UOpEmitter {
     var writes: Set<CellID> = []
     var readsGlobals: Bool = false
     var writesGlobals: Bool = false
-    var usesGradMemory: Bool = false
   }
 
   private func kernelAccessInfo(_ scheduleItem: ScheduleItem) -> KernelAccessInfo {
@@ -308,8 +300,6 @@ public class MetalRenderer: Renderer, UOpEmitter {
 
     let accA = kernelAccessInfo(a.item)
     let accB = kernelAccessInfo(b.item)
-
-    if accA.usesGradMemory || accB.usesGradMemory { return false }
 
     // If the first kernel writes globals, don't fuse if the next reads/writes globals.
     if accA.writesGlobals && (accB.readsGlobals || accB.writesGlobals) { return false }
@@ -352,9 +342,6 @@ public class MetalRenderer: Renderer, UOpEmitter {
 
     var currentSchedule: ScheduleItem? = nil
     var currentKind: Kind? = nil
-    var currentTemporality: Temporality? = nil
-    var currentPolicy: ParallelPolicy? = nil
-    var currentThreadCountScale: Int? = nil
     var loopOpened = false
     var hasFrameLoop = false
 
@@ -375,27 +362,14 @@ public class MetalRenderer: Renderer, UOpEmitter {
       return dest
     }
 
-    func blockHasGradMemoryCalls(_ block: BlockUOps) -> Bool {
-      return false  // No grad memory ops in current implementation
-    }
-
     for block in uopBlocks {
-      let needsNewKernel = true
-      /*
-      let needsNewKernel = currentKind != block.kind
-        || currentTemporality != block.temporality
-        || currentPolicy != block.parallelPolicy
-        || currentThreadCountScale != block.threadCountScale
-        || block.forceNewKernel
-       */
-
-      if needsNewKernel {
+      // Each block becomes its own kernel
+      if true {
         closeCurrentKernel()
 
         let scheduleItem = ScheduleItem(kind: block.kind, temporality: block.temporality)
         scheduleItem.parallelPolicy = block.parallelPolicy
         scheduleItem.threadCountScale = block.threadCountScale
-        scheduleItem.needsMemoryBarrier = block.needsMemoryBarrier
         scheduleItem.ops.append(UOp(op: .frameCount, value: .empty))
 
         for uop in block.ops {
@@ -419,9 +393,8 @@ public class MetalRenderer: Renderer, UOpEmitter {
           beginRange.kind = block.kind
           scheduleItem.ops.append(beginRange)
 
-          let incr = blockHasGradMemoryCalls(block) ? -1 : 1
           let loopCount = scaledFrameCount(block.threadCountScale, scheduleItem)
-          var beginLoop = UOp(op: .beginLoop(loopCount, incr), value: .empty)
+          var beginLoop = UOp(op: .beginLoop(loopCount, 1), value: .empty)
           beginLoop.kind = block.kind
           scheduleItem.ops.append(beginLoop)
           hasFrameLoop = true
@@ -436,9 +409,6 @@ public class MetalRenderer: Renderer, UOpEmitter {
 
         currentSchedule = scheduleItem
         currentKind = block.kind
-        currentTemporality = block.temporality
-        currentPolicy = block.parallelPolicy
-        currentThreadCountScale = block.threadCountScale
         loopOpened = true
       }
 
@@ -508,11 +478,6 @@ public class MetalRenderer: Renderer, UOpEmitter {
       parameters.append("    constant uint &segmentLen [[buffer(\(bufferIndex))]]")
       bufferIndex += 1
       parameters.append("    constant uint &segmentBase [[buffer(\(bufferIndex))]]")
-      bufferIndex += 1
-    }
-
-    if bufferRequirements.needsGrad {
-      parameters.append("    device float *gradients [[buffer(\(bufferIndex))]]")
       bufferIndex += 1
     }
 
@@ -937,8 +902,6 @@ public class MetalRenderer: Renderer, UOpEmitter {
 struct RequiredBuffers {
   let hasOutputOps: Bool
   let needsSegmenting: Bool
-  let needsGradMemory: Bool
-  let needsGrad: Bool
   let needsReducedGradsSum: Bool
 }
 
@@ -955,13 +918,9 @@ func analyzeRequiredBuffers(scheduleItem: ScheduleItem) -> RequiredBuffers {
     return false
   }
 
-  let needsGradMemory: Bool = false  // Grad memory ops removed
-  let needsGrad: Bool = false  // Grad ops removed
-  let needsReducedGradsSum: Bool = false
-
   return RequiredBuffers(
-    hasOutputOps: hasOutputOps, needsSegmenting: needsSegmenting,
-    needsGradMemory: needsGradMemory, needsGrad: needsGrad,
-    needsReducedGradsSum: needsReducedGradsSum
+    hasOutputOps: hasOutputOps,
+    needsSegmenting: needsSegmenting,
+    needsReducedGradsSum: false
   )
 }

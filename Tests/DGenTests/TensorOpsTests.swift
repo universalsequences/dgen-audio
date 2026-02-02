@@ -789,6 +789,18 @@ final class CTensorOpsTests: XCTestCase {
                 print("Peak output: \(maxOutput) at frame \(maxFrame)")
                 print("Final output: \(lastOutput)")
 
+                // Count frames with significant activity (> 1% of peak)
+                let threshold = maxOutput * 0.01
+                let activeFrames = output.filter { abs($0) > threshold }.count
+                print("Active frames (>1% of peak): \(activeFrames)")
+
+                // The membrane should have activity for many frames, not just 2-3
+                // With damping=0.03, the decay time constant is roughly 1/0.03 ≈ 33 frames
+                // So we should see significant activity for at least 50 frames
+                XCTAssertGreaterThan(
+                        activeFrames, 50,
+                        "Membrane should have activity for many frames (gradual decay), not abrupt drop to 0")
+
                 // After initial excitation and transient, output should decay
                 // Allow for some oscillation but expect overall decay trend
                 XCTAssertLessThan(
@@ -797,7 +809,7 @@ final class CTensorOpsTests: XCTestCase {
 
                 // With 512 frames and d=0.03 damping, should decay significantly
                 // Final output should be much smaller than peak
-                let decayRatio = lastOutput / maxOutput
+                let decayRatio = maxOutput > 0 ? lastOutput / maxOutput : 0
                 print("Decay ratio (final/peak): \(decayRatio)")
                 XCTAssertLessThan(
                         decayRatio, 0.05,

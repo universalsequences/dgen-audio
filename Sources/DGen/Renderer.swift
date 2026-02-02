@@ -9,8 +9,6 @@ public struct BlockUOps {
   public var forceNewKernel: Bool
   /// Optional: dispatch threads = frameCount * scale for this block
   public var threadCountScale: Int?
-  /// When true, requires a memory barrier before this block executes
-  public var needsMemoryBarrier: Bool
 
   public init(
     ops: [UOp],
@@ -18,8 +16,7 @@ public struct BlockUOps {
     temporality: Temporality = .static_,
     parallelPolicy: ParallelPolicy = .serial,
     forceNewKernel: Bool = false,
-    threadCountScale: Int? = nil,
-    needsMemoryBarrier: Bool = false
+    threadCountScale: Int? = nil
   ) {
     self.ops = ops
     self.kind = kind
@@ -27,7 +24,6 @@ public struct BlockUOps {
     self.parallelPolicy = parallelPolicy
     self.forceNewKernel = forceNewKernel
     self.threadCountScale = threadCountScale
-    self.needsMemoryBarrier = needsMemoryBarrier
   }
 }
 
@@ -50,7 +46,6 @@ public struct CompiledKernel {
   public let threadCount: Int?  // for Metal: override total threads (non-frame dispatch)
   public let threadCountScale: Int?  // for Metal: total threads = frameCount * scale
   public let needsReducedGradsSum: Bool
-  public let needsMemoryBarrier: Bool  // Force encoder break before this kernel for memory sync
   public let memorySize: Int  // Required memory allocation size in floats
 }
 
@@ -60,7 +55,6 @@ public class ScheduleItem {
   public var temporality: Temporality = .frameBased
   public var parallelPolicy: ParallelPolicy = .serial
   public var threadCountScale: Int? = nil
-  public var needsMemoryBarrier: Bool = false
 
   init(kind: Kind, temporality: Temporality = .frameBased) {
     self.kind = kind
@@ -202,7 +196,6 @@ public class CRenderer: Renderer {
         threadCount: nil,
         threadCountScale: nil,
         needsReducedGradsSum: false,
-        needsMemoryBarrier: false,
         memorySize: computedMem  // Ensure at least enough for voiceCellId
       )
     }
