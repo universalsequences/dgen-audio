@@ -523,11 +523,11 @@ public enum LazyOp {
 
                 // 2. Load windowed samples into per-frame FFT scratch cells
                 b.parallelRange(windowSize) { n in
-                    let nFloat = b.cast(n, to: .float)
                     let nInt = b.cast(n, to: .int)
+                    let nFloat = b.cast(nInt, to: .float)
                     let w = b.memoryRead(windowCell, nInt)
 
-                    // Load from tape: samples from frameIdx - windowSize + 1 + n to frameIdx
+                    // Load from tape: samples at position frameIdx - windowSize + 1 + n
                     let j = frameIdx - (winSizeFloat - one) + nFloat
 
                     let s1 = b.tapeLoad(sig1, at: j)
@@ -545,10 +545,10 @@ public enum LazyOp {
                     // Bit-reversal permutation
                     b.loop(windowSize) { i in
                         var rev = b.constant(0.0)
-                        var n = b.cast(i, to: .float)
+                        var bits = b.cast(i, to: .float)
                         for _ in 0..<numStages {
-                            rev = rev * b.constant(2.0) + (n % b.constant(2.0))
-                            n = b.floor(n / b.constant(2.0))
+                            rev = rev * b.constant(2.0) + (bits % b.constant(2.0))
+                            bits = b.floor(bits / b.constant(2.0))
                         }
 
                         let iFloat = b.cast(i, to: .float)
@@ -1452,7 +1452,7 @@ public enum LazyOp {
             b.use(val: b.selector(b.value(mode), options.map { b.value($0) }))
         case .historyWrite(let cellId):
             // Unified history write - handles both scalar and tensor based on cellToTensor mapping
-            if let tensorId = g.cellToTensor[cellId], let tensor = g.tensors[tensorId] {
+            if let tensorId = g.cellToTensor[cellId], let _ = g.tensors[tensorId] {
                 // Tensor write: copy from input tensor to history cell
                 guard node.inputs.count >= 1 else {
                     throw DGenError.insufficientInputs(
@@ -1460,7 +1460,6 @@ public enum LazyOp {
                 }
                 let inputTensorId = g.nodeToTensor[node.inputs[0]]!
                 let inputCellId = g.tensors[inputTensorId]!.cellId
-                let size = tensor.size
 
                 guard let index = ctx.tensorIndices[nodeId] else {
                     throw DGenError.insufficientInputs(
@@ -1489,11 +1488,10 @@ public enum LazyOp {
             b.use(val: u_historyWrite(cellId: cellId, b.value(inputs[0]))(b))
         case .historyRead(let cellId):
             // Unified history read - handles both scalar and tensor based on cellToTensor mapping
-            if let tensorId = g.cellToTensor[cellId], let tensor = g.tensors[tensorId] {
+            if let tensorId = g.cellToTensor[cellId], let _ = g.tensors[tensorId] {
                 // Tensor read: copy from history cell to output tensor
                 let outputTensorId = g.nodeToTensor[node.id]!
                 let outputCellId = g.tensors[outputTensorId]!.cellId
-                let size = tensor.size
 
                 guard let index = ctx.tensorIndices[nodeId] else {
                     throw DGenError.insufficientInputs(
@@ -2185,7 +2183,6 @@ public enum LazyOp {
             let hopSizeFloat = b.constant(Float(hopSize))
             let zero = b.constant(0.0)
             let one = b.constant(1.0)
-            let numBinsFloat = b.constant(Float(numBins))
 
             // Load read position and hop counter
             let readPos = b.memoryRead(readPosCell, zero)
@@ -2269,7 +2266,7 @@ public enum LazyOp {
 
                 // 3. Butterfly stages (IFFT uses POSITIVE twiddle angles)
                 var butterflySize = 2
-                for stage in 0..<numStages {
+                for _ in 0..<numStages {
                     let halfSize = butterflySize / 2
                     let numGroups = windowSize / butterflySize
 

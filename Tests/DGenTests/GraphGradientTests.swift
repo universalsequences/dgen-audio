@@ -1530,7 +1530,7 @@ final class GraphGradientTests: XCTestCase {
             loss: loss,
             tensorParameters: [studentW1, studentB1, studentW2, studentB2],
             optimizer: GraphSGD(),
-            learningRate: 0.000001,
+            learningRate: 0.0001,
             frameCount: frameCount,
             kernelDebugOutput: "/tmp/mlp_peekrow_harmonic_graph.metal"
         )
@@ -1545,13 +1545,13 @@ final class GraphGradientTests: XCTestCase {
         print("Initial loss: \(initialLoss)")
 
         // Training loop with timing
-        let epochs = 200
+        let epochs = 20000
         var finalLoss = initialLoss
         let trainStart = CFAbsoluteTimeGetCurrent()
         for i in 0..<epochs {
             finalLoss = ctx.trainStep()
             print("Epoch \(i): loss = \(String(format: "%.6f", finalLoss))")
-            if finalLoss < initialLoss * 0.25 {
+            if finalLoss < initialLoss * 0.0025 {
                 break
             }
         }

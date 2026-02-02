@@ -88,7 +88,7 @@ extension Graph {
     let mag1Cell = alloc(vectorWidth: numBins * maxFrameCount)
     let mag2Cell = alloc(vectorWidth: numBins * maxFrameCount)
 
-    // Allocate scratch for per-frame intermediate values (already per-frame)
+    // Allocate scratch for per-frame squared differences
     let scratchCell = alloc(vectorWidth: numBins * maxFrameCount)
 
     // Create the spectralLossFFT node with all resources
