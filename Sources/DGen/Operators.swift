@@ -1694,7 +1694,7 @@ public enum LazyOp {
         case .gradDeterministicPhasor:
             // Gradient for deterministic phasor: d(phase)/d(freq) = frameIndex / sampleRate
             // inputs: [gradOutput, sampleRate]
-            // Use currentFrameIndex() for correct behavior in frame-aware tensor blocks
+            // Use currentFrameIndex() - matches forward pass which uses currentFrameIndex() for tensor contexts
             guard inputs.count == 2 else { fatalError("gradDeterministicPhasor requires 2 inputs") }
             try emitBinaryOp(b: b, g: g, node: node, inputs: inputs) { gradOut, sampleRate in
                 let frameIdx = b.currentFrameIndex()
@@ -2442,11 +2442,11 @@ public enum LazyOp {
         case .gradPhasor(_):
             // Gradient for phasor: d(phase)/d(freq) = frameIndex / sampleRate
             // inputs: [gradOutput, sampleRate]
-            // Use currentFrameIndex() for correct behavior in frame-aware tensor blocks
+            // Use threadIndex() - the actual sample index, not decomposed frame index
             guard inputs.count == 2 else { fatalError("gradPhasor requires 2 inputs") }
             let gradOut = b.value(inputs[0])
             let sampleRate = b.value(inputs[1])
-            let frameIdx = b.currentFrameIndex()
+            let frameIdx = b.threadIndex()
             let gradFreq = gradOut * frameIdx / sampleRate
             b.use(val: gradFreq)
 

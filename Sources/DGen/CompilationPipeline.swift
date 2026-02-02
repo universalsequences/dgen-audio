@@ -193,6 +193,22 @@ public struct CompilationPipeline {
             finalBlocks = splitReduceBlocks(g: graph, blocks: finalBlocks)
         }
 
+        // Isolate spectral loss passes into their own blocks to prevent race conditions
+        // This ensures FFT forward pass completes before gradient pass runs
+        // Only do this if the graph has spectral loss ops (to avoid modifying blocks unnecessarily)
+        let hasSpectralLossOps = graph.nodes.values.contains { node in
+            switch node.op {
+            case .spectralLossFFT, .spectralLossFFTGradInline, .spectralLossFFTGradRead,
+                 .spectralLossFFTGradRead2, .spectralLossPass1, .spectralLossPass2:
+                return true
+            default:
+                return false
+            }
+        }
+        if hasSpectralLossOps {
+            finalBlocks = isolateSpectralPasses(finalBlocks, graph)
+        }
+
         // Step 4: Infer temporality and assign to blocks
         // This now includes hop-based temporality for FFT/IFFT and downstream operations
         let temporalityResult = time("inferTemporality") {

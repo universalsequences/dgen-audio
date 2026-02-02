@@ -830,11 +830,30 @@ public func fuseBlocks(_ blocks: [Block], _ g: Graph) -> [Block] {
 
 /// Isolate spectralLossPass1 and spectralLossPass2 into their own blocks
 /// to ensure they execute as separate kernels without any fused operations.
+/// Also isolates FFT-based spectral loss gradient operations to avoid race conditions.
 /// Preserves ordering of other nodes.
 public func isolateSpectralPasses(_ blocks: [Block], _ g: Graph) -> [Block] {
     var result: [Block] = []
 
+    // Helper to create a new block with the same properties as the original
+    func makeBlock(from original: Block, nodes: [NodeID]) -> Block {
+        var newBlock = Block(kind: original.kind)
+        newBlock.nodes = nodes
+        newBlock.temporality = original.temporality
+        newBlock.tensorIndex = original.tensorIndex
+        newBlock.shape = original.shape
+        newBlock.frameTensorChain = original.frameTensorChain
+        return newBlock
+    }
+
     for block in blocks {
+        // Don't split blocks that are part of a frame tensor chain
+        // These have special threading requirements
+        if block.frameTensorChain != nil {
+            result.append(block)
+            continue
+        }
+
         var currentNodes: [NodeID] = []
 
         for nodeId in block.nodes {
@@ -844,22 +863,24 @@ public func isolateSpectralPasses(_ blocks: [Block], _ g: Graph) -> [Block] {
                 if case .spectralLossPass2 = node.op { return true }
                 if case .parallelMap2DTestPass1 = node.op { return true }
                 if case .parallelMap2DTestPass2 = node.op { return true }
+                // FFT-based spectral loss ops need isolation to prevent race conditions
+                // GradInline writes frame-indexed gradients that GradRead reads across frames
+                if case .spectralLossFFT = node.op { return true }
+                if case .spectralLossFFTGradInline = node.op { return true }
+                if case .spectralLossFFTGradRead = node.op { return true }
+                if case .spectralLossFFTGradRead2 = node.op { return true }
                 return false
             }()
 
             if isSpectralPass {
                 // Flush any accumulated nodes before the spectral pass
                 if !currentNodes.isEmpty {
-                    var newBlock = Block(kind: block.kind)
-                    newBlock.nodes = currentNodes
-                    result.append(newBlock)
+                    result.append(makeBlock(from: block, nodes: currentNodes))
                     currentNodes = []
                 }
 
                 // Add spectral pass in its own block
-                var spectralBlock = Block(kind: block.kind)
-                spectralBlock.nodes = [nodeId]
-                result.append(spectralBlock)
+                result.append(makeBlock(from: block, nodes: [nodeId]))
             } else {
                 // Accumulate non-spectral nodes
                 currentNodes.append(nodeId)
@@ -868,9 +889,7 @@ public func isolateSpectralPasses(_ blocks: [Block], _ g: Graph) -> [Block] {
 
         // Flush any remaining nodes after the last spectral pass
         if !currentNodes.isEmpty {
-            var newBlock = Block(kind: block.kind)
-            newBlock.nodes = currentNodes
-            result.append(newBlock)
+            result.append(makeBlock(from: block, nodes: currentNodes))
         }
     }
 
