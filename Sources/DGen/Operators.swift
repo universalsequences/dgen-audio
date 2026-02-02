@@ -124,7 +124,7 @@ public enum LazyOp {
     // Input: [gradOutput (1D tensor), rowIndex]
     case peekRowGradWrite(
         floorGradCell: CellID, ceilGradCell: CellID, rowIdxCell: CellID, fracCell: CellID,
-        numRows: Int, numCols: Int)
+        numRows: Int, numCols: Int, maxFrameCount: Int)
     // peekRowGradReduce: sum gradient contributions from all frames for each tensor position
     case peekRowGradReduce(
         floorGradCell: CellID, ceilGradCell: CellID, rowIdxCell: CellID, fracCell: CellID,
@@ -1257,7 +1257,7 @@ public enum LazyOp {
 
         case .peekRowGradWrite(
             let floorGradCell, let ceilGradCell, let rowIdxCell, let fracCell,
-            let numRows, let numCols):
+            let numRows, let numCols, let maxFrameCount):
             // Write gradients for both floor and ceil rows to frame-indexed storage
             // Inputs: [gradOutput (scalar or 1D tensor), rowIndex]
             // Note: gradOutput can be scalar (from sum reduction) - same value for all elements
@@ -1308,7 +1308,7 @@ public enum LazyOp {
             _ = b.memoryWrite(rowIdxCell, b.cast(frameIdx, to: .int), floorIndex)
             _ = b.memoryWrite(fracCell, b.cast(frameIdx, to: .int), frac)
             // Write ceil index to a separate slot (frame + maxFrameCount)
-            let ceilSlot = frameIdx + b.constant(4096.0)  // maxFrameCount offset
+            let ceilSlot = frameIdx + b.constant(Float(maxFrameCount))
             _ = b.memoryWrite(rowIdxCell, b.cast(ceilSlot, to: .int), ceilWrapped)
 
             // Write weighted gradients for floor and ceil

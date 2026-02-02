@@ -1484,14 +1484,14 @@ final class GraphGradientTests: XCTestCase {
     /// MLP -> peekRow -> Harmonic Synth teacher-student test
     /// Tests efficiency of the full pipeline with graph-based gradients
     func testMLPPeekRowHarmonicSynth_TeacherStudent() throws {
-        let frameCount = 512
+        let frameCount = 64
         let controlFrames = 16
         let sampleRate: Float = 2000.0
         let f0: Float = 100.0
-        let numHarmonics = 100
+        let numHarmonics = 32
         let hiddenSize = 8
 
-        let g = Graph(sampleRate: sampleRate)
+        let g = Graph(sampleRate: sampleRate, maxFrameCount: frameCount)
 
         // Control-rate time tensor [controlFrames, 1], normalized 0..1
         let timeData = (0..<controlFrames).map { Float($0) / Float(controlFrames - 1) }
@@ -1646,7 +1646,7 @@ final class GraphGradientTests: XCTestCase {
         print("Initial loss: \(initialLoss)")
 
         // Training loop with timing
-        let epochs = 50
+        let epochs = 100
         var finalLoss = initialLoss
         let trainStart = CFAbsoluteTimeGetCurrent()
         for i in 0..<epochs {

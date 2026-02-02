@@ -81,6 +81,11 @@ public struct CompilationPipeline {
         options: Options = Options(),
         name: String = "kernel"
     ) throws -> CompilationResult {
+        precondition(
+            options.frameCount <= graph.maxFrameCount,
+            "frameCount (\(options.frameCount)) exceeds graph.maxFrameCount (\(graph.maxFrameCount)). " +
+            "Set graph.maxFrameCount to at least \(options.frameCount) before compilation."
+        )
         let pipelineStart = CFAbsoluteTimeGetCurrent()
         var timings: [(String, Double)] = []
 
@@ -189,9 +194,6 @@ public struct CompilationPipeline {
         }
 
         var finalBlocks = seperatedBlocks.compactMap { $0 }
-        if backend == .metal {
-            finalBlocks = splitReduceBlocks(g: graph, blocks: finalBlocks)
-        }
 
         // Isolate spectral loss passes into their own blocks to prevent race conditions
         // This ensures FFT forward pass completes before gradient pass runs
@@ -221,6 +223,12 @@ public struct CompilationPipeline {
                 frameBasedNodes: temporalityResult.frameBasedNodes,
                 hopBasedNodes: temporalityResult.hopBasedNodes
             )
+        }
+
+        // Split reduce blocks AFTER temporality assignment so we can override
+        // temporality for global reduces (peekRowGradReduce/selectRowGradReduce)
+        if backend == .metal {
+            finalBlocks = splitReduceBlocks(g: graph, blocks: finalBlocks)
         }
 
         // Step 4.6: Allocate real memory for lazy tensor cells

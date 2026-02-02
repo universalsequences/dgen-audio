@@ -656,15 +656,15 @@ final class SpectralLossGradientTests: XCTestCase {
     /// This is the spectral loss equivalent of testMLPPeekRowHarmonicSynth_TeacherStudent
     /// for speed comparison
     func testMLPPeekRowHarmonicSynth_SpectralLoss() throws {
-        let frameCount = 64
-        let controlFrames = 16
+        let frameCount = 512
+        let controlFrames = 64
         let sampleRate: Float = 2000.0
         let f0: Float = 100.0
-        let numHarmonics = 6
+        let numHarmonics = 32
         let hiddenSize = 8
-        let windowSize = 32  // FFT window size for spectral loss
+        let windowSize = 64  // FFT window size for spectral loss
 
-        let g = Graph(sampleRate: sampleRate)
+        let g = Graph(sampleRate: sampleRate, maxFrameCount: frameCount)
 
         // Control-rate time tensor [controlFrames, 1], normalized 0..1
         let timeData = (0..<controlFrames).map { Float($0) / Float(controlFrames - 1) }
@@ -789,8 +789,8 @@ final class SpectralLossGradientTests: XCTestCase {
             graph: g,
             loss: loss,
             tensorParameters: [studentW1, studentB1, studentW2, studentB2],
-            optimizer: GraphSGD(),
-            learningRate: 0.0000001,
+            optimizer: GraphAdam(),
+            learningRate: 0.001,
             frameCount: frameCount,
             kernelDebugOutput: "/tmp/mlp_peekrow_harmonic_spectral.metal"
         )

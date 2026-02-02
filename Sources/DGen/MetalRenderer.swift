@@ -61,7 +61,9 @@ public class MetalRenderer: Renderer, UOpEmitter {
       useReducedGradsSum = useReduced
 
       // Render parallelRange loops as thread-parallel only for split static kernels
-      parallelRangeMode = parallelCount == nil ? .loop : .thread
+      // Exception: static scalar blocks always use loop mode (they run once, no threading)
+      let isStaticScalar = scheduleItem.temporality == .static_ && scheduleItem.kind == .scalar
+      parallelRangeMode = (parallelCount == nil || isStaticScalar) ? .loop : .thread
       let source = render(
         name: kernelName, scheduleItem: scheduleItem, ctx: ctx, graph: graph,
         totalMemorySlots: totalMemorySlots)

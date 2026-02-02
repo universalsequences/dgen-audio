@@ -31,8 +31,7 @@ extension Graph {
   /// Uses tape-based compute; no ring buffers are required.
   public func spectralLoss(_ sig1: NodeID, _ sig2: NodeID, windowSize: Int) -> NodeID {
     // Allocate scratch memory for two-pass backward gradient distribution
-    // Conservative max: 4096 frames * windowSize * 2 (for sig1 and sig2 contributions)
-    let maxFrameCount = 4096
+    // Size: maxFrameCount * windowSize * 2 (for sig1 and sig2 contributions)
     let scratchSize = maxFrameCount * windowSize * 2
     let scratchCell = alloc(vectorWidth: scratchSize)
 
@@ -72,7 +71,6 @@ extension Graph {
                  "windowSize must be a power of 2")
 
     let numBins = windowSize / 2 + 1
-    let maxFrameCount = 4096
 
     // Allocate window coefficients (shared between all frames - same Hann window)
     let windowCell = alloc(vectorWidth: windowSize)
@@ -107,7 +105,6 @@ extension Graph {
   /// Parallel map2D test: writes per-bin values using flattened (frame, bin) threads,
   /// then reduces to a scalar per frame. Used to validate parallelMap2D semantics.
   public func parallelMap2DTest(bins: Int) -> NodeID {
-    let maxFrameCount = 4096
     let scratchSize = maxFrameCount * bins
     let scratchCell = alloc(vectorWidth: scratchSize)
 
@@ -746,7 +743,6 @@ extension Graph {
 
     // Allocate frame-indexed scratch cell for SIMD safety
     // Size: maxFrameCount * numCols
-    let maxFrameCount = 4096
     let scratchCell = alloc(vectorWidth: maxFrameCount * numCols)
 
     return n(.peekRowInline(scratchCell: scratchCell, numRows: numRows, numCols: numCols),

@@ -319,6 +319,10 @@ public class MetalCompiledKernel: CompiledKernelRuntime {
     outputs: UnsafeMutablePointer<Float>, inputs: UnsafePointer<Float>, frameCount: Int,
     volumeScale: Float = 1.0
   ) {
+    precondition(
+      frameCount <= maxFrameCount,
+      "frameCount (\(frameCount)) exceeds maxFrameCount (\(maxFrameCount))"
+    )
     // Update frameCount buffer with current frameCount value
     if let frameCountBuffer = bufferPool["frameCount"] {
       let frameCountPtr = frameCountBuffer.contents().assumingMemoryBound(to: UInt32.self)

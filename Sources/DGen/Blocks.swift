@@ -1484,24 +1484,25 @@ public func splitReduceBlocks(g: Graph, blocks: [Block]) -> [Block] {
         }
 
         // Reduction block
-        var reductionBlock = Block(kind: .simd)
-        reductionBlock.nodes = [block.nodes[reductionOpIndex]]
-        reductionBlock.temporality = block.temporality
+        // Global reduces (peekRowGradReduce/selectRowGradReduce) run once total, not per-frame
+        let reductionNode = g.nodes[block.nodes[reductionOpIndex]]
+        let isGlobalReduce: Bool
+        switch reductionNode?.op {
+        case .peekRowGradReduce, .selectRowGradReduce:
+            isGlobalReduce = true
+        default:
+            isGlobalReduce = false
+        }
 
-        // Set output shape for tensor reductions, but skip global reduce ops
-        // (peekRowGradReduce/selectRowGradReduce loop internally and don't need thread scaling)
-        if let reductionNode = g.nodes[block.nodes[reductionOpIndex]],
-           case .tensor(let outputShape) = reductionNode.shape {
-            let isGlobalReduce: Bool
-            switch reductionNode.op {
-            case .peekRowGradReduce, .selectRowGradReduce:
-                isGlobalReduce = true
-            default:
-                isGlobalReduce = false
-            }
-            if !isGlobalReduce {
-                reductionBlock.shape = outputShape
-            }
+        // Global reduces need kind=.scalar AND temporality=.static_ to run once total
+        var reductionBlock = Block(kind: isGlobalReduce ? .scalar : .simd)
+        reductionBlock.nodes = [block.nodes[reductionOpIndex]]
+        reductionBlock.temporality = isGlobalReduce ? .static_ : block.temporality
+
+        // Set output shape for tensor reductions (enables thread scaling)
+        // Skip for global reduces - they loop internally over all frames
+        if let reductionNode, case .tensor(let outputShape) = reductionNode.shape, !isGlobalReduce {
+            reductionBlock.shape = outputShape
         }
         splitBlocks.append(reductionBlock)
 

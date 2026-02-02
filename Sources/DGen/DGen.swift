@@ -34,6 +34,10 @@ open class Graph {
     /// Sample rate for audio processing (default 44100 Hz)
     public var sampleRate: Float = 44100.0
 
+    /// Maximum frame count for scratch buffer allocations (default 4096)
+    /// Set this to match your actual frame count to reduce memory usage and computation
+    public var maxFrameCount: Int = 4096
+
     /// Mapping from history cell IDs to gradient carry cell IDs.
     /// Used for temporal gradient flow through historyRead/historyWrite.
     public var gradCarryCells: [CellID: CellID] = [:]
@@ -55,6 +59,15 @@ open class Graph {
 
     public init(sampleRate: Float) {
         self.sampleRate = sampleRate
+    }
+
+    public init(maxFrameCount: Int) {
+        self.maxFrameCount = maxFrameCount
+    }
+
+    public init(sampleRate: Float, maxFrameCount: Int) {
+        self.sampleRate = sampleRate
+        self.maxFrameCount = maxFrameCount
     }
 
     /// Returns the total number of allocated memory cells

@@ -175,6 +175,11 @@ public class GraphTrainingContext {
         frameCount: Int = 64,
         kernelDebugOutput: String? = nil
     ) throws {
+        precondition(
+            frameCount <= graph.maxFrameCount,
+            "frameCount (\(frameCount)) exceeds graph.maxFrameCount (\(graph.maxFrameCount)). " +
+            "Set graph.maxFrameCount to at least \(frameCount) before creating GraphTraining."
+        )
         self.graph = graph
         self.lossNode = loss
         self.parameters = parameters

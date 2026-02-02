@@ -182,7 +182,6 @@ public final class IRBuilder {
   public func neg(_ val: Expr) -> Expr {
     let dest = ctx.useVariable(src: nodeId)
     let negativeConstant = constant(-1)
-    print("negative constant=\(negativeConstant)")
     let uop = UOp(op: .mul(val.lazy, negativeConstant.lazy), value: dest)
     ops.append(uop)
     return value(dest)
@@ -383,7 +382,6 @@ public final class IRBuilder {
   // MARK: - High-level tensor I/O
 
   public func readInput(_ node: Node, _ inputs: [Lazy], at idx: Int) throws -> Expr {
-    print("node.op=\(node.op) reading input for node=\(node.id) inputs=\(node.inputs) idx=\(idx)")
     let inputId = node.inputs[idx]
     guard let inputNode = ctx.g.nodes[inputId] else { throw DGenError.missingTensorID }
 
@@ -395,13 +393,8 @@ public final class IRBuilder {
       let tensor = ctx.g.nodeToTensor[inputId].flatMap({ ctx.g.tensors[$0] }),
       let loopIdx = ctx.tensorIndices[node.id]
     else {
-      print(
-        "ctx.tesnorIndices -> \(ctx.tensorIndices[node.id]) tensor=\(ctx.g.nodeToTensor[inputId].flatMap({ctx.g.tensors[$0]}))"
-      )
       throw DGenError.missingTensorID
     }
-
-    print("loopIdx for input node=\(node.op) loopIdx=\(loopIdx)")
 
     // For padded tensors, use tensorRead which handles bounds checking
     if tensor.padding != nil {
@@ -431,18 +424,14 @@ public final class IRBuilder {
   }
 
   public func writeOutput(_ node: Node, _ result: Expr) throws {
-    print(
-      "\(ANSI.green)write output \(ANSI.red)node=\(node.op)\(ANSI.reset) node.id=\(node.id) result=\(result) \(ANSI.green)tensor=\(ctx.g.nodeToTensor[node.id])\(ANSI.reset) tensorIndices=\(ctx.tensorIndices[node.id]) node.shape=\(node.shape)"
-    )
     use(val: result)
     guard case .tensor = node.shape,
       let tensor = ctx.g.nodeToTensor[node.id].flatMap({ ctx.g.tensors[$0] }),
       let loopIdx = ctx.tensorIndices[node.id]
     else {
-      print("somethings missing")
+      // scalar case, no need to store in tensor
       return
     }
-    print("gonna run tstore")
     _ = tstore(tensor.cellId, value(loopIdx), result)
   }
 

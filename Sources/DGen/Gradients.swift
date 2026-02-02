@@ -611,9 +611,8 @@ extension LazyOp {
 
             // Allocate per-frame time-domain gradient cells to avoid race conditions
             // Layout: frame0: [0..windowSize), frame1: [windowSize..2*windowSize), etc.
-            let maxFrameCount = 4096
-            let gradTime1Cell = g.alloc(vectorWidth: maxFrameCount * windowSize)
-            let gradTime2Cell = g.alloc(vectorWidth: maxFrameCount * windowSize)
+            let gradTime1Cell = g.alloc(vectorWidth: g.maxFrameCount * windowSize)
+            let gradTime2Cell = g.alloc(vectorWidth: g.maxFrameCount * windowSize)
 
             // Single gradient pass that recomputes DFT inline and scatters to time domain
             // Uses frame-indexed storage to avoid race conditions
@@ -687,13 +686,12 @@ extension LazyOp {
             let numRows = shape[0]
             let numCols = shape[1]
             let totalSize = numRows * numCols
-            let maxFrameCount = 4096
 
             let gradCell = getOrCreateGradCell(g, tensorInput: tensorInput, totalSize: totalSize)
 
             // Allocate frame-indexed storage for deterministic gradient accumulation
-            let gradWriteCell = g.alloc(vectorWidth: maxFrameCount * numCols)
-            let rowIdxCell = g.alloc(vectorWidth: maxFrameCount)
+            let gradWriteCell = g.alloc(vectorWidth: g.maxFrameCount * numCols)
+            let rowIdxCell = g.alloc(vectorWidth: g.maxFrameCount)
 
             // Phase 1: Write gradients to frame-indexed storage (no atomics)
             let rowIndex = node.inputs[1]
@@ -714,7 +712,7 @@ extension LazyOp {
                     gradCell: gradCell,
                     numRows: numRows,
                     numCols: numCols,
-                    maxFrameCount: maxFrameCount
+                    maxFrameCount: g.maxFrameCount
                 ), [writeOp])
             g.addGradientSideEffect(reduceOp)
 
@@ -743,15 +741,14 @@ extension LazyOp {
             }
 
             let totalSize = numRows * numCols
-            let maxFrameCount = 4096
 
             let gradCell = getOrCreateGradCell(g, tensorInput: tensorInput, totalSize: totalSize)
 
             // Allocate frame-indexed storage
-            let floorGradCell = g.alloc(vectorWidth: maxFrameCount * numCols)
-            let ceilGradCell = g.alloc(vectorWidth: maxFrameCount * numCols)
-            let rowIdxCell = g.alloc(vectorWidth: maxFrameCount * 2)  // floor and ceil indices
-            let fracCell = g.alloc(vectorWidth: maxFrameCount)
+            let floorGradCell = g.alloc(vectorWidth: g.maxFrameCount * numCols)
+            let ceilGradCell = g.alloc(vectorWidth: g.maxFrameCount * numCols)
+            let rowIdxCell = g.alloc(vectorWidth: g.maxFrameCount * 2)  // floor and ceil indices
+            let fracCell = g.alloc(vectorWidth: g.maxFrameCount)
 
             // Phase 1: Write weighted gradients to frame-indexed storage
             let rowIndex = node.inputs[1]
@@ -762,7 +759,8 @@ extension LazyOp {
                     rowIdxCell: rowIdxCell,
                     fracCell: fracCell,
                     numRows: numRows,
-                    numCols: numCols
+                    numCols: numCols,
+                    maxFrameCount: g.maxFrameCount
                 ), [gradOutput, rowIndex])
             g.addGradientSideEffect(writeOp)
 
@@ -776,7 +774,7 @@ extension LazyOp {
                     gradCell: gradCell,
                     numRows: numRows,
                     numCols: numCols,
-                    maxFrameCount: maxFrameCount
+                    maxFrameCount: g.maxFrameCount
                 ), [writeOp])
             g.addGradientSideEffect(reduceOp)
 
@@ -784,7 +782,7 @@ extension LazyOp {
             let zero = g.n(.constant(0.0), [])
             return [sequencedGrad, zero]
 
-        case .peekRowGradWrite(_, _, _, _, _, _), .peekRowGradReduce(_, _, _, _, _, _, _, _):
+        case .peekRowGradWrite(_, _, _, _, _, _, _), .peekRowGradReduce(_, _, _, _, _, _, _, _):
             // Gradient ops don't need their own gradients
             return node.inputs.map { _ in nil }
 
