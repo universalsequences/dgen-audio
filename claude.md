@@ -40,3 +40,11 @@ If training gets stuck, try:
 - Different initialization
 - Higher learning rate
 - Larger window size for better frequency resolution
+
+## Metal GPU Synchronization
+
+1. **`atomic_thread_fence` does NOT sync between threads** - it only orders memory operations within a single thread. For cross-thread synchronization, split into separate kernels.
+
+2. **Reduction ops need kernel boundaries** - If a write phase stores per-frame data and a reduce phase reads from ALL frames, they MUST be in separate kernels. Add the op to `isReductionOp()` in Blocks.swift.
+
+3. **Global reduces should skip thread scaling** - Ops like `peekRowGradReduce` that loop over all frames internally should NOT get `threadCountScale`. Check `splitReduceBlocks()` to exclude them from shape assignment.

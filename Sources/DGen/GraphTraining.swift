@@ -386,35 +386,28 @@ public class GraphTrainingContext {
         }
     }
 
-    /// Reset all state memory (phasor state, scratch cells, etc.) while preserving parameters
-    /// Call this at the start of each training step for deterministic gradients
+    /// Reset all state memory (phasor state, scratch cells, etc.) while preserving parameters.
+    /// Call this at the start of each training step for deterministic gradients.
     public func resetState(debug: Bool = false) {
         guard let runtime = runtime else { return }
 
-        // Zero ALL GPU buffers (memory, t, gradients, etc.)
         runtime.zeroAllBuffers()
+        if debug { print("[resetState] Zeroed all GPU buffers") }
 
-        if debug {
-            print("[resetState] Zeroed all GPU buffers")
-        }
-
-        // Re-initialize parameters and tensors
         initializeMemory()
 
-        if debug {
-            if let memBuffer = runtime.getBuffer(name: "memory") {
-                let bufferSize = memBuffer.length / MemoryLayout<Float>.size
-                let memPtr = memBuffer.contents().assumingMemoryBound(to: Float.self)
-                var nonZero = 0
-                var sum: Float = 0
-                for i in 0..<bufferSize {
-                    if memPtr[i] != 0 {
-                        nonZero += 1
-                        sum += memPtr[i]
-                    }
+        if debug, let memBuffer = runtime.getBuffer(name: "memory") {
+            let bufferSize = memBuffer.length / MemoryLayout<Float>.size
+            let memPtr = memBuffer.contents().assumingMemoryBound(to: Float.self)
+            var nonZero = 0
+            var sum: Float = 0
+            for i in 0..<bufferSize {
+                if memPtr[i] != 0 {
+                    nonZero += 1
+                    sum += memPtr[i]
                 }
-                print("[resetState] After init: nonZero=\(nonZero), sum=\(sum)")
             }
+            print("[resetState] After init: nonZero=\(nonZero), sum=\(sum)")
         }
     }
 

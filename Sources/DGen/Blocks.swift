@@ -1453,15 +1453,7 @@ public func emitBlockUOps(
 
 public func isReductionOp(_ op: LazyOp) -> Bool {
     switch op {
-    case .sum:
-        return true
-    case .sumAxis(_):
-        return true
-    case .tensorAccumulate(_):
-        return true
-    case .peekRowGradReduce(_, _, _, _, _, _, _, _):
-        return true
-    case .selectRowGradReduce(_, _, _, _, _, _):
+    case .sum, .sumAxis, .tensorAccumulate, .peekRowGradReduce, .selectRowGradReduce:
         return true
     default:
         return false
@@ -1470,47 +1462,58 @@ public func isReductionOp(_ op: LazyOp) -> Bool {
 
 public func splitReduceBlocks(g: Graph, blocks: [Block]) -> [Block] {
     var splitBlocks: [Block] = []
+
     for block in blocks {
-        if let reductionOpIndex = block.nodes.firstIndex { nodeId in
+        let reductionOpIndex = block.nodes.firstIndex { nodeId in
             guard let node = g.nodes[nodeId] else { return false }
             return isReductionOp(node.op)
-        } {
-            if reductionOpIndex > 0 {
-                var preReductionBlock = Block(kind: .simd)
-                preReductionBlock.nodes = Array(block.nodes[0..<reductionOpIndex])
-                preReductionBlock.shape = block.shape
-                preReductionBlock.temporality = block.temporality
-                splitBlocks.append(preReductionBlock)
-            }
-            var reductionBlock = Block(kind: .simd)  // still SIMD w.r.t frame count
-            reductionBlock.nodes = [block.nodes[reductionOpIndex]]
-            reductionBlock.temporality = block.temporality
-            // For reduction ops that output tensors (like sumAxis), set the output shape
-            // This enables emitThreadCountScaleOpIfNeeded to set up tensorIndices
-            // BUT: peekRowGradReduce/selectRowGradReduce are global reduces that loop
-            // over all frames internally - they should NOT get thread scaling
-            if let reductionNode = g.nodes[block.nodes[reductionOpIndex]],
-               case .tensor(let outputShape) = reductionNode.shape {
-                switch reductionNode.op {
-                case .peekRowGradReduce, .selectRowGradReduce:
-                    // Global reduce - runs once, not per-frame. Don't set shape.
-                    break
-                default:
-                    reductionBlock.shape = outputShape
-                }
-            }
-            splitBlocks.append(reductionBlock)
-            if reductionOpIndex < block.nodes.count - 1 {
-                var postReductionBlock = Block(kind: .simd)
-                postReductionBlock.nodes = Array(
-                    block.nodes[reductionOpIndex + 1..<block.nodes.count])
-                postReductionBlock.shape = block.shape
-                postReductionBlock.temporality = block.temporality
-                splitBlocks.append(postReductionBlock)
-            }
-        } else {
+        }
+
+        guard let reductionOpIndex else {
             splitBlocks.append(block)
+            continue
+        }
+
+        // Pre-reduction block
+        if reductionOpIndex > 0 {
+            var preReductionBlock = Block(kind: .simd)
+            preReductionBlock.nodes = Array(block.nodes[0..<reductionOpIndex])
+            preReductionBlock.shape = block.shape
+            preReductionBlock.temporality = block.temporality
+            splitBlocks.append(preReductionBlock)
+        }
+
+        // Reduction block
+        var reductionBlock = Block(kind: .simd)
+        reductionBlock.nodes = [block.nodes[reductionOpIndex]]
+        reductionBlock.temporality = block.temporality
+
+        // Set output shape for tensor reductions, but skip global reduce ops
+        // (peekRowGradReduce/selectRowGradReduce loop internally and don't need thread scaling)
+        if let reductionNode = g.nodes[block.nodes[reductionOpIndex]],
+           case .tensor(let outputShape) = reductionNode.shape {
+            let isGlobalReduce: Bool
+            switch reductionNode.op {
+            case .peekRowGradReduce, .selectRowGradReduce:
+                isGlobalReduce = true
+            default:
+                isGlobalReduce = false
+            }
+            if !isGlobalReduce {
+                reductionBlock.shape = outputShape
+            }
+        }
+        splitBlocks.append(reductionBlock)
+
+        // Post-reduction block
+        if reductionOpIndex < block.nodes.count - 1 {
+            var postReductionBlock = Block(kind: .simd)
+            postReductionBlock.nodes = Array(block.nodes[reductionOpIndex + 1..<block.nodes.count])
+            postReductionBlock.shape = block.shape
+            postReductionBlock.temporality = block.temporality
+            splitBlocks.append(postReductionBlock)
         }
     }
+
     return splitBlocks
 }

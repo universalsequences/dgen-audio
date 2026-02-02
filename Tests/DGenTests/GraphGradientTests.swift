@@ -1325,7 +1325,9 @@ final class GraphGradientTests: XCTestCase {
             let grads = ctx.getTensorGradients()
             let gradSum = grads.reduce(0, +)
             let gradAbsMax = grads.map { abs($0) }.max() ?? 0
-            print("Epoch \(i): loss = \(String(format: "%.6f", finalLoss)), gradSum = \(String(format: "%.6f", gradSum)), gradAbsMax = \(String(format: "%.6f", gradAbsMax))")
+            print(
+                "Epoch \(i): loss = \(String(format: "%.6f", finalLoss)), gradSum = \(String(format: "%.6f", gradSum)), gradAbsMax = \(String(format: "%.6f", gradAbsMax))"
+            )
         }
 
         print("Final loss: \(finalLoss)")
@@ -1482,11 +1484,11 @@ final class GraphGradientTests: XCTestCase {
     /// MLP -> peekRow -> Harmonic Synth teacher-student test
     /// Tests efficiency of the full pipeline with graph-based gradients
     func testMLPPeekRowHarmonicSynth_TeacherStudent() throws {
-        let frameCount = 64
+        let frameCount = 512
         let controlFrames = 16
         let sampleRate: Float = 2000.0
         let f0: Float = 100.0
-        let numHarmonics = 32 
+        let numHarmonics = 100
         let hiddenSize = 8
 
         let g = Graph(sampleRate: sampleRate)
@@ -1630,8 +1632,10 @@ final class GraphGradientTests: XCTestCase {
         ctx.debugTensorCells()
 
         // Print memory stats (GPU side) - check larger region
-        let memStats = ctx.getMemoryStats(maxElements: 10000000)
-        print("Memory (GPU): min=\(String(format: "%.4f", memStats.min)), max=\(String(format: "%.4f", memStats.max)), mean=\(String(format: "%.6f", memStats.mean)), nonZero=\(memStats.nonZeroCount)/\(memStats.totalCount)")
+        let memStats = ctx.getMemoryStats(maxElements: 10_000_000)
+        print(
+            "Memory (GPU): min=\(String(format: "%.4f", memStats.min)), max=\(String(format: "%.4f", memStats.max)), mean=\(String(format: "%.6f", memStats.mean)), nonZero=\(memStats.nonZeroCount)/\(memStats.totalCount)"
+        )
 
         // Warmup - use fullReset to ensure deterministic state
         ctx.resetState(debug: true)  // Debug first reset
@@ -1642,7 +1646,7 @@ final class GraphGradientTests: XCTestCase {
         print("Initial loss: \(initialLoss)")
 
         // Training loop with timing
-        let epochs = 500
+        let epochs = 50
         var finalLoss = initialLoss
         let trainStart = CFAbsoluteTimeGetCurrent()
         for i in 0..<epochs {
@@ -1665,7 +1669,7 @@ final class GraphGradientTests: XCTestCase {
             )
 
             XCTAssertFalse(finalLoss.isNaN, "Loss became NaN at epoch \(i)")
-            if finalLoss.isNaN || finalLoss < initialLoss * 0.0025 {
+            if finalLoss.isNaN || finalLoss < initialLoss * 0.025 {
                 break
             }
         }
