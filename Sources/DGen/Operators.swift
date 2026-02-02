@@ -501,31 +501,27 @@ public enum LazyOp {
             let fftBaseOffset = frameIdx * b.constant(Float(fftSize))
             let magBaseOffset = frameIdx * b.constant(Float(numBins))
 
+            // Helper to compute Hann coefficient inline (avoids shared memory race)
+            func hannCoeff(_ nFloat: Expr) -> Expr {
+                if useHann {
+                    let angle = b.constant(2.0) * b.pi * nFloat / b.constant(Float(windowSize - 1))
+                    return b.constant(0.5) * (one - b.cos(angle))
+                } else {
+                    return one
+                }
+            }
+
             // Use b.if_ to force scalar mode for the entire computation block
             // This prevents SIMD variable generation issues in nested loops
             let alwaysTrue = one > zero
             let loss = b.float(0.0)
             b.if_(alwaysTrue) {
-                // 1. Generate Hann window coefficients (shared - same for all frames)
-                if useHann {
-                    b.parallelRange(windowSize) { n in
-                        let nFloat = b.cast(n, to: .float)
-                        let angle =
-                            b.constant(2.0) * b.pi * nFloat / b.constant(Float(windowSize - 1))
-                        let w = b.constant(0.5) * (one - b.cos(angle))
-                        _ = b.memoryWrite(windowCell, b.cast(n, to: .int), w)
-                    }
-                } else {
-                    b.parallelRange(windowSize) { n in
-                        _ = b.memoryWrite(windowCell, b.cast(n, to: .int), one)
-                    }
-                }
-
-                // 2. Load windowed samples into per-frame FFT scratch cells
+                // 1. Load windowed samples into per-frame FFT scratch cells
+                // Compute Hann coefficient inline to avoid shared memory race
                 b.parallelRange(windowSize) { n in
                     let nInt = b.cast(n, to: .int)
                     let nFloat = b.cast(nInt, to: .float)
-                    let w = b.memoryRead(windowCell, nInt)
+                    let w = hannCoeff(nFloat)
 
                     // Load from tape: samples at position frameIdx - windowSize + 1 + n
                     let j = frameIdx - (winSizeFloat - one) + nFloat
@@ -860,32 +856,27 @@ public enum LazyOp {
             // Frame-indexed base offset for this frame's gradient storage
             let frameBase = frameIdx * winSizeFloat
 
+            // Helper to compute Hann coefficient inline (avoids shared memory race)
+            func hannCoeff(_ nFloat: Expr) -> Expr {
+                if useHann {
+                    let angle = b.constant(2.0) * b.pi * nFloat / b.constant(Float(windowSize - 1))
+                    return b.constant(0.5) * (one - b.cos(angle))
+                } else {
+                    return one
+                }
+            }
+
             // Use if_ to force scalar mode
             let alwaysTrue = one > zero
             b.if_(alwaysTrue) {
-                // 1. Generate Hann window coefficients (same as forward)
-                if useHann {
-                    b.parallelRange(windowSize) { n in
-                        let nFloat = b.cast(n, to: .float)
-                        let angle =
-                            b.constant(2.0) * b.pi * nFloat / b.constant(Float(windowSize - 1))
-                        let w = b.constant(0.5) * (one - b.cos(angle))
-                        _ = b.memoryWrite(windowCell, b.cast(n, to: .int), w)
-                    }
-                } else {
-                    b.parallelRange(windowSize) { n in
-                        _ = b.memoryWrite(windowCell, b.cast(n, to: .int), one)
-                    }
-                }
-
-                // 2. Zero the gradient cells at frame-indexed positions
+                // 1. Zero the gradient cells at frame-indexed positions
                 b.loop(windowSize) { n in
                     let idx = b.cast(frameBase + b.cast(n, to: .float), to: .int)
                     _ = b.memoryWrite(gradTime1Cell, idx, zero)
                     _ = b.memoryWrite(gradTime2Cell, idx, zero)
                 }
 
-                // 3. For each bin, recompute DFT and accumulate gradients to time domain
+                // 2. For each bin, recompute DFT and accumulate gradients to time domain
                 // This is the key: we compute the DFT inline using tapeLoad, avoiding shared cells
                 b.loop(numBins) { kIdx in
                     let k = b.cast(kIdx, to: .float)
@@ -899,7 +890,7 @@ public enum LazyOp {
                     b.loop(windowSize) { n in
                         let nFloat = b.cast(n, to: .float)
                         let j = frameIdx - (winSizeFloat - one) + nFloat
-                        let w = b.memoryRead(windowCell, b.cast(n, to: .int))
+                        let w = hannCoeff(nFloat)  // Compute Hann inline
 
                         let s1 = b.tapeLoad(sig1, at: j) * w
                         let s2 = b.tapeLoad(sig2, at: j) * w
@@ -934,21 +925,25 @@ public enum LazyOp {
                     let gradImag2 = gradMag2 * imag2.value / safeMag2
 
                     // Scatter gradient to time domain: ∂L/∂x[n] += gradReal * cos + gradImag * sin
-                    // This is the transpose of the DFT (IDFT without normalization)
+                    // This is the transpose of the DFT with normalization
                     // Uses frame-indexed storage to avoid race conditions
+                    //
+                    // Normalization: 1/(windowSize * numBins) - less aggressive to allow learning
+                    let normFactor = b.constant(1.0 / Float(windowSize * numBins))
+
                     b.loop(windowSize) { n in
                         let nFloat = b.cast(n, to: .float)
                         let angle = b.constant(-2.0) * b.pi * k * nFloat / winSizeFloat
                         let c = b.cos(angle)
                         let s = b.sin(angle)
-                        let w = b.memoryRead(windowCell, b.cast(n, to: .int))
+                        let w = hannCoeff(nFloat)  // Compute Hann inline
 
                         // Frame-indexed position
                         let idx = b.cast(frameBase + nFloat, to: .int)
 
-                        // Accumulate gradient (window backprop included)
-                        let grad1Contrib = (gradReal1 * c + gradImag1 * s) * w
-                        let grad2Contrib = (gradReal2 * c + gradImag2 * s) * w
+                        // Accumulate gradient (window backprop included, with normalization)
+                        let grad1Contrib = (gradReal1 * c + gradImag1 * s) * w * normFactor
+                        let grad2Contrib = (gradReal2 * c + gradImag2 * s) * w * normFactor
                         _ = b.memoryAccumulate(gradTime1Cell, idx, grad1Contrib)
                         _ = b.memoryAccumulate(gradTime2Cell, idx, grad2Contrib)
                     }
@@ -960,7 +955,7 @@ public enum LazyOp {
         case .spectralLossFFTGradRead(let windowSize, let gradTime1Cell, _):
             // Read gradient for signal 1 from frame-indexed storage
             // Sample at position p appears in windows at frames p, p+1, ..., p+windowSize-1
-            // We must sum contributions from all these windows
+            // We must sum contributions from all these windows (but only if the window exists)
             guard inputs.count == 1 else {
                 throw DGenError.insufficientInputs(
                     operator: "spectralLossFFTGradRead", expected: 1, actual: inputs.count)
@@ -970,26 +965,33 @@ public enum LazyOp {
 
             let frameIdx = b.threadIndex()
             let winSizeFloat = b.constant(Float(windowSize))
+            let frameCount = b.frameCount()
             let p = frameIdx  // absolute sample position
 
             // Sum contributions from all windows that contain sample p
             // Window at frame w contains sample p at offset (p - w + windowSize - 1)
             // Gradient stored at w * windowSize + (p - w + windowSize - 1)
+            // Only read from windows that exist (w < frameCount)
             let gradSum = b.float(0.0)
             b.loop(windowSize) { i in
                 let iFloat = b.cast(i, to: .float)
                 let w = p + iFloat  // window frame index
                 let offset = winSizeFloat - b.constant(1.0) - iFloat  // offset in that window
-                let idx = w * winSizeFloat + offset
+                // Clamp index to valid range to prevent out-of-bounds read
+                let clampedW = b.min(w, frameCount - b.constant(1.0))
+                let idx = clampedW * winSizeFloat + offset
+                // Read is now safe, but only accumulate if in bounds
                 let contrib = b.memoryRead(gradTime1Cell, b.cast(idx, to: .int))
-                gradSum.accumulate(contrib)
+                let inBounds = w < frameCount
+                let safeContrib = b.gswitch(inBounds, contrib, b.constant(0.0))
+                gradSum.accumulate(safeContrib)
             }
             b.use(val: gradSum.value)
 
         case .spectralLossFFTGradRead2(let windowSize, let gradTime2Cell):
             // Read gradient for signal 2 from frame-indexed storage
             // Sample at position p appears in windows at frames p, p+1, ..., p+windowSize-1
-            // We must sum contributions from all these windows
+            // We must sum contributions from all these windows (but only if the window exists)
             guard inputs.count == 1 else {
                 throw DGenError.insufficientInputs(
                     operator: "spectralLossFFTGradRead2", expected: 1, actual: inputs.count)
@@ -999,19 +1001,26 @@ public enum LazyOp {
 
             let frameIdx = b.threadIndex()
             let winSizeFloat = b.constant(Float(windowSize))
+            let frameCount = b.frameCount()
             let p = frameIdx  // absolute sample position
 
             // Sum contributions from all windows that contain sample p
             // Window at frame w contains sample p at offset (p - w + windowSize - 1)
             // Gradient stored at w * windowSize + (p - w + windowSize - 1)
+            // Only read from windows that exist (w < frameCount)
             let gradSum = b.float(0.0)
             b.loop(windowSize) { i in
                 let iFloat = b.cast(i, to: .float)
                 let w = p + iFloat  // window frame index
                 let offset = winSizeFloat - b.constant(1.0) - iFloat  // offset in that window
-                let idx = w * winSizeFloat + offset
+                // Clamp index to valid range to prevent out-of-bounds read
+                let clampedW = b.min(w, frameCount - b.constant(1.0))
+                let idx = clampedW * winSizeFloat + offset
+                // Read is now safe, but only accumulate if in bounds
                 let contrib = b.memoryRead(gradTime2Cell, b.cast(idx, to: .int))
-                gradSum.accumulate(contrib)
+                let inBounds = w < frameCount
+                let safeContrib = b.gswitch(inBounds, contrib, b.constant(0.0))
+                gradSum.accumulate(safeContrib)
             }
             b.use(val: gradSum.value)
 

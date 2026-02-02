@@ -131,6 +131,7 @@ public class MetalRenderer: Renderer, UOpEmitter {
         threadCount: parallelCount,
         threadCountScale: scheduleItem.threadCountScale,
         needsReducedGradsSum: useReduced,
+        needsMemoryBarrier: scheduleItem.needsMemoryBarrier,
         memorySize: max(totalMemorySlots, 1024)  // Match memory size calculation from render method
       )
     }
@@ -413,6 +414,7 @@ public class MetalRenderer: Renderer, UOpEmitter {
         let scheduleItem = ScheduleItem(kind: block.kind, temporality: block.temporality)
         scheduleItem.parallelPolicy = block.parallelPolicy
         scheduleItem.threadCountScale = block.threadCountScale
+        scheduleItem.needsMemoryBarrier = block.needsMemoryBarrier
         scheduleItem.ops.append(UOp(op: .frameCount, value: .empty))
 
         for uop in block.ops {

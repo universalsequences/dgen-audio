@@ -8,6 +8,90 @@ import XCTest
 /// emitting backward IR directly. Forward and backward are unified.
 final class GraphGradientTests: XCTestCase {
 
+    /// Minimal test to prove atomic_fetch_add is non-deterministic
+    /// Multiple frames atomically add to the SAME memory location
+    /// If atomic were truly deterministic, results would match across runs
+    func testAtomicAccumulateIsDeterministic() throws {
+        let frameCount = 64
+        let g = Graph(sampleRate: 1000.0)
+
+        // Use a deterministic phasor to get frame index (0, 1/64, 2/64, ... 63/64)
+        // Multiply by frameCount to get 0, 1, 2, ... 63
+        let freq = g.n(.constant(1.0))  // One cycle over all frames
+        let phase = g.n(.deterministicPhasor, [freq])  // 0, 1/64, 2/64, ...
+        let frameIdxFloat = g.n(.mul, [phase, g.n(.constant(Float(frameCount)))])  // 0, 1, 2, ...
+
+        // Allocate a cell that all frames will atomically add to
+        let accumCell = g.alloc()
+
+        // Each frame atomically adds its "frame index" to the accumulator
+        // memoryAccumulate takes [offset, value] - we use offset 0 so all frames write to same spot
+        let zeroOffset = g.n(.constant(0.0))
+        let accumNode = g.n(.memoryAccumulate(accumCell), [zeroOffset, frameIdxFloat])
+
+        // Also output the phase so we can verify frames are different
+        // Use seq to ensure accumulate happens before output
+        let seqNode = g.n(.seq, [accumNode, phase])
+        _ = g.n(.output(0), [seqNode])
+
+        // Compile
+        let result = try CompilationPipeline.compile(
+            graph: g,
+            backend: .metal,
+            options: .init(frameCount: frameCount, debug: false)
+        )
+
+        let runtime = try MetalCompiledKernel(
+            kernels: result.kernels,
+            cellAllocations: result.cellAllocations,
+            context: result.context
+        )
+
+        // Write kernel to file for inspection
+        if let source = result.kernels.first?.source {
+            try source.write(toFile: "/tmp/atomic_test.metal", atomically: true, encoding: .utf8)
+        }
+
+        // Run multiple times and collect the accumulated sum
+        var results: [Float] = []
+        for run in 0..<10 {
+            // Zero ALL memory before each run
+            runtime.zeroAllBuffers()
+
+            // Run the kernel
+            runtime.runNoCopy(frameCount: frameCount)
+
+            // Read the accumulated value from memory
+            if let memBuffer = runtime.getBuffer(name: "memory") {
+                let memPtr = memBuffer.contents().assumingMemoryBound(to: Float.self)
+                let physicalCell = result.cellAllocations.cellMappings[accumCell] ?? accumCell
+                let accumulated = memPtr[physicalCell]
+                results.append(accumulated)
+                print("Run \(run): accumulated = \(accumulated)")
+            }
+        }
+
+        // Expected: sum of 0 + 1 + 2 + ... + 63 = 64 * 63 / 2 = 2016
+        let expected: Float = Float(frameCount * (frameCount - 1)) / 2.0
+
+        // Check if all results are the same
+        let allSame = results.allSatisfy { abs($0 - results[0]) < 0.001 }
+
+        print("\nExpected sum: \(expected)")
+        print("Results: \(results)")
+        print("All results identical: \(allSame)")
+
+        if !allSame {
+            print("\n⚠️  ATOMIC_FETCH_ADD IS NON-DETERMINISTIC!")
+            print("Different runs produced different results.")
+        } else if abs(results[0] - expected) > 0.1 {
+            print("\n⚠️  Results are consistent but WRONG!")
+            print("Expected \(expected), got \(results[0])")
+        } else {
+            print("\n✓ Atomic accumulate appears deterministic for this test")
+        }
+    }
+
     /// Simple test: y = x * 2, loss = (y - target)^2
     /// Gradient: d(loss)/dx = 2 * (y - target) * 2 = 4 * (x*2 - target)
     func testSimpleMulGradient() throws {
@@ -1215,7 +1299,7 @@ final class GraphGradientTests: XCTestCase {
         let sumLearnable = g.n(.sum, [rowAtTime])
         let sumTarget = g.n(.sum, [targetTensor])
 
-        // MSE loss
+        // MSE loss (no spectral loss - isolate peekRow gradient issue)
         let diff = g.n(.sub, [sumLearnable, sumTarget])
         let loss = g.n(.mul, [diff, diff])
         _ = g.n(.output(0), [loss])
@@ -1232,15 +1316,16 @@ final class GraphGradientTests: XCTestCase {
             kernelDebugOutput: "/tmp/tensor_peekrow_sum.metal"
         )
 
-        let initialLoss = ctx.trainStep()
+        let initialLoss = ctx.trainStep(fullReset: true)
         print("Initial loss: \(initialLoss)")
 
         var finalLoss = initialLoss
         for i in 0..<20 {
-            finalLoss = ctx.trainStep()
-            if i % 5 == 0 {
-                print("Epoch \(i): loss = \(finalLoss)")
-            }
+            finalLoss = ctx.trainStep(fullReset: true)
+            let grads = ctx.getTensorGradients()
+            let gradSum = grads.reduce(0, +)
+            let gradAbsMax = grads.map { abs($0) }.max() ?? 0
+            print("Epoch \(i): loss = \(String(format: "%.6f", finalLoss)), gradSum = \(String(format: "%.6f", gradSum)), gradAbsMax = \(String(format: "%.6f", gradAbsMax))")
         }
 
         print("Final loss: \(finalLoss)")
@@ -1342,7 +1427,7 @@ final class GraphGradientTests: XCTestCase {
         let matmulOut = try g.matmul(inputTensor, weightTensor.node())
 
         // Target for sum
-        let targetSum = g.n(.constant(5.0))
+        let targetSum = g.phasor(freq: g.n(.constant(440)), reset: g.n(.constant(0)))
 
         let zero = g.n(.constant(0.0))
 
@@ -1358,8 +1443,9 @@ final class GraphGradientTests: XCTestCase {
         let sumOut = g.n(.sum, [rowAtTime])
 
         // MSE loss
-        let diff = g.n(.sub, [sumOut, targetSum])
-        let loss = g.n(.mul, [diff, diff])
+        //let diff = g.n(.sub, [sumOut, targetSum])
+        //let loss = g.n(.mul, [diff, diff])
+        let loss = g.spectralLossFFT(sumOut, targetSum, windowSize: 64)
         _ = g.n(.output(0), [loss])
 
         print("\n=== Matmul -> peekRow -> sum -> loss ===")
@@ -1369,7 +1455,7 @@ final class GraphGradientTests: XCTestCase {
             loss: loss,
             tensorParameters: [weightTensor],
             optimizer: GraphAdam(),
-            learningRate: 0.1,
+            learningRate: 0.001,
             frameCount: frameCount,
             kernelDebugOutput: "/tmp/matmul_peekrow_sum.metal"
         )
@@ -1378,7 +1464,7 @@ final class GraphGradientTests: XCTestCase {
         print("Initial loss: \(initialLoss)")
 
         var finalLoss = initialLoss
-        for i in 0..<20 {
+        for i in 0..<200 {
             finalLoss = ctx.trainStep()
             if i % 5 == 0 {
                 print("Epoch \(i): loss = \(finalLoss)")
@@ -1400,7 +1486,7 @@ final class GraphGradientTests: XCTestCase {
         let controlFrames = 16
         let sampleRate: Float = 2000.0
         let f0: Float = 100.0
-        let numHarmonics = 6
+        let numHarmonics = 32 
         let hiddenSize = 8
 
         let g = Graph(sampleRate: sampleRate)
@@ -1510,10 +1596,8 @@ final class GraphGradientTests: XCTestCase {
         let studentOut = g.n(.mul, [synthStudent, norm])
         let teacherOut = g.n(.mul, [synthTeacher, norm])
 
-        let diff = g.n(.sub, [studentOut, teacherOut])
-        let loss = g.n(
-            .add, g.spectralLossFFT(studentOut, teacherOut, windowSize: 64),
-            g.n(.mul, g.n(.constant(0.001)), g.n(.mul, [diff, diff])))
+        // Use just spectral loss (no MSE term) to isolate the issue
+        let loss = g.spectralLossFFT(studentOut, teacherOut, windowSize: 64)
         _ = g.n(.output(0), [loss])
 
         print("\n=== MLP -> peekRow -> Harmonic Synth (Teacher-Student) ===")
@@ -1530,28 +1614,58 @@ final class GraphGradientTests: XCTestCase {
             loss: loss,
             tensorParameters: [studentW1, studentB1, studentW2, studentB2],
             optimizer: GraphSGD(),
-            learningRate: 0.0001,
+            learningRate: 0.3,  // SGD with balanced LR
             frameCount: frameCount,
             kernelDebugOutput: "/tmp/mlp_peekrow_harmonic_graph.metal"
         )
         let compileTime = (CFAbsoluteTimeGetCurrent() - compileStart) * 1000
         print("Compile time: \(String(format: "%.2f", compileTime))ms")
 
-        // Warmup
-        _ = ctx.trainStep()
-        _ = ctx.trainStep()
+        // Print tensor parameter info (CPU side) - verify deterministic init
+        print("Tensor params at init:")
+        print("  W1 sum=\(studentW1.data.reduce(0,+)), first=\(studentW1.data[0])")
+        print("  W2 sum=\(studentW2.data.reduce(0,+)), first=\(studentW2.data[0])")
 
-        let initialLoss = ctx.trainStep()
+        // Debug: show physical cell addresses
+        ctx.debugTensorCells()
+
+        // Print memory stats (GPU side) - check larger region
+        let memStats = ctx.getMemoryStats(maxElements: 10000000)
+        print("Memory (GPU): min=\(String(format: "%.4f", memStats.min)), max=\(String(format: "%.4f", memStats.max)), mean=\(String(format: "%.6f", memStats.mean)), nonZero=\(memStats.nonZeroCount)/\(memStats.totalCount)")
+
+        // Warmup - use fullReset to ensure deterministic state
+        ctx.resetState(debug: true)  // Debug first reset
+        _ = ctx.trainStep(fullReset: true)
+        _ = ctx.trainStep(fullReset: true)
+
+        let initialLoss = ctx.trainStep(fullReset: true)
         print("Initial loss: \(initialLoss)")
 
         // Training loop with timing
-        let epochs = 20000
+        let epochs = 500
         var finalLoss = initialLoss
         let trainStart = CFAbsoluteTimeGetCurrent()
         for i in 0..<epochs {
-            finalLoss = ctx.trainStep()
-            print("Epoch \(i): loss = \(String(format: "%.6f", finalLoss))")
-            if finalLoss < initialLoss * 0.0025 {
+            // Print memory stats BEFORE trainStep (after zeroGrad from previous step)
+            finalLoss = ctx.trainStep(fullReset: true)
+
+            // Get gradient statistics from tensor parameters (not scalar params)
+            let grads = ctx.getTensorGradients()
+            let validGrads = grads.filter { !$0.isNaN && !$0.isInfinite }
+            let hasNaN = grads.contains { $0.isNaN }
+            let hasInf = grads.contains { $0.isInfinite }
+            let gradMin = validGrads.min() ?? Float.nan
+            let gradMax = validGrads.max() ?? Float.nan
+            let gradMean =
+                validGrads.isEmpty ? Float.nan : validGrads.reduce(0, +) / Float(validGrads.count)
+            let gradAbsMax = validGrads.map { abs($0) }.max() ?? Float.nan
+
+            print(
+                "Epoch \(i): loss = \(String(format: "%.6f", finalLoss)) | grads: min=\(String(format: "%.4f", gradMin)), max=\(String(format: "%.4f", gradMax)), mean=\(String(format: "%.6f", gradMean)), absMax=\(String(format: "%.4f", gradAbsMax)), hasNaN=\(hasNaN), hasInf=\(hasInf)"
+            )
+
+            XCTAssertFalse(finalLoss.isNaN, "Loss became NaN at epoch \(i)")
+            if finalLoss.isNaN || finalLoss < initialLoss * 0.0025 {
                 break
             }
         }

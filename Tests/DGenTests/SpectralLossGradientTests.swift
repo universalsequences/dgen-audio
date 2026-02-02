@@ -288,7 +288,8 @@ final class SpectralLossGradientTests: XCTestCase {
         let frameCount = 128
         let sampleRate: Float = 2000.0
 
-        for (startFreq, targetFreq) in [(Float(100.0), Float(200.0)), (Float(300.0), Float(200.0))] {
+        for (startFreq, targetFreq) in [(Float(100.0), Float(200.0)), (Float(300.0), Float(200.0))]
+        {
             let direction = startFreq < targetFreq ? "up" : "down"
             print("   Testing \(direction): \(startFreq) Hz → \(targetFreq) Hz")
 
@@ -332,7 +333,8 @@ final class SpectralLossGradientTests: XCTestCase {
             let actualGradSign: Float = grad > 0 ? 1.0 : -1.0
             XCTAssertEqual(
                 actualGradSign, expectedGradSign,
-                "Gradient should be \(expectedGradSign > 0 ? "positive" : "negative") when starting \(direction) of target")
+                "Gradient should be \(expectedGradSign > 0 ? "positive" : "negative") when starting \(direction) of target"
+            )
 
             print("      ✅ Gradient direction correct (\(grad > 0 ? "positive" : "negative"))")
         }
@@ -390,9 +392,12 @@ final class SpectralLossGradientTests: XCTestCase {
             let numericalDirection = numericalGrad > 0 ? 1.0 : -1.0
             let analyticalDirection = analyticalGrad > 0 ? 1.0 : -1.0
 
-            print("      Expected direction: \(expectedDirection > 0 ? "positive" : "negative") (need to decrease freq)")
+            print(
+                "      Expected direction: \(expectedDirection > 0 ? "positive" : "negative") (need to decrease freq)"
+            )
             print("      Numerical direction: \(numericalDirection > 0 ? "positive" : "negative")")
-            print("      Analytical direction: \(analyticalDirection > 0 ? "positive" : "negative")")
+            print(
+                "      Analytical direction: \(analyticalDirection > 0 ? "positive" : "negative")")
 
             // Verify directions match
             if numericalDirection == analyticalDirection {
@@ -890,7 +895,7 @@ final class SpectralLossGradientTests: XCTestCase {
             loss: loss,
             parameters: [freqParam],
             optimizer: GraphAdam(),
-            learningRate: 1.0,  // Adam with reasonable learning rate for frequency scale
+            learningRate: 0.1,  // Adam with reasonable learning rate for frequency scale
             frameCount: frameCount,
             kernelDebugOutput: "/tmp/simple_freq_spectral.metal"
         )
@@ -907,7 +912,7 @@ final class SpectralLossGradientTests: XCTestCase {
         )
 
         // Train
-        let epochs = 200
+        let epochs = 2000
         var lastLoss = initialLoss
         for i in 0..<epochs {
             lastLoss = ctx.trainStep()
@@ -1070,7 +1075,9 @@ final class SpectralLossGradientTests: XCTestCase {
 
         let initialLoss = ctx.trainStep()
         let initialFreq = freqParam.value
-        print("   Initial: freq = \(String(format: "%.1f", initialFreq)) Hz, loss = \(String(format: "%.2f", initialLoss))")
+        print(
+            "   Initial: freq = \(String(format: "%.1f", initialFreq)) Hz, loss = \(String(format: "%.2f", initialLoss))"
+        )
 
         // Train
         var lastLoss = initialLoss
@@ -1079,7 +1086,9 @@ final class SpectralLossGradientTests: XCTestCase {
             lastLoss = ctx.trainStep()
             epochsRun = i + 1
             if i % 50 == 0 {
-                print("   Epoch \(i): freq = \(String(format: "%.1f", freqParam.value)) Hz, loss = \(String(format: "%.2f", lastLoss))")
+                print(
+                    "   Epoch \(i): freq = \(String(format: "%.1f", freqParam.value)) Hz, loss = \(String(format: "%.2f", lastLoss))"
+                )
             }
             // Early stopping if converged
             if lastLoss < 1.0 {
@@ -1092,8 +1101,12 @@ final class SpectralLossGradientTests: XCTestCase {
         let initialDistance = abs(startFreq - targetFreq)
         let finalDistance = abs(finalFreq - targetFreq)
 
-        print("   Final: freq = \(String(format: "%.1f", finalFreq)) Hz, loss = \(String(format: "%.2f", finalLoss)) (after \(epochsRun) epochs)")
-        print("   Distance: \(String(format: "%.1f", initialDistance)) Hz → \(String(format: "%.1f", finalDistance)) Hz")
+        print(
+            "   Final: freq = \(String(format: "%.1f", finalFreq)) Hz, loss = \(String(format: "%.2f", finalLoss)) (after \(epochsRun) epochs)"
+        )
+        print(
+            "   Distance: \(String(format: "%.1f", initialDistance)) Hz → \(String(format: "%.1f", finalDistance)) Hz"
+        )
 
         // Verify direction
         let actualDirection = finalFreq > startFreq ? "up" : "down"

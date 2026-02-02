@@ -336,7 +336,8 @@ public struct CompilationPipeline {
                     BlockUOps(
                         ops: finalOps, kind: effectiveKind, temporality: block.temporality,
                         parallelPolicy: parallelPolicy, forceNewKernel: forceNew,
-                        threadCountScale: threadCountScale))
+                        threadCountScale: threadCountScale,
+                        needsMemoryBarrier: block.needsMemoryBarrier))
             }
         }
 

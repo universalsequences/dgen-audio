@@ -14,6 +14,9 @@ public struct Block: Equatable {
     /// If set, this block contains a frame-dependent tensor chain that can be
     /// SIMD-parallelized across frames with thread-local tensor storage.
     public var frameTensorChain: FrameDependentTensorChain? = nil
+    /// If true, this block requires a memory barrier before execution
+    /// (e.g., spectral gradient reads that depend on prior writes)
+    public var needsMemoryBarrier: Bool = false
 
     public init(kind: Kind) {
         self.kind = kind
@@ -23,7 +26,7 @@ public struct Block: Equatable {
         // Exclude frameTensorChain from equality to avoid issues with Equatable
         return lhs.kind == rhs.kind && lhs.nodes == rhs.nodes
             && lhs.temporality == rhs.temporality && lhs.tensorIndex == rhs.tensorIndex
-            && lhs.shape == rhs.shape
+            && lhs.shape == rhs.shape && lhs.needsMemoryBarrier == rhs.needsMemoryBarrier
     }
 }
 
@@ -872,6 +875,14 @@ public func isolateSpectralPasses(_ blocks: [Block], _ g: Graph) -> [Block] {
                 return false
             }()
 
+            // Check if this op needs a memory barrier (reads from prior spectral writes)
+            let needsBarrier = { () -> Bool in
+                guard let node = g.nodes[nodeId] else { return false }
+                if case .spectralLossFFTGradRead = node.op { return true }
+                if case .spectralLossFFTGradRead2 = node.op { return true }
+                return false
+            }()
+
             if isSpectralPass {
                 // Flush any accumulated nodes before the spectral pass
                 if !currentNodes.isEmpty {
@@ -879,8 +890,10 @@ public func isolateSpectralPasses(_ blocks: [Block], _ g: Graph) -> [Block] {
                     currentNodes = []
                 }
 
-                // Add spectral pass in its own block
-                result.append(makeBlock(from: block, nodes: [nodeId]))
+                // Add spectral pass in its own block, with memory barrier flag if needed
+                var spectralBlock = makeBlock(from: block, nodes: [nodeId])
+                spectralBlock.needsMemoryBarrier = needsBarrier
+                result.append(spectralBlock)
             } else {
                 // Accumulate non-spectral nodes
                 currentNodes.append(nodeId)
@@ -1446,6 +1459,10 @@ public func isReductionOp(_ op: LazyOp) -> Bool {
         return true
     case .tensorAccumulate(_):
         return true
+    case .peekRowGradReduce(_, _, _, _, _, _, _, _):
+        return true
+    case .selectRowGradReduce(_, _, _, _, _, _):
+        return true
     default:
         return false
     }
@@ -1470,9 +1487,17 @@ public func splitReduceBlocks(g: Graph, blocks: [Block]) -> [Block] {
             reductionBlock.temporality = block.temporality
             // For reduction ops that output tensors (like sumAxis), set the output shape
             // This enables emitThreadCountScaleOpIfNeeded to set up tensorIndices
+            // BUT: peekRowGradReduce/selectRowGradReduce are global reduces that loop
+            // over all frames internally - they should NOT get thread scaling
             if let reductionNode = g.nodes[block.nodes[reductionOpIndex]],
                case .tensor(let outputShape) = reductionNode.shape {
-                reductionBlock.shape = outputShape
+                switch reductionNode.op {
+                case .peekRowGradReduce, .selectRowGradReduce:
+                    // Global reduce - runs once, not per-frame. Don't set shape.
+                    break
+                default:
+                    reductionBlock.shape = outputShape
+                }
             }
             splitBlocks.append(reductionBlock)
             if reductionOpIndex < block.nodes.count - 1 {

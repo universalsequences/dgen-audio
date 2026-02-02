@@ -345,7 +345,13 @@ public class GraphTrainingContext {
         }
 
         // Initialize all tensors with initial data (not just TensorParameters)
+        // Skip tensors that belong to TensorParameters - those were already written above
+        let tensorParamCellIds = Set(tensorParameters.map { $0.cellId })
         for (_, tensor) in graph.tensors {
+            // Skip if this tensor belongs to a TensorParameter (already handled above)
+            if tensorParamCellIds.contains(tensor.cellId) {
+                continue
+            }
             if let data = tensor.data {
                 let physicalBase = cellAllocs.cellMappings[tensor.cellId] ?? tensor.cellId
                 for j in 0..<data.count {
@@ -376,6 +382,38 @@ public class GraphTrainingContext {
                 for j in 0..<gradInfo.size {
                     memPtr[gradInfo.base + j] = 0.0
                 }
+            }
+        }
+    }
+
+    /// Reset all state memory (phasor state, scratch cells, etc.) while preserving parameters
+    /// Call this at the start of each training step for deterministic gradients
+    public func resetState(debug: Bool = false) {
+        guard let runtime = runtime else { return }
+
+        // Zero ALL GPU buffers (memory, t, gradients, etc.)
+        runtime.zeroAllBuffers()
+
+        if debug {
+            print("[resetState] Zeroed all GPU buffers")
+        }
+
+        // Re-initialize parameters and tensors
+        initializeMemory()
+
+        if debug {
+            if let memBuffer = runtime.getBuffer(name: "memory") {
+                let bufferSize = memBuffer.length / MemoryLayout<Float>.size
+                let memPtr = memBuffer.contents().assumingMemoryBound(to: Float.self)
+                var nonZero = 0
+                var sum: Float = 0
+                for i in 0..<bufferSize {
+                    if memPtr[i] != 0 {
+                        nonZero += 1
+                        sum += memPtr[i]
+                    }
+                }
+                print("[resetState] After init: nonZero=\(nonZero), sum=\(sum)")
             }
         }
     }
@@ -447,9 +485,15 @@ public class GraphTrainingContext {
     }
 
     /// Run a complete training step: zero grad, forward, step
+    /// - Parameters:
+    ///   - fullReset: If true, resets all memory (state, scratch cells) before each step for determinism.
+    ///                If false (default), only zeros gradient accumulators.
     /// - Returns: Mean loss from this step
     @discardableResult
-    public func trainStep() -> Float {
+    public func trainStep(fullReset: Bool = false) -> Float {
+        if fullReset {
+            resetState()
+        }
         zeroGrad()
         let loss = forward()
         step()
@@ -478,5 +522,57 @@ public class GraphTrainingContext {
     /// Get the output buffer after forward pass
     public func getOutputs() -> [Float] {
         return runtime?.getOutputBuffer() ?? []
+    }
+
+    /// Get memory statistics for debugging
+    public func getMemoryStats(maxElements: Int = 10000) -> (min: Float, max: Float, mean: Float, nonZeroCount: Int, totalCount: Int) {
+        guard let runtime = runtime,
+              let memBuffer = runtime.getBuffer(name: "memory") else {
+            return (0, 0, 0, 0, 0)
+        }
+
+        let memPtr = memBuffer.contents().assumingMemoryBound(to: Float.self)
+        let totalCount = min(memBuffer.length / MemoryLayout<Float>.size, maxElements)
+
+        var minVal: Float = Float.greatestFiniteMagnitude
+        var maxVal: Float = -Float.greatestFiniteMagnitude
+        var sum: Float = 0
+        var nonZeroCount = 0
+
+        for i in 0..<totalCount {
+            let val = memPtr[i]
+            if !val.isNaN && !val.isInfinite {
+                minVal = min(minVal, val)
+                maxVal = max(maxVal, val)
+                sum += val
+                if val != 0 { nonZeroCount += 1 }
+            }
+        }
+
+        let mean = totalCount > 0 ? sum / Float(totalCount) : 0
+        return (minVal, maxVal, mean, nonZeroCount, totalCount)
+    }
+
+    /// Get tensor parameter gradients (for debugging)
+    public func getTensorGradients() -> [Float] {
+        return tensorParameters.flatMap { $0.grads }
+    }
+
+    /// Debug: print tensor physical cell info
+    public func debugTensorCells() {
+        print("Tensor physical cells:")
+        for (i, tp) in tensorParameters.enumerated() {
+            let base = tensorPhysicalCells[i].base
+            let gradBase = tensorGradPhysicalCells[i].base
+            print("  \(tp.name ?? "tensor\(i)"): base=\(base), size=\(tp.size), gradBase=\(gradBase)")
+        }
+    }
+
+    /// Debug: read memory at specific location
+    public func debugReadMemory(at offset: Int, count: Int = 5) -> [Float] {
+        guard let runtime = runtime,
+              let memBuffer = runtime.getBuffer(name: "memory") else { return [] }
+        let memPtr = memBuffer.contents().assumingMemoryBound(to: Float.self)
+        return (0..<count).map { memPtr[offset + $0] }
     }
 }

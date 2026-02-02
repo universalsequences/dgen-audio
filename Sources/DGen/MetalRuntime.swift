@@ -306,6 +306,15 @@ public class MetalCompiledKernel: CompiledKernelRuntime {
     return bufferPool[name]
   }
 
+  /// Zero all GPU buffers (for deterministic training reset)
+  public func zeroAllBuffers() {
+    for (name, buffer) in bufferPool {
+      // Skip frameCount - it's not a float buffer
+      if name == "frameCount" { continue }
+      memset(buffer.contents(), 0, buffer.length)
+    }
+  }
+
   public func run(
     outputs: UnsafeMutablePointer<Float>, inputs: UnsafePointer<Float>, frameCount: Int,
     volumeScale: Float = 1.0
@@ -364,6 +373,23 @@ public class MetalCompiledKernel: CompiledKernelRuntime {
           sharedEncoder = commandBuffer.makeComputeCommandEncoder()
         }
       }
+
+      // Force memory barrier before spectral gradient reads to ensure writes are visible
+      if kernel.needsMemoryBarrier {
+        if let enc = sharedEncoder {
+          enc.endEncoding()
+          sharedEncoder = nil
+        }
+        // Commit and wait to ensure previous writes are complete
+        commandBuffer.commit()
+        commandBuffer.waitUntilCompleted()
+        // Start new command buffer
+        if let cb = commandQueue.makeCommandBuffer() { commandBuffer = cb }
+        if !debugGradients {
+          sharedEncoder = commandBuffer.makeComputeCommandEncoder()
+        }
+      }
+
       // Pick encoder: shared if available (non-debug), otherwise one per kernel
       let computeEncoder: MTLComputeCommandEncoder
       if let enc = sharedEncoder {
