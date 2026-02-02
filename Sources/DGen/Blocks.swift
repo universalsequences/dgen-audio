@@ -1254,20 +1254,16 @@ public func emitBlockUOps(
   ctx.outboundTensorCells = findOutboundTensorCells(blocks, g, block: block)
   ctx.clearTensorRegisters()
 
-  var emitted = false
-  // Skip thread count scaling for C backend - it's a parallelization optimization
-  // that doesn't apply to sequential C loops and breaks feedback loop data flow
-  if backend != .c {
-    for uop in emitThreadCountScaleOpIfNeeded(ctx: ctx, block: block, g: g) {
-      emitted = true
-      bodyUops.append(uop)
-    }
-  }
+  // Thread count scaling is a Metal-specific parallelization optimization.
+  // C backend uses sequential loops, so this would break feedback loop data flow.
+  let threadScaleUOps = backend == .metal
+    ? emitThreadCountScaleOpIfNeeded(ctx: ctx, block: block, g: g)
+    : []
+  bodyUops.append(contentsOf: threadScaleUOps)
+  let emittedThreadScale = !threadScaleUOps.isEmpty
   for nodeId in block.nodes {
-    if !emitted {
-      if let tensorIndex = block.tensorIndex {
-        ctx.tensorIndices[nodeId] = tensorIndex
-      }
+    if !emittedThreadScale, let tensorIndex = block.tensorIndex {
+      ctx.tensorIndices[nodeId] = tensorIndex
     }
 
     if let node = g.nodes[nodeId] {
@@ -1314,16 +1310,12 @@ public func emitBlockUOps(
   // Note: frame-aware tensor blocks DON'T use parallelRange (no loop)
   var uops: [UOp] = []
 
-  if backend == .c {
-    if let tensorIndex = block.tensorIndex,
-      let shape = block.shape
-    {
-      let count = shape.reduce(1, *)
-      var loopUOp = UOp(op: .beginParallelRange(count, simdIncrement), value: tensorIndex)
-      // Match the loop wrapper kind to the body operations
-      loopUOp.kind = effectiveKind
-      uops.append(loopUOp)
-    }
+  // C backend wraps tensor blocks in a sequential loop
+  if backend == .c, let tensorIndex = block.tensorIndex, let shape = block.shape {
+    let count = shape.reduce(1, *)
+    var loopUOp = UOp(op: .beginParallelRange(count, simdIncrement), value: tensorIndex)
+    loopUOp.kind = effectiveKind  // Match loop wrapper kind to body operations
+    uops.append(loopUOp)
   }
 
   uops.append(contentsOf: bodyUops)
@@ -1372,14 +1364,15 @@ public func emitBlockUOps(
   let inbound = findNodesAsInboundDependencies(blocks, g, block: block)
 
   for nodeId in inbound {
-    // Skip loadGlobal for tensor-valued inputs - they use memory cells, not scratch buffers
-    if let node = g.nodes[nodeId], case .tensor = node.shape {
-      continue
-    }
-
+    // Only emit loadGlobal if the variable has a corresponding defineGlobal
+    // (i.e., it's in ctx.globals). Tensor-valued nodes that skip defineGlobal
+    // should also skip loadGlobal - their data flows through memory cells.
     if let lz = ctx.values[nodeId] {
       switch lz {
       case .variable(let a, _):
+        // Skip if this variable wasn't defined as a global (defineGlobal was skipped)
+        guard ctx.globals.contains(a) else { continue }
+
         var loadGlobalUOp = UOp(op: .loadGlobal(a), value: .variable(a, nil))
         // Use block.kind (frame loop kind), not effectiveKind (tensor loop kind)
         // Globals are indexed by frame loop, not tensor loop
@@ -1391,11 +1384,9 @@ public func emitBlockUOps(
     }
   }
 
-  // Only emit endParallelRange for non-frame-aware tensor blocks
-  if backend == .c {
-    if block.tensorIndex != nil {
-      uops.append(UOp(op: .endParallelRange, value: ctx.useVariable(src: nil)))
-    }
+  // Close the tensor loop for C backend
+  if backend == .c, block.tensorIndex != nil {
+    uops.append(UOp(op: .endParallelRange, value: ctx.useVariable(src: nil)))
   }
 
   return uops

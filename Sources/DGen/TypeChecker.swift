@@ -498,10 +498,10 @@ public func allocateTensorMemory(
     let isOutbound = outboundCells.contains(lazyCellId)
     let isFrameBased = nodeId.map { frameBasedNodes.contains($0) } ?? false
 
-    // For C backend only: exclude feedback loop tensors from frame-aware allocation
+    // For C backend only: exclude feedback loop tensors from frame-aware allocation.
     // They need persistent state across frames, not per-frame copies.
     // Metal handles this differently with parallel frame processing.
-    let isInFeedbackLoop = backend == .c && (nodeId.map { feedbackClusterNodes.contains($0) } ?? false)
+    let isInFeedbackLoop = backend == .c && nodeId.map { feedbackClusterNodes.contains($0) } ?? false
 
     // Determine if this tensor needs frame-aware allocation
     let needsFrameAwareAlloc = isFrameBased && !isInFeedbackLoop &&
