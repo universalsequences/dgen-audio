@@ -1968,15 +1968,32 @@ public enum LazyOp {
                     reason: "frame-based tensor peek requires tensor context - not yet implemented")
             }
 
-            // Read two samples for interpolation
-            let sample1 = b.memoryRead(cellId, b.cast(flooredPos, to: .int))
+            // Prepare positions for interpolation
             let nextPos = flooredPos + one
 
             // Wrap nextPos if it crosses channel boundary
             let nextChannelOffset = channelOffset + channelSizeFloat
             let nextPosWrapped = b.gswitch(nextPos >= nextChannelOffset, channelOffset, nextPos)
 
-            let sample2 = b.memoryRead(cellId, b.cast(nextPosWrapped, to: .int))
+            // Check if tensor is frame-aware (per-frame storage)
+            // Frame-aware tensors store each frame's data at frameIndex * tensorSize
+            let readPos1: Expr
+            let readPos2: Expr
+            if ctx.frameAwareTensorCells.contains(cellId) {
+                // Frame-aware tensor: add frameIndex * tensorSize to read positions
+                let tensorSizeFloat = b.constant(Float(channelSize * numChannels))
+                let frameIdx = b.currentFrameIndex()
+                let frameBase = frameIdx * tensorSizeFloat
+                readPos1 = frameBase + flooredPos
+                readPos2 = frameBase + nextPosWrapped
+            } else {
+                readPos1 = flooredPos
+                readPos2 = nextPosWrapped
+            }
+
+            // Read two samples for interpolation
+            let sample1 = b.memoryRead(cellId, b.cast(readPos1, to: .int))
+            let sample2 = b.memoryRead(cellId, b.cast(readPos2, to: .int))
 
             // Linear interpolation: (1-frac)*sample1 + frac*sample2
             let interpolated = b.mix(sample1, sample2, frac)

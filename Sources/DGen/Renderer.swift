@@ -147,6 +147,13 @@ public class CRenderer: Renderer {
     private var frameIndexOverride: String? = nil
     private var currentThreadCountScale: Int? = nil
 
+    // Track whether we're inside a scaled frame loop (frameBased with threadCountScale)
+    // This is set when we see beginLoop with a scaled count
+    private var inScaledFrameLoop: Bool = false
+
+    // Stack of parallel range loop variable names for threadIndex resolution
+    private var parallelRangeVarStack: [String] = []
+
     // Track the emitted type of each variable in current scope
     public enum EmittedType {
         case int_
@@ -260,6 +267,15 @@ public class CRenderer: Renderer {
                     loopOpen = false
                 }
 
+                // Emit setThreadCountScale UOp when scale changes so emit() can track it
+                if block.threadCountScale != currentThreadCountScale {
+                    if let scale = block.threadCountScale {
+                        scheduleItem.ops.append(UOp(op: .setThreadCountScale(scale), value: .empty))
+                    } else {
+                        scheduleItem.ops.append(UOp(op: .setThreadCountScale(0), value: .empty))  // 0 means nil
+                    }
+                }
+
                 // Open new loop based on temporality
                 switch block.temporality {
                 case .frameBased:
@@ -319,6 +335,8 @@ public class CRenderer: Renderer {
     ) -> String {
         frameIndexOverride = nil
         currentThreadCountScale = scheduleItem.threadCountScale
+        parallelRangeVarStack = []  // Reset parallel range tracking for new kernel
+        inScaledFrameLoop = false  // Reset scaled frame loop tracking
         var code: [String] = []
 
         // C includes and function signature
@@ -445,10 +463,27 @@ public class CRenderer: Renderer {
                 // Reset for each new loop scope - variables need to be redeclared
                 loadedGlobal = [:]
                 varEmittedTypes = [:]
+                frameIndexOverride = nil  // Reset frame index override for new loop scope
+                // Track if this is a scaled frame loop (used to decide if parallel range needs its own loop)
+                if currentThreadCountScale != nil {
+                    inScaledFrameLoop = true
+                }
             case .beginParallelRange:
+                // Always indent - we emit { } for scope even without a loop
                 diff = 1
-            case .endIf, .endLoop, .endParallelRange, .endHopCheck:
+            case .endIf, .endHopCheck:
                 indent -= 1
+            case .endLoop:
+                indent -= 1
+                // Reset frame index override when exiting loop scope
+                frameIndexOverride = nil
+                // Reset scaled frame loop tracking
+                inScaledFrameLoop = false
+            case .endInlineLoop, .endParallelRange:
+                indent -= 1
+                // Reset frame index override when exiting loop scope
+                // since _frameIndex variable goes out of scope in C
+                frameIndexOverride = nil
             default:
                 break
             }
@@ -960,24 +995,33 @@ public class CRenderer: Renderer {
         case .endLoop: return "}"
 
         case .threadIndex:
-            // In C, threadIndex maps to the loop variable 'i'
-            // For SIMD, create a vector of sequential indices: {i, i+1, i+2, i+3}
+            // In C, threadIndex maps to the loop variable
+            // Use the parallel range loop variable if inside one, otherwise 'i'
+            let loopVar = parallelRangeVarStack.last ?? "i"
+            // For SIMD, create a vector of sequential indices: {idx, idx+1, idx+2, idx+3}
             if uop.kind == .simd {
                 let varId = extractVarId(uop.value)
                 varEmittedTypes[varId] = .float32x4
                 let lhs = emitLazy(uop.value, ctx: ctx, kind: uop.kind, isOut: true)
-                return "float32x4_t \(lhs) = (float32x4_t){(float)i, (float)(i+1), (float)(i+2), (float)(i+3)};"
+                return "float32x4_t \(lhs) = (float32x4_t){(float)\(loopVar), (float)(\(loopVar)+1), (float)(\(loopVar)+2), (float)(\(loopVar)+3)};"
             } else {
-                return emitAssign(uop, "i", ctx)
+                return emitAssign(uop, loopVar, ctx)
             }
 
-        case .setThreadCountScale:
-            return "/* setThreadCountScale - handled in scheduler */"
+        case .setThreadCountScale(let scale):
+            // Update currentThreadCountScale dynamically as we process UOps
+            currentThreadCountScale = scale > 0 ? scale : nil
+            return "/* setThreadCountScale(\(scale)) */"
 
         case .setFrameIndex(let idx):
             let expr = g(idx)
             frameIndexOverride = "_frameIndex"
             return "int _frameIndex = (int)(\(expr));"
+
+        case .frameIndex:
+            // Use i for C scalar blocks, matching Metal's behavior
+            let baseIdx = "i"
+            return emitAssign(uop, frameIndexOverride ?? baseIdx, ctx)
 
         case .cast(let expr, let castType):
             let typeStr = castType == .int ? "int" : "float"
@@ -995,12 +1039,18 @@ public class CRenderer: Renderer {
                 return "/* skip load */"
             }
             loadedGlobal[id] = true
+
+            // Compute the correct index - use scaled index when in a scaled frame loop
+            let baseIdx = "i"
+            let idx = frameIndexOverride
+                ?? (currentThreadCountScale == nil ? baseIdx : "(\(baseIdx) / \(currentThreadCountScale!))")
+
             if uop.kind == .simd {
                 // Create a proper SIMD variable declaration for loadGlobal
                 if staticGlobalVars.contains(id) {
                     return "float32x4_t simd\(id) = vdupq_n_f32(t\(id)[0]);"
                 }
-                return "float32x4_t simd\(id) = vld1q_f32(t\(id) + i);"
+                return "float32x4_t simd\(id) = vld1q_f32(t\(id) + \(idx));"
             } else {
                 // if this global is required by a beginParallelRange element then we need
                 // a simd version where we
@@ -1010,24 +1060,50 @@ public class CRenderer: Renderer {
                     simdVersion = "float32x4_t simd\(id) = vdupq_n_f32(t\(id)[0]); /* extra */"
                     scalarVersion = emitAssign(uop, "t\(id)[0]", ctx)
                 } else {
-                    simdVersion = "float32x4_t simd\(id) = vdupq_n_f32(t\(id)[i]); /* extra */"
-                    scalarVersion = emitAssign(uop, "t\(id)[i]", ctx)
+                    simdVersion = "float32x4_t simd\(id) = vdupq_n_f32(t\(id)[\(idx)]); /* extra */"
+                    scalarVersion = emitAssign(uop, "t\(id)[\(idx)]", ctx)
                 }
                 return simdVersion + "\n    " + scalarVersion
             }
 
         // Parallel range - for C, render as a simple for loop
         // For static tensor ops, this could be outside frame loop (future optimization)
-        case .beginParallelRange(let count, let incr):
+        case .beginParallelRange(let count, var incr):
+            // For scalar blocks, always use incr=1 even if the UOp specifies incr=4
+            // This fixes the mismatch where a scalar block has a SIMD parallel range
+            if uop.kind == .scalar || uop.kind == nil {
+                incr = 1
+            }
             let pre = incr == 4 ? "simd" : "t"
             guard case .variable(let varId, _) = uop.value else {
                 fatalError("beginParallelRange requires variable")
             }
             // Track this as an int loop counter
             varEmittedTypes[varId] = .int_
+
+            // When inside a scaled frame loop (frameBased block with threadCountScale),
+            // the outer frame loop already iterates over all thread indices,
+            // so we don't need another loop here.
+            // The threadIndex will use 'i' from the outer loop instead.
+            if inScaledFrameLoop {
+                // No loop needed - outer frame loop covers all iterations
+                // Push "i" so threadIndex knows to use the frame loop variable
+                parallelRangeVarStack.append("i")
+                // Still emit { } to create a scope for local variables like _frameIndex
+                return "{ /* parallel range covered by scaled frame loop */"
+            }
+
+            // Push loop variable name onto stack for threadIndex resolution
+            let loopVarName = "\(pre)\(varId)"
+            parallelRangeVarStack.append(loopVarName)
             return
-                "for (int \(pre)\(varId) = 0; \(pre)\(varId) < \(count); \(pre)\(varId)+=\(incr)) {"
+                "for (int \(loopVarName) = 0; \(loopVarName) < \(count); \(loopVarName)+=\(incr)) {"
         case .endParallelRange:
+            // Pop the loop variable from the stack
+            if !parallelRangeVarStack.isEmpty {
+                parallelRangeVarStack.removeLast()
+            }
+            // Always emit closing brace - we emit { } for scope even without loop
             return "}"
         case .parallelIndex:
             // Return the loop variable from the enclosing parallelRange

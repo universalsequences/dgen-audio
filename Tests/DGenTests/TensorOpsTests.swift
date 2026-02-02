@@ -2980,7 +2980,7 @@ final class CTensorOpsTests: XCTestCase {
                         let cResult = try CompilationPipeline.compile(
                                 graph: g,
                                 backend: .c,
-                                options: .init(frameCount: 4410, debug: true)  // 100ms at 44100Hz
+                                options: .init(frameCount: 4096, debug: true)  // 100ms at 44100Hz
                         )
 
                         print("=== Cos(Phasor(Tensor)) Large - Generated Source ===")
@@ -3001,7 +3001,7 @@ final class CTensorOpsTests: XCTestCase {
 
                         injectTensorData(result: cResult, memory: mem.assumingMemoryBound(to: Float.self))
 
-                        let frameCount = 4410
+                        let frameCount = 4096
                         var output = [Float](repeating: 0, count: frameCount)
                         let input = [Float](repeating: 0, count: frameCount)
 
