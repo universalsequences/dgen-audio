@@ -1255,9 +1255,13 @@ public func emitBlockUOps(
   ctx.clearTensorRegisters()
 
   var emitted = false
-  for uop in emitThreadCountScaleOpIfNeeded(ctx: ctx, block: block, g: g) {
-    emitted = true
-    bodyUops.append(uop)
+  // Skip thread count scaling for C backend - it's a parallelization optimization
+  // that doesn't apply to sequential C loops and breaks feedback loop data flow
+  if backend != .c {
+    for uop in emitThreadCountScaleOpIfNeeded(ctx: ctx, block: block, g: g) {
+      emitted = true
+      bodyUops.append(uop)
+    }
   }
   for nodeId in block.nodes {
     if !emitted {
@@ -1315,7 +1319,10 @@ public func emitBlockUOps(
       let shape = block.shape
     {
       let count = shape.reduce(1, *)
-      uops.append(UOp(op: .beginParallelRange(count, simdIncrement), value: tensorIndex))
+      var loopUOp = UOp(op: .beginParallelRange(count, simdIncrement), value: tensorIndex)
+      // Match the loop wrapper kind to the body operations
+      loopUOp.kind = effectiveKind
+      uops.append(loopUOp)
     }
   }
 

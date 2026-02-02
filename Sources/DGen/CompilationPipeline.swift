@@ -237,10 +237,14 @@ public struct CompilationPipeline {
     // - Static outbound tensors: tensorSize
     // - Non-outbound tensors: no allocation (register-only)
     time("allocateTensorMemory") {
+      // Convert feedback clusters to a flat set of nodes
+      let feedbackClusterNodes = Set(feedbackClusters.flatMap { $0 })
       allocateTensorMemory(
         graph: graph,
         blocks: finalBlocks,
         frameBasedNodes: temporalityResult.frameBasedNodes,
+        feedbackClusterNodes: feedbackClusterNodes,
+        backend: backend,
         frameCount: options.frameCount
       )
       // Populate IRContext's frameAwareTensorCells from graph.frameAwareCells

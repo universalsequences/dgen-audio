@@ -413,10 +413,13 @@ public func allocateTensorOutputs(graph: Graph, sortedNodes: [NodeID]) {
 /// Allocate real memory for lazy tensor cells after temporality is known.
 /// Frame-based tensors with outbound dependencies get tensorSize * frameCount allocation.
 /// Static tensors just get tensorSize allocation.
+/// For C backend, feedback loop tensors are excluded from frame-aware allocation since they need persistent state.
 public func allocateTensorMemory(
   graph: Graph,
   blocks: [Block],
   frameBasedNodes: Set<NodeID>,
+  feedbackClusterNodes: Set<NodeID> = [],
+  backend: Backend = .metal,
   frameCount: Int
 ) {
   // Build a map from cellId -> nodeId for quick lookup
@@ -495,8 +498,13 @@ public func allocateTensorMemory(
     let isOutbound = outboundCells.contains(lazyCellId)
     let isFrameBased = nodeId.map { frameBasedNodes.contains($0) } ?? false
 
+    // For C backend only: exclude feedback loop tensors from frame-aware allocation
+    // They need persistent state across frames, not per-frame copies.
+    // Metal handles this differently with parallel frame processing.
+    let isInFeedbackLoop = backend == .c && (nodeId.map { feedbackClusterNodes.contains($0) } ?? false)
+
     // Determine if this tensor needs frame-aware allocation
-    let needsFrameAwareAlloc = isFrameBased &&
+    let needsFrameAwareAlloc = isFrameBased && !isInFeedbackLoop &&
       (isOutbound || intraBlockFrameAwareCells.contains(lazyCellId))
 
     // Only allocate if outbound or needs frame-aware storage

@@ -924,6 +924,21 @@ func runMetalTest(_ testCase: TensorTestCase) throws {
     }
   }
 
+  // Print output values for comparison with C backend
+  print("\n=== Metal OUTPUT VALUES ===")
+  var maxOutput: Float = 0
+  var maxFrame = 0
+  for (i, x) in output.enumerated() {
+    if i < 20 || i % 50 == 0 || i >= testCase.frameCount - 10 {
+      print("frame \(i): output=\(x)")
+    }
+    if abs(x) > maxOutput {
+      maxOutput = abs(x)
+      maxFrame = i
+    }
+  }
+  print("Peak output: \(maxOutput) at frame \(maxFrame)")
+
   if let validator = testCase.customValidator {
     validator(output)
   } else if let expectedOutputs = testCase.expectedOutputs {
