@@ -251,20 +251,3 @@ func u_accum(_ cellId: CellID, incr: Expr, reset: Expr, min: Expr, max: Expr) ->
   }
 }
 
-/// Pass1 for parallelMap2D test: writes per-bin values into scratch.
-/// Value = frameIdx * 100 + binIdx
-func u_parallelMap2DTestPass1(
-  bins: Int,
-  scratchCell: CellID
-) -> (IRBuilder) -> Void {
-  return { b in
-    let binsFloat = b.constant(Float(bins))
-    let scale = b.constant(100.0)
-
-    b.parallelMap2D(bins: bins) { frameIdx, binIdx in
-      let value = frameIdx * scale + binIdx
-      let offset = frameIdx * binsFloat + binIdx
-      _ = b.memoryWrite(scratchCell, b.cast(offset, to: .int), value)
-    }
-  }
-}

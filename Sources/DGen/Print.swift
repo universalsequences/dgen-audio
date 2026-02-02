@@ -115,8 +115,6 @@ extension UOp {
             opStr = "\(ANSI.green)beginForLoop\(ANSI.reset)(\(loopVar), \(count))"
         case let .defineConstant(constantId, value):
             opStr = "\(ANSI.green)defineConstant\(ANSI.reset)(\(constantId),\(value))"
-        case let .defineMemory(length):
-            opStr = "\(ANSI.green)defineMemory\(ANSI.reset)(\(length))"
         case .endLoop:
             opStr = "\(ANSI.green)endLoop\(ANSI.reset)"
         case let .beginRange(a, b):
@@ -129,18 +127,6 @@ extension UOp {
             opStr = "\(ANSI.green)input\(ANSI.reset)(\(a))"
         case .frameCount:
             opStr = "\(ANSI.magenta)frameCount\(ANSI.reset)"
-        case let .loadGrad(a):
-            opStr = "\(ANSI.magenta)loadGrad\(ANSI.reset)(\(a))"
-        case let .loadGradMemory(a):
-            opStr = "\(ANSI.magenta)loadGrad\(ANSI.reset)(\(a))"
-        case let .storeGradMemory(a, b):
-            opStr = "\(ANSI.magenta)storeGrad\(ANSI.reset)(\(a), \(b))"
-        case let .accumulateGrad(a, b):
-            opStr = "\(ANSI.magenta)accumulateGrad\(ANSI.reset)(\(a), \(b))"
-        case let .loadTensorGrad(baseGradId, indexLazy):
-            opStr = "\(ANSI.magenta)loadTensorGrad\(ANSI.reset)(\(baseGradId), \(indexLazy))"
-        case let .accumulateTensorGrad(baseGradId, indexLazy, valueLazy):
-            opStr = "\(ANSI.magenta)accumulateTensorGrad\(ANSI.reset)(\(baseGradId), \(indexLazy), \(valueLazy))"
         case let .loadTape(val, offset):
             opStr = "\(ANSI.magenta)loadTape\(ANSI.reset)(\(val), \(offset))"
         case let .mse(a, b):
@@ -159,18 +145,10 @@ extension UOp {
             opStr = "\(ANSI.magenta)beginParallelRange\(ANSI.reset)(\(count))"
         case .endParallelRange:
             opStr = "\(ANSI.magenta)endParallelRange\(ANSI.reset)"
-        case .parallelIndex:
-            opStr = "\(ANSI.magenta)parallelIndex\(ANSI.reset)"
         case let .setThreadCountScale(scale):
             opStr = "\(ANSI.magenta)setThreadCountScale\(ANSI.reset)(\(scale))"
         case let .setFrameIndex(idx):
             opStr = "\(ANSI.magenta)setFrameIndex\(ANSI.reset)(\(idx))"
-        case let .beginReduce(size):
-            opStr = "\(ANSI.magenta)beginReduce\(ANSI.reset)(\(size))"
-        case .endReduce:
-            opStr = "\(ANSI.magenta)endReduce\(ANSI.reset)"
-        case let .reduceAccumulate(val):
-            opStr = "\(ANSI.magenta)reduceAccumulate\(ANSI.reset)(\(val))"
         case let .reshape(shape):
             opStr = "\(ANSI.cyan)reshape\(ANSI.reset)(\(shape))"
         case let .transpose(axes):
@@ -181,24 +159,10 @@ extension UOp {
             opStr = "\(ANSI.cyan)pad\(ANSI.reset)(\(padding))"
         case .broadcastAccess:
             opStr = "\(ANSI.cyan)broadcastAccess\(ANSI.reset)"
-        case .requiresScalar:
-            opStr = "\(ANSI.cyan)requiresScalar\(ANSI.reset)"
         case let .beginHopCheck(counterCell):
             opStr = "\(ANSI.magenta)beginHopCheck\(ANSI.reset)(\(counterCell))"
         case .endHopCheck:
             opStr = "\(ANSI.magenta)endHopCheck\(ANSI.reset)"
-        case let .declareLocalTensor(varId, size):
-            opStr = "\(ANSI.cyan)declareLocalTensor\(ANSI.reset)(\(varId), \(size))"
-        case let .localTensorRead(varId, idx):
-            opStr = "\(ANSI.cyan)localTensorRead\(ANSI.reset)(\(varId), \(idx))"
-        case let .localTensorWrite(varId, idx, val):
-            opStr = "\(ANSI.cyan)localTensorWrite\(ANSI.reset)(\(varId), \(idx), \(val))"
-        case let .beginInlineLoop(count, incr):
-            opStr = "\(ANSI.magenta)beginInlineLoop\(ANSI.reset)(\(count), \(incr))"
-        case .endInlineLoop:
-            opStr = "\(ANSI.magenta)endInlineLoop\(ANSI.reset)"
-        case let .frameTensorChainMarker(shape):
-            opStr = "\(ANSI.bold)\(ANSI.cyan)frameTensorChainMarker\(ANSI.reset)(shape: \(shape))"
         }
 
         return "\(ANSI.bold)UOp\(ANSI.reset)(op: \(opStr), value: \(value))"

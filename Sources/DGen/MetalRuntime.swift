@@ -209,7 +209,7 @@ public class MetalCompiledKernel: CompiledKernelRuntime {
     switch bufferName {
     case "frameCount":
       return 1
-    case "memory", "grad_memory":
+    case "memory":
       return getMemorySize()
     case "t":
       return maxFrameCount * context.globals.count
@@ -286,15 +286,6 @@ public class MetalCompiledKernel: CompiledKernelRuntime {
       }
     }
 
-    // Reset grad_memory buffer (used for spectralLoss ring buffers and phasor gradient accumulation)
-    if let gradMemBuffer = bufferPool["grad_memory"] {
-      let gradMemSize = getElementCount("grad_memory")
-      let gradMemBufferSize = gradMemSize * MemoryLayout<Float>.size
-      let gradMemContents = gradMemBuffer.contents().assumingMemoryBound(to: Float.self)
-      for i in 0..<(gradMemBufferSize / MemoryLayout<Float>.size) {
-        gradMemContents[i] = 0.0
-      }
-    }
   }
 
   public func setParamValue(cellId: CellID, value: Float) {

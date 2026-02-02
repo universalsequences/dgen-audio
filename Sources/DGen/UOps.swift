@@ -18,12 +18,6 @@ public enum Op {
   case store(CellID, Lazy)
   case concatShift(Lazy, Lazy, Int)  // used in vectorized history
   case delay1(CellID, Lazy)
-  case loadGradMemory(CellID)
-  case storeGradMemory(CellID, Lazy)
-  case accumulateGrad(GradID, Lazy)
-  case loadGrad(GradID)
-  case loadTensorGrad(GradID, Lazy)  // Load gradient at baseGradId + index
-  case accumulateTensorGrad(GradID, Lazy, Lazy)  // Accumulate to baseGradId + index
   case mse(Lazy, Lazy)
   case mutate(Lazy, Lazy)
   case add(Lazy, Lazy)
@@ -67,7 +61,6 @@ public enum Op {
   case endIf
   case defineGlobal(VarID)
   case defineConstant(ConstantID, Float)
-  case defineMemory(Int)
   case loadGlobal(VarID)
   case beginLoop(Lazy, Int)
   case beginForLoop(Lazy, Lazy)  // (loopVariable, count) - step is always 1
@@ -76,16 +69,10 @@ public enum Op {
   case endRange
   case beginParallelRange(Int, Int)  // count - iterations are independent, can be parallelized
   case endParallelRange
-  case parallelIndex  // current index within parallel range
   case setThreadCountScale(Int)  // dispatch threads = frameCount * scale
-  case setFrameIndex(Lazy)        // override frame index used for outputs/gradients
+  case setFrameIndex(Lazy)  // override frame index used for outputs/gradients
   case output(ChannelNumber, Lazy)
   case input(ChannelNumber)
-
-  // Tensor reduction operations
-  case beginReduce(Int)  // (size) - start reduction over tensor elements
-  case endReduce  // end reduction
-  case reduceAccumulate(Lazy)  // accumulate value into reduction result
   case frameCount
   case frameIndex
   case threadIndex
@@ -95,24 +82,12 @@ public enum Op {
   case reshape([Int])  // View op: reshape to new shape - renders to nothing but prevents SIMD
   case transpose([Int])  // View op: transpose with permutation - renders to nothing but prevents SIMD
   case shrink([(Int, Int)?])  // View op: shrink/slice - renders to nothing but prevents SIMD
-  case pad([(Int, Int)])      // View op: pad with zeros - renders to nothing but prevents SIMD
+  case pad([(Int, Int)])  // View op: pad with zeros - renders to nothing but prevents SIMD
   case broadcastAccess  // Marker: broadcast indexing used - renders to nothing but prevents SIMD
-  case requiresScalar   // Marker: stateful accumulation requires scalar (sample-by-sample) execution
 
   // Hop-based execution control (for FFT/spectral processing)
   case beginHopCheck(CellID)  // if (memory[counterCell] == 0.0f) { - runs block only when counter is 0
-  case endHopCheck            // } - closes the hop check conditional
-
-  // Local tensor operations for SIMD-across-frames optimization
-  // These enable thread-local tensor storage for frame-dependent tensor chains
-  case declareLocalTensor(VarID, Int)        // float localT<id>[size] - thread-local array
-  case localTensorRead(VarID, Lazy)          // localT<id>[idx] - read from local tensor
-  case localTensorWrite(VarID, Lazy, Lazy)   // localT<id>[idx] = val - write to local tensor
-  case beginInlineLoop(Lazy, Int)            // for (int j = 0; j < count; j++) - non-parallel loop
-  case endInlineLoop                         // } - closes inline loop
-
-  // Marker for SIMD-across-frames optimization (frame-tensor chain detected)
-  case frameTensorChainMarker([Int])         // Marks block as frame-tensor chain with tensor shape
+  case endHopCheck  // } - closes the hop check conditional
 
   public var isDefineGlobal: Bool {
     if case .defineGlobal = self { return true }
@@ -123,8 +98,8 @@ public enum Op {
   public var memoryCellId: CellID? {
     switch self {
     case .load(let cellId), .store(let cellId, _), .delay1(let cellId, _),
-         .memoryRead(let cellId, _), .memoryWrite(let cellId, _, _),
-         .memoryAccumulate(let cellId, _, _):
+      .memoryRead(let cellId, _), .memoryWrite(let cellId, _, _),
+      .memoryAccumulate(let cellId, _, _):
       return cellId
     default:
       return nil
@@ -142,7 +117,8 @@ public enum Op {
     case .delay1(_, let a): return .delay1(newCellId, a)
     case .memoryRead(_, let offset): return .memoryRead(newCellId, offset)
     case .memoryWrite(_, let offset, let value): return .memoryWrite(newCellId, offset, value)
-    case .memoryAccumulate(_, let offset, let value): return .memoryAccumulate(newCellId, offset, value)
+    case .memoryAccumulate(_, let offset, let value):
+      return .memoryAccumulate(newCellId, offset, value)
     default: return nil
     }
   }

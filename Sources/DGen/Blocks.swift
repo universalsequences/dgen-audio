@@ -651,10 +651,6 @@ public func determineBlocksSimple(
       // Check using tracked flags instead of scanning all nodes (O(1) instead of O(n))
       var nodeIsPass1 = false
       var nodeIsPass2 = false
-      if let node = g.nodes[nodeId] {
-        if case .spectralLossPass1 = node.op { nodeIsPass1 = true }
-        if case .spectralLossPass2 = node.op { nodeIsPass2 = true }
-      }
 
       // Don't allow Pass1 and Pass2 in the same block
       if (nodeIsPass1 && currentBlockHasPass2) || (nodeIsPass2 && currentBlockHasPass1) {
@@ -682,11 +678,6 @@ public func determineBlocksSimple(
       // Start first block
       currentBlock = Block(kind: kind)
       currentBlock!.nodes.append(nodeId)
-      // Set flags for first node
-      if let node = g.nodes[nodeId] {
-        if case .spectralLossPass1 = node.op { currentBlockHasPass1 = true }
-        if case .spectralLossPass2 = node.op { currentBlockHasPass2 = true }
-      }
     }
   }
 
@@ -728,26 +719,6 @@ public func fuseBlocks(_ blocks: [Block], _ g: Graph) -> [Block] {
     var hasScaled = false
     var p1Cells = Set<CellID>()
     var p2Cells = Set<CellID>()
-    for nodeId in b.nodes {
-      if let node = g.nodes[nodeId] {
-        switch node.op {
-        case .spectralLossPass1(_, let scratchCell):
-          hasPass1 = true
-          p1Cells.insert(scratchCell)
-          hasScaled = true
-        case .spectralLossPass2(_, let scratchCell):
-          hasPass2 = true
-          p2Cells.insert(scratchCell)
-        case .parallelMap2DTestPass1(_, _):
-          hasScaled = true
-        case .parallelMap2DTestPass2(_, _):
-          // no-op for scaled flag
-          break
-        default:
-          break
-        }
-      }
-    }
     blockHasPass1.append(hasPass1)
     blockHasPass2.append(hasPass2)
     blockHasScaledThreads.append(hasScaled)
@@ -830,7 +801,7 @@ public func fuseBlocks(_ blocks: [Block], _ g: Graph) -> [Block] {
   return fused
 }
 
-/// Isolate spectralLossPass1 and spectralLossPass2 into their own blocks
+/// Isolate spectralloss ops into their own blocks
 /// to ensure they execute as separate kernels without any fused operations.
 /// Also isolates FFT-based spectral loss gradient operations to avoid race conditions.
 /// Preserves ordering of other nodes.
@@ -861,10 +832,6 @@ public func isolateSpectralPasses(_ blocks: [Block], _ g: Graph) -> [Block] {
     for nodeId in block.nodes {
       let isSpectralPass = { () -> Bool in
         guard let node = g.nodes[nodeId] else { return false }
-        if case .spectralLossPass1 = node.op { return true }
-        if case .spectralLossPass2 = node.op { return true }
-        if case .parallelMap2DTestPass1 = node.op { return true }
-        if case .parallelMap2DTestPass2 = node.op { return true }
         // FFT-based spectral loss ops need isolation because they use shared scratch
         // memory for FFT computation that can't be safely accessed by multiple SIMD threads
         if case .spectralLossFFT = node.op { return true }
@@ -1096,8 +1063,6 @@ private func containsSIMDBlockers(_ uops: [UOp], backend: Backend) -> Bool {
     case .broadcastAccess:
       // Metal handles broadcast access fine with per-thread execution
       if case .c = backend { return true }
-    case .requiresScalar:
-      return true  // Stateful ops (phasor, accum, latch) need sample-by-sample execution
     default:
       break
     }

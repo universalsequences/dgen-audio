@@ -27,24 +27,6 @@ extension Graph {
     return n(.phasor(cellId), freq, reset)
   }
 
-  /// Spectral loss: compute DFT-based magnitude MSE between two signals over a window
-  /// Uses tape-based compute; no ring buffers are required.
-  public func spectralLoss(_ sig1: NodeID, _ sig2: NodeID, windowSize: Int) -> NodeID {
-    // Allocate scratch memory for two-pass backward gradient distribution
-    // Size: maxFrameCount * windowSize * 2 (for sig1 and sig2 contributions)
-    let scratchSize = maxFrameCount * windowSize * 2
-    let scratchCell = alloc(vectorWidth: scratchSize)
-
-    // Create Pass1: computes spectral loss and stores DFT contributions (for backward)
-    let pass1 = n(.spectralLossPass1(windowSize, scratchCell), sig1, sig2)
-
-    // Create Pass2: no-op in forward, reduces contributions to gradients in backward
-    // Depends on pass1 to ensure correct kernel ordering
-    let pass2 = n(.spectralLossPass2(windowSize, scratchCell), pass1)
-
-    return pass2  // Return Pass2 result (forwards Pass1's loss value)
-  }
-
   /// FFT-based spectral loss with backpropagation support.
   ///
   /// Computes spectral loss using Cooley-Tukey FFT and provides gradients via IFFT.
@@ -67,8 +49,9 @@ extension Graph {
     windowSize: Int,
     useHannWindow: Bool = true
   ) -> NodeID {
-    precondition(windowSize > 0 && (windowSize & (windowSize - 1)) == 0,
-                 "windowSize must be a power of 2")
+    precondition(
+      windowSize > 0 && (windowSize & (windowSize - 1)) == 0,
+      "windowSize must be a power of 2")
 
     let numBins = windowSize / 2 + 1
 
@@ -90,27 +73,17 @@ extension Graph {
     let scratchCell = alloc(vectorWidth: numBins * maxFrameCount)
 
     // Create the spectralLossFFT node with all resources
-    return n(.spectralLossFFT(
-      windowSize: windowSize,
-      useHann: useHannWindow,
-      windowCell: windowCell,
-      fft1Cell: fft1Cell,
-      fft2Cell: fft2Cell,
-      mag1Cell: mag1Cell,
-      mag2Cell: mag2Cell,
-      scratchCell: scratchCell
-    ), [sig1, sig2])
-  }
-
-  /// Parallel map2D test: writes per-bin values using flattened (frame, bin) threads,
-  /// then reduces to a scalar per frame. Used to validate parallelMap2D semantics.
-  public func parallelMap2DTest(bins: Int) -> NodeID {
-    let scratchSize = maxFrameCount * bins
-    let scratchCell = alloc(vectorWidth: scratchSize)
-
-    let pass1 = n(.parallelMap2DTestPass1(bins, scratchCell))
-    let pass2 = n(.parallelMap2DTestPass2(bins, scratchCell), pass1)
-    return pass2
+    return n(
+      .spectralLossFFT(
+        windowSize: windowSize,
+        useHann: useHannWindow,
+        windowCell: windowCell,
+        fft1Cell: fft1Cell,
+        fft2Cell: fft2Cell,
+        mag1Cell: mag1Cell,
+        mag2Cell: mag2Cell,
+        scratchCell: scratchCell
+      ), [sig1, sig2])
   }
 
   /// Delta: returns the difference between current and previous input value
@@ -718,8 +691,9 @@ extension Graph {
   /// - Returns: 1D tensor [numCols] containing the selected row
   public func selectRow(tensor: NodeID, rowIndex: NodeID) throws -> NodeID {
     guard let tensorNode = nodes[tensor],
-          case .tensor(let shape) = tensorNode.shape,
-          shape.count == 2 else {
+      case .tensor(let shape) = tensorNode.shape,
+      shape.count == 2
+    else {
       throw DGenError.tensorError(op: "selectRow", reason: "requires 2D tensor input")
     }
     let numCols = shape[1]
@@ -734,8 +708,9 @@ extension Graph {
   /// - Returns: 1D tensor [numCols] containing the interpolated row
   public func peekRow(tensor: NodeID, rowIndex: NodeID) throws -> NodeID {
     guard let tensorNode = nodes[tensor],
-          case .tensor(let shape) = tensorNode.shape,
-          shape.count == 2 else {
+      case .tensor(let shape) = tensorNode.shape,
+      shape.count == 2
+    else {
       throw DGenError.tensorError(op: "peekRow", reason: "requires 2D tensor input")
     }
     let numRows = shape[0]
@@ -745,8 +720,9 @@ extension Graph {
     // Size: maxFrameCount * numCols
     let scratchCell = alloc(vectorWidth: maxFrameCount * numCols)
 
-    return n(.peekRowInline(scratchCell: scratchCell, numRows: numRows, numCols: numCols),
-             [tensor, rowIndex], shape: .tensor([numCols]))
+    return n(
+      .peekRowInline(scratchCell: scratchCell, numRows: numRows, numCols: numCols),
+      [tensor, rowIndex], shape: .tensor([numCols]))
   }
 
 }

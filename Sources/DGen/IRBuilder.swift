@@ -14,12 +14,6 @@ public final class IRBuilder {
     return Expr(lazy, ctx: ctx, nodeId: nodeId, builder: self)
   }
 
-  public func grad(_ nodeId: NodeID, value: Lazy) {
-    let gradId = ctx.useGradient(src: nodeId)
-    let uop = UOp(op: .accumulateGrad(gradId, value), value: value)
-    ops.append(uop)
-  }
-
   func values(_ inputs: [Lazy], count: Int) -> (Expr, Expr) {
     guard inputs.count == count else { fatalError("expected \(count) values") }
     return (value(inputs[0]), value(inputs[1]))
@@ -108,37 +102,10 @@ public final class IRBuilder {
     ops.append(uop)
   }
 
-  /// Mark that this block requires scalar (sample-by-sample) execution.
-  /// Used by stateful ops like phasor, accum, latch that accumulate state
-  /// and cannot be safely vectorized.
-  public func markRequiresScalar() {
-    let uop = UOp(op: .requiresScalar, value: .empty)
-    ops.append(uop)
-  }
-
   public func `if`(_ cond: Expr, then: () -> Void) {
     ops.append(u_begin_if(cond.lazy)(ctx, nodeId))
     then()
     ops.append(u_end_if()(ctx, nil))
-  }
-
-  /// Read a tensor element at flat index from memory (for backward pass)
-  public func readTensorElement(cellId: CellID, at index: Expr) -> Expr {
-    return memoryRead(cellId, index)
-  }
-
-  /// Read a tensor element using proper strides (for view tensors with non-contiguous layout)
-  /// Converts flat output index -> multi-dim coords -> strided memory access
-  public func readTensorWithStrides(tensor: Tensor, flatIdx: Expr, shape: [Int]) -> Expr {
-    // Fast path: contiguous tensor with no offset
-    if tensor.isContiguous && tensor.offset == 0 {
-      return memoryRead(tensor.cellId, flatIdx)
-    }
-
-    // Slow path: use strides to compute memory offset
-    let multiIdx = flatToMultiIndex(flatIdx, shape)
-    let memOffset = stridedIndex(indices: multiIdx, strides: tensor.strides, offset: tensor.offset)
-    return memoryRead(tensor.cellId, memOffset)
   }
 
   // Read a forward intermediate value for a given nodeId from the tape (intermediates buffer)
@@ -707,10 +674,6 @@ public final class IRBuilder {
     }
 
     ops.append(UOp(op: .beginParallelRange(count, incr), value: indexVar))
-
-    // Emit parallelIndex - use the SAME variable as beginParallelRange
-    // so the renderer can match them up
-    //ops.append(UOp(op: .parallelIndex, value: indexVar))
     body(value(indexVar))
     ops.append(UOp(op: .endParallelRange, value: ctx.useVariable(src: nil)))
     if case .simd = kind {

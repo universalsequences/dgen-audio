@@ -52,12 +52,7 @@ public class MetalRenderer: Renderer, UOpEmitter {
       let kernelName = "\(name)_\(i)"
 
       let bufferRequirements = analyzeRequiredBuffers(scheduleItem: scheduleItem)
-      let hasGradWrites = scheduleItem.ops.contains { uop in
-        if case .accumulateGrad = uop.op { return true }
-        if case .accumulateTensorGrad = uop.op { return true }
-        return false
-      }
-      let useReduced = bufferRequirements.needsReducedGradsSum && !hasGradWrites
+      let useReduced = bufferRequirements.needsReducedGradsSum
       useReducedGradsSum = useReduced
 
       // Render parallelRange loops as thread-parallel only for split static kernels
@@ -105,10 +100,6 @@ public class MetalRenderer: Renderer, UOpEmitter {
       if bufferRequirements.needsSegmenting {
         bufferNames.append("segmentLen")
         bufferNames.append("segmentBase")
-      }
-
-      if bufferRequirements.needsGradMemory {
-        bufferNames.append("grad_memory")
       }
 
       if bufferRequirements.needsGrad {
@@ -242,8 +233,7 @@ public class MetalRenderer: Renderer, UOpEmitter {
   private func kernelHasSideEffects(_ scheduleItem: ScheduleItem, ctx: IRContext) -> Bool {
     for uop in scheduleItem.ops {
       switch uop.op {
-      case .memoryWrite, .memoryAccumulate, .store, .delay1, .output,
-        .accumulateGrad, .accumulateTensorGrad, .storeGradMemory:
+      case .memoryWrite, .memoryAccumulate, .store, .delay1, .output:
         return true
       case .beginRange, .endRange, .beginLoop, .endLoop,
         .beginForLoop, .beginParallelRange, .endParallelRange,
@@ -295,10 +285,6 @@ public class MetalRenderer: Renderer, UOpEmitter {
       case .delay1(let cellId, _):
         info.reads.insert(cellId)
         info.writes.insert(cellId)
-      case .loadGradMemory:
-        info.usesGradMemory = true
-      case .storeGradMemory:
-        info.usesGradMemory = true
       case .defineGlobal:
         info.writesGlobals = true
       case .loadGlobal:
@@ -390,14 +376,7 @@ public class MetalRenderer: Renderer, UOpEmitter {
     }
 
     func blockHasGradMemoryCalls(_ block: BlockUOps) -> Bool {
-      return block.ops.contains { uop in
-        switch uop.op {
-        case .storeGradMemory, .loadGradMemory:
-          return true
-        default:
-          return false
-        }
-      }
+      return false  // No grad memory ops in current implementation
     }
 
     for block in uopBlocks {
@@ -532,11 +511,6 @@ public class MetalRenderer: Renderer, UOpEmitter {
       bufferIndex += 1
     }
 
-    if bufferRequirements.needsGradMemory {
-      parameters.append("    device float *grad_memory [[buffer(\(bufferIndex))]]")
-      bufferIndex += 1
-    }
-
     if bufferRequirements.needsGrad {
       parameters.append("    device float *gradients [[buffer(\(bufferIndex))]]")
       bufferIndex += 1
@@ -635,8 +609,6 @@ public class MetalRenderer: Renderer, UOpEmitter {
         checkLazyForGlobal(val)
       case .load, .store, .delay1, .memoryRead, .memoryWrite, .memoryAccumulate, .noise:
         needsMemory = true
-      case .defineMemory:
-        needsMemory = true
       default:
         break
       }
@@ -655,8 +627,6 @@ public class MetalRenderer: Renderer, UOpEmitter {
     let g = { self.emitLazy($0, ctx: ctx, kind: uop.kind, isOut: false) }
 
     switch uop.op {
-    case .defineMemory: return ""
-
     case .add(let a, let b): return emitAssign(uop, "\(g(a)) + \(g(b))", ctx)
     case .mul(let a, let b): return emitAssign(uop, "\(g(a)) * \(g(b))", ctx)
     case .sub(let a, let b): return emitAssign(uop, "\(g(a)) - \(g(b))", ctx)
@@ -784,7 +754,6 @@ public class MetalRenderer: Renderer, UOpEmitter {
       return emitAssign(uop, expr, ctx)
 
     case .load(let cell): return emitAssign(uop, "memory[\(cell)]", ctx)
-    case .loadGradMemory(let cellId): return emitAssign(uop, "grad_memory[\(cellId)]", ctx)
     case .frameIndex:
       // Use id for SIMD blocks, i for scalar blocks
       let baseIdx = (uop.kind == .simd) ? "id" : "i"
@@ -795,82 +764,6 @@ public class MetalRenderer: Renderer, UOpEmitter {
         "(\(g(offset)) < 0 || \(g(offset)) >= frameCount) ? 0.0 : t[\(varId) * frameCount + (int)\(g(offset))]"
       return emitAssign(uop, boundedFetch, ctx)
     case .store(let cell, let val): return "memory[\(cell)] = \(g(val));"
-    case .storeGradMemory(let cell, let val): return "grad_memory[\(cell)] = \(g(val));"
-    case .loadGrad(let gradId):
-      let hasOverride = frameIndexOverride != nil
-      if case .static_ = currentTemporality, !hasOverride {
-        if useReducedGradsSum {
-          return emitAssign(uop, "reducedGradsSum[\(gradId)]", ctx)
-        } else {
-          // Static blocks must sum gradients from all frames
-          let varName = emitLazy(uop.value, ctx: ctx, kind: uop.kind, isOut: true)
-          return """
-              float \(varName) = 0.0;
-              for (uint _gfi = 0; _gfi < frameCount; _gfi++) {
-                \(varName) += gradients[frameCount * \(gradId) + _gfi];
-              }
-            """
-        }
-      } else {
-        let baseIdx = uop.kind == .scalar ? "i" : "id"
-        let idx =
-          frameIndexOverride
-          ?? (currentThreadCountScale == nil
-            ? baseIdx : "(\(baseIdx) / \(currentThreadCountScale!))")
-        return emitAssign(uop, "gradients[frameCount * \(gradId) + \(idx)]", ctx)
-      }
-    case .accumulateGrad(let gradId, let val):
-      let idx: String
-      if case .static_ = currentTemporality, frameIndexOverride == nil {
-        idx = "0"
-      } else {
-        let baseIdx = uop.kind == .scalar ? "i" : "id"
-        idx =
-          frameIndexOverride
-          ?? (currentThreadCountScale == nil
-            ? baseIdx : "(\(baseIdx) / \(currentThreadCountScale!))")
-      }
-      return "gradients[frameCount*\(gradId)+\(idx)] += \(g(val));"
-    case .loadTensorGrad(let baseGradId, let indexLazy):
-      let hasOverride = frameIndexOverride != nil
-      if case .static_ = currentTemporality, !hasOverride {
-        if useReducedGradsSum {
-          return emitAssign(
-            uop,
-            "reducedGradsSum[(\(baseGradId)+(int)(\(g(indexLazy))))]",
-            ctx)
-        } else {
-          // Static blocks must sum gradients from all frames
-          let varName = emitLazy(uop.value, ctx: ctx, kind: uop.kind, isOut: true)
-          return """
-              float \(varName) = 0.0;
-              for (uint _gfi = 0; _gfi < frameCount; _gfi++) {
-                \(varName) += gradients[frameCount*(\(baseGradId)+(int)(\(g(indexLazy))))+_gfi];
-              }
-            """
-        }
-      } else {
-        let baseIdx = uop.kind == .scalar ? "i" : "id"
-        let idx =
-          frameIndexOverride
-          ?? (currentThreadCountScale == nil
-            ? baseIdx : "(\(baseIdx) / \(currentThreadCountScale!))")
-        return emitAssign(
-          uop, "gradients[frameCount*(\(baseGradId)+(int)(\(g(indexLazy))))+\(idx)]", ctx)
-      }
-    case .accumulateTensorGrad(let baseGradId, let indexLazy, let valueLazy):
-      let idx: String
-      if case .static_ = currentTemporality, frameIndexOverride == nil {
-        idx = "0"
-      } else {
-        let baseIdx = uop.kind == .scalar ? "i" : "id"
-        idx =
-          frameIndexOverride
-          ?? (currentThreadCountScale == nil
-            ? baseIdx : "(\(baseIdx) / \(currentThreadCountScale!))")
-      }
-      return
-        "gradients[frameCount*(\(baseGradId)+(int)(\(g(indexLazy))))+\(idx)] += \(g(valueLazy));"
     case .mutate(let a, let b):
       return "\(emitLazy(a, ctx: ctx, kind: uop.kind, isOut: true)) = \(g(b));"
     case .beginIf(let cond): return "if (\(g(cond))) {"
@@ -983,40 +876,6 @@ public class MetalRenderer: Renderer, UOpEmitter {
         return "}"
       }
       return "} atomic_thread_fence(metal::mem_flags::mem_device, metal::memory_order_seq_cst);"
-    case .parallelIndex:
-      // Return the loop variable from the enclosing parallelRange
-      guard case .variable(let varId, _) = uop.value else {
-        fatalError("parallelIndex requires variable")
-      }
-      return emitAssign(uop, "_pr\(varId)", ctx)
-
-    // Local tensor operations for SIMD-across-frames
-    case .declareLocalTensor(let varId, let size):
-      return "float localT\(varId)[\(size)];"
-
-    case .localTensorRead(let varId, let idx):
-      return emitAssign(uop, "localT\(varId)[(int)\(g(idx))]", ctx)
-
-    case .localTensorWrite(let varId, let idx, let val):
-      return "localT\(varId)[(int)\(g(idx))] = \(g(val));"
-
-    case .beginInlineLoop(let count, _):
-      guard case .variable(let varId, _) = uop.value else {
-        fatalError("beginInlineLoop requires variable")
-      }
-      let countStr: String
-      if case .constant(_, let val) = count {
-        countStr = "\(Int(val))"
-      } else {
-        countStr = "(int)\(g(count))"
-      }
-      return "for (int t\(varId) = 0; t\(varId) < \(countStr); t\(varId)++) {"
-
-    case .endInlineLoop:
-      return "}"
-
-    case .frameTensorChainMarker(let shape):
-      return "/* ====== SIMD-ACROSS-FRAMES: Frame-Tensor Chain Block (shape: \(shape)) ====== */"
 
     default:
       return "/* \(uop.prettyDescription()) */"
@@ -1096,26 +955,8 @@ func analyzeRequiredBuffers(scheduleItem: ScheduleItem) -> RequiredBuffers {
     return false
   }
 
-  let needsGradMemory: Bool = scheduleItem.ops.contains { uop in
-    if case .loadGradMemory = uop.op { return true }
-    if case .storeGradMemory = uop.op { return true }
-    return false
-  }
-
-  let hasGradReads: Bool = scheduleItem.ops.contains { uop in
-    if case .loadGrad = uop.op { return true }
-    if case .loadTensorGrad = uop.op { return true }
-    return false
-  }
-
-  let hasGradWrites: Bool = scheduleItem.ops.contains { uop in
-    if case .accumulateGrad = uop.op { return true }
-    if case .accumulateTensorGrad = uop.op { return true }
-    return false
-  }
-
-  let needsGrad: Bool = hasGradReads || hasGradWrites
-
+  let needsGradMemory: Bool = false  // Grad memory ops removed
+  let needsGrad: Bool = false  // Grad ops removed
   let needsReducedGradsSum: Bool = false
 
   return RequiredBuffers(
