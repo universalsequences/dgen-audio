@@ -72,22 +72,24 @@ extension Graph {
                  "windowSize must be a power of 2")
 
     let numBins = windowSize / 2 + 1
+    let maxFrameCount = 4096
 
-    // Allocate window coefficients (shared between both signals)
+    // Allocate window coefficients (shared between all frames - same Hann window)
     let windowCell = alloc(vectorWidth: windowSize)
 
-    // Allocate FFT scratch cells for storing complex spectrum
-    // Layout: real[0..<windowSize], imag[windowSize..<windowSize*2]
-    let fft1Cell = alloc(vectorWidth: windowSize * 2)
-    let fft2Cell = alloc(vectorWidth: windowSize * 2)
+    // Allocate FFT scratch cells for storing complex spectrum - PER FRAME
+    // Layout per frame: real[0..<windowSize], imag[windowSize..<windowSize*2]
+    // Total: (windowSize * 2) * maxFrameCount
+    let fftSize = windowSize * 2
+    let fft1Cell = alloc(vectorWidth: fftSize * maxFrameCount)
+    let fft2Cell = alloc(vectorWidth: fftSize * maxFrameCount)
 
-    // Allocate magnitude cells (only positive frequencies: numBins)
-    let mag1Cell = alloc(vectorWidth: numBins)
-    let mag2Cell = alloc(vectorWidth: numBins)
+    // Allocate magnitude cells (only positive frequencies: numBins) - PER FRAME
+    let mag1Cell = alloc(vectorWidth: numBins * maxFrameCount)
+    let mag2Cell = alloc(vectorWidth: numBins * maxFrameCount)
 
-    // Allocate scratch for per-frame intermediate values
-    let maxFrameCount = 4096
-    let scratchCell = alloc(vectorWidth: maxFrameCount)
+    // Allocate scratch for per-frame intermediate values (already per-frame)
+    let scratchCell = alloc(vectorWidth: numBins * maxFrameCount)
 
     // Create the spectralLossFFT node with all resources
     return n(.spectralLossFFT(

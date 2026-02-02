@@ -474,21 +474,21 @@ public enum LazyOp {
         case .spectralLossFFT(
             let windowSize, let useHann, let windowCell,
             let fft1Cell, let fft2Cell, let mag1Cell, let mag2Cell, let scratchCell):
-            // FFT-based spectral loss: forward pass
-            // 1. Apply optional Hann window
-            // 2. Compute FFT of both signals via Cooley-Tukey
-            // 3. Compute magnitudes
+            // FFT-based spectral loss: forward pass (SIMD-parallel across frames)
+            // Each frame gets its own scratch space to avoid race conditions
+            // 1. Apply optional Hann window (shared across frames)
+            // 2. Compute FFT of both signals via Cooley-Tukey (per-frame scratch)
+            // 3. Compute magnitudes (per-frame storage)
             // 4. Sum squared differences as loss
             guard inputs.count == 2 else {
                 throw DGenError.insufficientInputs(
                     operator: "spectralLossFFT", expected: 2, actual: inputs.count)
             }
 
-            b.markRequiresScalar()
-
             let numBins = windowSize / 2 + 1
             let numStages = Int(log2(Double(windowSize)))
-            let imagOffset = windowSize  // Scratch layout: real[0..<N], imag[N..<2N]
+            let fftSize = windowSize * 2  // real + imag
+            let imagOffset = windowSize   // Scratch layout: real[0..<N], imag[N..<2N]
 
             let sig1 = b.value(inputs[0])
             let sig2 = b.value(inputs[1])
@@ -497,32 +497,35 @@ public enum LazyOp {
             let one = b.constant(1.0)
             let frameIdx = b.threadIndex()
 
+            // Per-frame base offsets for thread-local scratch memory
+            let fftBaseOffset = frameIdx * b.constant(Float(fftSize))
+            let magBaseOffset = frameIdx * b.constant(Float(numBins))
+
             // Use b.if_ to force scalar mode for the entire computation block
             // This prevents SIMD variable generation issues in nested loops
             let alwaysTrue = one > zero
             let loss = b.float(0.0)
             b.if_(alwaysTrue) {
-                // 1. Generate Hann window coefficients (parallelizable - each index is independent)
+                // 1. Generate Hann window coefficients (shared - same for all frames)
                 if useHann {
                     b.parallelRange(windowSize) { n in
                         let nFloat = b.cast(n, to: .float)
-                        // w[n] = 0.5 * (1 - cos(2*pi*n / (N-1)))
                         let angle =
                             b.constant(2.0) * b.pi * nFloat / b.constant(Float(windowSize - 1))
                         let w = b.constant(0.5) * (one - b.cos(angle))
                         _ = b.memoryWrite(windowCell, b.cast(n, to: .int), w)
                     }
                 } else {
-                    // Rectangular window (all ones)
                     b.parallelRange(windowSize) { n in
                         _ = b.memoryWrite(windowCell, b.cast(n, to: .int), one)
                     }
                 }
 
-                // 2. Load windowed samples from tape into FFT scratch cells (parallelizable)
+                // 2. Load windowed samples into per-frame FFT scratch cells
                 b.parallelRange(windowSize) { n in
                     let nFloat = b.cast(n, to: .float)
-                    let w = b.memoryRead(windowCell, b.cast(n, to: .int))
+                    let nInt = b.cast(n, to: .int)
+                    let w = b.memoryRead(windowCell, nInt)
 
                     // Load from tape: samples from frameIdx - windowSize + 1 + n to frameIdx
                     let j = frameIdx - (winSizeFloat - one) + nFloat
@@ -530,18 +533,15 @@ public enum LazyOp {
                     let s1 = b.tapeLoad(sig1, at: j)
                     let s2 = b.tapeLoad(sig2, at: j)
 
-                    // Apply window and store as real part; imag = 0
-                    _ = b.memoryWrite(fft1Cell, b.cast(n, to: .int), s1 * w)
-                    _ = b.memoryWrite(
-                        fft1Cell, b.cast(n, to: .int) + b.constant(Float(imagOffset)), zero)
-                    _ = b.memoryWrite(fft2Cell, b.cast(n, to: .int), s2 * w)
-                    _ = b.memoryWrite(
-                        fft2Cell, b.cast(n, to: .int) + b.constant(Float(imagOffset)), zero)
+                    // Store in per-frame scratch: baseOffset + index
+                    _ = b.memoryWrite(fft1Cell, fftBaseOffset + nInt, s1 * w)
+                    _ = b.memoryWrite(fft1Cell, fftBaseOffset + nInt + b.constant(Float(imagOffset)), zero)
+                    _ = b.memoryWrite(fft2Cell, fftBaseOffset + nInt, s2 * w)
+                    _ = b.memoryWrite(fft2Cell, fftBaseOffset + nInt + b.constant(Float(imagOffset)), zero)
                 }
 
-                // 3. In-place FFT via Cooley-Tukey (bit-reversal + butterfly stages)
-                // Helper function to emit FFT for a single cell
-                func emitFFTInPlace(_ fftCell: CellID) {
+                // 3. In-place FFT via Cooley-Tukey (per-frame scratch)
+                func emitFFTInPlace(_ fftCell: CellID, _ baseOffset: Expr) {
                     // Bit-reversal permutation
                     b.loop(windowSize) { i in
                         var rev = b.constant(0.0)
@@ -556,35 +556,30 @@ public enum LazyOp {
                         let iInt = b.cast(i, to: .int)
                         let revInt = b.cast(rev, to: .int)
 
-                        let tempRealI = b.memoryRead(fftCell, iInt)
-                        let tempImagI = b.memoryRead(fftCell, iInt + b.constant(Float(imagOffset)))
-                        let tempRealRev = b.memoryRead(fftCell, revInt)
-                        let tempImagRev = b.memoryRead(
-                            fftCell, revInt + b.constant(Float(imagOffset)))
+                        let tempRealI = b.memoryRead(fftCell, baseOffset + iInt)
+                        let tempImagI = b.memoryRead(fftCell, baseOffset + iInt + b.constant(Float(imagOffset)))
+                        let tempRealRev = b.memoryRead(fftCell, baseOffset + revInt)
+                        let tempImagRev = b.memoryRead(fftCell, baseOffset + revInt + b.constant(Float(imagOffset)))
 
                         let newRealI = b.gswitch(shouldSwap, tempRealRev, tempRealI)
                         let newImagI = b.gswitch(shouldSwap, tempImagRev, tempImagI)
                         let newRealRev = b.gswitch(shouldSwap, tempRealI, tempRealRev)
                         let newImagRev = b.gswitch(shouldSwap, tempImagI, tempImagRev)
 
-                        _ = b.memoryWrite(fftCell, iInt, newRealI)
-                        _ = b.memoryWrite(fftCell, iInt + b.constant(Float(imagOffset)), newImagI)
-                        _ = b.memoryWrite(fftCell, revInt, newRealRev)
-                        _ = b.memoryWrite(
-                            fftCell, revInt + b.constant(Float(imagOffset)), newImagRev)
+                        _ = b.memoryWrite(fftCell, baseOffset + iInt, newRealI)
+                        _ = b.memoryWrite(fftCell, baseOffset + iInt + b.constant(Float(imagOffset)), newImagI)
+                        _ = b.memoryWrite(fftCell, baseOffset + revInt, newRealRev)
+                        _ = b.memoryWrite(fftCell, baseOffset + revInt + b.constant(Float(imagOffset)), newImagRev)
                     }
 
-                    // Butterfly stages - each stage must complete before the next
-                    // But within each stage, all butterflies are independent and parallelizable
+                    // Butterfly stages
                     for stage in 0..<numStages {
                         let butterflySize = 1 << (stage + 1)
                         let halfSize = butterflySize / 2
                         let numGroups = windowSize / butterflySize
-                        let numButterflies = numGroups * halfSize  // Total butterflies in this stage
+                        let numButterflies = numGroups * halfSize
 
-                        // Parallelize all butterflies in this stage
                         b.parallelRange(numButterflies) { flatIdx in
-                            // Compute group and k from flat index
                             let flatFloat = b.cast(flatIdx, to: .float)
                             let halfSizeFloat = b.constant(Float(halfSize))
                             let butterflySizeFloat = b.constant(Float(butterflySize))
@@ -595,7 +590,6 @@ public enum LazyOp {
                             let i = group * butterflySizeFloat + k
                             let j = i + halfSizeFloat
 
-                            // Twiddle factor: W = e^(-2*pi*i*k/butterflySize)
                             let angle = b.constant(-2.0) * b.pi * k / butterflySizeFloat
                             let wr = b.cos(angle)
                             let wi = b.sin(angle)
@@ -603,53 +597,49 @@ public enum LazyOp {
                             let iInt = b.cast(i, to: .int)
                             let jInt = b.cast(j, to: .int)
 
-                            let ar = b.memoryRead(fftCell, iInt)
-                            let ai = b.memoryRead(fftCell, iInt + b.constant(Float(imagOffset)))
-                            let br = b.memoryRead(fftCell, jInt)
-                            let bi = b.memoryRead(fftCell, jInt + b.constant(Float(imagOffset)))
+                            let ar = b.memoryRead(fftCell, baseOffset + iInt)
+                            let ai = b.memoryRead(fftCell, baseOffset + iInt + b.constant(Float(imagOffset)))
+                            let br = b.memoryRead(fftCell, baseOffset + jInt)
+                            let bi = b.memoryRead(fftCell, baseOffset + jInt + b.constant(Float(imagOffset)))
 
-                            // Butterfly: (ar,ai) + W*(br,bi) and (ar,ai) - W*(br,bi)
                             let tr = wr * br - wi * bi
                             let ti = wr * bi + wi * br
 
-                            _ = b.memoryWrite(fftCell, iInt, ar + tr)
-                            _ = b.memoryWrite(
-                                fftCell, iInt + b.constant(Float(imagOffset)), ai + ti)
-                            _ = b.memoryWrite(fftCell, jInt, ar - tr)
-                            _ = b.memoryWrite(
-                                fftCell, jInt + b.constant(Float(imagOffset)), ai - ti)
+                            _ = b.memoryWrite(fftCell, baseOffset + iInt, ar + tr)
+                            _ = b.memoryWrite(fftCell, baseOffset + iInt + b.constant(Float(imagOffset)), ai + ti)
+                            _ = b.memoryWrite(fftCell, baseOffset + jInt, ar - tr)
+                            _ = b.memoryWrite(fftCell, baseOffset + jInt + b.constant(Float(imagOffset)), ai - ti)
                         }
                     }
                 }
 
-                // Apply FFT to both cells
-                emitFFTInPlace(fft1Cell)
-                emitFFTInPlace(fft2Cell)
+                // Apply FFT to both cells with per-frame offsets
+                emitFFTInPlace(fft1Cell, fftBaseOffset)
+                emitFFTInPlace(fft2Cell, fftBaseOffset)
 
-                // 4. Compute magnitudes in parallel and store for backward pass
-                // This loop is fully parallelizable - each bin is independent
+                // 4. Compute magnitudes and store in per-frame storage
                 b.parallelRange(numBins) { k in
                     let kInt = b.cast(k, to: .int)
 
-                    let real1 = b.memoryRead(fft1Cell, kInt)
-                    let imag1 = b.memoryRead(fft1Cell, kInt + b.constant(Float(imagOffset)))
+                    let real1 = b.memoryRead(fft1Cell, fftBaseOffset + kInt)
+                    let imag1 = b.memoryRead(fft1Cell, fftBaseOffset + kInt + b.constant(Float(imagOffset)))
                     let mag1 = b.sqrt(real1 * real1 + imag1 * imag1)
-                    _ = b.memoryWrite(mag1Cell, kInt, mag1)
+                    _ = b.memoryWrite(mag1Cell, magBaseOffset + kInt, mag1)
 
-                    let real2 = b.memoryRead(fft2Cell, kInt)
-                    let imag2 = b.memoryRead(fft2Cell, kInt + b.constant(Float(imagOffset)))
+                    let real2 = b.memoryRead(fft2Cell, fftBaseOffset + kInt)
+                    let imag2 = b.memoryRead(fft2Cell, fftBaseOffset + kInt + b.constant(Float(imagOffset)))
                     let mag2 = b.sqrt(real2 * real2 + imag2 * imag2)
-                    _ = b.memoryWrite(mag2Cell, kInt, mag2)
+                    _ = b.memoryWrite(mag2Cell, magBaseOffset + kInt, mag2)
 
-                    // Store squared difference in scratch for parallel reduction
+                    // Store squared difference in per-frame scratch
                     let diff = mag1 - mag2
-                    _ = b.memoryWrite(scratchCell, kInt, diff * diff)
+                    _ = b.memoryWrite(scratchCell, magBaseOffset + kInt, diff * diff)
                 }
 
-                // 5. Sequential reduction of loss (could be improved with parallel reduction)
+                // 5. Sequential reduction of loss
                 b.loop(numBins) { k in
                     let kInt = b.cast(k, to: .int)
-                    let diffSq = b.memoryRead(scratchCell, kInt)
+                    let diffSq = b.memoryRead(scratchCell, magBaseOffset + kInt)
                     loss.accumulate(diffSq)
                 }
             }

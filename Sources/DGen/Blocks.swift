@@ -863,8 +863,8 @@ public func isolateSpectralPasses(_ blocks: [Block], _ g: Graph) -> [Block] {
                 if case .spectralLossPass2 = node.op { return true }
                 if case .parallelMap2DTestPass1 = node.op { return true }
                 if case .parallelMap2DTestPass2 = node.op { return true }
-                // FFT-based spectral loss ops need isolation to prevent race conditions
-                // GradInline writes frame-indexed gradients that GradRead reads across frames
+                // FFT-based spectral loss ops need isolation because they use shared scratch
+                // memory for FFT computation that can't be safely accessed by multiple SIMD threads
                 if case .spectralLossFFT = node.op { return true }
                 if case .spectralLossFFTGradInline = node.op { return true }
                 if case .spectralLossFFTGradRead = node.op { return true }
