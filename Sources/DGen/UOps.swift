@@ -83,6 +83,8 @@ public enum Op {
   case transpose([Int])  // View op: transpose with permutation - renders to nothing but prevents SIMD
   case shrink([(Int, Int)?])  // View op: shrink/slice - renders to nothing but prevents SIMD
   case pad([(Int, Int)])  // View op: pad with zeros - renders to nothing but prevents SIMD
+  case expandView([Int])  // View op: broadcast size-1 dims via stride=0 - renders to nothing but prevents SIMD
+  case repeatView([Int])  // View op: tile tensor via modular indexing - renders to nothing but prevents SIMD
   case broadcastAccess  // Marker: broadcast indexing used - renders to nothing but prevents SIMD
 
   // Hop-based execution control (for FFT/spectral processing)

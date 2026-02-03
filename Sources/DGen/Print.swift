@@ -157,6 +157,10 @@ extension UOp {
             opStr = "\(ANSI.cyan)shrink\(ANSI.reset)(\(ranges))"
         case let .pad(padding):
             opStr = "\(ANSI.cyan)pad\(ANSI.reset)(\(padding))"
+        case let .expandView(shape):
+            opStr = "\(ANSI.cyan)expandView\(ANSI.reset)(\(shape))"
+        case let .repeatView(repeats):
+            opStr = "\(ANSI.cyan)repeatView\(ANSI.reset)(\(repeats))"
         case .broadcastAccess:
             opStr = "\(ANSI.cyan)broadcastAccess\(ANSI.reset)"
         case let .beginHopCheck(counterCell):

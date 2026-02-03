@@ -72,22 +72,6 @@ public class IRContext {
   public var constants: [ConstantID: Float] = [:]
   public var variables: [VarID: NodeID] = [:]
   public var tapeIndex: [NodeID: Int] = [:]
-  public var seedGradients: [GradID] = []
-
-  // Tensor gradient support: maps tensor nodes to base GradID for contiguous allocation
-  public var tensorGradients: [NodeID: GradID] = [:]
-  public var tensorGradientSizes: [NodeID: Int] = [:]
-
-  // Track which tensor gradients are frame-based (need frameCount multiplier)
-  // GradIDs not in this set are static (only need tensor size)
-  public var frameBasedGradients: Set<GradID> = []
-
-  // Track scalar gradients that are frame-based
-  public var frameBasedScalarGradients: Set<GradID> = []
-
-  // Track tensor gradients that are frame-aware (need tensorSize × frameCount allocation)
-  // Used for gradients of tensors with outbound dependencies in frame-based blocks
-  public var frameAwareTensorGradients: Set<GradID> = []
 
   public func getGlobalId(_ varId: VarID) -> Int {
     if let index = globals.firstIndex(of: varId) {
@@ -111,30 +95,6 @@ public class IRContext {
     let constant = Lazy.constant(constantId, value)
     if let srcId = src { self.values[srcId] = constant }
     return constant
-  }
-
-  public func useGradient(src: NodeID, seed: Bool = false) -> GradID {
-    if let gradId = self.gradients[src] {
-      return gradId
-    }
-    let gradId = self.gradIdx + 1
-    self.gradIdx = gradId
-    self.gradients[src] = gradId
-    // Auto-detect if this node is frame-based from temporality analysis
-    if frameBasedNodes.contains(src) {
-      self.frameBasedScalarGradients.insert(gradId)
-    }
-    if seed {
-      self.seedGradients.append(gradId)
-    }
-    return gradId
-  }
-
-  /// Current layout: gradients[(gradId) * frameCount + threadIndex]
-  /// So total buffer size = (maxGradId + 1) * frameCount
-  public func computeGradientBufferSize(frameCount: Int) -> Int {
-    let currentSize = (maxGradId + 1) * frameCount
-    return 2 * currentSize  // 2x for safety margin
   }
 
   public func useVariable(src: NodeID?, trackInValues: Bool = true) -> Lazy {

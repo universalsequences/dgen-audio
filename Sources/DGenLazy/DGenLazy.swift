@@ -1,0 +1,43 @@
+// DGenLazy - Tinygrad-inspired lazy execution frontend for DGen
+//
+// Provides an ergonomic API for tensor operations, audio signal processing,
+// and differentiable DSP with lazy evaluation.
+
+import DGen
+
+// MARK: - Global Configuration
+
+/// Global configuration for DGenLazy
+public enum DGenConfig {
+    /// Execution backend (.metal or .cpu)
+    public static var backend: Backend = .metal
+
+    /// Audio sample rate in Hz
+    public static var sampleRate: Float = 44100.0
+
+    /// Default frame count for realize() calls
+    public static var defaultFrameCount: Int = 1024
+}
+
+// MARK: - Type Aliases for Convenience
+
+/// Shape is an array of dimensions
+public typealias Shape = [Int]
+
+// MARK: - LazyValue Protocol
+
+/// Base protocol for all lazy values (Tensor, Signal, SignalTensor)
+public protocol LazyValue {
+    /// Whether this value requires gradient computation
+    var requiresGrad: Bool { get }
+
+    /// The underlying graph node ID (internal)
+    var nodeId: NodeID { get }
+
+    /// The graph this value belongs to (internal)
+    var graph: LazyGraph { get }
+}
+
+// MARK: - Backend enum (re-export from DGen if not public)
+
+// Note: Backend is already defined in DGen, we just use it directly

@@ -465,6 +465,33 @@ extension LazyOp {
       // For now, return the gradient (TODO: implement proper reduction)
       return [gradOutput]
 
+    case .expandView(let targetShape):
+      // expandView backward: sum along dimensions that were expanded (size-1 -> larger)
+      // For each dim where input was 1 and output is > 1, we need to sum the gradients
+      guard let inputNode = g.nodes[node.inputs[0]],
+        case .tensor(let inputShape) = inputNode.shape
+      else {
+        return [gradOutput]
+      }
+
+      // Find which axes were expanded (input size 1 -> target size > 1)
+      var result = gradOutput
+      for (axis, (inSize, outSize)) in zip(inputShape, targetShape).enumerated().reversed() {
+        if inSize == 1 && outSize > 1 {
+          // This dimension was broadcast - need to sum gradients along it
+          result = try! g.sum(result, axis: axis)
+        }
+      }
+      // sumAxis removes dimensions, but we need to keep them as size-1
+      // Reshape back to original input shape
+      result = g.n(.reshape(inputShape), [result])
+      return [result]
+
+    case .repeatView(let repeats):
+      // repeatView backward: sum over the repeated tiles to get gradient for original
+      // For now, return the gradient (TODO: implement proper reduction for repeated dims)
+      return [gradOutput]
+
     // MARK: Stateful Operations
 
     case .phasor(_):

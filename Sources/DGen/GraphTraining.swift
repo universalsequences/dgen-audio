@@ -229,22 +229,9 @@ public class GraphTrainingContext {
             _ = graph.n(.memoryAccumulate(gradCell), [zero, gradNode])
         }
 
-        // Step 2b: For tensor parameters, create tensorAccumulate ops for gradients
-        // This pulls the lazy gradient tensor nodes into the compilation pipeline
-        for tp in tensorParameters {
-            guard let gradNode = gradients[tp.nodeId] else {
-                print("Warning: No gradient for tensor param \(tp.name ?? "?")")
-                continue
-            }
-
-            // Allocate gradient accumulation cell
-            let gradCell = graph.alloc(vectorWidth: tp.size)
-            graph.tensorGradCells[tp.nodeId] = gradCell
-
-            // Create tensor accumulate op - this pulls gradNode into the graph
-            let accumOp = graph.n(.tensorAccumulate(gradCell), [gradNode])
-            graph.addGradientSideEffect(accumOp)
-        }
+        // Step 2b: For tensor parameters, use shared gradient setup
+        let tensorNodes = tensorParameters.map { ($0.nodeId, $0.size) }
+        let _ = graph.setupTensorGradients(gradients: gradients, tensorNodes: tensorNodes)
 
         // Ensure gradient side effects are scheduled
         if !graph.gradientSideEffects.isEmpty {

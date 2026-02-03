@@ -168,6 +168,8 @@ public enum LazyOp {
   case transpose([Int])  // Transpose/permute axes (metadata only)
   case shrink([(Int, Int)?])  // Shrink/slice tensor (metadata only, no data movement)
   case pad([(Int, Int)])  // Pad tensor with zeros (virtual view, conditional reads)
+  case expandView(Shape)  // Broadcast size-1 dims to target shape (stride=0 view, no data copy)
+  case repeatView([Int])  // Tile tensor by repeating along each dim (modular index view, no data copy)
   case peek  // Read from 2D tensor at (index, channel) with interpolation - lazy version
   case fft(Int, Int, CellID, CellID, CellID, CellID)  // FFT transform: windowSize, hopSize, scratchCell, ringBufferCell, writePosCell, counterCell
   case ifft(Int, Int, CellID, CellID, CellID, CellID)  // IFFT transform: windowSize, hopSize, scratchCell, outputRingCell, readPosCell, counterCell
@@ -1772,7 +1774,7 @@ public enum LazyOp {
 
     case .sumAxis(let axis):
       guard case .tensor(let inShape) = g.nodes[node.inputs[0]]?.shape,
-        case .tensor = node.shape,
+        case .tensor(let outShape) = node.shape,
         let inTensor = g.nodeToTensor[node.inputs[0]].flatMap({ g.tensors[$0] }),
         let outCell = g.nodeToTensor[node.id].flatMap({ g.tensors[$0] })?.cellId,
         let loopIdx = b.ctx.tensorIndices[node.id],
@@ -1784,33 +1786,38 @@ public enum LazyOp {
       let outIdx = b.value(loopIdx)
       let acc = b.float(0.0)
 
+      // Compute output strides for index conversion
+      var outStrides = [Int](repeating: 1, count: outShape.count)
+      for i in stride(from: outShape.count - 2, through: 0, by: -1) {
+        outStrides[i] = outStrides[i + 1] * outShape[i + 1]
+      }
+
       b.loop(inShape[axis]) { reduceIdx in
         let rIdx = b.cast(reduceIdx, to: .float)
-        let oIdx = b.cast(outIdx, to: .float)
 
-        let indices: [Expr]
-        switch inShape.count {
-        case 1:
-          indices = [rIdx]
-        case 2:
-          indices = axis == 0 ? [rIdx, oIdx] : [oIdx, rIdx]
-        case 3:
-          let innerDim = axis == 2 ? inShape[1] : inShape[2]
-          let outer = b.floor(b.cast(outIdx, to: .int) / b.constant(Float(innerDim)))
-          let inner = b.cast(outIdx, to: .int) - outer * b.constant(Float(innerDim))
-          switch axis {
-          case 0: indices = [rIdx, outer, inner]
-          case 1: indices = [outer, rIdx, inner]
-          default: indices = [outer, inner, rIdx]
-          }
-        default:
-          // Fallback for higher dimensions - uses tensorRead
-          let val = b.tensorRead(inTensor, flatIdx: reduceIdx, shape: inShape)
-          acc.accumulate(val)
-          return
+        // Convert flat outIdx to multi-dimensional output indices
+        var outIndices = [Expr]()
+        var remaining = b.cast(outIdx, to: .int)
+        for i in 0..<outShape.count {
+          let stride = b.constant(Float(outStrides[i]))
+          let idx = b.floor(remaining / stride)
+          outIndices.append(idx)
+          remaining = remaining - idx * stride
         }
 
-        let val = b.tensorRead(inTensor, indices: indices)
+        // Build input indices by inserting rIdx at the reduction axis
+        var inIndices = [Expr]()
+        var outDim = 0
+        for i in 0..<inShape.count {
+          if i == axis {
+            inIndices.append(rIdx)
+          } else {
+            inIndices.append(outIndices[outDim])
+            outDim += 1
+          }
+        }
+
+        let val = b.tensorRead(inTensor, indices: inIndices)
         acc.accumulate(val)
         _ = b.memoryWrite(outCell, b.cast(outIdx, to: .int), acc.value)
       }
@@ -1842,6 +1849,18 @@ public enum LazyOp {
       ctx.values[nodeId] = .empty
       // Emit marker UOp for debugging and to signal SIMD should be disabled
       ops.append(UOp(op: .pad(padding), value: .empty))
+
+    case .expandView(let targetShape):
+      // expandView is metadata-only - broadcasts size-1 dims via stride=0
+      ctx.values[nodeId] = .empty
+      // Emit marker UOp for debugging and to signal SIMD should be disabled
+      ops.append(UOp(op: .expandView(targetShape), value: .empty))
+
+    case .repeatView(let repeats):
+      // repeatView is metadata-only - tiles tensor via modular indexing
+      ctx.values[nodeId] = .empty
+      // Emit marker UOp for debugging and to signal SIMD should be disabled
+      ops.append(UOp(op: .repeatView(repeats), value: .empty))
 
     case .peek:
       // Lazy peek: read from 2D tensor at (index, channel) with linear interpolation

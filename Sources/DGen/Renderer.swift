@@ -498,9 +498,7 @@ public class CRenderer: Renderer {
     case .defineConstant(let constantId, let val):
       return "float32x4_t c\(constantId) = vdupq_n_f32(\(val)f);"
     case .defineGlobal(let varId):
-      // Note: We no longer mark as loaded here. loadGlobal needs to run to emit
-      // SIMD variable declarations (float32x4_t simd{id}) when SIMD code accesses the global.
-      // loadGlobal will mark as loaded to prevent duplicate declarations.
+      // Declaration only; loadGlobal emits the SIMD variable when accessed
       return "/* t\(varId) declared globally */"
 
     case .add(let a, let b):

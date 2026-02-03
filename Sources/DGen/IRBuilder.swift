@@ -363,8 +363,8 @@ public final class IRBuilder {
       throw DGenError.missingTensorID
     }
 
-    // For padded tensors, use tensorRead which handles bounds checking
-    if tensor.padding != nil {
+    // For padded or repeated tensors, use tensorRead which handles bounds checking and modular indexing
+    if tensor.padding != nil || tensor.innerShapeForRepeat != nil {
       let indices = flatToMultiIndex(value(loopIdx), outShape)
       return tensorRead(
         tensor,
@@ -437,6 +437,24 @@ public final class IRBuilder {
   /// For non-padded tensors: direct memory read.
   /// For padded tensors: returns 0 for padded regions, real data otherwise.
   public func tensorRead(_ tensor: Tensor, indices: [Expr]) -> Expr {
+    var adjustedIndices = indices
+
+    // Step 1: Apply shrinkStart if present (for shrunk repeated tensors)
+    // This converts from shrunk tensor indices to full repeated tensor indices
+    if let shrinkStart = tensor.shrinkStart {
+      adjustedIndices = indices.enumerated().map { i, idx in
+        idx + constant(Float(shrinkStart[i]))
+      }
+    }
+
+    // Step 2: Apply modular indexing for repeated tensor
+    // This wraps indices to the original tensor size
+    if let innerShape = tensor.innerShapeForRepeat {
+      adjustedIndices = adjustedIndices.enumerated().map { i, idx in
+        mod(idx, constant(Float(innerShape[i])))
+      }
+    }
+
     if let padding = tensor.padding {
       // Padded tensor: default to 0, conditionally read real data
       let val = float(0.0)
@@ -444,7 +462,7 @@ public final class IRBuilder {
       // Build inBounds check for all axes
       var inBounds: Expr = constant(1.0)
       for (i, (left, right)) in padding.enumerated() {
-        let idx = indices[i]
+        let idx = adjustedIndices[i]
         let innerEnd = constant(Float(tensor.shape[i] - right))
         // idx >= left AND idx < innerEnd
         inBounds = inBounds * (idx >= constant(Float(left))) * (idx < innerEnd)
@@ -452,7 +470,7 @@ public final class IRBuilder {
 
       self.if(inBounds) {
         // Adjust indices by subtracting padLeft
-        let adjusted = indices.enumerated().map { i, idx in
+        let adjusted = adjustedIndices.enumerated().map { i, idx in
           idx - constant(Float(padding[i].left))
         }
         let memIdx = tensorMemoryIndex(tensor, indices: adjusted)
@@ -461,8 +479,8 @@ public final class IRBuilder {
 
       return val.value
     } else {
-      // Non-padded: direct read
-      let memIdx = tensorMemoryIndex(tensor, indices: indices)
+      // Non-padded: direct read using (possibly modulo-adjusted) indices
+      let memIdx = tensorMemoryIndex(tensor, indices: adjustedIndices)
       return memoryRead(tensor.cellId, memIdx)
     }
   }
@@ -470,8 +488,8 @@ public final class IRBuilder {
   /// Read from tensor using flat index with padding support.
   /// For frame-aware cells, uses frame-indexed addressing.
   public func tensorRead(_ tensor: Tensor, flatIdx: Expr, shape: [Int]) -> Expr {
-    if tensor.padding != nil {
-      // Need multi-dim indices for padding check
+    if tensor.padding != nil || tensor.innerShapeForRepeat != nil || tensor.shrinkStart != nil {
+      // Need multi-dim indices for padding check, modular repeat indexing, or shrink offset
       let indices = flatToMultiIndex(flatIdx, shape)
       return tensorRead(tensor, indices: indices)
     } else if ctx.frameAwareTensorCells.contains(tensor.cellId),

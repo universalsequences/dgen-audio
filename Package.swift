@@ -10,6 +10,7 @@ let package = Package(
         .executable(name: "dgen", targets: ["DGenApp"]),
         .library(name: "DGen", targets: ["DGen"]),
         .library(name: "DGenFrontend", targets: ["DGenFrontend"]),
+        .library(name: "DGenLazy", targets: ["DGenLazy"]),
     ],
     targets: [
         .target(
@@ -30,10 +31,19 @@ let package = Package(
             dependencies: ["DGen"],
             path: "Sources/DGenApp"
         ),
+        .target(
+            name: "DGenLazy",
+            dependencies: ["DGen"]
+        ),
         .testTarget(
             name: "DGenTests",
             dependencies: ["DGen", "DGenFrontend"],
             path: "Tests/DGenTests"
+        ),
+        .testTarget(
+            name: "DGenLazyTests",
+            dependencies: ["DGenLazy", "DGen"],
+            path: "Tests/DGenLazyTests"
         ),
     ]
 )

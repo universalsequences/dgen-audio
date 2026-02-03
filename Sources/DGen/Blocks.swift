@@ -1364,17 +1364,13 @@ public func emitBlockUOps(
   let inbound = findNodesAsInboundDependencies(blocks, g, block: block)
 
   for nodeId in inbound {
-    // Only emit loadGlobal if the variable has a corresponding defineGlobal
-    // (i.e., it's in ctx.globals). Tensor-valued nodes that skip defineGlobal
-    // should also skip loadGlobal - their data flows through memory cells.
     if let lz = ctx.values[nodeId] {
       switch lz {
       case .variable(let a, _):
-        // Skip if this variable wasn't defined as a global (defineGlobal was skipped)
+        // Skip variables without defineGlobal (tensor-valued nodes use memory cells instead)
         guard ctx.globals.contains(a) else { continue }
 
         var loadGlobalUOp = UOp(op: .loadGlobal(a), value: .variable(a, nil))
-        // Use block.kind (frame loop kind), not effectiveKind (tensor loop kind)
         // Globals are indexed by frame loop, not tensor loop
         loadGlobalUOp.kind = block.kind
         uops.insert(loadGlobalUOp, at: 0)

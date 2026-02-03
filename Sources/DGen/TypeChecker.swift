@@ -177,6 +177,18 @@ public func inferShape(op: LazyOp, inputs: [ValueShape], graph: Graph) throws ->
     }
     return .tensor(newShape)
 
+  case .expandView(let targetShape):
+    // expandView broadcasts size-1 dims to target shape (stride=0 view)
+    return .tensor(targetShape)
+
+  case .repeatView(let repeats):
+    // repeatView tiles tensor - output shape is input shape * repeats
+    guard let firstInput = inputs.first, case .tensor(let shape) = firstInput else {
+      throw DGenError.shapeInferenceFailed(op: "repeatView", reason: "requires tensor input")
+    }
+    let newShape = zip(shape, repeats).map { $0 * $1 }
+    return .tensor(newShape)
+
   // Peek - reads a scalar from a 2D tensor at (index, channel)
   case .peek:
     // Peek always outputs scalar - it reads one value from the tensor
@@ -508,7 +520,12 @@ public func allocateTensorMemory(
       (isOutbound || intraBlockFrameAwareCells.contains(lazyCellId))
 
     // Only allocate if outbound or needs frame-aware storage
-    guard isOutbound || needsFrameAwareAlloc else { continue }
+    // But always register the size for lazy cells so remapping knows the correct size
+    if !isOutbound && !needsFrameAwareAlloc {
+      // Still register the size for this lazy cell even though we're not converting it
+      graph.cellAllocationSizes[lazyCellId] = tensorSize
+      continue
+    }
 
     let allocSize = needsFrameAwareAlloc ? tensorSize * frameCount : tensorSize
     let realCellId = graph.allocateLazyCell(lazyCellId, vectorWidth: allocSize)

@@ -125,8 +125,6 @@ public struct CompilationPipeline {
         debug: false)
     }
 
-    print("\(ANSI.red)SORTED NODES=\(sortedNodes)\(ANSI.reset)")
-
     try time("inferShapes") {
       try inferShapes(graph: graph, sortedNodes: sortedNodes)
     }
@@ -175,8 +173,6 @@ public struct CompilationPipeline {
         debug: false
       )
     }
-
-    print("SIMPLE BLOCKS DETERMINED=\(blocks.compactMap{$0.nodes})")
 
     // Since we're using corridor-aware topological sort, blocks are already properly ordered
     // Fuse adjacent blocks of the same kind to reduce cross-block communication
@@ -292,14 +288,9 @@ public struct CompilationPipeline {
       return (scale, filtered)
     }
 
-    for (i, block) in finalBlocks.enumerated() {
-
-      print("\(ANSI.red)NODES in block \(i+1)\(ANSI.reset) -> \(block.nodes) ")
-    }
     try time("emitBlockUOps") {
       for blockIdx in finalBlockIndices {
         let block = finalBlocks[blockIdx]
-        print("emitting block with shape=\(block.shape)")
         let ops = try emitBlockUOps(
           ctx: context,
           block: block,
@@ -308,9 +299,7 @@ public struct CompilationPipeline {
           backend: backend,
           debug: options.debug
         )
-        print("extracting thread count")
         let (threadCountScale, filteredOps) = extractThreadCountScale(ops)
-        print("threadCoutnScale we extracted=\(threadCountScale)")
         var finalOps = filteredOps
         let effectiveKind: Kind
         if backend == .c, threadCountScale != nil {
@@ -376,6 +365,7 @@ public struct CompilationPipeline {
 
     // Print timing summary
     let pipelineTotal = (CFAbsoluteTimeGetCurrent() - pipelineStart) * 1000
+    /*
     print(
       "⏱️ [DGen Pipeline] Total: \(String(format: "%.1f", pipelineTotal))ms | nodes: \(graph.nodes.count)"
     )
@@ -385,6 +375,7 @@ public struct CompilationPipeline {
       print(
         "   \(String(format: "%6.1f", ms))ms (\(String(format: "%4.1f", pct))%) - \(label)")
     }
+    */
 
     return CompilationResult(
       graph: graph,

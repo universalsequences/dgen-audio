@@ -213,10 +213,6 @@ public class MetalCompiledKernel: CompiledKernelRuntime {
       return getMemorySize()
     case "t":
       return maxFrameCount * context.globals.count
-    case "gradients":
-      return context.computeGradientBufferSize(frameCount: maxFrameCount)
-    case "reducedGradsSum", "reducedGrads":
-      return max(1, context.maxGradId + 1)
     default:
       return maxFrameCount
     }
@@ -257,37 +253,6 @@ public class MetalCompiledKernel: CompiledKernelRuntime {
     bufferPool["frameCount"] = frameCountBuffer
   }
 
-  public func resetGradientBuffers(numFrames: Int) {
-    // Reset gradients buffer
-    guard let buffer = bufferPool["gradients"] else {
-      print("   [DEBUG] No gradients buffer found!")
-      return
-    }
-
-    let elementCount = getElementCount("gradients")
-    let bufferSize = elementCount * MemoryLayout<Float>.size
-    guard context.seedGradients.count > 0 else {
-      print("   [DEBUG] No seed gradients to reset!")
-      return
-    }
-
-    // Initialize buffer contents to zero
-    let bufferContents = buffer.contents().assumingMemoryBound(to: Float.self)
-    for i in 0..<(bufferSize / MemoryLayout<Float>.size) {
-      bufferContents[i] = 0.0
-    }
-
-    // Set all seed gradients to 1.0 (typically loss nodes)
-    for seedId in context.seedGradients {
-      let startIdx = numFrames * seedId
-      let endIdx = numFrames * (seedId + 1)
-      for i in startIdx..<endIdx {
-        bufferContents[i] = 1.0
-      }
-    }
-
-  }
-
   public func setParamValue(cellId: CellID, value: Float) {
     // TODO - implement
   }
@@ -322,32 +287,6 @@ public class MetalCompiledKernel: CompiledKernelRuntime {
 
     guard var commandBuffer = commandQueue.makeCommandBuffer() else { return }
 
-    func debugPrintGradStats(label: String) {
-      guard debugGradients, firstDebug, let gradientsBuf = bufferPool["gradients"] else { return }
-      let gptr = gradientsBuf.contents().assumingMemoryBound(to: Float.self)
-      let numGradIds = context.maxGradId + 1
-      let fc = frameCount
-      print("   [DEBUG] Grad stats after \(label):")
-      for gid in 0..<numGradIds {
-        let base = gid * fc
-        var minv: Float = Float.greatestFiniteMagnitude
-        var maxv: Float = -Float.greatestFiniteMagnitude
-        var anyNaN = false
-        var anyInf = false
-        var sum: Float = 0
-        for i in 0..<fc {
-          let v = gptr[base + i]
-          if v.isNaN { anyNaN = true }
-          if !v.isFinite { anyInf = true }
-          if v < minv { minv = v }
-          if v > maxv { maxv = v }
-          sum += v
-        }
-        let mean = sum / Float(fc)
-        print("      gid=\(gid) min=\(minv) max=\(maxv) mean=\(mean) NaN=\(anyNaN) Inf=\(anyInf)")
-      }
-    }
-
     // Execute kernels in sequence
     // In non-debug mode, reuse a single encoder to reduce CPU overhead
     var sharedEncoder: MTLComputeCommandEncoder? = nil
@@ -356,17 +295,7 @@ public class MetalCompiledKernel: CompiledKernelRuntime {
     }
     for (index, kernel) in kernels.enumerated() {
       if firstDebug {
-        print("   [DEBUG] Executing kernel \(index): \(kernel.name)  \(kernel.kind)")
-      }
-      if kernel.needsReducedGradsSum {
-        if let enc = sharedEncoder {
-          enc.endEncoding()
-          sharedEncoder = nil
-        }
-        encodeReduceGradientsSum(commandBuffer: commandBuffer, frameCount: frameCount)
-        if !debugGradients {
-          sharedEncoder = commandBuffer.makeComputeCommandEncoder()
-        }
+        //print("   [DEBUG] Executing kernel \(index): \(kernel.name)  \(kernel.kind)")
       }
 
       // Pick encoder: shared if available (non-debug), otherwise one per kernel
@@ -421,7 +350,6 @@ public class MetalCompiledKernel: CompiledKernelRuntime {
           if let error = commandBuffer.error {
             print("   [GPU ERROR] kernel \(index) (\(kernel.name)): \(error.localizedDescription)")
           }
-          debugPrintGradStats(label: "kernel \(index)")
           // Start a new command buffer for next kernel
           if let cb = commandQueue.makeCommandBuffer() { commandBuffer = cb }
         }
@@ -456,7 +384,6 @@ public class MetalCompiledKernel: CompiledKernelRuntime {
           // Execute this kernel now so shared-memory buffers are visible for debug
           commandBuffer.commit()
           commandBuffer.waitUntilCompleted()
-          debugPrintGradStats(label: "kernel \(index)")
           if let cb = commandQueue.makeCommandBuffer() { commandBuffer = cb }
         }
       }
@@ -622,40 +549,6 @@ public class MetalCompiledKernel: CompiledKernelRuntime {
     return Array(UnsafeBufferPointer(start: bufferContents, count: count))
   }
 
-  // Debug method to print intermediate buffer states
-  public func debugBufferStates() {
-    print("=== METAL BUFFER DEBUG ===")
-    for (name, buffer) in bufferPool.sorted(by: { $0.key < $1.key }) {
-      let values: [Float]
-
-      if name == "frameCount" {
-        let intContents = buffer.contents().assumingMemoryBound(to: Int32.self)
-        values = [Float(intContents[0])]
-      } else {
-        let elementCount = buffer.length / MemoryLayout<Float>.size
-        let bufferContents = buffer.contents().assumingMemoryBound(to: Float.self)
-        values = Array(UnsafeBufferPointer(start: bufferContents, count: elementCount))
-      }
-
-      if values.count > 20 {
-        let first10 = Array(values.prefix(10))
-        print(
-          "\(name): [\(first10.map { String(format: "%.3f", $0) }.joined(separator: ", "))...] (length: \(values.count))"
-        )
-        if name == "memory" {
-          print("  memory[0]: \(String(format: "%.6f", values[0]))")
-          print("  memory[1]: \(String(format: "%.6f", values[1]))")
-          print("  memory[2]: \(String(format: "%.6f", values[2]))")
-        }
-      } else {
-        print(
-          "\(name): [\(values.map { String(format: "%.3f", $0) }.joined(separator: ", "))]"
-        )
-      }
-    }
-    print("=========================")
-  }
-
   public func cleanup() {
     for (name, buffer) in bufferPool {
       if name == "frameCount" {
@@ -784,156 +677,6 @@ public class MetalCompiledKernel: CompiledKernelRuntime {
       return nil
     }
     return output.last
-  }
-
-  // MARK: - Training Kernel Dispatch
-
-  public func reduceGradientsGPU(frameCount: Int, numGradIds: Int) -> MTLBuffer? {
-    guard reduceGradientsFunction != nil else {
-      print("reduceGradients function not found")
-      return nil
-    }
-
-    guard let gradientsBuffer = bufferPool["gradients"] else {
-      print("gradients buffer not found")
-      return nil
-    }
-
-    let reducedGradsSize = numGradIds * MemoryLayout<Float>.size
-    if bufferPool["reducedGrads"] == nil {
-      guard let buffer = device.makeBuffer(length: reducedGradsSize, options: .storageModeShared)
-      else {
-        print("Failed to create reducedGrads buffer")
-        return nil
-      }
-      bufferPool["reducedGrads"] = buffer
-    }
-
-    guard let reducedGradsBuffer = bufferPool["reducedGrads"] else { return nil }
-
-    if debugGradients {
-      let ptr = reducedGradsBuffer.contents().assumingMemoryBound(to: Float.self)
-      for i in 0..<numGradIds {
-        ptr[i] = -999999.0
-      }
-      print(
-        "   [DEBUG] reduceGradientsGPU: zeroed buffer with sentinel, numGradIds=\(numGradIds), frameCount=\(frameCount)"
-      )
-    }
-
-    guard let commandBuffer = commandQueue.makeCommandBuffer(),
-      let computeEncoder = commandBuffer.makeComputeCommandEncoder()
-    else {
-      print("Failed to create command buffer or encoder")
-      return nil
-    }
-
-    guard let pipelineState = reduceGradientsPSO else {
-      print("reduceGradients pipeline state not found")
-      return nil
-    }
-
-    if debugGradients {
-      print(
-        "   [DEBUG] reduceGradientsGPU: pipelineState maxThreads=\(pipelineState.maxTotalThreadsPerThreadgroup)"
-      )
-    }
-
-    computeEncoder.setComputePipelineState(pipelineState)
-    computeEncoder.setBuffer(gradientsBuffer, offset: 0, index: 0)
-    computeEncoder.setBuffer(reducedGradsBuffer, offset: 0, index: 1)
-
-    var frameCountUInt = UInt32(frameCount)
-    var numGradIdsUInt = UInt32(numGradIds)
-    computeEncoder.setBytes(&frameCountUInt, length: MemoryLayout<UInt32>.size, index: 2)
-    computeEncoder.setBytes(&numGradIdsUInt, length: MemoryLayout<UInt32>.size, index: 3)
-
-    let threadsPerGrid = MTLSize(width: numGradIds, height: 1, depth: 1)
-    let threadsPerThreadgroup = MTLSize(
-      width: min(numGradIds, pipelineState.maxTotalThreadsPerThreadgroup), height: 1, depth: 1)
-
-    if debugGradients {
-      print(
-        "   [DEBUG] reduceGradientsGPU: dispatching \(threadsPerGrid.width) threads, tpg=\(threadsPerThreadgroup.width)"
-      )
-      print(
-        "   [DEBUG] reduceGradientsGPU: gradientsBuffer.length=\(gradientsBuffer.length), reducedGradsBuffer.length=\(reducedGradsBuffer.length)"
-      )
-    }
-
-    computeEncoder.dispatchThreads(threadsPerGrid, threadsPerThreadgroup: threadsPerThreadgroup)
-
-    computeEncoder.endEncoding()
-    commandBuffer.commit()
-    commandBuffer.waitUntilCompleted()
-
-    if debugGradients {
-      if let error = commandBuffer.error {
-        print("   [DEBUG] reduceGradientsGPU: command buffer error: \(error)")
-      } else {
-        print("   [DEBUG] reduceGradientsGPU: command buffer completed successfully")
-      }
-
-      // Verify reduction result
-      let reducedPtr = reducedGradsBuffer.contents().assumingMemoryBound(to: Float.self)
-      let gradPtr = gradientsBuffer.contents().assumingMemoryBound(to: Float.self)
-      print("   [DEBUG] reduceGradientsGPU completed:")
-      for gid in 0..<min(numGradIds, 30) {
-        // Compute expected value manually
-        var sum: Float = 0.0
-        let base = gid * frameCount
-        for i in 0..<frameCount {
-          sum += gradPtr[base + i]
-        }
-        let expected = sum / Float(frameCount)
-        let actual = reducedPtr[gid]
-        if abs(expected - actual) > 0.0001 || gid == 24 {
-          print(
-            "      gid=\(gid) expected=\(expected) actual=\(actual) match=\(abs(expected - actual) < 0.0001)"
-          )
-        }
-      }
-    }
-
-    return reducedGradsBuffer
-  }
-
-  private func encodeReduceGradientsSum(commandBuffer: MTLCommandBuffer, frameCount: Int) {
-    guard let pipelineState = reduceGradientsSumPSO else { return }
-    guard let gradientsBuffer = bufferPool["gradients"] else { return }
-
-    let numGradIds = max(0, context.maxGradId + 1)
-    if numGradIds == 0 { return }
-
-    // Create or get reducedGradsSum buffer
-    let reducedGradsSize = numGradIds * MemoryLayout<Float>.size
-    if bufferPool["reducedGradsSum"] == nil
-      || bufferPool["reducedGradsSum"]!.length < reducedGradsSize
-    {
-      guard let buffer = device.makeBuffer(length: reducedGradsSize, options: .storageModeShared)
-      else {
-        return
-      }
-      bufferPool["reducedGradsSum"] = buffer
-    }
-
-    guard let reducedGradsSumBuffer = bufferPool["reducedGradsSum"] else { return }
-
-    guard let computeEncoder = commandBuffer.makeComputeCommandEncoder() else { return }
-    computeEncoder.setComputePipelineState(pipelineState)
-    computeEncoder.setBuffer(gradientsBuffer, offset: 0, index: 0)
-    computeEncoder.setBuffer(reducedGradsSumBuffer, offset: 0, index: 1)
-
-    var frameCountUInt = UInt32(frameCount)
-    var numGradIdsUInt = UInt32(numGradIds)
-    computeEncoder.setBytes(&frameCountUInt, length: MemoryLayout<UInt32>.size, index: 2)
-    computeEncoder.setBytes(&numGradIdsUInt, length: MemoryLayout<UInt32>.size, index: 3)
-
-    let threadsPerGrid = MTLSize(width: numGradIds, height: 1, depth: 1)
-    let threadsPerThreadgroup = MTLSize(
-      width: min(numGradIds, pipelineState.maxTotalThreadsPerThreadgroup), height: 1, depth: 1)
-    computeEncoder.dispatchThreads(threadsPerGrid, threadsPerThreadgroup: threadsPerThreadgroup)
-    computeEncoder.endEncoding()
   }
 
   // MARK: - Parameter + Memory helpers
