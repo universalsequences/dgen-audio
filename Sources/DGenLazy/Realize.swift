@@ -35,8 +35,13 @@ extension LazyGraph {
         let result = try CompilationPipeline.compile(
             graph: graph,
             backend: DGenConfig.backend,
-            options: .init(frameCount: frameCount, debug: false)
+            options: .init(frameCount: frameCount, debug: DGenConfig.debug)
         )
+
+        // Write kernels to disk if path is configured
+        if let outputPath = DGenConfig.kernelOutputPath {
+            writeKernelsToDisk(result, outputPath)
+        }
 
         // Create runtime
         let runtime = try MetalCompiledKernel(
@@ -61,11 +66,28 @@ extension LazyGraph {
         }
     }
 
+    /// Inject Signal param values into Metal memory buffer
+    func injectSignalParams(context: ExecutionContext) {
+        guard let memBuffer = context.runtime.getBuffer(name: "memory") else { return }
+        let memPtr = memBuffer.contents().assumingMemoryBound(to: Float.self)
+        let cellMappings = context.compilationResult.cellAllocations.cellMappings
+
+        for signal in parameterRegistry.signals {
+            guard let cellId = signal.cellId,
+                  let value = signal.data else { continue }
+
+            // Map logical cell to physical cell
+            let physicalCell = cellMappings[cellId] ?? cellId
+            memPtr[physicalCell] = value
+        }
+    }
+
     /// Run the compiled graph
     func run(context: ExecutionContext, preserveState: Bool) {
         if !preserveState {
             context.runtime.zeroAllBuffers()
             injectTensorData(context: context)
+            injectSignalParams(context: context)
         }
         context.runtime.runNoCopy(frameCount: context.frameCount)
     }
@@ -82,20 +104,156 @@ extension LazyGraph {
         return outputs
     }
 
-    /// Read tensor data from memory buffer
+    /// Read tensor data from memory buffer, walking the transform chain to map indices
     func readTensorData(context: ExecutionContext, tensorId: TensorID) -> [Float]? {
-        guard let tensor = graph.tensors[tensorId] else { return nil }
+        guard let tensor = context.compilationResult.graph.tensors[tensorId] else { return nil }
 
         let physicalCellId = context.compilationResult.cellAllocations.cellMappings[tensor.cellId] ?? tensor.cellId
 
         guard let memBuffer = context.runtime.getBuffer(name: "memory") else { return nil }
         let memPtr = memBuffer.contents().assumingMemoryBound(to: Float.self)
 
-        var data = [Float](repeating: 0, count: tensor.size)
-        for i in 0..<tensor.size {
-            data[i] = memPtr[physicalCellId + i]
+        // Check if this is a frame-aware tensor (allocated as tensorSize * frameCount)
+        // frameAwareCells uses the tensor's cellId (before physical remapping)
+        let frameCount: Int
+        if let frameAwareInfo = context.compilationResult.graph.frameAwareCells[tensor.cellId] {
+            frameCount = frameAwareInfo.frameCount
+        } else {
+            frameCount = 1
         }
+
+        let outputSize = tensor.size * frameCount
+        var data = [Float](repeating: 0, count: outputSize)
+
+        // Fast path: no transforms, contiguous base
+        if tensor.transforms.isEmpty && tensor.baseStrides == DGen.Tensor.computeRowMajorStrides(tensor.baseShape) {
+            for i in 0..<outputSize {
+                data[i] = memPtr[physicalCellId + i]
+            }
+            return data
+        }
+
+        // Slow path: walk transform chain for each element
+        let shape = tensor.shape
+        let baseStrides = tensor.baseStrides
+        let transforms = tensor.transforms
+
+        for frame in 0..<frameCount {
+            let frameOffset = frame * tensor.size
+            let baseFrameOffset = frame * tensor.baseSize
+
+            for flatIdx in 0..<tensor.size {
+                // Convert flat index to multi-dimensional indices for output shape
+                var indices = flatToMultiIndex(flatIdx, shape)
+                var currentShape = shape
+                var inBounds = true
+
+                // Walk transforms BACKWARDS
+                for transform in transforms.reversed() {
+                    if !inBounds { break }
+
+                    switch transform {
+                    case .pad(let padding, let inputShape):
+                        // Check bounds and adjust indices
+                        for (i, pad) in padding.enumerated() {
+                            let idx = indices[i]
+                            let innerSize = currentShape[i] - pad.left - pad.right
+                            if idx < pad.left || idx >= pad.left + innerSize {
+                                inBounds = false
+                                break
+                            }
+                            indices[i] = idx - pad.left
+                        }
+                        currentShape = inputShape
+
+                    case .asStrided(_, let strides, let offset, let inputShape):
+                        // Convert strided indices to flat offset, then to input indices
+                        var flatOffset = offset
+                        for (i, idx) in indices.enumerated() {
+                            flatOffset += idx * strides[i]
+                        }
+                        indices = flatToMultiIndex(flatOffset, inputShape)
+                        currentShape = inputShape
+
+                    case .reshape(_, let inputShape):
+                        // Linearize then un-linearize
+                        let flat = multiIndexToFlat(indices, currentShape)
+                        indices = flatToMultiIndex(flat, inputShape)
+                        currentShape = inputShape
+
+                    case .transpose(let axes, let inputShape):
+                        // Inverse permutation
+                        var inverse = [Int](repeating: 0, count: axes.count)
+                        for (i, axis) in axes.enumerated() {
+                            inverse[axis] = i
+                        }
+                        indices = inverse.map { indices[$0] }
+                        currentShape = inputShape
+
+                    case .shrink(let ranges, let inputShape):
+                        // Add start offsets
+                        for (i, range) in ranges.enumerated() {
+                            if let r = range {
+                                indices[i] += r.start
+                            }
+                        }
+                        currentShape = inputShape
+
+                    case .expand(_, let inputShape):
+                        // Clamp broadcast dims to 0
+                        for (i, dim) in inputShape.enumerated() {
+                            if dim == 1 {
+                                indices[i] = 0
+                            }
+                        }
+                        currentShape = inputShape
+
+                    case .repeatTile(let innerShape, _):
+                        // Modular indexing
+                        for (i, dim) in innerShape.enumerated() {
+                            indices[i] = indices[i] % dim
+                        }
+                        currentShape = innerShape
+                    }
+                }
+
+                var value: Float = 0.0
+                if inBounds {
+                    // Compute base memory offset
+                    var baseOffset = 0
+                    for (i, idx) in indices.enumerated() {
+                        baseOffset += idx * baseStrides[i]
+                    }
+                    value = memPtr[physicalCellId + baseFrameOffset + baseOffset]
+                }
+
+                data[frameOffset + flatIdx] = value
+            }
+        }
+
         return data
+    }
+
+    /// Convert flat index to multi-dimensional indices (row-major)
+    private func flatToMultiIndex(_ flat: Int, _ shape: [Int]) -> [Int] {
+        var indices = [Int](repeating: 0, count: shape.count)
+        var remaining = flat
+        for i in 0..<shape.count {
+            let stride = shape[(i + 1)...].reduce(1, *)
+            indices[i] = remaining / stride
+            remaining = remaining % stride
+        }
+        return indices
+    }
+
+    /// Convert multi-dimensional indices to flat index (row-major)
+    private func multiIndexToFlat(_ indices: [Int], _ shape: [Int]) -> Int {
+        var flat = 0
+        for i in 0..<shape.count {
+            let stride = shape[(i + 1)...].reduce(1, *)
+            flat += indices[i] * stride
+        }
+        return flat
     }
 }
 
@@ -111,19 +269,28 @@ extension Tensor {
     ///
     /// - Returns: Flat array of tensor values in row-major order
     public func realize() throws -> [Float] {
+        // If we already have data (e.g., gradient tensors), return it directly
+        if let data = getData() {
+            return data
+        }
+
         // For static tensors, we use frameCount=1
         let frameCount = 1
 
-        // Add output node if this is a scalar result
-        // For tensors, we read directly from memory
+        // Add output to drive computation
         if isScalar {
-            // Add output node to drive computation
             let _ = graph.node(.output(0), [nodeId])
         } else {
-            // For non-scalar tensors, we need a dummy output to drive computation
-            // Sum the tensor to create a scalar output
+            // Sum to drive computation
             let sumNode = graph.node(.sum, [nodeId])
             let _ = graph.node(.output(0), [sumNode])
+        }
+
+        // Mark this node for materialization if it's a tensor
+        // allocateTensorOutputs will create a tensor for this node during compilation
+        // and materialize=true ensures allocateTensorMemory allocates memory for it
+        if !isScalar {
+            graph.graph.materializeNodes.insert(nodeId)
         }
 
         // Compile and run
@@ -131,20 +298,19 @@ extension Tensor {
         graph.run(context: context, preserveState: false)
 
         // Read tensor data from memory
-        if let tensorId = self.tensorId {
+        // Look up tensorId from nodeToTensor (created during compilation by allocateTensorOutputs)
+        if let tensorId = self.tensorId ?? graph.graph.nodeToTensor[nodeId] {
             if let data = graph.readTensorData(context: context, tensorId: tensorId) {
                 return data
             }
         }
 
-        // Fallback: if no tensorId, this is a computed result
-        // For scalar tensors, read from output
+        // Fallback for scalar tensors - read from output
         if isScalar {
             return graph.readOutputs(context: context)
         }
 
-        // For computed tensors without tensorId, we need to trace back
-        // This is a limitation - computed tensors should have their results stored
+        // Should not reach here after the changes above
         throw DGenLazyError.cannotRealizeDerivedTensor
     }
 }
@@ -193,26 +359,26 @@ extension SignalTensor {
     ///   - preserveState: If true, maintain state across realize() calls
     /// - Returns: Flat array of values: [frame0_elem0, frame0_elem1, ..., frame1_elem0, ...]
     public func realize(frames: Int = DGenConfig.defaultFrameCount, preserveState: Bool = false) throws -> [Float] {
-        // For SignalTensor, we need to output each element
-        // Sum to scalar for output (we'll read the tensor from memory)
+        // Sum to scalar for output (drives computation)
         let sumNode = graph.node(.sum, [nodeId])
         let _ = graph.node(.output(0), [sumNode])
+
+        // Mark this node for materialization so we can read the tensor values
+        graph.graph.materializeNodes.insert(nodeId)
 
         // Compile and run
         let context = try graph.compile(frameCount: frames)
         graph.run(context: context, preserveState: preserveState)
 
-        // Read tensor data from memory if we have a tensorId
-        if let tensorId = self.tensorId {
+        // Read tensor data from memory
+        // Look up tensorId from nodeToTensor (created during compilation)
+        if let tensorId = self.tensorId ?? graph.graph.nodeToTensor[nodeId] {
             if let data = graph.readTensorData(context: context, tensorId: tensorId) {
-                // For frame-varying tensors, data is stored per-frame
-                // Return flattened: frames * tensorSize
                 return data
             }
         }
 
-        // Fallback for computed SignalTensors - return the summed output
-        // This is a limitation for now
+        // Fallback - return the summed output
         return graph.readOutputs(context: context)
     }
 }

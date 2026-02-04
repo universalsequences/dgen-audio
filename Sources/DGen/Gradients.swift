@@ -425,6 +425,16 @@ extension LazyOp {
       }
       return [g.n(.reshape(origShape), [gradOutput])]
 
+    case .asStrided(_, _):
+      // asStrided gradient: reshape back to original shape
+      // (The strided view is used for pool/im2col, gradient flows back to original layout)
+      guard let inputNode = g.nodes[node.inputs[0]],
+        case .tensor(let origShape) = inputNode.shape
+      else {
+        return [gradOutput]
+      }
+      return [g.n(.reshape(origShape), [gradOutput])]
+
     case .transpose(let perm):
       // Inverse permutation for gradient
       let inversePerm = invertPermutation(perm)

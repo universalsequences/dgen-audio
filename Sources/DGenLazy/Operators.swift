@@ -243,6 +243,13 @@ public func * (lhs: SignalTensor, rhs: SignalTensor) -> SignalTensor {
     return SignalTensor(nodeId: nodeId, graph: lhs.graph, shape: outShape, requiresGrad: lhs.requiresGrad || rhs.requiresGrad)
 }
 
+// SignalTensor - SignalTensor
+public func - (lhs: SignalTensor, rhs: SignalTensor) -> SignalTensor {
+    let nodeId = lhs.graph.node(.sub, [lhs.nodeId, rhs.nodeId])
+    let outShape = broadcastShape(lhs.shape, rhs.shape)
+    return SignalTensor(nodeId: nodeId, graph: lhs.graph, shape: outShape, requiresGrad: lhs.requiresGrad || rhs.requiresGrad)
+}
+
 // SignalTensor + Signal (broadcast scalar)
 public func + (lhs: SignalTensor, rhs: Signal) -> SignalTensor {
     let nodeId = lhs.graph.node(.add, [lhs.nodeId, rhs.nodeId])
@@ -277,6 +284,44 @@ public func * (lhs: SignalTensor, rhs: Float) -> SignalTensor {
     let rhsNode = lhs.graph.node(.constant(rhs))
     let nodeId = lhs.graph.node(.mul, [lhs.nodeId, rhsNode])
     return SignalTensor(nodeId: nodeId, graph: lhs.graph, shape: lhs.shape, requiresGrad: lhs.requiresGrad)
+}
+
+// SignalTensor + Tensor (broadcast tensor across frames)
+public func + (lhs: SignalTensor, rhs: Tensor) -> SignalTensor {
+    rhs.refresh()
+    let nodeId = lhs.graph.node(.add, [lhs.nodeId, rhs.nodeId])
+    return SignalTensor(nodeId: nodeId, graph: lhs.graph, shape: lhs.shape, requiresGrad: lhs.requiresGrad || rhs.requiresGrad)
+}
+
+// Tensor + SignalTensor
+public func + (lhs: Tensor, rhs: SignalTensor) -> SignalTensor {
+    return rhs + lhs
+}
+
+// SignalTensor * Tensor (broadcast tensor across frames)
+public func * (lhs: SignalTensor, rhs: Tensor) -> SignalTensor {
+    rhs.refresh()
+    let nodeId = lhs.graph.node(.mul, [lhs.nodeId, rhs.nodeId])
+    return SignalTensor(nodeId: nodeId, graph: lhs.graph, shape: lhs.shape, requiresGrad: lhs.requiresGrad || rhs.requiresGrad)
+}
+
+// Tensor * SignalTensor
+public func * (lhs: Tensor, rhs: SignalTensor) -> SignalTensor {
+    return rhs * lhs
+}
+
+// SignalTensor - Tensor
+public func - (lhs: SignalTensor, rhs: Tensor) -> SignalTensor {
+    rhs.refresh()
+    let nodeId = lhs.graph.node(.sub, [lhs.nodeId, rhs.nodeId])
+    return SignalTensor(nodeId: nodeId, graph: lhs.graph, shape: lhs.shape, requiresGrad: lhs.requiresGrad || rhs.requiresGrad)
+}
+
+// Tensor - SignalTensor
+public func - (lhs: Tensor, rhs: SignalTensor) -> SignalTensor {
+    lhs.refresh()
+    let nodeId = rhs.graph.node(.sub, [lhs.nodeId, rhs.nodeId])
+    return SignalTensor(nodeId: nodeId, graph: rhs.graph, shape: rhs.shape, requiresGrad: lhs.requiresGrad || rhs.requiresGrad)
 }
 
 // Negation

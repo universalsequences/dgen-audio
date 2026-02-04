@@ -47,6 +47,9 @@ open class Graph {
     /// Used for tensors with outbound dependencies that need tensorSize * frameCount cells.
     public var frameAwareCells: [CellID: (tensorSize: Int, frameCount: Int)] = [:]
 
+    /// Nodes that should have their tensor results materialized in memory (for realize())
+    public var materializeNodes: Set<NodeID> = []
+
     /// Side-effect nodes created during backward pass (e.g., gradient carry writes)
     /// These need to be chained with gradient outputs to ensure they execute.
     public var gradientSideEffects: [NodeID] = []
@@ -68,6 +71,15 @@ open class Graph {
     public init(sampleRate: Float, maxFrameCount: Int) {
         self.sampleRate = sampleRate
         self.maxFrameCount = maxFrameCount
+    }
+
+    /// Reset node and cell counters for graph reuse
+    /// Call this when clearing the graph to start fresh with IDs
+    public func resetCounters() {
+        next = 0
+        nextCellId = 0
+        nextLazyCellId = -1
+        nextTensorId = 0
     }
 
     /// Returns the total number of allocated memory cells

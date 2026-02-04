@@ -10,57 +10,168 @@ import DGen
 /// Internal graph that accumulates lazy operations
 /// Users don't create this directly; it's managed implicitly
 public class LazyGraph {
-    /// The underlying DGen graph
-    internal let graph: Graph
+  public var id: Int = 0
 
-    /// Parameters registered for gradient computation
-    internal var parameters: [any LazyValue] = []
+  /// The underlying DGen graph
+  internal let graph: Graph
 
-    /// Cached compilation result (invalidated when graph changes)
-    internal var compilationCache: CompilationResult?
+  /// Parameters registered for gradient computation
+  internal var parameters: [any LazyValue] = []
 
-    /// Cached runtime (invalidated when graph changes)
-    internal var runtimeCache: MetalCompiledKernel?
+  /// Cached compilation result (invalidated when graph changes)
+  internal var compilationCache: CompilationResult?
 
-    /// Whether the graph has been modified since last compilation
-    internal var isDirty: Bool = true
+  /// Cached runtime (invalidated when graph changes)
+  internal var runtimeCache: MetalCompiledKernel?
 
-    public init(sampleRate: Float = DGenConfig.sampleRate) {
-        self.graph = Graph(sampleRate: sampleRate)
+  /// Whether the graph has been modified since last compilation
+  internal var isDirty: Bool = true
+
+  /// Cache compiled kernels by graph structure hash (persists across graph clears)
+  internal var compilationCacheByStructure: [String: (CompilationResult, MetalCompiledKernel)] = [:]
+
+  internal var tensors: [Tensor] = []
+  internal var signals: [Signal] = []
+
+  public init(sampleRate: Float = DGenConfig.sampleRate) {
+    self.graph = Graph(sampleRate: sampleRate)
+  }
+
+  /// Mark the graph as modified (invalidates caches)
+  internal func markDirty() {
+    isDirty = true
+    compilationCache = nil
+    runtimeCache = nil
+  }
+
+  /// Create a node in the underlying graph
+  internal func node(_ op: LazyOp, _ inputs: [NodeID] = []) -> NodeID {
+    markDirty()
+    return graph.n(op, inputs)
+  }
+
+  /// Allocate a memory cell
+  internal func alloc(vectorWidth: Int = 1) -> CellID {
+    return graph.alloc(vectorWidth: vectorWidth)
+  }
+
+  /// Create a tensor in the underlying graph
+  /// Returns (nodeId, tensorId) - the node is the tensorRef, tensorId is for data access
+  internal func createTensor(shape: Shape, data: [Float]?) -> (nodeId: NodeID, tensorId: TensorID?)
+  {
+    markDirty()
+    let nodeId: NodeID
+    if let data = data {
+      nodeId = graph.tensor(shape: shape, data: data)
+    } else {
+      nodeId = graph.tensor(shape: shape)
+    }
+    // Look up the tensorId from the nodeId
+    let tensorId = graph.nodeToTensor[nodeId]
+    return (nodeId, tensorId)
+  }
+
+  internal func getTensor(nodeId: NodeID) -> DGen.Tensor? {
+    guard let tensorId = graph.nodeToTensor[nodeId] else { return nil }
+    return graph.tensors[tensorId]
+  }
+
+  public func registerTensor(_ tensor: Tensor) {
+    tensors.append(tensor)
+  }
+
+  public func registerSignal(_ signal: Signal) {
+    signals.append(signal)
+  }
+
+  // MARK: - Graph Structure Hashing
+
+  /// Compute hash of current graph structure (ops and connections, not values)
+  /// Used to cache compiled kernels across graph rebuilds
+  /// Note: This hashes the logical structure, not specific node IDs
+  internal func graphStructureHash() -> String {
+    var hasher = Hasher()
+
+    // Build a topological representation independent of node IDs
+    // We hash: (operation type, number of inputs, relative input positions)
+    var nodeIndex: [NodeID: Int] = [:]
+    var index = 0
+    for (id, _) in graph.nodes.sorted(by: { $0.key < $1.key }) {
+      nodeIndex[id] = index
+      index += 1
     }
 
-    /// Mark the graph as modified (invalidates caches)
-    internal func markDirty() {
-        isDirty = true
-        compilationCache = nil
-        runtimeCache = nil
+    // Now hash each node's op and its inputs (as relative indices)
+    for (_, node) in graph.nodes.sorted(by: { $0.key < $1.key }) {
+      hasher.combine(String(describing: node.op))
+      // Hash input count and their relative positions
+      hasher.combine(node.inputs.count)
+      for inputId in node.inputs {
+        // Use relative position in sorted order, or -1 if not found
+        hasher.combine(nodeIndex[inputId] ?? -1)
+      }
     }
 
-    /// Create a node in the underlying graph
-    internal func node(_ op: LazyOp, _ inputs: [NodeID] = []) -> NodeID {
-        markDirty()
-        return graph.n(op, inputs)
+    // Include tensor shapes (keyed by their sorted position, not ID)
+    var tensorIndex = 0
+    for (_, tensor) in graph.tensors.sorted(by: { $0.key < $1.key }) {
+      hasher.combine(tensorIndex)
+      hasher.combine(tensor.shape)
+      tensorIndex += 1
     }
 
-    /// Allocate a memory cell
-    internal func alloc(vectorWidth: Int = 1) -> CellID {
-        return graph.alloc(vectorWidth: vectorWidth)
+    // Include parameter count and shapes
+    hasher.combine(parameterRegistry.tensors.count)
+    for tensor in parameterRegistry.tensors {
+      hasher.combine(tensor.shape)
     }
+    hasher.combine(parameterRegistry.signals.count)
 
-    /// Create a tensor in the underlying graph
-    /// Returns (nodeId, tensorId) - the node is the tensorRef, tensorId is for data access
-    internal func createTensor(shape: Shape, data: [Float]?) -> (nodeId: NodeID, tensorId: TensorID?) {
-        markDirty()
-        let nodeId: NodeID
-        if let data = data {
-            nodeId = graph.tensor(shape: shape, data: data)
-        } else {
-            nodeId = graph.tensor(shape: shape)
-        }
-        // Look up the tensorId from the nodeId
-        let tensorId = graph.nodeToTensor[nodeId]
-        return (nodeId, tensorId)
+    return String(hasher.finalize())
+  }
+
+  // MARK: - Graph Clearing
+
+  /// Clear computation nodes while preserving parameter state and compilation cache
+  /// Called after backward() to prevent node accumulation
+  public func clearComputationGraph() {
+    // 1. Clear all graph nodes (but don't reset counters - need unique IDs for GPU memory)
+    graph.nodes.removeAll()
+
+    // 2. Clear all tensors - refresh() will recreate them
+    graph.tensors.removeAll()
+    graph.nodeToTensor.removeAll()
+    graph.cellToTensor.removeAll()
+
+    // 3. Clear lazy cell state (will be recreated for new tensors)
+    graph.lazyCells.removeAll()
+    graph.frameAwareCells.removeAll()
+    graph.cellAllocationSizes.removeAll()
+
+    // 4. Clear gradient side effects
+    graph.gradientSideEffects.removeAll()
+    graph.tensorGradCells.removeAll()
+
+    // 5. Clear gradient cells from registry (they'll be recreated on next backward)
+    parameterRegistry.tensorGradCells.removeAll()
+    parameterRegistry.signalGradCells.removeAll()
+
+    // 6. Invalidate instance caches
+    compilationCache = nil
+    runtimeCache = nil
+    isDirty = true
+
+    // 7. Increment identifier to signify we have a new graph
+    id += 1
+
+    // 8. Refresh all tracked tensors and signals - recreates them in the fresh graph
+    for tensor in tensors {
+      tensor.refresh()
     }
+    for signal in signals {
+      signal.refresh()
+    }
+  }
 }
 
 // MARK: - Default Graph
@@ -68,26 +179,26 @@ public class LazyGraph {
 /// Thread-local default graph for implicit graph management
 /// Each thread gets its own graph to avoid concurrency issues
 public class LazyGraphContext {
-    /// The current default graph (thread-local via static)
-    private static var _current: LazyGraph?
+  /// The current default graph (thread-local via static)
+  private static var _current: LazyGraph?
 
-    /// Get or create the current default graph
-    public static var current: LazyGraph {
-        if _current == nil {
-            _current = LazyGraph()
-        }
-        return _current!
+  /// Get or create the current default graph
+  public static var current: LazyGraph {
+    if _current == nil {
+      _current = LazyGraph()
     }
+    return _current!
+  }
 
-    /// Set a new default graph
-    public static func setCurrent(_ graph: LazyGraph) {
-        _current = graph
-    }
+  /// Set a new default graph
+  public static func setCurrent(_ graph: LazyGraph) {
+    _current = graph
+  }
 
-    /// Reset to a fresh graph
-    public static func reset() {
-        // Clear the parameter registry when resetting graph
-        _current?.parameterRegistry.clear()
-        _current = LazyGraph()
-    }
+  /// Reset to a fresh graph
+  public static func reset() {
+    // Clear the parameter registry when resetting graph
+    _current?.parameterRegistry.clear()
+    _current = LazyGraph()
+  }
 }

@@ -163,6 +163,10 @@ extension UOp {
             opStr = "\(ANSI.cyan)repeatView\(ANSI.reset)(\(repeats))"
         case .broadcastAccess:
             opStr = "\(ANSI.cyan)broadcastAccess\(ANSI.reset)"
+        case let .sumAxisMarker(nodeId, axis, inShape, outShape, inFrameAware, outFrameAware):
+            opStr = "\(ANSI.cyan)sumAxisMarker\(ANSI.reset)(node=\(nodeId), axis=\(axis), in=\(inShape), out=\(outShape), inFA=\(inFrameAware), outFA=\(outFrameAware))"
+        case let .expandAxisMarker(nodeId, axis, inShape, outShape, inFrameAware, outFrameAware):
+            opStr = "\(ANSI.cyan)expandAxisMarker\(ANSI.reset)(node=\(nodeId), axis=\(axis), in=\(inShape), out=\(outShape), inFA=\(inFrameAware), outFA=\(outFrameAware))"
         case let .beginHopCheck(counterCell):
             opStr = "\(ANSI.magenta)beginHopCheck\(ANSI.reset)(\(counterCell))"
         case .endHopCheck:

@@ -422,6 +422,189 @@ final class DGenLazyTests: XCTestCase {
         XCTAssertEqual(result, [3, 4])
     }
 
+    // MARK: - Derived Tensor Realize Tests (Element-wise verification)
+
+    func testTensorAddTensorRealize() throws {
+        LazyGraphContext.reset()
+
+        let a = Tensor([1, 2, 3])
+        let b = Tensor([4, 5, 6])
+        let c = a + b
+        let result = try c.realize()
+
+        XCTAssertEqual(result, [5, 7, 9])
+    }
+
+    func testTensorSubTensorRealize() throws {
+        LazyGraphContext.reset()
+
+        let a = Tensor([10, 20, 30])
+        let b = Tensor([1, 2, 3])
+        let c = a - b
+        let result = try c.realize()
+
+        XCTAssertEqual(result, [9, 18, 27])
+    }
+
+    func testTensorMulTensorRealize() throws {
+        LazyGraphContext.reset()
+
+        let a = Tensor([1, 2, 3])
+        let b = Tensor([4, 5, 6])
+        let c = a * b
+        let result = try c.realize()
+
+        XCTAssertEqual(result, [4, 10, 18])
+    }
+
+    func testTensorDivTensorRealize() throws {
+        LazyGraphContext.reset()
+
+        let a = Tensor([10, 20, 30])
+        let b = Tensor([2, 4, 5])
+        let c = a / b
+        let result = try c.realize()
+
+        XCTAssertEqual(result[0], 5.0, accuracy: 1e-5)
+        XCTAssertEqual(result[1], 5.0, accuracy: 1e-5)
+        XCTAssertEqual(result[2], 6.0, accuracy: 1e-5)
+    }
+
+    func testTensorAddFloatRealize() throws {
+        LazyGraphContext.reset()
+
+        let a = Tensor([1, 2, 3])
+        let b = a + 10.0
+        let result = try b.realize()
+
+        XCTAssertEqual(result, [11, 12, 13])
+    }
+
+    func testTensorMulFloatRealize() throws {
+        LazyGraphContext.reset()
+
+        let a = Tensor([1, 2, 3])
+        let b = a * 3.0
+        let result = try b.realize()
+
+        XCTAssertEqual(result, [3, 6, 9])
+    }
+
+    func testTensorNegationRealize() throws {
+        LazyGraphContext.reset()
+
+        let a = Tensor([1, -2, 3])
+        let b = -a
+        let result = try b.realize()
+
+        XCTAssertEqual(result, [-1, 2, -3])
+    }
+
+    func testTensorChainedOpsRealize() throws {
+        LazyGraphContext.reset()
+
+        // (a + b) * 2 - 1
+        let a = Tensor([1, 2, 3])
+        let b = Tensor([4, 5, 6])
+        let c = (a + b) * 2.0 - 1.0
+        let result = try c.realize()
+
+        // (1+4)*2-1=9, (2+5)*2-1=13, (3+6)*2-1=17
+        XCTAssertEqual(result, [9, 13, 17])
+    }
+
+    func testTensorSinRealize() throws {
+        LazyGraphContext.reset()
+
+        let a = Tensor([0, Float.pi / 2, Float.pi])
+        let b = sin(a)
+        let result = try b.realize()
+
+        XCTAssertEqual(result[0], 0.0, accuracy: 1e-5)      // sin(0) = 0
+        XCTAssertEqual(result[1], 1.0, accuracy: 1e-5)      // sin(π/2) = 1
+        XCTAssertEqual(result[2], 0.0, accuracy: 1e-4)      // sin(π) ≈ 0
+    }
+
+    func testTensorExpRealize() throws {
+        LazyGraphContext.reset()
+
+        let a = Tensor([0, 1, 2])
+        let b = exp(a)
+        let result = try b.realize()
+
+        XCTAssertEqual(result[0], 1.0, accuracy: 1e-5)           // e^0 = 1
+        XCTAssertEqual(result[1], Float(M_E), accuracy: 1e-4)    // e^1 = e
+        XCTAssertEqual(result[2], Float(M_E * M_E), accuracy: 1e-3)  // e^2
+    }
+
+    func testTensorReluRealize() throws {
+        LazyGraphContext.reset()
+
+        let a = Tensor([-2, -1, 0, 1, 2])
+        let b = relu(a)
+        let result = try b.realize()
+
+        XCTAssertEqual(result, [0, 0, 0, 1, 2])
+    }
+
+    func testTensor2DRealize() throws {
+        LazyGraphContext.reset()
+
+        let a = Tensor([[1, 2], [3, 4]])
+        let b = Tensor([[10, 20], [30, 40]])
+        let c = a + b
+        let result = try c.realize()
+
+        // Row-major: [11, 22, 33, 44]
+        XCTAssertEqual(result, [11, 22, 33, 44])
+    }
+
+    // MARK: - SignalTensor Derived Realize Tests
+
+    func testSignalTensorDerivedRealize() throws {
+        DGenConfig.sampleRate = 1000.0
+        LazyGraphContext.reset()
+
+        // Source SignalTensor (phasor with tensor of frequencies)
+        let freqs = Tensor([100, 200])
+        let phases = Signal.phasor(freqs)
+
+        // Derived SignalTensor (multiply by 2)
+        let doubled = phases * 2.0
+        let result = try doubled.realize(frames: 4)
+
+        // phases at 100Hz (1000Hz SR): 0, 0.1, 0.2, 0.3 per frame
+        // phases at 200Hz (1000Hz SR): 0, 0.2, 0.4, 0.6 per frame
+        // doubled: phases * 2
+        // Layout: [frame0_elem0, frame0_elem1, frame1_elem0, frame1_elem1, ...]
+        XCTAssertEqual(result.count, 8, "Expected 8 values (4 frames * 2 elements)")
+        XCTAssertEqual(result[0], 0.0, accuracy: 1e-4)  // frame 0, elem 0: 0*2
+        XCTAssertEqual(result[1], 0.0, accuracy: 1e-4)  // frame 0, elem 1: 0*2
+        XCTAssertEqual(result[2], 0.2, accuracy: 1e-4)  // frame 1, elem 0: 0.1*2
+        XCTAssertEqual(result[3], 0.4, accuracy: 1e-4)  // frame 1, elem 1: 0.2*2
+        XCTAssertEqual(result[6], 0.6, accuracy: 1e-4)  // frame 3, elem 0: 0.3*2
+        XCTAssertEqual(result[7], 1.2, accuracy: 1e-4)  // frame 3, elem 1: 0.6*2
+    }
+
+    func testSignalTensorAddRealize() throws {
+        DGenConfig.sampleRate = 1000.0
+        LazyGraphContext.reset()
+
+        let freqs = Tensor([100, 200])
+        let phases = Signal.phasor(freqs)
+        let offset = phases + 0.5
+
+        let result = try offset.realize(frames: 2)
+
+        // frame 0: phases=[0, 0], offset=[0.5, 0.5]
+        // frame 1: phases=[0.1, 0.2], offset=[0.6, 0.7]
+        XCTAssertEqual(result.count, 4)
+        XCTAssertEqual(result[0], 0.5, accuracy: 1e-4)  // frame 0, elem 0
+        XCTAssertEqual(result[1], 0.5, accuracy: 1e-4)  // frame 0, elem 1
+        XCTAssertEqual(result[2], 0.6, accuracy: 1e-4)  // frame 1, elem 0
+        XCTAssertEqual(result[3], 0.7, accuracy: 1e-4)  // frame 1, elem 1
+    }
+
     // MARK: - Realize Tests (Forward Pass)
 
     func testTensorRealizeSimple() throws {
@@ -567,6 +750,8 @@ final class DGenLazyTests: XCTestCase {
 
     func testTensorBackwardSimple() throws {
         LazyGraphContext.reset()
+        DGenConfig.kernelOutputPath = "/tmp/tensor_backward_simple.metal"
+        DGenConfig.debug = true
 
         // Simple case: loss = sum(w * 2)
         // d(loss)/d(w) = 2 for each element
@@ -575,6 +760,8 @@ final class DGenLazyTests: XCTestCase {
 
         // Use frameCount=1 for static tensor ops (no frame variation)
         try loss.backward(frameCount: 1)
+        DGenConfig.kernelOutputPath = nil
+        DGenConfig.debug = false
 
         XCTAssertNotNil(w.grad, "Gradient should be populated after backward")
         if let grad = w.grad {

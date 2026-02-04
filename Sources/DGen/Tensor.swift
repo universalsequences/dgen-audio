@@ -1,48 +1,261 @@
+/// Represents a single view transformation applied to a tensor.
+/// Transforms are stored in order from base tensor to final view shape.
+/// To read an element: walk backwards through transforms, mapping output indices to base indices.
+public enum ViewTransform: Equatable {
+  /// Virtual padding - indices outside inner region return 0
+  /// padding: per-axis (left, right) padding amounts
+  /// inputShape: shape before this transform (the inner, unpadded shape)
+  case pad(padding: [(left: Int, right: Int)], inputShape: [Int])
+
+  /// Reinterpret memory layout with custom strides
+  /// outputShape: shape after this transform
+  /// strides: strides for the output shape
+  /// offset: additional offset from base
+  /// inputShape: shape before this transform
+  case asStrided(outputShape: [Int], strides: [Int], offset: Int, inputShape: [Int])
+
+  /// Change shape preserving element order (row-major)
+  /// outputShape: shape after reshape
+  /// inputShape: shape before reshape
+  case reshape(outputShape: [Int], inputShape: [Int])
+
+  /// Permute dimensions
+  /// axes: permutation of dimension indices
+  /// inputShape: shape before transpose
+  case transpose(axes: [Int], inputShape: [Int])
+
+  /// Slice along dimensions - nil means keep all
+  /// ranges: per-axis (start, end) or nil
+  /// inputShape: shape before shrink
+  case shrink(ranges: [(start: Int, end: Int)?], inputShape: [Int])
+
+  /// Broadcast size-1 dims to target
+  /// targetShape: shape after expand
+  /// inputShape: shape before expand (has size-1 dims)
+  case expand(targetShape: [Int], inputShape: [Int])
+
+  /// Tile tensor via modular indexing
+  /// innerShape: original shape before repeat (for modulo)
+  /// outputShape: tiled shape after repeat
+  case repeatTile(innerShape: [Int], outputShape: [Int])
+
+  public static func == (lhs: ViewTransform, rhs: ViewTransform) -> Bool {
+    switch (lhs, rhs) {
+    case let (.pad(lp, lis), .pad(rp, ris)):
+      return lis == ris && lp.count == rp.count && zip(lp, rp).allSatisfy { $0.left == $1.left && $0.right == $1.right }
+    case let (.asStrided(lo, ls, loff, lis), .asStrided(ro, rs, roff, ris)):
+      return lo == ro && ls == rs && loff == roff && lis == ris
+    case let (.reshape(lo, lis), .reshape(ro, ris)):
+      return lo == ro && lis == ris
+    case let (.transpose(la, lis), .transpose(ra, ris)):
+      return la == ra && lis == ris
+    case let (.shrink(lr, lis), .shrink(rr, ris)):
+      if lis != ris || lr.count != rr.count { return false }
+      for (l, r) in zip(lr, rr) {
+        switch (l, r) {
+        case (nil, nil): continue
+        case let (ls?, rs?): if ls.start != rs.start || ls.end != rs.end { return false }
+        default: return false
+        }
+      }
+      return true
+    case let (.expand(lt, lis), .expand(rt, ris)):
+      return lt == rt && lis == ris
+    case let (.repeatTile(li, lo), .repeatTile(ri, ro)):
+      return li == ri && lo == ro
+    default:
+      return false
+    }
+  }
+}
+
 public struct Tensor {
   public let id: TensorID
-  public let shape: Shape
-  public let strides: [Int]  // How many elements to skip per dimension
-  public let offset: Int  // Starting index in underlying storage (for views like shrink)
-  public var cellId: CellID
-  public var data: [Float]?  // Initial data to be injected by runtime
-  public let isView: Bool  // True if this is a view of another tensor (reshape/transpose/shrink)
-  public let padding: [(left: Int, right: Int)]?  // Per-axis padding for virtual pad views
-  public let innerShapeForRepeat: [Int]?  // Original shape before repeat (for modular indexing)
-  public let shrinkStart: [Int]?  // Logical start indices for shrink (used with repeat)
-  public var isLazy: Bool  // True if cellId is a lazy placeholder, not yet allocated
+  public let shape: Shape              // Final shape after all transforms
+  public var cellId: CellID            // Base memory cell
+  public var data: [Float]?            // Initial data to be injected by runtime
+
+  // Transform chain from base to final view
+  public let baseShape: [Int]          // Shape of actual data in memory
+  public let baseStrides: [Int]        // Strides of actual data (row-major)
+  public let transforms: [ViewTransform]  // Applied in order from base → final
+
+  // Computed property for quick view check
+  public var isView: Bool { !transforms.isEmpty }
+
+  // Legacy fields kept for compatibility during migration
+  public var isLazy: Bool              // True if cellId is a lazy placeholder
+  public var materialize: Bool         // True if this tensor should be stored in memory
 
   public init(
-    id: TensorID, shape: Shape, cellId: CellID, data: [Float]? = nil, strides: [Int]? = nil,
-    offset: Int = 0, isView: Bool = false, padding: [(left: Int, right: Int)]? = nil,
-    innerShapeForRepeat: [Int]? = nil,
-    shrinkStart: [Int]? = nil,
-    isLazy: Bool = false
+    id: TensorID, shape: Shape, cellId: CellID, data: [Float]? = nil,
+    baseShape: [Int]? = nil,
+    baseStrides: [Int]? = nil,
+    transforms: [ViewTransform] = [],
+    isLazy: Bool = false,
+    materialize: Bool = false
   ) {
     self.id = id
     self.shape = shape
     self.cellId = cellId
     self.data = data
-    self.offset = offset
-    self.isView = isView
-    self.padding = padding
-    self.innerShapeForRepeat = innerShapeForRepeat
-    self.shrinkStart = shrinkStart
+    self.transforms = transforms
     self.isLazy = isLazy
-    // Default to row-major (C-style) strides if not specified
-    self.strides = strides ?? Tensor.computeRowMajorStrides(shape)
+    self.materialize = materialize
+    // Base shape/strides default to final shape with row-major layout
+    self.baseShape = baseShape ?? shape
+    self.baseStrides = baseStrides ?? Tensor.computeRowMajorStrides(baseShape ?? shape)
   }
 
-  /// The inner (unpadded) shape - only valid when padding is set
-  public var innerShape: [Int]? {
-    guard let padding = padding else { return nil }
-    return zip(shape, padding).map { dim, pad in
-      dim - pad.left - pad.right
+  // Legacy compatibility initializer - converts old flat fields to transforms
+  public init(
+    id: TensorID, shape: Shape, cellId: CellID, data: [Float]? = nil, strides: [Int]? = nil,
+    offset: Int = 0, isView: Bool = false, padding: [(left: Int, right: Int)]? = nil,
+    paddingSourceShape: [Int]? = nil,
+    innerShapeForRepeat: [Int]? = nil,
+    shrinkStart: [Int]? = nil,
+    isLazy: Bool = false,
+    materialize: Bool = false
+  ) {
+    self.id = id
+    self.shape = shape
+    self.cellId = cellId
+    self.data = data
+    self.isLazy = isLazy
+    self.materialize = materialize
+
+    // Build transforms from legacy fields
+    var transforms: [ViewTransform] = []
+    var computedBaseShape = shape
+    var computedBaseStrides = strides ?? Tensor.computeRowMajorStrides(shape)
+
+    // If we have padding, it was applied first (base → padded)
+    if let pad = padding {
+      let innerShape = zip(shape, pad).map { $0 - $1.left - $1.right }
+      computedBaseShape = innerShape
+      computedBaseStrides = Tensor.computeRowMajorStrides(innerShape)
+      transforms.append(.pad(padding: pad, inputShape: innerShape))
     }
+
+    // If we have innerShapeForRepeat, it's a repeat view
+    if let innerShape = innerShapeForRepeat {
+      // For repeat, the base is the inner shape
+      computedBaseShape = innerShape
+      computedBaseStrides = Tensor.computeRowMajorStrides(innerShape)
+      transforms.append(.repeatTile(innerShape: innerShape, outputShape: shape))
+    }
+
+    // Handle shrinkStart for shrink+repeat combo
+    if let start = shrinkStart {
+      // This is a shrink on top of a repeated tensor
+      // The ranges would be from start to start + shape[i]
+      let ranges: [(start: Int, end: Int)?] = start.enumerated().map { i, s in
+        (start: s, end: s + shape[i])
+      }
+      // We need to insert shrink before the repeat in the chain
+      // Actually, shrinkStart is applied AFTER repeat, so add shrink transform
+      if let repeatIdx = transforms.firstIndex(where: {
+        if case .repeatTile = $0 { return true }
+        return false
+      }) {
+        // Get the repeated shape (output of repeat)
+        if case .repeatTile(_, let repeatedShape) = transforms[repeatIdx] {
+          transforms.append(.shrink(ranges: ranges, inputShape: repeatedShape))
+        }
+      }
+    }
+
+    // Handle non-contiguous strides (from transpose or asStrided)
+    if let strides = strides, strides != Tensor.computeRowMajorStrides(shape),
+       padding == nil && innerShapeForRepeat == nil {
+      // This is a strided view - add asStrided transform
+      // The base shape is determined by the strides
+      transforms.append(.asStrided(outputShape: shape, strides: strides, offset: offset, inputShape: shape))
+    }
+
+    self.transforms = transforms
+    self.baseShape = computedBaseShape
+    self.baseStrides = computedBaseStrides
   }
 
-  /// Total number of elements in this tensor
+  /// Legacy compatibility: The inner (unpadded) shape
+  public var innerShape: [Int]? {
+    for transform in transforms {
+      if case .pad(_, let inputShape) = transform {
+        return inputShape
+      }
+    }
+    return nil
+  }
+
+  /// Legacy compatibility: padding accessor
+  public var padding: [(left: Int, right: Int)]? {
+    for transform in transforms {
+      if case .pad(let padding, _) = transform {
+        return padding
+      }
+    }
+    return nil
+  }
+
+  /// Legacy compatibility: paddingSourceShape accessor
+  public var paddingSourceShape: [Int]? {
+    for transform in transforms {
+      if case .pad(_, _) = transform {
+        return shape  // The padded shape
+      }
+    }
+    return nil
+  }
+
+  /// Legacy compatibility: innerShapeForRepeat accessor
+  public var innerShapeForRepeat: [Int]? {
+    for transform in transforms {
+      if case .repeatTile(let innerShape, _) = transform {
+        return innerShape
+      }
+    }
+    return nil
+  }
+
+  /// Legacy compatibility: shrinkStart accessor
+  public var shrinkStart: [Int]? {
+    for transform in transforms {
+      if case .shrink(let ranges, _) = transform {
+        return ranges.map { $0?.start ?? 0 }
+      }
+    }
+    return nil
+  }
+
+  /// Legacy compatibility: strides accessor (returns base strides or from asStrided)
+  public var strides: [Int] {
+    for transform in transforms.reversed() {
+      if case .asStrided(_, let strides, _, _) = transform {
+        return strides
+      }
+    }
+    return baseStrides
+  }
+
+  /// Legacy compatibility: offset accessor
+  public var offset: Int {
+    for transform in transforms {
+      if case .asStrided(_, _, let offset, _) = transform {
+        return offset
+      }
+    }
+    return 0
+  }
+
+  /// Total number of elements in this tensor (final shape)
   public var size: Int {
     shape.reduce(1, *)
+  }
+
+  /// Total number of elements in the base tensor (actual memory)
+  public var baseSize: Int {
+    baseShape.reduce(1, *)
   }
 
   /// Compute row-major strides for a given shape
@@ -56,9 +269,9 @@ public struct Tensor {
     return strides
   }
 
-  /// Check if this tensor is contiguous (strides match row-major layout)
+  /// Check if this tensor is contiguous (strides match row-major layout of base)
   public var isContiguous: Bool {
-    strides == Tensor.computeRowMajorStrides(shape)
+    transforms.isEmpty && baseStrides == Tensor.computeRowMajorStrides(baseShape)
   }
 }
 
@@ -213,33 +426,33 @@ extension Graph {
     return tensor
   }
 
-  /// Create a tensor view with new shape/strides, sharing the same underlying data.
+  /// Create a tensor view with a new transform appended to the chain.
   /// For derived ops without tensors, creates node only - tensor created during allocation.
-  private func createView(
+  private func createViewWithTransform(
     input: NodeID,
     op: LazyOp,
     newShape: Shape,
-    offset: Int = 0,
-    computeStrides: (Tensor) -> [Int]
+    transform: ViewTransform
   ) throws -> NodeID {
     // Create the node first
     let nodeId = n(op, [input], shape: .tensor(newShape))
 
     // If input has a concrete tensor, create the view tensor now
     if let inputTensor = nodeToTensor[input].flatMap({ tensors[$0] }) {
-      let newStrides = computeStrides(inputTensor)
-      let totalOffset = inputTensor.offset + offset
-
       let tensorId = nextTensorId
       nextTensorId += 1
+
+      // Append the new transform to the input tensor's chain
+      var newTransforms = inputTensor.transforms
+      newTransforms.append(transform)
 
       tensors[tensorId] = Tensor(
         id: tensorId,
         shape: newShape,
         cellId: inputTensor.cellId,
-        strides: newStrides,
-        offset: totalOffset,
-        isView: true
+        baseShape: inputTensor.baseShape,
+        baseStrides: inputTensor.baseStrides,
+        transforms: newTransforms
       )
 
       nodeToTensor[nodeId] = tensorId
@@ -253,15 +466,6 @@ extension Graph {
 
   /// Reshape a tensor to a new shape (metadata only, no data movement)
   public func reshape(_ input: NodeID, to newShape: Shape) throws -> NodeID {
-    /*
-    let tensor = try getTensor(input)
-    guard tensor.isContiguous else {
-      throw DGenError.tensorError(
-        op: "reshape",
-        reason: "cannot reshape non-contiguous tensor - call contiguous() first")
-    }
-    */
-
     // Get input shape - works for both concrete tensors and derived ops
     guard let inputNode = nodes[input], case .tensor(let inputShape) = inputNode.shape else {
       throw DGenError.tensorError(op: "reshape", reason: "requires tensor input")
@@ -274,15 +478,8 @@ extension Graph {
         reason: "size mismatch: \(inputSize) vs \(newShape.reduce(1, *))")
     }
 
-    // If input has a concrete tensor, use its strides; otherwise assume row-major
-    let inputStrides =
-      nodeToTensor[input].flatMap { tensors[$0]?.strides }
-      ?? Tensor.computeRowMajorStrides(inputShape)
-
-    return try createView(input: input, op: .reshape(newShape), newShape: newShape) { _ in
-      adaptStridesForReshape(
-        inputShape: inputShape, inputStrides: inputStrides, newShape: newShape)
-    }
+    let transform = ViewTransform.reshape(outputShape: newShape, inputShape: inputShape)
+    return try createViewWithTransform(input: input, op: .reshape(newShape), newShape: newShape, transform: transform)
   }
 
   /// Transpose a tensor by permuting axes
@@ -300,143 +497,85 @@ extension Graph {
         op: "transpose", reason: "axes must have \(ndim) elements, got \(perm.count)")
     }
 
-    // If input has a concrete tensor, use its strides; otherwise assume row-major
-    let inputStrides =
-      nodeToTensor[input].flatMap { tensors[$0]?.strides }
-      ?? Tensor.computeRowMajorStrides(inputShape)
-
     let newShape = perm.map { inputShape[$0] }
-    let newStrides = perm.map { inputStrides[$0] }
-
-    return try createView(input: input, op: .transpose(perm), newShape: newShape) { _ in
-      newStrides
-    }
+    let transform = ViewTransform.transpose(axes: perm, inputShape: inputShape)
+    return try createViewWithTransform(input: input, op: .transpose(perm), newShape: newShape, transform: transform)
   }
 
   /// Shrink/slice a tensor along each axis (metadata only, no data movement)
   /// ranges: for each dimension, either nil (keep all) or (start, end) tuple
   public func shrink(_ input: NodeID, ranges: [(Int, Int)?]) throws -> NodeID {
-    let inputTensor = try getTensor(input)
+    // Get input shape - works for both concrete tensors and derived ops
+    guard let inputNode = nodes[input], case .tensor(let inputShape) = inputNode.shape else {
+      throw DGenError.tensorError(op: "shrink", reason: "requires tensor input")
+    }
 
-    guard ranges.count == inputTensor.shape.count else {
+    guard ranges.count == inputShape.count else {
       throw DGenError.tensorError(
         op: "shrink",
-        reason: "ranges count \(ranges.count) must match ndim \(inputTensor.shape.count)")
+        reason: "ranges count \(ranges.count) must match ndim \(inputShape.count)")
     }
 
     var newShape = [Int]()
-    var startIndices = [Int]()
-
     for (dim, range) in ranges.enumerated() {
       if let (start, end) = range {
-        guard start >= 0 && end <= inputTensor.shape[dim] && start < end else {
+        guard start >= 0 && end <= inputShape[dim] && start < end else {
           throw DGenError.tensorError(
             op: "shrink",
-            reason:
-              "invalid range (\(start), \(end)) for dimension \(dim) with size \(inputTensor.shape[dim])"
+            reason: "invalid range (\(start), \(end)) for dimension \(dim) with size \(inputShape[dim])"
           )
         }
-        startIndices.append(start)
         newShape.append(end - start)
       } else {
-        startIndices.append(0)
-        newShape.append(inputTensor.shape[dim])
+        newShape.append(inputShape[dim])
       }
     }
 
-    // If input has innerShapeForRepeat, use logical shrink (shrinkStart) instead of offset
-    // This ensures modular indexing is applied correctly at read time
-    if inputTensor.innerShapeForRepeat != nil {
-      // Combine with any existing shrinkStart
-      let combinedStart: [Int]
-      if let existingStart = inputTensor.shrinkStart {
-        combinedStart = zip(existingStart, startIndices).map { $0 + $1 }
-      } else {
-        combinedStart = startIndices
+    // Convert ranges to (start, end)? format for the transform
+    let transformRanges: [(start: Int, end: Int)?] = ranges.enumerated().map { dim, range in
+      if let (start, end) = range {
+        return (start: start, end: end)
       }
-
-      let tensorId = nextTensorId
-      nextTensorId += 1
-
-      tensors[tensorId] = Tensor(
-        id: tensorId,
-        shape: newShape,
-        cellId: inputTensor.cellId,
-        strides: inputTensor.strides,
-        offset: inputTensor.offset,  // Don't change offset
-        isView: true,
-        innerShapeForRepeat: inputTensor.innerShapeForRepeat,  // Preserve repeat info
-        shrinkStart: combinedStart  // Store logical start for read-time adjustment
-      )
-
-      let nodeId = n(.shrink(ranges), [input], shape: .tensor(newShape))
-      nodeToTensor[nodeId] = tensorId
-      return nodeId
+      return nil
     }
 
-    // Standard case: no repeat, use offset-based shrink
-    var offset = 0
-    for (dim, start) in startIndices.enumerated() {
-      offset += start * inputTensor.strides[dim]
-    }
-
-    return try createView(input: input, op: .shrink(ranges), newShape: newShape, offset: offset) {
-      t in
-      t.strides  // strides unchanged for shrink
-    }
+    let transform = ViewTransform.shrink(ranges: transformRanges, inputShape: inputShape)
+    return try createViewWithTransform(input: input, op: .shrink(ranges), newShape: newShape, transform: transform)
   }
 
-  /// Pad a tensor with zeros along each axis (virtual view, no data copy)
-  /// a virtual view requires conditional logic at read time (bounds check)
-  /// padding: for each dimension, (left, right) padding amounts
   public func pad(_ input: NodeID, padding: [(Int, Int)]) throws -> NodeID {
-    let inputTensor = try getTensor(input)
-
-    guard padding.count == inputTensor.shape.count else {
+    // Get input shape - works for both concrete tensors and derived ops
+    guard let inputNode = nodes[input], case .tensor(let inputShape) = inputNode.shape else {
+      throw DGenError.tensorError(op: "pad", reason: "requires tensor input")
+    }
+    guard padding.count == inputShape.count else {
       throw DGenError.tensorError(
         op: "pad",
-        reason: "padding count \(padding.count) must match ndim \(inputTensor.shape.count)")
+        reason: "padding count \(padding.count) must match ndim \(inputShape.count)")
     }
 
-    // Compute new padded shape
-    let newShape = zip(inputTensor.shape, padding).map { dim, pad in
-      dim + pad.0 + pad.1
-    }
-
-    // Create padded tensor view
-    let tensorId = nextTensorId
-    nextTensorId += 1
-
-    // Strides are based on the INNER (unpadded) shape for memory access
-    // The padded tensor shares the same underlying data
-    tensors[tensorId] = Tensor(
-      id: tensorId,
-      shape: newShape,
-      cellId: inputTensor.cellId,
-      strides: inputTensor.strides,
-      offset: inputTensor.offset,
-      isView: true,
-      padding: padding
-    )
-
-    let nodeId = n(.pad(padding), [input], shape: .tensor(newShape))
-    nodeToTensor[nodeId] = tensorId
-    return nodeId
+    let newShape = zip(inputShape, padding).map { dim, pad in dim + pad.0 + pad.1 }
+    let paddingTuples = padding.map { (left: $0.0, right: $0.1) }
+    let transform = ViewTransform.pad(padding: paddingTuples, inputShape: inputShape)
+    return try createViewWithTransform(input: input, op: .pad(padding), newShape: newShape, transform: transform)
   }
 
   /// Expand a tensor by broadcasting size-1 dimensions to target shape (stride=0 view, no data copy)
   /// e.g. [2, 1, 3] -> expandView to [2, 4, 3] makes dim 1 appear repeated 4 times via stride=0
   public func expandView(_ input: NodeID, to targetShape: Shape) throws -> NodeID {
-    let inputTensor = try getTensor(input)
+    // Get input shape - works for both concrete tensors and derived ops
+    guard let inputNode = nodes[input], case .tensor(let inputShape) = inputNode.shape else {
+      throw DGenError.tensorError(op: "expandView", reason: "requires tensor input")
+    }
 
-    guard inputTensor.shape.count == targetShape.count else {
+    guard inputShape.count == targetShape.count else {
       throw DGenError.tensorError(
         op: "expandView",
-        reason: "shape rank mismatch: \(inputTensor.shape.count) vs \(targetShape.count)")
+        reason: "shape rank mismatch: \(inputShape.count) vs \(targetShape.count)")
     }
 
     // Validate: each dim must be same size OR input dim must be 1
-    for (i, (inDim, targetDim)) in zip(inputTensor.shape, targetShape).enumerated() {
+    for (i, (inDim, targetDim)) in zip(inputShape, targetShape).enumerated() {
       guard inDim == targetDim || inDim == 1 else {
         throw DGenError.tensorError(
           op: "expandView",
@@ -444,39 +583,23 @@ extension Graph {
       }
     }
 
-    // Compute new strides: set stride=0 for dimensions being expanded (broadcast)
-    let newStrides = zip(zip(inputTensor.shape, targetShape), inputTensor.strides).map {
-      dims, stride in
-      dims.0 == 1 && dims.1 > 1 ? 0 : stride
-    }
-
-    let tensorId = nextTensorId
-    nextTensorId += 1
-
-    tensors[tensorId] = Tensor(
-      id: tensorId,
-      shape: targetShape,
-      cellId: inputTensor.cellId,
-      strides: newStrides,
-      offset: inputTensor.offset,
-      isView: true
-    )
-
-    let nodeId = n(.expandView(targetShape), [input], shape: .tensor(targetShape))
-    nodeToTensor[nodeId] = tensorId
-    return nodeId
+    let transform = ViewTransform.expand(targetShape: targetShape, inputShape: inputShape)
+    return try createViewWithTransform(input: input, op: .expandView(targetShape), newShape: targetShape, transform: transform)
   }
 
   /// Repeat/tile a tensor along each dimension (modular index view, no data copy)
   /// e.g. [2, 3] repeated by [2, 3] -> [4, 9] where each element appears multiple times
   /// Implemented via modular indexing: index[i] % originalShape[i]
   public func repeatView(_ input: NodeID, repeats: [Int]) throws -> NodeID {
-    let inputTensor = try getTensor(input)
+    // Get input shape - works for both concrete tensors and derived ops
+    guard let inputNode = nodes[input], case .tensor(let inputShape) = inputNode.shape else {
+      throw DGenError.tensorError(op: "repeatView", reason: "requires tensor input")
+    }
 
-    guard inputTensor.shape.count == repeats.count else {
+    guard inputShape.count == repeats.count else {
       throw DGenError.tensorError(
         op: "repeatView",
-        reason: "repeats count \(repeats.count) must match ndim \(inputTensor.shape.count)")
+        reason: "repeats count \(repeats.count) must match ndim \(inputShape.count)")
     }
 
     // Validate all repeats are positive
@@ -489,36 +612,12 @@ extension Graph {
     }
 
     // Compute new shape: original * repeats
-    let newShape = zip(inputTensor.shape, repeats).map { $0 * $1 }
+    let newShape = zip(inputShape, repeats).map { $0 * $1 }
 
-    // TODO(human): Create the repeated tensor view
-    // The tensor needs:
-    // - shape: newShape (the tiled shape)
-    // - strides: same as input (we use modular indexing, not stride tricks)
-    // - innerShapeForRepeat: inputTensor.shape (so tensorRead knows the modulo)
-    // - cellId, offset: same as input (sharing memory)
-
-    let tensorId = nextTensorId
-    nextTensorId += 1
-
-    tensors[tensorId] = Tensor(
-      id: tensorId,
-      shape: newShape,
-      cellId: inputTensor.cellId,
-      strides: inputTensor.strides,
-      offset: inputTensor.offset,
-      isView: true,
-      innerShapeForRepeat: inputTensor.shape  // Store original shape for modular indexing
-    )
-
-    let nodeId = n(.repeatView(repeats), [input], shape: .tensor(newShape))
-    nodeToTensor[nodeId] = tensorId
-    return nodeId
+    let transform = ViewTransform.repeatTile(innerShape: inputShape, outputShape: newShape)
+    return try createViewWithTransform(input: input, op: .repeatView(repeats), newShape: newShape, transform: transform)
   }
 
-  /// Pool operation: transforms input for convolution by extracting kernel windows
-  /// Input: [...batch, H, W] → Output: [...batch, oH, oW, kH, kW]
-  /// Each (oH, oW) position contains its (kH, kW) kernel window
   /// Create a strided view of a tensor with arbitrary shape and strides.
   /// This is the fundamental building block for view operations like pool.
   ///
@@ -537,30 +636,19 @@ extension Graph {
     strides: [Int],
     offset: Int = 0
   ) throws -> NodeID {
+    // Get input shape - works for both concrete tensors and derived ops
+    guard let inputNode = nodes[input], case .tensor(let inputShape) = inputNode.shape else {
+      throw DGenError.tensorError(op: "asStrided", reason: "requires tensor input")
+    }
+
     guard shape.count == strides.count else {
       throw DGenError.tensorError(
         op: "asStrided",
         reason: "shape and strides must have same count: \(shape.count) vs \(strides.count)")
     }
 
-    let inputTensor = try getTensor(input)
-
-    let tensorId = nextTensorId
-    nextTensorId += 1
-
-    tensors[tensorId] = Tensor(
-      id: tensorId,
-      shape: shape,
-      cellId: inputTensor.cellId,
-      strides: strides,
-      offset: inputTensor.offset + offset,
-      isView: true
-    )
-
-    // Use reshape op as marker (the actual behavior is determined by tensor strides)
-    let nodeId = n(.reshape(shape), [input], shape: .tensor(shape))
-    nodeToTensor[nodeId] = tensorId
-    return nodeId
+    let transform = ViewTransform.asStrided(outputShape: shape, strides: strides, offset: offset, inputShape: inputShape)
+    return try createViewWithTransform(input: input, op: .asStrided(shape, strides), newShape: shape, transform: transform)
   }
 
   /// Pool operation: transforms a tensor to expose sliding windows as extra dimensions.
@@ -574,9 +662,10 @@ extension Graph {
     kernelSize: [Int],
     stride: [Int]? = nil
   ) throws -> NodeID {
-    let inputTensor = try getTensor(input)
-    let inputShape = inputTensor.shape
-    let inputStrides = inputTensor.strides
+    // Get input shape - works for both concrete tensors and op-derived tensors
+    guard let inputNode = nodes[input], case .tensor(let inputShape) = inputNode.shape else {
+      throw DGenError.tensorError(op: "pool", reason: "requires tensor input")
+    }
 
     let spatialDims = kernelSize.count
     guard inputShape.count >= spatialDims else {
@@ -595,8 +684,12 @@ extension Graph {
     // Split into batch dims and spatial dims
     let batchDims = inputShape.count - spatialDims
     let batchShape = Array(inputShape.prefix(batchDims))
-    let batchStrides = Array(inputStrides.prefix(batchDims))
     let spatialShape = Array(inputShape.suffix(spatialDims))
+
+    // Use row-major strides for the current shape
+    // The transform chain will handle mapping to base memory correctly
+    let inputStrides = Tensor.computeRowMajorStrides(inputShape)
+    let batchStrides = Array(inputStrides.prefix(batchDims))
     let spatialStrides = Array(inputStrides.suffix(spatialDims))
 
     // Compute output spatial dims: o = (input - kernel) / stride + 1
@@ -711,13 +804,13 @@ extension Graph {
       return n(.sum, [input])
     }
 
-    // Allocate output tensor
-    let outputSize = outputShape.reduce(1, *)
-    let outputCellId = alloc(vectorWidth: outputSize)
+    // Allocate output tensor using lazy cell for frame-aware allocation support
+    // This is necessary because sumAxis output may be frame-based if input is frame-based
+    let outputCellId = reserveLazyCellId()
     let outputTensorId = nextTensorId
     nextTensorId += 1
     tensors[outputTensorId] = Tensor(
-      id: outputTensorId, shape: outputShape, cellId: outputCellId)
+      id: outputTensorId, shape: outputShape, cellId: outputCellId, isLazy: true)
     cellToTensor[outputCellId] = outputTensorId
 
     let nodeId = n(.sumAxis(normalizedAxis), [input], shape: .tensor(outputShape))
@@ -788,15 +881,15 @@ extension Graph {
   /// Read the current state from a tensor history buffer
   @discardableResult
   public func tensorHistoryRead(_ buffer: TensorHistoryBuffer) -> NodeID {
-    // Allocate a SEPARATE output cell for the read result
+    // Allocate a LAZY output cell for the read result
     // This is critical: the read copies from history cell to output cell
     // If we reuse the history cell, the read becomes a no-op!
-    let size = buffer.shape.reduce(1, *)
-    let outputCellId = alloc(vectorWidth: size)
+    // Using lazy cell allows frame-aware allocation when output crosses block boundaries
+    let outputCellId = reserveLazyCellId()
     let outputTensorId = nextTensorId
     nextTensorId += 1
     tensors[outputTensorId] = Tensor(
-      id: outputTensorId, shape: buffer.shape, cellId: outputCellId)
+      id: outputTensorId, shape: buffer.shape, cellId: outputCellId, isLazy: true)
     cellToTensor[outputCellId] = outputTensorId
 
     // Use unified historyRead - checks cellToTensor to determine if tensor or scalar

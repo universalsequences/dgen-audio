@@ -41,6 +41,30 @@ If training gets stuck, try:
 - Higher learning rate
 - Larger window size for better frequency resolution
 
+## DGenLazy Training Loop
+
+### Gradient Lifecycle (Tinygrad-Style)
+
+DGenLazy uses a tinygrad-inspired pattern where the computation graph is rebuilt each iteration:
+
+1. **`backward()`** - Computes gradients and stores them in `.grad` properties
+2. **`step()`** - Reads gradients and updates parameter weights
+3. **`zeroGrad()`** - Clears `.grad = nil` to prepare for next iteration
+4. **Always capture metrics before `zeroGrad()`** if you need them later
+
+### Graph Rebuilding
+
+After `backward()`, the graph is cleared to prevent node accumulation. Parameters (created with `Tensor.param()`) survive because their data is stored locally and nodeIds are lazily recreated. Computed nodes like `loss` must be rebuilt each iteration:
+
+```swift
+for epoch in 0..<epochs {
+    let loss = buildLoss()  // Rebuild graph fresh
+    try loss.backward(frames: frameCount)
+    optimizer.step()
+    optimizer.zeroGrad()
+}
+```
+
 ## Metal GPU Synchronization
 
 1. **`atomic_thread_fence` does NOT sync between threads** - it only orders memory operations within a single thread. For cross-thread synchronization, split into separate kernels.
@@ -48,3 +72,33 @@ If training gets stuck, try:
 2. **Reduction ops need kernel boundaries** - If a write phase stores per-frame data and a reduce phase reads from ALL frames, they MUST be in separate kernels. Add the op to `isReductionOp()` in Blocks.swift.
 
 3. **Global reduces should skip thread scaling** - Ops like `peekRowGradReduce` that loop over all frames internally should NOT get `threadCountScale`. Check `splitReduceBlocks()` to exclude them from shape assignment.
+
+## Memory Allocation & Cell IDs
+
+### Cell IDs ≠ Memory Addresses
+
+Cell IDs are **logical identifiers**, not memory offsets. The actual memory layout is computed by `remapVectorMemorySlots` in CompilationPipeline.swift.
+
+```
+Cell ID 0  → memory[84..99]   (after remapping)
+Cell ID 16 → memory[100..103]
+Cell ID -4 → memory[80..95]   (lazy cell)
+```
+
+To debug memory issues, check `cellAllocations.cellMappings` after compilation.
+
+### Lazy Cells (Negative IDs)
+
+Tensors created during graph construction get **lazy cells** (negative IDs like -1, -2, etc.) via `reserveLazyCellId()`. These are placeholders until we know if the tensor needs:
+- Frame-aware allocation (tensorSize × frameCount)
+- Outbound allocation (crosses block boundaries)
+
+**Critical**: `allocateTensorMemory` in TypeChecker.swift must register sizes for ALL lazy cells in `cellAllocationSizes`, even non-outbound ones. Otherwise `remapVectorMemorySlots` defaults to size=1, causing memory overlap.
+
+### Debugging Memory Corruption
+
+If gradients explode or have wrong values:
+1. Check generated Metal kernel for memory indices (e.g., `memory[80 + ...]`)
+2. Look for overlapping ranges between different tensors
+3. Verify `cellAllocationSizes` has correct sizes for all cells used
+4. Add debug output in GraphTrainingContext to print `cellAllocations.cellMappings`
