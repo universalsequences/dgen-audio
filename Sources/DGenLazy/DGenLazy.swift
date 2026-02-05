@@ -17,6 +17,13 @@ public enum DGenConfig {
 
     /// Default frame count for realize() calls
     public static var defaultFrameCount: Int = 1024
+
+    /// Optional path to write generated Metal kernels for debugging
+    /// When set, kernels will be written to this file after compilation
+    public static var kernelOutputPath: String? = nil
+
+    /// Enable debug output during compilation (prints block structure, etc.)
+    public static var debug: Bool = false
 }
 
 // MARK: - Type Aliases for Convenience

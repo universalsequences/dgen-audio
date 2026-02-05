@@ -1,3 +1,5 @@
+import Foundation
+
 /// Adapt strides when reshaping a tensor.
 /// For contiguous tensors, computes fresh row-major strides.
 /// For non-contiguous tensors (e.g., after transpose), preserves the stride pattern
@@ -138,6 +140,10 @@ public func inferShape(op: LazyOp, inputs: [ValueShape], graph: Graph) throws ->
 
   // Reshape - changes shape, preserves total size
   case .reshape(let newShape):
+    return .tensor(newShape)
+
+  // AsStrided - view with custom strides (for pool/im2col)
+  case .asStrided(let newShape, _):
     return .tensor(newShape)
 
   // Transpose - permutes axes
@@ -285,7 +291,8 @@ public func inferShapes(graph: Graph, sortedNodes: [NodeID]) throws {
 /// Allocate output tensors for nodes that produce tensor results.
 /// This is called after shape inference, so all nodes have their shapes assigned.
 /// Nodes that already have a tensor (via tensorRef) are skipped.
-/// View operations (reshape, transpose, shrink, pad) create views of their input's tensor.
+/// View operations (reshape, transpose, shrink, pad, etc.) create views of their input's tensor
+/// by appending transforms to the transform chain.
 public func allocateTensorOutputs(graph: Graph, sortedNodes: [NodeID]) {
   for nodeId in sortedNodes {
     guard let node = graph.nodes[nodeId] else { continue }
@@ -313,7 +320,7 @@ public func allocateTensorOutputs(graph: Graph, sortedNodes: [NodeID]) {
       break
     }
 
-    // Handle view operations - create view of input tensor instead of allocating
+    // Handle view operations - create view by appending transform to input tensor's chain
     switch node.op {
     case .reshape(let newShape):
       guard let inputId = node.inputs.first,
@@ -321,11 +328,9 @@ public func allocateTensorOutputs(graph: Graph, sortedNodes: [NodeID]) {
         let inputTensor = graph.tensors[inputTensorId]
       else { continue }
 
-      let newStrides = adaptStridesForReshape(
-        inputShape: inputTensor.shape,
-        inputStrides: inputTensor.strides,
-        newShape: newShape
-      )
+      let transform = ViewTransform.reshape(outputShape: newShape, inputShape: inputTensor.shape)
+      var newTransforms = inputTensor.transforms
+      newTransforms.append(transform)
 
       let tensorId = graph.nextTensorId
       graph.nextTensorId += 1
@@ -333,9 +338,32 @@ public func allocateTensorOutputs(graph: Graph, sortedNodes: [NodeID]) {
         id: tensorId,
         shape: newShape,
         cellId: inputTensor.cellId,
-        strides: newStrides,
-        offset: inputTensor.offset,
-        isView: true
+        baseShape: inputTensor.baseShape,
+        baseStrides: inputTensor.baseStrides,
+        transforms: newTransforms
+      )
+      graph.nodeToTensor[nodeId] = tensorId
+      continue
+
+    case .asStrided(let newShape, let newStrides):
+      guard let inputId = node.inputs.first,
+        let inputTensorId = graph.nodeToTensor[inputId],
+        let inputTensor = graph.tensors[inputTensorId]
+      else { continue }
+
+      let transform = ViewTransform.asStrided(outputShape: newShape, strides: newStrides, offset: 0, inputShape: inputTensor.shape)
+      var newTransforms = inputTensor.transforms
+      newTransforms.append(transform)
+
+      let tensorId = graph.nextTensorId
+      graph.nextTensorId += 1
+      graph.tensors[tensorId] = Tensor(
+        id: tensorId,
+        shape: newShape,
+        cellId: inputTensor.cellId,
+        baseShape: inputTensor.baseShape,
+        baseStrides: inputTensor.baseStrides,
+        transforms: newTransforms
       )
       graph.nodeToTensor[nodeId] = tensorId
       continue
@@ -347,7 +375,9 @@ public func allocateTensorOutputs(graph: Graph, sortedNodes: [NodeID]) {
       else { continue }
 
       let perm = axes.isEmpty ? Array((0..<inputTensor.shape.count).reversed()) : axes
-      let newStrides = perm.map { inputTensor.strides[$0] }
+      let transform = ViewTransform.transpose(axes: perm, inputShape: inputTensor.shape)
+      var newTransforms = inputTensor.transforms
+      newTransforms.append(transform)
 
       let tensorId = graph.nextTensorId
       graph.nextTensorId += 1
@@ -355,9 +385,9 @@ public func allocateTensorOutputs(graph: Graph, sortedNodes: [NodeID]) {
         id: tensorId,
         shape: shape,
         cellId: inputTensor.cellId,
-        strides: newStrides,
-        offset: inputTensor.offset,
-        isView: true
+        baseShape: inputTensor.baseShape,
+        baseStrides: inputTensor.baseStrides,
+        transforms: newTransforms
       )
       graph.nodeToTensor[nodeId] = tensorId
       continue
@@ -368,12 +398,15 @@ public func allocateTensorOutputs(graph: Graph, sortedNodes: [NodeID]) {
         let inputTensor = graph.tensors[inputTensorId]
       else { continue }
 
-      var offset = inputTensor.offset
-      for (dim, range) in ranges.enumerated() {
-        if let (start, _) = range {
-          offset += start * inputTensor.strides[dim]
+      let transformRanges: [(start: Int, end: Int)?] = ranges.enumerated().map { dim, range in
+        if let (start, end) = range {
+          return (start: start, end: end)
         }
+        return nil
       }
+      let transform = ViewTransform.shrink(ranges: transformRanges, inputShape: inputTensor.shape)
+      var newTransforms = inputTensor.transforms
+      newTransforms.append(transform)
 
       let tensorId = graph.nextTensorId
       graph.nextTensorId += 1
@@ -381,9 +414,9 @@ public func allocateTensorOutputs(graph: Graph, sortedNodes: [NodeID]) {
         id: tensorId,
         shape: shape,
         cellId: inputTensor.cellId,
-        strides: inputTensor.strides,
-        offset: offset,
-        isView: true
+        baseShape: inputTensor.baseShape,
+        baseStrides: inputTensor.baseStrides,
+        transforms: newTransforms
       )
       graph.nodeToTensor[nodeId] = tensorId
       continue
@@ -394,16 +427,66 @@ public func allocateTensorOutputs(graph: Graph, sortedNodes: [NodeID]) {
         let inputTensor = graph.tensors[inputTensorId]
       else { continue }
 
+      let paddingTuples = padding.map { (left: $0.0, right: $0.1) }
+      let transform = ViewTransform.pad(padding: paddingTuples, inputShape: inputTensor.shape)
+      var newTransforms = inputTensor.transforms
+      newTransforms.append(transform)
+
       let tensorId = graph.nextTensorId
       graph.nextTensorId += 1
       graph.tensors[tensorId] = Tensor(
         id: tensorId,
         shape: shape,
         cellId: inputTensor.cellId,
-        strides: inputTensor.strides,
-        offset: inputTensor.offset,
-        isView: true,
-        padding: padding
+        baseShape: inputTensor.baseShape,
+        baseStrides: inputTensor.baseStrides,
+        transforms: newTransforms
+      )
+      graph.nodeToTensor[nodeId] = tensorId
+      continue
+
+    case .expandView(let targetShape):
+      guard let inputId = node.inputs.first,
+        let inputTensorId = graph.nodeToTensor[inputId],
+        let inputTensor = graph.tensors[inputTensorId]
+      else { continue }
+
+      let transform = ViewTransform.expand(targetShape: targetShape, inputShape: inputTensor.shape)
+      var newTransforms = inputTensor.transforms
+      newTransforms.append(transform)
+
+      let tensorId = graph.nextTensorId
+      graph.nextTensorId += 1
+      graph.tensors[tensorId] = Tensor(
+        id: tensorId,
+        shape: shape,
+        cellId: inputTensor.cellId,
+        baseShape: inputTensor.baseShape,
+        baseStrides: inputTensor.baseStrides,
+        transforms: newTransforms
+      )
+      graph.nodeToTensor[nodeId] = tensorId
+      continue
+
+    case .repeatView(_):
+      guard let inputId = node.inputs.first,
+        let inputTensorId = graph.nodeToTensor[inputId],
+        let inputTensor = graph.tensors[inputTensorId]
+      else { continue }
+
+      let transform = ViewTransform.repeatTile(innerShape: inputTensor.shape, outputShape: shape)
+      var newTransforms = inputTensor.transforms
+      newTransforms.append(transform)
+
+      let tensorId = graph.nextTensorId
+      graph.nextTensorId += 1
+      graph.tensors[tensorId] = Tensor(
+        id: tensorId,
+        shape: shape,
+        cellId: inputTensor.cellId,
+        baseShape: inputTensor.baseShape,
+        baseStrides: inputTensor.baseStrides,
+        transforms: newTransforms
       )
       graph.nodeToTensor[nodeId] = tensorId
       continue
@@ -471,6 +554,19 @@ public func allocateTensorMemory(
             }
           }
         }
+
+        // Also check historyWrite - it reads from its INPUT tensor, not the history cell parameter
+        if case .historyWrite(_) = node.op {
+          for inputId in node.inputs {
+            if let inputNode = graph.nodes[inputId], case .tensor = inputNode.shape {
+              if let tensorId = graph.nodeToTensor[inputId], let tensor = graph.tensors[tensorId] {
+                if producedCells.contains(tensor.cellId) {
+                  outboundCells.insert(tensor.cellId)
+                }
+              }
+            }
+          }
+        }
       }
     }
 
@@ -519,33 +615,42 @@ public func allocateTensorMemory(
     let needsFrameAwareAlloc = isFrameBased && !isInFeedbackLoop &&
       (isOutbound || intraBlockFrameAwareCells.contains(lazyCellId))
 
-    // Only allocate if outbound or needs frame-aware storage
-    // But always register the size for lazy cells so remapping knows the correct size
-    if !isOutbound && !needsFrameAwareAlloc {
-      // Still register the size for this lazy cell even though we're not converting it
+    // Check if this node is marked for materialization
+    let shouldMaterialize = tensor.materialize || (nodeId != nil && graph.materializeNodes.contains(nodeId!))
+
+    // For materialized frame-based tensors, we also need frame-aware allocation
+    let needsFrameAwareForMaterialize = shouldMaterialize && isFrameBased && !isInFeedbackLoop
+    let actuallyNeedsFrameAware = needsFrameAwareAlloc || needsFrameAwareForMaterialize
+
+    // Skip full allocation for non-outbound, non-frame-aware, non-materialize cells.
+    // These tensors stay in registers and don't need memory allocation.
+    // Still register the tensor size so remapping can use the correct size.
+    if !isOutbound && !actuallyNeedsFrameAware && !shouldMaterialize {
       graph.cellAllocationSizes[lazyCellId] = tensorSize
       continue
     }
 
-    let allocSize = needsFrameAwareAlloc ? tensorSize * frameCount : tensorSize
+    // Outbound/frame-aware/materialize tensors need real cell IDs allocated.
+    // Frame-aware tensors get tensorSize * frameCount, others get just tensorSize.
+    let allocSize = actuallyNeedsFrameAware ? tensorSize * frameCount : tensorSize
     let realCellId = graph.allocateLazyCell(lazyCellId, vectorWidth: allocSize)
     lazyToReal[lazyCellId] = realCellId
 
-    if needsFrameAwareAlloc {
+    if actuallyNeedsFrameAware {
       graph.frameAwareCells[realCellId] = (tensorSize: tensorSize, frameCount: frameCount)
     }
 
-    // Update tensor with real cell ID
+    // Update tensor with real cell ID, preserving transforms
     graph.tensors[tensorId] = Tensor(
       id: tensor.id,
       shape: tensor.shape,
       cellId: realCellId,
       data: tensor.data,
-      strides: tensor.strides,
-      offset: tensor.offset,
-      isView: tensor.isView,
-      padding: tensor.padding,
-      isLazy: false
+      baseShape: tensor.baseShape,
+      baseStrides: tensor.baseStrides,
+      transforms: tensor.transforms,
+      isLazy: false,
+      materialize: tensor.materialize
     )
     graph.cellToTensor[realCellId] = tensorId
   }
@@ -555,17 +660,17 @@ public func allocateTensorMemory(
   for (tensorId, tensor) in graph.tensors {
     guard tensor.isView, let realCellId = lazyToReal[tensor.cellId] else { continue }
 
-    // Update view to use real cell ID
+    // Update view to use real cell ID, preserving transforms
     graph.tensors[tensorId] = Tensor(
       id: tensor.id,
       shape: tensor.shape,
       cellId: realCellId,
       data: tensor.data,
-      strides: tensor.strides,
-      offset: tensor.offset,
-      isView: tensor.isView,
-      padding: tensor.padding,
-      isLazy: false
+      baseShape: tensor.baseShape,
+      baseStrides: tensor.baseStrides,
+      transforms: tensor.transforms,
+      isLazy: false,
+      materialize: tensor.materialize
     )
   }
 }

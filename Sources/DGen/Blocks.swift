@@ -192,6 +192,13 @@ public func findFeedbackLoops(_ g: Graph) -> [[NodeID]] {
       let nodesOnFeedbackPaths = forwardFromReadsAll.intersection(backwardToWrites)
       clusterNodes.formUnion(nodesOnFeedbackPaths)
 
+      // NOTE: For tensor feedback loops like Conv2D, nodes downstream of historyRead
+      // but not on the path to historyWrite (like sumAxis -> output) also need
+      // sequential execution. However, including ALL forward-reachable nodes is too
+      // aggressive and breaks other tests. Tensor feedback loop support requires
+      // nested loop execution (sequential frames, parallel tensor elements).
+      // TODO: Implement proper nested loop execution for tensor feedback clusters.
+
       clusters.append(clusterNodes)
     }
   }
@@ -380,7 +387,7 @@ public func topoWithCorridors(
   let nodeToCorridorId = determineScalarCorridors(g, feedbackClusters: feedbackClusters)
 
   // Handle seq operators - if any input to seq is scalar, make all inputs scalar
-  var finalScalarSet = scalarNodeSet
+  let finalScalarSet = scalarNodeSet
 
   // Group nodes by corridor (much simpler grouping)
   var corridorToNodes: [Int: [NodeID]] = [:]
@@ -903,8 +910,6 @@ public func findOutputNodeNeeds(_ b: Block, _ g: Graph) -> Set<NodeID> {
   return outputNodeNeeds
 }
 
-// ─── 3. decide which nodes need cross-block scratch buffers ─────
-// in the case of metal, these are transmitted via buffers
 public func findNodesWithOutboundDependencies(_ blks: [Block], _ g: Graph, block: Block) -> [NodeID]
 {
   // Map node -> block index
@@ -918,17 +923,6 @@ public func findNodesWithOutboundDependencies(_ blks: [Block], _ g: Graph, block
   }
 
   guard let thisIdx = blks.firstIndex(of: block) else { return [] }
-
-  // Compute contiguous-kind groups to enable within-group fusion
-  /*
-  var groupForBlock = Array(repeating: 0, count: blks.count)
-  var group = 0
-  for i in 0..<blks.count {
-      if i > 0 && blks[i].kind != blks[i - 1].kind { group += 1 }
-      groupForBlock[i] = group
-  }
-  let thisGroup = groupForBlock[thisIdx]
-   */
 
   var need: Set<NodeID> = []
   for (consumerIdx, b) in blks.enumerated() {
@@ -962,18 +956,6 @@ public func findNodesAsInboundDependencies(_ blks: [Block], _ g: Graph, block: B
       }
     }
   }
-  //for (bidx, b) in blks.enumerated() { b.nodes.forEach { nodeBlock[$0] = bidx } }
-
-  // Compute contiguous-kind groups
-  /*
-  var groupForBlock = Array(repeating: 0, count: blks.count)
-  var group = 0
-  for i in 0..<blks.count {
-      if i > 0 && blks[i].kind != blks[i - 1].kind { group += 1 }
-      groupForBlock[i] = group
-  }
-  let thisGroup = groupForBlock[thisIdx]
-   */
 
   var need: Set<NodeID> = []
   // Collect only dependencies produced in a different group
@@ -1023,9 +1005,22 @@ public func findOutboundTensorCells(_ blks: [Block], _ g: Graph, block: Block) -
 
       // Also check historyRead/historyWrite operations that reference tensor cells
       switch node.op {
-      case .historyRead(let cellId), .historyWrite(let cellId):
+      case .historyRead(let cellId):
+        // historyRead's cellId is the history buffer - mark if produced here
         if producedCells.contains(cellId) {
           outboundCells.insert(cellId)
+        }
+      case .historyWrite(_):
+        // historyWrite reads from its INPUT tensor, not the history cell parameter
+        // If the input tensor's cell was produced in this block, mark it as outbound
+        for inputId in node.inputs {
+          if let inputNode = g.nodes[inputId], case .tensor = inputNode.shape {
+            if let tensorId = g.nodeToTensor[inputId], let tensor = g.tensors[tensorId] {
+              if producedCells.contains(tensor.cellId) {
+                outboundCells.insert(tensor.cellId)
+              }
+            }
+          }
         }
       default:
         break
@@ -1056,6 +1051,231 @@ private func containsSIMDBlockers(_ uops: [UOp], backend: Backend) -> Bool {
     }
   }
   return false
+}
+
+/// Check if a scalar block has multiple tensor shapes (shape transitions)
+/// Returns the list of (nodeIndex, shape) pairs where shape changes
+public func detectShapeTransitions(block: Block, g: Graph) -> [(nodeIndex: Int, shape: [Int])] {
+  var transitions: [(nodeIndex: Int, shape: [Int])] = []
+  var currentShape: [Int]? = nil
+
+  for (index, nodeId) in block.nodes.enumerated() {
+    guard let node = g.nodes[nodeId] else { continue }
+
+    if case .tensor(let shape) = node.shape {
+      // Check for shape change
+      var needsNewRegion = shape != currentShape
+
+      // Conv2d/conv1d have global read patterns - they need ALL elements of their
+      // input tensor to be computed before ANY conv2d output is computed.
+      // Force a region boundary BEFORE conv2d so the input is complete.
+      // Also, conv2d emits its own parallelRange internally, so it must be
+      // in its own region (not mixed with other element-wise ops).
+      switch node.op {
+      case .conv2d, .conv1d:
+        // Always start a new region for conv2d, even if shape matches
+        needsNewRegion = true
+      default:
+        break
+      }
+
+      if needsNewRegion {
+        transitions.append((nodeIndex: index, shape: shape))
+        currentShape = shape
+      }
+
+      // Force region boundary AFTER conv2d - it has its own internal loop,
+      // so subsequent ops must be in a separate region
+      switch node.op {
+      case .conv2d, .conv1d:
+        // Mark that next tensor node needs new region even if same shape
+        currentShape = nil
+      default:
+        break
+      }
+    } else if case .scalar = node.shape {
+      // Scalar node - check if it consumes a tensor (e.g., sum reduction)
+      // These need their own region AFTER the tensor region completes
+      // BUT: only create a new region when transitioning FROM tensor TO scalar,
+      // not for consecutive scalar operations (which may depend on each other)
+      let consumesTensor = node.inputs.contains { inputId in
+        if let inputNode = g.nodes[inputId], case .tensor = inputNode.shape {
+          return true
+        }
+        return false
+      }
+      let alreadyInScalarRegion = currentShape == [1]
+      if consumesTensor && currentShape != nil && !alreadyInScalarRegion {
+        // Create a "scalar reduction" region with shape [1] to separate it
+        // This ensures the tensor computation completes before reduction runs
+        transitions.append((nodeIndex: index, shape: [1]))
+        currentShape = [1]
+      }
+    }
+  }
+  return transitions
+}
+
+/// Find tensor cells that cross shape region boundaries within a scalar block.
+/// These must be written to memory (not kept in registers) because they're computed
+/// in one loop and consumed in a different loop.
+public func findCrossRegionOutboundCells(
+  block: Block, g: Graph, transitions: [(nodeIndex: Int, shape: [Int])]
+) -> Set<CellID> {
+  guard !transitions.isEmpty else { return [] }
+
+  var outbound: Set<CellID> = []
+
+  // Build map: nodeId -> regionIndex
+  var nodeToRegion: [NodeID: Int] = [:]
+  for (regionIdx, transition) in transitions.enumerated() {
+    let regionEnd =
+      regionIdx + 1 < transitions.count
+      ? transitions[regionIdx + 1].nodeIndex
+      : block.nodes.count
+    for nodeIndex in transition.nodeIndex..<regionEnd {
+      nodeToRegion[block.nodes[nodeIndex]] = regionIdx
+    }
+  }
+
+  // For each node, check if any of its inputs come from a different region
+  for nodeId in block.nodes {
+    guard let node = g.nodes[nodeId] else { continue }
+    let myRegion = nodeToRegion[nodeId]  // May be nil for scalar nodes
+
+    for inputId in node.inputs {
+      let inputRegion = nodeToRegion[inputId]
+
+      // Case 1: Both have regions and they differ (cross-region)
+      // Case 2: Node is scalar (no region) but input has a region (tensor → scalar)
+      let crossesRegion =
+        (myRegion != nil && inputRegion != nil && myRegion != inputRegion)
+        || (myRegion == nil && inputRegion != nil)
+
+      guard crossesRegion else { continue }
+
+      // This input crosses a region boundary - its cell must be outbound
+      if let tensorId = g.nodeToTensor[inputId],
+        let tensor = g.tensors[tensorId]
+      {
+        outbound.insert(tensor.cellId)
+      }
+    }
+  }
+
+  return outbound
+}
+
+/// Emit UOps for a scalar block with shape transitions (e.g., conv2d in feedback loop)
+/// Instead of one flat loop, emits nested loops: outer frame loop + inner element loops
+public func emitScalarBlockWithShapeTransitions(
+  ctx: IRContext, block: Block, blocks: [Block], g: Graph,
+  transitions: [(nodeIndex: Int, shape: [Int])]
+) throws -> [UOp] {
+  var uops: [UOp] = []
+  var emittedNodes: Set<NodeID> = []
+
+  // Track outbound cells for register optimization
+  // Include both cross-block outbound AND cross-region outbound (shape transitions)
+  // Use ALL blocks to correctly detect cells needed by later blocks (e.g., sum after feedback loop)
+  var outbound = findOutboundTensorCells(blocks, g, block: block)
+  let crossRegion = findCrossRegionOutboundCells(block: block, g: g, transitions: transitions)
+  outbound.formUnion(crossRegion)
+
+  // Mark conv2d/conv1d input tensors as outbound - they use memoryRead() directly
+  // instead of tload(), so the input MUST be in memory not just in registers
+  for nodeId in block.nodes {
+    guard let node = g.nodes[nodeId] else { continue }
+    let isConvOp: Bool
+    switch node.op {
+    case .conv2d, .conv1d:
+      isConvOp = true
+    default:
+      isConvOp = false
+    }
+    if isConvOp, let inputId = node.inputs.first,
+      let tensorId = g.nodeToTensor[inputId],
+      let tensor = g.tensors[tensorId]
+    {
+      outbound.insert(tensor.cellId)
+    }
+  }
+
+  ctx.outboundTensorCells = outbound
+  ctx.clearTensorRegisters()
+
+  // Group nodes by their shape region
+  var regionStart = 0
+  for (transitionIdx, transition) in transitions.enumerated() {
+    let regionEnd =
+      transitionIdx + 1 < transitions.count
+      ? transitions[transitionIdx + 1].nodeIndex
+      : block.nodes.count
+
+    let shape = transition.shape
+    let elementCount = shape.reduce(1, *)
+
+    // Check if this region contains only conv2d (which has its own parallelRange)
+    let firstNodeId = block.nodes[transition.nodeIndex]
+    let isConvOnlyRegion: Bool
+    if let firstNode = g.nodes[firstNodeId] {
+      switch firstNode.op {
+      case .conv2d, .conv1d:
+        // Conv2d creates its own parallelRange, so don't wrap it
+        isConvOnlyRegion = (regionEnd - transition.nodeIndex == 1)
+      default:
+        isConvOnlyRegion = false
+      }
+    } else {
+      isConvOnlyRegion = false
+    }
+
+    // Create element loop variable for this region
+    let elemVar = ctx.useVariable(src: nil)
+
+    // Emit beginForLoop for element iteration (skip for conv-only regions)
+    if !isConvOnlyRegion {
+      var beginLoop = UOp(
+        op: .beginForLoop(elemVar, .constant(0, Float(elementCount))),
+        value: elemVar
+      )
+      beginLoop.kind = .scalar
+      uops.append(beginLoop)
+    }
+
+    // Emit ops for nodes in this region
+    for nodeIndex in transition.nodeIndex..<regionEnd {
+      let nodeId = block.nodes[nodeIndex]
+      // Set tensor index for this node to the element loop variable
+      ctx.tensorIndices[nodeId] = elemVar
+
+      if let node = g.nodes[nodeId] {
+        for uop in try node.op.emit(ctx: ctx, g: g, nodeId: nodeId) {
+          emittedNodes.insert(nodeId)
+          var typedUop = uop
+          typedUop.kind = .scalar
+          uops.append(typedUop)
+        }
+      }
+    }
+
+    // Emit endLoop (skip for conv-only regions)
+    if !isConvOnlyRegion {
+      var endLoop = UOp(op: .endLoop, value: .empty)
+      endLoop.kind = .scalar
+      uops.append(endLoop)
+    }
+
+    // Clear tensor registers after each region so next region reads from memory
+    // instead of using stale register variables from a different loop scope.
+    // NOTE: This forces memory reads even for values that could theoretically
+    // be kept in registers if the scoping were different.
+    ctx.clearTensorRegisters()
+
+    regionStart = regionEnd
+  }
+
+  return uops
 }
 
 public func emitThreadCountScaleOpIfNeeded(ctx: IRContext, block: Block, g: Graph) -> [UOp] {
@@ -1177,10 +1397,9 @@ public func emitFrameTensorChainBlock(
         let positiveIndex = b.gswitch(isNegative, wrappedIndex + numRowsFloat, wrappedIndex)
         let floorIndex = b.floor(positiveIndex)
 
-        // Read the selected row element for this column
-        let colOffset = b.value(binIdx.lazy) * numRowsFloat
-        let readPos = colOffset + floorIndex
-        let value = b.memoryRead(inTensor.cellId, b.cast(readPos, to: .int))
+        // Row-major read: tensorRead handles both transformed and base tensors
+        let colIdxFloat = b.cast(b.value(binIdx.lazy), to: .float)
+        let value = b.tensorRead(inTensor, indices: [floorIndex, colIdxFloat])
 
         // Register output tensor element in a register (avoid shared memory writes)
         _ = b.tstore(outTensor.cellId, b.value(binIdx.lazy), value)
@@ -1251,25 +1470,76 @@ public func emitBlockUOps(
   // Tensor Register Optimization:
   // Compute which tensor cells need to be written to memory (used by later blocks)
   // and clear the register tracking for this new block.
-  ctx.outboundTensorCells = findOutboundTensorCells(blocks, g, block: block)
+  var outboundCells = findOutboundTensorCells(blocks, g, block: block)
+
+  // Check for scalar blocks with shape transitions (e.g., conv2d in feedback loops)
+  // These need nested element loops instead of flat threading
+  let shapeTransitions = detectShapeTransitions(block: block, g: g)
+  let hasMultipleShapes = shapeTransitions.count > 1
+
+  // For ALL backends: include cross-region outbound cells (tensor → scalar reductions)
+  // This ensures tensors are written to memory before scalar reductions read them
+  if hasMultipleShapes {
+    let crossRegion = findCrossRegionOutboundCells(
+      block: block, g: g, transitions: shapeTransitions)
+    outboundCells.formUnion(crossRegion)
+  }
+
+  // Mark conv2d/conv1d input tensors as outbound - they use memoryRead() directly
+  // instead of tload(), so the input MUST be in memory not just in registers
+  for nodeId in block.nodes {
+    guard let node = g.nodes[nodeId] else { continue }
+    switch node.op {
+    case .conv2d, .conv1d:
+      if let inputId = node.inputs.first,
+        let tensorId = g.nodeToTensor[inputId],
+        let tensor = g.tensors[tensorId]
+      {
+        outboundCells.insert(tensor.cellId)
+      }
+    default:
+      break
+    }
+  }
+
+  ctx.outboundTensorCells = outboundCells
   ctx.clearTensorRegisters()
 
-  // Thread count scaling is a Metal-specific parallelization optimization.
-  // C backend uses sequential loops, so this would break feedback loop data flow.
-  let threadScaleUOps = backend == .metal
-    ? emitThreadCountScaleOpIfNeeded(ctx: ctx, block: block, g: g)
-    : []
-  bodyUops.append(contentsOf: threadScaleUOps)
-  let emittedThreadScale = !threadScaleUOps.isEmpty
-  for nodeId in block.nodes {
-    if !emittedThreadScale, let tensorIndex = block.tensorIndex {
-      ctx.tensorIndices[nodeId] = tensorIndex
-    }
+  // Shape-aware emission for blocks with shape transitions
+  // Both Metal and C need this when shapes change (e.g., matmul [M,K] @ [K,N] -> [M,N,K] product)
+  // Without this, the outer loop uses the wrong shape, producing incorrect results
+  let useShapeAwareEmission = block.kind == .scalar && hasMultipleShapes
 
-    if let node = g.nodes[nodeId] {
-      for uop in try node.op.emit(ctx: ctx, g: g, nodeId: nodeId) {
-        emittedNodes.insert(nodeId)
-        bodyUops.append(uop)
+  if useShapeAwareEmission {
+    // Use specialized emission with per-shape element loops
+    let shapeAwareUOps = try emitScalarBlockWithShapeTransitions(
+      ctx: ctx, block: block, blocks: blocks, g: g, transitions: shapeTransitions
+    )
+    // Mark nodes as emitted
+    for nodeId in block.nodes {
+      emittedNodes.insert(nodeId)
+    }
+    bodyUops.append(contentsOf: shapeAwareUOps)
+  } else {
+    // Standard emission path
+    // Thread count scaling is a Metal-specific parallelization optimization.
+    // C backend uses sequential loops, so this would break feedback loop data flow.
+    let threadScaleUOps =
+      backend == .metal
+      ? emitThreadCountScaleOpIfNeeded(ctx: ctx, block: block, g: g)
+      : []
+    bodyUops.append(contentsOf: threadScaleUOps)
+    let emittedThreadScale = !threadScaleUOps.isEmpty
+    for nodeId in block.nodes {
+      if !emittedThreadScale, let tensorIndex = block.tensorIndex {
+        ctx.tensorIndices[nodeId] = tensorIndex
+      }
+
+      if let node = g.nodes[nodeId] {
+        for uop in try node.op.emit(ctx: ctx, g: g, nodeId: nodeId) {
+          emittedNodes.insert(nodeId)
+          bodyUops.append(uop)
+        }
       }
     }
   }
@@ -1311,7 +1581,10 @@ public func emitBlockUOps(
   var uops: [UOp] = []
 
   // C backend wraps tensor blocks in a sequential loop
-  if backend == .c, let tensorIndex = block.tensorIndex, let shape = block.shape {
+  // Skip if using shape-aware emission (it has its own loops)
+  if backend == .c, !useShapeAwareEmission, let tensorIndex = block.tensorIndex,
+    let shape = block.shape
+  {
     let count = shape.reduce(1, *)
     var loopUOp = UOp(op: .beginParallelRange(count, simdIncrement), value: tensorIndex)
     loopUOp.kind = effectiveKind  // Match loop wrapper kind to body operations
@@ -1380,8 +1653,8 @@ public func emitBlockUOps(
     }
   }
 
-  // Close the tensor loop for C backend
-  if backend == .c, block.tensorIndex != nil {
+  // Close the tensor loop for C backend (skip if shape-aware emission has its own loops)
+  if backend == .c, !useShapeAwareEmission, block.tensorIndex != nil {
     uops.append(UOp(op: .endParallelRange, value: ctx.useVariable(src: nil)))
   }
 
@@ -1401,6 +1674,13 @@ public func splitReduceBlocks(g: Graph, blocks: [Block]) -> [Block] {
   var splitBlocks: [Block] = []
 
   for block in blocks {
+    // Don't split scalar blocks - they run frame-by-frame serially and need
+    // all operations to stay together for feedback cycles to work correctly
+    if block.kind == .scalar {
+      splitBlocks.append(block)
+      continue
+    }
+
     let reductionOpIndex = block.nodes.firstIndex { nodeId in
       guard let node = g.nodes[nodeId] else { return false }
       return isReductionOp(node.op)
@@ -1421,11 +1701,13 @@ public func splitReduceBlocks(g: Graph, blocks: [Block]) -> [Block] {
     }
 
     // Reduction block
-    // Global reduces (peekRowGradReduce/selectRowGradReduce) run once total, not per-frame
+    // Global reduces run once total, not per-frame:
+    // - peekRowGradReduce/selectRowGradReduce: reduction ops with internal frame loops
+    // - tensorAccumulate: atomic gradient accumulation, loops over frames internally
     let reductionNode = g.nodes[block.nodes[reductionOpIndex]]
     let isGlobalReduce: Bool
     switch reductionNode?.op {
-    case .peekRowGradReduce, .selectRowGradReduce:
+    case .peekRowGradReduce, .selectRowGradReduce, .tensorAccumulate:
       isGlobalReduce = true
     default:
       isGlobalReduce = false
@@ -1443,13 +1725,15 @@ public func splitReduceBlocks(g: Graph, blocks: [Block]) -> [Block] {
     }
     splitBlocks.append(reductionBlock)
 
-    // Post-reduction block
+    // Post-reduction block - recursively split if it contains more reductions
     if reductionOpIndex < block.nodes.count - 1 {
       var postReductionBlock = Block(kind: .simd)
       postReductionBlock.nodes = Array(block.nodes[reductionOpIndex + 1..<block.nodes.count])
       postReductionBlock.shape = block.shape
       postReductionBlock.temporality = block.temporality
-      splitBlocks.append(postReductionBlock)
+      // Recursively split the post-reduction block in case it has more reductions
+      let furtherSplit = splitReduceBlocks(g: g, blocks: [postReductionBlock])
+      splitBlocks.append(contentsOf: furtherSplit)
     }
   }
 

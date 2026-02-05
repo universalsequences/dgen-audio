@@ -203,6 +203,7 @@ public struct CompilationPipeline {
         return false
       }
     }
+
     if hasSpectralLossOps {
       finalBlocks = isolateSpectralPasses(finalBlocks, graph)
     }
@@ -441,7 +442,7 @@ extension CompilationResult {
 private func printUOpBlocks(_ uopBlocks: [BlockUOps], blocks: [Block]) {
   for (i, uopBlock) in uopBlocks.enumerated() {
     print(
-      "block #\(i+1) kind=\(uopBlock.kind) threadCountScale\(uopBlock.threadCountScale) shape=\(blocks[i].shape) tensorIndex=\(blocks[i].tensorIndex)"
+      "block #\(i+1) kind=\(uopBlock.kind) threadCountScale\(uopBlock.threadCountScale) shape=\(blocks[i].shape) tensorIndex=\(blocks[i].tensorIndex) nodes=\(blocks[i].nodes)"
     )
     var indentLevel = 0
     for uop in uopBlock.ops {
@@ -786,6 +787,24 @@ func determineTensorBlocks(_ blocks: [Block], _ graph: Graph, _ ctx: IRContext) 
   }
 
   for block in blocks {
+    // CRITICAL: Scalar blocks (feedback clusters) must NOT be split!
+    // They contain history read/write ops that must execute sequentially together.
+    // But we still need to set up tensorIndex for tensor operations inside.
+    if block.kind == .scalar {
+      var modifiedBlock = block
+      // Set up tensor index for the first tensor op in this scalar block
+      for nodeId in block.nodes {
+        if let node = graph.nodes[nodeId], case .tensor(let shape) = node.shape {
+          if modifiedBlock.tensorIndex == nil {
+            modifiedBlock.tensorIndex = ctx.useVariable(src: nil)
+            modifiedBlock.shape = shape
+          }
+          break  // Only need to assign once per block
+        }
+      }
+      determined.append(modifiedBlock)
+      continue
+    }
     var innerBlocks: [Block] = []
     var currentBlock = makeBlock(from: block)
     var currentShape: Shape? = nil
@@ -802,6 +821,13 @@ func determineTensorBlocks(_ blocks: [Block], _ graph: Graph, _ ctx: IRContext) 
         // that process tensor data will create the tensor blocks.
         if case .tensorRef = node.op {
           if case .tensor(let shape) = node.shape {
+            // If shape differs, split the block first
+            if currentShape != nil && shape != currentShape {
+              if currentBlock.nodes.count > 0 {
+                innerBlocks.append(currentBlock)
+              }
+              currentBlock = makeBlock(from: block)
+            }
             currentBlock.shape = shape
             currentBlock.tensorIndex = ctx.useVariable(src: nil)
             currentShape = shape

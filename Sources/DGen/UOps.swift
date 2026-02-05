@@ -86,6 +86,8 @@ public enum Op {
   case expandView([Int])  // View op: broadcast size-1 dims via stride=0 - renders to nothing but prevents SIMD
   case repeatView([Int])  // View op: tile tensor via modular indexing - renders to nothing but prevents SIMD
   case broadcastAccess  // Marker: broadcast indexing used - renders to nothing but prevents SIMD
+  case sumAxisMarker(Int, Int, [Int], [Int], Bool, Bool)  // Marker: sumAxis(nodeId, axis, inShape, outShape, inFrameAware, outFrameAware)
+  case expandAxisMarker(Int, Int, [Int], [Int], Bool, Bool)  // Marker: expandAxis(nodeId, axis, inShape, outShape, inFrameAware, outFrameAware)
 
   // Hop-based execution control (for FFT/spectral processing)
   case beginHopCheck(CellID)  // if (memory[counterCell] == 0.0f) { - runs block only when counter is 0

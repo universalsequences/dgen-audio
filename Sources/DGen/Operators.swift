@@ -170,6 +170,7 @@ public enum LazyOp {
   case pad([(Int, Int)])  // Pad tensor with zeros (virtual view, conditional reads)
   case expandView(Shape)  // Broadcast size-1 dims to target shape (stride=0 view, no data copy)
   case repeatView([Int])  // Tile tensor by repeating along each dim (modular index view, no data copy)
+  case asStrided(Shape, [Int])  // View with custom strides (for pool/im2col operations)
   case peek  // Read from 2D tensor at (index, channel) with interpolation - lazy version
   case fft(Int, Int, CellID, CellID, CellID, CellID)  // FFT transform: windowSize, hopSize, scratchCell, ringBufferCell, writePosCell, counterCell
   case ifft(Int, Int, CellID, CellID, CellID, CellID)  // IFFT transform: windowSize, hopSize, scratchCell, outputRingCell, readPosCell, counterCell
@@ -380,7 +381,7 @@ public enum LazyOp {
       }
       b.use(val: acc.value)
     case .tensorAccumulate(let cellId):
-      // Input is a tensor node - atomically add each element to cell
+      // Atomically add each tensor element to a memory cell
       guard node.inputs.count == 1 else {
         throw DGenError.insufficientInputs(
           operator: "tensorAccumulate", expected: 1, actual: node.inputs.count)
@@ -397,12 +398,10 @@ public enum LazyOp {
 
       let size = shape.reduce(1, *)
 
-      // Check if input tensor is frame-aware (has per-frame storage)
       if ctx.frameAwareTensorCells.contains(tensor.cellId),
         let (tensorSize, frameCount) = ctx.g.frameAwareCells[tensor.cellId]
       {
-        // Frame-aware: sum across all frames into the accumulation cell
-        // Each frame has its own copy at frameIdx * tensorSize + elemIdx
+        // Frame-aware: sum across all frames (each at frameIdx * tensorSize + elemIdx)
         let tensorSizeFloat = b.constant(Float(tensorSize))
         b.parallelRange(size) { elemIdx in
           let elemIdxFloat = b.cast(elemIdx, to: .float)
@@ -413,8 +412,15 @@ public enum LazyOp {
             _ = b.memoryAccumulate(cellId, b.cast(elemIdx, to: .int), val)
           }
         }
+      } else if !tensor.transforms.isEmpty {
+        // Use tensorRead to walk the transform chain
+        b.parallelRange(size) { idx in
+          let indices = b.flatToMultiIndex(b.cast(idx, to: .float), shape)
+          let val = b.tensorRead(tensor, indices: indices)
+          _ = b.memoryAccumulate(cellId, b.cast(idx, to: .int), val)
+        }
       } else {
-        // Non-frame-aware: existing linear read
+        // Direct linear read (no transforms, no frame awareness)
         b.parallelRange(size) { idx in
           let val = b.memoryRead(tensor.cellId, b.cast(idx, to: .int))
           _ = b.memoryAccumulate(cellId, b.cast(idx, to: .int), val)
@@ -950,7 +956,13 @@ public enum LazyOp {
         let safeContrib = b.gswitch(inBounds, contrib, b.constant(0.0))
         gradSum.accumulate(safeContrib)
       }
-      b.use(val: gradSum.value)
+      // Normalize to prevent gradient explosion while allowing learning
+      // The gradient from each overlapping window contributes to this sum
+      // Normalize by sqrt(numBins * windowSize) to balance gradient magnitude
+      let numBinsFloat = b.constant(Float(windowSize / 2 + 1))
+      let normFactor = b.sqrt(numBinsFloat * winSizeFloat)
+      let normalizedGrad = gradSum.value / normFactor
+      b.use(val: normalizedGrad)
 
     case .spectralLossFFTGradRead2(let windowSize, let gradTime2Cell):
       // Read gradient for signal 2 from frame-indexed storage
@@ -986,20 +998,24 @@ public enum LazyOp {
         let safeContrib = b.gswitch(inBounds, contrib, b.constant(0.0))
         gradSum.accumulate(safeContrib)
       }
-      b.use(val: gradSum.value)
+      // Normalize to prevent gradient explosion while allowing learning
+      // The gradient from each overlapping window contributes to this sum
+      // Normalize by sqrt(numBins * windowSize) to balance gradient magnitude
+      let numBinsFloat2 = b.constant(Float(windowSize / 2 + 1))
+      let normFactor2 = b.sqrt(numBinsFloat2 * winSizeFloat)
+      let normalizedGrad2 = gradSum.value / normFactor2
+      b.use(val: normalizedGrad2)
 
     case .selectRow:
-      // selectRow: extract a single row from a 2D tensor using dynamic index
-      // Inputs: [tensor2D, rowIndex]
-      // Output: 1D tensor [numCols]
+      // Extract a single row from a 2D tensor using dynamic index.
+      // Uses block-level parallelism via tensorIndices (like binary ops)
+      // Inputs: [tensor2D, rowIndex], Output: 1D tensor [numCols]
       guard node.inputs.count == 2 else {
         throw DGenError.insufficientInputs(
           operator: "selectRow", expected: 2, actual: node.inputs.count)
       }
 
       let tensorInput = node.inputs[0]
-
-      // Get tensor shape from the input node
       guard let inputNode = g.nodes[tensorInput],
         case .tensor(let shape) = inputNode.shape,
         shape.count == 2
@@ -1008,110 +1024,93 @@ public enum LazyOp {
       }
 
       let numRows = shape[0]
-      let numCols = shape[1]
 
-      // Get input and output tensors
       guard let inTensorId = g.nodeToTensor[tensorInput],
         let inTensor = g.tensors[inTensorId],
         let outTensorId = g.nodeToTensor[node.id],
-        let outTensor = g.tensors[outTensorId]
+        let outTensor = g.tensors[outTensorId],
+        let loopIdx = ctx.tensorIndices[nodeId]
       else {
         throw DGenError.tensorError(op: "selectRow", reason: "missing tensor")
       }
 
-      // Read rowIndex input and floor it
       let rowIndex = try b.readInput(node, inputs, at: 1)
       let numRowsFloat = b.constant(Float(numRows))
       let zero = b.constant(0.0)
 
-      // Wrap rowIndex using modulo for wrapping behavior, then floor
+      // Wrap rowIndex with modulo and ensure positive
       let wrappedIndex = b.mod(rowIndex, numRowsFloat)
       let isNegative = wrappedIndex < zero
       let positiveIndex = b.gswitch(isNegative, wrappedIndex + numRowsFloat, wrappedIndex)
       let floorIndex = b.floor(positiveIndex)
 
-      // Read the selected row and write to output
-      // Column-major layout: offset = col * numRows + row
-      b.parallelRange(numCols) { colIdx in
-        let colIdxFloat = b.cast(colIdx, to: .float)
-        let readPos = colIdxFloat * numRowsFloat + floorIndex
-        let value = b.memoryRead(inTensor.cellId, b.cast(readPos, to: .int))
-        _ = b.memoryWrite(outTensor.cellId, b.cast(colIdx, to: .int), value)
-      }
+      // Use block's tensor index - each thread handles ONE column
+      let colIdx = b.value(loopIdx)
+      let colIdxFloat = b.cast(colIdx, to: .float)
+      // Row-major read: tensorRead handles both transformed and base tensors
+      let value = b.tensorRead(inTensor, indices: [floorIndex, colIdxFloat])
+      _ = b.memoryWrite(outTensor.cellId, b.cast(colIdx, to: .int), value)
 
       ctx.values[nodeId] = .empty
 
     case .peekRowInline(let scratchCell, let numRows, let numCols):
-      // Interpolated row extraction with frame-indexed storage for SIMD safety
-      // Inputs: [tensor2D, rowIndex]
-      // Output: 1D tensor [numCols] stored at scratchCell[frame * numCols + col]
+      // Interpolated row extraction with frame-indexed storage for SIMD safety.
+      // Uses block-level parallelism via tensorIndices (like binary ops)
+      // Inputs: [tensor2D, rowIndex], Output: 1D tensor [numCols] at scratchCell[frame * numCols + col]
       guard node.inputs.count == 2 else {
         throw DGenError.insufficientInputs(
           operator: "peekRowInline", expected: 2, actual: node.inputs.count)
       }
 
       let tensorInput = node.inputs[0]
-
-      // Get input tensor
       guard let inTensorId = g.nodeToTensor[tensorInput],
         let inTensor = g.tensors[inTensorId],
         let outTensorId = g.nodeToTensor[node.id],
-        let outTensor = g.tensors[outTensorId]
+        let outTensor = g.tensors[outTensorId],
+        let loopIdx = ctx.tensorIndices[nodeId]
       else {
         throw DGenError.tensorError(op: "peekRowInline", reason: "missing tensor")
       }
 
-      // Read rowIndex input
       let rowIndex = try b.readInput(node, inputs, at: 1)
       let numRowsFloat = b.constant(Float(numRows))
       let numColsFloat = b.constant(Float(numCols))
       let zero = b.constant(0.0)
       let one = b.constant(1.0)
 
-      // Wrap rowIndex using modulo for wrapping behavior
+      // Wrap rowIndex with modulo and ensure positive
       let wrappedIndex = b.mod(rowIndex, numRowsFloat)
       let isNegative = wrappedIndex < zero
       let positiveIndex = b.gswitch(isNegative, wrappedIndex + numRowsFloat, wrappedIndex)
 
-      // Compute floor and ceil indices
+      // Compute floor/ceil indices for interpolation
       let floorIndex = b.floor(positiveIndex)
       let ceilIndex = floorIndex + one
       let ceilWrapped = b.gswitch(ceilIndex >= numRowsFloat, zero, ceilIndex)
-
-      // Compute frac for interpolation
       let frac = positiveIndex - floorIndex
       let oneMinusFrac = one - frac
 
-      // Get frame index for frame-indexed output storage
-      // Use currentFrameIndex() which returns the correct frame index in both normal
-      // and frame-aware tensor blocks (where threadIndex() would return the flat index)
+      // Use currentFrameIndex for correct frame index in frame-aware tensor blocks
       let frameIdx = b.currentFrameIndex()
       let frameBase = frameIdx * numColsFloat
 
-      // Compute interpolated values and write to frame-indexed positions
-      // Column-major layout for input: offset = col * numRows + row
-      b.parallelRange(numCols) { colIdx in
-        let colIdxFloat = b.cast(colIdx, to: .float)
-        // Read floor row value
-        let floorPos = colIdxFloat * numRowsFloat + floorIndex
-        let floorValue = b.memoryRead(inTensor.cellId, b.cast(floorPos, to: .int))
-        // Read ceil row value
-        let ceilPos = colIdxFloat * numRowsFloat + ceilWrapped
-        let ceilValue = b.memoryRead(inTensor.cellId, b.cast(ceilPos, to: .int))
-        // Interpolate: (1 - frac) * floor + frac * ceil
-        let interpolated = oneMinusFrac * floorValue + frac * ceilValue
-        // Write to frame-indexed position in scratch cell
-        let writePos = frameBase + colIdxFloat
-        _ = b.memoryWrite(scratchCell, b.cast(writePos, to: .int), interpolated)
-        // Also write to output tensor
-        // If the output cell is frame-aware, use frame-indexed addressing
-        // This matches how tensorRead will read from it
-        if ctx.frameAwareTensorCells.contains(outTensor.cellId) {
-          _ = b.memoryWrite(outTensor.cellId, b.cast(writePos, to: .int), interpolated)
-        } else {
-          // Legacy mode: non-frame-indexed (will be overwritten each frame)
-          _ = b.memoryWrite(outTensor.cellId, b.cast(colIdx, to: .int), interpolated)
-        }
+      // Use block's tensor index - each thread handles ONE column
+      let colIdx = b.value(loopIdx)
+      let colIdxFloat = b.cast(colIdx, to: .float)
+      // Row-major read: tensorRead handles both transformed and base tensors
+      let floorValue = b.tensorRead(inTensor, indices: [floorIndex, colIdxFloat])
+      let ceilValue = b.tensorRead(inTensor, indices: [ceilWrapped, colIdxFloat])
+
+      // Interpolate: (1 - frac) * floor + frac * ceil
+      let interpolated = oneMinusFrac * floorValue + frac * ceilValue
+      let writePos = frameBase + colIdxFloat
+      _ = b.memoryWrite(scratchCell, b.cast(writePos, to: .int), interpolated)
+
+      // Write to output tensor with appropriate addressing
+      if ctx.frameAwareTensorCells.contains(outTensor.cellId) {
+        _ = b.memoryWrite(outTensor.cellId, b.cast(writePos, to: .int), interpolated)
+      } else {
+        _ = b.memoryWrite(outTensor.cellId, b.cast(colIdx, to: .int), interpolated)
       }
 
       ctx.values[nodeId] = .empty
@@ -1171,23 +1170,18 @@ public enum LazyOp {
     case .selectRowGradReduce(
       let gradWriteCell, let rowIdxCell, let gradCell,
       let numRows, let numCols, let maxFrameCount):
-      // Sum contributions from all frames for each tensor position
-      // Input: [gradWritePass] (for ordering)
-      // Reads from frame-indexed storage and accumulates to gradCell
+      // Sum gradient contributions from all frames for each tensor position.
+      // Input: [gradWritePass] (dependency ordering only)
       guard node.inputs.count == 1 else {
         throw DGenError.insufficientInputs(
           operator: "selectRowGradReduce", expected: 1, actual: node.inputs.count)
       }
 
-      // Force dependency on write pass
-      let _ = b.value(inputs[0])
+      _ = b.value(inputs[0])  // Force dependency on write pass
 
       let numColsFloat = b.constant(Float(numCols))
       let zero = b.constant(0.0)
 
-      // For each position in the 2D tensor, sum contributions from all frames
-      // that selected this row
-      // Column-major layout: offset = col * numRows + row
       b.parallelRange(numRows) { rowIdx in
         let rowFloat = b.cast(rowIdx, to: .float)
 
@@ -1195,29 +1189,23 @@ public enum LazyOp {
           let colFloat = b.cast(colIdx, to: .float)
           let gradSum = b.float(0.0)
 
-          // Loop over all frames
           b.loop(maxFrameCount) { frameIdx in
             let frameFloat = b.cast(frameIdx, to: .float)
-            // Read which row this frame selected
             let selectedRow = b.memoryRead(rowIdxCell, b.cast(frameIdx, to: .int))
-            // Check if this frame selected the current row
             let isMatch = b.abs(selectedRow - rowFloat) < b.constant(0.5)
-            // Read gradient value from frame-indexed storage
             let readPos = frameFloat * numColsFloat + colFloat
             let gradValue = b.memoryRead(gradWriteCell, b.cast(readPos, to: .int))
-            // Conditionally accumulate
             let contribution = b.gswitch(isMatch, gradValue, zero)
             gradSum.accumulate(contribution)
           }
 
-          // Write accumulated gradient to output cell
-          // Column-major layout: offset = col * numRows + row
-          let destPos = colFloat * b.constant(Float(numRows)) + rowFloat
+          // Row-major layout to match tensorRead: offset = row * numCols + col
+          let destPos = rowFloat * numColsFloat + colFloat
           _ = b.memoryAccumulate(gradCell, b.cast(destPos, to: .int), gradSum.value)
         }
       }
 
-      b.use(val: zero)  // Side-effect only
+      b.use(val: zero)
 
     case .peekRowGradWrite(
       let floorGradCell, let ceilGradCell, let rowIdxCell, let fracCell,
@@ -1305,20 +1293,20 @@ public enum LazyOp {
     case .peekRowGradReduce(
       let floorGradCell, let ceilGradCell, let rowIdxCell, _,
       let gradCell, let numRows, let numCols, let maxFrameCount):
-      // Sum gradient contributions from all frames for each tensor position
+      // Sum gradient contributions from all frames for each tensor position (floor and ceil).
+      // Input: [gradWritePass] (dependency ordering only)
       guard node.inputs.count == 1 else {
         throw DGenError.insufficientInputs(
           operator: "peekRowGradReduce", expected: 1, actual: node.inputs.count)
       }
 
-      // Force dependency on write pass
-      let _ = b.value(inputs[0])
+      _ = b.value(inputs[0])  // Force dependency on write pass
 
       let numColsFloat = b.constant(Float(numCols))
       let zero = b.constant(0.0)
       let maxFrameCountFloat = b.constant(Float(maxFrameCount))
+      let frameCount = b.frameCount()
 
-      // For each position in the 2D tensor, sum contributions from all frames
       b.parallelRange(numRows) { rowIdx in
         let rowFloat = b.cast(rowIdx, to: .float)
 
@@ -1326,28 +1314,31 @@ public enum LazyOp {
           let colFloat = b.cast(colIdx, to: .float)
           let gradSum = b.float(0.0)
 
-          // Check both floor and ceil contributions from each frame
           b.loop(maxFrameCount) { frameIdx in
             let frameFloat = b.cast(frameIdx, to: .float)
-            // Check floor row match
+            let inBounds = frameFloat < frameCount
+            let readPos = frameFloat * numColsFloat + colFloat
+
+            // Floor row contribution
             let floorRow = b.memoryRead(rowIdxCell, b.cast(frameIdx, to: .int))
             let isFloorMatch = b.abs(floorRow - rowFloat) < b.constant(0.5)
-            let readPos = frameFloat * numColsFloat + colFloat
             let floorGrad = b.memoryRead(floorGradCell, b.cast(readPos, to: .int))
-            let floorContrib = b.gswitch(isFloorMatch, floorGrad, zero)
+            let floorValid = inBounds * isFloorMatch
+            let floorContrib = b.gswitch(floorValid > zero, floorGrad, zero)
             gradSum.accumulate(floorContrib)
 
-            // Check ceil row match (stored at frame + maxFrameCount)
+            // Ceil row contribution (index stored at frame + maxFrameCount)
             let ceilSlot = frameFloat + maxFrameCountFloat
             let ceilRow = b.memoryRead(rowIdxCell, b.cast(ceilSlot, to: .int))
             let isCeilMatch = b.abs(ceilRow - rowFloat) < b.constant(0.5)
             let ceilGrad = b.memoryRead(ceilGradCell, b.cast(readPos, to: .int))
-            let ceilContrib = b.gswitch(isCeilMatch, ceilGrad, zero)
+            let ceilValid = inBounds * isCeilMatch
+            let ceilContrib = b.gswitch(ceilValid > zero, ceilGrad, zero)
             gradSum.accumulate(ceilContrib)
           }
 
-          // Write to gradient cell (column-major layout)
-          let destPos = colFloat * b.constant(Float(numRows)) + rowFloat
+          // Row-major layout to match tensorRead: offset = row * numCols + col
+          let destPos = rowFloat * numColsFloat + colFloat
           _ = b.memoryAccumulate(gradCell, b.cast(destPos, to: .int), gradSum.value)
         }
       }
@@ -1783,8 +1774,23 @@ public enum LazyOp {
         throw DGenError.tensorError(op: "sumAxis", reason: "invalid input")
       }
 
+      // Check if input/output cells are frame-aware
+      let inIsFrameAware = ctx.frameAwareTensorCells.contains(inTensor.cellId)
+      let outIsFrameAware = ctx.frameAwareTensorCells.contains(outCell)
+      let inTensorSize = inShape.reduce(1, *)
+      let outTensorSize = outShape.reduce(1, *)
+
+      // Debug marker for tracing sumAxis operations
+      b.ops.append(UOp(op: .sumAxisMarker(nodeId, axis, inShape, outShape, inIsFrameAware, outIsFrameAware), value: .empty))
+
       let outIdx = b.value(loopIdx)
       let acc = b.float(0.0)
+
+      // Compute input strides for flat index calculation
+      var inStrides = [Int](repeating: 1, count: inShape.count)
+      for i in stride(from: inShape.count - 2, through: 0, by: -1) {
+        inStrides[i] = inStrides[i + 1] * inShape[i + 1]
+      }
 
       // Compute output strides for index conversion
       var outStrides = [Int](repeating: 1, count: outShape.count)
@@ -1817,9 +1823,35 @@ public enum LazyOp {
           }
         }
 
-        let val = b.tensorRead(inTensor, indices: inIndices)
+        // Compute flat input index from multi-dimensional indices
+        var inFlatIdx: Expr = b.constant(0.0)
+        for i in 0..<inShape.count {
+          inFlatIdx = inFlatIdx + inIndices[i] * b.constant(Float(inStrides[i]))
+        }
+
+        // Read from input tensor
+        // Always use tensorRead for padded tensors - it handles padding bounds checking
+        // tensorRead also handles frame-aware tensors internally
+        let val: Expr
+        if inTensor.padding != nil {
+          // Padded tensor: must use tensorRead for padding bounds checking
+          val = b.tensorRead(inTensor, indices: inIndices)
+        } else if inIsFrameAware {
+          // Non-padded frame-aware tensor: use direct frame-aware read
+          val = b.frameAwareTensorRead(cellId: inTensor.cellId, tensorSize: inTensorSize, elemIdx: inFlatIdx)
+        } else {
+          // Non-padded, non-frame-aware: use tensorRead
+          val = b.tensorRead(inTensor, indices: inIndices)
+        }
+
         acc.accumulate(val)
-        _ = b.memoryWrite(outCell, b.cast(outIdx, to: .int), acc.value)
+
+        // Write with frame-aware addressing if needed
+        if outIsFrameAware {
+          _ = b.frameAwareTensorWrite(cellId: outCell, tensorSize: outTensorSize, elemIdx: outIdx, value: acc.value)
+        } else {
+          _ = b.memoryWrite(outCell, b.cast(outIdx, to: .int), acc.value)
+        }
       }
 
     case .reshape(let newShape):
@@ -1829,6 +1861,12 @@ public enum LazyOp {
       ctx.values[nodeId] = .empty
       // Emit marker UOp for debugging and to signal SIMD should be disabled
       ops.append(UOp(op: .reshape(newShape), value: .empty))
+
+    case .asStrided(let newShape, _):
+      // asStrided is metadata-only (view with custom strides for pool/im2col)
+      // The actual stride change is handled by tensor metadata
+      ctx.values[nodeId] = .empty
+      ops.append(UOp(op: .reshape(newShape), value: .empty))  // Use reshape UOp as marker
 
     case .transpose(let axes):
       // Transpose is metadata-only for contiguous layouts
@@ -2306,11 +2344,14 @@ public enum LazyOp {
 
     case .expand(let targetShape):
       // Broadcast scalar to tensor shape (for sum backward)
+      // Uses block-level parallelism via tensorIndices (like binary ops)
       // Input is scalar, output is tensor where all elements = input
       guard inputs.count == 1 else { fatalError("expand requires 1 input") }
 
       // Get or create output tensor
-      guard let outTensor = g.nodeToTensor[nodeId].flatMap({ g.tensors[$0] }) else {
+      guard let outTensor = g.nodeToTensor[nodeId].flatMap({ g.tensors[$0] }),
+        let loopIdx = ctx.tensorIndices[nodeId]
+      else {
         // Fallback: just pass through the scalar
         b.use(val: b.value(inputs[0]))
         break
@@ -2322,58 +2363,43 @@ public enum LazyOp {
       // Check if output tensor is frame-aware (needs per-frame storage)
       let isFrameAware = ctx.frameAwareTensorCells.contains(outTensor.cellId)
 
-      // Check if input has a tensor cell we can read from (for cross-scope access)
+      // Use block's tensor index - each thread handles ONE element
+      let idx = b.value(loopIdx)
+
+      // Get scalar value to broadcast
+      let scalarVal: Expr
       if let inputTensorId = g.nodeToTensor[inputNodeId],
         let inputTensor = g.tensors[inputTensorId]
       {
         // Input is a tensor - read element 0 (assumes scalar stored in tensor)
-        if isFrameAware {
-          // Frame-aware output: write to frame-indexed positions
-          let frameIdx = b.currentFrameIndex()
-          let frameBase = frameIdx * b.constant(Float(size))
-          b.parallelRange(size) { idx in
-            let scalarVal = b.memoryRead(inputTensor.cellId, b.int(0))
-            let writePos = frameBase + b.cast(idx, to: .float)
-            _ = b.memoryWrite(outTensor.cellId, b.cast(writePos, to: .int), scalarVal)
-          }
-        } else {
-          // Non-frame-aware: existing linear write
-          b.parallelRange(size) { idx in
-            let scalarVal = b.memoryRead(inputTensor.cellId, b.int(0))
-            _ = b.memoryWrite(outTensor.cellId, b.cast(idx, to: .int), scalarVal)
-          }
-        }
+        scalarVal = b.memoryRead(inputTensor.cellId, b.int(0))
       } else {
         // Input is a scalar computed in current scope
-        let scalarVal = b.value(inputs[0])
+        scalarVal = b.value(inputs[0])
+      }
 
-        if isFrameAware {
-          // Frame-aware output: write to frame-indexed positions
-          // Use scalar directly without write-read-back to avoid race condition
-          let frameIdx = b.currentFrameIndex()
-          let frameBase = frameIdx * b.constant(Float(size))
-          b.parallelRange(size) { idx in
-            let writePos = frameBase + b.cast(idx, to: .float)
-            _ = b.memoryWrite(outTensor.cellId, b.cast(writePos, to: .int), scalarVal)
-          }
-        } else {
-          // Non-frame-aware: use write-read-back pattern for scope capture
-          _ = b.memoryWrite(outTensor.cellId, b.int(0), scalarVal)
-          b.parallelRange(size) { idx in
-            let storedVal = b.memoryRead(outTensor.cellId, b.int(0))
-            _ = b.memoryWrite(outTensor.cellId, b.cast(idx, to: .int), storedVal)
-          }
-        }
+      // Write to output position
+      if isFrameAware {
+        // Frame-aware output: write to frame-indexed position
+        let frameIdx = b.currentFrameIndex()
+        let frameBase = frameIdx * b.constant(Float(size))
+        let writePos = frameBase + b.cast(idx, to: .float)
+        _ = b.memoryWrite(outTensor.cellId, b.cast(writePos, to: .int), scalarVal)
+      } else {
+        // Non-frame-aware: direct write
+        _ = b.memoryWrite(outTensor.cellId, b.cast(idx, to: .int), scalarVal)
       }
 
     case .expandAxis(let targetShape, let axis):
       // Broadcast along a specific axis (for sumAxis backward)
+      // Uses block-level parallelism via tensorIndices (like binary ops)
       guard inputs.count == 1 else { fatalError("expandAxis requires 1 input") }
 
       guard let inTensor = g.nodeToTensor[node.inputs[0]].flatMap({ g.tensors[$0] }),
-        let outTensor = g.nodeToTensor[nodeId].flatMap({ g.tensors[$0] })
+        let outTensor = g.nodeToTensor[nodeId].flatMap({ g.tensors[$0] }),
+        let loopIdx = ctx.tensorIndices[nodeId]
       else {
-        // Fallback
+        // Fallback for scalar case
         if let s = inputs.first { b.use(val: b.value(s)) }
         break
       }
@@ -2381,25 +2407,46 @@ public enum LazyOp {
       let outSize = targetShape.reduce(1, *)
       let normalizedAxis = axis < 0 ? targetShape.count + axis : axis
 
-      // Compute strides for output shape (excluding the expanded axis)
+      // Check if input/output cells are frame-aware
+      let inIsFrameAware = ctx.frameAwareTensorCells.contains(inTensor.cellId)
+      let outIsFrameAware = ctx.frameAwareTensorCells.contains(outTensor.cellId)
+
+      // Compute input shape (output shape with the expanded axis removed)
       var inputShape = targetShape
       inputShape.remove(at: normalizedAxis)
+
+      // Debug marker for tracing expandAxis operations
+      b.ops.append(UOp(op: .expandAxisMarker(nodeId, normalizedAxis, inputShape, targetShape, inIsFrameAware, outIsFrameAware), value: .empty))
+      let inSize = inputShape.reduce(1, *)
       let inputStrides = Tensor.computeRowMajorStrides(inputShape)
       let outputStrides = Tensor.computeRowMajorStrides(targetShape)
 
-      b.parallelRange(outSize) { outIdx in
-        // Map output index to input index (skip the expanded axis dimension)
-        var inputFlatIdx = b.int(0)
-        var inDim = 0
-        for dim in 0..<targetShape.count {
-          if dim == normalizedAxis { continue }
-          let coord = b.mod(
-            b.floorDiv(outIdx, b.int(outputStrides[dim])), b.int(targetShape[dim]))
-          inputFlatIdx = b.add(inputFlatIdx, b.mul(coord, b.int(inputStrides[inDim])))
-          inDim += 1
-        }
+      // Use block's tensor index (like binary ops) - each thread handles ONE element
+      let outIdx = b.value(loopIdx)
 
-        let val = b.memoryRead(inTensor.cellId, inputFlatIdx)
+      // Map output index to input index (skip the expanded axis dimension)
+      var inputFlatIdx: Expr = b.int(0)
+      var inDim = 0
+      for dim in 0..<targetShape.count {
+        if dim == normalizedAxis { continue }
+        let coord = b.mod(
+          b.floorDiv(outIdx, b.int(outputStrides[dim])), b.int(targetShape[dim]))
+        inputFlatIdx = b.add(inputFlatIdx, b.mul(coord, b.int(inputStrides[inDim])))
+        inDim += 1
+      }
+
+      // Read with frame-aware addressing if needed
+      let val: Expr
+      if inIsFrameAware {
+        val = b.frameAwareTensorRead(cellId: inTensor.cellId, tensorSize: inSize, elemIdx: b.cast(inputFlatIdx, to: .float))
+      } else {
+        val = b.memoryRead(inTensor.cellId, inputFlatIdx)
+      }
+
+      // Write with frame-aware addressing if needed
+      if outIsFrameAware {
+        _ = b.frameAwareTensorWrite(cellId: outTensor.cellId, tensorSize: outSize, elemIdx: b.cast(outIdx, to: .float), value: val)
+      } else {
         _ = b.memoryWrite(outTensor.cellId, b.cast(outIdx, to: .int), val)
       }
 

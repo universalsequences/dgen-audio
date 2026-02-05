@@ -353,7 +353,9 @@ public final class IRBuilder {
     guard let inputNode = ctx.g.nodes[inputId] else { throw DGenError.missingTensorID }
 
     // scalar
-    if case .scalar = inputNode.shape ?? .scalar { return value(inputs[idx]) }
+    if case .scalar = inputNode.shape ?? .scalar {
+      return value(inputs[idx])
+    }
 
     // tensor
     guard case .tensor(let outShape) = node.shape,
@@ -363,13 +365,12 @@ public final class IRBuilder {
       throw DGenError.missingTensorID
     }
 
-    // For padded or repeated tensors, use tensorRead which handles bounds checking and modular indexing
-    if tensor.padding != nil || tensor.innerShapeForRepeat != nil {
+    // For tensors with transforms, use tensorRead which handles the transform chain
+    if !tensor.transforms.isEmpty {
       let indices = flatToMultiIndex(value(loopIdx), outShape)
-      return tensorRead(
-        tensor,
-        indices: broadcastIndices(
-          outputIndices: indices, outputShape: outShape, inputTensor: tensor))
+      let broadcastedIndices = broadcastIndices(
+        outputIndices: indices, outputShape: outShape, inputTensor: tensor)
+      return tensorRead(tensor, indices: broadcastedIndices)
     }
 
     let memOffset = broadcastIndex(
@@ -431,97 +432,35 @@ public final class IRBuilder {
     return stridedIndex(indices: indices, strides: tensor.strides, offset: tensor.offset)
   }
 
-  // MARK: - Tensor Read (handles padding)
-
-  /// Read from tensor with padding support.
-  /// For non-padded tensors: direct memory read.
-  /// For padded tensors: returns 0 for padded regions, real data otherwise.
-  public func tensorRead(_ tensor: Tensor, indices: [Expr]) -> Expr {
-    var adjustedIndices = indices
-
-    // Step 1: Apply shrinkStart if present (for shrunk repeated tensors)
-    // This converts from shrunk tensor indices to full repeated tensor indices
-    if let shrinkStart = tensor.shrinkStart {
-      adjustedIndices = indices.enumerated().map { i, idx in
-        idx + constant(Float(shrinkStart[i]))
-      }
-    }
-
-    // Step 2: Apply modular indexing for repeated tensor
-    // This wraps indices to the original tensor size
-    if let innerShape = tensor.innerShapeForRepeat {
-      adjustedIndices = adjustedIndices.enumerated().map { i, idx in
-        mod(idx, constant(Float(innerShape[i])))
-      }
-    }
-
-    if let padding = tensor.padding {
-      // Padded tensor: default to 0, conditionally read real data
-      let val = float(0.0)
-
-      // Build inBounds check for all axes
-      var inBounds: Expr = constant(1.0)
-      for (i, (left, right)) in padding.enumerated() {
-        let idx = adjustedIndices[i]
-        let innerEnd = constant(Float(tensor.shape[i] - right))
-        // idx >= left AND idx < innerEnd
-        inBounds = inBounds * (idx >= constant(Float(left))) * (idx < innerEnd)
-      }
-
-      self.if(inBounds) {
-        // Adjust indices by subtracting padLeft
-        let adjusted = adjustedIndices.enumerated().map { i, idx in
-          idx - constant(Float(padding[i].left))
-        }
-        let memIdx = tensorMemoryIndex(tensor, indices: adjusted)
-        mutate(val.value, to: memoryRead(tensor.cellId, memIdx))
-      }
-
-      return val.value
-    } else {
-      // Non-padded: direct read using (possibly modulo-adjusted) indices
-      let memIdx = tensorMemoryIndex(tensor, indices: adjustedIndices)
-      return memoryRead(tensor.cellId, memIdx)
-    }
-  }
-
-  /// Read from tensor using flat index with padding support.
-  /// For frame-aware cells, uses frame-indexed addressing.
-  public func tensorRead(_ tensor: Tensor, flatIdx: Expr, shape: [Int]) -> Expr {
-    if tensor.padding != nil || tensor.innerShapeForRepeat != nil || tensor.shrinkStart != nil {
-      // Need multi-dim indices for padding check, modular repeat indexing, or shrink offset
-      let indices = flatToMultiIndex(flatIdx, shape)
-      return tensorRead(tensor, indices: indices)
-    } else if ctx.frameAwareTensorCells.contains(tensor.cellId),
-      let (tensorSize, _) = ctx.g.frameAwareCells[tensor.cellId]
-    {
-      // Frame-aware tensor: use frame-indexed addressing
-      return frameAwareTensorRead(cellId: tensor.cellId, tensorSize: tensorSize, elemIdx: flatIdx)
-    } else {
-      // Non-padded: use fast path
-      let memIdx = tensorMemoryIndex(tensor, flatIdx: flatIdx, shape: shape)
-      return memoryRead(tensor.cellId, memIdx)
-    }
-  }
-
   // MARK: - Broadcast Indexing
 
-  /// Flat index → multi-dim indices for shape (row-major)
+  /// Flat index -> multi-dim indices for shape (row-major).
+  /// For the last dimension, the remainder is the index directly (stride is always 1).
   func flatToMultiIndex(_ flat: Expr, _ shape: [Int]) -> [Expr] {
     var indices: [Expr] = []
     var rem = flat
+    let lastDim = shape.count - 1
     for i in 0..<shape.count {
-      let stride = shape[(i + 1)...].reduce(1, *)
-      if stride == 1 {
+      if i == lastDim {
         indices.append(rem)
       } else {
-        let s = constant(Float(stride))
-        let idx = floor(rem / s)
+        let stride = constant(Float(shape[(i + 1)...].reduce(1, *)))
+        let idx = floor(rem / stride)
         indices.append(idx)
-        rem = rem - idx * s
+        rem = rem - idx * stride
       }
     }
     return indices
+  }
+
+  /// Multi-dim indices → flat index for shape (row-major)
+  func multiIndexToFlat(_ indices: [Expr], _ shape: [Int]) -> Expr {
+    var flat = constant(0.0)
+    for i in 0..<shape.count {
+      let stride = shape[(i + 1)...].reduce(1, *)
+      flat = flat + indices[i] * constant(Float(stride))
+    }
+    return flat
   }
 
   /// Output flat idx → input memory offset (handles broadcasting and view offsets)

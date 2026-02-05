@@ -1480,6 +1480,251 @@ final class GraphGradientTests: XCTestCase {
     XCTAssertLessThan(finalLoss, initialLoss, "Loss should decrease when gradients flow")
   }
 
+  /// Diagnostic: verify loss = 0 when student weights == teacher weights
+  func testMLPPeekRowHarmonicSynth_IdenticalWeightsZeroLoss() throws {
+    let frameCount = 64
+    let controlFrames = 16
+    let sampleRate: Float = 2000.0
+    let f0: Float = 100.0
+    let numHarmonics = 16
+    let hiddenSize = 8
+
+    let g = Graph(sampleRate: sampleRate, maxFrameCount: frameCount)
+
+    let timeData = (0..<controlFrames).map { Float($0) / Float(controlFrames - 1) }
+    let timeTensor = g.tensor(shape: [controlFrames, 1], data: timeData)
+
+    // Shared weight data - SAME for teacher and student
+    let W1Data = (0..<hiddenSize).map { i in
+      let x = Float(i) / Float(max(1, hiddenSize - 1))
+      return 1.1 * sin(x * 3.1 * Float.pi) + 0.5 * cos(x * 2.3 * Float.pi)
+    }
+    let b1Data = (0..<hiddenSize).map { i in
+      let x = Float(i) / Float(max(1, hiddenSize - 1))
+      return 0.4 * (x - 0.5) + 0.2 * sin(x * 5.0)
+    }
+    let W2Data = (0..<(hiddenSize * numHarmonics)).map { i in
+      let row = i / numHarmonics
+      let col = i % numHarmonics
+      let base = Float(row) * 0.6 + Float(col) * 0.25
+      let sign: Float = (col % 2 == 0) ? 1.0 : -1.0
+      return sign * (0.7 * sin(base) + 0.5 * cos(base * 1.3))
+    }
+    let b2Data = (0..<numHarmonics).map { i in
+      let inv = 0.8 / Float(i + 1)
+      let wiggle = 0.1 * sin(Float(i) * 1.7)
+      return inv + wiggle
+    }
+
+    // Teacher weights
+    let teacherW1 = g.tensor(shape: [1, hiddenSize], data: W1Data)
+    let teacherB1 = g.tensor(shape: [1, hiddenSize], data: b1Data)
+    let teacherW2 = g.tensor(shape: [hiddenSize, numHarmonics], data: W2Data)
+    let teacherB2 = g.tensor(shape: [1, numHarmonics], data: b2Data)
+
+    // Student weights - IDENTICAL to teacher
+    let studentW1 = g.tensor(shape: [1, hiddenSize], data: W1Data)
+    let studentB1 = g.tensor(shape: [1, hiddenSize], data: b1Data)
+    let studentW2 = g.tensor(shape: [hiddenSize, numHarmonics], data: W2Data)
+    let studentB2 = g.tensor(shape: [1, numHarmonics], data: b2Data)
+
+    // MLP forward
+    func mlpAmplitudes(time: NodeID, W1: NodeID, b1: NodeID, W2: NodeID, b2: NodeID) throws
+      -> NodeID
+    {
+      let one = g.n(.constant(1.0))
+      let h1 = try g.matmul(time, W1)
+      let h1b = g.n(.add, [h1, b1])
+      let h1a = g.n(.tanh, [h1b])
+      let h2 = try g.matmul(h1a, W2)
+      let h2b = g.n(.add, [h2, b2])
+      let neg = g.n(.mul, [h2b, g.n(.constant(-1.0))])
+      let expNeg = g.n(.exp, [neg])
+      return g.n(.div, [one, g.n(.add, [one, expNeg])])
+    }
+
+    let ampsStudent = try mlpAmplitudes(
+      time: timeTensor, W1: studentW1, b1: studentB1, W2: studentW2, b2: studentB2)
+    let ampsTeacher = try mlpAmplitudes(
+      time: timeTensor, W1: teacherW1, b1: teacherB1, W2: teacherW2, b2: teacherB2)
+
+    let ampsStudentT = try g.transpose(
+      try g.reshape(ampsStudent, to: [numHarmonics, controlFrames]), axes: [1, 0])
+    let ampsTeacherT = try g.transpose(
+      try g.reshape(ampsTeacher, to: [numHarmonics, controlFrames]), axes: [1, 0])
+
+    let zero = g.n(.constant(0.0))
+    let twoPi = g.n(.constant(Float.pi * 2.0))
+    let frameIdx = g.phasor(freq: g.n(.constant(sampleRate / Float(frameCount))), reset: zero)
+    let playhead = g.n(.mul, [frameIdx, g.n(.constant(Float(controlFrames - 1)))])
+
+    let freqData = (1...numHarmonics).map { f0 * Float($0) }
+    let freqTensor = g.tensor(shape: [numHarmonics], data: freqData)
+    let phasesTensor = g.n(.deterministicPhasor, [freqTensor])
+    let sinesTensor = g.n(.sin, [g.n(.mul, [twoPi, phasesTensor])])
+
+    let ampsStudentAtTime = try g.peekRow(tensor: ampsStudentT, rowIndex: playhead)
+    let ampsTeacherAtTime = try g.peekRow(tensor: ampsTeacherT, rowIndex: playhead)
+
+    let synthStudent = g.n(.sum, [g.n(.mul, [sinesTensor, ampsStudentAtTime])])
+    let synthTeacher = g.n(.sum, [g.n(.mul, [sinesTensor, ampsTeacherAtTime])])
+
+    let norm = g.n(.constant(1.0 / Float(numHarmonics)))
+    let studentOut = g.n(.mul, [synthStudent, norm])
+    let teacherOut = g.n(.mul, [synthTeacher, norm])
+
+    let loss = g.spectralLossFFT(studentOut, teacherOut, windowSize: 64)
+    _ = g.n(.output(0), [loss])
+
+    let ctx = try GraphTrainingContext(
+      graph: g, loss: loss, tensorParameters: [], optimizer: GraphSGD(),
+      learningRate: 0.0, frameCount: frameCount
+    )
+
+    let lossValue = ctx.trainStep(fullReset: true)
+    print("Identical weights loss: \(lossValue)")
+
+    // Loss should be exactly 0 (or very close due to floating point)
+    XCTAssertLessThan(lossValue, 1e-6, "Loss should be ~0 when student == teacher")
+  }
+
+  /// Diagnostic: can gradients correct small perturbations?
+  func testMLPPeekRowHarmonicSynth_SmallPerturbation() throws {
+    let frameCount = 64
+    let controlFrames = 16
+    let sampleRate: Float = 2000.0
+    let f0: Float = 100.0
+    let numHarmonics = 16
+    let hiddenSize = 8
+
+    let g = Graph(sampleRate: sampleRate, maxFrameCount: frameCount)
+
+    let timeData = (0..<controlFrames).map { Float($0) / Float(controlFrames - 1) }
+    let timeTensor = g.tensor(shape: [controlFrames, 1], data: timeData)
+
+    // SINGLE-LAYER linear model (unique solution! not overparameterized)
+    // y = x @ W + b
+    // Shape: [controlFrames, 1] @ [1, numHarmonics] + [1, numHarmonics] = [controlFrames, numHarmonics]
+    let WData = (0..<numHarmonics).map { i in
+      let x = Float(i) / Float(max(1, numHarmonics - 1))
+      return 1.1 * sin(x * 3.1 * Float.pi) + 0.5 * cos(x * 2.3 * Float.pi)
+    }
+    let bData = (0..<numHarmonics).map { i in
+      let inv = 0.8 / Float(i + 1)
+      let wiggle = 0.1 * sin(Float(i) * 1.7)
+      return inv + wiggle
+    }
+
+    // Teacher weights (fixed)
+    let teacherW = g.tensor(shape: [1, numHarmonics], data: WData)
+    let teacherB = g.tensor(shape: [1, numHarmonics], data: bData)
+
+    // Student weights = teacher + perturbation
+    let perturbation: Float = 0.5
+    let studentW = TensorParameter(
+      graph: g, shape: [1, numHarmonics],
+      data: WData.map { $0 * (1.0 + perturbation) }, name: "W")
+    let studentB = TensorParameter(
+      graph: g, shape: [1, numHarmonics],
+      data: bData.map { $0 + perturbation * 0.1 }, name: "b")
+
+    // Single-layer linear: y = x @ W + b
+    func linearLayer(time: NodeID, W: NodeID, b: NodeID) throws -> NodeID {
+      let h = try g.matmul(time, W)  // [controlFrames, 1] @ [1, numHarmonics] = [controlFrames, numHarmonics]
+      return g.n(.add, [h, b])
+    }
+
+    let ampsStudent = try linearLayer(time: timeTensor, W: studentW.node(), b: studentB.node())
+    let ampsTeacher = try linearLayer(time: timeTensor, W: teacherW, b: teacherB)
+
+    // Skip peekRow and harmonic synthesis - compare raw MLP outputs directly
+    // ampsStudent and ampsTeacher are [controlFrames, numHarmonics]
+
+    // Compare all amplitudes with MSE
+    let ampsDiff = g.n(.sub, [ampsStudent, ampsTeacher])
+    let ampsDiffSq = g.n(.mul, [ampsDiff, ampsDiff])
+    let ampsSum = g.n(.sum, [ampsDiffSq])  // Sum of all squared differences
+    let totalElements = controlFrames * numHarmonics
+    let loss = g.n(.mul, [ampsSum, g.n(.constant(1.0 / Float(totalElements)))])  // MSE
+    _ = g.n(.output(0), [loss])
+
+    print("\n=== Single-Layer Linear Test (unique solution!) ===")
+
+    let ctx = try GraphTrainingContext(
+      graph: g, loss: loss,
+      tensorParameters: [studentW, studentB],  // Just 2 params now (single layer)
+      optimizer: GraphSGD(),
+      learningRate: 10.0,  // Higher LR for faster convergence
+      frameCount: frameCount,
+      kernelDebugOutput: "/tmp/pertubations.metal"
+    )
+
+    let initialLoss = ctx.trainStep(fullReset: true)
+    print("Initial loss (1% perturbation): \(String(format: "%.2e", initialLoss))")
+
+    var minLoss = initialLoss
+    var finalLoss = initialLoss
+    var patience = 0
+    let maxPatience = 100  // Stop if no improvement for 100 epochs
+
+    // Helper to compute gradient L2 norm
+    func gradNorm() -> Float {
+      let grads = ctx.getTensorGradients()
+      return sqrt(grads.map { $0 * $0 }.reduce(0, +))
+    }
+
+    for i in 0..<2000 {
+      // Manual step to capture gradients before update
+      ctx.resetState()
+      ctx.zeroGrad()
+      finalLoss = ctx.forward()
+      let norm = gradNorm()
+      ctx.step()
+
+      if finalLoss < minLoss {
+        minLoss = finalLoss
+        patience = 0
+      } else {
+        patience += 1
+      }
+      if i % 200 == 0 || i == 0 || (patience > 0 && patience < 5) {
+        let grads = ctx.getTensorGradients()
+        let firstFew = grads.prefix(4).map { String(format: "%.3f", $0) }.joined(separator: ", ")
+        print(
+          "Epoch \(i): loss = \(String(format: "%.8f", finalLoss)), grad_norm = \(String(format: "%.2e", norm)), grads[0:4] = [\(firstFew)]"
+        )
+      }
+      // Early stopping
+      if patience >= maxPatience {
+        print("Early stopping at epoch \(i) - no improvement for \(maxPatience) epochs")
+        print("Final grad_norm at plateau: \(String(format: "%.2e", norm))")
+        finalLoss = minLoss  // Report best achieved
+        break
+      }
+    }
+
+    print("Final loss: \(String(format: "%.8f", finalLoss))")
+    print("Min loss: \(String(format: "%.8f", minLoss))")
+    print("Loss reduction: \(String(format: "%.2f", initialLoss / minLoss))x")
+
+    // Analyze: compare weights directly (single layer = unique solution)
+    let diffW = zip(WData, studentW.data).map { abs($0 - $1) }
+    let maxDiffW = diffW.max() ?? 0
+    let diffB = zip(bData, studentB.data).map { abs($0 - $1) }
+    let maxDiffB = diffB.max() ?? 0
+
+    print("\nWeight comparison (single layer = unique solution):")
+    print("Max W diff: \(String(format: "%.6f", maxDiffW))")
+    print("Max b diff: \(String(format: "%.6f", maxDiffB))")
+    print("Teacher W first 4: \(WData.prefix(4).map { String(format: "%.4f", $0) })")
+    print("Student W first 4: \(studentW.data.prefix(4).map { String(format: "%.4f", $0) })")
+    print("Teacher b first 4: \(bData.prefix(4).map { String(format: "%.4f", $0) })")
+    print("Student b first 4: \(studentB.data.prefix(4).map { String(format: "%.4f", $0) })")
+
+    // With MSE loss, should be able to reduce loss significantly
+    XCTAssertLessThan(minLoss, initialLoss * 0.5, "Should correct perturbations with MSE loss")
+  }
+
   /// MLP -> peekRow -> Harmonic Synth teacher-student test
   /// Tests efficiency of the full pipeline with graph-based gradients
   func testMLPPeekRowHarmonicSynth_TeacherStudent() throws {
@@ -1615,7 +1860,7 @@ final class GraphGradientTests: XCTestCase {
       loss: loss,
       tensorParameters: [studentW1, studentB1, studentW2, studentB2],
       optimizer: GraphSGD(),
-      learningRate: 0.2,  // SGD with balanced LR
+      learningRate: 400.0,  // High LR due to tiny gradients from sigmoid saturation
       frameCount: frameCount,
       kernelDebugOutput: "/tmp/mlp_peekrow_harmonic_graph.metal"
     )
@@ -1644,44 +1889,64 @@ final class GraphGradientTests: XCTestCase {
     let initialLoss = ctx.trainStep(fullReset: true)
     print("Initial loss: \(initialLoss)")
 
-    // Training loop with timing
+    // Training loop with early stopping - stop when loss stops improving
     let epochs = 500
+    let patience = 200  // Stop if no improvement for this many epochs
     var finalLoss = initialLoss
+    var minLoss = initialLoss
+    var minLossEpoch = 0
+    var epochsWithoutImprovement = 0
     let trainStart = CFAbsoluteTimeGetCurrent()
+    var actualEpochs = 0
     for i in 0..<epochs {
-      // Print memory stats BEFORE trainStep (after zeroGrad from previous step)
+      actualEpochs = i + 1
       finalLoss = ctx.trainStep(fullReset: true)
+
+      // Track minimum loss and early stopping
+      if finalLoss < minLoss {
+        minLoss = finalLoss
+        minLossEpoch = i
+        epochsWithoutImprovement = 0
+      } else {
+        epochsWithoutImprovement += 1
+      }
 
       // Get gradient statistics from tensor parameters (not scalar params)
       let grads = ctx.getTensorGradients()
-      let validGrads = grads.filter { !$0.isNaN && !$0.isInfinite }
       let hasNaN = grads.contains { $0.isNaN }
       let hasInf = grads.contains { $0.isInfinite }
-      let gradMin = validGrads.min() ?? Float.nan
-      let gradMax = validGrads.max() ?? Float.nan
-      let gradMean =
-        validGrads.isEmpty ? Float.nan : validGrads.reduce(0, +) / Float(validGrads.count)
-      let gradAbsMax = validGrads.map { abs($0) }.max() ?? Float.nan
+      let gradAbsMax = grads.filter { !$0.isNaN && !$0.isInfinite }.map { abs($0) }.max() ?? 0
 
-      print(
-        "Epoch \(i): loss = \(String(format: "%.6f", finalLoss)) | grads: min=\(String(format: "%.4f", gradMin)), max=\(String(format: "%.4f", gradMax)), mean=\(String(format: "%.6f", gradMean)), absMax=\(String(format: "%.4f", gradAbsMax)), hasNaN=\(hasNaN), hasInf=\(hasInf)"
-      )
+      if i % 100 == 0 || i == epochs - 1 {
+        print(
+          "Epoch \(i): loss = \(String(format: "%.6f", finalLoss)), min = \(String(format: "%.6f", minLoss)) @ \(minLossEpoch) | grads: absMax=\(String(format: "%.2e", gradAbsMax)), hasNaN=\(hasNaN), hasInf=\(hasInf)"
+        )
+      }
 
       XCTAssertFalse(finalLoss.isNaN, "Loss became NaN at epoch \(i)")
-      if finalLoss.isNaN || finalLoss < initialLoss * 0.025 {
+
+      // Early stopping conditions
+      if finalLoss.isNaN || minLoss < initialLoss * 0.025 {
+        print("Early stop: target reached at epoch \(i)")
+        break
+      }
+      if epochsWithoutImprovement >= patience {
+        print("Early stop: no improvement for \(patience) epochs, stopping at epoch \(i)")
         break
       }
     }
     let trainTime = (CFAbsoluteTimeGetCurrent() - trainStart) * 1000
-    let timePerEpoch = trainTime / Double(epochs)
+    let timePerEpoch = trainTime / Double(actualEpochs)
 
-    print("\nFinal loss: \(String(format: "%.6f", finalLoss))")
+    print("\nFinal loss: \(String(format: "%.6f", finalLoss)) (at epoch \(actualEpochs))")
+    print("Best loss: \(String(format: "%.6f", minLoss)) at epoch \(minLossEpoch)")
     print("Loss reduction: \(String(format: "%.2f", initialLoss / finalLoss))x")
     print("\n--- Performance ---")
-    print("Total train time (\(epochs) epochs): \(String(format: "%.2f", trainTime))ms")
+    print("Total train time (\(actualEpochs) epochs): \(String(format: "%.2f", trainTime))ms")
     print("Time per epoch: \(String(format: "%.3f", timePerEpoch))ms")
     print("Epochs per second: \(String(format: "%.1f", 1000.0 / timePerEpoch))")
 
+    // Final loss should be near the minimum due to early stopping
     XCTAssertLessThan(
       finalLoss, initialLoss * 0.5, "Loss should drop for teacher-student setup")
   }

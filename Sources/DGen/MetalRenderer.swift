@@ -133,6 +133,19 @@ public class MetalRenderer: Renderer, UOpEmitter {
       return [SplitScheduleItem(item: scheduleItem, threadCount: nil)]
     }
 
+    // Check if this kernel contains atomic operations (memoryAccumulate).
+    // If so, parallelRanges should NOT be thread-parallelized because:
+    // - Each thread would run the full for loop
+    // - With atomics, this causes N× overcounting (N threads × full loop each)
+    // Instead, keep threadCount = nil so only 1 thread runs the loop.
+    let hasAtomics = scheduleItem.ops.contains { op in
+      if case .memoryAccumulate = op.op { return true }
+      return false
+    }
+    if hasAtomics {
+      return [SplitScheduleItem(item: scheduleItem, threadCount: nil)]
+    }
+
     let ops = scheduleItem.ops
     guard
       let beginRangeIdx = ops.firstIndex(where: {
