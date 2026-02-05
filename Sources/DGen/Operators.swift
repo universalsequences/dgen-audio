@@ -2341,11 +2341,14 @@ public enum LazyOp {
 
     case .expand(let targetShape):
       // Broadcast scalar to tensor shape (for sum backward)
+      // Uses block-level parallelism via tensorIndices (like binary ops)
       // Input is scalar, output is tensor where all elements = input
       guard inputs.count == 1 else { fatalError("expand requires 1 input") }
 
       // Get or create output tensor
-      guard let outTensor = g.nodeToTensor[nodeId].flatMap({ g.tensors[$0] }) else {
+      guard let outTensor = g.nodeToTensor[nodeId].flatMap({ g.tensors[$0] }),
+        let loopIdx = ctx.tensorIndices[nodeId]
+      else {
         // Fallback: just pass through the scalar
         b.use(val: b.value(inputs[0]))
         break
@@ -2357,48 +2360,31 @@ public enum LazyOp {
       // Check if output tensor is frame-aware (needs per-frame storage)
       let isFrameAware = ctx.frameAwareTensorCells.contains(outTensor.cellId)
 
-      // Check if input has a tensor cell we can read from (for cross-scope access)
+      // Use block's tensor index - each thread handles ONE element
+      let idx = b.value(loopIdx)
+
+      // Get scalar value to broadcast
+      let scalarVal: Expr
       if let inputTensorId = g.nodeToTensor[inputNodeId],
         let inputTensor = g.tensors[inputTensorId]
       {
         // Input is a tensor - read element 0 (assumes scalar stored in tensor)
-        if isFrameAware {
-          // Frame-aware output: write to frame-indexed positions
-          let frameIdx = b.currentFrameIndex()
-          let frameBase = frameIdx * b.constant(Float(size))
-          b.parallelRange(size) { idx in
-            let scalarVal = b.memoryRead(inputTensor.cellId, b.int(0))
-            let writePos = frameBase + b.cast(idx, to: .float)
-            _ = b.memoryWrite(outTensor.cellId, b.cast(writePos, to: .int), scalarVal)
-          }
-        } else {
-          // Non-frame-aware: existing linear write
-          b.parallelRange(size) { idx in
-            let scalarVal = b.memoryRead(inputTensor.cellId, b.int(0))
-            _ = b.memoryWrite(outTensor.cellId, b.cast(idx, to: .int), scalarVal)
-          }
-        }
+        scalarVal = b.memoryRead(inputTensor.cellId, b.int(0))
       } else {
         // Input is a scalar computed in current scope
-        let scalarVal = b.value(inputs[0])
+        scalarVal = b.value(inputs[0])
+      }
 
-        if isFrameAware {
-          // Frame-aware output: write to frame-indexed positions
-          // Use scalar directly without write-read-back to avoid race condition
-          let frameIdx = b.currentFrameIndex()
-          let frameBase = frameIdx * b.constant(Float(size))
-          b.parallelRange(size) { idx in
-            let writePos = frameBase + b.cast(idx, to: .float)
-            _ = b.memoryWrite(outTensor.cellId, b.cast(writePos, to: .int), scalarVal)
-          }
-        } else {
-          // Non-frame-aware: use write-read-back pattern for scope capture
-          _ = b.memoryWrite(outTensor.cellId, b.int(0), scalarVal)
-          b.parallelRange(size) { idx in
-            let storedVal = b.memoryRead(outTensor.cellId, b.int(0))
-            _ = b.memoryWrite(outTensor.cellId, b.cast(idx, to: .int), storedVal)
-          }
-        }
+      // Write to output position
+      if isFrameAware {
+        // Frame-aware output: write to frame-indexed position
+        let frameIdx = b.currentFrameIndex()
+        let frameBase = frameIdx * b.constant(Float(size))
+        let writePos = frameBase + b.cast(idx, to: .float)
+        _ = b.memoryWrite(outTensor.cellId, b.cast(writePos, to: .int), scalarVal)
+      } else {
+        // Non-frame-aware: direct write
+        _ = b.memoryWrite(outTensor.cellId, b.cast(idx, to: .int), scalarVal)
       }
 
     case .expandAxis(let targetShape, let axis):
