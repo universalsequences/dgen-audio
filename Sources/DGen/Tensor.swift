@@ -127,14 +127,31 @@ public struct Tensor {
     return baseStrides
   }
 
-  /// Memory offset - from asStrided transform or 0
+  /// Memory offset - computed from transforms (asStrided or shrink)
   public var offset: Int {
+    var totalOffset = 0
+    var currentStrides = baseStrides
+
     for transform in transforms {
-      if case .asStrided(_, _, let offset, _) = transform {
-        return offset
+      switch transform {
+      case .asStrided(_, let strides, let offset, _):
+        // asStrided sets explicit offset and strides
+        totalOffset = offset
+        currentStrides = strides
+
+      case .shrink(let ranges, _):
+        // shrink adds offset based on start indices
+        for (dim, range) in ranges.enumerated() {
+          if let (start, _) = range, dim < currentStrides.count {
+            totalOffset += start * currentStrides[dim]
+          }
+        }
+
+      default:
+        break
       }
     }
-    return 0
+    return totalOffset
   }
 
   /// Total number of elements in this tensor (final shape)

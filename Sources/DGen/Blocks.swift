@@ -1524,21 +1524,10 @@ public func emitBlockUOps(
   ctx.outboundTensorCells = outboundCells
   ctx.clearTensorRegisters()
 
-  // Check if block contains conv2d (which has special data dependency requirements)
-  let hasConv2d = block.nodes.contains { nodeId in
-    if let node = g.nodes[nodeId] {
-      switch node.op {
-      case .conv2d, .conv1d: return true
-      default: return false
-      }
-    }
-    return false
-  }
-
   // Shape-aware emission for blocks with shape transitions
-  // Metal: always use for multi-shape blocks
-  // C: only use when conv2d is present (it has global read patterns that require special handling)
-  let useShapeAwareEmission = block.kind == .scalar && hasMultipleShapes && (backend == .metal || hasConv2d)
+  // Both Metal and C need this when shapes change (e.g., matmul [M,K] @ [K,N] -> [M,N,K] product)
+  // Without this, the outer loop uses the wrong shape, producing incorrect results
+  let useShapeAwareEmission = block.kind == .scalar && hasMultipleShapes
 
   if useShapeAwareEmission {
     // Use specialized emission with per-shape element loops
