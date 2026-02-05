@@ -2403,12 +2403,14 @@ public enum LazyOp {
 
     case .expandAxis(let targetShape, let axis):
       // Broadcast along a specific axis (for sumAxis backward)
+      // Uses block-level parallelism via tensorIndices (like binary ops)
       guard inputs.count == 1 else { fatalError("expandAxis requires 1 input") }
 
       guard let inTensor = g.nodeToTensor[node.inputs[0]].flatMap({ g.tensors[$0] }),
-        let outTensor = g.nodeToTensor[nodeId].flatMap({ g.tensors[$0] })
+        let outTensor = g.nodeToTensor[nodeId].flatMap({ g.tensors[$0] }),
+        let loopIdx = ctx.tensorIndices[nodeId]
       else {
-        // Fallback
+        // Fallback for scalar case
         if let s = inputs.first { b.use(val: b.value(s)) }
         break
       }
@@ -2430,32 +2432,33 @@ public enum LazyOp {
       let inputStrides = Tensor.computeRowMajorStrides(inputShape)
       let outputStrides = Tensor.computeRowMajorStrides(targetShape)
 
-      b.parallelRange(outSize) { outIdx in
-        // Map output index to input index (skip the expanded axis dimension)
-        var inputFlatIdx: Expr = b.int(0)
-        var inDim = 0
-        for dim in 0..<targetShape.count {
-          if dim == normalizedAxis { continue }
-          let coord = b.mod(
-            b.floorDiv(outIdx, b.int(outputStrides[dim])), b.int(targetShape[dim]))
-          inputFlatIdx = b.add(inputFlatIdx, b.mul(coord, b.int(inputStrides[inDim])))
-          inDim += 1
-        }
+      // Use block's tensor index (like binary ops) - each thread handles ONE element
+      let outIdx = b.value(loopIdx)
 
-        // Read with frame-aware addressing if needed
-        let val: Expr
-        if inIsFrameAware {
-          val = b.frameAwareTensorRead(cellId: inTensor.cellId, tensorSize: inSize, elemIdx: b.cast(inputFlatIdx, to: .float))
-        } else {
-          val = b.memoryRead(inTensor.cellId, inputFlatIdx)
-        }
+      // Map output index to input index (skip the expanded axis dimension)
+      var inputFlatIdx: Expr = b.int(0)
+      var inDim = 0
+      for dim in 0..<targetShape.count {
+        if dim == normalizedAxis { continue }
+        let coord = b.mod(
+          b.floorDiv(outIdx, b.int(outputStrides[dim])), b.int(targetShape[dim]))
+        inputFlatIdx = b.add(inputFlatIdx, b.mul(coord, b.int(inputStrides[inDim])))
+        inDim += 1
+      }
 
-        // Write with frame-aware addressing if needed
-        if outIsFrameAware {
-          _ = b.frameAwareTensorWrite(cellId: outTensor.cellId, tensorSize: outSize, elemIdx: b.cast(outIdx, to: .float), value: val)
-        } else {
-          _ = b.memoryWrite(outTensor.cellId, b.cast(outIdx, to: .int), val)
-        }
+      // Read with frame-aware addressing if needed
+      let val: Expr
+      if inIsFrameAware {
+        val = b.frameAwareTensorRead(cellId: inTensor.cellId, tensorSize: inSize, elemIdx: b.cast(inputFlatIdx, to: .float))
+      } else {
+        val = b.memoryRead(inTensor.cellId, inputFlatIdx)
+      }
+
+      // Write with frame-aware addressing if needed
+      if outIsFrameAware {
+        _ = b.frameAwareTensorWrite(cellId: outTensor.cellId, tensorSize: outSize, elemIdx: b.cast(outIdx, to: .float), value: val)
+      } else {
+        _ = b.memoryWrite(outTensor.cellId, b.cast(outIdx, to: .int), val)
       }
 
     case .gradPhasor(_):
