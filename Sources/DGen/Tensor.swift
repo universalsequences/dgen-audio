@@ -351,9 +351,33 @@ extension Graph {
     return nodeId
   }
 
-  // MARK: - Tensor Views (Reshape/Transpose/Shrink)
+  // MARK: - Tensor View Operations
+  //
+  // View operations create new "views" of existing tensors without copying data.
+  // They work by recording transforms that map output indices to base memory indices.
+  // Views can be composed: reshape(pad(x)) creates a chain of transforms.
 
-  /// Reshape a tensor to a new shape (metadata only, no data movement)
+  /// Reshape a tensor to a new shape without copying data.
+  ///
+  /// The total number of elements must remain the same. Data is reinterpreted
+  /// in row-major (C-style) order.
+  ///
+  /// ```swift
+  /// // Flatten a 2D tensor to 1D
+  /// let flat = try g.reshape(matrix, to: [rows * cols])
+  ///
+  /// // Reshape 1D to 2D
+  /// let matrix = try g.reshape(vector, to: [4, 4])
+  ///
+  /// // Add a dimension (useful for broadcasting)
+  /// let col = try g.reshape(vector, to: [n, 1])
+  /// ```
+  ///
+  /// - Parameters:
+  ///   - input: Source tensor
+  ///   - newShape: Target shape (must have same total element count)
+  /// - Returns: A view of the tensor with the new shape
+  /// - Throws: If element counts don't match
   public func reshape(_ input: NodeID, to newShape: Shape) throws -> NodeID {
     // Get input shape - works for both concrete tensors and derived ops
     guard let inputNode = nodes[input], case .tensor(let inputShape) = inputNode.shape else {
@@ -371,7 +395,27 @@ extension Graph {
     return try createViewWithTransform(input: input, op: .reshape(newShape), newShape: newShape, transform: transform)
   }
 
-  /// Transpose a tensor by permuting axes
+  /// Transpose a tensor by permuting its axes without copying data.
+  ///
+  /// Reorders the dimensions of a tensor. For 2D tensors (matrices), this swaps
+  /// rows and columns. For higher dimensions, you specify which axis goes where.
+  ///
+  /// ```swift
+  /// // 2D matrix transpose (swap rows and columns)
+  /// let transposed = try g.transpose(matrix)  // [M, N] → [N, M]
+  ///
+  /// // Explicit axes for 2D (equivalent to above)
+  /// let transposed = try g.transpose(matrix, axes: [1, 0])
+  ///
+  /// // 3D tensor: move last axis to front
+  /// let reordered = try g.transpose(tensor3d, axes: [2, 0, 1])  // [A, B, C] → [C, A, B]
+  /// ```
+  ///
+  /// - Parameters:
+  ///   - input: Source tensor
+  ///   - axes: Permutation of dimension indices. If nil, reverses all axes (standard transpose).
+  ///           `axes[i]` specifies which input dimension becomes output dimension `i`.
+  /// - Returns: A view of the tensor with reordered dimensions
   public func transpose(_ input: NodeID, axes: [Int]? = nil) throws -> NodeID {
     // Get input shape - works for both concrete tensors and derived ops
     guard let inputNode = nodes[input], case .tensor(let inputShape) = inputNode.shape else {
@@ -391,8 +435,29 @@ extension Graph {
     return try createViewWithTransform(input: input, op: .transpose(perm), newShape: newShape, transform: transform)
   }
 
-  /// Shrink/slice a tensor along each axis (metadata only, no data movement)
-  /// ranges: for each dimension, either nil (keep all) or (start, end) tuple
+  /// Slice a tensor along each axis without copying data.
+  ///
+  /// Extracts a contiguous sub-region of a tensor. Similar to Python's `tensor[start:end]`
+  /// but generalized to multiple dimensions.
+  ///
+  /// ```swift
+  /// // Extract rows 2-5 from a matrix (keeping all columns)
+  /// let slice = try g.shrink(matrix, ranges: [(2, 5), nil])
+  ///
+  /// // Extract a 3x3 patch from position (10, 20)
+  /// let patch = try g.shrink(image, ranges: [(10, 13), (20, 23)])
+  ///
+  /// // Keep first dimension, slice second
+  /// let partial = try g.shrink(tensor, ranges: [nil, (0, 5)])
+  /// ```
+  ///
+  /// - Parameters:
+  ///   - input: Source tensor
+  ///   - ranges: For each dimension, either:
+  ///     - `nil`: Keep all elements in this dimension
+  ///     - `(start, end)`: Keep elements from index `start` up to (but not including) `end`
+  /// - Returns: A view of the sliced region
+  /// - Throws: If ranges are out of bounds or start >= end
   public func shrink(_ input: NodeID, ranges: [(Int, Int)?]) throws -> NodeID {
     // Get input shape - works for both concrete tensors and derived ops
     guard let inputNode = nodes[input], case .tensor(let inputShape) = inputNode.shape else {
@@ -432,6 +497,28 @@ extension Graph {
     return try createViewWithTransform(input: input, op: .shrink(ranges), newShape: newShape, transform: transform)
   }
 
+  /// Pad a tensor with zeros along each axis without copying data.
+  ///
+  /// Adds virtual zero-padding around the tensor. The padded regions return 0 when
+  /// read; the original data is not copied. This is essential for convolutions
+  /// where you need to handle boundary conditions.
+  ///
+  /// ```swift
+  /// // Pad a 1D signal with 2 zeros on each side
+  /// let padded = try g.pad(signal, padding: [(2, 2)])  // [N] → [N+4]
+  ///
+  /// // Pad a 2D image: 1 pixel on top/bottom, 2 on left/right
+  /// let padded = try g.pad(image, padding: [(1, 1), (2, 2)])  // [H, W] → [H+2, W+4]
+  ///
+  /// // Asymmetric padding (more on one side)
+  /// let padded = try g.pad(tensor, padding: [(0, 3), (1, 0)])
+  /// ```
+  ///
+  /// - Parameters:
+  ///   - input: Source tensor
+  ///   - padding: For each dimension, `(left, right)` specifying how many zeros to add
+  ///              on each side. `left` is added before index 0, `right` after the last element.
+  /// - Returns: A view of the padded tensor (reads in padded region return 0)
   public func pad(_ input: NodeID, padding: [(Int, Int)]) throws -> NodeID {
     // Get input shape - works for both concrete tensors and derived ops
     guard let inputNode = nodes[input], case .tensor(let inputShape) = inputNode.shape else {
@@ -449,8 +536,31 @@ extension Graph {
     return try createViewWithTransform(input: input, op: .pad(padding), newShape: newShape, transform: transform)
   }
 
-  /// Expand a tensor by broadcasting size-1 dimensions to target shape (stride=0 view, no data copy)
-  /// e.g. [2, 1, 3] -> expandView to [2, 4, 3] makes dim 1 appear repeated 4 times via stride=0
+  /// Broadcast a tensor by expanding size-1 dimensions without copying data.
+  ///
+  /// Expands dimensions that have size 1 to a larger size. The single value in that
+  /// dimension is "broadcast" (repeated) to fill the new size. This is how numpy/PyTorch
+  /// broadcasting works under the hood.
+  ///
+  /// ```swift
+  /// // Broadcast a column vector to a matrix (for row-wise operations)
+  /// // [N, 1] → [N, M]  (the single column is repeated M times)
+  /// let expanded = try g.expandView(column, to: [n, m])
+  ///
+  /// // Broadcast a row vector to a matrix
+  /// // [1, M] → [N, M]  (the single row is repeated N times)
+  /// let expanded = try g.expandView(row, to: [n, m])
+  ///
+  /// // Broadcast a scalar-like tensor
+  /// // [1, 1, 1] → [A, B, C]
+  /// let expanded = try g.expandView(scalar3d, to: [a, b, c])
+  /// ```
+  ///
+  /// - Parameters:
+  ///   - input: Source tensor (must have size 1 in any dimension being expanded)
+  ///   - targetShape: Target shape (must have same rank as input)
+  /// - Returns: A view where size-1 dims appear expanded (reads return the same value)
+  /// - Throws: If trying to expand a dimension that isn't size 1
   public func expandView(_ input: NodeID, to targetShape: Shape) throws -> NodeID {
     // Get input shape - works for both concrete tensors and derived ops
     guard let inputNode = nodes[input], case .tensor(let inputShape) = inputNode.shape else {
@@ -476,9 +586,27 @@ extension Graph {
     return try createViewWithTransform(input: input, op: .expandView(targetShape), newShape: targetShape, transform: transform)
   }
 
-  /// Repeat/tile a tensor along each dimension (modular index view, no data copy)
-  /// e.g. [2, 3] repeated by [2, 3] -> [4, 9] where each element appears multiple times
-  /// Implemented via modular indexing: index[i] % originalShape[i]
+  /// Tile a tensor by repeating it along each dimension without copying data.
+  ///
+  /// Creates a larger tensor by conceptually tiling the input. Implemented via
+  /// modular indexing: `output[i] = input[i % inputSize]`. Similar to `numpy.tile()`.
+  ///
+  /// ```swift
+  /// // Repeat a [2, 3] tensor 2x along dim 0, 3x along dim 1 → [4, 9]
+  /// let tiled = try g.repeatView(tensor, repeats: [2, 3])
+  /// // Element at [3, 7] reads from [3 % 2, 7 % 3] = [1, 1]
+  ///
+  /// // Repeat only along one dimension
+  /// let repeated = try g.repeatView(row, repeats: [4, 1])  // [1, N] → [4, N]
+  ///
+  /// // Create a checkerboard pattern from a 2x2 tile
+  /// let board = try g.repeatView(tile2x2, repeats: [4, 4])  // [2, 2] → [8, 8]
+  /// ```
+  ///
+  /// - Parameters:
+  ///   - input: Source tensor to tile
+  ///   - repeats: How many times to repeat along each dimension (must be >= 1)
+  /// - Returns: A view of the tiled tensor (reads use modular indexing)
   public func repeatView(_ input: NodeID, repeats: [Int]) throws -> NodeID {
     // Get input shape - works for both concrete tensors and derived ops
     guard let inputNode = nodes[input], case .tensor(let inputShape) = inputNode.shape else {
@@ -507,18 +635,34 @@ extension Graph {
     return try createViewWithTransform(input: input, op: .repeatView(repeats), newShape: newShape, transform: transform)
   }
 
-  /// Create a strided view of a tensor with arbitrary shape and strides.
-  /// This is the fundamental building block for view operations like pool.
+  /// Create a strided view with arbitrary shape and strides (advanced, low-level).
   ///
-  /// WARNING: This operation can create out-of-bounds accesses if strides/shape
-  /// are not chosen carefully. The caller is responsible for ensuring the view
-  /// stays within the underlying storage bounds.
+  /// This is the fundamental building block for sliding window operations like pooling
+  /// and convolution. It allows you to create views where moving along each dimension
+  /// skips a custom number of elements.
+  ///
+  /// **Warning**: This is a low-level operation. Incorrect strides can read out-of-bounds
+  /// memory. Prefer higher-level operations like `pool()` when possible.
+  ///
+  /// ```swift
+  /// // Extract 2x2 non-overlapping windows from a 4x4 image
+  /// // Input [4, 4] → Output [2, 2, 2, 2] (2x2 grid of 2x2 windows)
+  /// let windows = try g.asStrided(image,
+  ///     shape: [2, 2, 2, 2],      // [outH, outW, kH, kW]
+  ///     strides: [8, 2, 4, 1])    // [outH*W*stride, stride, W, 1]
+  ///
+  /// // Sliding window with overlap (stride < kernel)
+  /// // Moving 1 element at a time instead of kernel-size
+  /// ```
   ///
   /// - Parameters:
-  ///   - input: The source tensor
-  ///   - shape: The new shape for the view
-  ///   - strides: The strides for each dimension (how many elements to skip)
-  ///   - offset: Additional offset from the tensor's current offset
+  ///   - input: Source tensor
+  ///   - shape: Output shape for the view
+  ///   - strides: Elements to skip when moving along each dimension.
+  ///              `strides[i]` = how many elements to skip when incrementing index `i` by 1.
+  ///   - offset: Starting offset from the tensor's base (default 0)
+  /// - Returns: A strided view of the tensor
+  /// - Throws: If shape and strides counts don't match
   public func asStrided(
     _ input: NodeID,
     shape: [Int],
@@ -540,12 +684,38 @@ extension Graph {
     return try createViewWithTransform(input: input, op: .asStrided(shape, strides), newShape: shape, transform: transform)
   }
 
-  /// Pool operation: transforms a tensor to expose sliding windows as extra dimensions.
-  /// Transforms [...batch, H, W] → [...batch, oH, oW, kH, kW] for 2D pooling.
+  /// Extract sliding windows from a tensor as extra dimensions (im2col via views).
   ///
-  /// This is the "im2col" transformation done via view operations (no data copy)
+  /// Transforms a tensor to expose sliding kernel windows as additional dimensions,
+  /// enabling convolutions and pooling via element-wise operations and reductions.
+  /// This is the "im2col" transformation, but done as a zero-copy view operation.
   ///
-  /// Supports both non-overlapping (stride >= kernel) and overlapping (stride < kernel) windows.
+  /// ```swift
+  /// // 2D pooling: [H, W] → [outH, outW, kH, kW]
+  /// // Each (outH, outW) position contains its (kH, kW) window
+  /// let windows = try g.pool(image, kernelSize: [3, 3])
+  ///
+  /// // With stride (non-overlapping windows)
+  /// let windows = try g.pool(image, kernelSize: [2, 2], stride: [2, 2])
+  ///
+  /// // 1D pooling: [N] → [outN, K]
+  /// let windows = try g.pool(signal, kernelSize: [5])
+  ///
+  /// // Max pooling = pool + reduce max over kernel dims
+  /// // Avg pooling = pool + reduce mean over kernel dims
+  /// // Conv = pool + broadcast multiply kernel + sum over kernel dims
+  /// ```
+  ///
+  /// **Output shape**: `[...batch, out₀, out₁, ..., k₀, k₁, ...]` where:
+  /// - `outᵢ = (inputᵢ - kernelᵢ) / strideᵢ + 1`
+  /// - Batch dimensions are preserved at the front
+  /// - Kernel dimensions are appended at the end
+  ///
+  /// - Parameters:
+  ///   - input: Source tensor with shape `[...batch, spatial...]`
+  ///   - kernelSize: Size of the sliding window in each spatial dimension
+  ///   - stride: Step size for the window (default = kernelSize for non-overlapping)
+  /// - Returns: A view exposing all windows as extra dimensions
   public func pool(
     _ input: NodeID,
     kernelSize: [Int],
@@ -604,22 +774,33 @@ extension Graph {
     return try asStrided(input, shape: outputShape, strides: outputStrides)
   }
 
-  /// 2D Convolution using the pool-based "im2col" approach (view operations, then multiply-sum)
+  /// 2D Convolution implemented via view operations (zero-copy im2col approach).
   ///
-  /// This implements conv2d by:
-  /// 1. Using pool to extract sliding windows: [H, W] → [oH, oW, kH, kW]
-  /// 2. Broadcasting kernel to match: [kH, kW] → [oH, oW, kH, kW]
-  /// 3. Element-wise multiply
-  /// 4. Sum over kernel dimensions → [oH, oW]
+  /// Performs 2D convolution by extracting sliding windows as views, then using
+  /// broadcasting and reduction. The input is never copied—only the final output
+  /// is materialized.
   ///
-  /// This approach is zero-copy for the input (view operations only) and enables
-  /// the same code path for both overlapping and non-overlapping strides.
+  /// ```swift
+  /// // Convolve an image with an edge detection kernel
+  /// let edges = try g.conv2dView(image, kernel: sobelKernel)
+  ///
+  /// // With custom stride (downsampling)
+  /// let downsampled = try g.conv2dView(image, kernel: kernel, stride: [2, 2])
+  /// ```
+  ///
+  /// **How it works internally**:
+  /// 1. `pool(input)` extracts sliding windows: `[H, W]` → `[oH, oW, kH, kW]`
+  /// 2. Kernel is broadcast: `[kH, kW]` → `[oH, oW, kH, kW]`
+  /// 3. Element-wise multiply windows with kernel
+  /// 4. Sum over kernel dimensions → `[oH, oW]`
+  ///
+  /// **Output shape**: `[(H - kH) / stride + 1, (W - kW) / stride + 1]`
   ///
   /// - Parameters:
-  ///   - input: Input tensor of shape [H, W]
-  ///   - kernel: Kernel tensor of shape [kH, kW]
-  ///   - stride: Convolution stride (default [1, 1])
-  /// - Returns: Output tensor of shape [oH, oW]
+  ///   - input: Input tensor of shape `[H, W]`
+  ///   - kernel: Convolution kernel of shape `[kH, kW]`
+  ///   - stride: Step size for the convolution window (default `[1, 1]`)
+  /// - Returns: Convolved output tensor of shape `[oH, oW]`
   public func conv2dView(
     _ input: NodeID,
     kernel: NodeID,
@@ -665,8 +846,37 @@ extension Graph {
     return sumKH
   }
 
-  /// Sum a tensor along a specific axis, reducing that dimension
-  /// e.g. [M, N, K].sum(axis: -1) -> [M, N]
+  /// Sum a tensor along a specific axis, removing that dimension from the result.
+  ///
+  /// Reduces one dimension by summing all elements along it. The output has one
+  /// fewer dimension than the input.
+  ///
+  /// ```swift
+  /// // Sum columns (reduce last dimension)
+  /// let rowSums = try g.sum(matrix, axis: -1)    // [M, N] → [M]
+  ///
+  /// // Sum rows (reduce first dimension)
+  /// let colSums = try g.sum(matrix, axis: 0)     // [M, N] → [N]
+  ///
+  /// // Sum over middle dimension of 3D tensor
+  /// let reduced = try g.sum(tensor3d, axis: 1)   // [A, B, C] → [A, C]
+  /// ```
+  ///
+  /// **Negative axis indexing**: Negative values count from the end.
+  /// - `axis: -1` = last dimension
+  /// - `axis: -2` = second-to-last dimension
+  /// - This matches NumPy/PyTorch conventions
+  ///
+  /// For a tensor of shape `[A, B, C, D]`:
+  /// - `axis: 0` or `axis: -4` → reduces dim A → `[B, C, D]`
+  /// - `axis: 1` or `axis: -3` → reduces dim B → `[A, C, D]`
+  /// - `axis: 2` or `axis: -2` → reduces dim C → `[A, B, D]`
+  /// - `axis: 3` or `axis: -1` → reduces dim D → `[A, B, C]`
+  ///
+  /// - Parameters:
+  ///   - input: Source tensor
+  ///   - axis: Which dimension to sum over. Negative values count from the end.
+  /// - Returns: Tensor with one fewer dimension (or scalar if input was 1D)
   public func sum(_ input: NodeID, axis: Int) throws -> NodeID {
     guard let inputNode = nodes[input] else {
       throw DGenError.tensorError(op: "sum", reason: "input node not found")
@@ -707,8 +917,27 @@ extension Graph {
     return nodeId
   }
 
-  /// Matrix multiply: A[M,K] @ B[K,N] -> C[M,N]
-  /// Implemented as: reshape + broadcast multiply + sum
+  /// Matrix multiplication: `A[M, K] @ B[K, N] → C[M, N]`
+  ///
+  /// Performs standard matrix multiplication. The inner dimensions must match:
+  /// A's last dimension (K) must equal B's first dimension (K).
+  ///
+  /// ```swift
+  /// // Multiply two matrices
+  /// let C = try g.matmul(A, B)  // [M, K] @ [K, N] → [M, N]
+  ///
+  /// // Linear layer: output = input @ weights
+  /// let output = try g.matmul(input, weights)  // [batch, in] @ [in, out] → [batch, out]
+  /// ```
+  ///
+  /// **Implementation**: Uses reshape + broadcast multiply + sum (no explicit GEMM kernel).
+  /// This leverages the existing view operations and is differentiable.
+  ///
+  /// - Parameters:
+  ///   - a: Left matrix of shape `[M, K]`
+  ///   - b: Right matrix of shape `[K, N]`
+  /// - Returns: Result matrix of shape `[M, N]`
+  /// - Throws: If inputs aren't 2D or inner dimensions don't match
   public func matmul(_ a: NodeID, _ b: NodeID) throws -> NodeID {
     // Get shapes from nodes - works even for derived tensor ops like (tensor * scalar)
     guard let aNode = nodes[a], case .tensor(let aShape) = aNode.shape,

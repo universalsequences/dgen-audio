@@ -397,6 +397,8 @@ extension LazyOp {
       // can use this scalar directly since the gradient is uniform across all elements.
       // This avoids the tensor allocation timing issue where computeGradients runs
       // before allocateTensorOutputs.
+
+      // TODO - the comment above seems sketchy, investigate if this is correct
       if let nodeInput = g.nodes[node.inputs[0]],
         case .tensor(let shape) = nodeInput.shape
       {
