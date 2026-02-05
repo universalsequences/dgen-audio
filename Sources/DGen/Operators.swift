@@ -1008,6 +1008,7 @@ public enum LazyOp {
 
     case .selectRow:
       // Extract a single row from a 2D tensor using dynamic index.
+      // Uses block-level parallelism via tensorIndices (like binary ops)
       // Inputs: [tensor2D, rowIndex], Output: 1D tensor [numCols]
       guard node.inputs.count == 2 else {
         throw DGenError.insufficientInputs(
@@ -1023,12 +1024,12 @@ public enum LazyOp {
       }
 
       let numRows = shape[0]
-      let numCols = shape[1]
 
       guard let inTensorId = g.nodeToTensor[tensorInput],
         let inTensor = g.tensors[inTensorId],
         let outTensorId = g.nodeToTensor[node.id],
-        let outTensor = g.tensors[outTensorId]
+        let outTensor = g.tensors[outTensorId],
+        let loopIdx = ctx.tensorIndices[nodeId]
       else {
         throw DGenError.tensorError(op: "selectRow", reason: "missing tensor")
       }
@@ -1043,17 +1044,18 @@ public enum LazyOp {
       let positiveIndex = b.gswitch(isNegative, wrappedIndex + numRowsFloat, wrappedIndex)
       let floorIndex = b.floor(positiveIndex)
 
-      b.parallelRange(numCols) { colIdx in
-        let colIdxFloat = b.cast(colIdx, to: .float)
-        // Row-major read: tensorRead handles both transformed and base tensors
-        let value = b.tensorRead(inTensor, indices: [floorIndex, colIdxFloat])
-        _ = b.memoryWrite(outTensor.cellId, b.cast(colIdx, to: .int), value)
-      }
+      // Use block's tensor index - each thread handles ONE column
+      let colIdx = b.value(loopIdx)
+      let colIdxFloat = b.cast(colIdx, to: .float)
+      // Row-major read: tensorRead handles both transformed and base tensors
+      let value = b.tensorRead(inTensor, indices: [floorIndex, colIdxFloat])
+      _ = b.memoryWrite(outTensor.cellId, b.cast(colIdx, to: .int), value)
 
       ctx.values[nodeId] = .empty
 
     case .peekRowInline(let scratchCell, let numRows, let numCols):
       // Interpolated row extraction with frame-indexed storage for SIMD safety.
+      // Uses block-level parallelism via tensorIndices (like binary ops)
       // Inputs: [tensor2D, rowIndex], Output: 1D tensor [numCols] at scratchCell[frame * numCols + col]
       guard node.inputs.count == 2 else {
         throw DGenError.insufficientInputs(
@@ -1064,7 +1066,8 @@ public enum LazyOp {
       guard let inTensorId = g.nodeToTensor[tensorInput],
         let inTensor = g.tensors[inTensorId],
         let outTensorId = g.nodeToTensor[node.id],
-        let outTensor = g.tensors[outTensorId]
+        let outTensor = g.tensors[outTensorId],
+        let loopIdx = ctx.tensorIndices[nodeId]
       else {
         throw DGenError.tensorError(op: "peekRowInline", reason: "missing tensor")
       }
@@ -1091,23 +1094,23 @@ public enum LazyOp {
       let frameIdx = b.currentFrameIndex()
       let frameBase = frameIdx * numColsFloat
 
-      b.parallelRange(numCols) { colIdx in
-        let colIdxFloat = b.cast(colIdx, to: .float)
-        // Row-major read: tensorRead handles both transformed and base tensors
-        let floorValue = b.tensorRead(inTensor, indices: [floorIndex, colIdxFloat])
-        let ceilValue = b.tensorRead(inTensor, indices: [ceilWrapped, colIdxFloat])
+      // Use block's tensor index - each thread handles ONE column
+      let colIdx = b.value(loopIdx)
+      let colIdxFloat = b.cast(colIdx, to: .float)
+      // Row-major read: tensorRead handles both transformed and base tensors
+      let floorValue = b.tensorRead(inTensor, indices: [floorIndex, colIdxFloat])
+      let ceilValue = b.tensorRead(inTensor, indices: [ceilWrapped, colIdxFloat])
 
-        // Interpolate: (1 - frac) * floor + frac * ceil
-        let interpolated = oneMinusFrac * floorValue + frac * ceilValue
-        let writePos = frameBase + colIdxFloat
-        _ = b.memoryWrite(scratchCell, b.cast(writePos, to: .int), interpolated)
+      // Interpolate: (1 - frac) * floor + frac * ceil
+      let interpolated = oneMinusFrac * floorValue + frac * ceilValue
+      let writePos = frameBase + colIdxFloat
+      _ = b.memoryWrite(scratchCell, b.cast(writePos, to: .int), interpolated)
 
-        // Write to output tensor with appropriate addressing
-        if ctx.frameAwareTensorCells.contains(outTensor.cellId) {
-          _ = b.memoryWrite(outTensor.cellId, b.cast(writePos, to: .int), interpolated)
-        } else {
-          _ = b.memoryWrite(outTensor.cellId, b.cast(colIdx, to: .int), interpolated)
-        }
+      // Write to output tensor with appropriate addressing
+      if ctx.frameAwareTensorCells.contains(outTensor.cellId) {
+        _ = b.memoryWrite(outTensor.cellId, b.cast(writePos, to: .int), interpolated)
+      } else {
+        _ = b.memoryWrite(outTensor.cellId, b.cast(colIdx, to: .int), interpolated)
       }
 
       ctx.values[nodeId] = .empty
