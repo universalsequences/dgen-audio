@@ -1507,17 +1507,15 @@ public func emitBlockUOps(
   // instead of tload(), so the input MUST be in memory not just in registers
   for nodeId in block.nodes {
     guard let node = g.nodes[nodeId] else { continue }
-    let isConvOp: Bool
     switch node.op {
     case .conv2d, .conv1d:
-      isConvOp = true
+      if let inputId = node.inputs.first,
+         let tensorId = g.nodeToTensor[inputId],
+         let tensor = g.tensors[tensorId] {
+        outboundCells.insert(tensor.cellId)
+      }
     default:
-      isConvOp = false
-    }
-    if isConvOp, let inputId = node.inputs.first,
-       let tensorId = g.nodeToTensor[inputId],
-       let tensor = g.tensors[tensorId] {
-      outboundCells.insert(tensor.cellId)
+      break
     }
   }
 
