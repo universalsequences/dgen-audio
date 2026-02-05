@@ -203,6 +203,7 @@ public struct CompilationPipeline {
         return false
       }
     }
+
     if hasSpectralLossOps {
       finalBlocks = isolateSpectralPasses(finalBlocks, graph)
     }

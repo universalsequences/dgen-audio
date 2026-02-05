@@ -910,8 +910,6 @@ public func findOutputNodeNeeds(_ b: Block, _ g: Graph) -> Set<NodeID> {
   return outputNodeNeeds
 }
 
-// ─── 3. decide which nodes need cross-block scratch buffers ─────
-// in the case of metal, these are transmitted via buffers
 public func findNodesWithOutboundDependencies(_ blks: [Block], _ g: Graph, block: Block) -> [NodeID]
 {
   // Map node -> block index
@@ -925,17 +923,6 @@ public func findNodesWithOutboundDependencies(_ blks: [Block], _ g: Graph, block
   }
 
   guard let thisIdx = blks.firstIndex(of: block) else { return [] }
-
-  // Compute contiguous-kind groups to enable within-group fusion
-  /*
-  var groupForBlock = Array(repeating: 0, count: blks.count)
-  var group = 0
-  for i in 0..<blks.count {
-      if i > 0 && blks[i].kind != blks[i - 1].kind { group += 1 }
-      groupForBlock[i] = group
-  }
-  let thisGroup = groupForBlock[thisIdx]
-   */
 
   var need: Set<NodeID> = []
   for (consumerIdx, b) in blks.enumerated() {
@@ -969,18 +956,6 @@ public func findNodesAsInboundDependencies(_ blks: [Block], _ g: Graph, block: B
       }
     }
   }
-  //for (bidx, b) in blks.enumerated() { b.nodes.forEach { nodeBlock[$0] = bidx } }
-
-  // Compute contiguous-kind groups
-  /*
-  var groupForBlock = Array(repeating: 0, count: blks.count)
-  var group = 0
-  for i in 0..<blks.count {
-      if i > 0 && blks[i].kind != blks[i - 1].kind { group += 1 }
-      groupForBlock[i] = group
-  }
-  let thisGroup = groupForBlock[thisIdx]
-   */
 
   var need: Set<NodeID> = []
   // Collect only dependencies produced in a different group
@@ -1154,7 +1129,8 @@ public func findCrossRegionOutboundCells(
   // Build map: nodeId -> regionIndex
   var nodeToRegion: [NodeID: Int] = [:]
   for (regionIdx, transition) in transitions.enumerated() {
-    let regionEnd = regionIdx + 1 < transitions.count
+    let regionEnd =
+      regionIdx + 1 < transitions.count
       ? transitions[regionIdx + 1].nodeIndex
       : block.nodes.count
     for nodeIndex in transition.nodeIndex..<regionEnd {
@@ -1172,14 +1148,16 @@ public func findCrossRegionOutboundCells(
 
       // Case 1: Both have regions and they differ (cross-region)
       // Case 2: Node is scalar (no region) but input has a region (tensor → scalar)
-      let crossesRegion = (myRegion != nil && inputRegion != nil && myRegion != inputRegion)
-                       || (myRegion == nil && inputRegion != nil)
+      let crossesRegion =
+        (myRegion != nil && inputRegion != nil && myRegion != inputRegion)
+        || (myRegion == nil && inputRegion != nil)
 
       guard crossesRegion else { continue }
 
       // This input crosses a region boundary - its cell must be outbound
       if let tensorId = g.nodeToTensor[inputId],
-         let tensor = g.tensors[tensorId] {
+        let tensor = g.tensors[tensorId]
+      {
         outbound.insert(tensor.cellId)
       }
     }
@@ -1191,7 +1169,8 @@ public func findCrossRegionOutboundCells(
 /// Emit UOps for a scalar block with shape transitions (e.g., conv2d in feedback loop)
 /// Instead of one flat loop, emits nested loops: outer frame loop + inner element loops
 public func emitScalarBlockWithShapeTransitions(
-  ctx: IRContext, block: Block, blocks: [Block], g: Graph, transitions: [(nodeIndex: Int, shape: [Int])]
+  ctx: IRContext, block: Block, blocks: [Block], g: Graph,
+  transitions: [(nodeIndex: Int, shape: [Int])]
 ) throws -> [UOp] {
   var uops: [UOp] = []
   var emittedNodes: Set<NodeID> = []
@@ -1215,8 +1194,9 @@ public func emitScalarBlockWithShapeTransitions(
       isConvOp = false
     }
     if isConvOp, let inputId = node.inputs.first,
-       let tensorId = g.nodeToTensor[inputId],
-       let tensor = g.tensors[tensorId] {
+      let tensorId = g.nodeToTensor[inputId],
+      let tensor = g.tensors[tensorId]
+    {
       outbound.insert(tensor.cellId)
     }
   }
@@ -1227,7 +1207,8 @@ public func emitScalarBlockWithShapeTransitions(
   // Group nodes by their shape region
   var regionStart = 0
   for (transitionIdx, transition) in transitions.enumerated() {
-    let regionEnd = transitionIdx + 1 < transitions.count
+    let regionEnd =
+      transitionIdx + 1 < transitions.count
       ? transitions[transitionIdx + 1].nodeIndex
       : block.nodes.count
 
@@ -1499,7 +1480,8 @@ public func emitBlockUOps(
   // For ALL backends: include cross-region outbound cells (tensor → scalar reductions)
   // This ensures tensors are written to memory before scalar reductions read them
   if hasMultipleShapes {
-    let crossRegion = findCrossRegionOutboundCells(block: block, g: g, transitions: shapeTransitions)
+    let crossRegion = findCrossRegionOutboundCells(
+      block: block, g: g, transitions: shapeTransitions)
     outboundCells.formUnion(crossRegion)
   }
 
@@ -1510,8 +1492,9 @@ public func emitBlockUOps(
     switch node.op {
     case .conv2d, .conv1d:
       if let inputId = node.inputs.first,
-         let tensorId = g.nodeToTensor[inputId],
-         let tensor = g.tensors[tensorId] {
+        let tensorId = g.nodeToTensor[inputId],
+        let tensor = g.tensors[tensorId]
+      {
         outboundCells.insert(tensor.cellId)
       }
     default:
@@ -1599,7 +1582,9 @@ public func emitBlockUOps(
 
   // C backend wraps tensor blocks in a sequential loop
   // Skip if using shape-aware emission (it has its own loops)
-  if backend == .c, !useShapeAwareEmission, let tensorIndex = block.tensorIndex, let shape = block.shape {
+  if backend == .c, !useShapeAwareEmission, let tensorIndex = block.tensorIndex,
+    let shape = block.shape
+  {
     let count = shape.reduce(1, *)
     var loopUOp = UOp(op: .beginParallelRange(count, simdIncrement), value: tensorIndex)
     loopUOp.kind = effectiveKind  // Match loop wrapper kind to body operations
