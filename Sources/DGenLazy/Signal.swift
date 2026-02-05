@@ -289,4 +289,17 @@ public class Signal: LazyValue {
   public static func mix(_ a: Signal, _ b: Signal, _ t: Float) -> Signal {
     return mix(a, b, Signal.constant(t))
   }
+
+  // MARK: - Buffer
+
+  /// Buffer the last N samples of this signal into a [1, N] tensor.
+  /// Zero-copy ring buffer — the tensor IS the buffer. Composes with conv2d, sum, etc.
+  /// - Parameter size: Number of samples to buffer
+  /// - Returns: SignalTensor of shape [1, size] backed by a ring buffer
+  public func buffer(size: Int) -> SignalTensor {
+    let nodeId = graph.graph.bufferView(self.nodeId, size: size)
+    return SignalTensor(
+      nodeId: nodeId, graph: graph, shape: [1, size],
+      requiresGrad: self.requiresGrad)
+  }
 }

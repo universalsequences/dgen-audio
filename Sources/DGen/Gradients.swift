@@ -835,14 +835,14 @@ extension LazyOp {
 
       let tensorInput = node.inputs[0]
       guard let inputNode = g.nodes[tensorInput],
-        case .tensor(let shape) = inputNode.shape,
-        shape.count >= 2,
+        case .tensor(let originalShape) = inputNode.shape,
         let tensorId = g.nodeToTensor[tensorInput],
         let tensor = g.tensors[tensorId]
       else {
         let zero = g.n(.constant(0.0), [])
         return [nil, zero, zero]
       }
+      let shape = originalShape.count == 1 ? [originalShape[0], 1] : originalShape
 
       let channelSize = shape[0]
       let numChannels = shape[1]

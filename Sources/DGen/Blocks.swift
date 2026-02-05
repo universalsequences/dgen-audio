@@ -852,8 +852,10 @@ public func isolateSpectralPasses(_ blocks: [Block], _ g: Graph) -> [Block] {
           currentNodes = []
         }
 
-        // Add spectral pass in its own block
-        let spectralBlock = makeBlock(from: block, nodes: [nodeId])
+        // Add spectral pass in its own SIMD block — spectral ops are always
+        // parallel across frames, even when their inputs come from scalar blocks
+        var spectralBlock = makeBlock(from: block, nodes: [nodeId])
+        spectralBlock.kind = .simd
         result.append(spectralBlock)
       } else {
         // Accumulate non-spectral nodes

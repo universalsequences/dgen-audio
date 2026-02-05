@@ -33,8 +33,9 @@ public class LazyGraph {
   internal var tensors: [Tensor] = []
   internal var signals: [Signal] = []
 
-  public init(sampleRate: Float = DGenConfig.sampleRate) {
-    self.graph = Graph(sampleRate: sampleRate)
+  public init(sampleRate: Float = DGenConfig.sampleRate,
+              maxFrameCount: Int = DGenConfig.maxFrameCount) {
+    self.graph = Graph(sampleRate: sampleRate, maxFrameCount: maxFrameCount)
   }
 
   /// Mark the graph as modified (invalidates caches)

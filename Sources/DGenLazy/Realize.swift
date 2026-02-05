@@ -47,7 +47,8 @@ extension LazyGraph {
         let runtime = try MetalCompiledKernel(
             kernels: result.kernels,
             cellAllocations: result.cellAllocations,
-            context: result.context
+            context: result.context,
+            frameCount: frameCount
         )
 
         // Cache for reuse
@@ -214,6 +215,15 @@ extension LazyGraph {
                             indices[i] = indices[i] % dim
                         }
                         currentShape = innerShape
+
+                    case .circularOffset(let offsetCellId, let bufferSize, let inputShape):
+                        // Read write position from memory and apply circular offset
+                        let physicalOffsetCell = context.compilationResult.cellAllocations
+                            .cellMappings[offsetCellId] ?? offsetCellId
+                        let writePos = Int(memPtr[physicalOffsetCell])
+                        let lastDim = indices.count - 1
+                        indices[lastDim] = (indices[lastDim] + writePos + 1) % bufferSize
+                        currentShape = inputShape
                     }
                 }
 

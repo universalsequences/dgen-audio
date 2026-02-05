@@ -517,6 +517,49 @@ extension Graph {
     return n(.seq, writeOp, out)
   }
 
+  /// Buffer view: writes a scalar signal into a ring buffer each frame,
+  /// returns a [1, size] tensor backed by the buffer with a circularOffset transform.
+  /// Zero-copy — the tensor IS the buffer. Composes with conv2d, sum, etc.
+  ///
+  /// - Parameters:
+  ///   - input: Scalar signal to buffer
+  ///   - size: Number of samples to buffer
+  /// - Returns: TensorRef node for a [1, size] tensor view of the ring buffer
+  public func bufferView(_ input: NodeID, size: Int) -> NodeID {
+    let bufferBase = alloc(vectorWidth: size)
+    let writePosCellId = alloc()
+
+    let one = n(.constant(1.0))
+    let zero = n(.constant(0.0))
+    let maxSize = n(.constant(Float(size)))
+
+    // Write position wraps in [0, size)
+    let writePos = n(.floor, n(.accum(writePosCellId), one, zero, zero, maxSize))
+
+    // Write input sample at current write position
+    let writeOp = n(.memoryWrite(bufferBase), writePos, input)
+
+    // Create tensor backed by the ring buffer with circularOffset transform
+    let tensorShape: Shape = [1, size]
+    let tensorId = nextTensorId
+    nextTensorId += 1
+    let transform = ViewTransform.circularOffset(
+      offsetCellId: writePosCellId, bufferSize: size, inputShape: tensorShape)
+    tensors[tensorId] = Tensor(
+      id: tensorId, shape: tensorShape, cellId: bufferBase,
+      baseShape: tensorShape, transforms: [transform])
+    cellToTensor[bufferBase] = tensorId
+
+    let tensorRefNode = n(.tensorRef(tensorId), [], shape: .tensor(tensorShape))
+    nodeToTensor[tensorRefNode] = tensorId
+
+    // seq ensures write happens before read
+    let result = n(.seq, writeOp, tensorRefNode)
+    nodeToTensor[result] = tensorId
+
+    return result
+  }
+
   /// Compute FFT of a signal using Cooley-Tukey algorithm.
   /// - Parameters:
   ///   - signal: Input signal (scalar per frame)

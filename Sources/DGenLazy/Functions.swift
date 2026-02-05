@@ -696,6 +696,24 @@ extension Tensor {
     }
 }
 
+/// Read a scalar from a tensor at (index, channel) with interpolation
+/// For 1D tensors, channel is ignored (auto-promoted to [N, 1])
+extension Tensor {
+    public func peek(_ index: Signal, channel: Signal? = nil) -> Signal {
+        let ch = channel ?? Signal.constant(0.0)
+        let nodeId = try! graph.graph.peek(tensor: self.nodeId, index: index.nodeId, channel: ch.nodeId)
+        return Signal(nodeId: nodeId, graph: graph, requiresGrad: requiresGrad || index.requiresGrad)
+    }
+
+    /// Convert a 1D tensor to a Signal: frame[i] reads tensor[i].
+    /// Convenience over peek + accumulator.
+    public func toSignal(maxFrames: Int? = nil) -> Signal {
+        let len = Float(maxFrames ?? shape[0])
+        let counter = Signal.accum(Signal.constant(1.0), reset: 0.0, min: 0.0, max: len)
+        return peek(counter)
+    }
+}
+
 /// Read a row from a 2D SignalTensor with linear interpolation
 extension SignalTensor {
     public func peekRow(_ rowIndex: Signal) -> SignalTensor {

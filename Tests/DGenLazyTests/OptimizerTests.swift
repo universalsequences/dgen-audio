@@ -198,6 +198,145 @@ final class OptimizerTests: XCTestCase {
     }
   }
 
+  // MARK: - Scalar Signal.param through history (onepole)
+
+  func testSignalParamOnepole() throws {
+    // Direct port of GraphGradientTests.testGraphTrainingOnepole to DGenLazy.
+    // Learns a onepole filter cutoff (0.5 → 0.2) using MSE loss.
+    let cutoff = Signal.param(0.5)
+    let targetCutoff: Float = 0.2
+    let optimizer = SGD(params: [cutoff], lr: 0.05)
+
+    // Learnable filter
+    func buildLearnable() -> Signal {
+      let phase = Signal.phasor(440.0)
+      let (prev, write) = Signal.history()
+      let out = Signal.mix(phase, prev, cutoff)
+      write(out)
+      return out
+    }
+
+    // Target filter (constant cutoff)
+    func buildTarget() -> Signal {
+      let phase = Signal.phasor(440.0)
+      let (prev, write) = Signal.history()
+      let out = Signal.mix(phase, prev, targetCutoff)
+      write(out)
+      return out
+    }
+
+    let frameCount = 256
+
+    // Warmup
+    let _ = try mse(buildLearnable(), buildTarget()).backward(frames: frameCount)
+    optimizer.zeroGrad()
+
+    // Train
+    var firstLoss: Float = 0
+    var lastLoss: Float = 0
+    for epoch in 0..<200 {
+      let loss = mse(buildLearnable(), buildTarget())
+      let lossValues = try loss.backward(frames: frameCount)
+      let avgLoss = lossValues.reduce(0, +) / Float(frameCount)
+
+      if epoch == 0 { firstLoss = avgLoss }
+      lastLoss = avgLoss
+
+      if epoch % 20 == 0 {
+        print("Epoch \(epoch): loss=\(String(format: "%.6f", avgLoss)) cutoff=\(cutoff.data ?? -1) grad=\(cutoff.grad?.data ?? -999)")
+      }
+
+      optimizer.step()
+      optimizer.zeroGrad()
+    }
+
+    print("Final cutoff: \(cutoff.data ?? -1) (target: \(targetCutoff))")
+    XCTAssertLessThan(lastLoss, firstLoss, "Loss should decrease")
+    XCTAssertEqual(cutoff.data ?? -1, targetCutoff, accuracy: 0.1, "Cutoff should approach 0.2")
+  }
+
+  // Minimal repro: does mse(synth_with_history, peek_from_tensor) produce gradients?
+  func testSignalParamWithPeekTarget() throws {
+    // Simplest case: param * envelope vs tensor peek
+    let amp = Signal.param(0.5)
+    let optimizer = SGD(params: [amp], lr: 0.1)
+    let frameCount = 64
+
+    // Target: constant 0.8 stored in tensor, read via toSignal
+    let target = Tensor([Float](repeating: 0.8, count: frameCount))
+
+    func buildSynth() -> Signal {
+      let trigger = Signal.click()
+      let (prev, write) = Signal.history()
+      let out = gswitch(trigger, 1.0, prev * amp)
+      write(out)
+      return out
+    }
+
+    // Warmup — use constant target (no peek/accum) to test history alone
+    let _ = try mse(buildSynth(), Signal.constant(0.8)).backward(frames: frameCount)
+    print("After warmup (const target): amp.grad = \(amp.grad?.data ?? -999)")
+    optimizer.zeroGrad()
+
+    // One real step
+    let loss = mse(buildSynth(), Signal.constant(0.8))
+    let lv = try loss.backward(frames: frameCount)
+    let avgLoss = lv.reduce(0, +) / Float(frameCount)
+    print("Loss=\(avgLoss) amp=\(amp.data ?? -1) grad=\(amp.grad?.data ?? -999)")
+    XCTAssertNotEqual(amp.grad?.data ?? 0, 0, "Gradient should be non-zero")
+  }
+
+  func testSignalParamOnepoleSpectral() throws {
+    // Same as testSignalParamOnepole but with spectralLossFFT instead of MSE
+    let cutoff = Signal.param(0.5)
+    let targetCutoff: Float = 0.2
+    let optimizer = SGD(params: [cutoff], lr: 0.05)
+
+    func buildLearnable() -> Signal {
+      let phase = Signal.phasor(440.0)
+      let (prev, write) = Signal.history()
+      let out = Signal.mix(phase, prev, cutoff)
+      write(out)
+      return out
+    }
+
+    func buildTarget() -> Signal {
+      let phase = Signal.phasor(440.0)
+      let (prev, write) = Signal.history()
+      let out = Signal.mix(phase, prev, targetCutoff)
+      write(out)
+      return out
+    }
+
+    let frameCount = 256
+
+    // Warmup
+    let _ = try spectralLossFFT(buildLearnable(), buildTarget(), windowSize: 32).backward(frames: frameCount)
+    optimizer.zeroGrad()
+
+    // Train
+    var firstLoss: Float = 0
+    var lastLoss: Float = 0
+    for epoch in 0..<200 {
+      let loss = spectralLossFFT(buildLearnable(), buildTarget(), windowSize: 32)
+      let lossValues = try loss.backward(frames: frameCount)
+      let avgLoss = lossValues.reduce(0, +) / Float(frameCount)
+
+      if epoch == 0 { firstLoss = avgLoss }
+      lastLoss = avgLoss
+
+      if epoch % 20 == 0 {
+        print("Epoch \(epoch): loss=\(String(format: "%.6f", avgLoss)) cutoff=\(cutoff.data ?? -1) grad=\(cutoff.grad?.data ?? -999)")
+      }
+
+      optimizer.step()
+      optimizer.zeroGrad()
+    }
+
+    print("Final cutoff: \(cutoff.data ?? -1) (target: \(targetCutoff))")
+    XCTAssertLessThan(lastLoss, firstLoss, "Loss should decrease")
+  }
+
   func testAdamVsSGDConvergence() throws {
     // Compare Adam vs SGD on same problem
 

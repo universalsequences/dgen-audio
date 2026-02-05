@@ -1910,13 +1910,13 @@ public enum LazyOp {
 
       let tensorInput = node.inputs[0]
 
-      // Get tensor shape from the input node
+      // Get tensor shape from the input node (auto-promote 1D to [N, 1])
       guard let inputNode = g.nodes[tensorInput],
-        case .tensor(let shape) = inputNode.shape,
-        shape.count >= 2
+        case .tensor(let originalShape) = inputNode.shape
       else {
-        throw DGenError.tensorError(op: "peek", reason: "requires 2D tensor input")
+        throw DGenError.tensorError(op: "peek", reason: "requires tensor input")
       }
+      let shape = originalShape.count == 1 ? [originalShape[0], 1] : originalShape
 
       // Try to get concrete tensor, or use shape info to compute access
       let channelSize = shape[0]

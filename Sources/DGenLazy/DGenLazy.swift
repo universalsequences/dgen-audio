@@ -18,6 +18,10 @@ public enum DGenConfig {
     /// Default frame count for realize() calls
     public static var defaultFrameCount: Int = 1024
 
+    /// Maximum frame count for GPU buffer allocations (default 4096)
+    /// Set this before creating graphs if you need more than 4096 frames per realize() call
+    public static var maxFrameCount: Int = 4096
+
     /// Optional path to write generated Metal kernels for debugging
     /// When set, kernels will be written to this file after compilation
     public static var kernelOutputPath: String? = nil

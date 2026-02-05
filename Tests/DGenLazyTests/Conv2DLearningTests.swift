@@ -194,7 +194,7 @@ final class Conv2DLearningTests: XCTestCase {
       return (diff * diff).sum()
     }
 
-    let optimizer = SGD(params: [learnedKernel], lr: 0.002)
+    let optimizer = SGD(params: [learnedKernel], lr: 0.0002)
     let epochs = 200
 
     let initialLoss = try buildLoss().backward(frameCount: 1)[0]

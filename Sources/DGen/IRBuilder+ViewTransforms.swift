@@ -116,6 +116,18 @@ extension IRBuilder {
         mod(idx, constant(Float(innerShape[i])))
       }
       return (newIndices, innerShape, inBoundsCheck)
+
+    case .circularOffset(let offsetCellId, let bufferSize, let inputShape):
+      // Dynamic circular buffer offset: index i → buffer[(writePos + 1 + i) % bufferSize]
+      let offset = load(offsetCellId, nil)
+      let one = constant(1.0)
+      let size = constant(Float(bufferSize))
+      var newIndices = indices
+      let lastDim = newIndices.count - 1
+      let shifted = newIndices[lastDim] + offset + one
+      let q = floor(shifted / size)
+      newIndices[lastDim] = shifted - q * size
+      return (newIndices, inputShape, inBoundsCheck)
     }
   }
 
