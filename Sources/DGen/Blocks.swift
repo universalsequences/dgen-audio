@@ -1085,10 +1085,28 @@ public func detectShapeTransitions(block: Block, g: Graph) -> [(nodeIndex: Int, 
   var currentShape: [Int]? = nil
 
   for (index, nodeId) in block.nodes.enumerated() {
-    if let node = g.nodes[nodeId], case .tensor(let shape) = node.shape {
+    guard let node = g.nodes[nodeId] else { continue }
+
+    if case .tensor(let shape) = node.shape {
+      // Tensor node - check for shape change
       if shape != currentShape {
         transitions.append((nodeIndex: index, shape: shape))
         currentShape = shape
+      }
+    } else if case .scalar = node.shape {
+      // Scalar node - check if it consumes a tensor (e.g., sum reduction)
+      // These need their own region AFTER the tensor region completes
+      let consumesTensor = node.inputs.contains { inputId in
+        if let inputNode = g.nodes[inputId], case .tensor = inputNode.shape {
+          return true
+        }
+        return false
+      }
+      if consumesTensor && currentShape != nil {
+        // Create a "scalar reduction" region with shape [1] to separate it
+        // This ensures the tensor computation completes before reduction runs
+        transitions.append((nodeIndex: index, shape: [1]))
+        currentShape = [1]
       }
     }
   }
@@ -1101,7 +1119,7 @@ public func detectShapeTransitions(block: Block, g: Graph) -> [(nodeIndex: Int, 
 public func findCrossRegionOutboundCells(
   block: Block, g: Graph, transitions: [(nodeIndex: Int, shape: [Int])]
 ) -> Set<CellID> {
-  guard transitions.count > 1 else { return [] }
+  guard !transitions.isEmpty else { return [] }
 
   var outbound: Set<CellID> = []
 
@@ -1118,12 +1136,18 @@ public func findCrossRegionOutboundCells(
 
   // For each node, check if any of its inputs come from a different region
   for nodeId in block.nodes {
-    guard let node = g.nodes[nodeId],
-          let myRegion = nodeToRegion[nodeId] else { continue }
+    guard let node = g.nodes[nodeId] else { continue }
+    let myRegion = nodeToRegion[nodeId]  // May be nil for scalar nodes
 
     for inputId in node.inputs {
-      guard let inputRegion = nodeToRegion[inputId],
-            inputRegion != myRegion else { continue }
+      let inputRegion = nodeToRegion[inputId]
+
+      // Case 1: Both have regions and they differ (cross-region)
+      // Case 2: Node is scalar (no region) but input has a region (tensor → scalar)
+      let crossesRegion = (myRegion != nil && inputRegion != nil && myRegion != inputRegion)
+                       || (myRegion == nil && inputRegion != nil)
+
+      guard crossesRegion else { continue }
 
       // This input crosses a region boundary - its cell must be outbound
       if let tensorId = g.nodeToTensor[inputId],
@@ -1399,13 +1423,21 @@ public func emitBlockUOps(
   // Tensor Register Optimization:
   // Compute which tensor cells need to be written to memory (used by later blocks)
   // and clear the register tracking for this new block.
-  ctx.outboundTensorCells = findOutboundTensorCells(blocks, g, block: block)
-  ctx.clearTensorRegisters()
+  var outboundCells = findOutboundTensorCells(blocks, g, block: block)
 
   // Check for scalar blocks with shape transitions (e.g., conv2d in feedback loops)
   // These need nested element loops instead of flat threading
   let shapeTransitions = detectShapeTransitions(block: block, g: g)
   let hasMultipleShapes = shapeTransitions.count > 1
+
+  // For ALL backends: include cross-region outbound cells (tensor → scalar reductions)
+  // This ensures tensors are written to memory before scalar reductions read them
+  if hasMultipleShapes {
+    let crossRegion = findCrossRegionOutboundCells(block: block, g: g, transitions: shapeTransitions)
+    outboundCells.formUnion(crossRegion)
+  }
+  ctx.outboundTensorCells = outboundCells
+  ctx.clearTensorRegisters()
 
   if backend == .metal && block.kind == .scalar && hasMultipleShapes {
     // Use specialized emission with per-shape element loops
