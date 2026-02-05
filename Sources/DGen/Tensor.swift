@@ -83,9 +83,9 @@ public struct Tensor {
   // Computed property for quick view check
   public var isView: Bool { !transforms.isEmpty }
 
-  // Legacy fields kept for compatibility during migration
-  public var isLazy: Bool              // True if cellId is a lazy placeholder
-  public var materialize: Bool         // True if this tensor should be stored in memory
+  // Allocation flags
+  public var isLazy: Bool              // True if cellId is a lazy placeholder (not yet allocated)
+  public var materialize: Bool         // True if this tensor should be stored in memory (for realize())
 
   public init(
     id: TensorID, shape: Shape, cellId: CellID, data: [Float]? = nil,
@@ -107,88 +107,7 @@ public struct Tensor {
     self.baseStrides = baseStrides ?? Tensor.computeRowMajorStrides(baseShape ?? shape)
   }
 
-  // Legacy compatibility initializer - converts old flat fields to transforms
-  public init(
-    id: TensorID, shape: Shape, cellId: CellID, data: [Float]? = nil, strides: [Int]? = nil,
-    offset: Int = 0, isView: Bool = false, padding: [(left: Int, right: Int)]? = nil,
-    paddingSourceShape: [Int]? = nil,
-    innerShapeForRepeat: [Int]? = nil,
-    shrinkStart: [Int]? = nil,
-    isLazy: Bool = false,
-    materialize: Bool = false
-  ) {
-    self.id = id
-    self.shape = shape
-    self.cellId = cellId
-    self.data = data
-    self.isLazy = isLazy
-    self.materialize = materialize
-
-    // Build transforms from legacy fields
-    var transforms: [ViewTransform] = []
-    var computedBaseShape = shape
-    var computedBaseStrides = strides ?? Tensor.computeRowMajorStrides(shape)
-
-    // If we have padding, it was applied first (base → padded)
-    if let pad = padding {
-      let innerShape = zip(shape, pad).map { $0 - $1.left - $1.right }
-      computedBaseShape = innerShape
-      computedBaseStrides = Tensor.computeRowMajorStrides(innerShape)
-      transforms.append(.pad(padding: pad, inputShape: innerShape))
-    }
-
-    // If we have innerShapeForRepeat, it's a repeat view
-    if let innerShape = innerShapeForRepeat {
-      // For repeat, the base is the inner shape
-      computedBaseShape = innerShape
-      computedBaseStrides = Tensor.computeRowMajorStrides(innerShape)
-      transforms.append(.repeatTile(innerShape: innerShape, outputShape: shape))
-    }
-
-    // Handle shrinkStart for shrink+repeat combo
-    if let start = shrinkStart {
-      // This is a shrink on top of a repeated tensor
-      // The ranges would be from start to start + shape[i]
-      let ranges: [(start: Int, end: Int)?] = start.enumerated().map { i, s in
-        (start: s, end: s + shape[i])
-      }
-      // We need to insert shrink before the repeat in the chain
-      // Actually, shrinkStart is applied AFTER repeat, so add shrink transform
-      if let repeatIdx = transforms.firstIndex(where: {
-        if case .repeatTile = $0 { return true }
-        return false
-      }) {
-        // Get the repeated shape (output of repeat)
-        if case .repeatTile(_, let repeatedShape) = transforms[repeatIdx] {
-          transforms.append(.shrink(ranges: ranges, inputShape: repeatedShape))
-        }
-      }
-    }
-
-    // Handle non-contiguous strides (from transpose or asStrided)
-    if let strides = strides, strides != Tensor.computeRowMajorStrides(shape),
-       padding == nil && innerShapeForRepeat == nil {
-      // This is a strided view - add asStrided transform
-      // The base shape is determined by the strides
-      transforms.append(.asStrided(outputShape: shape, strides: strides, offset: offset, inputShape: shape))
-    }
-
-    self.transforms = transforms
-    self.baseShape = computedBaseShape
-    self.baseStrides = computedBaseStrides
-  }
-
-  /// Legacy compatibility: The inner (unpadded) shape
-  public var innerShape: [Int]? {
-    for transform in transforms {
-      if case .pad(_, let inputShape) = transform {
-        return inputShape
-      }
-    }
-    return nil
-  }
-
-  /// Legacy compatibility: padding accessor
+  /// Padding amounts - extracts from pad transform if present
   public var padding: [(left: Int, right: Int)]? {
     for transform in transforms {
       if case .pad(let padding, _) = transform {
@@ -198,37 +117,7 @@ public struct Tensor {
     return nil
   }
 
-  /// Legacy compatibility: paddingSourceShape accessor
-  public var paddingSourceShape: [Int]? {
-    for transform in transforms {
-      if case .pad(_, _) = transform {
-        return shape  // The padded shape
-      }
-    }
-    return nil
-  }
-
-  /// Legacy compatibility: innerShapeForRepeat accessor
-  public var innerShapeForRepeat: [Int]? {
-    for transform in transforms {
-      if case .repeatTile(let innerShape, _) = transform {
-        return innerShape
-      }
-    }
-    return nil
-  }
-
-  /// Legacy compatibility: shrinkStart accessor
-  public var shrinkStart: [Int]? {
-    for transform in transforms {
-      if case .shrink(let ranges, _) = transform {
-        return ranges.map { $0?.start ?? 0 }
-      }
-    }
-    return nil
-  }
-
-  /// Legacy compatibility: strides accessor (returns base strides or from asStrided)
+  /// Effective strides - from asStrided transform or baseStrides
   public var strides: [Int] {
     for transform in transforms.reversed() {
       if case .asStrided(_, let strides, _, _) = transform {
@@ -238,7 +127,7 @@ public struct Tensor {
     return baseStrides
   }
 
-  /// Legacy compatibility: offset accessor
+  /// Memory offset - from asStrided transform or 0
   public var offset: Int {
     for transform in transforms {
       if case .asStrided(_, _, let offset, _) = transform {

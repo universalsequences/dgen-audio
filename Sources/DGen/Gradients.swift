@@ -536,7 +536,7 @@ extension LazyOp {
     case .historyRead(let cellId):
       // historyRead exposes previous state. The gradient w.r.t. this read's output
       // must be passed to the previous timestep via the gradient carry cell.
-      // This is like storeGradMemory in the legacy backward.
+      // Stores gradient to carry cell for the previous timestep to read.
       let carryCell = g.getGradCarryCell(for: cellId)
       let zero = g.n(.constant(0.0), [])
       // Store gradOutput to carry cell for previous timestep
@@ -548,7 +548,7 @@ extension LazyOp {
     case .historyWrite(let cellId):
       // historyWrite stores current input into the cell.
       // The gradient for the input comes from future reads via the carry cell.
-      // This is like loadGradMemory in the legacy backward.
+      // Reads gradient from carry cell written by the future timestep.
       let carryCell = g.getGradCarryCell(for: cellId)
       let zero = g.n(.constant(0.0), [])
       // Read gradient from carry cell (from future timestep)
