@@ -1045,16 +1045,8 @@ public enum LazyOp {
 
       b.parallelRange(numCols) { colIdx in
         let colIdxFloat = b.cast(colIdx, to: .float)
-
-        let value: Expr
-        if !inTensor.transforms.isEmpty {
-          // Use tensorRead to walk the transform chain
-          value = b.tensorRead(inTensor, indices: [floorIndex, colIdxFloat])
-        } else {
-          // Legacy column-major layout: offset = col * numRows + row
-          let readPos = colIdxFloat * numRowsFloat + floorIndex
-          value = b.memoryRead(inTensor.cellId, b.cast(readPos, to: .int))
-        }
+        // Row-major read: tensorRead handles both transformed and base tensors
+        let value = b.tensorRead(inTensor, indices: [floorIndex, colIdxFloat])
         _ = b.memoryWrite(outTensor.cellId, b.cast(colIdx, to: .int), value)
       }
 
@@ -1101,20 +1093,9 @@ public enum LazyOp {
 
       b.parallelRange(numCols) { colIdx in
         let colIdxFloat = b.cast(colIdx, to: .float)
-
-        let floorValue: Expr
-        let ceilValue: Expr
-        if !inTensor.transforms.isEmpty {
-          // Use tensorRead to walk the transform chain
-          floorValue = b.tensorRead(inTensor, indices: [floorIndex, colIdxFloat])
-          ceilValue = b.tensorRead(inTensor, indices: [ceilWrapped, colIdxFloat])
-        } else {
-          // Legacy column-major layout: offset = col * numRows + row
-          let floorPos = colIdxFloat * numRowsFloat + floorIndex
-          floorValue = b.memoryRead(inTensor.cellId, b.cast(floorPos, to: .int))
-          let ceilPos = colIdxFloat * numRowsFloat + ceilWrapped
-          ceilValue = b.memoryRead(inTensor.cellId, b.cast(ceilPos, to: .int))
-        }
+        // Row-major read: tensorRead handles both transformed and base tensors
+        let floorValue = b.tensorRead(inTensor, indices: [floorIndex, colIdxFloat])
+        let ceilValue = b.tensorRead(inTensor, indices: [ceilWrapped, colIdxFloat])
 
         // Interpolate: (1 - frac) * floor + frac * ceil
         let interpolated = oneMinusFrac * floorValue + frac * ceilValue

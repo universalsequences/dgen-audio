@@ -1326,10 +1326,9 @@ public func emitFrameTensorChainBlock(
         let positiveIndex = b.gswitch(isNegative, wrappedIndex + numRowsFloat, wrappedIndex)
         let floorIndex = b.floor(positiveIndex)
 
-        // Read the selected row element for this column
-        let colOffset = b.value(binIdx.lazy) * numRowsFloat
-        let readPos = colOffset + floorIndex
-        let value = b.memoryRead(inTensor.cellId, b.cast(readPos, to: .int))
+        // Row-major read: tensorRead handles both transformed and base tensors
+        let colIdxFloat = b.cast(b.value(binIdx.lazy), to: .float)
+        let value = b.tensorRead(inTensor, indices: [floorIndex, colIdxFloat])
 
         // Register output tensor element in a register (avoid shared memory writes)
         _ = b.tstore(outTensor.cellId, b.value(binIdx.lazy), value)
