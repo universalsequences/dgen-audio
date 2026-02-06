@@ -763,7 +763,8 @@ public struct Expr {
     return Expr(uop.value, ctx: lhs.ctx, nodeId: lhs.nodeId, builder: lhs.builder)
   }
 
-  /// Try constant folding for a binary op; returns nil if either operand is not a constant
+  /// Try constant folding for a binary op; returns nil if either operand is not a constant.
+  /// When both operands are int-typed, the result is truncated to match GPU int arithmetic.
   private static func foldConstants(
     _ lhs: Expr, _ rhs: Expr, op: (Float, Float) -> Float
   ) -> Expr? {
@@ -771,7 +772,9 @@ public struct Expr {
           case .constant(_, let rval) = rhs.lazy
     else { return nil }
     let resultType = promotedType(lhs, rhs)
-    let folded = lhs.ctx.useConstant(src: lhs.nodeId, value: op(lval, rval))
+    var result = op(lval, rval)
+    if resultType == .int { result = Float(Int(result)) }
+    let folded = lhs.ctx.useConstant(src: lhs.nodeId, value: result)
     return Expr(folded, ctx: lhs.ctx, nodeId: lhs.nodeId, builder: lhs.builder, scalarType: resultType)
   }
 

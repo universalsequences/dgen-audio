@@ -491,7 +491,7 @@ public enum LazyOp {
         // 1. Load windowed samples into per-frame FFT scratch cells
         // Compute Hann coefficient inline to avoid shared memory race
         b.parallelRange(windowSize) { n in
-          let nInt = n  // b.cast(n, to: .int)
+          let nInt = n
           let nFloat = b.cast(nInt, to: .float)
           let w = hannCoeff(nFloat)
 
@@ -675,13 +675,17 @@ public enum LazyOp {
         let gradImag2 = gradMag2 * imag2 / safeMag2
 
         // Store gradient spectrum directly (no conjugation needed)
+        // IFFT with positive twiddle: Re[Σ X[k]·e^{+jθ}] = Σ [X_real·cos - X_imag·sin]
+        // which matches the DFT transpose scatter formula exactly
         _ = b.memoryWrite(gradSpec1Cell, gradSpecBase + kInt, gradReal1)
         _ = b.memoryWrite(gradSpec1Cell, gradSpecBase + kInt + imagOff, gradImag1)
         _ = b.memoryWrite(gradSpec2Cell, gradSpecBase + kInt, gradReal2)
         _ = b.memoryWrite(gradSpec2Cell, gradSpecBase + kInt + imagOff, gradImag2)
       }
 
-      // Zero upper bins (numBins to windowSize-1) — no conjugate fill needed
+      // Zero upper bins (numBins to windowSize-1) — no conjugate fill needed.
+      // The loss only depends on bins 0..numBins-1, so the gradient has no
+      // contribution from mirror bins. Zeroing prevents garbage from affecting IFFT.
       if windowSize / 2 - 1 > 0 {
         b.parallelRange(windowSize / 2 - 1) { k in
           let kInt = b.cast(k, to: .int) + b.intConstant(numBins)
