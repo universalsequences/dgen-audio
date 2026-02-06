@@ -8,6 +8,9 @@ extension IRBuilder {
   /// Read from tensor by walking the transform chain backwards.
   /// Maps output indices to base memory indices, handling padding, striding, etc.
   /// For frame-aware tensors: uses frame-indexed addressing.
+  ///
+  /// Tries composed path first: if all transforms compose into (shape, strides, offset)
+  /// views, emits a single stridedIndex per view instead of divmod chains.
   public func tensorRead(_ tensor: Tensor, indices: [Expr]) -> Expr {
     // If no transforms, fast path: direct read from base memory
     if tensor.transforms.isEmpty {
@@ -15,7 +18,16 @@ extension IRBuilder {
       return tensorReadFromBase(tensor, elemIdx: memIdx)
     }
 
-    // Walk transforms BACKWARDS to map output indices → base indices
+    // Try composed path: collapse transform chain into stride tuples
+    let composed = tensor.composeTransforms()
+    if composed.isFullyComposed && !composed.views.isEmpty {
+      if composed.views.count == 1 {
+        return tensorReadSingleView(tensor, indices: indices, view: composed.views[0])
+      }
+      return tensorReadComposed(tensor, indices: indices, views: composed.views)
+    }
+
+    // Fall back: walk transforms BACKWARDS to map output indices → base indices
     var currentIndices = indices
     var currentShape = tensor.shape
     var inBoundsCheck: Expr? = nil  // Accumulate bounds checks from padding
@@ -46,9 +58,27 @@ extension IRBuilder {
 
   /// Read from tensor using flat index with transform chain support.
   /// For frame-aware cells, uses frame-indexed addressing.
+  ///
+  /// Tries composed path: if the outermost view is contiguous with offset 0,
+  /// the flat index maps directly through without flatToMultiIndex.
   public func tensorRead(_ tensor: Tensor, flatIdx: Expr, shape: [Int]) -> Expr {
     if !tensor.transforms.isEmpty {
-      // Need multi-dim indices for transform chain
+      // Try composed path to avoid unnecessary flatToMultiIndex
+      let composed = tensor.composeTransforms()
+      if composed.isFullyComposed && !composed.views.isEmpty {
+        let outerView = composed.views.last!
+        if composed.views.count == 1 && outerView.isContiguous && outerView.offset == 0 {
+          // Single contiguous view: flat index maps directly to base memory
+          return tensorReadFromBase(tensor, elemIdx: flatIdx)
+        }
+        // Multi-view or non-contiguous: decompose flat index into outer view indices
+        let indices = flatToMultiIndex(flatIdx, shape)
+        if composed.views.count == 1 {
+          return tensorReadSingleView(tensor, indices: indices, view: outerView)
+        }
+        return tensorReadComposed(tensor, indices: indices, views: composed.views)
+      }
+      // Fall back: need multi-dim indices for transform chain
       let indices = flatToMultiIndex(flatIdx, shape)
       return tensorRead(tensor, indices: indices)
     } else if ctx.frameAwareTensorCells.contains(tensor.cellId),
@@ -61,6 +91,69 @@ extension IRBuilder {
       let memIdx = tensorMemoryIndex(tensor, flatIdx: flatIdx, shape: shape)
       return memoryRead(tensor.cellId, memIdx)
     }
+  }
+
+  // MARK: - Composed View Read Paths
+
+  /// Fast path for a single composed view: one stridedIndex call → base memory read.
+  /// Squeezes out size-1 dims to avoid redundant IR ops.
+  private func tensorReadSingleView(_ tensor: Tensor, indices: [Expr], view: ComposedView) -> Expr {
+    let (sqIdx, sqStr) = squeezeView(indices: indices, view: view)
+    let memIdx = stridedIndex(indices: sqIdx, strides: sqStr, offset: view.offset)
+    return tensorReadFromBase(tensor, elemIdx: memIdx)
+  }
+
+  /// Multi-view composed path: walk from outermost view to innermost.
+  /// Each view boundary requires: stridedIndex → flatToMultiIndex → next view's stridedIndex.
+  /// Squeezes size-1 dims at each boundary to minimize divmod chains in generated IR.
+  ///
+  /// Views are ordered innermost-first (index 0 = closest to base memory).
+  /// We process from the last view (outermost, matching the tensor's final shape) inward.
+  private func tensorReadComposed(
+    _ tensor: Tensor, indices: [Expr], views: [ComposedView]
+  ) -> Expr {
+    var currentIndices = indices
+
+    // Walk from outermost view (last) down to innermost (first)
+    for i in stride(from: views.count - 1, through: 0, by: -1) {
+      let view = views[i]
+
+      // Squeeze size-1 dims to avoid generating divmod for dead dimensions
+      let (sqIdx, sqStr) = squeezeView(indices: currentIndices, view: view)
+      let flatIdx = stridedIndex(indices: sqIdx, strides: sqStr, offset: view.offset)
+
+      if i == 0 {
+        // Innermost view: flat index maps directly to base memory
+        return tensorReadFromBase(tensor, elemIdx: flatIdx)
+      }
+
+      // Decompose flat index into the next inner view's full shape.
+      // Must use unsqueezed shape so indices stay positionally aligned with view dims
+      // (squeezeView picks indices[i] where i is the dim position).
+      let innerView = views[i - 1]
+      currentIndices = flatToMultiIndex(flatIdx, innerView.shape)
+    }
+
+    // Should not reach here (loop always returns at i==0)
+    let memIdx = stridedIndex(
+      indices: currentIndices, strides: views[0].strides, offset: views[0].offset)
+    return tensorReadFromBase(tensor, elemIdx: memIdx)
+  }
+
+  /// Remove size-1 dimensions from indices and strides to avoid useless IR.
+  /// Size-1 dims always index at 0, contributing nothing to the strided offset.
+  private func squeezeView(indices: [Expr], view: ComposedView) -> (indices: [Expr], strides: [Int])
+  {
+    var sqIdx: [Expr] = []
+    var sqStr: [Int] = []
+    for i in 0..<view.shape.count where view.shape[i] != 1 {
+      sqIdx.append(i < indices.count ? indices[i] : constant(0.0))
+      sqStr.append(view.strides[i])
+    }
+    if sqIdx.isEmpty {
+      return ([constant(0.0)], [0])
+    }
+    return (sqIdx, sqStr)
   }
 
   // MARK: - Transform Backward Application

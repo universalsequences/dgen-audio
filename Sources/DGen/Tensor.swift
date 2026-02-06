@@ -46,29 +46,32 @@ public enum ViewTransform: Equatable {
 
   public static func == (lhs: ViewTransform, rhs: ViewTransform) -> Bool {
     switch (lhs, rhs) {
-    case let (.pad(lp, lis), .pad(rp, ris)):
-      return lis == ris && lp.count == rp.count && zip(lp, rp).allSatisfy { $0.left == $1.left && $0.right == $1.right }
-    case let (.asStrided(lo, ls, loff, lis), .asStrided(ro, rs, roff, ris)):
+    case (.pad(let lp, let lis), .pad(let rp, let ris)):
+      return lis == ris && lp.count == rp.count
+        && zip(lp, rp).allSatisfy { $0.left == $1.left && $0.right == $1.right }
+    case (
+      .asStrided(let lo, let ls, let loff, let lis), .asStrided(let ro, let rs, let roff, let ris)
+    ):
       return lo == ro && ls == rs && loff == roff && lis == ris
-    case let (.reshape(lo, lis), .reshape(ro, ris)):
+    case (.reshape(let lo, let lis), .reshape(let ro, let ris)):
       return lo == ro && lis == ris
-    case let (.transpose(la, lis), .transpose(ra, ris)):
+    case (.transpose(let la, let lis), .transpose(let ra, let ris)):
       return la == ra && lis == ris
-    case let (.shrink(lr, lis), .shrink(rr, ris)):
+    case (.shrink(let lr, let lis), .shrink(let rr, let ris)):
       if lis != ris || lr.count != rr.count { return false }
       for (l, r) in zip(lr, rr) {
         switch (l, r) {
         case (nil, nil): continue
-        case let (ls?, rs?): if ls.start != rs.start || ls.end != rs.end { return false }
+        case (let ls?, let rs?): if ls.start != rs.start || ls.end != rs.end { return false }
         default: return false
         }
       }
       return true
-    case let (.expand(lt, lis), .expand(rt, ris)):
+    case (.expand(let lt, let lis), .expand(let rt, let ris)):
       return lt == rt && lis == ris
-    case let (.repeatTile(li, lo), .repeatTile(ri, ro)):
+    case (.repeatTile(let li, let lo), .repeatTile(let ri, let ro)):
       return li == ri && lo == ro
-    case let (.slidingWindow(lw, lis), .slidingWindow(rw, ris)):
+    case (.slidingWindow(let lw, let lis), .slidingWindow(let rw, let ris)):
       return lw == rw && lis == ris
     default:
       return false
@@ -76,23 +79,47 @@ public enum ViewTransform: Equatable {
   }
 }
 
+/// A composed view represents a segment of consecutive composable transforms
+/// collapsed into a single (shape, strides, offset) tuple.
+/// This is the tinygrad ShapeTracker pattern: instead of replaying each transform
+/// at IR time (generating divmod chains), we compose them at compile time.
+public struct ComposedView {
+  public let shape: [Int]
+  public let strides: [Int]
+  public let offset: Int
+
+  /// A view is contiguous if its strides match row-major layout for its shape.
+  /// This determines whether a subsequent reshape can be absorbed into this view
+  /// (row-major reshape only works on contiguous data) or forces a new view boundary.
+  public var isContiguous: Bool {
+    let expectedContiguousStrides = Tensor.computeRowMajorStrides(shape)
+    return (strides == expectedContiguousStrides)
+  }
+}
+
+/// Result of composing a tensor's transform chain into ComposedView segments.
+public struct ComposedTransformResult {
+  public let views: [ComposedView]
+  public let isFullyComposed: Bool
+}
+
 public struct Tensor {
   public let id: TensorID
-  public let shape: Shape              // Final shape after all transforms
-  public var cellId: CellID            // Base memory cell
-  public var data: [Float]?            // Initial data to be injected by runtime
+  public let shape: Shape  // Final shape after all transforms
+  public var cellId: CellID  // Base memory cell
+  public var data: [Float]?  // Initial data to be injected by runtime
 
   // Transform chain from base to final view
-  public let baseShape: [Int]          // Shape of actual data in memory
-  public let baseStrides: [Int]        // Strides of actual data (row-major)
+  public let baseShape: [Int]  // Shape of actual data in memory
+  public let baseStrides: [Int]  // Strides of actual data (row-major)
   public let transforms: [ViewTransform]  // Applied in order from base → final
 
   // Computed property for quick view check
   public var isView: Bool { !transforms.isEmpty }
 
   // Allocation flags
-  public var isLazy: Bool              // True if cellId is a lazy placeholder (not yet allocated)
-  public var materialize: Bool         // True if this tensor should be stored in memory (for realize())
+  public var isLazy: Bool  // True if cellId is a lazy placeholder (not yet allocated)
+  public var materialize: Bool  // True if this tensor should be stored in memory (for realize())
 
   public init(
     id: TensorID, shape: Shape, cellId: CellID, data: [Float]? = nil,
@@ -185,6 +212,87 @@ public struct Tensor {
   /// Check if this tensor is contiguous (strides match row-major layout of base)
   public var isContiguous: Bool {
     transforms.isEmpty && baseStrides == Tensor.computeRowMajorStrides(baseShape)
+  }
+
+  /// Compose the transform chain into ComposedView segments.
+  ///
+  /// Walks transforms forward from base, accumulating shape/strides/offset.
+  /// Compatible transforms (reshape on contiguous, transpose, shrink, expand, asStrided)
+  /// are absorbed into the current view. Incompatible transforms or reshape on
+  /// non-contiguous views push a view boundary.
+  ///
+  /// Non-composable transforms (pad, repeatTile, slidingWindow) cause an early
+  /// return with isFullyComposed=false → caller falls back to the chain walker.
+  public func composeTransforms() -> ComposedTransformResult {
+    guard !transforms.isEmpty else {
+      // No transforms: single contiguous view from base
+      return ComposedTransformResult(
+        views: [ComposedView(shape: baseShape, strides: baseStrides, offset: 0)],
+        isFullyComposed: true
+      )
+    }
+
+    var currentShape = baseShape
+    var currentStrides = baseStrides
+    var currentOffset = 0
+    var views: [ComposedView] = []
+
+    for transform in transforms {
+      switch transform {
+
+      case .reshape(let outputShape, _):
+        let view = ComposedView(shape: currentShape, strides: currentStrides, offset: currentOffset)
+        if view.isContiguous {
+          // Contiguous: absorb reshape by computing new row-major strides
+          currentShape = outputShape
+          currentStrides = Tensor.computeRowMajorStrides(outputShape)
+          // offset stays the same (contiguous → row-major reinterpretation)
+        } else {
+          // Non-contiguous: push current view as boundary, start fresh
+          views.append(view)
+          currentShape = outputShape
+          currentStrides = Tensor.computeRowMajorStrides(outputShape)
+          currentOffset = 0
+        }
+
+      case .transpose(let axes, _):
+        // Permute shape and strides
+        currentShape = axes.map { currentShape[$0] }
+        currentStrides = axes.map { currentStrides[$0] }
+
+      case .shrink(let ranges, _):
+        // Add start offsets and update shape
+        for (dim, range) in ranges.enumerated() {
+          if let (start, end) = range {
+            currentOffset += start * currentStrides[dim]
+            currentShape[dim] = end - start
+          }
+        }
+
+      case .expand(let targetShape, _):
+        // Set strides to 0 for broadcast dims
+        for i in 0..<currentShape.count {
+          if currentShape[i] == 1 && targetShape[i] != 1 {
+            currentStrides[i] = 0
+          }
+          currentShape[i] = targetShape[i]
+        }
+
+      case .asStrided(let outputShape, let strides, let offset, _):
+        // Replace shape/strides/offset directly
+        currentShape = outputShape
+        currentStrides = strides
+        currentOffset = offset
+
+      case .pad, .repeatTile, .slidingWindow:
+        // Non-composable: fall back to chain walker
+        return ComposedTransformResult(views: [], isFullyComposed: false)
+      }
+    }
+
+    // Push the final view
+    views.append(ComposedView(shape: currentShape, strides: currentStrides, offset: currentOffset))
+    return ComposedTransformResult(views: views, isFullyComposed: true)
   }
 }
 
@@ -416,7 +524,8 @@ extension Graph {
     }
 
     let transform = ViewTransform.reshape(outputShape: newShape, inputShape: inputShape)
-    return try createViewWithTransform(input: input, op: .reshape(newShape), newShape: newShape, transform: transform)
+    return try createViewWithTransform(
+      input: input, op: .reshape(newShape), newShape: newShape, transform: transform)
   }
 
   /// Transpose a tensor by permuting its axes without copying data.
@@ -456,7 +565,8 @@ extension Graph {
 
     let newShape = perm.map { inputShape[$0] }
     let transform = ViewTransform.transpose(axes: perm, inputShape: inputShape)
-    return try createViewWithTransform(input: input, op: .transpose(perm), newShape: newShape, transform: transform)
+    return try createViewWithTransform(
+      input: input, op: .transpose(perm), newShape: newShape, transform: transform)
   }
 
   /// Slice a tensor along each axis without copying data.
@@ -500,7 +610,8 @@ extension Graph {
         guard start >= 0 && end <= inputShape[dim] && start < end else {
           throw DGenError.tensorError(
             op: "shrink",
-            reason: "invalid range (\(start), \(end)) for dimension \(dim) with size \(inputShape[dim])"
+            reason:
+              "invalid range (\(start), \(end)) for dimension \(dim) with size \(inputShape[dim])"
           )
         }
         newShape.append(end - start)
@@ -518,7 +629,8 @@ extension Graph {
     }
 
     let transform = ViewTransform.shrink(ranges: transformRanges, inputShape: inputShape)
-    return try createViewWithTransform(input: input, op: .shrink(ranges), newShape: newShape, transform: transform)
+    return try createViewWithTransform(
+      input: input, op: .shrink(ranges), newShape: newShape, transform: transform)
   }
 
   /// Pad a tensor with zeros along each axis without copying data.
@@ -557,7 +669,8 @@ extension Graph {
     let newShape = zip(inputShape, padding).map { dim, pad in dim + pad.0 + pad.1 }
     let paddingTuples = padding.map { (left: $0.0, right: $0.1) }
     let transform = ViewTransform.pad(padding: paddingTuples, inputShape: inputShape)
-    return try createViewWithTransform(input: input, op: .pad(padding), newShape: newShape, transform: transform)
+    return try createViewWithTransform(
+      input: input, op: .pad(padding), newShape: newShape, transform: transform)
   }
 
   /// Broadcast a tensor by expanding size-1 dimensions without copying data.
@@ -607,7 +720,8 @@ extension Graph {
     }
 
     let transform = ViewTransform.expand(targetShape: targetShape, inputShape: inputShape)
-    return try createViewWithTransform(input: input, op: .expandView(targetShape), newShape: targetShape, transform: transform)
+    return try createViewWithTransform(
+      input: input, op: .expandView(targetShape), newShape: targetShape, transform: transform)
   }
 
   /// Tile a tensor by repeating it along each dimension without copying data.
@@ -656,7 +770,8 @@ extension Graph {
     let newShape = zip(inputShape, repeats).map { $0 * $1 }
 
     let transform = ViewTransform.repeatTile(innerShape: inputShape, outputShape: newShape)
-    return try createViewWithTransform(input: input, op: .repeatView(repeats), newShape: newShape, transform: transform)
+    return try createViewWithTransform(
+      input: input, op: .repeatView(repeats), newShape: newShape, transform: transform)
   }
 
   /// Create a strided view with arbitrary shape and strides (advanced, low-level).
@@ -704,8 +819,10 @@ extension Graph {
         reason: "shape and strides must have same count: \(shape.count) vs \(strides.count)")
     }
 
-    let transform = ViewTransform.asStrided(outputShape: shape, strides: strides, offset: offset, inputShape: inputShape)
-    return try createViewWithTransform(input: input, op: .asStrided(shape, strides), newShape: shape, transform: transform)
+    let transform = ViewTransform.asStrided(
+      outputShape: shape, strides: strides, offset: offset, inputShape: inputShape)
+    return try createViewWithTransform(
+      input: input, op: .asStrided(shape, strides), newShape: shape, transform: transform)
   }
 
   /// Extract sliding windows from a tensor as extra dimensions (im2col via views).
