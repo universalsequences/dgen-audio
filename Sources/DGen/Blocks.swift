@@ -840,6 +840,8 @@ public func isolateSpectralPasses(_ blocks: [Block], _ g: Graph) -> [Block] {
         // memory for FFT computation that can't be safely accessed by multiple SIMD threads
         if case .spectralLossFFT = node.op { return true }
         if case .spectralLossFFTGradInline = node.op { return true }
+        if case .spectralLossFFTGradSpec = node.op { return true }
+        if case .spectralLossFFTGradIFFT = node.op { return true }
         if case .spectralLossFFTGradRead = node.op { return true }
         if case .spectralLossFFTGradRead2 = node.op { return true }
         return false

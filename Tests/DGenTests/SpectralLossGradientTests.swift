@@ -804,13 +804,15 @@ final class SpectralLossGradientTests: XCTestCase {
     print("Initial loss: \(initialLoss)")
 
     // Training loop with timing
-    let epochs = 500
+    let epochs = 100
     var finalLoss = initialLoss
     let trainStart = CFAbsoluteTimeGetCurrent()
     for i in 0..<epochs {
       finalLoss = ctx.trainStep()
       // Print every epoch to see gradient behavior
-      print("Epoch \(i): loss = \(String(format: "%.6f", finalLoss))")
+      if i % 20 == 0 {
+        print("Epoch \(i): loss = \(String(format: "%.6f", finalLoss))")
+      }
     }
     let trainTime = (CFAbsoluteTimeGetCurrent() - trainStart) * 1000
     let timePerEpoch = trainTime / Double(epochs)

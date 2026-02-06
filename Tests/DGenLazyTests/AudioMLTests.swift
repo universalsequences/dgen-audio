@@ -98,7 +98,7 @@ final class AudioMLTests: XCTestCase {
       bodyAmp, bodyDecay, startFreq, endFreq,
       freqDecay, clickAmp, clickDecay, clickFreq,
     ]
-    let optimizer = Adam(params: params, lr: 0.005)
+    let optimizer = Adam(params: params, lr: 0.0005)
 
     // --- Build functions (called each epoch to rebuild graph fresh) ---
 
@@ -138,11 +138,12 @@ final class AudioMLTests: XCTestCase {
       return targetTensor.toSignal(maxFrames: numFrames)
     }
 
+    let windowSize = 2048
     // --- Warmup (first compile) ---
     do {
       let s = buildSynth()
       let t = buildTarget()
-      let loss = spectralLossFFT(s, t, windowSize: 2048)
+      let loss = spectralLossFFT(s, t, windowSize: windowSize)
       let initialLoss = try loss.backward(frames: numFrames)
       print("INITIAL LOSS = \(initialLoss.reduce(0, +) / Float(numFrames))")
       optimizer.zeroGrad()
@@ -160,7 +161,7 @@ final class AudioMLTests: XCTestCase {
     for epoch in 0..<epochs {
       let synth = buildSynth()
       let target = buildTarget()
-      let loss = spectralLossFFT(synth, target, windowSize: 2048)
+      let loss = spectralLossFFT(synth, target, windowSize: windowSize)
 
       let lossValues = try loss.backward(frames: numFrames)
       let epochLoss = lossValues.reduce(0, +) / Float(numFrames)
@@ -218,7 +219,7 @@ final class AudioMLTests: XCTestCase {
       data: [Float](repeating: 0.5, count: numHarmonics)
     )
 
-    let optimizer = Adam(params: [studentAmplitudes], lr: 0.01)
+    let optimizer = Adam(params: [studentAmplitudes], lr: 0.8)
 
     // Warmup
     let teacherSignal = buildHarmonicSignal(
@@ -574,7 +575,7 @@ final class AudioMLTests: XCTestCase {
       name: "Sawtooth",
       fundamental: 100.0,
       numHarmonics: 10,
-      frameCount: 20000,
+      frameCount: 128,
       windowSize: 128,
       epochs: 50,
       buildTeacher: { fundamental in

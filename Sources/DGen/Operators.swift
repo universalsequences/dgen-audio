@@ -505,6 +505,10 @@ public enum LazyOp {
           _ = b.memoryWrite(fft1Cell, fftBaseOffset + nInt + b.constant(Float(imagOffset)), zero)
           _ = b.memoryWrite(fft2Cell, fftBaseOffset + nInt, s2 * w)
           _ = b.memoryWrite(fft2Cell, fftBaseOffset + nInt + b.constant(Float(imagOffset)), zero)
+
+          // Store window coefficients for backward pass (GradIFFT reads these)
+          // All frames write the same values — benign race
+          _ = b.memoryWrite(windowCell, nInt, w)
         }
 
         // 3. In-place FFT via Cooley-Tukey (per-frame scratch)
@@ -618,31 +622,39 @@ public enum LazyOp {
     case .spectralLossFFTGradSpec(
       let windowSize, let fft1Cell, let fft2Cell,
       let mag1Cell, let mag2Cell, let gradSpec1Cell, let gradSpec2Cell):
-      // Compute gradient w.r.t. complex spectrum
+      // Compute gradient w.r.t. complex spectrum (frame-aware)
+      // Reads from forward pass's per-frame FFT/magnitude cells
       // ∂L/∂X.real = ∂L/∂mag * (real / mag)
       // ∂L/∂X.imag = ∂L/∂mag * (imag / mag)
-      guard inputs.count == 1 else {
+      // inputs[0] = gradOutput, inputs[1..2] = sig1/sig2 (ordering-only dependencies)
+      guard inputs.count >= 1 else {
         throw DGenError.insufficientInputs(
           operator: "spectralLossFFTGradSpec", expected: 1, actual: inputs.count)
       }
 
-
+      let fftSize = windowSize * 2
       let numBins = windowSize / 2 + 1
       let imagOffset = windowSize
       let gradOutput = b.value(inputs[0])
       let eps = b.constant(1e-8)
+      let frameIdx = b.threadIndex()
+
+      // Per-frame base offsets (matching forward pass layout)
+      let fftBase = frameIdx * b.constant(Float(fftSize))
+      let magBase = frameIdx * b.constant(Float(numBins))
+      let gradSpecBase = frameIdx * b.constant(Float(fftSize))
 
       // Compute gradient spectrum in parallel (each bin is independent)
       b.parallelRange(numBins) { k in
         let kInt = b.cast(k, to: .int)
 
-        // Read stored values
-        let mag1 = b.memoryRead(mag1Cell, kInt)
-        let mag2 = b.memoryRead(mag2Cell, kInt)
-        let real1 = b.memoryRead(fft1Cell, kInt)
-        let imag1 = b.memoryRead(fft1Cell, kInt + b.constant(Float(imagOffset)))
-        let real2 = b.memoryRead(fft2Cell, kInt)
-        let imag2 = b.memoryRead(fft2Cell, kInt + b.constant(Float(imagOffset)))
+        // Read stored values from forward pass's per-frame cells
+        let mag1 = b.memoryRead(mag1Cell, magBase + kInt)
+        let mag2 = b.memoryRead(mag2Cell, magBase + kInt)
+        let real1 = b.memoryRead(fft1Cell, fftBase + kInt)
+        let imag1 = b.memoryRead(fft1Cell, fftBase + kInt + b.constant(Float(imagOffset)))
+        let real2 = b.memoryRead(fft2Cell, fftBase + kInt)
+        let imag2 = b.memoryRead(fft2Cell, fftBase + kInt + b.constant(Float(imagOffset)))
 
         // ∂L/∂mag = 2 * (mag1 - mag2) * gradOutput
         let gradMag1 = b.constant(2.0) * (mag1 - mag2) * gradOutput
@@ -658,36 +670,27 @@ public enum LazyOp {
         let gradReal2 = gradMag2 * real2 / safeMag2
         let gradImag2 = gradMag2 * imag2 / safeMag2
 
-        // Store gradient spectrum
-        _ = b.memoryWrite(gradSpec1Cell, kInt, gradReal1)
-        _ = b.memoryWrite(gradSpec1Cell, kInt + b.constant(Float(imagOffset)), gradImag1)
-        _ = b.memoryWrite(gradSpec2Cell, kInt, gradReal2)
-        _ = b.memoryWrite(gradSpec2Cell, kInt + b.constant(Float(imagOffset)), gradImag2)
+        // Store gradient spectrum directly (no conjugation needed)
+        // IFFT with positive twiddle: Re[Σ X[k]·e^{+jθ}] = Σ [X_real·cos - X_imag·sin]
+        // which matches the DFT transpose scatter formula exactly
+        _ = b.memoryWrite(gradSpec1Cell, gradSpecBase + kInt, gradReal1)
+        _ = b.memoryWrite(gradSpec1Cell, gradSpecBase + kInt + b.constant(Float(imagOffset)), gradImag1)
+        _ = b.memoryWrite(gradSpec2Cell, gradSpecBase + kInt, gradReal2)
+        _ = b.memoryWrite(gradSpec2Cell, gradSpecBase + kInt + b.constant(Float(imagOffset)), gradImag2)
       }
 
-      // Fill in conjugate symmetric part for IFFT (bins numBins to windowSize-1)
-      // X[N-k] = conj(X[k]) for k = 1 to N/2-1
-      // This is parallelizable since each k writes to a unique index
-      b.parallelRange(windowSize / 2 - 1) { k in
-        let kPlusOne = b.cast(k, to: .float) + b.constant(1.0)
-        let kIdx = b.cast(kPlusOne, to: .int)
-        let conjIdx = b.constant(Float(windowSize)) - kPlusOne
-
-        // Signal 1
-        let real1 = b.memoryRead(gradSpec1Cell, kIdx)
-        let imag1 = b.memoryRead(gradSpec1Cell, kIdx + b.constant(Float(imagOffset)))
-        _ = b.memoryWrite(gradSpec1Cell, b.cast(conjIdx, to: .int), real1)
-        _ = b.memoryWrite(
-          gradSpec1Cell, b.cast(conjIdx, to: .int) + b.constant(Float(imagOffset)),
-          b.constant(0.0) - imag1)
-
-        // Signal 2
-        let real2 = b.memoryRead(gradSpec2Cell, kIdx)
-        let imag2 = b.memoryRead(gradSpec2Cell, kIdx + b.constant(Float(imagOffset)))
-        _ = b.memoryWrite(gradSpec2Cell, b.cast(conjIdx, to: .int), real2)
-        _ = b.memoryWrite(
-          gradSpec2Cell, b.cast(conjIdx, to: .int) + b.constant(Float(imagOffset)),
-          b.constant(0.0) - imag2)
+      // Zero upper bins (numBins to windowSize-1) — no conjugate fill needed
+      // The loss only depends on bins 0..numBins-1, so the gradient has no
+      // contribution from mirror bins. Zeroing prevents garbage from affecting IFFT.
+      if windowSize / 2 - 1 > 0 {
+        b.parallelRange(windowSize / 2 - 1) { k in
+          let kFloat = b.cast(k, to: .float) + b.constant(Float(numBins))
+          let kInt = b.cast(kFloat, to: .int)
+          _ = b.memoryWrite(gradSpec1Cell, gradSpecBase + kInt, b.constant(0.0))
+          _ = b.memoryWrite(gradSpec1Cell, gradSpecBase + kInt + b.constant(Float(imagOffset)), b.constant(0.0))
+          _ = b.memoryWrite(gradSpec2Cell, gradSpecBase + kInt, b.constant(0.0))
+          _ = b.memoryWrite(gradSpec2Cell, gradSpecBase + kInt + b.constant(Float(imagOffset)), b.constant(0.0))
+        }
       }
 
       b.use(val: b.constant(0.0))  // Side-effect only
@@ -695,17 +698,30 @@ public enum LazyOp {
     case .spectralLossFFTGradIFFT(
       let windowSize, let gradSpec1Cell, let gradSpec2Cell,
       let gradTime1Cell, let gradTime2Cell, let windowCell):
-      // IFFT to scatter frequency-domain gradients back to time domain
+      // IFFT to scatter frequency-domain gradients back to time domain (frame-aware)
       // Then multiply by window coefficients for Hann backprop
       guard inputs.count == 1 else {
         throw DGenError.insufficientInputs(
           operator: "spectralLossFFTGradIFFT", expected: 1, actual: inputs.count)
       }
 
-
+      let fftSize = windowSize * 2
+      let numBins = windowSize / 2 + 1
       let numStages = Int(log2(Double(windowSize)))
       let imagOffset = windowSize
-      let invN = b.constant(1.0 / Float(windowSize))
+      // Scale by 1/(N * numBins) to match GradInline normalization
+      let invNBins = b.constant(1.0 / Float(windowSize * numBins))
+      let zero = b.constant(0.0)
+      let one = b.constant(1.0)
+      let frameIdx = b.threadIndex()
+
+      // Per-frame base offsets
+      let gradSpecBase = frameIdx * b.constant(Float(fftSize))
+      let gradTimeBase = frameIdx * b.constant(Float(windowSize))
+
+      // Force scalar mode (same pattern as forward FFT)
+      let alwaysTrue = one > zero
+      b.if_(alwaysTrue) {
 
       // Helper function to emit IFFT for a single gradient spectrum cell
       func emitIFFTInPlace(_ gradSpecCell: CellID, _ gradTimeCell: CellID) {
@@ -723,20 +739,20 @@ public enum LazyOp {
           let iInt = b.cast(i, to: .int)
           let revInt = b.cast(rev, to: .int)
 
-          let tempR = b.memoryRead(gradSpecCell, iInt)
-          let tempI = b.memoryRead(gradSpecCell, iInt + b.constant(Float(imagOffset)))
-          let revR = b.memoryRead(gradSpecCell, revInt)
-          let revI = b.memoryRead(gradSpecCell, revInt + b.constant(Float(imagOffset)))
+          let tempR = b.memoryRead(gradSpecCell, gradSpecBase + iInt)
+          let tempI = b.memoryRead(gradSpecCell, gradSpecBase + iInt + b.constant(Float(imagOffset)))
+          let revR = b.memoryRead(gradSpecCell, gradSpecBase + revInt)
+          let revI = b.memoryRead(gradSpecCell, gradSpecBase + revInt + b.constant(Float(imagOffset)))
 
           let newIR = b.gswitch(shouldSwap, revR, tempR)
           let newII = b.gswitch(shouldSwap, revI, tempI)
           let newRevR = b.gswitch(shouldSwap, tempR, revR)
           let newRevI = b.gswitch(shouldSwap, tempI, revI)
 
-          _ = b.memoryWrite(gradSpecCell, iInt, newIR)
-          _ = b.memoryWrite(gradSpecCell, iInt + b.constant(Float(imagOffset)), newII)
-          _ = b.memoryWrite(gradSpecCell, revInt, newRevR)
-          _ = b.memoryWrite(gradSpecCell, revInt + b.constant(Float(imagOffset)), newRevI)
+          _ = b.memoryWrite(gradSpecCell, gradSpecBase + iInt, newIR)
+          _ = b.memoryWrite(gradSpecCell, gradSpecBase + iInt + b.constant(Float(imagOffset)), newII)
+          _ = b.memoryWrite(gradSpecCell, gradSpecBase + revInt, newRevR)
+          _ = b.memoryWrite(gradSpecCell, gradSpecBase + revInt + b.constant(Float(imagOffset)), newRevI)
         }
 
         // Butterfly stages with POSITIVE twiddle angles (IFFT)
@@ -766,32 +782,32 @@ public enum LazyOp {
             let iInt = b.cast(i, to: .int)
             let jInt = b.cast(j, to: .int)
 
-            let ar = b.memoryRead(gradSpecCell, iInt)
-            let ai = b.memoryRead(gradSpecCell, iInt + b.constant(Float(imagOffset)))
-            let br = b.memoryRead(gradSpecCell, jInt)
-            let bi = b.memoryRead(gradSpecCell, jInt + b.constant(Float(imagOffset)))
+            let ar = b.memoryRead(gradSpecCell, gradSpecBase + iInt)
+            let ai = b.memoryRead(gradSpecCell, gradSpecBase + iInt + b.constant(Float(imagOffset)))
+            let br = b.memoryRead(gradSpecCell, gradSpecBase + jInt)
+            let bi = b.memoryRead(gradSpecCell, gradSpecBase + jInt + b.constant(Float(imagOffset)))
 
             // Complex multiply and butterfly
             let tr = wr * br - wi * bi
             let ti = wr * bi + wi * br
 
-            _ = b.memoryWrite(gradSpecCell, iInt, ar + tr)
+            _ = b.memoryWrite(gradSpecCell, gradSpecBase + iInt, ar + tr)
             _ = b.memoryWrite(
-              gradSpecCell, iInt + b.constant(Float(imagOffset)), ai + ti)
-            _ = b.memoryWrite(gradSpecCell, jInt, ar - tr)
+              gradSpecCell, gradSpecBase + iInt + b.constant(Float(imagOffset)), ai + ti)
+            _ = b.memoryWrite(gradSpecCell, gradSpecBase + jInt, ar - tr)
             _ = b.memoryWrite(
-              gradSpecCell, jInt + b.constant(Float(imagOffset)), ai - ti)
+              gradSpecCell, gradSpecBase + jInt + b.constant(Float(imagOffset)), ai - ti)
           }
           butterflySize *= 2
         }
 
-        // Scale by 1/N and multiply by window (Hann backprop), write to time-domain gradient cell
-        // This is fully parallelizable - each index is independent
+        // Scale by 1/(N*numBins) and multiply by window (Hann backprop)
+        // windowCell is shared (not per-frame), gradTimeCell is per-frame
         b.parallelRange(windowSize) { n in
           let nInt = b.cast(n, to: .int)
-          let realVal = b.memoryRead(gradSpecCell, nInt) * invN
+          let realVal = b.memoryRead(gradSpecCell, gradSpecBase + nInt) * invNBins
           let w = b.memoryRead(windowCell, nInt)
-          _ = b.memoryWrite(gradTimeCell, nInt, realVal * w)
+          _ = b.memoryWrite(gradTimeCell, gradTimeBase + nInt, realVal * w)
         }
       }
 
@@ -799,10 +815,12 @@ public enum LazyOp {
       emitIFFTInPlace(gradSpec1Cell, gradTime1Cell)
       emitIFFTInPlace(gradSpec2Cell, gradTime2Cell)
 
-      b.use(val: b.constant(0.0))  // Side-effect only
+      }  // end b.if_
+
+      b.use(val: zero)  // Side-effect only
 
     case .spectralLossFFTGradInline(
-      let windowSize, let useHann, let windowCell,
+      let windowSize, let useHann, _,
       let gradTime1Cell, let gradTime2Cell):
       // Inline gradient computation that recomputes DFT to avoid race conditions
       // Uses frame-indexed storage to prevent race conditions between parallel frames

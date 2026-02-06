@@ -196,8 +196,8 @@ public struct CompilationPipeline {
     // Only do this if the graph has spectral loss ops (to avoid modifying blocks unnecessarily)
     let hasSpectralLossOps = graph.nodes.values.contains { node in
       switch node.op {
-      case .spectralLossFFT, .spectralLossFFTGradInline, .spectralLossFFTGradRead,
-        .spectralLossFFTGradRead2:
+      case .spectralLossFFT, .spectralLossFFTGradInline, .spectralLossFFTGradSpec,
+        .spectralLossFFTGradIFFT, .spectralLossFFTGradRead, .spectralLossFFTGradRead2:
         return true
       default:
         return false

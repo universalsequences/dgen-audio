@@ -136,8 +136,12 @@ public class LazyGraph {
   /// Clear computation nodes while preserving parameter state and compilation cache
   /// Called after backward() to prevent node accumulation
   public func clearComputationGraph() {
-    // 1. Clear all graph nodes (but don't reset counters - need unique IDs for GPU memory)
+    // 1. Clear all graph nodes and reset allocation counters
+    // Safe because cellAllocationSizes/lazyCells/frameAwareCells are also cleared below,
+    // so old cell IDs have no remaining references. Resetting prevents unbounded growth
+    // of cell ID space across training epochs.
     graph.nodes.removeAll()
+    graph.resetCounters()
 
     // 2. Clear all tensors - refresh() will recreate them
     graph.tensors.removeAll()

@@ -309,7 +309,6 @@ final class OptimizerTests: XCTestCase {
     }
 
     let frameCount = 256
-
     // Warmup
     let _ = try spectralLossFFT(buildLearnable(), buildTarget(), windowSize: 32).backward(frames: frameCount)
     optimizer.zeroGrad()
