@@ -14,6 +14,8 @@ public class MetalRenderer: Renderer, UOpEmitter {
   private var useReducedGradsSum = false
   private var staticGlobalVars: Set<VarID> = []
   private var currentThreadCountScale: Int? = nil
+  /// Track scalarType of emitted UOps by their VarID for offset type lookups
+  private var varScalarTypes: [VarID: CastType] = [:]
 
   public override init() {
   }
@@ -444,6 +446,7 @@ public class MetalRenderer: Renderer, UOpEmitter {
   ) -> String {
     var kernels = ""
     parallelRangeVars.removeAll()  // Reset parallel range tracking for new kernel
+    varScalarTypes.removeAll()  // Reset type tracking for new kernel
     frameIndexOverride = nil
     currentThreadCountScale = scheduleItem.threadCountScale
     currentTemporality = scheduleItem.temporality  // Set temporality for gradient indexing
@@ -601,14 +604,44 @@ public class MetalRenderer: Renderer, UOpEmitter {
     return (inputs: Array(inputs), outputs: Array(outputs))
   }
 
+  /// Check if a Lazy value was emitted as an int-typed variable
+  private func isIntTyped(_ lazy: Lazy) -> Bool {
+    guard case .variable(let varId, _) = lazy else { return false }
+    return varScalarTypes[varId] == .int
+  }
+
+  /// Render a Lazy value, optionally as an integer literal for int-typed constants
+  private func emitLazyTyped(_ lazy: Lazy, ctx: IRContext, kind: Kind?, asInt: Bool) -> String {
+    if asInt, case .constant(_, let val) = lazy {
+      return "\(Int(val))"
+    }
+    return emitLazy(lazy, ctx: ctx, kind: kind, isOut: false)
+  }
+
+  /// Returns "(int)" cast prefix if offset is not already int-typed, empty string otherwise
+  private func intCastPrefix(for offset: Lazy) -> String {
+    return isIntTyped(offset) ? "" : "(int)"
+  }
+
   func emit(_ uop: UOp, ctx: IRContext) -> String {
+    // Track scalarType for this UOp's destination variable
+    if case .variable(let varId, _) = uop.value {
+      varScalarTypes[varId] = uop.scalarType
+    }
+
     let g = { self.emitLazy($0, ctx: ctx, kind: uop.kind, isOut: false) }
+    // Integer-aware emitter: renders constants as int literals when the UOp is int-typed
+    let gi = { self.emitLazyTyped($0, ctx: ctx, kind: uop.kind, asInt: uop.scalarType == .int) }
 
     switch uop.op {
-    case .add(let a, let b): return emitAssign(uop, "\(g(a)) + \(g(b))", ctx)
-    case .mul(let a, let b): return emitAssign(uop, "\(g(a)) * \(g(b))", ctx)
-    case .sub(let a, let b): return emitAssign(uop, "\(g(a)) - \(g(b))", ctx)
+    case .add(let a, let b): return emitAssign(uop, "\(gi(a)) + \(gi(b))", ctx)
+    case .mul(let a, let b): return emitAssign(uop, "\(gi(a)) * \(gi(b))", ctx)
+    case .sub(let a, let b): return emitAssign(uop, "\(gi(a)) - \(gi(b))", ctx)
     case .div(let a, let b):
+      if uop.scalarType == .int {
+        // Integer division — no reciprocal optimization
+        return emitAssign(uop, "\(gi(a)) / \(gi(b))", ctx)
+      }
       // Strength-reduce division by constant to multiply by reciprocal
       switch b {
       case .constant(_, let val):
@@ -617,6 +650,9 @@ public class MetalRenderer: Renderer, UOpEmitter {
         return emitAssign(uop, "\(g(a)) / \(g(b))", ctx)
       }
     case .mod(let a, let b):
+      if uop.scalarType == .int {
+        return emitAssign(uop, "\(gi(a)) % \(gi(b))", ctx)
+      }
       // Fast modulo for constant denominator: a - floor(a / b) * b
       switch b {
       case .constant(_, let val):
@@ -669,13 +705,16 @@ public class MetalRenderer: Renderer, UOpEmitter {
         """
       return emitAssign(uop, expr, ctx)
     case .memoryRead(let base, let offset):
-      return emitAssign(uop, "memory[\(base) + (int)\(g(offset))]", ctx)
+      let cast = intCastPrefix(for: offset)
+      return emitAssign(uop, "memory[\(base) + \(cast)\(g(offset))]", ctx)
     case .memoryWrite(let base, let offset, let value):
-      return "memory[\(base) + (int)\(g(offset))] = \(g(value));"
+      let cast = intCastPrefix(for: offset)
+      return "memory[\(base) + \(cast)\(g(offset))] = \(g(value));"
     case .memoryAccumulate(let base, let offset, let value):
       // Atomic add to memory cell - safe for concurrent accumulation from SIMD threads
+      let cast = intCastPrefix(for: offset)
       return
-        "atomic_fetch_add_explicit((device metal::atomic<float>*)&memory[\(base) + (int)\(g(offset))], \(g(value)), metal::memory_order_relaxed);"
+        "atomic_fetch_add_explicit((device metal::atomic<float>*)&memory[\(base) + \(cast)\(g(offset))], \(g(value)), metal::memory_order_relaxed);"
     case .sin(let a): return emitAssign(uop, "metal::sin(\(g(a)))", ctx)
     case .cos(let a): return emitAssign(uop, "metal::cos(\(g(a)))", ctx)
     case .tan(let a): return emitAssign(uop, "metal::tan(\(g(a)))", ctx)
@@ -900,15 +939,14 @@ public class MetalRenderer: Renderer, UOpEmitter {
   }
 
   func emitAssign(_ uop: UOp, _ expr: String, _ ctx: IRContext) -> String {
-    // TODO (backpropagation) - if this value is needed in the tape of the backprop and we're in forward pass we must store it
-
     let lhs = emitLazy(uop.value, ctx: ctx, kind: uop.kind, isOut: true)
     let isGlobal = ctx.globals.contains(extractVarId(uop.value))
 
     if isGlobal {
       return "\(lhs) = \(expr);"
     }
-    return "float \(lhs) = \(expr);"
+    let typeStr = uop.scalarType == .int ? "int" : "float"
+    return "\(typeStr) \(lhs) = \(expr);"
   }
 }
 

@@ -403,14 +403,14 @@ public enum LazyOp {
         let (tensorSize, frameCount) = ctx.g.frameAwareCells[tensor.cellId]
       {
         // Frame-aware: sum across all frames (each at frameIdx * tensorSize + elemIdx)
-        let tensorSizeFloat = b.constant(Float(tensorSize))
+        let tensorSizeInt = b.intConstant(tensorSize)
         b.parallelRange(size) { elemIdx in
-          let elemIdxFloat = b.cast(elemIdx, to: .float)
+          let elemIdxInt = b.cast(elemIdx, to: .int)
           b.loop(frameCount) { frameIdx in
-            let frameIdxFloat = b.cast(frameIdx, to: .float)
-            let readPos = frameIdxFloat * tensorSizeFloat + elemIdxFloat
-            let val = b.memoryRead(tensor.cellId, b.cast(readPos, to: .int))
-            _ = b.memoryAccumulate(cellId, b.cast(elemIdx, to: .int), val)
+            let frameIdxInt = b.cast(frameIdx, to: .int)
+            let readPos = frameIdxInt * tensorSizeInt + elemIdxInt
+            let val = b.memoryRead(tensor.cellId, readPos)
+            _ = b.memoryAccumulate(cellId, elemIdxInt, val)
           }
         }
       } else if !tensor.transforms.isEmpty {
@@ -469,9 +469,9 @@ public enum LazyOp {
       let one = b.constant(1.0)
       let frameIdx = b.threadIndex()
 
-      // Per-frame base offsets for thread-local scratch memory
-      let fftBaseOffset = frameIdx * b.constant(Float(fftSize))
-      let magBaseOffset = frameIdx * b.constant(Float(numBins))
+      // Per-frame base offsets for thread-local scratch memory (integer to avoid float32 precision loss)
+      let fftBaseOffset = frameIdx * b.intConstant(fftSize)
+      let magBaseOffset = frameIdx * b.intConstant(numBins)
 
       // Helper to compute Hann coefficient inline (avoids shared memory race)
       func hannCoeff(_ nFloat: Expr) -> Expr {
@@ -491,21 +491,22 @@ public enum LazyOp {
         // 1. Load windowed samples into per-frame FFT scratch cells
         // Compute Hann coefficient inline to avoid shared memory race
         b.parallelRange(windowSize) { n in
-          let nInt = b.cast(n, to: .int)
+          let nInt = n
           let nFloat = b.cast(nInt, to: .float)
           let w = hannCoeff(nFloat)
 
           // Load from tape: samples at position frameIdx - windowSize + 1 + n
-          let j = frameIdx - (winSizeFloat - one) + nFloat
+          let j = b.cast(frameIdx, to: .float) - (winSizeFloat - one) + nFloat
 
           let s1 = b.tapeLoad(sig1, at: j)
           let s2 = b.tapeLoad(sig2, at: j)
 
-          // Store in per-frame scratch: baseOffset + index
+          // Store in per-frame scratch: baseOffset + index (all int arithmetic)
+          let imagOff = b.intConstant(imagOffset)
           _ = b.memoryWrite(fft1Cell, fftBaseOffset + nInt, s1 * w)
-          _ = b.memoryWrite(fft1Cell, fftBaseOffset + nInt + b.constant(Float(imagOffset)), zero)
+          _ = b.memoryWrite(fft1Cell, fftBaseOffset + nInt + imagOff, zero)
           _ = b.memoryWrite(fft2Cell, fftBaseOffset + nInt, s2 * w)
-          _ = b.memoryWrite(fft2Cell, fftBaseOffset + nInt + b.constant(Float(imagOffset)), zero)
+          _ = b.memoryWrite(fft2Cell, fftBaseOffset + nInt + imagOff, zero)
 
           // Store window coefficients for backward pass (GradIFFT reads these)
           // All frames write the same values — benign race
@@ -514,6 +515,8 @@ public enum LazyOp {
 
         // 3. In-place FFT via Cooley-Tukey (per-frame scratch)
         func emitFFTInPlace(_ fftCell: CellID, _ baseOffset: Expr) {
+          let imagOff = b.intConstant(imagOffset)
+
           // Bit-reversal permutation
           b.loop(windowSize) { i in
             var rev = b.constant(0.0)
@@ -529,10 +532,9 @@ public enum LazyOp {
             let revInt = b.cast(rev, to: .int)
 
             let tempRealI = b.memoryRead(fftCell, baseOffset + iInt)
-            let tempImagI = b.memoryRead(fftCell, baseOffset + iInt + b.constant(Float(imagOffset)))
+            let tempImagI = b.memoryRead(fftCell, baseOffset + iInt + imagOff)
             let tempRealRev = b.memoryRead(fftCell, baseOffset + revInt)
-            let tempImagRev = b.memoryRead(
-              fftCell, baseOffset + revInt + b.constant(Float(imagOffset)))
+            let tempImagRev = b.memoryRead(fftCell, baseOffset + revInt + imagOff)
 
             let newRealI = b.gswitch(shouldSwap, tempRealRev, tempRealI)
             let newImagI = b.gswitch(shouldSwap, tempImagRev, tempImagI)
@@ -540,10 +542,9 @@ public enum LazyOp {
             let newImagRev = b.gswitch(shouldSwap, tempImagI, tempImagRev)
 
             _ = b.memoryWrite(fftCell, baseOffset + iInt, newRealI)
-            _ = b.memoryWrite(fftCell, baseOffset + iInt + b.constant(Float(imagOffset)), newImagI)
+            _ = b.memoryWrite(fftCell, baseOffset + iInt + imagOff, newImagI)
             _ = b.memoryWrite(fftCell, baseOffset + revInt, newRealRev)
-            _ = b.memoryWrite(
-              fftCell, baseOffset + revInt + b.constant(Float(imagOffset)), newImagRev)
+            _ = b.memoryWrite(fftCell, baseOffset + revInt + imagOff, newImagRev)
           }
 
           // Butterfly stages
@@ -572,17 +573,17 @@ public enum LazyOp {
               let jInt = b.cast(j, to: .int)
 
               let ar = b.memoryRead(fftCell, baseOffset + iInt)
-              let ai = b.memoryRead(fftCell, baseOffset + iInt + b.constant(Float(imagOffset)))
+              let ai = b.memoryRead(fftCell, baseOffset + iInt + imagOff)
               let br = b.memoryRead(fftCell, baseOffset + jInt)
-              let bi = b.memoryRead(fftCell, baseOffset + jInt + b.constant(Float(imagOffset)))
+              let bi = b.memoryRead(fftCell, baseOffset + jInt + imagOff)
 
               let tr = wr * br - wi * bi
               let ti = wr * bi + wi * br
 
               _ = b.memoryWrite(fftCell, baseOffset + iInt, ar + tr)
-              _ = b.memoryWrite(fftCell, baseOffset + iInt + b.constant(Float(imagOffset)), ai + ti)
+              _ = b.memoryWrite(fftCell, baseOffset + iInt + imagOff, ai + ti)
               _ = b.memoryWrite(fftCell, baseOffset + jInt, ar - tr)
-              _ = b.memoryWrite(fftCell, baseOffset + jInt + b.constant(Float(imagOffset)), ai - ti)
+              _ = b.memoryWrite(fftCell, baseOffset + jInt + imagOff, ai - ti)
             }
           }
         }
@@ -594,14 +595,15 @@ public enum LazyOp {
         // 4. Compute magnitudes and store in per-frame storage
         b.parallelRange(numBins) { k in
           let kInt = b.cast(k, to: .int)
+          let imagOff = b.intConstant(imagOffset)
 
           let real1 = b.memoryRead(fft1Cell, fftBaseOffset + kInt)
-          let imag1 = b.memoryRead(fft1Cell, fftBaseOffset + kInt + b.constant(Float(imagOffset)))
+          let imag1 = b.memoryRead(fft1Cell, fftBaseOffset + kInt + imagOff)
           let mag1 = b.sqrt(real1 * real1 + imag1 * imag1)
           _ = b.memoryWrite(mag1Cell, magBaseOffset + kInt, mag1)
 
           let real2 = b.memoryRead(fft2Cell, fftBaseOffset + kInt)
-          let imag2 = b.memoryRead(fft2Cell, fftBaseOffset + kInt + b.constant(Float(imagOffset)))
+          let imag2 = b.memoryRead(fft2Cell, fftBaseOffset + kInt + imagOff)
           let mag2 = b.sqrt(real2 * real2 + imag2 * imag2)
           _ = b.memoryWrite(mag2Cell, magBaseOffset + kInt, mag2)
 
@@ -640,10 +642,11 @@ public enum LazyOp {
       let eps = b.constant(1e-8)
       let frameIdx = b.threadIndex()
 
-      // Per-frame base offsets (matching forward pass layout)
-      let fftBase = frameIdx * b.constant(Float(fftSize))
-      let magBase = frameIdx * b.constant(Float(numBins))
-      let gradSpecBase = frameIdx * b.constant(Float(fftSize))
+      // Per-frame base offsets (integer arithmetic for precision)
+      let fftBase = frameIdx * b.intConstant(fftSize)
+      let magBase = frameIdx * b.intConstant(numBins)
+      let gradSpecBase = frameIdx * b.intConstant(fftSize)
+      let imagOff = b.intConstant(imagOffset)
 
       // Compute gradient spectrum in parallel (each bin is independent)
       b.parallelRange(numBins) { k in
@@ -653,9 +656,9 @@ public enum LazyOp {
         let mag1 = b.memoryRead(mag1Cell, magBase + kInt)
         let mag2 = b.memoryRead(mag2Cell, magBase + kInt)
         let real1 = b.memoryRead(fft1Cell, fftBase + kInt)
-        let imag1 = b.memoryRead(fft1Cell, fftBase + kInt + b.constant(Float(imagOffset)))
+        let imag1 = b.memoryRead(fft1Cell, fftBase + kInt + imagOff)
         let real2 = b.memoryRead(fft2Cell, fftBase + kInt)
-        let imag2 = b.memoryRead(fft2Cell, fftBase + kInt + b.constant(Float(imagOffset)))
+        let imag2 = b.memoryRead(fft2Cell, fftBase + kInt + imagOff)
 
         // ∂L/∂mag = 2 * (mag1 - mag2) * gradOutput
         let gradMag1 = b.constant(2.0) * (mag1 - mag2) * gradOutput
@@ -675,26 +678,21 @@ public enum LazyOp {
         // IFFT with positive twiddle: Re[Σ X[k]·e^{+jθ}] = Σ [X_real·cos - X_imag·sin]
         // which matches the DFT transpose scatter formula exactly
         _ = b.memoryWrite(gradSpec1Cell, gradSpecBase + kInt, gradReal1)
-        _ = b.memoryWrite(
-          gradSpec1Cell, gradSpecBase + kInt + b.constant(Float(imagOffset)), gradImag1)
+        _ = b.memoryWrite(gradSpec1Cell, gradSpecBase + kInt + imagOff, gradImag1)
         _ = b.memoryWrite(gradSpec2Cell, gradSpecBase + kInt, gradReal2)
-        _ = b.memoryWrite(
-          gradSpec2Cell, gradSpecBase + kInt + b.constant(Float(imagOffset)), gradImag2)
+        _ = b.memoryWrite(gradSpec2Cell, gradSpecBase + kInt + imagOff, gradImag2)
       }
 
-      // Zero upper bins (numBins to windowSize-1) — no conjugate fill needed
+      // Zero upper bins (numBins to windowSize-1) — no conjugate fill needed.
       // The loss only depends on bins 0..numBins-1, so the gradient has no
       // contribution from mirror bins. Zeroing prevents garbage from affecting IFFT.
       if windowSize / 2 - 1 > 0 {
         b.parallelRange(windowSize / 2 - 1) { k in
-          let kFloat = b.cast(k, to: .float) + b.constant(Float(numBins))
-          let kInt = b.cast(kFloat, to: .int)
+          let kInt = b.cast(k, to: .int) + b.intConstant(numBins)
           _ = b.memoryWrite(gradSpec1Cell, gradSpecBase + kInt, b.constant(0.0))
-          _ = b.memoryWrite(
-            gradSpec1Cell, gradSpecBase + kInt + b.constant(Float(imagOffset)), b.constant(0.0))
+          _ = b.memoryWrite(gradSpec1Cell, gradSpecBase + kInt + imagOff, b.constant(0.0))
           _ = b.memoryWrite(gradSpec2Cell, gradSpecBase + kInt, b.constant(0.0))
-          _ = b.memoryWrite(
-            gradSpec2Cell, gradSpecBase + kInt + b.constant(Float(imagOffset)), b.constant(0.0))
+          _ = b.memoryWrite(gradSpec2Cell, gradSpecBase + kInt + imagOff, b.constant(0.0))
         }
       }
 
@@ -720,9 +718,10 @@ public enum LazyOp {
       let one = b.constant(1.0)
       let frameIdx = b.threadIndex()
 
-      // Per-frame base offsets
-      let gradSpecBase = frameIdx * b.constant(Float(fftSize))
-      let gradTimeBase = frameIdx * b.constant(Float(windowSize))
+      // Per-frame base offsets (integer arithmetic for precision)
+      let gradSpecBase = frameIdx * b.intConstant(fftSize)
+      let gradTimeBase = frameIdx * b.intConstant(windowSize)
+      let imagOff = b.intConstant(imagOffset)
 
       // Force scalar mode (same pattern as forward FFT)
       let alwaysTrue = one > zero
@@ -745,11 +744,9 @@ public enum LazyOp {
             let revInt = b.cast(rev, to: .int)
 
             let tempR = b.memoryRead(gradSpecCell, gradSpecBase + iInt)
-            let tempI = b.memoryRead(
-              gradSpecCell, gradSpecBase + iInt + b.constant(Float(imagOffset)))
+            let tempI = b.memoryRead(gradSpecCell, gradSpecBase + iInt + imagOff)
             let revR = b.memoryRead(gradSpecCell, gradSpecBase + revInt)
-            let revI = b.memoryRead(
-              gradSpecCell, gradSpecBase + revInt + b.constant(Float(imagOffset)))
+            let revI = b.memoryRead(gradSpecCell, gradSpecBase + revInt + imagOff)
 
             let newIR = b.gswitch(shouldSwap, revR, tempR)
             let newII = b.gswitch(shouldSwap, revI, tempI)
@@ -757,15 +754,12 @@ public enum LazyOp {
             let newRevI = b.gswitch(shouldSwap, tempI, revI)
 
             _ = b.memoryWrite(gradSpecCell, gradSpecBase + iInt, newIR)
-            _ = b.memoryWrite(
-              gradSpecCell, gradSpecBase + iInt + b.constant(Float(imagOffset)), newII)
+            _ = b.memoryWrite(gradSpecCell, gradSpecBase + iInt + imagOff, newII)
             _ = b.memoryWrite(gradSpecCell, gradSpecBase + revInt, newRevR)
-            _ = b.memoryWrite(
-              gradSpecCell, gradSpecBase + revInt + b.constant(Float(imagOffset)), newRevI)
+            _ = b.memoryWrite(gradSpecCell, gradSpecBase + revInt + imagOff, newRevI)
           }
 
           // Butterfly stages with POSITIVE twiddle angles (IFFT)
-          // Stages are sequential but butterflies within each stage are parallel
           var butterflySize = 2
           for _ in 0..<numStages {
             let halfSize = butterflySize / 2
@@ -792,28 +786,23 @@ public enum LazyOp {
               let jInt = b.cast(j, to: .int)
 
               let ar = b.memoryRead(gradSpecCell, gradSpecBase + iInt)
-              let ai = b.memoryRead(
-                gradSpecCell, gradSpecBase + iInt + b.constant(Float(imagOffset)))
+              let ai = b.memoryRead(gradSpecCell, gradSpecBase + iInt + imagOff)
               let br = b.memoryRead(gradSpecCell, gradSpecBase + jInt)
-              let bi = b.memoryRead(
-                gradSpecCell, gradSpecBase + jInt + b.constant(Float(imagOffset)))
+              let bi = b.memoryRead(gradSpecCell, gradSpecBase + jInt + imagOff)
 
               // Complex multiply and butterfly
               let tr = wr * br - wi * bi
               let ti = wr * bi + wi * br
 
               _ = b.memoryWrite(gradSpecCell, gradSpecBase + iInt, ar + tr)
-              _ = b.memoryWrite(
-                gradSpecCell, gradSpecBase + iInt + b.constant(Float(imagOffset)), ai + ti)
+              _ = b.memoryWrite(gradSpecCell, gradSpecBase + iInt + imagOff, ai + ti)
               _ = b.memoryWrite(gradSpecCell, gradSpecBase + jInt, ar - tr)
-              _ = b.memoryWrite(
-                gradSpecCell, gradSpecBase + jInt + b.constant(Float(imagOffset)), ai - ti)
+              _ = b.memoryWrite(gradSpecCell, gradSpecBase + jInt + imagOff, ai - ti)
             }
             butterflySize *= 2
           }
 
           // Scale by 1/(N*numBins) and multiply by window (Hann backprop)
-          // windowCell is shared (not per-frame), gradTimeCell is per-frame
           b.parallelRange(windowSize) { n in
             let nInt = b.cast(n, to: .int)
             let realVal = b.memoryRead(gradSpecCell, gradSpecBase + nInt) * invNBins
@@ -851,8 +840,8 @@ public enum LazyOp {
       let eps = b.constant(1e-8)
       let frameIdx = b.threadIndex()
 
-      // Frame-indexed base offset for this frame's gradient storage
-      let frameBase = frameIdx * winSizeFloat
+      // Frame-indexed base offset for this frame's gradient storage (integer arithmetic)
+      let frameBase = frameIdx * b.intConstant(windowSize)
 
       // Helper to compute Hann coefficient inline (avoids shared memory race)
       func hannCoeff(_ nFloat: Expr) -> Expr {
@@ -869,7 +858,7 @@ public enum LazyOp {
       b.if_(alwaysTrue) {
         // 1. Zero the gradient cells at frame-indexed positions
         b.loop(windowSize) { n in
-          let idx = b.cast(frameBase + b.cast(n, to: .float), to: .int)
+          let idx = frameBase + b.cast(n, to: .int)
           _ = b.memoryWrite(gradTime1Cell, idx, zero)
           _ = b.memoryWrite(gradTime2Cell, idx, zero)
         }
@@ -887,7 +876,7 @@ public enum LazyOp {
 
           b.loop(windowSize) { n in
             let nFloat = b.cast(n, to: .float)
-            let j = frameIdx - (winSizeFloat - one) + nFloat
+            let j = b.cast(frameIdx, to: .float) - (winSizeFloat - one) + nFloat
             let w = hannCoeff(nFloat)  // Compute Hann inline
 
             let s1 = b.tapeLoad(sig1, at: j) * w
@@ -936,8 +925,8 @@ public enum LazyOp {
             let s = b.sin(angle)
             let w = hannCoeff(nFloat)  // Compute Hann inline
 
-            // Frame-indexed position
-            let idx = b.cast(frameBase + nFloat, to: .int)
+            // Frame-indexed position (integer arithmetic)
+            let idx = frameBase + b.cast(n, to: .int)
 
             // Accumulate gradient (window backprop included, with normalization)
             let grad1Contrib = (gradReal1 * c + gradImag1 * s) * w * normFactor
@@ -962,31 +951,29 @@ public enum LazyOp {
       let _ = b.value(inputs[0])
 
       let frameIdx = b.threadIndex()
+      let winSizeInt = b.intConstant(windowSize)
       let winSizeFloat = b.constant(Float(windowSize))
       let frameCount = b.frameCount()
-      let p = frameIdx  // absolute sample position
+      let p = frameIdx  // absolute sample position (int)
 
       // Sum contributions from all windows that contain sample p
-      // Window at frame w contains sample p at offset (p - w + windowSize - 1)
-      // Gradient stored at w * windowSize + (p - w + windowSize - 1)
-      // Only read from windows that exist (w < frameCount)
       let gradSum = b.float(0.0)
       b.loop(windowSize) { i in
+        let iInt = b.cast(i, to: .int)
         let iFloat = b.cast(i, to: .float)
-        let w = p + iFloat  // window frame index
-        let offset = winSizeFloat - b.constant(1.0) - iFloat  // offset in that window
+        let pFloat = b.cast(p, to: .float)
+        let w = pFloat + iFloat  // window frame index (float for comparisons)
+        let offsetInt = winSizeInt - b.intConstant(1) - iInt  // offset in that window (int)
         // Clamp index to valid range to prevent out-of-bounds read
-        let clampedW = b.min(w, frameCount - b.constant(1.0))
-        let idx = clampedW * winSizeFloat + offset
+        let clampedW = b.min(w, b.cast(frameCount, to: .float) - b.constant(1.0))
+        let idx = b.cast(clampedW, to: .int) * winSizeInt + offsetInt
         // Read is now safe, but only accumulate if in bounds
-        let contrib = b.memoryRead(gradTime1Cell, b.cast(idx, to: .int))
-        let inBounds = w < frameCount
+        let contrib = b.memoryRead(gradTime1Cell, idx)
+        let inBounds = w < b.cast(frameCount, to: .float)
         let safeContrib = b.gswitch(inBounds, contrib, b.constant(0.0))
         gradSum.accumulate(safeContrib)
       }
       // Normalize to prevent gradient explosion while allowing learning
-      // The gradient from each overlapping window contributes to this sum
-      // Normalize by sqrt(numBins * windowSize) to balance gradient magnitude
       let numBinsFloat = b.constant(Float(windowSize / 2 + 1))
       let normFactor = b.sqrt(numBinsFloat * winSizeFloat)
       let normalizedGrad = gradSum.value / normFactor
@@ -994,41 +981,32 @@ public enum LazyOp {
 
     case .spectralLossFFTGradRead2(let windowSize, let gradTime2Cell):
       // Read gradient for signal 2 from frame-indexed storage
-      // Sample at position p appears in windows at frames p, p+1, ..., p+windowSize-1
-      // We must sum contributions from all these windows (but only if the window exists)
       guard inputs.count == 1 else {
         throw DGenError.insufficientInputs(
           operator: "spectralLossFFTGradRead2", expected: 1, actual: inputs.count)
       }
-      // Force dependency on gradPass by reading its value (should be 0, just for ordering)
       let _ = b.value(inputs[0])
 
       let frameIdx = b.threadIndex()
+      let winSizeInt = b.intConstant(windowSize)
       let winSizeFloat = b.constant(Float(windowSize))
       let frameCount = b.frameCount()
-      let p = frameIdx  // absolute sample position
+      let p = frameIdx  // absolute sample position (int)
 
-      // Sum contributions from all windows that contain sample p
-      // Window at frame w contains sample p at offset (p - w + windowSize - 1)
-      // Gradient stored at w * windowSize + (p - w + windowSize - 1)
-      // Only read from windows that exist (w < frameCount)
       let gradSum = b.float(0.0)
       b.loop(windowSize) { i in
+        let iInt = b.cast(i, to: .int)
         let iFloat = b.cast(i, to: .float)
-        let w = p + iFloat  // window frame index
-        let offset = winSizeFloat - b.constant(1.0) - iFloat  // offset in that window
-        // Clamp index to valid range to prevent out-of-bounds read
-        let clampedW = b.min(w, frameCount - b.constant(1.0))
-        let idx = clampedW * winSizeFloat + offset
-        // Read is now safe, but only accumulate if in bounds
-        let contrib = b.memoryRead(gradTime2Cell, b.cast(idx, to: .int))
-        let inBounds = w < frameCount
+        let pFloat = b.cast(p, to: .float)
+        let w = pFloat + iFloat  // window frame index (float for comparisons)
+        let offsetInt = winSizeInt - b.intConstant(1) - iInt  // offset in that window (int)
+        let clampedW = b.min(w, b.cast(frameCount, to: .float) - b.constant(1.0))
+        let idx = b.cast(clampedW, to: .int) * winSizeInt + offsetInt
+        let contrib = b.memoryRead(gradTime2Cell, idx)
+        let inBounds = w < b.cast(frameCount, to: .float)
         let safeContrib = b.gswitch(inBounds, contrib, b.constant(0.0))
         gradSum.accumulate(safeContrib)
       }
-      // Normalize to prevent gradient explosion while allowing learning
-      // The gradient from each overlapping window contributes to this sum
-      // Normalize by sqrt(numBins * windowSize) to balance gradient magnitude
       let numBinsFloat2 = b.constant(Float(windowSize / 2 + 1))
       let normFactor2 = b.sqrt(numBinsFloat2 * winSizeFloat)
       let normalizedGrad2 = gradSum.value / normFactor2
@@ -2435,11 +2413,11 @@ public enum LazyOp {
 
       // Write to output position
       if isFrameAware {
-        // Frame-aware output: write to frame-indexed position
+        // Frame-aware output: write to frame-indexed position (integer arithmetic)
         let frameIdx = b.currentFrameIndex()
-        let frameBase = frameIdx * b.constant(Float(size))
-        let writePos = frameBase + b.cast(idx, to: .float)
-        _ = b.memoryWrite(outTensor.cellId, b.cast(writePos, to: .int), scalarVal)
+        let frameBase = frameIdx * b.intConstant(size)
+        let writePos = frameBase + b.cast(idx, to: .int)
+        _ = b.memoryWrite(outTensor.cellId, writePos, scalarVal)
       } else {
         // Non-frame-aware: direct write
         _ = b.memoryWrite(outTensor.cellId, b.cast(idx, to: .int), scalarVal)

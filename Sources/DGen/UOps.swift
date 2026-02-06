@@ -134,4 +134,5 @@ public struct UOp {
   public var kind: Kind? = nil  // SIMD or Scalar
   public var kindOverride: Kind? = nil
   public var tensorIndex: Lazy? = nil
+  public var scalarType: CastType = .float  // int or float for variable declarations
 }

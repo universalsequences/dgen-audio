@@ -1208,6 +1208,23 @@ public func emitScalarBlockWithShapeTransitions(
   ctx.outboundTensorCells = outbound
   ctx.clearTensorRegisters()
 
+  // Emit scalar nodes that appear before the first shape transition.
+  // These are scalar ops (e.g., gradient div for mean backward) whose results are
+  // needed by tensor nodes in the first transition region. Without this, they would
+  // be silently skipped since the transition loop starts at the first tensor node.
+  if let firstTransition = transitions.first, firstTransition.nodeIndex > 0 {
+    for nodeIndex in 0..<firstTransition.nodeIndex {
+      let nodeId = block.nodes[nodeIndex]
+      guard let node = g.nodes[nodeId] else { continue }
+      emittedNodes.insert(nodeId)
+      for uop in try node.op.emit(ctx: ctx, g: g, nodeId: nodeId) {
+        var typedUop = uop
+        typedUop.kind = .scalar
+        uops.append(typedUop)
+      }
+    }
+  }
+
   // Group nodes by their shape region
   var regionStart = 0
   for (transitionIdx, transition) in transitions.enumerated() {
@@ -1661,7 +1678,6 @@ public func emitBlockUOps(
   if backend == .c, !useShapeAwareEmission, block.tensorIndex != nil {
     uops.append(UOp(op: .endParallelRange, value: ctx.useVariable(src: nil)))
   }
-
   return uops
 }
 
