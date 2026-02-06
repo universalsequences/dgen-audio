@@ -378,14 +378,14 @@ public final class IRBuilder {
 
     // For tensors with transforms, use tensorRead which handles the transform chain
     if !tensor.transforms.isEmpty {
-      let indices = flatToMultiIndex(value(loopIdx), outShape)
+      let indices = flatToMultiIndex(value(loopIdx, scalarType: .int), outShape)
       let broadcastedIndices = broadcastIndices(
         outputIndices: indices, outputShape: outShape, inputTensor: tensor)
       return tensorRead(tensor, indices: broadcastedIndices)
     }
 
     let memOffset = broadcastIndex(
-      outputIdx: value(loopIdx), outputShape: outShape,
+      outputIdx: value(loopIdx, scalarType: .int), outputShape: outShape,
       inputTensor: tensor
     )
     return tload(tensor.cellId, memOffset)
@@ -411,18 +411,18 @@ public final class IRBuilder {
       // scalar case, no need to store in tensor
       return
     }
-    _ = tstore(tensor.cellId, value(loopIdx), result)
+    _ = tstore(tensor.cellId, value(loopIdx, scalarType: .int), result)
   }
 
   /// Multi-dim indices + strides + offset → linear memory offset
   public func stridedIndex(indices: [Expr], strides: [Int], offset: Int = 0) -> Expr {
     assert(indices.count == strides.count)
-    var acc: Expr? = offset != 0 ? constant(Float(offset)) : nil
+    var acc: Expr? = offset != 0 ? intConstant(offset) : nil
     for (idx, s) in zip(indices, strides) where s != 0 {
-      let term = s == 1 ? idx : idx * constant(Float(s))
+      let term = s == 1 ? idx : idx * intConstant(s)
       acc = acc.map { $0 + term } ?? term
     }
-    return acc ?? constant(0)
+    return acc ?? intConstant(0)
   }
 
   // MARK: - Tensor Memory Indexing (encapsulates fast path vs strided path)
@@ -447,16 +447,19 @@ public final class IRBuilder {
 
   /// Flat index -> multi-dim indices for shape (row-major).
   /// For the last dimension, the remainder is the index directly (stride is always 1).
+  /// When the input is int-typed, uses integer division (truncates automatically, no floor needed).
   func flatToMultiIndex(_ flat: Expr, _ shape: [Int]) -> [Expr] {
     var indices: [Expr] = []
     var rem = flat
+    let useIntMath = flat.scalarType == .int
     let lastDim = shape.count - 1
     for i in 0..<shape.count {
       if i == lastDim {
         indices.append(rem)
       } else {
-        let stride = constant(Float(shape[(i + 1)...].reduce(1, *)))
-        let idx = floor(rem / stride)
+        let stride = intConstant(shape[(i + 1)...].reduce(1, *))
+        let quotient = rem / stride
+        let idx = useIntMath ? quotient : floor(quotient)
         indices.append(idx)
         rem = rem - idx * stride
       }
@@ -466,10 +469,10 @@ public final class IRBuilder {
 
   /// Multi-dim indices → flat index for shape (row-major)
   func multiIndexToFlat(_ indices: [Expr], _ shape: [Int]) -> Expr {
-    var flat = constant(0.0)
+    var flat: Expr = intConstant(0)
     for i in 0..<shape.count {
       let stride = shape[(i + 1)...].reduce(1, *)
-      flat = flat + indices[i] * constant(Float(stride))
+      flat = flat + indices[i] * intConstant(stride)
     }
     return flat
   }
@@ -488,7 +491,7 @@ public final class IRBuilder {
 
     // fast path: shapes match + contiguous + has offset → just add offset
     if inputShape == outputShape && inputTensor.isContiguous {
-      return outputIdx + constant(Float(inputTensor.offset))
+      return outputIdx + intConstant(inputTensor.offset)
     }
 
     ops.append(UOp(op: .broadcastAccess, value: .empty))  // disable SIMD
@@ -498,7 +501,7 @@ public final class IRBuilder {
 
     // right-align shapes, clamp broadcast dims to 0
     let indices = inputShape.enumerated().map { i, dim in
-      dim == 1 ? constant(0) : multiIdx[i + rankDiff]
+      dim == 1 ? intConstant(0) : multiIdx[i + rankDiff]
     }
     return tensorMemoryIndex(inputTensor, indices: indices)
   }
@@ -519,9 +522,11 @@ public final class IRBuilder {
 
   public func mod(_ a: Expr, _ b: Expr) -> Expr {
     let dest = ctx.useVariable(src: nodeId)
-    let uop = UOp(op: .mod(a.lazy, b.lazy), value: dest)
+    var uop = UOp(op: .mod(a.lazy, b.lazy), value: dest)
+    let resultType = (a.scalarType == .int && b.scalarType == .int) ? CastType.int : CastType.float
+    uop.scalarType = resultType
     ops.append(uop)
-    return value(dest)
+    return value(dest, scalarType: resultType)
   }
 
   public func mix(_ a: Expr, _ b: Expr, _ t: Expr) -> Expr {
@@ -576,31 +581,40 @@ public final class IRBuilder {
   /// Add two expressions
   public func add(_ a: Expr, _ b: Expr) -> Expr {
     let dest = ctx.useVariable(src: nodeId)
-    let uop = UOp(op: .add(a.lazy, b.lazy), value: dest)
+    var uop = UOp(op: .add(a.lazy, b.lazy), value: dest)
+    let resultType = (a.scalarType == .int && b.scalarType == .int) ? CastType.int : CastType.float
+    uop.scalarType = resultType
     ops.append(uop)
-    return value(dest)
+    return value(dest, scalarType: resultType)
   }
 
   /// Multiply two expressions
   public func mul(_ a: Expr, _ b: Expr) -> Expr {
     let dest = ctx.useVariable(src: nodeId)
-    let uop = UOp(op: .mul(a.lazy, b.lazy), value: dest)
+    var uop = UOp(op: .mul(a.lazy, b.lazy), value: dest)
+    let resultType = (a.scalarType == .int && b.scalarType == .int) ? CastType.int : CastType.float
+    uop.scalarType = resultType
     ops.append(uop)
-    return value(dest)
+    return value(dest, scalarType: resultType)
   }
 
   /// Divide two expressions
   public func div(_ a: Expr, _ b: Expr) -> Expr {
     let dest = ctx.useVariable(src: nodeId)
-    let uop = UOp(op: .div(a.lazy, b.lazy), value: dest)
+    var uop = UOp(op: .div(a.lazy, b.lazy), value: dest)
+    let resultType = (a.scalarType == .int && b.scalarType == .int) ? CastType.int : CastType.float
+    uop.scalarType = resultType
     ops.append(uop)
-    return value(dest)
+    return value(dest, scalarType: resultType)
   }
 
   /// Floor division: floor(a / b)
   /// Use this for integer index calculations where we need truncation toward negative infinity.
   public func floorDiv(_ a: Expr, _ b: Expr) -> Expr {
-    return floor(div(a, b))
+    let quotient = div(a, b)
+    // Int division truncates automatically — floor is redundant
+    if a.scalarType == .int && b.scalarType == .int { return quotient }
+    return floor(quotient)
   }
 
   public func loop(_ count: Int, body: (Expr) -> Void) {

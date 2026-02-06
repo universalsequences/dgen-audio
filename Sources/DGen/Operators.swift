@@ -1051,7 +1051,7 @@ public enum LazyOp {
       let floorIndex = b.floor(positiveIndex)
 
       // Use block's tensor index - each thread handles ONE column
-      let colIdx = b.value(loopIdx)
+      let colIdx = b.value(loopIdx, scalarType: .int)
       let colIdxFloat = b.cast(colIdx, to: .float)
       // Row-major read: tensorRead handles both transformed and base tensors
       let value = b.tensorRead(inTensor, indices: [floorIndex, colIdxFloat])
@@ -1101,7 +1101,7 @@ public enum LazyOp {
       let frameBase = frameIdx * numColsFloat
 
       // Use block's tensor index - each thread handles ONE column
-      let colIdx = b.value(loopIdx)
+      let colIdx = b.value(loopIdx, scalarType: .int)
       let colIdxFloat = b.cast(colIdx, to: .float)
       // Row-major read: tensorRead handles both transformed and base tensors
       let floorValue = b.tensorRead(inTensor, indices: [floorIndex, colIdxFloat])
@@ -1410,7 +1410,7 @@ public enum LazyOp {
           throw DGenError.insufficientInputs(
             operator: "historyWrite", expected: 1, actual: node.inputs.count)
         }
-        let idx = b.value(index)
+        let idx = b.value(index, scalarType: .int)
         // tload for cached register, but ALWAYS write - history persists across frames
         let value = b.tload(inputCellId, idx)
         _ = b.memoryWrite(cellId, b.cast(idx, to: .int), value)
@@ -1442,7 +1442,7 @@ public enum LazyOp {
           throw DGenError.insufficientInputs(
             operator: "historyWrite", expected: 1, actual: node.inputs.count)
         }
-        let idx = b.value(index)
+        let idx = b.value(index, scalarType: .int)
         let value = b.tload(cellId, idx)
         _ = b.tstore(outputCellId, idx, value)
         // Register placeholder for downstream ops
@@ -1464,7 +1464,7 @@ public enum LazyOp {
 
         let value = try b.readInput(node, inputs, at: 0)
         let cond = try b.readInput(node, inputs, at: 1)
-        let idx = b.value(tensorIndex)
+        let idx = b.value(tensorIndex, scalarType: .int)
 
         let zero = b.constant(0.0)
 
@@ -1511,7 +1511,7 @@ public enum LazyOp {
         let reset = try b.readInput(node, inputs, at: 1)
         let min = try b.readInput(node, inputs, at: 2)
         let max = try b.readInput(node, inputs, at: 3)
-        let idx = b.value(tensorIndex)
+        let idx = b.value(tensorIndex, scalarType: .int)
 
         let zero = b.constant(0.0)
         let span = max - min
@@ -1568,7 +1568,7 @@ public enum LazyOp {
 
         let freq = try b.readInput(node, inputs, at: 0)
         let reset = try b.readInput(node, inputs, at: 1)
-        let idx = b.value(tensorIndex)
+        let idx = b.value(tensorIndex, scalarType: .int)
 
         // Phasor accumulator logic with indexed state
         // Uses gswitch instead of if statements for SIMD compatibility
@@ -1815,7 +1815,7 @@ public enum LazyOp {
           op: .sumAxisMarker(nodeId, axis, inShape, outShape, inIsFrameAware, outIsFrameAware),
           value: .empty))
 
-      let outIdx = b.value(loopIdx)
+      let outIdx = b.value(loopIdx, scalarType: .int)
       let acc = b.float(0.0)
 
       // Compute input strides for flat index calculation
@@ -1837,8 +1837,8 @@ public enum LazyOp {
         var outIndices = [Expr]()
         var remaining = b.cast(outIdx, to: .int)
         for i in 0..<outShape.count {
-          let stride = b.constant(Float(outStrides[i]))
-          let idx = b.floor(remaining / stride)
+          let stride = b.intConstant(outStrides[i])
+          let idx = remaining / stride
           outIndices.append(idx)
           remaining = remaining - idx * stride
         }
@@ -1856,9 +1856,9 @@ public enum LazyOp {
         }
 
         // Compute flat input index from multi-dimensional indices
-        var inFlatIdx: Expr = b.constant(0.0)
+        var inFlatIdx: Expr = b.intConstant(0)
         for i in 0..<inShape.count {
-          inFlatIdx = inFlatIdx + inIndices[i] * b.constant(Float(inStrides[i]))
+          inFlatIdx = inFlatIdx + inIndices[i] * b.intConstant(inStrides[i])
         }
 
         // Read from input tensor
@@ -2397,7 +2397,7 @@ public enum LazyOp {
       let isFrameAware = ctx.frameAwareTensorCells.contains(outTensor.cellId)
 
       // Use block's tensor index - each thread handles ONE element
-      let idx = b.value(loopIdx)
+      let idx = b.value(loopIdx, scalarType: .int)
 
       // Get scalar value to broadcast
       let scalarVal: Expr
@@ -2459,7 +2459,7 @@ public enum LazyOp {
       let outputStrides = Tensor.computeRowMajorStrides(targetShape)
 
       // Use block's tensor index (like binary ops) - each thread handles ONE element
-      let outIdx = b.value(loopIdx)
+      let outIdx = b.value(loopIdx, scalarType: .int)
 
       // Map output index to input index (skip the expanded axis dimension)
       var inputFlatIdx: Expr = b.int(0)

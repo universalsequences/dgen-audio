@@ -731,7 +731,10 @@ public class MetalRenderer: Renderer, UOpEmitter {
     case .lt(let a, let b): return emitAssign(uop, "\(g(a)) < \(g(b))", ctx)
     case .eq(let a, let b): return emitAssign(uop, "\(g(a)) == \(g(b))", ctx)
     case .gswitch(let cond, let a, let b):
-      let expr = "metal::select(\(g(b)), \(g(a)), \(g(cond)) > 0.0)"
+      // Cast both value args to float to avoid ambiguous select overload (int vs float)
+      let bStr = isIntTyped(b) ? "(float)\(gi(b))" : g(b)
+      let aStr = isIntTyped(a) ? "(float)\(gi(a))" : g(a)
+      let expr = "metal::select(\(bStr), \(aStr), \(g(cond)) > 0.0)"
       return emitAssign(uop, expr, ctx)
     case .delay1(let cell, let a):
       // Metal thread-per-sample delay-by-1 using threadgroup neighbor exchange.

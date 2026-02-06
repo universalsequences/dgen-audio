@@ -147,11 +147,11 @@ extension IRBuilder {
     var sqIdx: [Expr] = []
     var sqStr: [Int] = []
     for i in 0..<view.shape.count where view.shape[i] != 1 {
-      sqIdx.append(i < indices.count ? indices[i] : constant(0.0))
+      sqIdx.append(i < indices.count ? indices[i] : intConstant(0))
       sqStr.append(view.strides[i])
     }
     if sqIdx.isEmpty {
-      return ([constant(0.0)], [0])
+      return ([intConstant(0)], [0])
     }
     return (sqIdx, sqStr)
   }
@@ -206,21 +206,21 @@ extension IRBuilder {
     case .repeatTile(let innerShape, _):
       // Modular indexing
       let newIndices = indices.enumerated().map { i, idx in
-        mod(idx, constant(Float(innerShape[i])))
+        idx % intConstant(innerShape[i])
       }
       return (newIndices, innerShape, inBoundsCheck)
 
     case .slidingWindow(let windowSize, let inputShape):
       // Sliding window: index i at frame f → base[f - windowSize + 1 + i]
       let fi = currentFrameIndex()
-      let wSize = constant(Float(windowSize))
-      let one = constant(1.0)
+      let wSize = intConstant(windowSize)
+      let one = intConstant(1)
       var newIndices = indices
       let lastDim = newIndices.count - 1
       let baseIdx = fi - wSize + one + newIndices[lastDim]
       newIndices[lastDim] = baseIdx
       // Early frames: out-of-bounds → 0 (reuse padding bounds-check infrastructure)
-      let boundsCheck = baseIdx >= constant(0.0)
+      let boundsCheck = baseIdx >= intConstant(0)
       return (newIndices, inputShape, combineBoundsChecks(inBoundsCheck, boundsCheck))
     }
   }
@@ -252,12 +252,12 @@ extension IRBuilder {
       let innerSize = paddedShape[i] - pad.left - pad.right
 
       // Check: idx >= pad.left AND idx < pad.left + innerSize
-      let leftCheck = idx >= constant(Float(pad.left))
-      let rightCheck = idx < constant(Float(pad.left + innerSize))
+      let leftCheck = idx >= intConstant(pad.left)
+      let rightCheck = idx < intConstant(pad.left + innerSize)
       boundsCheck = boundsCheck * leftCheck * rightCheck
 
       // Adjust index: subtract left padding
-      newIndices.append(idx - constant(Float(pad.left)))
+      newIndices.append(idx - intConstant(pad.left))
     }
 
     return (newIndices, boundsCheck)
@@ -290,7 +290,7 @@ extension IRBuilder {
   {
     return indices.enumerated().map { i, idx in
       if let range = ranges[i] {
-        return idx + constant(Float(range.start))
+        return idx + intConstant(range.start)
       }
       return idx
     }
@@ -299,7 +299,7 @@ extension IRBuilder {
   /// Apply expand transform backwards: clamp broadcast dims to 0
   private func applyExpandBackward(_ indices: [Expr], _ inputShape: [Int]) -> [Expr] {
     return indices.enumerated().map { i, idx in
-      inputShape[i] == 1 ? constant(0.0) : idx
+      inputShape[i] == 1 ? intConstant(0) : idx
     }
   }
 }

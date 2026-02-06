@@ -1309,8 +1309,8 @@ public func emitThreadCountScaleOpIfNeeded(ctx: IRContext, block: Block, g: Grap
   let setup = IRBuilder(ctx: ctx, nodeId: block.nodes[block.nodes.count - 1])
   setup.setThreadCountScale(tensorSize)
   let flatIdx = setup.threadIndex()
-  let sizeExpr = setup.constant(Float(tensorSize))
-  let frameIdx = setup.floor(flatIdx / sizeExpr)
+  let sizeExpr = setup.intConstant(tensorSize)
+  let frameIdx = flatIdx / sizeExpr
   setup.setFrameIndex(frameIdx)
   let binIdx = flatIdx - frameIdx * sizeExpr
   uops.append(contentsOf: setup.ops)
@@ -1362,8 +1362,8 @@ public func emitFrameTensorChainBlock(
   let setup = IRBuilder(ctx: ctx, nodeId: chain.reductionNodeId)
   setup.setThreadCountScale(tensorSize)
   let flatIdx = setup.threadIndex()
-  let sizeExpr = setup.constant(Float(tensorSize))
-  let frameIdx = setup.floor(flatIdx / sizeExpr)
+  let sizeExpr = setup.intConstant(tensorSize)
+  let frameIdx = flatIdx / sizeExpr
   setup.setFrameIndex(frameIdx)
   let binIdx = flatIdx - frameIdx * sizeExpr
   uops.append(contentsOf: setup.ops)
