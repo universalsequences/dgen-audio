@@ -142,6 +142,50 @@ extension LazyGraph {
   }
 }
 
+// MARK: - Shared Backward Logic
+
+extension LazyGraph {
+  /// Core backward pass: set up gradients, compile, run, populate .grad, and return loss values.
+  ///
+  /// Both `Tensor.backward()` and `Signal.backward()` delegate here to avoid duplication.
+  func runBackward(loss: NodeID, frameCount: Int) throws -> [Float] {
+    markDirty()
+    _ = setupGradients(loss: loss, frameCount: frameCount)
+
+    // Create a single output(0) node. If there are gradient side effects
+    // (e.g. tensorAccumulate/memoryAccumulate), chain them via seq so they
+    // execute, but the output still carries the loss value through the chain.
+    if graph.gradientSideEffects.isEmpty {
+      _ = graph.n(.output(0), [loss])
+    } else {
+      let chainedValue = graph.chainGradientSideEffects(after: loss)
+      _ = graph.n(.output(0), [chainedValue])
+      graph.gradientSideEffects = []
+    }
+
+    let context = try compile(frameCount: frameCount)
+    run(context: context, preserveState: false)
+
+    let (tensorGrads, signalGrads) = readGradients(context: context)
+
+    // Populate .grad properties (gradients are data-only, not graph participants)
+    for tensor in parameterRegistry.tensors {
+      if let grads = tensorGrads[tensor.nodeId] {
+        tensor.grad = Tensor(nodeId: -1, graph: self, shape: [grads.count], data: grads)
+      }
+    }
+    for signal in parameterRegistry.signals {
+      if let gradValue = signalGrads[signal.nodeId] {
+        signal.grad = Signal(nodeId: -1, graph: self, data: gradValue)
+      }
+    }
+
+    let lossValues = readOutputs(context: context)
+    clearComputationGraph()
+    return lossValues
+  }
+}
+
 // MARK: - Backward for Tensor
 
 extension Tensor {
@@ -163,47 +207,7 @@ extension Tensor {
   /// - Returns: The computed loss values (one per frame)
   @discardableResult
   public func backward(frameCount: Int = DGenConfig.defaultFrameCount) throws -> [Float] {
-    // Set up gradient computation before adding output
-    let _ = graph.setupGradients(loss: nodeId, frameCount: frameCount)
-
-    // Create a single output(0) node. If there are gradient side effects
-    // (e.g. tensorAccumulate), chain them via seq so they execute,
-    // but the output still carries the loss value through the seq chain.
-    if !graph.graph.gradientSideEffects.isEmpty {
-      let chainedValue = graph.graph.chainGradientSideEffects(after: nodeId)
-      let _ = graph.graph.n(.output(0), [chainedValue])
-    } else {
-      let _ = graph.node(.output(0), [nodeId])
-    }
-    graph.graph.gradientSideEffects = []
-
-    // Compile and run
-    let context = try graph.compile(frameCount: frameCount)
-    graph.run(context: context, preserveState: false)
-
-    // Read gradients
-    let (tensorGrads, signalGrads) = graph.readGradients(context: context)
-
-    // Populate .grad properties (use internal init - gradients are data-only, not graph participants)
-    for tensor in graph.parameterRegistry.tensors {
-      if let grads = tensorGrads[tensor.nodeId] {
-        tensor.grad = Tensor(nodeId: -1, graph: graph, shape: [grads.count], data: grads)
-      }
-    }
-
-    for signal in graph.parameterRegistry.signals {
-      if let gradValue = signalGrads[signal.nodeId] {
-        signal.grad = Signal(nodeId: -1, graph: graph, data: gradValue)
-      }
-    }
-
-    // Read loss values from outputs before clearing
-    let lossValues = graph.readOutputs(context: context)
-
-    // Clear graph to prevent node accumulation - tensors refresh automatically
-    graph.clearComputationGraph()
-
-    return lossValues
+    return try graph.runBackward(loss: nodeId, frameCount: frameCount)
   }
 }
 
@@ -214,47 +218,7 @@ extension Signal {
   /// - Returns: The computed loss values (one per frame)
   @discardableResult
   public func backward(frames: Int = DGenConfig.defaultFrameCount) throws -> [Float] {
-    // Set up gradient computation before adding output
-    let _ = graph.setupGradients(loss: nodeId, frameCount: frames)
-
-    // Create a single output(0) node. If there are gradient side effects
-    // (e.g. memoryAccumulate), chain them via seq so they execute,
-    // but the output still carries the loss value through the seq chain.
-    if !graph.graph.gradientSideEffects.isEmpty {
-      let chainedValue = graph.graph.chainGradientSideEffects(after: nodeId)
-      let _ = graph.graph.n(.output(0), [chainedValue])
-    } else {
-      let _ = graph.node(.output(0), [nodeId])
-    }
-    graph.graph.gradientSideEffects = []
-
-    // Compile and run
-    let context = try graph.compile(frameCount: frames)
-    graph.run(context: context, preserveState: false)
-
-    // Read gradients
-    let (tensorGrads, signalGrads) = graph.readGradients(context: context)
-
-    // Populate .grad properties (use internal init - gradients are data-only, not graph participants)
-    for tensor in graph.parameterRegistry.tensors {
-      if let grads = tensorGrads[tensor.nodeId] {
-        tensor.grad = Tensor(nodeId: -1, graph: graph, shape: [grads.count], data: grads)
-      }
-    }
-
-    for signal in graph.parameterRegistry.signals {
-      if let gradValue = signalGrads[signal.nodeId] {
-        signal.grad = Signal(nodeId: -1, graph: graph, data: gradValue)
-      }
-    }
-
-    // Read loss values from outputs before clearing
-    let lossValues = graph.readOutputs(context: context)
-
-    // Clear graph to prevent node accumulation - signals refresh automatically
-    graph.clearComputationGraph()
-
-    return lossValues
+    return try graph.runBackward(loss: nodeId, frameCount: frames)
   }
 }
 

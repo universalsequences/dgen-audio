@@ -14,24 +14,31 @@ final class FIRFilterTests: XCTestCase {
     LazyGraphContext.reset()
   }
 
+  /// Generate a clean sine wave and a noisy version with high-frequency interference.
+  /// - Parameters:
+  ///   - n: Number of samples
+  ///   - freq: Frequency of the clean sine (cycles across n samples)
+  /// - Returns: (clean, noisy) signal arrays of length n
+  private func generateTestSignals(n: Int = 64, freq: Float = 4.0) -> (clean: [Float], noisy: [Float]) {
+    var clean = [Float](repeating: 0, count: n)
+    var noisy = [Float](repeating: 0, count: n)
+    for i in 0..<n {
+      let phase = Float(i) / Float(n) * freq * 2.0 * .pi
+      clean[i] = sin(phase)
+      // High-frequency noise (25 cycles across n samples -- avoids integer aliasing)
+      let noise = 0.3 * sin(Float(i) / Float(n) * 25.0 * 2.0 * .pi)
+      noisy[i] = clean[i] + noise
+    }
+    return (clean, noisy)
+  }
+
   // MARK: - Manual FIR Lowpass
 
   /// Verify that conv2d with a box filter (moving average) smooths a signal.
   /// A moving average is the simplest FIR lowpass — equal weights.
   func testMovingAverageLowpass() throws {
     let n = 64
-    let freq: Float = 4.0  // 4 cycles across 64 samples
-
-    // Build a sine wave with high-freq noise
-    var clean = [Float](repeating: 0, count: n)
-    var noisy = [Float](repeating: 0, count: n)
-    for i in 0..<n {
-      let phase = Float(i) / Float(n) * freq * 2.0 * .pi
-      clean[i] = sin(phase)
-      // Add high-frequency noise (25 cycles across n samples — avoids integer aliasing)
-      let noise = 0.3 * sin(Float(i) / Float(n) * 25.0 * 2.0 * .pi)
-      noisy[i] = clean[i] + noise
-    }
+    let (clean, noisy) = generateTestSignals(n: n)
 
     // Reshape as [1, N] for conv2d (faking 2D: height=1, width=N)
     let noisyTensor = Tensor([noisy])  // [1, 64]
@@ -149,18 +156,8 @@ final class FIRFilterTests: XCTestCase {
   /// The optimizer discovers FIR coefficients that minimize MSE against a clean signal.
   func testLearnedFIRLowpass() throws {
     let n = 64
-    let freq: Float = 4.0
     let kernelSize = 7
-
-    // Generate clean + noisy signals
-    var clean = [Float](repeating: 0, count: n)
-    var noisy = [Float](repeating: 0, count: n)
-    for i in 0..<n {
-      let phase = Float(i) / Float(n) * freq * 2.0 * .pi
-      clean[i] = sin(phase)
-      let noise = 0.3 * sin(Float(i) / Float(n) * 25.0 * 2.0 * .pi)
-      noisy[i] = clean[i] + noise
-    }
+    let (clean, noisy) = generateTestSignals(n: n)
 
     let noisyTensor = Tensor([noisy])  // [1, 64]
 
@@ -233,17 +230,8 @@ final class FIRFilterTests: XCTestCase {
   /// Forward-only test: realize the loss without backward to isolate output readout.
   func testFIRLossForwardOnly() throws {
     let n = 64
-    let freq: Float = 4.0
     let kernelSize = 7
-
-    var clean = [Float](repeating: 0, count: n)
-    var noisy = [Float](repeating: 0, count: n)
-    for i in 0..<n {
-      let phase = Float(i) / Float(n) * freq * 2.0 * .pi
-      clean[i] = sin(phase)
-      let noise = 0.3 * sin(Float(i) / Float(n) * 25.0 * 2.0 * .pi)
-      noisy[i] = clean[i] + noise
-    }
+    let (clean, noisy) = generateTestSignals(n: n)
 
     let noisyTensor = Tensor([noisy])
     let offset = (kernelSize - 1) / 2
@@ -278,13 +266,14 @@ final class FIRFilterTests: XCTestCase {
 ///   Options: plain MSE, or MSE + a regularization term (e.g., penalize kernel sum != 1)
 //
 func firKernelInit(_ size: Int) -> [Float] {
-  return [Float](repeating: 1.0 / Float(size), count: size)
+  [Float](repeating: 1.0 / Float(size), count: size)
 }
 
 func firLoss(prediction: Tensor, target: Tensor, kernel: Tensor) -> Tensor {
   let diff = prediction - target
   let mse = (diff * diff).mean()
-  let reg = (kernel.sum() - Tensor([1.0])) * (kernel.sum() - Tensor([1.0])) * Tensor([0.1])
+  let sumDeviation = kernel.sum() - Tensor([1.0])
+  let reg = sumDeviation * sumDeviation * Tensor([0.1])
   return mse + reg
 }
 
@@ -304,6 +293,5 @@ func firLoss(prediction: Tensor, target: Tensor, kernel: Tensor) -> Tensor {
 func bufferGradLoss(filtered: SignalTensor) -> Signal {
   // TODO(human): Replace this with your loss design.
   // Currently uses sum-of-squares (energy minimization) as a placeholder.
-  let energy = (filtered * filtered).sum()
-  return energy
+  return (filtered * filtered).sum()
 }

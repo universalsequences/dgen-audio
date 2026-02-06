@@ -214,8 +214,9 @@ public enum LazyOp {
     case .mul:
       guard inputs.count == 2 else {
         let fullInputs: [Lazy?] = node.inputs.map { ctx.values[$0] }
+        let nilIndex = fullInputs.firstIndex { $0 == nil }.map(String.init) ?? "none"
         print(
-          "mul failing \(node.id) nilIndex=\(fullInputs.firstIndex {$0 == nil}) fullInputs=\(fullInputs) node.inputs=\(node.inputs)"
+          "mul failing \(node.id) nilIndex=\(nilIndex) fullInputs=\(fullInputs) node.inputs=\(node.inputs)"
         )
         throw DGenError.insufficientInputs(
           operator: "mul", expected: 2, actual: inputs.count)
@@ -1656,11 +1657,12 @@ public enum LazyOp {
             let lastInput = srcNode.inputs.last {
         sourceId = lastInput
       }
+
       // If the source is a shape-[1] tensor, read from its memory cell
       // instead of referencing a variable that may live in another kernel scope.
-      let sourceNode = ctx.g.nodes[sourceId]
       let outputValue: Expr
-      if let sourceNode, case .tensor(let shape) = sourceNode.shape,
+      if let srcNode = ctx.g.nodes[sourceId],
+         case .tensor(let shape) = srcNode.shape,
          shape.reduce(1, *) == 1,
          let tensorId = ctx.g.nodeToTensor[sourceId],
          let tensor = ctx.g.tensors[tensorId]
