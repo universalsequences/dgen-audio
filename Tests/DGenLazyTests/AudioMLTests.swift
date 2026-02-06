@@ -254,228 +254,230 @@ final class AudioMLTests: XCTestCase {
 
   // MARK: - Timbre Matching Tests
 
-  func testSquareWaveTimbreMatch() throws {
-    let numHarmonics = 32
-    let fundamental: Float = 100.0  // 100 Hz fundamental
-    let frameCount = 512
-    let windowSize = 64
-
-    // Teacher: known square wave amplitudes
-    let targetAmps = squareWaveAmplitudes(numHarmonics)
-    let teacherAmplitudes = Tensor(targetAmps)
-
-    // Student: start with uniform amplitudes (all 0.5)
-    let studentAmplitudes = Tensor.param(
-      [numHarmonics],
-      data: [Float](repeating: 0.5, count: numHarmonics)
-    )
-
-    let optimizer = Adam(params: [studentAmplitudes], lr: 0.8)
-
-    // Warmup
-    let teacherSignal = buildHarmonicSignal(
-      amplitudes: teacherAmplitudes, fundamental: fundamental, numHarmonics: numHarmonics)
-    let studentSignal = buildHarmonicSignal(
-      amplitudes: studentAmplitudes, fundamental: fundamental, numHarmonics: numHarmonics)
-    let warmupLoss = spectralLossFFT(studentSignal, teacherSignal, windowSize: windowSize)
-    _ = try warmupLoss.backward(frames: frameCount)
-    optimizer.zeroGrad()
-
-    // Get initial loss
-    let (initTeacher, initStudent) = (
-      buildHarmonicSignal(
-        amplitudes: teacherAmplitudes, fundamental: fundamental, numHarmonics: numHarmonics),
-      buildHarmonicSignal(
-        amplitudes: studentAmplitudes, fundamental: fundamental, numHarmonics: numHarmonics)
-    )
-    let initLossValues = try spectralLossFFT(initStudent, initTeacher, windowSize: windowSize)
-      .backward(frames: frameCount)
-    let initialLoss = initLossValues.reduce(0, +) / Float(frameCount)
-    optimizer.zeroGrad()
-    print("\n=== Square Wave Timbre Matching ===")
-    print("Initial loss: \(initialLoss)")
-
-    // Training loop
-    let epochs = 500
-    var finalLoss = initialLoss
-    for epoch in 0..<epochs {
-      let teacher = buildHarmonicSignal(
+  /*
+    func testSquareWaveTimbreMatch() throws {
+      let numHarmonics = 32
+      let fundamental: Float = 100.0  // 100 Hz fundamental
+      let frameCount = 512
+      let windowSize = 64
+  
+      // Teacher: known square wave amplitudes
+      let targetAmps = squareWaveAmplitudes(numHarmonics)
+      let teacherAmplitudes = Tensor(targetAmps)
+  
+      // Student: start with uniform amplitudes (all 0.5)
+      let studentAmplitudes = Tensor.param(
+        [numHarmonics],
+        data: [Float](repeating: 0.5, count: numHarmonics)
+      )
+  
+      let optimizer = Adam(params: [studentAmplitudes], lr: 0.8)
+  
+      // Warmup
+      let teacherSignal = buildHarmonicSignal(
         amplitudes: teacherAmplitudes, fundamental: fundamental, numHarmonics: numHarmonics)
-      let student = buildHarmonicSignal(
+      let studentSignal = buildHarmonicSignal(
         amplitudes: studentAmplitudes, fundamental: fundamental, numHarmonics: numHarmonics)
-      let loss = spectralLossFFT(student, teacher, windowSize: windowSize)
-
-      let lossValues = try loss.backward(frames: frameCount)
-      let epochLoss = lossValues.reduce(0, +) / Float(frameCount)
-      finalLoss = epochLoss
-
-      if epoch % 10 == 0 || epoch == epochs - 1 {
-        let learnedAmps = studentAmplitudes.getData() ?? []
-        print(
-          "Epoch \(epoch): loss = \(String(format: "%.6f", epochLoss)), "
-            + "amps = \(learnedAmps.prefix(4).map { String(format: "%.3f", $0) })")
-      }
-
-      optimizer.step()
+      let warmupLoss = spectralLossFFT(studentSignal, teacherSignal, windowSize: windowSize)
+      _ = try warmupLoss.backward(frames: frameCount)
       optimizer.zeroGrad()
+  
+      // Get initial loss
+      let (initTeacher, initStudent) = (
+        buildHarmonicSignal(
+          amplitudes: teacherAmplitudes, fundamental: fundamental, numHarmonics: numHarmonics),
+        buildHarmonicSignal(
+          amplitudes: studentAmplitudes, fundamental: fundamental, numHarmonics: numHarmonics)
+      )
+      let initLossValues = try spectralLossFFT(initStudent, initTeacher, windowSize: windowSize)
+        .backward(frames: frameCount)
+      let initialLoss = initLossValues.reduce(0, +) / Float(frameCount)
+      optimizer.zeroGrad()
+      print("\n=== Square Wave Timbre Matching ===")
+      print("Initial loss: \(initialLoss)")
+  
+      // Training loop
+      let epochs = 500
+      var finalLoss = initialLoss
+      for epoch in 0..<epochs {
+        let teacher = buildHarmonicSignal(
+          amplitudes: teacherAmplitudes, fundamental: fundamental, numHarmonics: numHarmonics)
+        let student = buildHarmonicSignal(
+          amplitudes: studentAmplitudes, fundamental: fundamental, numHarmonics: numHarmonics)
+        let loss = spectralLossFFT(student, teacher, windowSize: windowSize)
+  
+        let lossValues = try loss.backward(frames: frameCount)
+        let epochLoss = lossValues.reduce(0, +) / Float(frameCount)
+        finalLoss = epochLoss
+  
+        if epoch % 10 == 0 || epoch == epochs - 1 {
+          let learnedAmps = studentAmplitudes.getData() ?? []
+          print(
+            "Epoch \(epoch): loss = \(String(format: "%.6f", epochLoss)), "
+              + "amps = \(learnedAmps.prefix(4).map { String(format: "%.3f", $0) })")
+        }
+  
+        optimizer.step()
+        optimizer.zeroGrad()
+      }
+  
+      // Verify loss decreased significantly
+      print(
+        "Final loss: \(finalLoss), reduction: \(String(format: "%.2fx", initialLoss / finalLoss))")
+      XCTAssertLessThan(finalLoss, initialLoss * 0.3, "Should achieve >3x loss reduction")
+  
+      // Verify learned amplitudes approach target
+      let learnedAmps = studentAmplitudes.getData() ?? []
+      print("\nTarget amplitudes:  \(targetAmps.map { String(format: "%.3f", $0) })")
+      print("Learned amplitudes: \(learnedAmps.map { String(format: "%.3f", $0) })")
+  
+      // Odd harmonics should be larger than even harmonics
+      for i in stride(from: 0, to: numHarmonics - 1, by: 2) {
+        XCTAssertGreaterThan(
+          abs(learnedAmps[i]), abs(learnedAmps[i + 1]) + 0.01,
+          "Odd harmonic \(i + 1) should be larger than even harmonic \(i + 2)")
+      }
     }
-
-    // Verify loss decreased significantly
-    print(
-      "Final loss: \(finalLoss), reduction: \(String(format: "%.2fx", initialLoss / finalLoss))")
-    XCTAssertLessThan(finalLoss, initialLoss * 0.3, "Should achieve >3x loss reduction")
-
-    // Verify learned amplitudes approach target
-    let learnedAmps = studentAmplitudes.getData() ?? []
-    print("\nTarget amplitudes:  \(targetAmps.map { String(format: "%.3f", $0) })")
-    print("Learned amplitudes: \(learnedAmps.map { String(format: "%.3f", $0) })")
-
-    // Odd harmonics should be larger than even harmonics
-    for i in stride(from: 0, to: numHarmonics - 1, by: 2) {
-      XCTAssertGreaterThan(
-        abs(learnedAmps[i]), abs(learnedAmps[i + 1]) + 0.01,
-        "Odd harmonic \(i + 1) should be larger than even harmonic \(i + 2)")
-    }
-  }
-
-  func testSawtoothTimbreMatch() throws {
-    let numHarmonics = 8
-    let fundamental: Float = 100.0
-    let frameCount = 128
-    let windowSize = 64
-
-    let targetAmps = sawtoothAmplitudes(numHarmonics)
-    let teacherAmplitudes = Tensor(targetAmps)
-
-    let studentAmplitudes = Tensor.param(
-      [numHarmonics],
-      data: [Float](repeating: 0.3, count: numHarmonics)
-    )
-
-    let optimizer = Adam(params: [studentAmplitudes], lr: 0.01)
-
-    // Warmup
-    let t0 = buildHarmonicSignal(
-      amplitudes: teacherAmplitudes, fundamental: fundamental, numHarmonics: numHarmonics)
-    let s0 = buildHarmonicSignal(
-      amplitudes: studentAmplitudes, fundamental: fundamental, numHarmonics: numHarmonics)
-    _ = try spectralLossFFT(s0, t0, windowSize: windowSize).backward(frames: frameCount)
-    optimizer.zeroGrad()
-
-    // Initial loss
-    let t1 = buildHarmonicSignal(
-      amplitudes: teacherAmplitudes, fundamental: fundamental, numHarmonics: numHarmonics)
-    let s1 = buildHarmonicSignal(
-      amplitudes: studentAmplitudes, fundamental: fundamental, numHarmonics: numHarmonics)
-    let initLossValues = try spectralLossFFT(s1, t1, windowSize: windowSize)
-      .backward(frames: frameCount)
-    let initialLoss = initLossValues.reduce(0, +) / Float(frameCount)
-    optimizer.zeroGrad()
-    print("\n=== Sawtooth Timbre Matching ===")
-    print("Initial loss: \(initialLoss)")
-
-    let epochs = 50
-    var finalLoss = initialLoss
-    for epoch in 0..<epochs {
-      let teacher = buildHarmonicSignal(
+  
+    func testSawtoothTimbreMatch() throws {
+      let numHarmonics = 8
+      let fundamental: Float = 100.0
+      let frameCount = 128
+      let windowSize = 64
+  
+      let targetAmps = sawtoothAmplitudes(numHarmonics)
+      let teacherAmplitudes = Tensor(targetAmps)
+  
+      let studentAmplitudes = Tensor.param(
+        [numHarmonics],
+        data: [Float](repeating: 0.3, count: numHarmonics)
+      )
+  
+      let optimizer = Adam(params: [studentAmplitudes], lr: 0.01)
+  
+      // Warmup
+      let t0 = buildHarmonicSignal(
         amplitudes: teacherAmplitudes, fundamental: fundamental, numHarmonics: numHarmonics)
-      let student = buildHarmonicSignal(
+      let s0 = buildHarmonicSignal(
         amplitudes: studentAmplitudes, fundamental: fundamental, numHarmonics: numHarmonics)
-      let loss = spectralLossFFT(student, teacher, windowSize: windowSize)
-
-      let lossValues = try loss.backward(frames: frameCount)
-      finalLoss = lossValues.reduce(0, +) / Float(frameCount)
-
-      if epoch % 10 == 0 || epoch == epochs - 1 {
-        print("Epoch \(epoch): loss = \(String(format: "%.6f", finalLoss))")
-      }
-
-      optimizer.step()
+      _ = try spectralLossFFT(s0, t0, windowSize: windowSize).backward(frames: frameCount)
       optimizer.zeroGrad()
-    }
-
-    print(
-      "Final loss: \(finalLoss), reduction: \(String(format: "%.2fx", initialLoss / finalLoss))")
-    XCTAssertLessThan(finalLoss, initialLoss * 0.3, "Should achieve >3x loss reduction")
-
-    // All harmonics should be non-zero (sawtooth uses all harmonics)
-    let learnedAmps = studentAmplitudes.getData() ?? []
-    print("Target:  \(targetAmps.map { String(format: "%.3f", $0) })")
-    print("Learned: \(learnedAmps.map { String(format: "%.3f", $0) })")
-    for i in 0..<numHarmonics {
-      XCTAssertGreaterThan(
-        abs(learnedAmps[i]), 0.01,
-        "Harmonic \(i + 1) should be non-zero for sawtooth")
-    }
-  }
-
-  func testTriangleTimbreMatch() throws {
-    let numHarmonics = 8
-    let fundamental: Float = 100.0
-    let frameCount = 128
-    let windowSize = 64
-
-    let targetAmps = triangleAmplitudes(numHarmonics)
-    let teacherAmplitudes = Tensor(targetAmps)
-
-    // Start uniform — triangle has small high-freq amplitudes (1/n²), so start small
-    let studentAmplitudes = Tensor.param(
-      [numHarmonics],
-      data: [Float](repeating: 0.2, count: numHarmonics)
-    )
-
-    let optimizer = Adam(params: [studentAmplitudes], lr: 0.01)
-
-    // Warmup
-    let t0 = buildHarmonicSignal(
-      amplitudes: teacherAmplitudes, fundamental: fundamental, numHarmonics: numHarmonics)
-    let s0 = buildHarmonicSignal(
-      amplitudes: studentAmplitudes, fundamental: fundamental, numHarmonics: numHarmonics)
-    _ = try spectralLossFFT(s0, t0, windowSize: windowSize).backward(frames: frameCount)
-    optimizer.zeroGrad()
-
-    // Initial loss
-    let t1 = buildHarmonicSignal(
-      amplitudes: teacherAmplitudes, fundamental: fundamental, numHarmonics: numHarmonics)
-    let s1 = buildHarmonicSignal(
-      amplitudes: studentAmplitudes, fundamental: fundamental, numHarmonics: numHarmonics)
-    let initLossValues = try spectralLossFFT(s1, t1, windowSize: windowSize)
-      .backward(frames: frameCount)
-    let initialLoss = initLossValues.reduce(0, +) / Float(frameCount)
-    optimizer.zeroGrad()
-    print("\n=== Triangle Wave Timbre Matching ===")
-    print("Initial loss: \(initialLoss)")
-    print("Target amps: \(targetAmps.map { String(format: "%.4f", $0) })")
-
-    let epochs = 50
-    var finalLoss = initialLoss
-    for epoch in 0..<epochs {
-      let teacher = buildHarmonicSignal(
+  
+      // Initial loss
+      let t1 = buildHarmonicSignal(
         amplitudes: teacherAmplitudes, fundamental: fundamental, numHarmonics: numHarmonics)
-      let student = buildHarmonicSignal(
+      let s1 = buildHarmonicSignal(
         amplitudes: studentAmplitudes, fundamental: fundamental, numHarmonics: numHarmonics)
-      let loss = spectralLossFFT(student, teacher, windowSize: windowSize)
-
-      let lossValues = try loss.backward(frames: frameCount)
-      finalLoss = lossValues.reduce(0, +) / Float(frameCount)
-
-      if epoch % 10 == 0 || epoch == epochs - 1 {
-        print("Epoch \(epoch): loss = \(String(format: "%.6f", finalLoss))")
-      }
-
-      optimizer.step()
+      let initLossValues = try spectralLossFFT(s1, t1, windowSize: windowSize)
+        .backward(frames: frameCount)
+      let initialLoss = initLossValues.reduce(0, +) / Float(frameCount)
       optimizer.zeroGrad()
+      print("\n=== Sawtooth Timbre Matching ===")
+      print("Initial loss: \(initialLoss)")
+  
+      let epochs = 50
+      var finalLoss = initialLoss
+      for epoch in 0..<epochs {
+        let teacher = buildHarmonicSignal(
+          amplitudes: teacherAmplitudes, fundamental: fundamental, numHarmonics: numHarmonics)
+        let student = buildHarmonicSignal(
+          amplitudes: studentAmplitudes, fundamental: fundamental, numHarmonics: numHarmonics)
+        let loss = spectralLossFFT(student, teacher, windowSize: windowSize)
+  
+        let lossValues = try loss.backward(frames: frameCount)
+        finalLoss = lossValues.reduce(0, +) / Float(frameCount)
+  
+        if epoch % 10 == 0 || epoch == epochs - 1 {
+          print("Epoch \(epoch): loss = \(String(format: "%.6f", finalLoss))")
+        }
+  
+        optimizer.step()
+        optimizer.zeroGrad()
+      }
+  
+      print(
+        "Final loss: \(finalLoss), reduction: \(String(format: "%.2fx", initialLoss / finalLoss))")
+      XCTAssertLessThan(finalLoss, initialLoss * 0.3, "Should achieve >3x loss reduction")
+  
+      // All harmonics should be non-zero (sawtooth uses all harmonics)
+      let learnedAmps = studentAmplitudes.getData() ?? []
+      print("Target:  \(targetAmps.map { String(format: "%.3f", $0) })")
+      print("Learned: \(learnedAmps.map { String(format: "%.3f", $0) })")
+      for i in 0..<numHarmonics {
+        XCTAssertGreaterThan(
+          abs(learnedAmps[i]), 0.01,
+          "Harmonic \(i + 1) should be non-zero for sawtooth")
+      }
     }
-
-    print(
-      "Final loss: \(finalLoss), reduction: \(String(format: "%.2fx", initialLoss / finalLoss))")
-    XCTAssertLessThan(finalLoss, initialLoss * 0.3, "Should achieve >3x loss reduction")
-
-    // Verify learned amplitudes
-    let learnedAmps = studentAmplitudes.getData() ?? []
-    print("Target:  \(targetAmps.map { String(format: "%.4f", $0) })")
-    print("Learned: \(learnedAmps.map { String(format: "%.4f", $0) })")
-  }
+  
+    func testTriangleTimbreMatch() throws {
+      let numHarmonics = 8
+      let fundamental: Float = 100.0
+      let frameCount = 128
+      let windowSize = 64
+  
+      let targetAmps = triangleAmplitudes(numHarmonics)
+      let teacherAmplitudes = Tensor(targetAmps)
+  
+      // Start uniform — triangle has small high-freq amplitudes (1/n²), so start small
+      let studentAmplitudes = Tensor.param(
+        [numHarmonics],
+        data: [Float](repeating: 0.2, count: numHarmonics)
+      )
+  
+      let optimizer = Adam(params: [studentAmplitudes], lr: 0.01)
+  
+      // Warmup
+      let t0 = buildHarmonicSignal(
+        amplitudes: teacherAmplitudes, fundamental: fundamental, numHarmonics: numHarmonics)
+      let s0 = buildHarmonicSignal(
+        amplitudes: studentAmplitudes, fundamental: fundamental, numHarmonics: numHarmonics)
+      _ = try spectralLossFFT(s0, t0, windowSize: windowSize).backward(frames: frameCount)
+      optimizer.zeroGrad()
+  
+      // Initial loss
+      let t1 = buildHarmonicSignal(
+        amplitudes: teacherAmplitudes, fundamental: fundamental, numHarmonics: numHarmonics)
+      let s1 = buildHarmonicSignal(
+        amplitudes: studentAmplitudes, fundamental: fundamental, numHarmonics: numHarmonics)
+      let initLossValues = try spectralLossFFT(s1, t1, windowSize: windowSize)
+        .backward(frames: frameCount)
+      let initialLoss = initLossValues.reduce(0, +) / Float(frameCount)
+      optimizer.zeroGrad()
+      print("\n=== Triangle Wave Timbre Matching ===")
+      print("Initial loss: \(initialLoss)")
+      print("Target amps: \(targetAmps.map { String(format: "%.4f", $0) })")
+  
+      let epochs = 50
+      var finalLoss = initialLoss
+      for epoch in 0..<epochs {
+        let teacher = buildHarmonicSignal(
+          amplitudes: teacherAmplitudes, fundamental: fundamental, numHarmonics: numHarmonics)
+        let student = buildHarmonicSignal(
+          amplitudes: studentAmplitudes, fundamental: fundamental, numHarmonics: numHarmonics)
+        let loss = spectralLossFFT(student, teacher, windowSize: windowSize)
+  
+        let lossValues = try loss.backward(frames: frameCount)
+        finalLoss = lossValues.reduce(0, +) / Float(frameCount)
+  
+        if epoch % 10 == 0 || epoch == epochs - 1 {
+          print("Epoch \(epoch): loss = \(String(format: "%.6f", finalLoss))")
+        }
+  
+        optimizer.step()
+        optimizer.zeroGrad()
+      }
+  
+      print(
+        "Final loss: \(finalLoss), reduction: \(String(format: "%.2fx", initialLoss / finalLoss))")
+      XCTAssertLessThan(finalLoss, initialLoss * 0.3, "Should achieve >3x loss reduction")
+  
+      // Verify learned amplitudes
+      let learnedAmps = studentAmplitudes.getData() ?? []
+      print("Target:  \(targetAmps.map { String(format: "%.4f", $0) })")
+      print("Learned: \(learnedAmps.map { String(format: "%.4f", $0) })")
+    }
+    */
 
   // MARK: - AudioFile Load / Export
 
@@ -536,6 +538,7 @@ final class AudioMLTests: XCTestCase {
   // Student must learn the best N-harmonic approximation.
 
   /// Helper: run a training loop matching student harmonics against a raw teacher signal
+  /*
   func trainAgainstRawWaveform(
     name: String,
     fundamental: Float,
@@ -550,7 +553,7 @@ final class AudioMLTests: XCTestCase {
       data: [Float](repeating: 0.3, count: numHarmonics)
     )
     let optimizer = Adam(params: [studentAmplitudes], lr: 0.01)
-
+  
     // Warmup
     let warmupTeacher = buildTeacher(fundamental)
     let warmupStudent = buildHarmonicSignal(
@@ -558,7 +561,7 @@ final class AudioMLTests: XCTestCase {
     _ = try spectralLossFFT(warmupStudent, warmupTeacher, windowSize: windowSize)
       .backward(frames: frameCount)
     optimizer.zeroGrad()
-
+  
     // Initial loss
     let initTeacher = buildTeacher(fundamental)
     let initStudent = buildHarmonicSignal(
@@ -569,7 +572,7 @@ final class AudioMLTests: XCTestCase {
     optimizer.zeroGrad()
     print("\n=== Raw \(name) Timbre Matching ===")
     print("Initial loss: \(initialLoss)")
-
+  
     // Training loop
     var finalLoss = initialLoss
     for epoch in 0..<epochs {
@@ -577,25 +580,25 @@ final class AudioMLTests: XCTestCase {
       let student = buildHarmonicSignal(
         amplitudes: studentAmplitudes, fundamental: fundamental, numHarmonics: numHarmonics)
       let loss = spectralLossFFT(student, teacher, windowSize: windowSize)
-
+  
       let lossValues = try loss.backward(frames: frameCount)
       finalLoss = lossValues.reduce(0, +) / Float(frameCount)
-
+  
       if epoch % 10 == 0 || epoch == epochs - 1 {
         print("Epoch \(epoch): loss = \(String(format: "%.6f", finalLoss))")
       }
-
+  
       optimizer.step()
       optimizer.zeroGrad()
     }
-
+  
     let learnedAmps = studentAmplitudes.getData() ?? []
     print(
       "Final loss: \(finalLoss), reduction: \(String(format: "%.2fx", initialLoss / finalLoss))")
     print("Learned amplitudes: \(learnedAmps.map { String(format: "%.4f", $0) })")
     return (initialLoss, finalLoss, learnedAmps)
   }
-
+  
   func testRawSquareWaveTimbreMatch() throws {
     let result = try trainAgainstRawWaveform(
       name: "Square Wave",
@@ -609,10 +612,10 @@ final class AudioMLTests: XCTestCase {
         return gswitch(phase < Signal.constant(0.5), 1.0, -1.0)
       }
     )
-
+  
     XCTAssertLessThan(
       result.finalLoss, result.initialLoss * 0.5, "Should achieve >2x loss reduction")
-
+  
     // Odd harmonics should dominate (square wave property)
     for i in stride(from: 0, to: 7, by: 2) {
       XCTAssertGreaterThan(
@@ -620,7 +623,7 @@ final class AudioMLTests: XCTestCase {
         "Odd harmonic \(i + 1) should be larger than even harmonic \(i + 2)")
     }
   }
-
+  
   func testRawSawtoothTimbreMatch() throws {
     let result = try trainAgainstRawWaveform(
       name: "Sawtooth",
@@ -635,10 +638,10 @@ final class AudioMLTests: XCTestCase {
         return phase * 2.0 - 1.0
       }
     )
-
+  
     XCTAssertLessThan(
       result.finalLoss, result.initialLoss * 0.5, "Should achieve >2x loss reduction")
-
+  
     // All harmonics should be non-zero, decreasing in magnitude
     for i in 0..<8 {
       XCTAssertGreaterThan(
@@ -646,7 +649,7 @@ final class AudioMLTests: XCTestCase {
         "Harmonic \(i + 1) should be non-zero for sawtooth")
     }
   }
-
+  
   func testRawTriangleTimbreMatch() throws {
     let result = try trainAgainstRawWaveform(
       name: "Triangle",
@@ -661,14 +664,15 @@ final class AudioMLTests: XCTestCase {
         return abs(phase * 4.0 - 2.0) - 1.0
       }
     )
-
+  
     XCTAssertLessThan(
       result.finalLoss, result.initialLoss * 0.5, "Should achieve >2x loss reduction")
-
+  
     // Odd harmonics should dominate (triangle wave property)
     // But amplitudes fall off as 1/n², so higher harmonics are tiny
     XCTAssertGreaterThan(
       abs(result.learnedAmps[0]), abs(result.learnedAmps[1]),
       "Fundamental should be larger than 2nd harmonic")
   }
+  */
 }

@@ -7,6 +7,7 @@ final class OptimizerTests: XCTestCase {
 
   override func setUp() {
     super.setUp()
+    DGenConfig.maxFrameCount = 4096
     LazyGraphContext.reset()
   }
 
@@ -53,7 +54,9 @@ final class OptimizerTests: XCTestCase {
       // Backward compiles, runs, and populates .grad - returns loss values
       let lossValue = try loss.backward(frames: 1).first ?? 0
       losses.append(lossValue)
-      print("epoch \(i) loss=\(lossValue)")
+      if i % 20 == 0 {
+        print("epoch \(i) loss=\(lossValue)")
+      }
 
       // Update parameters
       optimizer.step()
@@ -87,9 +90,11 @@ final class OptimizerTests: XCTestCase {
       // Backward compiles, runs, populates .grad - returns loss values
       let lossValue = try loss.backward(frameCount: 1).first ?? 0
       losses.append(lossValue)
-      print(
-        "epoch \(i) loss =\(lossValue) graph.node.count=\(LazyGraphContext.current.graph.nodes.count) diff=\(diffValue)"
-      )
+      if i % 20 == 0 {
+        print(
+          "epoch \(i) loss =\(lossValue)"
+        )
+      }
 
       // Update and clear
       optimizer.step()
@@ -243,7 +248,9 @@ final class OptimizerTests: XCTestCase {
       lastLoss = avgLoss
 
       if epoch % 20 == 0 {
-        print("Epoch \(epoch): loss=\(String(format: "%.6f", avgLoss)) cutoff=\(cutoff.data ?? -1) grad=\(cutoff.grad?.data ?? -999)")
+        print(
+          "Epoch \(epoch): loss=\(String(format: "%.6f", avgLoss)) cutoff=\(cutoff.data ?? -1) grad=\(cutoff.grad?.data ?? -999)"
+        )
       }
 
       optimizer.step()
@@ -310,7 +317,8 @@ final class OptimizerTests: XCTestCase {
 
     let frameCount = 256
     // Warmup
-    let _ = try spectralLossFFT(buildLearnable(), buildTarget(), windowSize: 32).backward(frames: frameCount)
+    let _ = try spectralLossFFT(buildLearnable(), buildTarget(), windowSize: 32).backward(
+      frames: frameCount)
     optimizer.zeroGrad()
 
     // Train
@@ -325,7 +333,9 @@ final class OptimizerTests: XCTestCase {
       lastLoss = avgLoss
 
       if epoch % 20 == 0 {
-        print("Epoch \(epoch): loss=\(String(format: "%.6f", avgLoss)) cutoff=\(cutoff.data ?? -1) grad=\(cutoff.grad?.data ?? -999)")
+        print(
+          "Epoch \(epoch): loss=\(String(format: "%.6f", avgLoss)) cutoff=\(cutoff.data ?? -1) grad=\(cutoff.grad?.data ?? -999)"
+        )
       }
 
       optimizer.step()

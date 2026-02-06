@@ -23,7 +23,7 @@ final class MLPHarmonicSynthTests: XCTestCase {
   func linearForward(
     input: Tensor,
     W: Tensor,  // [1, outputSize]
-    b: Tensor   // [1, outputSize]
+    b: Tensor  // [1, outputSize]
   ) -> Tensor {
     return input.matmul(W) + b
   }
@@ -32,7 +32,6 @@ final class MLPHarmonicSynthTests: XCTestCase {
 
   func testMLPPeekRowHarmonicSynth() throws {
     DGenConfig.kernelOutputPath = "/tmp/mlp_peek_row_harmonic_sync.metal"
-    DGenConfig.debug = true
     let frameCount = 64
     let controlFrames = 16
     let numHarmonics = 16
@@ -204,7 +203,7 @@ final class MLPHarmonicSynthTests: XCTestCase {
 
     // Weights
     let W = Tensor([[1.0, 0.5, -0.5]])  // [1, outputSize]
-    let b = Tensor([[0.1, 0.2, 0.3]])   // [1, outputSize]
+    let b = Tensor([[0.1, 0.2, 0.3]])  // [1, outputSize]
 
     // Forward: y = x @ W + b
     let output = linearForward(input: input, W: W, b: b)

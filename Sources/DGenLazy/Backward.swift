@@ -163,16 +163,17 @@ extension Tensor {
   /// - Returns: The computed loss values (one per frame)
   @discardableResult
   public func backward(frameCount: Int = DGenConfig.defaultFrameCount) throws -> [Float] {
-    // Add output node for the loss
-    let _ = graph.node(.output(0), [nodeId])
-
-    // Set up gradient computation
+    // Set up gradient computation before adding output
     let _ = graph.setupGradients(loss: nodeId, frameCount: frameCount)
 
-    // Ensure side effects are scheduled with output
+    // Create a single output(0) node. If there are gradient side effects
+    // (e.g. tensorAccumulate), chain them via seq so they execute,
+    // but the output still carries the loss value through the seq chain.
     if !graph.graph.gradientSideEffects.isEmpty {
       let chainedValue = graph.graph.chainGradientSideEffects(after: nodeId)
       let _ = graph.graph.n(.output(0), [chainedValue])
+    } else {
+      let _ = graph.node(.output(0), [nodeId])
     }
     graph.graph.gradientSideEffects = []
 
@@ -213,16 +214,17 @@ extension Signal {
   /// - Returns: The computed loss values (one per frame)
   @discardableResult
   public func backward(frames: Int = DGenConfig.defaultFrameCount) throws -> [Float] {
-    // Add output node for the loss
-    let _ = graph.node(.output(0), [nodeId])
-
-    // Set up gradient computation
+    // Set up gradient computation before adding output
     let _ = graph.setupGradients(loss: nodeId, frameCount: frames)
 
-    // Ensure side effects are scheduled with output
+    // Create a single output(0) node. If there are gradient side effects
+    // (e.g. memoryAccumulate), chain them via seq so they execute,
+    // but the output still carries the loss value through the seq chain.
     if !graph.graph.gradientSideEffects.isEmpty {
       let chainedValue = graph.graph.chainGradientSideEffects(after: nodeId)
       let _ = graph.graph.n(.output(0), [chainedValue])
+    } else {
+      let _ = graph.node(.output(0), [nodeId])
     }
     graph.graph.gradientSideEffects = []
 

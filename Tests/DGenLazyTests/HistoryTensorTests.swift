@@ -302,36 +302,32 @@ final class HistoryTensorTests: XCTestCase {
   /// Functionally equivalent to TensorOpsTests.testMembraneSimulationExecute
   func testConv2DMembraneSimulation() throws {
     DGenConfig.kernelOutputPath = "/tmp/membrane_simulation.metal"
-    DGenConfig.debug = true
 
     let gridSize = 4
     let frameCount = 64
 
     // Physical parameters
-    let cSquared: Float = 0.1   // Wave speed squared
-    let damping: Float = 0.03   // Velocity-proportional damping
+    let cSquared: Float = 0.1  // Wave speed squared
+    let damping: Float = 0.03  // Velocity-proportional damping
 
     // Coefficients for wave equation
-    let twoMinusD: Float = 2.0 - damping   // 1.97
-    let oneMinusD: Float = 1.0 - damping   // 0.97
+    let twoMinusD: Float = 2.0 - damping  // 1.97
+    let oneMinusD: Float = 1.0 - damping  // 0.97
 
     // Initial excitation: 2x2 block in center
     var exciteData = [Float](repeating: 0.0, count: gridSize * gridSize)
-    exciteData[5] = 1.0   // [1,1]
-    exciteData[6] = 1.0   // [1,2]
-    exciteData[9] = 1.0   // [2,1]
+    exciteData[5] = 1.0  // [1,1]
+    exciteData[6] = 1.0  // [1,2]
+    exciteData[9] = 1.0  // [2,1]
     exciteData[10] = 1.0  // [2,2]
     let excitation = Tensor(exciteData).reshape([gridSize, gridSize])
-    print("DEBUG: excitation nodeId=\(excitation.nodeId), shape=\(excitation.shape)")
 
     // Frame counter: 0, 1, 2, 3... (accum outputs value BEFORE incrementing)
     let frameCounter = Signal.accum(Signal.constant(1.0), min: 0.0, max: 10000.0)
     let isFirstFrame = frameCounter.eq(0.0)  // 1.0 on frame 0, 0.0 after
-    print("DEBUG: isFirstFrame nodeId=\(isFirstFrame.nodeId)")
 
     // Gate excitation to only fire on first frame
     let gatedExcite = excitation * isFirstFrame  // Tensor * Signal -> SignalTensor
-    print("DEBUG: gatedExcite nodeId=\(gatedExcite.nodeId), shape=\(gatedExcite.shape)")
 
     // Two history buffers for wave equation (need current and previous state)
     let stateHistory = TensorHistory(shape: [gridSize, gridSize])
@@ -350,7 +346,6 @@ final class HistoryTensorTests: XCTestCase {
       [1.0, -4.0, 1.0],
       [0.0, 1.0, 0.0],
     ])
-    print("DEBUG: laplacianKernel nodeId=\(laplacianKernel.nodeId), shape=\(laplacianKernel.shape)")
 
     // Pad state for same-size convolution output (Dirichlet boundary = fixed at 0)
     let paddedState = state_t.pad([(1, 1), (1, 1)])  // [gridSize+2, gridSize+2]
@@ -376,20 +371,6 @@ final class HistoryTensorTests: XCTestCase {
     // Run simulation
     let result = try output.realize(frames: frameCount)
 
-    print("\n=== Full Membrane Simulation ===")
-    print("Grid: \(gridSize)x\(gridSize), Frames: \(frameCount)")
-    print("c² = \(cSquared), damping = \(damping)")
-    print("\nOutput (sum of state) per frame:")
-    for i in stride(from: 0, to: min(20, frameCount), by: 1) {
-      print("  frame \(i): \(String(format: "%.4f", result[i]))")
-    }
-    if frameCount > 20 {
-      print("  ...")
-      for i in stride(from: frameCount - 5, to: frameCount, by: 1) {
-        print("  frame \(i): \(String(format: "%.4f", result[i]))")
-      }
-    }
-
     // Find peak and verify decay
     var maxOutput: Float = 0
     var maxFrame = 0
@@ -399,8 +380,6 @@ final class HistoryTensorTests: XCTestCase {
         maxFrame = i
       }
     }
-    print("\nPeak: \(String(format: "%.4f", maxOutput)) at frame \(maxFrame)")
-
     // Verify we got output values
     XCTAssertEqual(result.count, frameCount)
 

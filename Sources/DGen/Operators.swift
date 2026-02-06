@@ -1648,7 +1648,28 @@ public enum LazyOp {
         throw DGenError.insufficientInputs(
           operator: "output", expected: 1, actual: inputs.count)
       }
-      b.use(val: b.output(outputNumber, b.value(inputs[0])))
+      // Walk through seq nodes to find the actual value source.
+      // backward() chains gradient side effects via seq(sideEffect, lossNode),
+      // so the output's direct input may be a seq rather than the loss tensor.
+      var sourceId = node.inputs[0]
+      while let srcNode = ctx.g.nodes[sourceId], case .seq = srcNode.op,
+            let lastInput = srcNode.inputs.last {
+        sourceId = lastInput
+      }
+      // If the source is a shape-[1] tensor, read from its memory cell
+      // instead of referencing a variable that may live in another kernel scope.
+      let sourceNode = ctx.g.nodes[sourceId]
+      let outputValue: Expr
+      if let sourceNode, case .tensor(let shape) = sourceNode.shape,
+         shape.reduce(1, *) == 1,
+         let tensorId = ctx.g.nodeToTensor[sourceId],
+         let tensor = ctx.g.tensors[tensorId]
+      {
+        outputValue = b.memoryRead(tensor.cellId, b.cast(b.constant(0), to: .int))
+      } else {
+        outputValue = b.value(inputs[0])
+      }
+      b.use(val: b.output(outputNumber, outputValue))
     case .input(let inputNumber):
       b.use(val: b.input(inputNumber))
     case .seq:
