@@ -38,8 +38,7 @@ public final class IRBuilder {
   /// The value is stored as Float internally but tagged as .int so renderers
   /// emit integer declarations and arithmetic stays in int until mixed with float.
   public func intConstant(_ v: Int) -> Expr {
-    let l = ctx.useConstant(src: nodeId, value: Float(v))
-    return value(l, scalarType: .int)
+    return int(v)
   }
 
   public func load(_ cell: CellID, _ nodeId: NodeID? = nil) -> Expr {
@@ -95,12 +94,17 @@ public final class IRBuilder {
     return value(uop.value)
   }
 
-  func frameIndex(_ nodeId: NodeID) -> Expr {
-    let dest = ctx.useVariable(src: nodeId)
-    var uop = UOp(op: .frameIndex, value: dest)
+  /// Emit an int-typed UOp (frameIndex, threadIndex, etc.) and return an int Expr
+  private func emitIntOp(_ op: Op, src: NodeID? = nil) -> Expr {
+    let dest = ctx.useVariable(src: src ?? nodeId)
+    var uop = UOp(op: op, value: dest)
     uop.scalarType = .int
     ops.append(uop)
-    return value(uop.value, scalarType: .int)
+    return value(dest, scalarType: .int)
+  }
+
+  func frameIndex(_ nodeId: NodeID) -> Expr {
+    return emitIntOp(.frameIndex, src: nodeId)
   }
 
   func mutate(_ target: Expr, to newValue: Expr) {
@@ -660,11 +664,7 @@ public final class IRBuilder {
   }
 
   public func threadIndex() -> Expr {
-    let dest = ctx.useVariable(src: nodeId)
-    var uop = UOp(op: .threadIndex, value: dest)
-    uop.scalarType = .int
-    ops.append(uop)
-    return value(dest, scalarType: .int)
+    return emitIntOp(.threadIndex)
   }
 
   /// Returns the current frame index. In normal blocks, this is the thread index.
@@ -681,11 +681,7 @@ public final class IRBuilder {
   /// Returns the frame index using the .frameIndex UOp.
   /// This returns _frameIndex if setFrameIndex was called, otherwise falls back to thread index.
   public func frameIndex() -> Expr {
-    let dest = ctx.useVariable(src: nodeId)
-    var uop = UOp(op: .frameIndex, value: dest)
-    uop.scalarType = .int
-    ops.append(uop)
-    return value(dest, scalarType: .int)
+    return emitIntOp(.frameIndex)
   }
 
   /// Frame count (runtime parameter)
@@ -742,85 +738,50 @@ public struct Expr {
     self.scalarType = scalarType
   }
 
-  /// Compute the result scalarType: int op int → int, otherwise float
+  /// Compute the result scalarType: int op int -> int, otherwise float
   private static func promotedType(_ lhs: Expr, _ rhs: Expr) -> CastType {
     return (lhs.scalarType == .int && rhs.scalarType == .int) ? .int : .float
   }
 
+  /// Emit a binary UOp with type promotion, returning a typed Expr
+  private static func emitBinaryOp(
+    _ lhs: Expr, _ rhs: Expr,
+    thunk: (Lazy, Lazy) -> (IRContext, NodeID?) -> UOp
+  ) -> Expr {
+    let resultType = promotedType(lhs, rhs)
+    var uop = thunk(lhs.lazy, rhs.lazy)(lhs.ctx, nil)
+    uop.scalarType = resultType
+    lhs.builder.ops.append(uop)
+    return Expr(uop.value, ctx: lhs.ctx, nodeId: lhs.nodeId, builder: lhs.builder, scalarType: resultType)
+  }
+
+  /// Try constant folding for a binary op; returns nil if either operand is not a constant
+  private static func foldConstants(
+    _ lhs: Expr, _ rhs: Expr, op: (Float, Float) -> Float
+  ) -> Expr? {
+    guard case .constant(_, let lval) = lhs.lazy,
+          case .constant(_, let rval) = rhs.lazy
+    else { return nil }
+    let resultType = promotedType(lhs, rhs)
+    let folded = lhs.ctx.useConstant(src: lhs.nodeId, value: op(lval, rval))
+    return Expr(folded, ctx: lhs.ctx, nodeId: lhs.nodeId, builder: lhs.builder, scalarType: resultType)
+  }
+
   // Operators emit automatically
   static func + (lhs: Expr, rhs: Expr) -> Expr {
-    let resultType = promotedType(lhs, rhs)
-    if case .constant(let lconst) = lhs.lazy {
-      if case .constant(let hconst) = rhs.lazy {
-        let sum = lconst.1 + hconst.1
-        let ctx = lhs.ctx
-        return Expr(
-          ctx.useConstant(src: lhs.nodeId, value: sum), ctx: lhs.ctx, nodeId: lhs.nodeId,
-          builder: lhs.builder, scalarType: resultType)
-      }
-    }
-    let thunk = u_add(lhs.lazy, rhs.lazy)
-    var uop = thunk(lhs.ctx, nil)
-    uop.scalarType = resultType
-    lhs.builder.ops.append(uop)
-    return Expr(uop.value, ctx: lhs.ctx, nodeId: lhs.nodeId, builder: lhs.builder, scalarType: resultType)
-  }
-
-  static func / (lhs: Expr, rhs: Expr) -> Expr {
-    let resultType = promotedType(lhs, rhs)
-    if case .constant(let lconst) = lhs.lazy {
-      if case .constant(let hconst) = rhs.lazy {
-        let sum = lconst.1 / hconst.1
-        let ctx = lhs.ctx
-        return Expr(
-          ctx.useConstant(src: lhs.nodeId, value: sum), ctx: lhs.ctx, nodeId: lhs.nodeId,
-          builder: lhs.builder, scalarType: resultType)
-      }
-    }
-
-    let thunk = u_div(lhs.lazy, rhs.lazy)
-    var uop = thunk(lhs.ctx, nil)
-    uop.scalarType = resultType
-    lhs.builder.ops.append(uop)
-    return Expr(uop.value, ctx: lhs.ctx, nodeId: lhs.nodeId, builder: lhs.builder, scalarType: resultType)
-  }
-
-  static func * (lhs: Expr, rhs: Expr) -> Expr {
-    let resultType = promotedType(lhs, rhs)
-    if case .constant(_, let lconst) = lhs.lazy {
-      if case .constant(_, let hconst) = rhs.lazy {
-        let sum = lconst * hconst
-        let ctx = lhs.ctx
-        return Expr(
-          ctx.useConstant(src: lhs.nodeId, value: sum), ctx: lhs.ctx, nodeId: lhs.nodeId,
-          builder: lhs.builder, scalarType: resultType)
-      }
-    }
-
-    let thunk = u_mul(lhs.lazy, rhs.lazy)
-    var uop = thunk(lhs.ctx, nil)
-    uop.scalarType = resultType
-    lhs.builder.ops.append(uop)
-    return Expr(uop.value, ctx: lhs.ctx, nodeId: lhs.nodeId, builder: lhs.builder, scalarType: resultType)
+    return foldConstants(lhs, rhs, op: +) ?? emitBinaryOp(lhs, rhs, thunk: u_add)
   }
 
   static func - (lhs: Expr, rhs: Expr) -> Expr {
-    let resultType = promotedType(lhs, rhs)
-    if case .constant(_, let lconst) = lhs.lazy {
-      if case .constant(_, let hconst) = rhs.lazy {
-        let sum = lconst - hconst
-        let ctx = lhs.ctx
-        return Expr(
-          ctx.useConstant(src: lhs.nodeId, value: sum), ctx: lhs.ctx, nodeId: lhs.nodeId,
-          builder: lhs.builder, scalarType: resultType)
-      }
-    }
+    return foldConstants(lhs, rhs, op: -) ?? emitBinaryOp(lhs, rhs, thunk: u_sub)
+  }
 
-    let thunk = u_sub(lhs.lazy, rhs.lazy)
-    var uop = thunk(lhs.ctx, nil)
-    uop.scalarType = resultType
-    lhs.builder.ops.append(uop)
-    return Expr(uop.value, ctx: lhs.ctx, nodeId: lhs.nodeId, builder: lhs.builder, scalarType: resultType)
+  static func * (lhs: Expr, rhs: Expr) -> Expr {
+    return foldConstants(lhs, rhs, op: *) ?? emitBinaryOp(lhs, rhs, thunk: u_mul)
+  }
+
+  static func / (lhs: Expr, rhs: Expr) -> Expr {
+    return foldConstants(lhs, rhs, op: /) ?? emitBinaryOp(lhs, rhs, thunk: u_div)
   }
 
   static func > (lhs: Expr, rhs: Expr) -> Expr {
@@ -859,12 +820,7 @@ public struct Expr {
   }
 
   static func % (lhs: Expr, rhs: Expr) -> Expr {
-    let resultType = promotedType(lhs, rhs)
-    let thunk = u_mod(lhs.lazy, rhs.lazy)
-    var uop = thunk(lhs.ctx, nil)
-    uop.scalarType = resultType
-    lhs.builder.ops.append(uop)
-    return Expr(uop.value, ctx: lhs.ctx, nodeId: lhs.nodeId, builder: lhs.builder, scalarType: resultType)
+    return emitBinaryOp(lhs, rhs, thunk: u_mod)
   }
 
 }

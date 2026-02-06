@@ -491,7 +491,7 @@ public enum LazyOp {
         // 1. Load windowed samples into per-frame FFT scratch cells
         // Compute Hann coefficient inline to avoid shared memory race
         b.parallelRange(windowSize) { n in
-          let nInt = b.cast(n, to: .int)
+          let nInt = n  // b.cast(n, to: .int)
           let nFloat = b.cast(nInt, to: .float)
           let w = hannCoeff(nFloat)
 

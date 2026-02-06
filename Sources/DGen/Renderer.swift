@@ -499,6 +499,12 @@ public class CRenderer: Renderer {
     return emitLazy(lazy, ctx: ctx, kind: kind, isOut: false)
   }
 
+  /// Check if a Lazy offset was emitted as an int-typed variable
+  private func isIntTypedOffset(_ offset: Lazy) -> Bool {
+    guard case .variable(let varId, _) = offset else { return false }
+    return varEmittedTypes[varId] == .int_
+  }
+
   func emit(_ uop: UOp, ctx: IRContext) -> String {
     let g = { self.emitLazy($0, ctx: ctx, kind: uop.kind, isOut: false) }
     let gi = { self.emitLazyTyped($0, ctx: ctx, kind: uop.kind, asInt: uop.scalarType == .int) }
@@ -724,21 +730,11 @@ public class CRenderer: Renderer {
           return emitAssign(uop, gatherExpr, ctx)
         }
       } else {
-        // Check if offset is already int-typed (no cast needed)
-        let offsetIsInt: Bool
-        if case .variable(let varId, _) = offset {
-          offsetIsInt = varEmittedTypes[varId] == .int_
-        } else {
-          offsetIsInt = false
-        }
-        if offsetIsInt {
+        if isIntTypedOffset(offset) {
           return emitAssign(uop, "memory[\(base) + \(g(offset))]", ctx)
         }
         let safeOffset = "(isfinite((int) \(g(offset))) ? (int) \(g(offset)) : 0)"
-        return emitAssign(
-          uop,
-          "memory[\(base) + \(safeOffset)]",
-          ctx)
+        return emitAssign(uop, "memory[\(base) + \(safeOffset)]", ctx)
       }
 
     case .memoryWrite(let base, let offset, let value):
@@ -767,14 +763,8 @@ public class CRenderer: Renderer {
             """.trimmingCharacters(in: .whitespacesAndNewlines)
         }
       } else {
-        let offsetIsInt: Bool
-        if case .variable(let varId, _) = offset {
-          offsetIsInt = varEmittedTypes[varId] == .int_
-        } else {
-          offsetIsInt = false
-        }
-        let castPrefix = offsetIsInt ? "" : "(int)"
-        return "memory[\(base) + \(castPrefix)\(g(offset))] = \(g(value));"
+        let cast = isIntTypedOffset(offset) ? "" : "(int)"
+        return "memory[\(base) + \(cast)\(g(offset))] = \(g(value));"
       }
     case .sin(let a):
       let expr = uop.kind == .simd ? "vsinf(\(g(a)))" : "sinf(\(g(a)))"

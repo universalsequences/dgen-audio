@@ -606,14 +606,8 @@ public class MetalRenderer: Renderer, UOpEmitter {
 
   /// Check if a Lazy value was emitted as an int-typed variable
   private func isIntTyped(_ lazy: Lazy) -> Bool {
-    switch lazy {
-    case .variable(let varId, _):
-      return varScalarTypes[varId] == .int
-    case .constant:
-      return false  // Constants are untyped in Metal (just literal numbers)
-    default:
-      return false
-    }
+    guard case .variable(let varId, _) = lazy else { return false }
+    return varScalarTypes[varId] == .int
   }
 
   /// Render a Lazy value, optionally as an integer literal for int-typed constants
@@ -622,6 +616,11 @@ public class MetalRenderer: Renderer, UOpEmitter {
       return "\(Int(val))"
     }
     return emitLazy(lazy, ctx: ctx, kind: kind, isOut: false)
+  }
+
+  /// Returns "(int)" cast prefix if offset is not already int-typed, empty string otherwise
+  private func intCastPrefix(for offset: Lazy) -> String {
+    return isIntTyped(offset) ? "" : "(int)"
   }
 
   func emit(_ uop: UOp, ctx: IRContext) -> String {
@@ -706,16 +705,16 @@ public class MetalRenderer: Renderer, UOpEmitter {
         """
       return emitAssign(uop, expr, ctx)
     case .memoryRead(let base, let offset):
-      let castPrefix = isIntTyped(offset) ? "" : "(int)"
-      return emitAssign(uop, "memory[\(base) + \(castPrefix)\(g(offset))]", ctx)
+      let cast = intCastPrefix(for: offset)
+      return emitAssign(uop, "memory[\(base) + \(cast)\(g(offset))]", ctx)
     case .memoryWrite(let base, let offset, let value):
-      let castPrefix = isIntTyped(offset) ? "" : "(int)"
-      return "memory[\(base) + \(castPrefix)\(g(offset))] = \(g(value));"
+      let cast = intCastPrefix(for: offset)
+      return "memory[\(base) + \(cast)\(g(offset))] = \(g(value));"
     case .memoryAccumulate(let base, let offset, let value):
       // Atomic add to memory cell - safe for concurrent accumulation from SIMD threads
-      let castPrefix = isIntTyped(offset) ? "" : "(int)"
+      let cast = intCastPrefix(for: offset)
       return
-        "atomic_fetch_add_explicit((device metal::atomic<float>*)&memory[\(base) + \(castPrefix)\(g(offset))], \(g(value)), metal::memory_order_relaxed);"
+        "atomic_fetch_add_explicit((device metal::atomic<float>*)&memory[\(base) + \(cast)\(g(offset))], \(g(value)), metal::memory_order_relaxed);"
     case .sin(let a): return emitAssign(uop, "metal::sin(\(g(a)))", ctx)
     case .cos(let a): return emitAssign(uop, "metal::cos(\(g(a)))", ctx)
     case .tan(let a): return emitAssign(uop, "metal::tan(\(g(a)))", ctx)

@@ -33,7 +33,6 @@ public class MetalCompiledKernel: CompiledKernelRuntime {
   )
     throws
   {
-    print("MAX FRAME COUNT runtime=\(frameCount)")
     self.maxFrameCount = frameCount * 2
     self.kernels = kernels
     self.cellAllocations = cellAllocations

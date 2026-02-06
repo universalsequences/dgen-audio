@@ -63,7 +63,7 @@ final class AudioMLTests: XCTestCase {
   // MARK: - 808 Kick Learning
 
   func test808KickLearning() throws {
-    let sr: Float = 32500.0
+    let sr: Float = 44100
     DGenConfig.sampleRate = sr
     DGenConfig.debug = false
     DGenConfig.kernelOutputPath = "/tmp/808_kernel.metal"
@@ -341,7 +341,9 @@ final class AudioMLTests: XCTestCase {
         if v != 0.0 { nonZeroFrames.append((i, v)) }
       }
 
-      print("\n=== Identical Signals (frames=\(numFrames), windowSize=\(windowSize), fftSize=\(windowSize*2)) ===")
+      print(
+        "\n=== Identical Signals (frames=\(numFrames), windowSize=\(windowSize), fftSize=\(windowSize*2)) ==="
+      )
       print("float32 precision limit at frame: \(16_777_216 / (windowSize * 2))")
       print("Total: \(total), non-zero frames: \(nonZeroFrames.count)/\(numFrames)")
       if nonZeroFrames.count <= 20 {
@@ -379,7 +381,9 @@ final class AudioMLTests: XCTestCase {
       let total = vals.reduce(0, +)
       let avg = total / Float(numFrames)
       let maxVal = vals.max() ?? 0
-      print("frames=\(numFrames): total=\(String(format:"%.4e", total))  avg=\(String(format:"%.4e", avg))  max=\(String(format:"%.4e", maxVal))")
+      print(
+        "frames=\(numFrames): total=\(String(format:"%.4e", total))  avg=\(String(format:"%.4e", avg))  max=\(String(format:"%.4e", maxVal))"
+      )
 
       DGenConfig.maxFrameCount = prevMax
     }
