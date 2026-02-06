@@ -1305,17 +1305,10 @@ public func emitThreadCountScaleOpIfNeeded(ctx: IRContext, block: Block, g: Grap
   let tensorSize = shape.reduce(1, *)
 
   var uops: [UOp] = []
-  // Flattened (frame, bin) threading
   let setup = IRBuilder(ctx: ctx, nodeId: block.nodes[block.nodes.count - 1])
-  setup.setThreadCountScale(tensorSize)
-  let flatIdx = setup.threadIndex()
-  let sizeExpr = setup.intConstant(tensorSize)
-  let frameIdx = flatIdx / sizeExpr
-  setup.setFrameIndex(frameIdx)
-  let binIdx = flatIdx - frameIdx * sizeExpr
+  let (frameIdx, binIdx) = setup.setupFlatThreading(tensorSize: tensorSize)
   uops.append(contentsOf: setup.ops)
 
-  // Use binIdx as the tensor index for all nodes in the chain
   for nodeId in block.nodes {
     ctx.tensorIndices[nodeId] = binIdx.lazy
   }
@@ -1323,7 +1316,6 @@ public func emitThreadCountScaleOpIfNeeded(ctx: IRContext, block: Block, g: Grap
   // If this is a frame-based block with frame-aware tensor outputs,
   // set context flags so currentFrameIndex() returns the correct frame
   if block.temporality == .frameBased {
-    // Check if any tensor output in this block is frame-aware
     let hasFrameAwareOutput = block.nodes.contains { nodeId in
       if let tensorId = g.nodeToTensor[nodeId],
         let tensor = g.tensors[tensorId]
@@ -1358,17 +1350,10 @@ public func emitFrameTensorChainBlock(
 
   let tensorSize = scratch.tensorSize
 
-  // Flattened (frame, bin) threading
   let setup = IRBuilder(ctx: ctx, nodeId: chain.reductionNodeId)
-  setup.setThreadCountScale(tensorSize)
-  let flatIdx = setup.threadIndex()
-  let sizeExpr = setup.intConstant(tensorSize)
-  let frameIdx = flatIdx / sizeExpr
-  setup.setFrameIndex(frameIdx)
-  let binIdx = flatIdx - frameIdx * sizeExpr
+  let (frameIdx, binIdx) = setup.setupFlatThreading(tensorSize: tensorSize)
   uops.append(contentsOf: setup.ops)
 
-  // Use binIdx as the tensor index for all nodes in the chain
   for nodeId in block.nodes {
     ctx.tensorIndices[nodeId] = binIdx.lazy
   }

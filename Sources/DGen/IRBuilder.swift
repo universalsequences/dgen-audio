@@ -324,37 +324,36 @@ public final class IRBuilder {
 
   // MARK: - Frame-Aware Tensor Ops
 
+  /// Compute frame-aware memory offset: frameIdx * tensorSize + elemIdx
+  private func frameAwareOffset(frameIdx: Expr, tensorSize: Int, elemIdx: Expr) -> Expr {
+    return cast(frameIdx * intConstant(tensorSize) + elemIdx, to: .int)
+  }
+
   /// Read from frame-aware tensor: memory[cellId + frameIdx * tensorSize + elemIdx]
   /// Used for tensors that need per-frame storage to enable parallelism
   public func frameAwareTensorRead(cellId: CellID, tensorSize: Int, elemIdx: Expr) -> Expr {
-    let frameIdx = frameIndex(nodeId)
-    let offset = frameIdx * intConstant(tensorSize) + elemIdx
-    return memoryRead(cellId, cast(offset, to: .int))
+    return memoryRead(cellId, frameAwareOffset(frameIdx: frameIndex(nodeId), tensorSize: tensorSize, elemIdx: elemIdx))
   }
 
   /// Read from frame-aware tensor with explicit frame index
   public func frameAwareTensorRead(cellId: CellID, tensorSize: Int, frameIdx: Expr, elemIdx: Expr)
     -> Expr
   {
-    let offset = frameIdx * intConstant(tensorSize) + elemIdx
-    return memoryRead(cellId, cast(offset, to: .int))
+    return memoryRead(cellId, frameAwareOffset(frameIdx: frameIdx, tensorSize: tensorSize, elemIdx: elemIdx))
   }
 
   /// Write to frame-aware tensor: memory[cellId + frameIdx * tensorSize + elemIdx]
   public func frameAwareTensorWrite(cellId: CellID, tensorSize: Int, elemIdx: Expr, value: Expr)
     -> Expr
   {
-    let frameIdx = frameIndex(nodeId)
-    let offset = frameIdx * intConstant(tensorSize) + elemIdx
-    return memoryWrite(cellId, cast(offset, to: .int), value)
+    return memoryWrite(cellId, frameAwareOffset(frameIdx: frameIndex(nodeId), tensorSize: tensorSize, elemIdx: elemIdx), value)
   }
 
   /// Write to frame-aware tensor with explicit frame index
   public func frameAwareTensorWrite(
     cellId: CellID, tensorSize: Int, frameIdx: Expr, elemIdx: Expr, value: Expr
   ) -> Expr {
-    let offset = frameIdx * intConstant(tensorSize) + elemIdx
-    return memoryWrite(cellId, cast(offset, to: .int), value)
+    return memoryWrite(cellId, frameAwareOffset(frameIdx: frameIdx, tensorSize: tensorSize, elemIdx: elemIdx), value)
   }
 
   // MARK: - High-level tensor I/O
@@ -521,12 +520,7 @@ public final class IRBuilder {
   }
 
   public func mod(_ a: Expr, _ b: Expr) -> Expr {
-    let dest = ctx.useVariable(src: nodeId)
-    var uop = UOp(op: .mod(a.lazy, b.lazy), value: dest)
-    let resultType = (a.scalarType == .int && b.scalarType == .int) ? CastType.int : CastType.float
-    uop.scalarType = resultType
-    ops.append(uop)
-    return value(dest, scalarType: resultType)
+    return emitTypedBinaryOp(.mod(a.lazy, b.lazy), a, b)
   }
 
   public func mix(_ a: Expr, _ b: Expr, _ t: Expr) -> Expr {
@@ -535,7 +529,7 @@ public final class IRBuilder {
   }
 
   public func selector(_ mode: Expr, _ options: [Expr]) -> Expr {
-    if case .constant(let constId, let constMode) = mode.lazy {
+    if case .constant(_, let constMode) = mode.lazy {
       if constMode <= 0 {
         return self.constant(0)
       }
@@ -578,34 +572,26 @@ public final class IRBuilder {
     return Expr(constLazy, ctx: ctx, nodeId: nodeId, builder: self, scalarType: .int)
   }
 
-  /// Add two expressions
+  /// Emit a binary UOp with int/float type propagation: int op int -> int, otherwise float.
+  private func emitTypedBinaryOp(_ op: Op, _ a: Expr, _ b: Expr) -> Expr {
+    let dest = ctx.useVariable(src: nodeId)
+    let resultType: CastType = (a.scalarType == .int && b.scalarType == .int) ? .int : .float
+    var uop = UOp(op: op, value: dest)
+    uop.scalarType = resultType
+    ops.append(uop)
+    return value(dest, scalarType: resultType)
+  }
+
   public func add(_ a: Expr, _ b: Expr) -> Expr {
-    let dest = ctx.useVariable(src: nodeId)
-    var uop = UOp(op: .add(a.lazy, b.lazy), value: dest)
-    let resultType = (a.scalarType == .int && b.scalarType == .int) ? CastType.int : CastType.float
-    uop.scalarType = resultType
-    ops.append(uop)
-    return value(dest, scalarType: resultType)
+    return emitTypedBinaryOp(.add(a.lazy, b.lazy), a, b)
   }
 
-  /// Multiply two expressions
   public func mul(_ a: Expr, _ b: Expr) -> Expr {
-    let dest = ctx.useVariable(src: nodeId)
-    var uop = UOp(op: .mul(a.lazy, b.lazy), value: dest)
-    let resultType = (a.scalarType == .int && b.scalarType == .int) ? CastType.int : CastType.float
-    uop.scalarType = resultType
-    ops.append(uop)
-    return value(dest, scalarType: resultType)
+    return emitTypedBinaryOp(.mul(a.lazy, b.lazy), a, b)
   }
 
-  /// Divide two expressions
   public func div(_ a: Expr, _ b: Expr) -> Expr {
-    let dest = ctx.useVariable(src: nodeId)
-    var uop = UOp(op: .div(a.lazy, b.lazy), value: dest)
-    let resultType = (a.scalarType == .int && b.scalarType == .int) ? CastType.int : CastType.float
-    uop.scalarType = resultType
-    ops.append(uop)
-    return value(dest, scalarType: resultType)
+    return emitTypedBinaryOp(.div(a.lazy, b.lazy), a, b)
   }
 
   /// Floor division: floor(a / b)
@@ -673,6 +659,19 @@ public final class IRBuilder {
     setFrameIndex(frameIdx)
     let binIdx = flatIdx - frameIdx * binsExpr
     body(frameIdx, binIdx)
+  }
+
+  /// Decompose a flat thread index into (frameIndex, elementIndex) using integer arithmetic.
+  /// Sets up thread count scaling and frame index override for the kernel.
+  /// Returns (frameIdx, elemIdx) as int-typed expressions.
+  public func setupFlatThreading(tensorSize: Int) -> (frameIdx: Expr, elemIdx: Expr) {
+    setThreadCountScale(tensorSize)
+    let flatIdx = threadIndex()
+    let sizeExpr = intConstant(tensorSize)
+    let frameIdx = flatIdx / sizeExpr
+    setFrameIndex(frameIdx)
+    let elemIdx = flatIdx - frameIdx * sizeExpr
+    return (frameIdx, elemIdx)
   }
 
   public func threadIndex() -> Expr {
