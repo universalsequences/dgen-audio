@@ -185,7 +185,8 @@ public class LazyGraph {
 /// Each thread gets its own graph to avoid concurrency issues
 public class LazyGraphContext {
   /// The current default graph (thread-local via static)
-  private static var _current: LazyGraph?
+  /// Internal so DGenConfig.didSet can propagate changes
+  internal static var _current: LazyGraph?
 
   /// Get or create the current default graph
   public static var current: LazyGraph {

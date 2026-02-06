@@ -4,9 +4,9 @@ import XCTest
 
 /// Tests for FIR (Finite Impulse Response) lowpass filtering using conv2d.
 ///
-/// Key insight: An FIR filter is just a convolution. Each output sample is a
-/// weighted sum of a window of *input* samples — no feedback, fully parallel.
-/// By making the kernel learnable, the optimizer discovers filter coefficients.
+/// An FIR filter is just a convolution — each output sample is a weighted sum
+/// of a window of input samples. By making the kernel learnable, the optimizer
+/// discovers filter coefficients.
 final class FIRFilterTests: XCTestCase {
 
   override func setUp() {
@@ -14,18 +14,12 @@ final class FIRFilterTests: XCTestCase {
     LazyGraphContext.reset()
   }
 
-  /// Generate a clean sine wave and a noisy version with high-frequency interference.
-  /// - Parameters:
-  ///   - n: Number of samples
-  ///   - freq: Frequency of the clean sine (cycles across n samples)
-  /// - Returns: (clean, noisy) signal arrays of length n
   private func generateTestSignals(n: Int = 64, freq: Float = 4.0) -> (clean: [Float], noisy: [Float]) {
     var clean = [Float](repeating: 0, count: n)
     var noisy = [Float](repeating: 0, count: n)
     for i in 0..<n {
       let phase = Float(i) / Float(n) * freq * 2.0 * .pi
       clean[i] = sin(phase)
-      // High-frequency noise (25 cycles across n samples -- avoids integer aliasing)
       let noise = 0.3 * sin(Float(i) / Float(n) * 25.0 * 2.0 * .pi)
       noisy[i] = clean[i] + noise
     }
@@ -34,28 +28,21 @@ final class FIRFilterTests: XCTestCase {
 
   // MARK: - Manual FIR Lowpass
 
-  /// Verify that conv2d with a box filter (moving average) smooths a signal.
-  /// A moving average is the simplest FIR lowpass — equal weights.
+  /// conv2d with a box filter (moving average) should smooth a signal.
   func testMovingAverageLowpass() throws {
     let n = 64
     let (clean, noisy) = generateTestSignals(n: n)
 
-    // Reshape as [1, N] for conv2d (faking 2D: height=1, width=N)
     let noisyTensor = Tensor([noisy])  // [1, 64]
-
-    // 5-tap moving average kernel: [1, 5]
-    let kernel = Tensor([[0.2, 0.2, 0.2, 0.2, 0.2]])
+    let kernel = Tensor([[0.2, 0.2, 0.2, 0.2, 0.2]])  // 5-tap box filter
 
     let filtered = noisyTensor.conv2d(kernel)  // [1, 60]
     XCTAssertEqual(filtered.shape, [1, n - 4])
 
     let result = try filtered.realize()
 
-    // Compare filtered output to the clean signal (trimmed to match conv output)
-    // The moving average should reduce the noise, bringing us closer to clean
     var mseFiltered: Float = 0
     var mseNoisy: Float = 0
-    // conv2d output is offset by (kernelSize-1)/2 = 2 samples
     for i in 0..<(n - 4) {
       let cleanVal = clean[i + 2]  // align with conv center
       mseFiltered += (result[i] - cleanVal) * (result[i] - cleanVal)
@@ -74,16 +61,13 @@ final class FIRFilterTests: XCTestCase {
 
   // MARK: - Signal.buffer() Tests
 
-  /// Verify buffer + sum produces known per-frame values.
-  /// accum(1, max: large) produces 0, 1, 2, 3, ...
-  /// buffer(4).sum() should give the sum of the last 4 values written.
+  /// buffer(4).sum() on a counter should give the sum of the last 4 values.
   func testBufferNumerical() throws {
     let counter = Signal.accum(Signal.constant(1.0), min: 0.0, max: 10000.0)
-    let buf = counter.buffer(size: 4)  // SignalTensor [1, 4]
-    let s = buf.sum()  // Signal
+    let buf = counter.buffer(size: 4)
+    let s = buf.sum()
     let result = try s.realize(frames: 8)
 
-    // Expected sums per frame (see derivation in test comments):
     let expected: [Float] = [0, 1, 3, 6, 10, 14, 18, 22]
     print("\n=== Buffer Numerical Test ===")
     for i in 0..<8 {
@@ -94,21 +78,54 @@ final class FIRFilterTests: XCTestCase {
     }
   }
 
-  /// Verify buffer composes with conv2d: phasor → buffer → conv2d with a simple kernel
+  /// Verify buffer element ORDER using a weighted sum (conv2d with asymmetric kernel).
+  /// Plain sum can't distinguish [1,2,3,4] from [4,3,2,1], but a weighted sum can.
+  func testBufferElementOrder() throws {
+    let counter = Signal.accum(Signal.constant(1.0), min: 0.0, max: 10000.0)
+    let buf = counter.buffer(size: 4)  // [1, 4]
+
+    // Weighted sum: kernel [1, 10, 100, 1000] encodes position into the result
+    let kernel = Tensor([[1, 10, 100, 1000]])
+    let weighted = buf.conv2d(kernel)  // [1, 1] per frame
+    let result = try weighted.sum().realize(frames: 8)
+
+    // Counter: 0, 1, 2, 3, 4, 5, 6, 7
+    // slidingWindow: element i at frame f → base[f - 4 + 1 + i] = base[f - 3 + i]
+    // So at frame f, buffer = [base[f-3], base[f-2], base[f-1], base[f]]
+    // with base[k] = k for k >= 0, and 0 for k < 0 (out of bounds)
+    //
+    // Frame 0: [0, 0, 0, 0]       → 1*0 + 10*0 + 100*0 + 1000*0 = 0
+    // Frame 1: [0, 0, 0, 1]       → 1*0 + 10*0 + 100*0 + 1000*1 = 1000
+    // Frame 2: [0, 0, 1, 2]       → 1*0 + 10*0 + 100*1 + 1000*2 = 2100
+    // Frame 3: [0, 1, 2, 3]       → 1*0 + 10*1 + 100*2 + 1000*3 = 3210
+    // Frame 4: [1, 2, 3, 4]       → 1*1 + 10*2 + 100*3 + 1000*4 = 4321
+    // Frame 5: [2, 3, 4, 5]       → 1*2 + 10*3 + 100*4 + 1000*5 = 5432
+    // Frame 6: [3, 4, 5, 6]       → 1*3 + 10*4 + 100*5 + 1000*6 = 6543
+    // Frame 7: [4, 5, 6, 7]       → 1*4 + 10*5 + 100*6 + 1000*7 = 7654
+    let expected: [Float] = [0, 1000, 2100, 3210, 4321, 5432, 6543, 7654]
+
+    print("\n=== Buffer Element Order Test ===")
+    for i in 0..<8 {
+      print("Frame \(i): weighted=\(result[i]), expected=\(expected[i])")
+    }
+    for i in 0..<8 {
+      XCTAssertEqual(result[i], expected[i], accuracy: 0.5,
+        "Frame \(i) weighted sum mismatch — buffer element order is wrong")
+    }
+  }
+
+  /// buffer composes with conv2d: phasor -> buffer -> conv2d
   func testBufferConv2d() throws {
     let phasor = Signal.phasor(440.0)
-    let sig = sin(phasor * Signal.constant(2.0 * .pi))  // sine wave
-    let buf = sig.buffer(size: 128)  // [1, 128]
+    let sig = sin(phasor * Signal.constant(2.0 * .pi))
+    let buf = sig.buffer(size: 128)
 
-    // Simple averaging kernel [1, 5]
     let kernel = Tensor([[0.2, 0.2, 0.2, 0.2, 0.2]])
-    let filtered = buf.conv2d(kernel)  // SignalTensor [1, 124]
+    let filtered = buf.conv2d(kernel)  // [1, 124]
 
-    // Run enough frames to fill the buffer
     let result = try filtered.realize(frames: 200)
-    let tensorSize = 124  // 128 - 5 + 1
+    let tensorSize = 124
 
-    // Check last frame output is non-trivial (buffer should be full of sine data)
     let lastFrame = Array(result[(199 * tensorSize)..<(200 * tensorSize)])
     let maxVal = lastFrame.max() ?? 0
     let minVal = lastFrame.min() ?? 0
@@ -117,27 +134,20 @@ final class FIRFilterTests: XCTestCase {
     print("Last frame: max=\(maxVal), min=\(minVal)")
     print("First 10 values: \(lastFrame.prefix(10).map { String(format: "%.4f", $0) })")
 
-    // After 200 frames at 440Hz (sr=44100), the buffer should have ~1 cycle of sine
-    // The moving average should produce a smoothed but non-zero signal
     XCTAssertGreaterThan(maxVal - minVal, 0.01, "Filtered output should have non-trivial variation")
   }
 
-  /// Verify gradients flow through buffer to a conv2d kernel.
-  /// TODO(human): Design the loss function and target signal below.
+  /// Gradients flow through buffer -> conv2d to the kernel.
   func testBufferGradient() throws {
     let phasor = Signal.phasor(440.0)
     let sig = sin(phasor * Signal.constant(2.0 * .pi))
-    let buf = sig.buffer(size: 32)  // [1, 32]
+    let buf = sig.buffer(size: 32)
 
-    // Learnable kernel [1, 5]
     let kernel = Tensor.param([1, 5], data: [0.2, 0.2, 0.2, 0.2, 0.2])
-    let filtered = buf.conv2d(kernel)  // SignalTensor [1, 28]
+    let filtered = buf.conv2d(kernel)  // [1, 28]
 
-    // TODO(human): Design a loss that gives the optimizer a clear gradient signal.
-    // `filtered` is the conv2d output, a SignalTensor [1, 28].
-    // Return a scalar Signal loss.
-    let loss = bufferGradLoss(filtered: filtered)
-
+    // Energy minimization: push all filtered values toward zero
+    let loss = (filtered * filtered).sum()
     let lossValues = try loss.backward(frames: 64)
 
     let gradData = kernel.grad?.getData() ?? []
@@ -153,36 +163,36 @@ final class FIRFilterTests: XCTestCase {
   // MARK: - Learned FIR Lowpass
 
   /// Train a conv2d kernel to act as a lowpass filter.
-  /// The optimizer discovers FIR coefficients that minimize MSE against a clean signal.
+  /// MSE loss + regularization to keep kernel sum near 1.0 (unity DC gain).
   func testLearnedFIRLowpass() throws {
     let n = 64
     let kernelSize = 7
     let (clean, noisy) = generateTestSignals(n: n)
 
-    let noisyTensor = Tensor([noisy])  // [1, 64]
+    let noisyTensor = Tensor([noisy])
 
-    // Trim clean signal to match conv2d output size, centered
     let offset = (kernelSize - 1) / 2
     let outLen = n - kernelSize + 1
     let cleanTrimmed = Array(clean[offset..<(offset + outLen)])
-    let targetTensor = Tensor([cleanTrimmed])  // [1, outLen]
+    let targetTensor = Tensor([cleanTrimmed])
 
-    // TODO(human): Design the initial kernel data and choose the loss function.
-    // Learnable FIR kernel — your design choice below:
-    let learnedKernel = Tensor.param([1, kernelSize], data: firKernelInit(kernelSize))
+    let learnedKernel = Tensor.param(
+      [1, kernelSize], data: [Float](repeating: 1.0 / Float(kernelSize), count: kernelSize))
 
     func buildLoss() -> Tensor {
-      let filtered = noisyTensor.conv2d(learnedKernel)  // [1, outLen]
-      return firLoss(prediction: filtered, target: targetTensor, kernel: learnedKernel)
+      let filtered = noisyTensor.conv2d(learnedKernel)
+      let diff = filtered - targetTensor
+      let mse = (diff * diff).mean()
+      let sumDev = learnedKernel.sum() - Tensor([1.0])
+      let reg = sumDev * sumDev * Tensor([0.1])
+      return mse + reg
     }
 
     let optimizer = SGD(params: [learnedKernel], lr: 0.01)
     let epochs = 50
 
-    DGenConfig.kernelOutputPath = "/tmp/learn_fir_lowpass_loop.metal"
     let initialLoss = try buildLoss().backward(frameCount: 1)[0]
     optimizer.zeroGrad()
-    DGenConfig.kernelOutputPath = nil
 
     print("\n=== Learned FIR Lowpass ===")
     print("Kernel size: \(kernelSize)")
@@ -205,7 +215,7 @@ final class FIRFilterTests: XCTestCase {
 
       optimizer.step()
 
-      // Project kernel onto constraint: sum = 1.0 (unity DC gain)
+      // Project kernel: normalize to sum = 1.0 (unity DC gain)
       if var k = learnedKernel.getData() {
         let s = k.reduce(0, +)
         if abs(s) > 1e-8 { k = k.map { $0 / s } }
@@ -215,9 +225,6 @@ final class FIRFilterTests: XCTestCase {
       optimizer.zeroGrad()
     }
 
-    // The learned kernel should have lowpass characteristics:
-    // - Positive, roughly symmetric weights
-    // - Weights sum to ~1.0 (unity gain at DC)
     let finalKernel = learnedKernel.getData() ?? []
     let kernelSum = finalKernel.reduce(0, +)
     print("\nFinal kernel: \(finalKernel.map { String(format: "%.4f", $0) })")
@@ -227,7 +234,7 @@ final class FIRFilterTests: XCTestCase {
     XCTAssertEqual(kernelSum, 1.0, accuracy: 0.3, "Lowpass kernel should have ~unity DC gain")
   }
 
-  /// Forward-only test: realize the loss without backward to isolate output readout.
+  /// Forward-only: realize loss without backward to verify output readout.
   func testFIRLossForwardOnly() throws {
     let n = 64
     let kernelSize = 7
@@ -239,59 +246,21 @@ final class FIRFilterTests: XCTestCase {
     let cleanTrimmed = Array(clean[offset..<(offset + outLen)])
     let targetTensor = Tensor([cleanTrimmed])
 
-    let learnedKernel = Tensor.param([1, kernelSize], data: firKernelInit(kernelSize))
+    let learnedKernel = Tensor.param(
+      [1, kernelSize], data: [Float](repeating: 1.0 / Float(kernelSize), count: kernelSize))
 
     let filtered = noisyTensor.conv2d(learnedKernel)
-    let loss = firLoss(prediction: filtered, target: targetTensor, kernel: learnedKernel)
+    let diff = filtered - targetTensor
+    let mse = (diff * diff).mean()
+    let sumDev = learnedKernel.sum() - Tensor([1.0])
+    let reg = sumDev * sumDev * Tensor([0.1])
+    let loss = mse + reg
 
-    DGenConfig.kernelOutputPath = "/tmp/fir_forward_only.metal"
     let result = try loss.realize()
-    DGenConfig.kernelOutputPath = nil
 
     print("\n=== FIR Forward Only (no backward) ===")
     print("Loss realize() result: \(result)")
     XCTAssertFalse(result.isEmpty, "Should have a result")
     XCTAssertGreaterThan(result[0], 0, "Loss should be non-zero")
   }
-}
-
-// MARK: - TODO(human): Design the FIR filter initialization and loss
-
-/// Initialize FIR kernel weights and compute training loss.
-///
-/// firKernelInit: Return an array of `size` floats for starting kernel weights.
-///   Options to consider: uniform (1/size each), triangular window, random small values
-///
-/// firLoss: Return a scalar Tensor loss given the filtered output and clean target.
-///   Options: plain MSE, or MSE + a regularization term (e.g., penalize kernel sum != 1)
-//
-func firKernelInit(_ size: Int) -> [Float] {
-  [Float](repeating: 1.0 / Float(size), count: size)
-}
-
-func firLoss(prediction: Tensor, target: Tensor, kernel: Tensor) -> Tensor {
-  let diff = prediction - target
-  let mse = (diff * diff).mean()
-  let sumDeviation = kernel.sum() - Tensor([1.0])
-  let reg = sumDeviation * sumDeviation * Tensor([0.1])
-  return mse + reg
-}
-
-// MARK: - TODO(human): Design the buffer gradient test loss
-
-/// Build a loss from the conv2d-filtered buffer output.
-/// `filtered` is a SignalTensor [1, 28] — the result of convolving a sine wave
-/// buffer with a learnable 5-tap kernel.
-///
-/// The goal: produce a scalar Signal loss that gives meaningful gradients
-/// to the kernel weights. The optimizer should have a clear direction to move.
-///
-/// Options to consider:
-/// - Sum-of-squares of the filtered output (minimize energy)
-/// - MSE against a known target signal
-/// - Difference from a desired magnitude (e.g., push mean toward a target value)
-func bufferGradLoss(filtered: SignalTensor) -> Signal {
-  // TODO(human): Replace this with your loss design.
-  // Currently uses sum-of-squares (energy minimization) as a placeholder.
-  return (filtered * filtered).sum()
 }

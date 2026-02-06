@@ -675,9 +675,11 @@ public enum LazyOp {
         // IFFT with positive twiddle: Re[Σ X[k]·e^{+jθ}] = Σ [X_real·cos - X_imag·sin]
         // which matches the DFT transpose scatter formula exactly
         _ = b.memoryWrite(gradSpec1Cell, gradSpecBase + kInt, gradReal1)
-        _ = b.memoryWrite(gradSpec1Cell, gradSpecBase + kInt + b.constant(Float(imagOffset)), gradImag1)
+        _ = b.memoryWrite(
+          gradSpec1Cell, gradSpecBase + kInt + b.constant(Float(imagOffset)), gradImag1)
         _ = b.memoryWrite(gradSpec2Cell, gradSpecBase + kInt, gradReal2)
-        _ = b.memoryWrite(gradSpec2Cell, gradSpecBase + kInt + b.constant(Float(imagOffset)), gradImag2)
+        _ = b.memoryWrite(
+          gradSpec2Cell, gradSpecBase + kInt + b.constant(Float(imagOffset)), gradImag2)
       }
 
       // Zero upper bins (numBins to windowSize-1) — no conjugate fill needed
@@ -688,9 +690,11 @@ public enum LazyOp {
           let kFloat = b.cast(k, to: .float) + b.constant(Float(numBins))
           let kInt = b.cast(kFloat, to: .int)
           _ = b.memoryWrite(gradSpec1Cell, gradSpecBase + kInt, b.constant(0.0))
-          _ = b.memoryWrite(gradSpec1Cell, gradSpecBase + kInt + b.constant(Float(imagOffset)), b.constant(0.0))
+          _ = b.memoryWrite(
+            gradSpec1Cell, gradSpecBase + kInt + b.constant(Float(imagOffset)), b.constant(0.0))
           _ = b.memoryWrite(gradSpec2Cell, gradSpecBase + kInt, b.constant(0.0))
-          _ = b.memoryWrite(gradSpec2Cell, gradSpecBase + kInt + b.constant(Float(imagOffset)), b.constant(0.0))
+          _ = b.memoryWrite(
+            gradSpec2Cell, gradSpecBase + kInt + b.constant(Float(imagOffset)), b.constant(0.0))
         }
       }
 
@@ -724,97 +728,103 @@ public enum LazyOp {
       let alwaysTrue = one > zero
       b.if_(alwaysTrue) {
 
-      // Helper function to emit IFFT for a single gradient spectrum cell
-      func emitIFFTInPlace(_ gradSpecCell: CellID, _ gradTimeCell: CellID) {
-        // Bit-reversal permutation (has data dependencies - keep sequential)
-        b.loop(windowSize) { i in
-          var rev = b.constant(0.0)
-          var n = b.cast(i, to: .float)
-          for _ in 0..<numStages {
-            rev = rev * b.constant(2.0) + (n % b.constant(2.0))
-            n = b.floor(n / b.constant(2.0))
-          }
+        // Helper function to emit IFFT for a single gradient spectrum cell
+        func emitIFFTInPlace(_ gradSpecCell: CellID, _ gradTimeCell: CellID) {
+          // Bit-reversal permutation (has data dependencies - keep sequential)
+          b.loop(windowSize) { i in
+            var rev = b.constant(0.0)
+            var n = b.cast(i, to: .float)
+            for _ in 0..<numStages {
+              rev = rev * b.constant(2.0) + (n % b.constant(2.0))
+              n = b.floor(n / b.constant(2.0))
+            }
 
-          let iFloat = b.cast(i, to: .float)
-          let shouldSwap = iFloat < rev
-          let iInt = b.cast(i, to: .int)
-          let revInt = b.cast(rev, to: .int)
-
-          let tempR = b.memoryRead(gradSpecCell, gradSpecBase + iInt)
-          let tempI = b.memoryRead(gradSpecCell, gradSpecBase + iInt + b.constant(Float(imagOffset)))
-          let revR = b.memoryRead(gradSpecCell, gradSpecBase + revInt)
-          let revI = b.memoryRead(gradSpecCell, gradSpecBase + revInt + b.constant(Float(imagOffset)))
-
-          let newIR = b.gswitch(shouldSwap, revR, tempR)
-          let newII = b.gswitch(shouldSwap, revI, tempI)
-          let newRevR = b.gswitch(shouldSwap, tempR, revR)
-          let newRevI = b.gswitch(shouldSwap, tempI, revI)
-
-          _ = b.memoryWrite(gradSpecCell, gradSpecBase + iInt, newIR)
-          _ = b.memoryWrite(gradSpecCell, gradSpecBase + iInt + b.constant(Float(imagOffset)), newII)
-          _ = b.memoryWrite(gradSpecCell, gradSpecBase + revInt, newRevR)
-          _ = b.memoryWrite(gradSpecCell, gradSpecBase + revInt + b.constant(Float(imagOffset)), newRevI)
-        }
-
-        // Butterfly stages with POSITIVE twiddle angles (IFFT)
-        // Stages are sequential but butterflies within each stage are parallel
-        var butterflySize = 2
-        for _ in 0..<numStages {
-          let halfSize = butterflySize / 2
-          let numGroups = windowSize / butterflySize
-          let numButterflies = numGroups * halfSize
-
-          b.parallelRange(numButterflies) { flatIdx in
-            let flatFloat = b.cast(flatIdx, to: .float)
-            let halfSizeFloat = b.constant(Float(halfSize))
-            let butterflySizeFloat = b.constant(Float(butterflySize))
-
-            let group = b.floor(flatFloat / halfSizeFloat)
-            let k = flatFloat - (group * halfSizeFloat)
-
-            let i = group * butterflySizeFloat + k
-            let j = i + halfSizeFloat
-
-            // IFFT twiddle: W = e^(+2πi*k/butterflySize) - POSITIVE angle
-            let angle = b.constant(2.0) * b.pi * k / butterflySizeFloat
-            let wr = b.cos(angle)
-            let wi = b.sin(angle)
-
+            let iFloat = b.cast(i, to: .float)
+            let shouldSwap = iFloat < rev
             let iInt = b.cast(i, to: .int)
-            let jInt = b.cast(j, to: .int)
+            let revInt = b.cast(rev, to: .int)
 
-            let ar = b.memoryRead(gradSpecCell, gradSpecBase + iInt)
-            let ai = b.memoryRead(gradSpecCell, gradSpecBase + iInt + b.constant(Float(imagOffset)))
-            let br = b.memoryRead(gradSpecCell, gradSpecBase + jInt)
-            let bi = b.memoryRead(gradSpecCell, gradSpecBase + jInt + b.constant(Float(imagOffset)))
+            let tempR = b.memoryRead(gradSpecCell, gradSpecBase + iInt)
+            let tempI = b.memoryRead(
+              gradSpecCell, gradSpecBase + iInt + b.constant(Float(imagOffset)))
+            let revR = b.memoryRead(gradSpecCell, gradSpecBase + revInt)
+            let revI = b.memoryRead(
+              gradSpecCell, gradSpecBase + revInt + b.constant(Float(imagOffset)))
 
-            // Complex multiply and butterfly
-            let tr = wr * br - wi * bi
-            let ti = wr * bi + wi * br
+            let newIR = b.gswitch(shouldSwap, revR, tempR)
+            let newII = b.gswitch(shouldSwap, revI, tempI)
+            let newRevR = b.gswitch(shouldSwap, tempR, revR)
+            let newRevI = b.gswitch(shouldSwap, tempI, revI)
 
-            _ = b.memoryWrite(gradSpecCell, gradSpecBase + iInt, ar + tr)
+            _ = b.memoryWrite(gradSpecCell, gradSpecBase + iInt, newIR)
             _ = b.memoryWrite(
-              gradSpecCell, gradSpecBase + iInt + b.constant(Float(imagOffset)), ai + ti)
-            _ = b.memoryWrite(gradSpecCell, gradSpecBase + jInt, ar - tr)
+              gradSpecCell, gradSpecBase + iInt + b.constant(Float(imagOffset)), newII)
+            _ = b.memoryWrite(gradSpecCell, gradSpecBase + revInt, newRevR)
             _ = b.memoryWrite(
-              gradSpecCell, gradSpecBase + jInt + b.constant(Float(imagOffset)), ai - ti)
+              gradSpecCell, gradSpecBase + revInt + b.constant(Float(imagOffset)), newRevI)
           }
-          butterflySize *= 2
+
+          // Butterfly stages with POSITIVE twiddle angles (IFFT)
+          // Stages are sequential but butterflies within each stage are parallel
+          var butterflySize = 2
+          for _ in 0..<numStages {
+            let halfSize = butterflySize / 2
+            let numGroups = windowSize / butterflySize
+            let numButterflies = numGroups * halfSize
+
+            b.parallelRange(numButterflies) { flatIdx in
+              let flatFloat = b.cast(flatIdx, to: .float)
+              let halfSizeFloat = b.constant(Float(halfSize))
+              let butterflySizeFloat = b.constant(Float(butterflySize))
+
+              let group = b.floor(flatFloat / halfSizeFloat)
+              let k = flatFloat - (group * halfSizeFloat)
+
+              let i = group * butterflySizeFloat + k
+              let j = i + halfSizeFloat
+
+              // IFFT twiddle: W = e^(+2πi*k/butterflySize) - POSITIVE angle
+              let angle = b.constant(2.0) * b.pi * k / butterflySizeFloat
+              let wr = b.cos(angle)
+              let wi = b.sin(angle)
+
+              let iInt = b.cast(i, to: .int)
+              let jInt = b.cast(j, to: .int)
+
+              let ar = b.memoryRead(gradSpecCell, gradSpecBase + iInt)
+              let ai = b.memoryRead(
+                gradSpecCell, gradSpecBase + iInt + b.constant(Float(imagOffset)))
+              let br = b.memoryRead(gradSpecCell, gradSpecBase + jInt)
+              let bi = b.memoryRead(
+                gradSpecCell, gradSpecBase + jInt + b.constant(Float(imagOffset)))
+
+              // Complex multiply and butterfly
+              let tr = wr * br - wi * bi
+              let ti = wr * bi + wi * br
+
+              _ = b.memoryWrite(gradSpecCell, gradSpecBase + iInt, ar + tr)
+              _ = b.memoryWrite(
+                gradSpecCell, gradSpecBase + iInt + b.constant(Float(imagOffset)), ai + ti)
+              _ = b.memoryWrite(gradSpecCell, gradSpecBase + jInt, ar - tr)
+              _ = b.memoryWrite(
+                gradSpecCell, gradSpecBase + jInt + b.constant(Float(imagOffset)), ai - ti)
+            }
+            butterflySize *= 2
+          }
+
+          // Scale by 1/(N*numBins) and multiply by window (Hann backprop)
+          // windowCell is shared (not per-frame), gradTimeCell is per-frame
+          b.parallelRange(windowSize) { n in
+            let nInt = b.cast(n, to: .int)
+            let realVal = b.memoryRead(gradSpecCell, gradSpecBase + nInt) * invNBins
+            let w = b.memoryRead(windowCell, nInt)
+            _ = b.memoryWrite(gradTimeCell, gradTimeBase + nInt, realVal * w)
+          }
         }
 
-        // Scale by 1/(N*numBins) and multiply by window (Hann backprop)
-        // windowCell is shared (not per-frame), gradTimeCell is per-frame
-        b.parallelRange(windowSize) { n in
-          let nInt = b.cast(n, to: .int)
-          let realVal = b.memoryRead(gradSpecCell, gradSpecBase + nInt) * invNBins
-          let w = b.memoryRead(windowCell, nInt)
-          _ = b.memoryWrite(gradTimeCell, gradTimeBase + nInt, realVal * w)
-        }
-      }
-
-      // Apply IFFT to both gradient cells
-      emitIFFTInPlace(gradSpec1Cell, gradTime1Cell)
-      emitIFFTInPlace(gradSpec2Cell, gradTime2Cell)
+        // Apply IFFT to both gradient cells
+        emitIFFTInPlace(gradSpec1Cell, gradTime1Cell)
+        emitIFFTInPlace(gradSpec2Cell, gradTime2Cell)
 
       }  // end b.if_
 
@@ -830,7 +840,6 @@ public enum LazyOp {
         throw DGenError.insufficientInputs(
           operator: "spectralLossFFTGradInline", expected: 3, actual: inputs.count)
       }
-
 
       let numBins = windowSize / 2 + 1
       let gradOutput = b.value(inputs[0])
@@ -1474,7 +1483,7 @@ public enum LazyOp {
       if let tensorIndex = ctx.tensorIndices[nodeId] {
         // Tensor latch: read inputs from tensors, use indexed state
         // Mark as requiring scalar execution - latch state updates sample-by-sample
-  
+
         let value = try b.readInput(node, inputs, at: 0)
         let cond = try b.readInput(node, inputs, at: 1)
         let idx = b.value(tensorIndex)
@@ -1519,7 +1528,7 @@ public enum LazyOp {
       if let tensorIndex = ctx.tensorIndices[nodeId] {
         // Tensor accum: read inputs from tensors, use indexed state
         // Mark as requiring scalar execution - accum state accumulates sample-by-sample
-  
+
         let incr = try b.readInput(node, inputs, at: 0)
         let reset = try b.readInput(node, inputs, at: 1)
         let min = try b.readInput(node, inputs, at: 2)
@@ -1578,7 +1587,7 @@ public enum LazyOp {
       if let tensorIndex = ctx.tensorIndices[nodeId] {
         // Tensor phasor: read freq from tensor, use indexed state
         // Mark as requiring scalar execution - phasor state accumulates sample-by-sample
-  
+
         let freq = try b.readInput(node, inputs, at: 0)
         let reset = try b.readInput(node, inputs, at: 1)
         let idx = b.value(tensorIndex)
@@ -1654,7 +1663,8 @@ public enum LazyOp {
       // so the output's direct input may be a seq rather than the loss tensor.
       var sourceId = node.inputs[0]
       while let srcNode = ctx.g.nodes[sourceId], case .seq = srcNode.op,
-            let lastInput = srcNode.inputs.last {
+        let lastInput = srcNode.inputs.last
+      {
         sourceId = lastInput
       }
 
@@ -1662,10 +1672,10 @@ public enum LazyOp {
       // instead of referencing a variable that may live in another kernel scope.
       let outputValue: Expr
       if let srcNode = ctx.g.nodes[sourceId],
-         case .tensor(let shape) = srcNode.shape,
-         shape.reduce(1, *) == 1,
-         let tensorId = ctx.g.nodeToTensor[sourceId],
-         let tensor = ctx.g.tensors[tensorId]
+        case .tensor(let shape) = srcNode.shape,
+        shape.reduce(1, *) == 1,
+        let tensorId = ctx.g.nodeToTensor[sourceId],
+        let tensor = ctx.g.tensors[tensorId]
       {
         outputValue = b.memoryRead(tensor.cellId, b.cast(b.constant(0), to: .int))
       } else {
@@ -1822,7 +1832,10 @@ public enum LazyOp {
       let outTensorSize = outShape.reduce(1, *)
 
       // Debug marker for tracing sumAxis operations
-      b.ops.append(UOp(op: .sumAxisMarker(nodeId, axis, inShape, outShape, inIsFrameAware, outIsFrameAware), value: .empty))
+      b.ops.append(
+        UOp(
+          op: .sumAxisMarker(nodeId, axis, inShape, outShape, inIsFrameAware, outIsFrameAware),
+          value: .empty))
 
       let outIdx = b.value(loopIdx)
       let acc = b.float(0.0)
@@ -1879,7 +1892,8 @@ public enum LazyOp {
           val = b.tensorRead(inTensor, indices: inIndices)
         } else if inIsFrameAware {
           // Non-padded frame-aware tensor: use direct frame-aware read
-          val = b.frameAwareTensorRead(cellId: inTensor.cellId, tensorSize: inTensorSize, elemIdx: inFlatIdx)
+          val = b.frameAwareTensorRead(
+            cellId: inTensor.cellId, tensorSize: inTensorSize, elemIdx: inFlatIdx)
         } else {
           // Non-padded, non-frame-aware: use tensorRead
           val = b.tensorRead(inTensor, indices: inIndices)
@@ -1889,7 +1903,8 @@ public enum LazyOp {
 
         // Write with frame-aware addressing if needed
         if outIsFrameAware {
-          _ = b.frameAwareTensorWrite(cellId: outCell, tensorSize: outTensorSize, elemIdx: outIdx, value: acc.value)
+          _ = b.frameAwareTensorWrite(
+            cellId: outCell, tensorSize: outTensorSize, elemIdx: outIdx, value: acc.value)
         } else {
           _ = b.memoryWrite(outCell, b.cast(outIdx, to: .int), acc.value)
         }
@@ -2214,7 +2229,6 @@ public enum LazyOp {
       // Input: spectrum tensor [numBins, 2] where numBins = windowSize/2 + 1
       // Output: scalar (one sample per frame via overlap-add)
 
-
       guard inputs.count == 1 else {
         throw DGenError.insufficientInputs(
           operator: "ifft", expected: 1, actual: inputs.count)
@@ -2457,7 +2471,11 @@ public enum LazyOp {
       inputShape.remove(at: normalizedAxis)
 
       // Debug marker for tracing expandAxis operations
-      b.ops.append(UOp(op: .expandAxisMarker(nodeId, normalizedAxis, inputShape, targetShape, inIsFrameAware, outIsFrameAware), value: .empty))
+      b.ops.append(
+        UOp(
+          op: .expandAxisMarker(
+            nodeId, normalizedAxis, inputShape, targetShape, inIsFrameAware, outIsFrameAware),
+          value: .empty))
       let inSize = inputShape.reduce(1, *)
       let inputStrides = Tensor.computeRowMajorStrides(inputShape)
       let outputStrides = Tensor.computeRowMajorStrides(targetShape)
@@ -2479,14 +2497,17 @@ public enum LazyOp {
       // Read with frame-aware addressing if needed
       let val: Expr
       if inIsFrameAware {
-        val = b.frameAwareTensorRead(cellId: inTensor.cellId, tensorSize: inSize, elemIdx: b.cast(inputFlatIdx, to: .float))
+        val = b.frameAwareTensorRead(
+          cellId: inTensor.cellId, tensorSize: inSize, elemIdx: b.cast(inputFlatIdx, to: .float))
       } else {
         val = b.memoryRead(inTensor.cellId, inputFlatIdx)
       }
 
       // Write with frame-aware addressing if needed
       if outIsFrameAware {
-        _ = b.frameAwareTensorWrite(cellId: outTensor.cellId, tensorSize: outSize, elemIdx: b.cast(outIdx, to: .float), value: val)
+        _ = b.frameAwareTensorWrite(
+          cellId: outTensor.cellId, tensorSize: outSize, elemIdx: b.cast(outIdx, to: .float),
+          value: val)
       } else {
         _ = b.memoryWrite(outTensor.cellId, b.cast(outIdx, to: .int), val)
       }

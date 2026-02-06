@@ -67,7 +67,7 @@ final class AudioMLTests: XCTestCase {
     DGenConfig.sampleRate = sr
     DGenConfig.debug = false
     DGenConfig.kernelOutputPath = "/tmp/808_kernel.metal"
-    let numFrames = 4096  // ~126ms: covers transient + early body
+    let numFrames = 4096 * 2  // ~126ms: covers transient + early body
     let prevMaxFrameCount = DGenConfig.maxFrameCount
     DGenConfig.maxFrameCount = numFrames
     defer { DGenConfig.maxFrameCount = prevMaxFrameCount }
@@ -178,6 +178,17 @@ final class AudioMLTests: XCTestCase {
         spectralLossFFT(s, t, windowSize: windowSize, normalize: true)
       let initialLoss = try loss.backward(frames: numFrames)
       print("INITIAL LOSS = \(initialLoss.reduce(0, +))")
+
+      // Diagnostic: check per-frame loss distribution
+      let sorted = initialLoss.sorted()
+      let maxLoss = sorted.last ?? 0
+      let minLoss = sorted.first ?? 0
+      let medianLoss = sorted[sorted.count / 2]
+      print("  per-frame: min=\(minLoss) median=\(medianLoss) max=\(maxLoss)")
+      print("  first 5: \(Array(initialLoss.prefix(5)))")
+      print("  last 5: \(Array(initialLoss.suffix(5)))")
+      let nanCount = initialLoss.filter { $0.isNaN || $0.isInfinite }.count
+      if nanCount > 0 { print("  *** \(nanCount) NaN/Inf frames! ***") }
       optimizer.zeroGrad()
       DGenConfig.kernelOutputPath = nil
     }
@@ -250,6 +261,128 @@ final class AudioMLTests: XCTestCase {
       samples: synthSamples, sampleRate: sr)
 
     print("Exported: /tmp/808_target.wav and /tmp/808_learned.wav")
+  }
+
+  // MARK: - Forward-Only Spectral Loss Diagnostic
+
+  /// Tests whether spectral loss grows exponentially with frame index
+  /// in the forward pass alone (no backward/gradients involved).
+  func testSpectralLossForwardOnly() throws {
+    let sr: Float = 32500.0
+    DGenConfig.sampleRate = sr
+    DGenConfig.debug = false
+    DGenConfig.kernelOutputPath = "/tmp/fwd_only_kernel.metal"
+    let numFrames = 4096 * 2
+    let prevMaxFrameCount = DGenConfig.maxFrameCount
+    DGenConfig.maxFrameCount = numFrames
+    defer { DGenConfig.maxFrameCount = prevMaxFrameCount }
+    LazyGraphContext.reset()
+
+    // Load target 808
+    let inputURL = projectRoot.appendingPathComponent("Assets/808kicklong.wav")
+    let (allSamples, _) = try AudioFile.load(url: inputURL)
+    let targetSamples = Array(allSamples.prefix(numFrames))
+    let targetTensor = Tensor(targetSamples)
+
+    // Fixed synth (no learnable params, no backward)
+    let freq: Float = 55.0
+    let synth = sin(Signal.phasor(freq) * Float.pi * 2.0) * 0.5
+    let target = targetTensor.toSignal(maxFrames: numFrames)
+
+    let windowSize = 2048
+    let loss = spectralLossFFT(synth, target, windowSize: windowSize)
+
+    // Forward only — just realize, no backward
+    let lossValues = try loss.realize(frames: numFrames)
+    let totalLoss = lossValues.reduce(0, +)
+
+    print("\n=== Forward-Only Spectral Loss (\(numFrames) frames, windowSize=\(windowSize)) ===")
+    print("Total loss: \(totalLoss)")
+
+    let sorted = lossValues.sorted()
+    print("  min=\(sorted.first ?? 0)  median=\(sorted[sorted.count/2])  max=\(sorted.last ?? 0)")
+    print("  first 10: \(Array(lossValues.prefix(10)))")
+    print("  last 10: \(Array(lossValues.suffix(10)))")
+
+    // Check for exponential growth pattern
+    let first100 = lossValues.prefix(100).reduce(0, +) / 100.0
+    let last100 = lossValues.suffix(100).reduce(0, +) / 100.0
+    print("  avg first 100 frames: \(first100)")
+    print("  avg last 100 frames:  \(last100)")
+    print("  ratio last/first: \(last100 / max(first100, 1e-30))")
+
+    let nanCount = lossValues.filter { $0.isNaN || $0.isInfinite }.count
+    if nanCount > 0 { print("  *** \(nanCount) NaN/Inf frames! ***") }
+  }
+
+  /// Spectral loss with identical signals — should be ~0 at all frames.
+  func testSpectralLossIdenticalSignals() throws {
+    DGenConfig.sampleRate = 32500.0
+    DGenConfig.debug = false
+    DGenConfig.kernelOutputPath = nil
+    LazyGraphContext.reset()
+
+    // Test windowSize=512 (fftSize=1024, precision limit at frame 2^24/1024=16384)
+    // vs windowSize=2048 (fftSize=4096, precision limit at frame 2^24/4096=4096)
+    for windowSize in [512, 2048] {
+      let numFrames = 8192
+      DGenConfig.maxFrameCount = numFrames
+      LazyGraphContext.reset()
+
+      let sig1 = sin(Signal.phasor(100.0) * Float.pi * 2.0) * 0.5
+      let sig2 = sin(Signal.phasor(100.0) * Float.pi * 2.0) * 0.5
+
+      let loss = spectralLossFFT(sig1, sig2, windowSize: windowSize)
+      let vals = try loss.realize(frames: numFrames)
+      let total = vals.reduce(0, +)
+
+      var nonZeroFrames: [(Int, Float)] = []
+      for (i, v) in vals.enumerated() {
+        if v != 0.0 { nonZeroFrames.append((i, v)) }
+      }
+
+      print("\n=== Identical Signals (frames=\(numFrames), windowSize=\(windowSize), fftSize=\(windowSize*2)) ===")
+      print("float32 precision limit at frame: \(16_777_216 / (windowSize * 2))")
+      print("Total: \(total), non-zero frames: \(nonZeroFrames.count)/\(numFrames)")
+      if nonZeroFrames.count <= 20 {
+        for (idx, val) in nonZeroFrames {
+          print("  frame \(idx): \(val)")
+        }
+      } else {
+        print("  first 5 non-zero: \(nonZeroFrames.prefix(5))")
+        print("  largest: \(nonZeroFrames.sorted { $0.1 > $1.1 }.prefix(5))")
+      }
+    }
+  }
+
+  /// Spectral loss with small vs large frame count — same signals.
+  func testSpectralLossScaling() throws {
+    DGenConfig.sampleRate = 32500.0
+    DGenConfig.debug = false
+    DGenConfig.kernelOutputPath = nil
+    LazyGraphContext.reset()
+
+    let inputURL = projectRoot.appendingPathComponent("Assets/808kicklong.wav")
+    let (allSamples, _) = try AudioFile.load(url: inputURL)
+
+    for numFrames in [512, 2048, 4096, 8192] {
+      let prevMax = DGenConfig.maxFrameCount
+      DGenConfig.maxFrameCount = numFrames
+      LazyGraphContext.reset()
+
+      let target = Tensor(Array(allSamples.prefix(numFrames)))
+      let synth = sin(Signal.phasor(55.0) * Float.pi * 2.0) * 0.5
+      let tgt = target.toSignal(maxFrames: numFrames)
+      let loss = spectralLossFFT(synth, tgt, windowSize: min(2048, numFrames))
+      let vals = try loss.realize(frames: numFrames)
+
+      let total = vals.reduce(0, +)
+      let avg = total / Float(numFrames)
+      let maxVal = vals.max() ?? 0
+      print("frames=\(numFrames): total=\(String(format:"%.4e", total))  avg=\(String(format:"%.4e", avg))  max=\(String(format:"%.4e", maxVal))")
+
+      DGenConfig.maxFrameCount = prevMax
+    }
   }
 
   // MARK: - Timbre Matching Tests

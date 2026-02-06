@@ -294,6 +294,7 @@ final class OptimizerTests: XCTestCase {
   }
 
   func testSignalParamOnepoleSpectral() throws {
+    DGenConfig.kernelOutputPath = "/tmp/signal_param_onepole_spectral.metal"
     // Same as testSignalParamOnepole but with spectralLossFFT instead of MSE
     let cutoff = Signal.param(0.5)
     let targetCutoff: Float = 0.2
@@ -320,6 +321,8 @@ final class OptimizerTests: XCTestCase {
     let _ = try spectralLossFFT(buildLearnable(), buildTarget(), windowSize: 32).backward(
       frames: frameCount)
     optimizer.zeroGrad()
+
+    DGenConfig.kernelOutputPath = nil
 
     // Train
     var firstLoss: Float = 0
