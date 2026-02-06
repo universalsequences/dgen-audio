@@ -10,7 +10,9 @@ final class FIRFilterTests: XCTestCase {
     LazyGraphContext.reset()
   }
 
-  private func generateTestSignals(n: Int = 64, freq: Float = 4.0) -> (clean: [Float], noisy: [Float]) {
+  private func generateTestSignals(n: Int = 64, freq: Float = 4.0) -> (
+    clean: [Float], noisy: [Float]
+  ) {
     var clean = [Float](repeating: 0, count: n)
     var noisy = [Float](repeating: 0, count: n)
     for i in 0..<n {
@@ -74,6 +76,7 @@ final class FIRFilterTests: XCTestCase {
 
   /// Train a conv2d kernel to act as a lowpass filter.
   func testLearnedFIRLowpass() throws {
+    DGenConfig.kernelOutputPath = "/tmp/learned_fir_lowpass.metal"
     let (noisyTensor, targetTensor, kernel) = makeFIRLowpassFixture()
 
     func buildLoss() -> Tensor {
@@ -82,6 +85,7 @@ final class FIRFilterTests: XCTestCase {
 
     let optimizer = SGD(params: [kernel], lr: 0.01)
     let initialLoss = try buildLoss().backward(frameCount: 1)[0]
+    DGenConfig.kernelOutputPath = nil
     optimizer.zeroGrad()
 
     print("\n=== Learned FIR Lowpass ===")
@@ -93,7 +97,9 @@ final class FIRFilterTests: XCTestCase {
 
       if epoch % 20 == 0 || epoch == 49 {
         let k = kernel.getData() ?? []
-        print("Epoch \(epoch): loss = \(String(format: "%.6f", finalLoss)), kernel = \(k.map { String(format: "%.3f", $0) })")
+        print(
+          "Epoch \(epoch): loss = \(String(format: "%.6f", finalLoss)), kernel = \(k.map { String(format: "%.3f", $0) })"
+        )
       }
 
       optimizer.step()
@@ -171,7 +177,9 @@ final class FIRFilterTests: XCTestCase {
 
       if epoch % 50 == 0 || epoch == 199 {
         let k = firKernel.getData() ?? []
-        print("Epoch \(epoch): loss=\(String(format: "%.6f", avgLoss)) kernel[0..4]=\(k.prefix(5).map { String(format: "%.4f", $0) })")
+        print(
+          "Epoch \(epoch): loss=\(String(format: "%.6f", avgLoss)) kernel[0..4]=\(k.prefix(5).map { String(format: "%.4f", $0) })"
+        )
       }
 
       optimizer.step()
