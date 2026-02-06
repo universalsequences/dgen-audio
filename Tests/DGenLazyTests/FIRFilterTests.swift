@@ -71,7 +71,6 @@ final class FIRFilterTests: XCTestCase {
   /// accum(1, max: large) produces 0, 1, 2, 3, ...
   /// buffer(4).sum() should give the sum of the last 4 values written.
   func testBufferNumerical() throws {
-    DGenConfig.kernelOutputPath = "/tmp/buffer_numerical.metal"
     let counter = Signal.accum(Signal.constant(1.0), min: 0.0, max: 10000.0)
     let buf = counter.buffer(size: 4)  // SignalTensor [1, 4]
     let s = buf.sum()  // Signal
@@ -140,7 +139,8 @@ final class FIRFilterTests: XCTestCase {
     print("Kernel grad: \(gradData.map { String(format: "%.6f", $0) })")
 
     XCTAssertFalse(gradData.isEmpty, "Kernel should have gradients")
-    XCTAssertTrue(gradData.contains(where: { abs($0) > 1e-6 }), "At least one gradient should be non-zero")
+    XCTAssertTrue(
+      gradData.contains(where: { abs($0) > 1e-6 }), "At least one gradient should be non-zero")
   }
 
   // MARK: - Learned FIR Lowpass
@@ -148,7 +148,6 @@ final class FIRFilterTests: XCTestCase {
   /// Train a conv2d kernel to act as a lowpass filter.
   /// The optimizer discovers FIR coefficients that minimize MSE against a clean signal.
   func testLearnedFIRLowpass() throws {
-    DGenConfig.kernelOutputPath = "/tmp/learn_fir_lowpass.metal"
     let n = 64
     let freq: Float = 4.0
     let kernelSize = 7
@@ -177,15 +176,15 @@ final class FIRFilterTests: XCTestCase {
 
     func buildLoss() -> Tensor {
       let filtered = noisyTensor.conv2d(learnedKernel)  // [1, outLen]
-      return firLoss(prediction: filtered, target: targetTensor)
+      return firLoss(prediction: filtered, target: targetTensor, kernel: learnedKernel)
     }
 
     let optimizer = SGD(params: [learnedKernel], lr: 0.01)
-    let epochs = 150
+    let epochs = 200
 
     let initialLoss = try buildLoss().backward(frameCount: 1)[0]
     optimizer.zeroGrad()
-    DGenConfig.kernelOutputPath = nil
+    DGenConfig.kernelOutputPath = "/tmp/learn_fir_lowpass_loop.metal"
 
     print("\n=== Learned FIR Lowpass ===")
     print("Kernel size: \(kernelSize)")
@@ -208,6 +207,14 @@ final class FIRFilterTests: XCTestCase {
       }
 
       optimizer.step()
+
+      // Project kernel onto constraint: sum = 1.0 (unity DC gain)
+      if var k = learnedKernel.getData() {
+        let s = k.reduce(0, +)
+        if abs(s) > 1e-8 { k = k.map { $0 / s } }
+        learnedKernel.updateDataLazily(k)
+      }
+
       optimizer.zeroGrad()
     }
 
@@ -238,9 +245,11 @@ func firKernelInit(_ size: Int) -> [Float] {
   return [Float](repeating: 1.0 / Float(size), count: size)
 }
 
-func firLoss(prediction: Tensor, target: Tensor) -> Tensor {
+func firLoss(prediction: Tensor, target: Tensor, kernel: Tensor) -> Tensor {
   let diff = prediction - target
-  return (diff * diff).mean()
+  let mse = (diff * diff).mean()
+  let reg = (kernel.sum() - Tensor([1.0])) * (kernel.sum() - Tensor([1.0])) * Tensor([0.1])
+  return mse + reg
 }
 
 // MARK: - TODO(human): Design the buffer gradient test loss

@@ -122,14 +122,23 @@ public class Signal: LazyValue {
     return Signal(value, requiresGrad: false)
   }
 
+  /// Optional bounds for parameter clamping (applied after optimizer step)
+  public var minBound: Float?
+  public var maxBound: Float?
+
   /// Create a learnable parameter signal
-  /// - Parameter value: Initial value
-  public static func param(_ value: Float) -> Signal {
+  /// - Parameters:
+  ///   - value: Initial value
+  ///   - min: Optional lower bound (clamped after each optimizer step)
+  ///   - max: Optional upper bound (clamped after each optimizer step)
+  public static func param(_ value: Float, min: Float? = nil, max: Float? = nil) -> Signal {
     let graph = LazyGraphContext.current
     let cellId = graph.alloc()
 
     let nodeId = graph.node(.param(cellId), [])
     let signal = Signal(nodeId: nodeId, graph: graph, requiresGrad: true, cellId: cellId, data: value, graphId: graph.id)
+    signal.minBound = min
+    signal.maxBound = max
     graph.registerParameter(signal)  // Register for gradient tracking
     graph.registerSignal(signal)  // Track for refresh after clear
     return signal
@@ -138,7 +147,10 @@ public class Signal: LazyValue {
   /// Update the signal's parameter data for the next forward pass
   /// Used by optimizers to apply parameter updates
   public func updateDataLazily(_ newValue: Float) {
-    self.data = newValue
+    var clamped = newValue
+    if let lo = minBound { clamped = Swift.max(clamped, lo) }
+    if let hi = maxBound { clamped = Swift.min(clamped, hi) }
+    self.data = clamped
     graph.markDirty()  // Invalidate caches so next realize uses new data
   }
 

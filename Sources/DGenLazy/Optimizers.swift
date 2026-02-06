@@ -173,10 +173,13 @@ public class Adam: Optimizer {
           continue
         }
 
-        // Initialize moment buffers on first step
+        // Initialize moment buffers on first step (or fix size if pre-filled by scalar handler)
         if m.count <= paramIdx {
           m.append([Float](repeating: 0.0, count: data.count))
           v.append([Float](repeating: 0.0, count: data.count))
+        } else if m[paramIdx].count != data.count {
+          m[paramIdx] = [Float](repeating: 0.0, count: data.count)
+          v[paramIdx] = [Float](repeating: 0.0, count: data.count)
         }
 
         // Bias correction factors

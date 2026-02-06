@@ -39,11 +39,10 @@ public enum ViewTransform: Equatable {
   /// outputShape: tiled shape after repeat
   case repeatTile(innerShape: [Int], outputShape: [Int])
 
-  /// Circular buffer offset - dynamic (signal-dependent) transform
-  /// offsetCellId: memory cell holding the current write position
-  /// bufferSize: total size of the ring buffer
-  /// inputShape: shape before this transform
-  case circularOffset(offsetCellId: CellID, bufferSize: Int, inputShape: [Int])
+  /// Sliding window into a flat history array, indexed by frame
+  /// windowSize: number of elements visible in the window
+  /// inputShape: shape of the base history array
+  case slidingWindow(windowSize: Int, inputShape: [Int])
 
   public static func == (lhs: ViewTransform, rhs: ViewTransform) -> Bool {
     switch (lhs, rhs) {
@@ -69,8 +68,8 @@ public enum ViewTransform: Equatable {
       return lt == rt && lis == ris
     case let (.repeatTile(li, lo), .repeatTile(ri, ro)):
       return li == ri && lo == ro
-    case let (.circularOffset(lo, ls, lis), .circularOffset(ro, rs, ris)):
-      return lo == ro && ls == rs && lis == ris
+    case let (.slidingWindow(lw, lis), .slidingWindow(rw, ris)):
+      return lw == rw && lis == ris
     default:
       return false
     }

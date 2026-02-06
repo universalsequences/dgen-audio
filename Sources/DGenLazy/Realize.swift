@@ -216,13 +216,15 @@ extension LazyGraph {
                         }
                         currentShape = innerShape
 
-                    case .circularOffset(let offsetCellId, let bufferSize, let inputShape):
-                        // Read write position from memory and apply circular offset
-                        let physicalOffsetCell = context.compilationResult.cellAllocations
-                            .cellMappings[offsetCellId] ?? offsetCellId
-                        let writePos = Int(memPtr[physicalOffsetCell])
+                    case .slidingWindow(let windowSize, let inputShape):
+                        // Sliding window: index i at frame f → base[f - windowSize + 1 + i]
                         let lastDim = indices.count - 1
-                        indices[lastDim] = (indices[lastDim] + writePos + 1) % bufferSize
+                        let baseIdx = frame - windowSize + 1 + indices[lastDim]
+                        if baseIdx < 0 {
+                            inBounds = false
+                        } else {
+                            indices[lastDim] = baseIdx
+                        }
                         currentShape = inputShape
                     }
                 }

@@ -1614,9 +1614,14 @@ public func emitBlockUOps(
   let outbound = findNodesWithOutboundDependencies(blocks, g, block: block)
   for nodeId in outbound {
     if emittedNodes.contains(nodeId) {
-      // Skip defineGlobal for tensor-valued outputs - they use memory cells, not scratch buffers
-      if let node = g.nodes[nodeId], case .tensor = node.shape {
-        continue
+      // Skip defineGlobal for tensor-valued outputs - they use memory cells, not scratch buffers.
+      // Exception: shape [1] tensors are effectively scalars and CAN use globals.
+      // Without this, output nodes in separate blocks can't access the value
+      // (they reference a variable from another kernel scope).
+      if let node = g.nodes[nodeId], case .tensor(let shape) = node.shape {
+        if shape.reduce(1, *) > 1 {
+          continue
+        }
       }
 
       if let lz = ctx.values[nodeId] {
@@ -1727,6 +1732,7 @@ public func splitReduceBlocks(g: Graph, blocks: [Block]) -> [Block] {
     if let reductionNode, case .tensor(let outputShape) = reductionNode.shape, !isGlobalReduce {
       reductionBlock.shape = outputShape
     }
+
     splitBlocks.append(reductionBlock)
 
     // Post-reduction block - recursively split if it contains more reductions

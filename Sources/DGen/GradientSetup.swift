@@ -26,18 +26,20 @@ extension Graph {
         var result: [NodeID: CellID] = [:]
 
         for (nodeId, size) in tensorNodes {
-            guard let gradNode = gradients[nodeId] else {
-                continue
+            if let gradNode = gradients[nodeId] {
+                // Standard path: gradient computed by autodiff
+                let gradCell = alloc(vectorWidth: size)
+                tensorGradCells[nodeId] = gradCell
+                result[nodeId] = gradCell
+
+                let accumOp = n(.tensorAccumulate(gradCell), [gradNode])
+                addGradientSideEffect(accumOp)
+            } else if let tensorId = nodeToTensor[nodeId],
+                      let tensor = tensors[tensorId],
+                      let carryCell = gradCarryCells[tensor.cellId] {
+                // Fallback: peek/scatter-based gradient (already written via memoryAccumulate)
+                result[nodeId] = carryCell
             }
-
-            // Allocate gradient accumulation cell
-            let gradCell = alloc(vectorWidth: size)
-            tensorGradCells[nodeId] = gradCell
-            result[nodeId] = gradCell
-
-            // Create tensor accumulate op - this pulls gradNode into the graph
-            let accumOp = n(.tensorAccumulate(gradCell), [gradNode])
-            addGradientSideEffect(accumOp)
         }
 
         return result

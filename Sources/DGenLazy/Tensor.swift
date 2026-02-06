@@ -127,14 +127,25 @@ public class Tensor: LazyValue {
     return graph.graph.tensors[tensorId]?.data
   }
 
+  /// Optional element-wise bounds for parameter clamping (applied after optimizer step)
+  public var minBound: Float?
+  public var maxBound: Float?
+
   /// Update the tensor's data for the next forward pass
   /// Used by optimizers to apply parameter updates
   public func updateDataLazily(_ newData: [Float]) {
+    var clamped = newData
+    if let lo = minBound {
+      clamped = clamped.map { Swift.max($0, lo) }
+    }
+    if let hi = maxBound {
+      clamped = clamped.map { Swift.min($0, hi) }
+    }
     // Always update local storage
-    _data = newData
+    _data = clamped
     // Also update graph storage if tensor exists there
     if let tensorId = self.tensorId {
-      graph.graph.tensors[tensorId]?.data = newData
+      graph.graph.tensors[tensorId]?.data = clamped
     }
     graph.markDirty()  // Invalidate caches so next realize uses new data
   }

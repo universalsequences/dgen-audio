@@ -517,38 +517,40 @@ extension Graph {
     return n(.seq, writeOp, out)
   }
 
-  /// Buffer view: writes a scalar signal into a ring buffer each frame,
-  /// returns a [1, size] tensor backed by the buffer with a circularOffset transform.
-  /// Zero-copy — the tensor IS the buffer. Composes with conv2d, sum, etc.
+  /// Buffer view: writes a scalar signal into a flat history array each frame,
+  /// returns a [1, size] tensor view via a sliding window transform.
+  /// Fully parallel — each frame writes to a unique slot. Composes with conv2d, sum, etc.
   ///
   /// - Parameters:
   ///   - input: Scalar signal to buffer
-  ///   - size: Number of samples to buffer
-  /// - Returns: TensorRef node for a [1, size] tensor view of the ring buffer
+  ///   - size: Number of samples visible in the window
+  /// - Returns: TensorRef node for a [1, size] sliding window over the history
   public func bufferView(_ input: NodeID, size: Int) -> NodeID {
-    let bufferBase = alloc(vectorWidth: size)
+    // Flat history: one slot per frame, no ring buffer
+    let historyBase = alloc(vectorWidth: maxFrameCount)
     let writePosCellId = alloc()
 
     let one = n(.constant(1.0))
     let zero = n(.constant(0.0))
-    let maxSize = n(.constant(Float(size)))
+    let maxSize = n(.constant(Float(maxFrameCount)))
 
-    // Write position wraps in [0, size)
+    // Write position counts 0, 1, 2, ..., maxFrameCount-1
     let writePos = n(.floor, n(.accum(writePosCellId), one, zero, zero, maxSize))
 
-    // Write input sample at current write position
-    let writeOp = n(.memoryWrite(bufferBase), writePos, input)
+    // Write input sample at current position (parallel: each frame → unique slot)
+    let writeOp = n(.memoryWrite(historyBase), writePos, input)
 
-    // Create tensor backed by the ring buffer with circularOffset transform
+    // Tensor view: [1, size] window into [1, maxFrameCount] base
     let tensorShape: Shape = [1, size]
+    let baseShape: Shape = [1, maxFrameCount]
     let tensorId = nextTensorId
     nextTensorId += 1
-    let transform = ViewTransform.circularOffset(
-      offsetCellId: writePosCellId, bufferSize: size, inputShape: tensorShape)
+    let transform = ViewTransform.slidingWindow(
+      windowSize: size, inputShape: baseShape)
     tensors[tensorId] = Tensor(
-      id: tensorId, shape: tensorShape, cellId: bufferBase,
-      baseShape: tensorShape, transforms: [transform])
-    cellToTensor[bufferBase] = tensorId
+      id: tensorId, shape: tensorShape, cellId: historyBase,
+      baseShape: baseShape, transforms: [transform])
+    cellToTensor[historyBase] = tensorId
 
     let tensorRefNode = n(.tensorRef(tensorId), [], shape: .tensor(tensorShape))
     nodeToTensor[tensorRefNode] = tensorId

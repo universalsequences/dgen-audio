@@ -659,7 +659,8 @@ public func spectralLossFFT(
     _ sig1: Signal,
     _ sig2: Signal,
     windowSize: Int,
-    useHannWindow: Bool = true
+    useHannWindow: Bool = true,
+    normalize: Bool = false
 ) -> Signal {
     let nodeId = sig1.graph.graph.spectralLossFFT(
         sig1.nodeId,
@@ -667,7 +668,12 @@ public func spectralLossFFT(
         windowSize: windowSize,
         useHannWindow: useHannWindow
     )
-    return Signal(nodeId: nodeId, graph: sig1.graph, requiresGrad: sig1.requiresGrad || sig2.requiresGrad)
+    let loss = Signal(nodeId: nodeId, graph: sig1.graph, requiresGrad: sig1.requiresGrad || sig2.requiresGrad)
+    if normalize {
+        let n = Float(sig1.graph.graph.maxFrameCount)
+        return loss / Signal.constant(n)
+    }
+    return loss
 }
 
 /// Read a row from a 2D tensor with linear interpolation (frame-based)

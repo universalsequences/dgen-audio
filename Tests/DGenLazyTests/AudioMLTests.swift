@@ -67,9 +67,11 @@ final class AudioMLTests: XCTestCase {
     DGenConfig.sampleRate = sr
     DGenConfig.debug = false
     DGenConfig.kernelOutputPath = "/tmp/808_kernel.metal"
-    LazyGraphContext.reset()
-
     let numFrames = 4096  // ~126ms: covers transient + early body
+    let prevMaxFrameCount = DGenConfig.maxFrameCount
+    DGenConfig.maxFrameCount = numFrames
+    defer { DGenConfig.maxFrameCount = prevMaxFrameCount }
+    LazyGraphContext.reset()
 
     // Load target 808
     let inputURL = projectRoot.appendingPathComponent("Assets/808kicklong.wav")
@@ -84,54 +86,83 @@ final class AudioMLTests: XCTestCase {
     // Target as 1D tensor for peek playback
     let targetTensor = Tensor(targetSamples)
 
-    // === Learnable parameters (initialized near Python analysis values) ===
-    let bodyAmp = Signal.param(0.5)  // overall body amplitude
-    let bodyDecay = Signal.param(0.9995)  // slow body envelope decay
-    let startFreq = Signal.param(65.0)  // initial pitch (before sweep)
-    let endFreq = Signal.param(48.0)  // settled pitch ~50Hz
-    let freqDecay = Signal.param(0.999)  // pitch sweep rate
-    let clickAmp = Signal.param(0.3)  // transient amplitude
-    let clickDecay = Signal.param(0.98)  // fast click decay
-    let clickFreq = Signal.param(180.0)  // click resonant frequency
+    // === Learnable parameters ===
+    let startFreq = Signal.param(65.0, min: 20.0)  // initial pitch (before sweep)
+    let endFreq = Signal.param(48.0, min: 20.0)  // settled pitch ~50Hz
+    let freqDecay = Signal.param(0.999, min: 0.0, max: 0.99999)  // pitch sweep rate
+    let clickAmp = Signal.param(0.3, min: 0.0)  // transient amplitude
+    let clickDecay = Signal.param(0.98, min: 0.0, max: 0.99999)  // fast click decay
+    let clickFreq = Signal.param(180.0, min: 20.0)  // click resonant frequency
 
-    let params: [Signal] = [
-      bodyAmp, bodyDecay, startFreq, endFreq,
-      freqDecay, clickAmp, clickDecay, clickFreq,
+    // Learnable amplitude envelopes: 256 control points each, interpolated via peek
+    // Each harmonic gets its own envelope to shape its contribution independently
+    let envSize = 256
+    let samplesPerPoint = numFrames / envSize
+    let targetEnvData: [Float] = (0..<envSize).map { i in
+      let start = i * samplesPerPoint
+      let end = min(start + samplesPerPoint, numFrames)
+      let chunk = targetSamples[start..<end]
+      return chunk.map { abs($0) }.max() ?? 0  // peak amplitude per window
+    }
+
+    // Fundamental envelope — initialized from target contour
+    let bodyEnvTensor = Tensor.param([envSize], data: targetEnvData)
+    bodyEnvTensor.minBound = 0.0
+
+    // Sub-bass (freq * 0.5) — start quieter, let optimizer find the level
+    let subEnvTensor = Tensor.param([envSize], data: targetEnvData.map { $0 * 0.1 })
+    subEnvTensor.minBound = 0.0
+
+    // 2nd harmonic (freq * 2) — start quiet
+    let harmEnvTensor = Tensor.param([envSize], data: targetEnvData.map { $0 * 0.05 })
+    harmEnvTensor.minBound = 0.0
+
+    let signalParams: [Signal] = [
+      startFreq, endFreq, freqDecay,
+      clickAmp, clickDecay, clickFreq,
     ]
-    let optimizer = Adam(params: params, lr: 0.0005)
+    let allParams: [any LazyValue] = signalParams + [bodyEnvTensor, subEnvTensor, harmEnvTensor]
+    let optimizer = Adam(params: allParams, lr: 0.1)
 
     // --- Build functions (called each epoch to rebuild graph fresh) ---
 
-    // Differentiable envelope: starts at 1, decays by `rate` each frame.
-    // History starts at 0 so: frame0 = (1 - 0) = 1, frame1 = (1 - decay) * decay + decay...
-    // Simpler: prev * rate + (1 - rate) on frame 0 gives 1, then converges.
-    // Actually cleanest: write 1.0 first frame, then decay.
-    // Since history=0 on frame 0: out = max(prev, seed) * rate works but max isn't smooth.
-    // Use: out = prev * rate, write(out + (1-out) * (1-prev))
-    // Frame 0: prev=0, out=0, write = 0 + 1*1 = 1  ✓
-    // Frame 1: prev=1, out=rate, write = rate + (1-rate)*0 = rate  ✓
-    // Frame 2: prev=rate, out=rate^2, write = rate^2  ✓
-    func envelope(_ rate: Signal) -> Signal {
-      let (prev, write) = Signal.history()
-      let out = prev * rate
-      // Seed: (1-out)*(1-prev) is 1 only when both are 0 (frame 0), else ~0
-      write(out + (Signal.constant(1.0) - out) * (Signal.constant(1.0) - prev))
-      return out
-    }
-
     func buildSynth() -> Signal {
-      let bodyEnv = envelope(bodyDecay)
+      // Shared frame counter for envelope seeding (0 on frame 0, 1+ after)
+      let t = Signal.accum(Signal.constant(1.0), reset: 0.0, min: 0.0, max: Float(numFrames + 1))
+
+      func envelope(_ rate: Signal) -> Signal {
+        let (prev, write) = Signal.history()
+        let seed = max(Signal.constant(1.0) - t, 0.0)  // 1 on frame 0, 0 after
+        let out = prev * rate + seed
+        write(out)
+        return out
+      }
+
       let freqEnv = envelope(freqDecay)
 
       // Swept frequency: endFreq + (startFreq - endFreq) * freqEnv
       let freq = endFreq + (startFreq - endFreq) * freqEnv
-      let body = sin(Signal.phasor(freq) * Float.pi * 2.0) * bodyEnv * bodyAmp
+
+      // Shared playhead: maps frame counter (0..numFrames) → envelope index (0..envSize)
+      let playhead = Signal.accum(
+        Signal.constant(Float(envSize) / Float(numFrames)),
+        reset: 0.0, min: 0.0, max: Float(envSize)
+      )
+
+      // Fundamental body
+      let body = sin(Signal.phasor(freq) * Float.pi * 2.0) * bodyEnvTensor.peek(playhead)
+
+      // Sub-bass: half frequency, own envelope
+      let sub = sin(Signal.phasor(freq * 0.5) * Float.pi * 2.0) * subEnvTensor.peek(playhead)
+
+      // 2nd harmonic: double frequency, own envelope
+      let harm = sin(Signal.phasor(freq * 2.0) * Float.pi * 2.0) * harmEnvTensor.peek(playhead)
 
       // Click transient: high-freq sine burst with fast decay
       let clickEnv = envelope(clickDecay)
       let click = sin(Signal.phasor(clickFreq) * Float.pi * 2.0) * clickEnv * clickAmp
 
-      return body + click
+      return body + sub + harm + click
     }
 
     func buildTarget() -> Signal {
@@ -143,9 +174,10 @@ final class AudioMLTests: XCTestCase {
     do {
       let s = buildSynth()
       let t = buildTarget()
-      let loss = spectralLossFFT(s, t, windowSize: windowSize)
+      let loss =
+        spectralLossFFT(s, t, windowSize: windowSize, normalize: true)
       let initialLoss = try loss.backward(frames: numFrames)
-      print("INITIAL LOSS = \(initialLoss.reduce(0, +) / Float(numFrames))")
+      print("INITIAL LOSS = \(initialLoss.reduce(0, +))")
       optimizer.zeroGrad()
       DGenConfig.kernelOutputPath = nil
     }
@@ -156,29 +188,48 @@ final class AudioMLTests: XCTestCase {
     )
     var firstLoss: Float = 0
     var lastLoss: Float = 0
-    let epochs = 400
+    let epochs = 20
 
     for epoch in 0..<epochs {
       let synth = buildSynth()
       let target = buildTarget()
-      let loss = spectralLossFFT(synth, target, windowSize: windowSize)
+      let loss =
+        spectralLossFFT(synth, target, windowSize: windowSize, normalize: true)
 
       let lossValues = try loss.backward(frames: numFrames)
-      let epochLoss = lossValues.reduce(0, +) / Float(numFrames)
+      let epochLoss = lossValues.reduce(0, +)
 
       if epoch == 0 { firstLoss = epochLoss }
       lastLoss = epochLoss
 
-      if epoch % 1 == 0 || epoch == epochs - 1 {
-        let pv = params.compactMap { $0.data }
-        print(
-          "Epoch \(epoch): loss=\(String(format: "%.4f", epochLoss))")
-        print(
-          "  bodyAmp=\(String(format:"%.4f",pv[0])) bodyDecay=\(String(format:"%.6f",pv[1])) "
-            + "startFreq=\(String(format:"%.2f",pv[2])) endFreq=\(String(format:"%.2f",pv[3]))")
-        print(
-          "  freqDecay=\(String(format:"%.6f",pv[4])) clickAmp=\(String(format:"%.4f",pv[5])) "
-            + "clickDecay=\(String(format:"%.6f",pv[6])) clickFreq=\(String(format:"%.2f",pv[7]))")
+      let pv = signalParams.compactMap { $0.data }
+      let gv = signalParams.map { $0.grad?.data ?? Float.nan }
+      let names = [
+        "startFreq", "endFreq", "freqDecay",
+        "clickAmp", "clickDecay", "clickFreq",
+      ]
+
+      if epoch % 10 == 0 || epoch == epochs - 1 {
+        print("Epoch \(epoch): loss=\(String(format: "%.4f", epochLoss))")
+        for (i, name) in names.enumerated() {
+          print(
+            "  \(name)=\(String(format:"%12.6f", pv[i]))  grad=\(String(format:"%12.6e", gv[i]))")
+        }
+        for (label, tensor) in [
+          ("body", bodyEnvTensor), ("sub", subEnvTensor), ("harm", harmEnvTensor),
+        ] {
+          let d = tensor.getData() ?? []
+          let g = tensor.grad?.getData() ?? []
+          let gMax = g.map { abs($0) }.max() ?? 0
+          print(
+            "  \(label)Env: max=\(String(format:"%.4f", d.max() ?? 0)) gradMax=\(String(format:"%.4e", gMax))"
+          )
+        }
+      }
+
+      if epochLoss.isNaN || epochLoss.isInfinite {
+        print("*** NaN/Inf detected at epoch \(epoch) — stopping ***")
+        break
       }
 
       optimizer.step()
