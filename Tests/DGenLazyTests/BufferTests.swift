@@ -68,7 +68,7 @@ final class BufferTests: XCTestCase {
     let filtered = sig.buffer(size: 32).conv2d(kernel)
 
     let loss = (filtered * filtered).sum()
-    let _ = try loss.backward(frames: 64)
+    _ = try loss.backward(frames: 64)
 
     let gradData = kernel.grad?.getData() ?? []
     XCTAssertFalse(gradData.isEmpty, "Kernel should have gradients")

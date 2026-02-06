@@ -34,9 +34,7 @@ public final class IRBuilder {
     return value(l, scalarType: .float)
   }
 
-  /// Create an integer-typed constant expression for index calculations.
-  /// The value is stored as Float internally but tagged as .int so renderers
-  /// emit integer declarations and arithmetic stays in int until mixed with float.
+  /// Alias for `int(_:)` with a more descriptive name for use in operator emit code.
   public func intConstant(_ v: Int) -> Expr {
     return int(v)
   }
@@ -755,6 +753,16 @@ public struct Expr {
     return Expr(uop.value, ctx: lhs.ctx, nodeId: lhs.nodeId, builder: lhs.builder, scalarType: resultType)
   }
 
+  /// Emit a comparison UOp (always returns float, no type promotion)
+  private static func emitComparisonOp(
+    _ lhs: Expr, _ rhs: Expr,
+    thunk: (Lazy, Lazy) -> (IRContext, NodeID?) -> UOp
+  ) -> Expr {
+    let uop = thunk(lhs.lazy, rhs.lazy)(lhs.ctx, nil)
+    lhs.builder.ops.append(uop)
+    return Expr(uop.value, ctx: lhs.ctx, nodeId: lhs.nodeId, builder: lhs.builder)
+  }
+
   /// Try constant folding for a binary op; returns nil if either operand is not a constant
   private static func foldConstants(
     _ lhs: Expr, _ rhs: Expr, op: (Float, Float) -> Float
@@ -785,38 +793,23 @@ public struct Expr {
   }
 
   static func > (lhs: Expr, rhs: Expr) -> Expr {
-    let thunk = u_gt(lhs.lazy, rhs.lazy)
-    let uop = thunk(lhs.ctx, nil)
-    lhs.builder.ops.append(uop)
-    return Expr(uop.value, ctx: lhs.ctx, nodeId: lhs.nodeId, builder: lhs.builder)
+    return emitComparisonOp(lhs, rhs, thunk: u_gt)
   }
 
   static func >= (lhs: Expr, rhs: Expr) -> Expr {
-    let thunk = u_gte(lhs.lazy, rhs.lazy)
-    let uop = thunk(lhs.ctx, nil)
-    lhs.builder.ops.append(uop)
-    return Expr(uop.value, ctx: lhs.ctx, nodeId: lhs.nodeId, builder: lhs.builder)
+    return emitComparisonOp(lhs, rhs, thunk: u_gte)
   }
 
   static func <= (lhs: Expr, rhs: Expr) -> Expr {
-    let thunk = u_lte(lhs.lazy, rhs.lazy)
-    let uop = thunk(lhs.ctx, nil)
-    lhs.builder.ops.append(uop)
-    return Expr(uop.value, ctx: lhs.ctx, nodeId: lhs.nodeId, builder: lhs.builder)
+    return emitComparisonOp(lhs, rhs, thunk: u_lte)
   }
 
   static func < (lhs: Expr, rhs: Expr) -> Expr {
-    let thunk = u_lt(lhs.lazy, rhs.lazy)
-    let uop = thunk(lhs.ctx, nil)
-    lhs.builder.ops.append(uop)
-    return Expr(uop.value, ctx: lhs.ctx, nodeId: lhs.nodeId, builder: lhs.builder)
+    return emitComparisonOp(lhs, rhs, thunk: u_lt)
   }
 
   static func == (lhs: Expr, rhs: Expr) -> Expr {
-    let thunk = u_eq(lhs.lazy, rhs.lazy)
-    let uop = thunk(lhs.ctx, nil)
-    lhs.builder.ops.append(uop)
-    return Expr(uop.value, ctx: lhs.ctx, nodeId: lhs.nodeId, builder: lhs.builder)
+    return emitComparisonOp(lhs, rhs, thunk: u_eq)
   }
 
   static func % (lhs: Expr, rhs: Expr) -> Expr {

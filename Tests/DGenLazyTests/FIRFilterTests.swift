@@ -22,12 +22,25 @@ final class FIRFilterTests: XCTestCase {
     return (clean, noisy)
   }
 
-  /// MSE + regularization penalizing kernel sum != 1.0
+  /// MSE + regularization penalizing kernel sum deviating from 1.0
   private func firLoss(filtered: Tensor, target: Tensor, kernel: Tensor) -> Tensor {
     let diff = filtered - target
     let mse = (diff * diff).mean()
     let sumDev = kernel.sum() - Tensor([1.0])
     return mse + sumDev * sumDev * Tensor([0.1])
+  }
+
+  /// Shared setup for FIR lowpass tests: noisy input, clean target, and learnable kernel.
+  private func makeFIRLowpassFixture(
+    n: Int = 64, kernelSize: Int = 7
+  ) -> (noisyTensor: Tensor, targetTensor: Tensor, kernel: Tensor) {
+    let (clean, noisy) = generateTestSignals(n: n)
+    let offset = (kernelSize - 1) / 2
+    let noisyTensor = Tensor([noisy])
+    let targetTensor = Tensor([Array(clean[offset..<(offset + n - kernelSize + 1)])])
+    let kernel = Tensor.param(
+      [1, kernelSize], data: [Float](repeating: 1.0 / Float(kernelSize), count: kernelSize))
+    return (noisyTensor, targetTensor, kernel)
   }
 
   /// conv2d with a box filter (moving average) should smooth a signal.
@@ -61,16 +74,7 @@ final class FIRFilterTests: XCTestCase {
 
   /// Train a conv2d kernel to act as a lowpass filter.
   func testLearnedFIRLowpass() throws {
-    let n = 64
-    let kernelSize = 7
-    let (clean, noisy) = generateTestSignals(n: n)
-
-    let noisyTensor = Tensor([noisy])
-    let offset = (kernelSize - 1) / 2
-    let targetTensor = Tensor([Array(clean[offset..<(offset + n - kernelSize + 1)])])
-
-    let kernel = Tensor.param(
-      [1, kernelSize], data: [Float](repeating: 1.0 / Float(kernelSize), count: kernelSize))
+    let (noisyTensor, targetTensor, kernel) = makeFIRLowpassFixture()
 
     func buildLoss() -> Tensor {
       firLoss(filtered: noisyTensor.conv2d(kernel), target: targetTensor, kernel: kernel)
@@ -109,17 +113,7 @@ final class FIRFilterTests: XCTestCase {
   /// Forward-only: realize loss without backward to verify output readout
   /// works for shape-[1] tensor losses.
   func testFIRLossForwardOnly() throws {
-    let n = 64
-    let kernelSize = 7
-    let (clean, noisy) = generateTestSignals(n: n)
-
-    let noisyTensor = Tensor([noisy])
-    let offset = (kernelSize - 1) / 2
-    let targetTensor = Tensor([Array(clean[offset..<(offset + n - kernelSize + 1)])])
-
-    let kernel = Tensor.param(
-      [1, kernelSize], data: [Float](repeating: 1.0 / Float(kernelSize), count: kernelSize))
-
+    let (noisyTensor, targetTensor, kernel) = makeFIRLowpassFixture()
     let loss = firLoss(filtered: noisyTensor.conv2d(kernel), target: targetTensor, kernel: kernel)
     let result = try loss.realize()
 
@@ -161,7 +155,7 @@ final class FIRFilterTests: XCTestCase {
     let optimizer = Adam(params: [firKernel], lr: 0.01)
 
     // Warmup
-    let _ = try buildLoss(firKernel: firKernel).backward(frames: frameCount)
+    _ = try buildLoss(firKernel: firKernel).backward(frames: frameCount)
     optimizer.zeroGrad()
 
     print("\n=== FIR Approximates One-Pole ===")

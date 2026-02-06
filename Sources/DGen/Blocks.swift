@@ -1215,13 +1215,12 @@ public func emitScalarBlockWithShapeTransitions(
   if let firstTransition = transitions.first, firstTransition.nodeIndex > 0 {
     for nodeIndex in 0..<firstTransition.nodeIndex {
       let nodeId = block.nodes[nodeIndex]
-      if let node = g.nodes[nodeId] {
-        for uop in try node.op.emit(ctx: ctx, g: g, nodeId: nodeId) {
-          emittedNodes.insert(nodeId)
-          var typedUop = uop
-          typedUop.kind = .scalar
-          uops.append(typedUop)
-        }
+      guard let node = g.nodes[nodeId] else { continue }
+      emittedNodes.insert(nodeId)
+      for uop in try node.op.emit(ctx: ctx, g: g, nodeId: nodeId) {
+        var typedUop = uop
+        typedUop.kind = .scalar
+        uops.append(typedUop)
       }
     }
   }
