@@ -491,8 +491,17 @@ public class CRenderer: Renderer {
     return code.joined(separator: "\n")
   }
 
+  /// Render a Lazy value, optionally as an integer literal for int-typed constants
+  private func emitLazyTyped(_ lazy: Lazy, ctx: IRContext, kind: Kind?, asInt: Bool) -> String {
+    if asInt, case .constant(_, let val) = lazy {
+      return "\(Int(val))"
+    }
+    return emitLazy(lazy, ctx: ctx, kind: kind, isOut: false)
+  }
+
   func emit(_ uop: UOp, ctx: IRContext) -> String {
     let g = { self.emitLazy($0, ctx: ctx, kind: uop.kind, isOut: false) }
+    let gi = { self.emitLazyTyped($0, ctx: ctx, kind: uop.kind, asInt: uop.scalarType == .int) }
 
     switch uop.op {
     case .defineConstant(let constantId, let val):
@@ -502,18 +511,21 @@ public class CRenderer: Renderer {
       return "/* t\(varId) declared globally */"
 
     case .add(let a, let b):
-      let expr = uop.kind == .simd ? "vaddq_f32(\(g(a)), \(g(b)))" : "\(g(a)) + \(g(b))"
+      let expr = uop.kind == .simd ? "vaddq_f32(\(g(a)), \(g(b)))" : "\(gi(a)) + \(gi(b))"
       return emitAssign(uop, expr, ctx)
 
     case .mul(let a, let b):
-      let expr = uop.kind == .simd ? "vmulq_f32(\(g(a)), \(g(b)))" : "\(g(a)) * \(g(b))"
+      let expr = uop.kind == .simd ? "vmulq_f32(\(g(a)), \(g(b)))" : "\(gi(a)) * \(gi(b))"
       return emitAssign(uop, expr, ctx)
 
     case .sub(let a, let b):
-      let expr = uop.kind == .simd ? "vsubq_f32(\(g(a)), \(g(b)))" : "\(g(a)) - \(g(b))"
+      let expr = uop.kind == .simd ? "vsubq_f32(\(g(a)), \(g(b)))" : "\(gi(a)) - \(gi(b))"
       return emitAssign(uop, expr, ctx)
 
     case .div(let a, let b):
+      if uop.scalarType == .int && uop.kind != .simd {
+        return emitAssign(uop, "\(gi(a)) / \(gi(b))", ctx)
+      }
       // Strength-reduce division by constant to multiply by reciprocal
       switch b {
       case .constant(_, let val):
@@ -530,6 +542,9 @@ public class CRenderer: Renderer {
       }
 
     case .mod(let a, let b):
+      if uop.scalarType == .int && uop.kind != .simd {
+        return emitAssign(uop, "\(gi(a)) % \(gi(b))", ctx)
+      }
       // Fast modulo for constant denominator: a - floor(a / b) * b
       switch b {
       case .constant(_, let val):
@@ -709,6 +724,16 @@ public class CRenderer: Renderer {
           return emitAssign(uop, gatherExpr, ctx)
         }
       } else {
+        // Check if offset is already int-typed (no cast needed)
+        let offsetIsInt: Bool
+        if case .variable(let varId, _) = offset {
+          offsetIsInt = varEmittedTypes[varId] == .int_
+        } else {
+          offsetIsInt = false
+        }
+        if offsetIsInt {
+          return emitAssign(uop, "memory[\(base) + \(g(offset))]", ctx)
+        }
         let safeOffset = "(isfinite((int) \(g(offset))) ? (int) \(g(offset)) : 0)"
         return emitAssign(
           uop,
@@ -742,7 +767,14 @@ public class CRenderer: Renderer {
             """.trimmingCharacters(in: .whitespacesAndNewlines)
         }
       } else {
-        return "memory[\(base) + (int)\(g(offset))] = \(g(value));"
+        let offsetIsInt: Bool
+        if case .variable(let varId, _) = offset {
+          offsetIsInt = varEmittedTypes[varId] == .int_
+        } else {
+          offsetIsInt = false
+        }
+        let castPrefix = offsetIsInt ? "" : "(int)"
+        return "memory[\(base) + \(castPrefix)\(g(offset))] = \(g(value));"
       }
     case .sin(let a):
       let expr = uop.kind == .simd ? "vsinf(\(g(a)))" : "sinf(\(g(a)))"
@@ -1179,14 +1211,17 @@ public class CRenderer: Renderer {
         return "\(type) \(lhs) = \(expr);"
       }
     } else {
-      // Track type as float
-      varEmittedTypes[varId] = .float_
+      // Use scalarType from UOp for int/float distinction
+      let isInt = !forceFloatType && uop.scalarType == .int
+      varEmittedTypes[varId] = isInt ? .int_ : .float_
 
       let lhs = emitLazy(
         uop.value, ctx: ctx, kind: uop.kind, isOut: true)
-      return isGlobal
-        ? "\(lhs) = \(expr);"
-        : "float \(lhs) = \(expr);"
+      if isGlobal {
+        return "\(lhs) = \(expr);"
+      }
+      let typeStr = isInt ? "int" : "float"
+      return "\(typeStr) \(lhs) = \(expr);"
     }
   }
 }

@@ -10,8 +10,8 @@ public final class IRBuilder {
     self.nodeId = nodeId
   }
 
-  public func value(_ lazy: Lazy) -> Expr {
-    return Expr(lazy, ctx: ctx, nodeId: nodeId, builder: self)
+  public func value(_ lazy: Lazy, scalarType: CastType = .float) -> Expr {
+    return Expr(lazy, ctx: ctx, nodeId: nodeId, builder: self, scalarType: scalarType)
   }
 
   func values(_ inputs: [Lazy], count: Int) -> (Expr, Expr) {
@@ -31,7 +31,15 @@ public final class IRBuilder {
 
   public func constant(_ v: Float) -> Expr {
     let l = ctx.useConstant(src: nodeId, value: v)
-    return value(l)
+    return value(l, scalarType: .float)
+  }
+
+  /// Create an integer-typed constant expression for index calculations.
+  /// The value is stored as Float internally but tagged as .int so renderers
+  /// emit integer declarations and arithmetic stays in int until mixed with float.
+  public func intConstant(_ v: Int) -> Expr {
+    let l = ctx.useConstant(src: nodeId, value: Float(v))
+    return value(l, scalarType: .int)
   }
 
   public func load(_ cell: CellID, _ nodeId: NodeID? = nil) -> Expr {
@@ -89,9 +97,10 @@ public final class IRBuilder {
 
   func frameIndex(_ nodeId: NodeID) -> Expr {
     let dest = ctx.useVariable(src: nodeId)
-    let uop = UOp(op: .frameIndex, value: dest)
+    var uop = UOp(op: .frameIndex, value: dest)
+    uop.scalarType = .int
     ops.append(uop)
-    return value(uop.value)
+    return value(uop.value, scalarType: .int)
   }
 
   func mutate(_ target: Expr, to newValue: Expr) {
@@ -317,7 +326,7 @@ public final class IRBuilder {
   /// Used for tensors that need per-frame storage to enable parallelism
   public func frameAwareTensorRead(cellId: CellID, tensorSize: Int, elemIdx: Expr) -> Expr {
     let frameIdx = frameIndex(nodeId)
-    let offset = frameIdx * constant(Float(tensorSize)) + elemIdx
+    let offset = frameIdx * intConstant(tensorSize) + elemIdx
     return memoryRead(cellId, cast(offset, to: .int))
   }
 
@@ -325,7 +334,7 @@ public final class IRBuilder {
   public func frameAwareTensorRead(cellId: CellID, tensorSize: Int, frameIdx: Expr, elemIdx: Expr)
     -> Expr
   {
-    let offset = frameIdx * constant(Float(tensorSize)) + elemIdx
+    let offset = frameIdx * intConstant(tensorSize) + elemIdx
     return memoryRead(cellId, cast(offset, to: .int))
   }
 
@@ -334,7 +343,7 @@ public final class IRBuilder {
     -> Expr
   {
     let frameIdx = frameIndex(nodeId)
-    let offset = frameIdx * constant(Float(tensorSize)) + elemIdx
+    let offset = frameIdx * intConstant(tensorSize) + elemIdx
     return memoryWrite(cellId, cast(offset, to: .int), value)
   }
 
@@ -342,7 +351,7 @@ public final class IRBuilder {
   public func frameAwareTensorWrite(
     cellId: CellID, tensorSize: Int, frameIdx: Expr, elemIdx: Expr, value: Expr
   ) -> Expr {
-    let offset = frameIdx * constant(Float(tensorSize)) + elemIdx
+    let offset = frameIdx * intConstant(tensorSize) + elemIdx
     return memoryWrite(cellId, cast(offset, to: .int), value)
   }
 
@@ -559,7 +568,7 @@ public final class IRBuilder {
   /// Create an integer constant expression (for index calculations)
   public func int(_ value: Int) -> Expr {
     let constLazy = ctx.useConstant(src: nodeId, value: Float(value))
-    return Expr(constLazy, ctx: ctx, nodeId: nodeId, builder: self)
+    return Expr(constLazy, ctx: ctx, nodeId: nodeId, builder: self, scalarType: .int)
   }
 
   /// Add two expressions
@@ -596,7 +605,7 @@ public final class IRBuilder {
     let loopVar = ctx.useVariable(src: nodeId)
     let countLazy = ctx.useConstant(src: nodeId, value: Float(count))
     ops.append(UOp(op: .beginForLoop(loopVar, countLazy), value: loopVar))
-    body(value(loopVar))
+    body(value(loopVar, scalarType: .int))
     ops.append(UOp(op: .endLoop, value: ctx.useVariable(src: nil)))
   }
 
@@ -631,7 +640,7 @@ public final class IRBuilder {
     }
 
     ops.append(UOp(op: .beginParallelRange(count, incr), value: indexVar))
-    body(value(indexVar))
+    body(value(indexVar, scalarType: .int))
     ops.append(UOp(op: .endParallelRange, value: ctx.useVariable(src: nil)))
     if case .simd = kind {
       ops = ops.map { UOp(op: $0.op, value: $0.value, kind: $0.kind, kindOverride: .simd) }
@@ -652,9 +661,10 @@ public final class IRBuilder {
 
   public func threadIndex() -> Expr {
     let dest = ctx.useVariable(src: nodeId)
-    let uop = UOp(op: .threadIndex, value: dest)
+    var uop = UOp(op: .threadIndex, value: dest)
+    uop.scalarType = .int
     ops.append(uop)
-    return value(dest)
+    return value(dest, scalarType: .int)
   }
 
   /// Returns the current frame index. In normal blocks, this is the thread index.
@@ -662,7 +672,7 @@ public final class IRBuilder {
   /// the flat thread decomposition (flat index / tensor size).
   public func currentFrameIndex() -> Expr {
     if ctx.isInFrameAwareTensorBlock, let frameIdx = ctx.frameAwareTensorFrameIndex {
-      return value(frameIdx)
+      return value(frameIdx, scalarType: .int)
     }
     // Fall back to thread index for normal blocks
     return threadIndex()
@@ -672,9 +682,10 @@ public final class IRBuilder {
   /// This returns _frameIndex if setFrameIndex was called, otherwise falls back to thread index.
   public func frameIndex() -> Expr {
     let dest = ctx.useVariable(src: nodeId)
-    let uop = UOp(op: .frameIndex, value: dest)
+    var uop = UOp(op: .frameIndex, value: dest)
+    uop.scalarType = .int
     ops.append(uop)
-    return value(dest)
+    return value(dest, scalarType: .int)
   }
 
   /// Frame count (runtime parameter)
@@ -706,92 +717,110 @@ public final class IRBuilder {
   }
 
   public func cast(_ expr: Expr, to type: CastType) -> Expr {
+    // If already the right type, skip the cast
+    if expr.scalarType == type { return expr }
     let dest = ctx.useVariable(src: nodeId)
-    let uop = UOp(op: .cast(expr.lazy, type), value: dest)
+    var uop = UOp(op: .cast(expr.lazy, type), value: dest)
+    uop.scalarType = type
     ops.append(uop)
-    return value(dest)
+    return value(dest, scalarType: type)
   }
 }
 
 public struct Expr {
   public let lazy: Lazy
+  public let scalarType: CastType
   private let ctx: IRContext
   private let nodeId: NodeID
   private unowned let builder: IRBuilder
 
-  init(_ lazy: Lazy, ctx: IRContext, nodeId: NodeID, builder: IRBuilder) {
+  init(_ lazy: Lazy, ctx: IRContext, nodeId: NodeID, builder: IRBuilder, scalarType: CastType = .float) {
     self.lazy = lazy
     self.ctx = ctx
     self.nodeId = nodeId
     self.builder = builder
+    self.scalarType = scalarType
+  }
+
+  /// Compute the result scalarType: int op int → int, otherwise float
+  private static func promotedType(_ lhs: Expr, _ rhs: Expr) -> CastType {
+    return (lhs.scalarType == .int && rhs.scalarType == .int) ? .int : .float
   }
 
   // Operators emit automatically
   static func + (lhs: Expr, rhs: Expr) -> Expr {
+    let resultType = promotedType(lhs, rhs)
     if case .constant(let lconst) = lhs.lazy {
       if case .constant(let hconst) = rhs.lazy {
         let sum = lconst.1 + hconst.1
         let ctx = lhs.ctx
         return Expr(
           ctx.useConstant(src: lhs.nodeId, value: sum), ctx: lhs.ctx, nodeId: lhs.nodeId,
-          builder: lhs.builder)
+          builder: lhs.builder, scalarType: resultType)
       }
     }
     let thunk = u_add(lhs.lazy, rhs.lazy)
-    let uop = thunk(lhs.ctx, nil)
+    var uop = thunk(lhs.ctx, nil)
+    uop.scalarType = resultType
     lhs.builder.ops.append(uop)
-    return Expr(uop.value, ctx: lhs.ctx, nodeId: lhs.nodeId, builder: lhs.builder)
+    return Expr(uop.value, ctx: lhs.ctx, nodeId: lhs.nodeId, builder: lhs.builder, scalarType: resultType)
   }
 
   static func / (lhs: Expr, rhs: Expr) -> Expr {
+    let resultType = promotedType(lhs, rhs)
     if case .constant(let lconst) = lhs.lazy {
       if case .constant(let hconst) = rhs.lazy {
         let sum = lconst.1 / hconst.1
         let ctx = lhs.ctx
         return Expr(
           ctx.useConstant(src: lhs.nodeId, value: sum), ctx: lhs.ctx, nodeId: lhs.nodeId,
-          builder: lhs.builder)
+          builder: lhs.builder, scalarType: resultType)
       }
     }
 
     let thunk = u_div(lhs.lazy, rhs.lazy)
-    let uop = thunk(lhs.ctx, nil)
+    var uop = thunk(lhs.ctx, nil)
+    uop.scalarType = resultType
     lhs.builder.ops.append(uop)
-    return Expr(uop.value, ctx: lhs.ctx, nodeId: lhs.nodeId, builder: lhs.builder)
+    return Expr(uop.value, ctx: lhs.ctx, nodeId: lhs.nodeId, builder: lhs.builder, scalarType: resultType)
   }
 
   static func * (lhs: Expr, rhs: Expr) -> Expr {
+    let resultType = promotedType(lhs, rhs)
     if case .constant(_, let lconst) = lhs.lazy {
       if case .constant(_, let hconst) = rhs.lazy {
         let sum = lconst * hconst
         let ctx = lhs.ctx
         return Expr(
           ctx.useConstant(src: lhs.nodeId, value: sum), ctx: lhs.ctx, nodeId: lhs.nodeId,
-          builder: lhs.builder)
+          builder: lhs.builder, scalarType: resultType)
       }
     }
 
     let thunk = u_mul(lhs.lazy, rhs.lazy)
-    let uop = thunk(lhs.ctx, nil)
+    var uop = thunk(lhs.ctx, nil)
+    uop.scalarType = resultType
     lhs.builder.ops.append(uop)
-    return Expr(uop.value, ctx: lhs.ctx, nodeId: lhs.nodeId, builder: lhs.builder)
+    return Expr(uop.value, ctx: lhs.ctx, nodeId: lhs.nodeId, builder: lhs.builder, scalarType: resultType)
   }
 
   static func - (lhs: Expr, rhs: Expr) -> Expr {
+    let resultType = promotedType(lhs, rhs)
     if case .constant(_, let lconst) = lhs.lazy {
       if case .constant(_, let hconst) = rhs.lazy {
         let sum = lconst - hconst
         let ctx = lhs.ctx
         return Expr(
           ctx.useConstant(src: lhs.nodeId, value: sum), ctx: lhs.ctx, nodeId: lhs.nodeId,
-          builder: lhs.builder)
+          builder: lhs.builder, scalarType: resultType)
       }
     }
 
     let thunk = u_sub(lhs.lazy, rhs.lazy)
-    let uop = thunk(lhs.ctx, nil)
+    var uop = thunk(lhs.ctx, nil)
+    uop.scalarType = resultType
     lhs.builder.ops.append(uop)
-    return Expr(uop.value, ctx: lhs.ctx, nodeId: lhs.nodeId, builder: lhs.builder)
+    return Expr(uop.value, ctx: lhs.ctx, nodeId: lhs.nodeId, builder: lhs.builder, scalarType: resultType)
   }
 
   static func > (lhs: Expr, rhs: Expr) -> Expr {
@@ -830,10 +859,12 @@ public struct Expr {
   }
 
   static func % (lhs: Expr, rhs: Expr) -> Expr {
+    let resultType = promotedType(lhs, rhs)
     let thunk = u_mod(lhs.lazy, rhs.lazy)
-    let uop = thunk(lhs.ctx, nil)
+    var uop = thunk(lhs.ctx, nil)
+    uop.scalarType = resultType
     lhs.builder.ops.append(uop)
-    return Expr(uop.value, ctx: lhs.ctx, nodeId: lhs.nodeId, builder: lhs.builder)
+    return Expr(uop.value, ctx: lhs.ctx, nodeId: lhs.nodeId, builder: lhs.builder, scalarType: resultType)
   }
 
 }
