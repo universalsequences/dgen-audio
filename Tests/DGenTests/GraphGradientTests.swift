@@ -1,7 +1,7 @@
 import XCTest
 
 @testable import DGen
-@testable import DGenFrontend
+
 
 /// Tests for the new graph-based gradient computation (Gradients.swift)
 /// This approach builds gradients as LazyOps in the graph, rather than

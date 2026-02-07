@@ -1,7 +1,7 @@
 import XCTest
 
 @testable import DGen
-@testable import DGenFrontend
+
 
 final class FrameTensorChainTests: XCTestCase {
 

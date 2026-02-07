@@ -1,7 +1,7 @@
 import XCTest
 
 @testable import DGen
-@testable import DGenFrontend
+
 
 /// Tests for view operations: expandView and pool
 /// These operations manipulate tensor strides/shapes without copying data
