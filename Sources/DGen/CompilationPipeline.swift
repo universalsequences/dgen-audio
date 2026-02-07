@@ -895,14 +895,22 @@ func determineTensorBlocks(_ blocks: [Block], _ graph: Graph, _ ctx: IRContext) 
           continue  // Skip the append at end of loop
         } else if case .tensor(let shape) = node.shape {
           if shape != currentShape {
-            if currentBlock.nodes.count > 0 {
-              innerBlocks.append(currentBlock)
+            // Axis reduces (sumAxis, maxAxis, meanAxis) can stay in the same block
+            // as their input — each output thread reduces over an independent slice.
+            // Don't change block kind — shape-transition emission handles the different
+            // element counts via per-region loops while keeping the block parallelizable.
+            if currentShape != nil && isAxisReduceOp(node.op) {
+              currentShape = shape
+            } else {
+              if currentBlock.nodes.count > 0 {
+                innerBlocks.append(currentBlock)
+              }
+              // tensor block
+              currentBlock = makeBlock(from: block)
+              currentBlock.tensorIndex = ctx.useVariable(src: nil)
+              currentBlock.shape = shape
+              currentShape = shape
             }
-            // tensor block
-            currentBlock = makeBlock(from: block)
-            currentBlock.tensorIndex = ctx.useVariable(src: nil)
-            currentBlock.shape = shape
-            currentShape = shape
           }
         } else {
           if currentShape != nil {

@@ -35,11 +35,6 @@ extension LazyOp {
       try emitBinaryOp(b: b, g: g, node: node, inputs: inputs) { $0 - $1 }
     case .mul:
       guard inputs.count == 2 else {
-        let fullInputs: [Lazy?] = node.inputs.map { ctx.values[$0] }
-        let nilIndex = fullInputs.firstIndex { $0 == nil }.map(String.init) ?? "none"
-        print(
-          "mul failing \(node.id) nilIndex=\(nilIndex) fullInputs=\(fullInputs) node.inputs=\(node.inputs)"
-        )
         throw DGenError.insufficientInputs(
           operator: "mul", expected: 2, actual: inputs.count)
       }
@@ -263,7 +258,7 @@ extension LazyOp {
     case .fft, .ifft:
       try emitFFT(b: b, ctx: ctx, g: g, node: node, inputs: inputs, nodeId: nodeId)
 
-    case .conv1d, .conv2d, .sum, .sumAxis, .reshape, .asStrided, .transpose, .shrink,
+    case .conv1d, .conv2d, .sum, .sumAxis, .maxAxis, .meanAxis, .reshape, .asStrided, .transpose, .shrink,
       .pad, .expandView, .repeatView, .peek, .expand, .expandAxis, .gradPhasor:
       try emitTensorOp(b: b, ctx: ctx, g: g, node: node, inputs: inputs, nodeId: nodeId, ops: &ops)
 

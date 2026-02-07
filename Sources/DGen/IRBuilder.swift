@@ -219,10 +219,11 @@ public struct Expr {
     return emitBinaryOp(lhs, rhs, thunk: u_add)
   }
 
-  /// Subtract. Folds constants, eliminates `x - 0`.
+  /// Subtract. Folds constants, eliminates `x - 0` and `x - x`.
   static func - (lhs: Expr, rhs: Expr) -> Expr {
     if let folded = foldConstants(lhs, rhs, op: -) { return folded }
     if rhs.constantValue == 0, promotedType(lhs, rhs) == lhs.scalarType { return lhs }
+    if lhs.lazy == rhs.lazy { return makeTypedConstant(0, lhs, rhs) }
     return emitBinaryOp(lhs, rhs, thunk: u_sub)
   }
 
@@ -293,6 +294,11 @@ public struct MutableVar {
     // Emit: self = self + expr
     let sum = value + expr
     let uop = UOp(op: .mutate(lazy, sum.lazy), value: lazy)
+    builder.ops.append(uop)
+  }
+
+  public func mutate(to expr: Expr) {
+    let uop = UOp(op: .mutate(lazy, expr.lazy), value: lazy)
     builder.ops.append(uop)
   }
 }
