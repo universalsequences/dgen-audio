@@ -1231,8 +1231,9 @@ public func emitScalarBlockWithShapeTransitions(
       case .mul = mulNode.op,
       mulNode.inputs.count == 2
     else { continue }
-    let regionNodeIds = Set(block.nodes[transition.nodeIndex..<regionEnd])
-    guard regionNodeIds.contains(mulNodeId) else { continue }
+    let regionSlice = block.nodes[transition.nodeIndex..<regionEnd]
+    let regionSet = Set(regionSlice)
+    guard regionSet.contains(mulNodeId) else { continue }
 
     // Get the intermediate tensor (mul's output)
     // Only fuse if it's not needed by later blocks (block-level outbound)
@@ -1251,8 +1252,7 @@ public func emitScalarBlockWithShapeTransitions(
 
     // Only skip if ALL nodes in the region are matmul-expand related
     // AND no node in the region is consumed by anything outside the region + sumAxis.
-    let regionNodeIds2 = block.nodes[transition.nodeIndex..<regionEnd]
-    let allExpandRelated = regionNodeIds2.allSatisfy { nid in
+    let allExpandRelated = regionSlice.allSatisfy { nid in
       guard let n = g.nodes[nid] else { return true }
       if nid == mulNodeId { return true }
       switch n.op {
@@ -1267,12 +1267,10 @@ public func emitScalarBlockWithShapeTransitions(
 
     // Check that no non-tensorRef node in the region is consumed outside the region.
     // Must scan ALL graph nodes since ctx.values is shared across blocks.
-    let regionSet = Set(regionNodeIds2)
     let safeConsumers = regionSet.union([nextNodeId]) // region nodes + the sumAxis
-    // Collect non-tensorRef region node IDs (tensorRef are always emitted in skipped regions)
+    // Non-tensorRef region nodes — tensorRef are always emitted in skipped regions
     let skippableNodeIds = regionSet.filter { nid in
-      guard let n = g.nodes[nid] else { return false }
-      if case .tensorRef(_) = n.op { return false }
+      if let n = g.nodes[nid], case .tensorRef(_) = n.op { return false }
       return true
     }
     var hasExternalConsumers = false
