@@ -1668,8 +1668,19 @@ public func emitBlockUOps(
 
 public func isReductionOp(_ op: LazyOp) -> Bool {
   switch op {
-  case .sum, .sumAxis, .maxAxis, .meanAxis, .tensorAccumulate, .peekRowGradReduce,
+  case .sum, .tensorAccumulate, .peekRowGradReduce,
     .selectRowGradReduce:
+    return true
+  default:
+    return false
+  }
+}
+
+/// Axis reduces (sumAxis, maxAxis, meanAxis) can be fused with their input
+/// because each output element reduces over an independent slice — no cross-thread barrier needed.
+public func isAxisReduceOp(_ op: LazyOp) -> Bool {
+  switch op {
+  case .sumAxis, .maxAxis, .meanAxis:
     return true
   default:
     return false
