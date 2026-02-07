@@ -181,11 +181,21 @@ extension LazyOp {
           inFlatIdx = inFlatIdx + inIndices[i] * b.intConstant(inStrides[i])
         }
 
-        // Read from input tensor
-        // Always use tensorRead for padded tensors - it handles padding bounds checking
-        // tensorRead also handles frame-aware tensors internally
+        // Read from input tensor — or compute inline if fused with expand
         let val: Expr
-        if inTensor.padding != nil {
+        if let (aTensor, bTensor) = ctx.inlineableReduceInputs[inTensor.cellId] {
+          // Fused path: compute A * B inline instead of reading from memory.
+          // The mul's input tensors have view transforms (reshape, expand) that
+          // handle broadcasting — tensorRead walks the transform chain to map
+          // [M,N,K] indices back to the correct base memory locations.
+          let broadcastedA = b.broadcastIndices(
+            outputIndices: inIndices, outputShape: inShape, inputTensor: aTensor)
+          let broadcastedB = b.broadcastIndices(
+            outputIndices: inIndices, outputShape: inShape, inputTensor: bTensor)
+          let aVal = b.tensorRead(aTensor, indices: broadcastedA)
+          let bVal = b.tensorRead(bTensor, indices: broadcastedB)
+          val = aVal * bVal
+        } else if inTensor.padding != nil {
           // Padded tensor: must use tensorRead for padding bounds checking
           val = b.tensorRead(inTensor, indices: inIndices)
         } else if inIsFrameAware {

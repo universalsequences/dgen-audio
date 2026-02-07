@@ -35,11 +35,6 @@ extension LazyOp {
       try emitBinaryOp(b: b, g: g, node: node, inputs: inputs) { $0 - $1 }
     case .mul:
       guard inputs.count == 2 else {
-        let fullInputs: [Lazy?] = node.inputs.map { ctx.values[$0] }
-        let nilIndex = fullInputs.firstIndex { $0 == nil }.map(String.init) ?? "none"
-        print(
-          "mul failing \(node.id) nilIndex=\(nilIndex) fullInputs=\(fullInputs) node.inputs=\(node.inputs)"
-        )
         throw DGenError.insufficientInputs(
           operator: "mul", expected: 2, actual: inputs.count)
       }

@@ -54,6 +54,11 @@ public class IRContext {
     tensorCellToVar = [:]
   }
 
+  /// Fused axis reduce: maps intermediate cellId → (inputA tensor, inputB tensor)
+  /// When sumAxis sees its input cell here, it computes A * B inline
+  /// instead of reading the pre-computed product from memory.
+  public var inlineableReduceInputs: [CellID: (Tensor, Tensor)] = [:]
+
   /// Check if a node is part of a frame-dependent tensor chain
   public func isPartOfFrameTensorChain(_ nodeId: NodeID) -> Bool {
     return frameTensorChainNodes.contains(nodeId)

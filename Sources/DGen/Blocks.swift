@@ -1179,11 +1179,14 @@ public func emitScalarBlockWithShapeTransitions(
   var uops: [UOp] = []
   var emittedNodes: Set<NodeID> = []
 
+  // Clear inline state from previous blocks
+  ctx.inlineableReduceInputs = [:]
+
   // Track outbound cells for register optimization
-  // Include both cross-block outbound AND cross-region outbound (shape transitions)
-  // Use ALL blocks to correctly detect cells needed by later blocks (e.g., sum after feedback loop)
-  var outbound = findOutboundTensorCells(blocks, g, block: block)
+  // Block-level outbound: cells needed by LATER blocks (cross-block dependencies)
+  let blockOutbound = findOutboundTensorCells(blocks, g, block: block)
   let crossRegion = findCrossRegionOutboundCells(block: block, g: g, transitions: transitions)
+  var outbound = blockOutbound
   outbound.formUnion(crossRegion)
 
   // Mark conv2d/conv1d input tensors as outbound - they use memoryRead() directly
@@ -1203,6 +1206,90 @@ public func emitScalarBlockWithShapeTransitions(
     {
       outbound.insert(tensor.cellId)
     }
+  }
+
+  // Detect fusable expand→axis-reduce pairs.
+  // When an element-wise mul feeds directly into a sumAxis in the next region,
+  // we can skip the expand region and have sumAxis compute the product inline.
+  var skipRegions = Set<Int>()
+  for (idx, transition) in transitions.enumerated() {
+    let nextIdx = idx + 1
+    guard nextIdx < transitions.count else { continue }
+
+    let nextTransition = transitions[nextIdx]
+    let regionEnd = nextTransition.nodeIndex
+
+    // Next region must start with an axis reduce
+    let nextNodeId = block.nodes[nextTransition.nodeIndex]
+    guard let nextNode = g.nodes[nextNodeId],
+      isAxisReduceOp(nextNode.op)
+    else { continue }
+
+    // Axis reduce's input must be a mul in this region
+    let mulNodeId = nextNode.inputs[0]
+    guard let mulNode = g.nodes[mulNodeId],
+      case .mul = mulNode.op,
+      mulNode.inputs.count == 2
+    else { continue }
+    let regionNodeIds = Set(block.nodes[transition.nodeIndex..<regionEnd])
+    guard regionNodeIds.contains(mulNodeId) else { continue }
+
+    // Get the intermediate tensor (mul's output)
+    // Only fuse if it's not needed by later blocks (block-level outbound)
+    guard let intermediateTensorId = g.nodeToTensor[mulNodeId],
+      let intermediateTensor = g.tensors[intermediateTensorId]
+    else { continue }
+    let intermediateCell = intermediateTensor.cellId
+    guard !blockOutbound.contains(intermediateCell) else { continue }
+
+    // Get mul's input tensors for inline computation
+    guard let aTensorId = g.nodeToTensor[mulNode.inputs[0]],
+      let aTensor = g.tensors[aTensorId],
+      let bTensorId = g.nodeToTensor[mulNode.inputs[1]],
+      let bTensor = g.tensors[bTensorId]
+    else { continue }
+
+    // Only skip if ALL nodes in the region are matmul-expand related
+    // AND no node in the region is consumed by anything outside the region + sumAxis.
+    let regionNodeIds2 = block.nodes[transition.nodeIndex..<regionEnd]
+    let allExpandRelated = regionNodeIds2.allSatisfy { nid in
+      guard let n = g.nodes[nid] else { return true }
+      if nid == mulNodeId { return true }
+      switch n.op {
+      case .tensorRef(_), .reshape(_), .transpose(_), .expand,
+           .expandAxis(_, _), .expandView, .shrink(_), .constant(_):
+        return true
+      default:
+        return false
+      }
+    }
+    guard allExpandRelated else { continue }
+
+    // Check that no non-tensorRef node in the region is consumed outside the region.
+    // Must scan ALL graph nodes since ctx.values is shared across blocks.
+    let regionSet = Set(regionNodeIds2)
+    let safeConsumers = regionSet.union([nextNodeId]) // region nodes + the sumAxis
+    // Collect non-tensorRef region node IDs (tensorRef are always emitted in skipped regions)
+    let skippableNodeIds = regionSet.filter { nid in
+      guard let n = g.nodes[nid] else { return false }
+      if case .tensorRef(_) = n.op { return false }
+      return true
+    }
+    var hasExternalConsumers = false
+    for (consumerId, consumerNode) in g.nodes {
+      guard !safeConsumers.contains(consumerId) else { continue }
+      if consumerNode.inputs.contains(where: { skippableNodeIds.contains($0) }) {
+        hasExternalConsumers = true
+        break
+      }
+    }
+    guard !hasExternalConsumers else { continue }
+
+    skipRegions.insert(idx)
+    // Remove intermediate from outbound (no memory write needed)
+    outbound.remove(intermediateCell)
+    // Store inline info for the sumAxis emitter
+    ctx.inlineableReduceInputs[intermediateCell] = (aTensor, bTensor)
   }
 
   ctx.outboundTensorCells = outbound
@@ -1228,6 +1315,29 @@ public func emitScalarBlockWithShapeTransitions(
   // Group nodes by their shape region
   var regionStart = 0
   for (transitionIdx, transition) in transitions.enumerated() {
+    // For skipped expand regions, only emit metadata nodes (tensorRef)
+    // that set ctx.values placeholders needed by downstream ops.
+    // Skip the computation loop entirely — sumAxis will inline the mul.
+    if skipRegions.contains(transitionIdx) {
+      let regionEnd =
+        transitionIdx + 1 < transitions.count
+        ? transitions[transitionIdx + 1].nodeIndex
+        : block.nodes.count
+      for nodeIndex in transition.nodeIndex..<regionEnd {
+        let nodeId = block.nodes[nodeIndex]
+        guard let node = g.nodes[nodeId] else { continue }
+        if case .tensorRef(_) = node.op {
+          emittedNodes.insert(nodeId)
+          for uop in try node.op.emit(ctx: ctx, g: g, nodeId: nodeId) {
+            var typedUop = uop
+            typedUop.kind = .scalar
+            uops.append(typedUop)
+          }
+        }
+      }
+      continue
+    }
+
     let regionEnd =
       transitionIdx + 1 < transitions.count
       ? transitions[transitionIdx + 1].nodeIndex
