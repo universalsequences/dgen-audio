@@ -169,6 +169,12 @@ public struct Expr {
     return Expr(uop.value, ctx: lhs.ctx, nodeId: lhs.nodeId, builder: lhs.builder)
   }
 
+  /// The constant value of this expression, or nil if not a compile-time constant.
+  private var constantValue: Float? {
+    if case .constant(_, let v) = lazy { return v }
+    return nil
+  }
+
   /// Try constant folding for a binary op; returns nil if either operand is not a constant.
   /// When both operands are int-typed, the result is truncated to match GPU int arithmetic.
   private static func foldConstants(
@@ -185,45 +191,83 @@ public struct Expr {
       folded, ctx: lhs.ctx, nodeId: lhs.nodeId, builder: lhs.builder, scalarType: resultType)
   }
 
-  // Operators emit automatically
+  /// Try constant folding for a comparison op; returns nil if either is not a constant.
+  /// Evaluates to 1.0 (true) or 0.0 (false) as a float-typed constant.
+  private static func foldComparison(
+    _ lhs: Expr, _ rhs: Expr, op: (Float, Float) -> Bool
+  ) -> Expr? {
+    guard let lval = lhs.constantValue, let rval = rhs.constantValue else { return nil }
+    let result: Float = op(lval, rval) ? 1.0 : 0.0
+    let folded = lhs.ctx.useConstant(src: lhs.nodeId, value: result)
+    return Expr(folded, ctx: lhs.ctx, nodeId: lhs.nodeId, builder: lhs.builder)
+  }
+
+  /// Create a typed constant using the promoted type of two operands.
+  private static func makeTypedConstant(_ value: Float, _ lhs: Expr, _ rhs: Expr) -> Expr {
+    let resultType = promotedType(lhs, rhs)
+    let c = lhs.ctx.useConstant(src: lhs.nodeId, value: value)
+    return Expr(c, ctx: lhs.ctx, nodeId: lhs.nodeId, builder: lhs.builder, scalarType: resultType)
+  }
+
+  // MARK: - Arithmetic Operators (with constant folding and identity elimination)
+
+  /// Add. Folds constants, eliminates `x + 0` and `0 + x`.
   static func + (lhs: Expr, rhs: Expr) -> Expr {
-    return foldConstants(lhs, rhs, op: +) ?? emitBinaryOp(lhs, rhs, thunk: u_add)
+    if let folded = foldConstants(lhs, rhs, op: +) { return folded }
+    if rhs.constantValue == 0, promotedType(lhs, rhs) == lhs.scalarType { return lhs }
+    if lhs.constantValue == 0, promotedType(lhs, rhs) == rhs.scalarType { return rhs }
+    return emitBinaryOp(lhs, rhs, thunk: u_add)
   }
 
+  /// Subtract. Folds constants, eliminates `x - 0`.
   static func - (lhs: Expr, rhs: Expr) -> Expr {
-    return foldConstants(lhs, rhs, op: -) ?? emitBinaryOp(lhs, rhs, thunk: u_sub)
+    if let folded = foldConstants(lhs, rhs, op: -) { return folded }
+    if rhs.constantValue == 0, promotedType(lhs, rhs) == lhs.scalarType { return lhs }
+    return emitBinaryOp(lhs, rhs, thunk: u_sub)
   }
 
+  /// Multiply. Folds constants, eliminates `x * 1` / `1 * x`, and `x * 0` / `0 * x`.
   static func * (lhs: Expr, rhs: Expr) -> Expr {
-    return foldConstants(lhs, rhs, op: *) ?? emitBinaryOp(lhs, rhs, thunk: u_mul)
+    if let folded = foldConstants(lhs, rhs, op: *) { return folded }
+    if rhs.constantValue == 1, promotedType(lhs, rhs) == lhs.scalarType { return lhs }
+    if lhs.constantValue == 1, promotedType(lhs, rhs) == rhs.scalarType { return rhs }
+    if rhs.constantValue == 0 || lhs.constantValue == 0 {
+      return makeTypedConstant(0, lhs, rhs)
+    }
+    return emitBinaryOp(lhs, rhs, thunk: u_mul)
   }
 
+  /// Divide. Folds constants, eliminates `x / 1`.
   static func / (lhs: Expr, rhs: Expr) -> Expr {
-    return foldConstants(lhs, rhs, op: /) ?? emitBinaryOp(lhs, rhs, thunk: u_div)
+    if let folded = foldConstants(lhs, rhs, op: /) { return folded }
+    if rhs.constantValue == 1, promotedType(lhs, rhs) == lhs.scalarType { return lhs }
+    return emitBinaryOp(lhs, rhs, thunk: u_div)
   }
+
+  // MARK: - Comparison Operators (with constant folding)
 
   static func > (lhs: Expr, rhs: Expr) -> Expr {
-    return emitComparisonOp(lhs, rhs, thunk: u_gt)
+    return foldComparison(lhs, rhs, op: >) ?? emitComparisonOp(lhs, rhs, thunk: u_gt)
   }
 
   static func >= (lhs: Expr, rhs: Expr) -> Expr {
-    return emitComparisonOp(lhs, rhs, thunk: u_gte)
+    return foldComparison(lhs, rhs, op: >=) ?? emitComparisonOp(lhs, rhs, thunk: u_gte)
   }
 
   static func <= (lhs: Expr, rhs: Expr) -> Expr {
-    return emitComparisonOp(lhs, rhs, thunk: u_lte)
+    return foldComparison(lhs, rhs, op: <=) ?? emitComparisonOp(lhs, rhs, thunk: u_lte)
   }
 
   static func < (lhs: Expr, rhs: Expr) -> Expr {
-    return emitComparisonOp(lhs, rhs, thunk: u_lt)
+    return foldComparison(lhs, rhs, op: <) ?? emitComparisonOp(lhs, rhs, thunk: u_lt)
   }
 
   static func == (lhs: Expr, rhs: Expr) -> Expr {
-    return emitComparisonOp(lhs, rhs, thunk: u_eq)
+    return foldComparison(lhs, rhs, op: ==) ?? emitComparisonOp(lhs, rhs, thunk: u_eq)
   }
 
   static func % (lhs: Expr, rhs: Expr) -> Expr {
-    return emitBinaryOp(lhs, rhs, thunk: u_mod)
+    return foldConstants(lhs, rhs, op: { fmodf($0, $1) }) ?? emitBinaryOp(lhs, rhs, thunk: u_mod)
   }
 
 }
