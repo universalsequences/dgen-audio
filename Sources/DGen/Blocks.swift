@@ -1622,7 +1622,9 @@ public func emitBlockUOps(
   // Shape-aware emission for blocks with shape transitions
   // Both Metal and C need this when shapes change (e.g., matmul [M,K] @ [K,N] -> [M,N,K] product)
   // Without this, the outer loop uses the wrong shape, producing incorrect results
-  let useShapeAwareEmission = block.kind == .scalar && hasMultipleShapes
+  // Triggers for any block with multiple shapes — not just scalar blocks — so that
+  // fused axis reduces (which keep their block SIMD) still get per-region loops.
+  let useShapeAwareEmission = hasMultipleShapes
 
   if useShapeAwareEmission {
     // Use specialized emission with per-shape element loops

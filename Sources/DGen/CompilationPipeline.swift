@@ -897,9 +897,9 @@ func determineTensorBlocks(_ blocks: [Block], _ graph: Graph, _ ctx: IRContext) 
           if shape != currentShape {
             // Axis reduces (sumAxis, maxAxis, meanAxis) can stay in the same block
             // as their input — each output thread reduces over an independent slice.
-            // Convert to scalar so shape transitions handle the different element counts.
+            // Don't change block kind — shape-transition emission handles the different
+            // element counts via per-region loops while keeping the block parallelizable.
             if currentShape != nil && isAxisReduceOp(node.op) {
-              currentBlock.kind = .scalar
               currentShape = shape
             } else {
               if currentBlock.nodes.count > 0 {

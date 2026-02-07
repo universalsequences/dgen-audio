@@ -151,7 +151,7 @@ extension LazyOp {
       }
 
       b.loop(inShape[axis]) { reduceIdx in
-        let rIdx = b.cast(reduceIdx, to: .float)
+        let rIdx = reduceIdx
 
         // Convert flat outIdx to multi-dimensional output indices
         var outIndices = [Expr]()
@@ -252,7 +252,7 @@ extension LazyOp {
       }
 
       b.loop(inShape[axis]) { reduceIdx in
-        let rIdx = b.cast(reduceIdx, to: .float)
+        let rIdx = reduceIdx
 
         var outIndices = [Expr]()
         var remaining = b.cast(outIdxMax, to: .int)
@@ -334,7 +334,7 @@ extension LazyOp {
       }
 
       b.loop(inShape[axis]) { reduceIdx in
-        let rIdx = b.cast(reduceIdx, to: .float)
+        let rIdx = reduceIdx
 
         var outIndices = [Expr]()
         var remaining = b.cast(outIdxMean, to: .int)
