@@ -208,6 +208,171 @@ extension LazyOp {
         }
       }
 
+    case .maxAxis(let axis):
+      guard case .tensor(let inShape) = g.nodes[node.inputs[0]]?.shape,
+        case .tensor(let outShape) = node.shape,
+        let inTensor = g.nodeToTensor[node.inputs[0]].flatMap({ g.tensors[$0] }),
+        let outCell = g.nodeToTensor[node.id].flatMap({ g.tensors[$0] })?.cellId,
+        let loopIdx = b.ctx.tensorIndices[node.id],
+        axis >= 0 && axis < inShape.count
+      else {
+        throw DGenError.tensorError(op: "maxAxis", reason: "invalid input")
+      }
+
+      let inIsFrameAwareMax = ctx.frameAwareTensorCells.contains(inTensor.cellId)
+      let outIsFrameAwareMax = ctx.frameAwareTensorCells.contains(outCell)
+      let inTensorSizeMax = inShape.reduce(1, *)
+      let outTensorSizeMax = outShape.reduce(1, *)
+
+      b.ops.append(
+        UOp(
+          op: .maxAxisMarker(nodeId, axis, inShape, outShape, inIsFrameAwareMax, outIsFrameAwareMax),
+          value: .empty))
+
+      let outIdxMax = b.value(loopIdx, scalarType: .int)
+      let maxAcc = b.float(-Float.greatestFiniteMagnitude)
+
+      var inStridesMax = [Int](repeating: 1, count: inShape.count)
+      for i in stride(from: inShape.count - 2, through: 0, by: -1) {
+        inStridesMax[i] = inStridesMax[i + 1] * inShape[i + 1]
+      }
+      var outStridesMax = [Int](repeating: 1, count: outShape.count)
+      for i in stride(from: outShape.count - 2, through: 0, by: -1) {
+        outStridesMax[i] = outStridesMax[i + 1] * outShape[i + 1]
+      }
+
+      b.loop(inShape[axis]) { reduceIdx in
+        let rIdx = b.cast(reduceIdx, to: .float)
+
+        var outIndices = [Expr]()
+        var remaining = b.cast(outIdxMax, to: .int)
+        for i in 0..<outShape.count {
+          let stride = b.intConstant(outStridesMax[i])
+          let idx = remaining / stride
+          outIndices.append(idx)
+          remaining = remaining - idx * stride
+        }
+
+        var inIndices = [Expr]()
+        var outDim = 0
+        for i in 0..<inShape.count {
+          if i == axis {
+            inIndices.append(rIdx)
+          } else {
+            inIndices.append(outIndices[outDim])
+            outDim += 1
+          }
+        }
+
+        var inFlatIdx: Expr = b.intConstant(0)
+        for i in 0..<inShape.count {
+          inFlatIdx = inFlatIdx + inIndices[i] * b.intConstant(inStridesMax[i])
+        }
+
+        let val: Expr
+        if inTensor.padding != nil {
+          val = b.tensorRead(inTensor, indices: inIndices)
+        } else if inIsFrameAwareMax {
+          val = b.frameAwareTensorRead(
+            cellId: inTensor.cellId, tensorSize: inTensorSizeMax, elemIdx: inFlatIdx)
+        } else {
+          val = b.tensorRead(inTensor, indices: inIndices)
+        }
+
+        maxAcc.mutate(to: b.max(maxAcc.value, val))
+      }
+
+      // Write final max value after the loop
+      if outIsFrameAwareMax {
+        _ = b.frameAwareTensorWrite(
+          cellId: outCell, tensorSize: outTensorSizeMax, elemIdx: outIdxMax, value: maxAcc.value)
+      } else {
+        _ = b.memoryWrite(outCell, b.cast(outIdxMax, to: .int), maxAcc.value)
+      }
+
+    case .meanAxis(let axis):
+      guard case .tensor(let inShape) = g.nodes[node.inputs[0]]?.shape,
+        case .tensor(let outShape) = node.shape,
+        let inTensor = g.nodeToTensor[node.inputs[0]].flatMap({ g.tensors[$0] }),
+        let outCell = g.nodeToTensor[node.id].flatMap({ g.tensors[$0] })?.cellId,
+        let loopIdx = b.ctx.tensorIndices[node.id],
+        axis >= 0 && axis < inShape.count
+      else {
+        throw DGenError.tensorError(op: "meanAxis", reason: "invalid input")
+      }
+
+      let inIsFrameAwareMean = ctx.frameAwareTensorCells.contains(inTensor.cellId)
+      let outIsFrameAwareMean = ctx.frameAwareTensorCells.contains(outCell)
+      let inTensorSizeMean = inShape.reduce(1, *)
+      let outTensorSizeMean = outShape.reduce(1, *)
+
+      b.ops.append(
+        UOp(
+          op: .meanAxisMarker(nodeId, axis, inShape, outShape, inIsFrameAwareMean, outIsFrameAwareMean),
+          value: .empty))
+
+      let outIdxMean = b.value(loopIdx, scalarType: .int)
+      let meanAcc = b.float(0.0)
+
+      var inStridesMean = [Int](repeating: 1, count: inShape.count)
+      for i in stride(from: inShape.count - 2, through: 0, by: -1) {
+        inStridesMean[i] = inStridesMean[i + 1] * inShape[i + 1]
+      }
+      var outStridesMean = [Int](repeating: 1, count: outShape.count)
+      for i in stride(from: outShape.count - 2, through: 0, by: -1) {
+        outStridesMean[i] = outStridesMean[i + 1] * outShape[i + 1]
+      }
+
+      b.loop(inShape[axis]) { reduceIdx in
+        let rIdx = b.cast(reduceIdx, to: .float)
+
+        var outIndices = [Expr]()
+        var remaining = b.cast(outIdxMean, to: .int)
+        for i in 0..<outShape.count {
+          let stride = b.intConstant(outStridesMean[i])
+          let idx = remaining / stride
+          outIndices.append(idx)
+          remaining = remaining - idx * stride
+        }
+
+        var inIndices = [Expr]()
+        var outDim = 0
+        for i in 0..<inShape.count {
+          if i == axis {
+            inIndices.append(rIdx)
+          } else {
+            inIndices.append(outIndices[outDim])
+            outDim += 1
+          }
+        }
+
+        var inFlatIdx: Expr = b.intConstant(0)
+        for i in 0..<inShape.count {
+          inFlatIdx = inFlatIdx + inIndices[i] * b.intConstant(inStridesMean[i])
+        }
+
+        let val: Expr
+        if inTensor.padding != nil {
+          val = b.tensorRead(inTensor, indices: inIndices)
+        } else if inIsFrameAwareMean {
+          val = b.frameAwareTensorRead(
+            cellId: inTensor.cellId, tensorSize: inTensorSizeMean, elemIdx: inFlatIdx)
+        } else {
+          val = b.tensorRead(inTensor, indices: inIndices)
+        }
+
+        meanAcc.accumulate(val)
+      }
+
+      // Divide by axis size and write
+      meanAcc.mutate(to: meanAcc.value / b.constant(Float(inShape[axis])))
+      if outIsFrameAwareMean {
+        _ = b.frameAwareTensorWrite(
+          cellId: outCell, tensorSize: outTensorSizeMean, elemIdx: outIdxMean, value: meanAcc.value)
+      } else {
+        _ = b.memoryWrite(outCell, b.cast(outIdxMean, to: .int), meanAcc.value)
+      }
+
     case .reshape(let newShape):
       // Reshape is metadata-only - the data stays in place
       // Just register that this node produces a tensor view

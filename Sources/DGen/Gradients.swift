@@ -425,6 +425,34 @@ extension LazyOp {
       // Expand gradient back to input shape along the reduced axis
       return [g.n(.expandAxis(inputShape, axis), [gradOutput])]
 
+    case .maxAxis(let axis):
+      // Gradient flows only to max element(s), split evenly on ties:
+      // mask = (input == max_expanded), normMask = mask / sum(mask, axis), grad = normMask * grad_expanded
+      guard let inputNode = g.nodes[node.inputs[0]],
+        case .tensor(let inputShape) = inputNode.shape
+      else {
+        return [gradOutput]
+      }
+      let input = node.inputs[0]
+      let maxExpanded = g.n(.expandAxis(inputShape, axis), [node.id])
+      let mask = g.n(.eq, [input, maxExpanded])
+      let tieCount = try! g.sum(mask, axis: axis)
+      let tieExpanded = g.n(.expandAxis(inputShape, axis), [tieCount])
+      let normMask = g.n(.div, [mask, tieExpanded])
+      let gradExpanded = g.n(.expandAxis(inputShape, axis), [gradOutput])
+      return [g.n(.mul, [normMask, gradExpanded])]
+
+    case .meanAxis(let axis):
+      // Gradient is uniformly distributed: grad_input = grad_output / axis_size, broadcast back
+      guard let inputNode = g.nodes[node.inputs[0]],
+        case .tensor(let inputShape) = inputNode.shape
+      else {
+        return [gradOutput]
+      }
+      let scale = g.n(.constant(1.0 / Float(inputShape[axis])))
+      let scaled = g.n(.mul, [gradOutput, scale])
+      return [g.n(.expandAxis(inputShape, axis), [scaled])]
+
     // MARK: Tensor Shape Operations
 
     case .reshape(_):

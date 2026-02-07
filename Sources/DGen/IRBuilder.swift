@@ -295,4 +295,9 @@ public struct MutableVar {
     let uop = UOp(op: .mutate(lazy, sum.lazy), value: lazy)
     builder.ops.append(uop)
   }
+
+  public func mutate(to expr: Expr) {
+    let uop = UOp(op: .mutate(lazy, expr.lazy), value: lazy)
+    builder.ops.append(uop)
+  }
 }

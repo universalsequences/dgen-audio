@@ -263,7 +263,7 @@ extension LazyOp {
     case .fft, .ifft:
       try emitFFT(b: b, ctx: ctx, g: g, node: node, inputs: inputs, nodeId: nodeId)
 
-    case .conv1d, .conv2d, .sum, .sumAxis, .reshape, .asStrided, .transpose, .shrink,
+    case .conv1d, .conv2d, .sum, .sumAxis, .maxAxis, .meanAxis, .reshape, .asStrided, .transpose, .shrink,
       .pad, .expandView, .repeatView, .peek, .expand, .expandAxis, .gradPhasor:
       try emitTensorOp(b: b, ctx: ctx, g: g, node: node, inputs: inputs, nodeId: nodeId, ops: &ops)
 

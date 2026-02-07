@@ -138,6 +138,42 @@ public func inferShape(op: LazyOp, inputs: [ValueShape], graph: Graph) throws ->
     }
     return .tensor(outputShape)
 
+  // Max along axis - reduces one dimension (same shape logic as sumAxis)
+  case .maxAxis(let axis):
+    guard let firstInput = inputs.first, case .tensor(let shape) = firstInput else {
+      throw DGenError.shapeInferenceFailed(op: "maxAxis", reason: "requires tensor input")
+    }
+    let ndim = shape.count
+    let normalizedAxis = axis < 0 ? ndim + axis : axis
+    guard normalizedAxis >= 0 && normalizedAxis < ndim else {
+      throw DGenError.shapeInferenceFailed(
+        op: "maxAxis", reason: "axis \(axis) out of range for \(ndim)D tensor")
+    }
+    var outputShape = shape
+    outputShape.remove(at: normalizedAxis)
+    if outputShape.isEmpty {
+      return .scalar
+    }
+    return .tensor(outputShape)
+
+  // Mean along axis - reduces one dimension (same shape logic as sumAxis)
+  case .meanAxis(let axis):
+    guard let firstInput = inputs.first, case .tensor(let shape) = firstInput else {
+      throw DGenError.shapeInferenceFailed(op: "meanAxis", reason: "requires tensor input")
+    }
+    let ndim = shape.count
+    let normalizedAxis = axis < 0 ? ndim + axis : axis
+    guard normalizedAxis >= 0 && normalizedAxis < ndim else {
+      throw DGenError.shapeInferenceFailed(
+        op: "meanAxis", reason: "axis \(axis) out of range for \(ndim)D tensor")
+    }
+    var outputShape = shape
+    outputShape.remove(at: normalizedAxis)
+    if outputShape.isEmpty {
+      return .scalar
+    }
+    return .tensor(outputShape)
+
   // Reshape - changes shape, preserves total size
   case .reshape(let newShape):
     return .tensor(newShape)

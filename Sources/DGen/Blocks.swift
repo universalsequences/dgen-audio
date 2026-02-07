@@ -334,7 +334,7 @@ public func scalarNodes(_ g: Graph, feedbackClusters: [[NodeID]], backend: Backe
         if g.cellToTensor[cellId] != nil {
           scalar.insert($0.id)
         }
-      case .conv2d(_), .sum, .peek:
+      case .conv2d(_), .sum, .maxAxis, .meanAxis, .peek:
         scalar.insert($0.id)
       default: break
       }
@@ -1668,7 +1668,8 @@ public func emitBlockUOps(
 
 public func isReductionOp(_ op: LazyOp) -> Bool {
   switch op {
-  case .sum, .sumAxis, .tensorAccumulate, .peekRowGradReduce, .selectRowGradReduce:
+  case .sum, .sumAxis, .maxAxis, .meanAxis, .tensorAccumulate, .peekRowGradReduce,
+    .selectRowGradReduce:
     return true
   default:
     return false
