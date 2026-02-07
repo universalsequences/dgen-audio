@@ -889,16 +889,6 @@ public class CRenderer: Renderer {
         let assign = emitAssign(uop, "memory[\(cell)]", ctx)
         return "\(assign) memory[\(cell)] = \(g(curr));"
       }
-    case .concatShift(let a, let b, let shift):
-      if uop.kind == .simd {
-        // this op is only relevant in vectorized block
-        let expr = "vextq_f32(\(g(a)), \(g(b)), \(shift))"
-        return emitAssign(uop, expr, ctx)
-      } else {
-        // scalar version is simple identity (i.e. a no-op).
-        let expr = "\(g(a))"
-        return emitAssign(uop, expr, ctx)
-      }
     case .selector(let mode, let options):
       if uop.kind == .simd {
         // For SIMD: if mode <= 0 return 0, if mode <= 1 return options[0], etc.

@@ -59,12 +59,6 @@ func u_delay1(_ cell: CellID, _ a: Lazy) -> (IRContext, NodeID?) -> UOp {
   }
 }
 
-func u_concatShift(_ a: Lazy, _ b: Lazy, _ shift: Int) -> (IRContext, NodeID?) -> UOp {
-  return { ctx, _ in
-    return UOp(op: .concatShift(a, b, shift), value: ctx.useVariable(src: nil))
-  }
-}
-
 func u_floor(_ value: Lazy) -> (IRContext, NodeID?) -> UOp {
   return { ctx, nodeId in
     let dest = ctx.useVariable(src: nodeId)

@@ -49,8 +49,6 @@ extension UOp {
             opStr = "\(ANSI.cyan)memoryWrite\(ANSI.reset)(\(base), \(offset), \(value))"
         case let .memoryAccumulate(base, offset, value):
             opStr = "\(ANSI.cyan)memoryAccumulate\(ANSI.reset)(\(base), \(offset), \(value))"
-        case let .concatShift(a, b, c):
-            opStr = "\(ANSI.cyan)concatShift\(ANSI.reset)(\(a), \(b), \(c))"
         case let .sin(a):
             opStr = "\(ANSI.green)sin\(ANSI.reset)(\(a))"
         case let .cos(a):

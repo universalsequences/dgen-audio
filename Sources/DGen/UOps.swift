@@ -16,7 +16,6 @@ public enum CastType {
 public enum Op {
   case load(CellID)
   case store(CellID, Lazy)
-  case concatShift(Lazy, Lazy, Int)  // used in vectorized history
   case delay1(CellID, Lazy)
   case mse(Lazy, Lazy)
   case mutate(Lazy, Lazy)
