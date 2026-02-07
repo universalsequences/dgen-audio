@@ -1058,6 +1058,82 @@ extension Graph {
     return nodeId
   }
 
+  /// Reduce along an axis keeping maximum values.
+  /// Same structure as `sum(_:axis:)` but uses `.maxAxis`.
+  public func max(_ input: NodeID, axis: Int) throws -> NodeID {
+    guard let inputNode = nodes[input] else {
+      throw DGenError.tensorError(op: "max", reason: "input node not found")
+    }
+    guard case .tensor(let inputShape) = inputNode.shape else {
+      throw DGenError.tensorError(
+        op: "max",
+        reason: "requires tensor input, got \(String(describing: inputNode.shape))")
+    }
+
+    let ndim = inputShape.count
+    let normalizedAxis = axis < 0 ? ndim + axis : axis
+    guard normalizedAxis >= 0 && normalizedAxis < ndim else {
+      throw DGenError.tensorError(
+        op: "max", reason: "axis \(axis) out of range for tensor with \(ndim) dimensions")
+    }
+
+    var outputShape = inputShape
+    outputShape.remove(at: normalizedAxis)
+    if outputShape.isEmpty {
+      // TODO: full max reduce (not needed yet)
+      throw DGenError.tensorError(op: "max", reason: "reducing to scalar not yet supported")
+    }
+
+    let outputCellId = reserveLazyCellId()
+    let outputTensorId = nextTensorId
+    nextTensorId += 1
+    tensors[outputTensorId] = Tensor(
+      id: outputTensorId, shape: outputShape, cellId: outputCellId, isLazy: true)
+    cellToTensor[outputCellId] = outputTensorId
+
+    let nodeId = n(.maxAxis(normalizedAxis), [input], shape: .tensor(outputShape))
+    nodeToTensor[nodeId] = outputTensorId
+    return nodeId
+  }
+
+  /// Reduce along an axis computing the mean.
+  /// Same structure as `sum(_:axis:)` but uses `.meanAxis`.
+  public func mean(_ input: NodeID, axis: Int) throws -> NodeID {
+    guard let inputNode = nodes[input] else {
+      throw DGenError.tensorError(op: "mean", reason: "input node not found")
+    }
+    guard case .tensor(let inputShape) = inputNode.shape else {
+      throw DGenError.tensorError(
+        op: "mean",
+        reason: "requires tensor input, got \(String(describing: inputNode.shape))")
+    }
+
+    let ndim = inputShape.count
+    let normalizedAxis = axis < 0 ? ndim + axis : axis
+    guard normalizedAxis >= 0 && normalizedAxis < ndim else {
+      throw DGenError.tensorError(
+        op: "mean", reason: "axis \(axis) out of range for tensor with \(ndim) dimensions")
+    }
+
+    var outputShape = inputShape
+    outputShape.remove(at: normalizedAxis)
+    if outputShape.isEmpty {
+      // TODO: full mean reduce (not needed yet)
+      throw DGenError.tensorError(op: "mean", reason: "reducing to scalar not yet supported")
+    }
+
+    let outputCellId = reserveLazyCellId()
+    let outputTensorId = nextTensorId
+    nextTensorId += 1
+    tensors[outputTensorId] = Tensor(
+      id: outputTensorId, shape: outputShape, cellId: outputCellId, isLazy: true)
+    cellToTensor[outputCellId] = outputTensorId
+
+    let nodeId = n(.meanAxis(normalizedAxis), [input], shape: .tensor(outputShape))
+    nodeToTensor[nodeId] = outputTensorId
+    return nodeId
+  }
+
   /// Matrix multiplication: `A[M, K] @ B[K, N] → C[M, N]`
   ///
   /// Performs standard matrix multiplication. The inner dimensions must match:

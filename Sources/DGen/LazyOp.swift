@@ -164,6 +164,8 @@ public enum LazyOp {
   case conv2d(Shape)  // 2D convolution, Shape is kernel shape [kH, kW]
   case sum  // Reduce tensor to scalar by summing all elements
   case sumAxis(Int)  // Reduce along a specific axis
+  case maxAxis(Int)  // Reduce along axis keeping maximum
+  case meanAxis(Int)  // Reduce along axis computing mean
   case reshape(Shape)  // Reshape tensor (metadata only, no data movement)
   case transpose([Int])  // Transpose/permute axes (metadata only)
   case shrink([(Int, Int)?])  // Shrink/slice tensor (metadata only, no data movement)

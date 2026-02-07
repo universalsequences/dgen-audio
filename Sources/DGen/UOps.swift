@@ -86,6 +86,8 @@ public enum Op {
   case repeatView([Int])  // View op: tile tensor via modular indexing - renders to nothing but prevents SIMD
   case broadcastAccess  // Marker: broadcast indexing used - renders to nothing but prevents SIMD
   case sumAxisMarker(Int, Int, [Int], [Int], Bool, Bool)  // Marker: sumAxis(nodeId, axis, inShape, outShape, inFrameAware, outFrameAware)
+  case maxAxisMarker(Int, Int, [Int], [Int], Bool, Bool)  // Marker: maxAxis(nodeId, axis, inShape, outShape, inFrameAware, outFrameAware)
+  case meanAxisMarker(Int, Int, [Int], [Int], Bool, Bool)  // Marker: meanAxis(nodeId, axis, inShape, outShape, inFrameAware, outFrameAware)
   case expandAxisMarker(Int, Int, [Int], [Int], Bool, Bool)  // Marker: expandAxis(nodeId, axis, inShape, outShape, inFrameAware, outFrameAware)
 
   // Hop-based execution control (for FFT/spectral processing)

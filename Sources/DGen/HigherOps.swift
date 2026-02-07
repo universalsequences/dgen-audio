@@ -582,7 +582,7 @@ extension Graph {
       "windowSize must be a power of 2")
 
     // Default hopSize to windowSize/4 (75% overlap) - good balance of efficiency and responsiveness
-    let actualHopSize = hopSize ?? max(1, windowSize / 4)
+    let actualHopSize = hopSize ?? Swift.max(1, windowSize / 4)
     precondition(actualHopSize > 0, "hopSize must be positive")
 
     let numBins = windowSize / 2 + 1
@@ -701,7 +701,7 @@ extension Graph {
       "windowSize must be a power of 2")
 
     // Default hopSize to windowSize/4 (75% overlap) for smooth reconstruction
-    let actualHopSize = hopSize ?? max(1, windowSize / 4)
+    let actualHopSize = hopSize ?? Swift.max(1, windowSize / 4)
     precondition(actualHopSize > 0, "hopSize must be positive")
 
     // Allocate scratch for in-place IFFT computation: real[N] + imag[N]

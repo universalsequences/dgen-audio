@@ -112,6 +112,19 @@ extension IRBuilder {
   private func tensorReadComposed(
     _ tensor: Tensor, indices: [Expr], views: [ComposedView]
   ) -> Expr {
+    // Fast path: 2-view chain where the outer view is contiguous (row-major strides, zero offset)
+    // and shapes match. The outer stridedIndex→flatToMultiIndex round-trip is a no-op — skip it
+    // and pass indices directly to the inner view's stridedIndex.
+    let outerView = views.last!
+    let outerRowMajor = Tensor.computeRowMajorStrides(outerView.shape)
+    if views.count == 2 && outerView.strides == outerRowMajor && outerView.offset == 0
+      && outerView.shape == views[0].shape
+    {
+      let (sqIdx, sqStr) = squeezeView(indices: indices, view: views[0])
+      let memIdx = stridedIndex(indices: sqIdx, strides: sqStr, offset: views[0].offset)
+      return tensorReadFromBase(tensor, elemIdx: memIdx)
+    }
+
     var currentIndices = indices
 
     // Walk from outermost view (last) down to innermost (first)
