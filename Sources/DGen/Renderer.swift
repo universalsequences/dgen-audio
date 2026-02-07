@@ -305,7 +305,7 @@ public class CRenderer: Renderer {
 
       for uop in block.ops {
         // Don't skip defineGlobal - it needs to run through emit to mark loadedGlobal
-        scheduleItem.ops.append(UOp(op: uop.op, value: uop.value, kind: uop.kind))
+        scheduleItem.ops.append(uop)
       }
     }
 
