@@ -2,7 +2,6 @@ import Foundation
 
 public class MetalRenderer: Renderer, UOpEmitter {
   let memoryVarID = -1  // Virtual ID for the global memory buffer
-  var needsSegmenting = false
   var parallelRangeVars: Set<VarID> = []  // Track parallel range loop variable IDs
   var currentTemporality: Temporality = .frameBased  // Track temporality for gradient indexing
   var frameIndexOverride: String? = nil
@@ -97,12 +96,6 @@ public class MetalRenderer: Renderer, UOpEmitter {
 
       // Add frameCount buffer for all Metal kernels (needed for output operations)
       bufferNames.append("frameCount")
-
-      // Add segment buffers if this kernel needs segmented execution
-      if bufferRequirements.needsSegmenting {
-        bufferNames.append("segmentLen")
-        bufferNames.append("segmentBase")
-      }
 
       if bufferRequirements.needsReducedGradsSum {
         bufferNames.append("reducedGradsSum")
@@ -489,23 +482,12 @@ public class MetalRenderer: Renderer, UOpEmitter {
     parameters.append("    constant uint &frameCount [[buffer(\(bufferIndex))]]")
     bufferIndex += 1
 
-    // If segmented, add segmentLen and segmentBase buffers
-    if bufferRequirements.needsSegmenting {
-      parameters.append("    constant uint &segmentLen [[buffer(\(bufferIndex))]]")
-      bufferIndex += 1
-      parameters.append("    constant uint &segmentBase [[buffer(\(bufferIndex))]]")
-      bufferIndex += 1
-    }
-
     if bufferRequirements.needsReducedGradsSum {
       parameters.append("    device float *reducedGradsSum [[buffer(\(bufferIndex))]]")
       bufferIndex += 1
     }
 
     parameters.append("    uint id [[thread_position_in_grid]]")
-    if bufferRequirements.needsSegmenting {
-      parameters.append("    uint tid [[thread_index_in_threadgroup]]")
-    }
 
     kernels += "kernel void \(name)(\n"
     kernels += parameters.joined(separator: ",\n")
@@ -516,14 +498,6 @@ public class MetalRenderer: Renderer, UOpEmitter {
     kernels += "  #pragma clang diagnostic ignored \"-Wunused-variable\"\n"
 
     var indent = 1
-
-    // If segmented, declare threadgroup scratch buffers for delay/store helpers
-    if bufferRequirements.needsSegmenting {
-      kernels += "  threadgroup float __dgen_delay_tmp[128];\n"
-      kernels += "  threadgroup float __dgen_store_tmp[128];\n"
-    }
-
-    self.needsSegmenting = bufferRequirements.needsSegmenting
 
     // For static blocks, define i=0 since there's no frame loop
     if case .static_ = currentTemporality {
@@ -737,28 +711,9 @@ public class MetalRenderer: Renderer, UOpEmitter {
       let expr = "metal::select(\(bStr), \(aStr), \(g(cond)) > 0.0)"
       return emitAssign(uop, expr, ctx)
     case .delay1(let cell, let a):
-      // Metal thread-per-sample delay-by-1 using threadgroup neighbor exchange.
-      // Also persists the last 4 current values to memory[cell..cell+3] at the end of the segment.
-      // Relies on segmented dispatch so all threads in a group hit barriers.
-      let writeTmp = "__dgen_delay_tmp[tid] = \(g(a));"
-      let barrier1 = "threadgroup_barrier(metal::mem_flags::mem_threadgroup);"
-      let expr = "(tid > 0u ? __dgen_delay_tmp[tid - 1] : memory[\(cell) + 3])"
-      let assign = emitAssign(uop, expr, ctx)
-      // Persist state for next segment
-      let writeStore = "__dgen_store_tmp[tid] = \(g(a));"
-      let barrier2 = "threadgroup_barrier(metal::mem_flags::mem_threadgroup);"
-      let persist = """
-        if ((int)tid == segmentLen - 1) {
-            memory[\(cell) + 0] = __dgen_store_tmp[segmentLen - 4];
-            memory[\(cell) + 1] = __dgen_store_tmp[segmentLen - 3];
-            memory[\(cell) + 2] = __dgen_store_tmp[segmentLen - 2];
-            memory[\(cell) + 3] = __dgen_store_tmp[segmentLen - 1];
-        }
-        """.trimmingCharacters(in: .whitespacesAndNewlines)
-      return "\(writeTmp) \(barrier1) \(assign) \(writeStore) \(barrier2) \(persist)"
-    /**
-     delay1 implemented via threadgroup neighbor exchange
-     */
+      // Scalar: read previous value, then write current value
+      let assign = emitAssign(uop, "memory[\(cell)]", ctx)
+      return "\(assign) memory[\(cell)] = \(g(a));"
     case .selector(let mode, let options):
       // Metal: if mode <= 0 return 0, if mode <= 1 return options[0], etc.
       var expr = "0.0f"  // Default value
@@ -921,7 +876,7 @@ public class MetalRenderer: Renderer, UOpEmitter {
             ?? (currentThreadCountScale == nil
               ? baseIdx : "(\(baseIdx) / \(currentThreadCountScale!))"))
         return
-          "t[\(tapeSlot)*frameCount + \(needsSegmenting ? "segmentBase + " : "") \(idx)]"
+          "t[\(tapeSlot)*frameCount + \(idx)]"
       } else {
         return "t\(id)"
       }
@@ -936,7 +891,7 @@ public class MetalRenderer: Renderer, UOpEmitter {
           ?? (currentThreadCountScale == nil
             ? baseIdx : "(\(baseIdx) / \(currentThreadCountScale!))"))
       return
-        "t[\(tapeSlot)*frameCount + \(needsSegmenting ? "segmentBase + " : "")\(idx)]"
+        "t[\(tapeSlot)*frameCount + \(idx)]"
     default: return "/* unknown lazy */"
     }
   }
@@ -955,7 +910,6 @@ public class MetalRenderer: Renderer, UOpEmitter {
 
 struct RequiredBuffers {
   let hasOutputOps: Bool
-  let needsSegmenting: Bool
   let needsReducedGradsSum: Bool
 }
 
@@ -966,15 +920,8 @@ func analyzeRequiredBuffers(scheduleItem: ScheduleItem) -> RequiredBuffers {
     return false
   }
 
-  // Detect whether this kernel needs segmented dispatch (for delay/barrier semantics)
-  let needsSegmenting: Bool = scheduleItem.ops.contains { uop in
-    if case .delay1 = uop.op { return true }
-    return false
-  }
-
   return RequiredBuffers(
     hasOutputOps: hasOutputOps,
-    needsSegmenting: needsSegmenting,
     needsReducedGradsSum: false
   )
 }

@@ -366,6 +366,17 @@ public func scalarNodes(_ g: Graph, feedbackClusters: [[NodeID]], backend: Backe
     }
   }
 
+  // Metal: historyReadWrite must be scalar — the SIMD delay1 segmented
+  // dispatch is broken. Sequential frame-by-frame processing is correct
+  // and outputs cross to SIMD blocks via the outbound tape mechanism.
+  if case .metal = backend {
+    g.nodes.values.forEach {
+      if case .historyReadWrite(_) = $0.op {
+        scalar.insert($0.id)
+      }
+    }
+  }
+
   // Use feedback loop detection to mark all nodes in feedback loops as scalar
   // This is the core reason for scalar execution - frame-to-frame state dependencies
   for loop in feedbackClusters {

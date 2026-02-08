@@ -307,81 +307,37 @@ public class MetalCompiledKernel: CompiledKernelRuntime {
       let pipelineState = pipelineStates[index]
       computeEncoder.setComputePipelineState(pipelineState)
 
-      // Segmented kernels (e.g., delay1) require processing in batches
-      if kernel.buffers.contains("segmentLen") {
-        let segmentCapacity = MIN_FRAME_COUNT
-        // We'll reuse the same encoder for multiple segment dispatches
-        var base = 0
-        while base < frameCount {
-          let thisLen = min(segmentCapacity, frameCount - base)
-
-          // Update segmentLen
-          if let segBuf = bufferPool["segmentLen"] {
-            let segPtr = segBuf.contents().assumingMemoryBound(to: UInt32.self)
-            segPtr[0] = UInt32(thisLen)
-          }
-          // Update segmentBase (in frames)
-          if let segBaseBuf = bufferPool["segmentBase"] {
-            let basePtr = segBaseBuf.contents().assumingMemoryBound(to: UInt32.self)
-            basePtr[0] = UInt32(base)
-          }
-
-          for (bufferIndex, bufferName) in kernel.buffers.enumerated() {
-            guard let buffer = bufferPool[bufferName] else { continue }
-            computeEncoder.setBuffer(buffer, offset: 0, index: bufferIndex)
-          }
-
-          let threadsPerGroup = MTLSize(width: thisLen, height: 1, depth: 1)
-          let numThreadGroups = MTLSize(width: 1, height: 1, depth: 1)
-          computeEncoder.dispatchThreadgroups(
-            numThreadGroups, threadsPerThreadgroup: threadsPerGroup)
-          base += thisLen
+      for (bufferIndex, bufferName) in kernel.buffers.enumerated() {
+        if let buffer = bufferPool[bufferName] {
+          computeEncoder.setBuffer(buffer, offset: 0, index: bufferIndex)
         }
-        if sharedEncoder == nil { computeEncoder.endEncoding() }
-        if debugGradients {
-          // Execute this kernel now so shared-memory buffers are visible for debug
-          commandBuffer.commit()
-          commandBuffer.waitUntilCompleted()
-          // Check for GPU errors
-          if let error = commandBuffer.error {
-            print("   [GPU ERROR] kernel \(index) (\(kernel.name)): \(error.localizedDescription)")
-          }
-          // Start a new command buffer for next kernel
-          if let cb = commandQueue.makeCommandBuffer() { commandBuffer = cb }
-        }
+      }
+
+      let totalThreads: Int
+      if let scale = kernel.threadCountScale {
+        totalThreads = max(1, frameCount * scale)
+      } else if let overrideThreads = kernel.threadCount {
+        totalThreads = max(1, overrideThreads)
+      } else if kernel.kind == .scalar {
+        totalThreads = 1
       } else {
-        for (bufferIndex, bufferName) in kernel.buffers.enumerated() {
-          if let buffer = bufferPool[bufferName] {
-            computeEncoder.setBuffer(buffer, offset: 0, index: bufferIndex)
-          }
-        }
+        totalThreads = frameCount
+      }
+      let maxThreadsPerGroup = pipelineState.maxTotalThreadsPerThreadgroup
 
-        let totalThreads: Int
-        if let scale = kernel.threadCountScale {
-          totalThreads = max(1, frameCount * scale)
-        } else if let overrideThreads = kernel.threadCount {
-          totalThreads = max(1, overrideThreads)
-        } else if kernel.kind == .scalar {
-          totalThreads = 1
-        } else {
-          totalThreads = frameCount
-        }
-        let maxThreadsPerGroup = pipelineState.maxTotalThreadsPerThreadgroup
-
-        let threadGroupWidth =
-          totalThreads == 1
-          ? 1
-          : min(kernel.threadGroupSize ?? 64, maxThreadsPerGroup, totalThreads)
-        let threads = MTLSize(width: totalThreads, height: 1, depth: 1)
-        let threadsPerGroup = MTLSize(width: threadGroupWidth, height: 1, depth: 1)
-        computeEncoder.dispatchThreads(threads, threadsPerThreadgroup: threadsPerGroup)
-        if sharedEncoder == nil { computeEncoder.endEncoding() }
-        if debugGradients {
-          // Execute this kernel now so shared-memory buffers are visible for debug
-          commandBuffer.commit()
-          commandBuffer.waitUntilCompleted()
-          if let cb = commandQueue.makeCommandBuffer() { commandBuffer = cb }
-        }
+      let threadGroupWidth =
+        totalThreads == 1
+        ? 1
+        : min(kernel.threadGroupSize ?? 64, maxThreadsPerGroup, totalThreads)
+      let threads = MTLSize(width: totalThreads, height: 1, depth: 1)
+      let threadsPerGroup = MTLSize(width: threadGroupWidth, height: 1, depth: 1)
+      computeEncoder.dispatchThreads(threads, threadsPerThreadgroup: threadsPerGroup)
+      if sharedEncoder == nil { computeEncoder.endEncoding() }
+      if debugGradients {
+        // Execute this kernel now so shared-memory buffers are visible for debug
+        commandBuffer.commit()
+        commandBuffer.waitUntilCompleted()
+        if let cb = commandQueue.makeCommandBuffer() { commandBuffer = cb }
       }
     }
 
