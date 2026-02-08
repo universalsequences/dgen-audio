@@ -249,6 +249,10 @@ public class CRenderer: Renderer {
         // Close previous hop check if open
         if hopCheckOpen {
           scheduleItem.ops.append(UOp(op: .endHopCheck, value: .empty))
+          // Counter increment + wrap (runs every frame, outside the hop check)
+          if case .hopBased(let prevHopSize, let prevCounterCell) = currentTemporality {
+            scheduleItem.ops.append(UOp(op: .hopCounterIncrement(prevCounterCell, prevHopSize), value: .empty))
+          }
           hopCheckOpen = false
         }
 
@@ -312,6 +316,10 @@ public class CRenderer: Renderer {
     // Close any open hop check
     if hopCheckOpen {
       scheduleItem.ops.append(UOp(op: .endHopCheck, value: .empty))
+      // Counter increment + wrap (runs every frame, outside the hop check)
+      if case .hopBased(let prevHopSize, let prevCounterCell) = currentTemporality {
+        scheduleItem.ops.append(UOp(op: .hopCounterIncrement(prevCounterCell, prevHopSize), value: .empty))
+      }
     }
 
     // Close any open loop
@@ -1115,6 +1123,8 @@ public class CRenderer: Renderer {
       return "if (memory[\(counterCell)] == 0.0f) {"
     case .endHopCheck:
       return "}"
+    case .hopCounterIncrement(let counterCell, let hopSize):
+      return "{ float _ctr = memory[\(counterCell)] + 1.0f; memory[\(counterCell)] = _ctr >= \(hopSize).0f ? 0.0f : _ctr; }"
 
     default:
       return "/* \(uop.prettyDescription()) */"

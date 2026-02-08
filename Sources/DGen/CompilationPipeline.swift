@@ -893,6 +893,18 @@ func determineTensorBlocks(_ blocks: [Block], _ graph: Graph, _ ctx: IRContext) 
           currentBlock = makeBlock(from: block)
           currentShape = nil
           continue  // Skip the append at end of loop
+        } else if case .overlapAdd = node.op {
+          // overlapAdd has internal loops (scatter-add) — needs its own scalar block
+          if currentBlock.nodes.count > 0 {
+            innerBlocks.append(currentBlock)
+          }
+          currentBlock = makeBlock(from: block)
+          currentBlock.kind = .scalar
+          currentBlock.nodes.append(nodeId)
+          innerBlocks.append(currentBlock)
+          currentBlock = makeBlock(from: block)
+          currentShape = nil
+          continue
         } else if case .tensor(let shape) = node.shape {
           if shape != currentShape {
             // Axis reduces (sumAxis, maxAxis, meanAxis) can stay in the same block

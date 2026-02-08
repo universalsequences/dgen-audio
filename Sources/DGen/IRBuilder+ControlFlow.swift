@@ -105,7 +105,8 @@ extension IRBuilder {
   /// In frame-aware blocks, returns the pre-computed frame index from flat thread decomposition
   /// (flat index / tensor size). In normal blocks, falls back to the raw thread index.
   public func currentFrameIndex() -> Expr {
-    if ctx.isInFrameAwareTensorBlock, let frameIdx = ctx.frameAwareTensorFrameIndex {
+    // Use decomposed frame index when available (ThreadCountScale blocks)
+    if let frameIdx = ctx.frameAwareTensorFrameIndex {
       return value(frameIdx, scalarType: .int)
     }
     // Fall back to thread index for normal blocks

@@ -524,8 +524,9 @@ extension Graph {
   /// - Parameters:
   ///   - input: Scalar signal to buffer
   ///   - size: Number of samples visible in the window
+  ///   - hopSize: If specified, downstream blocks only execute every hopSize frames
   /// - Returns: TensorRef node for a [1, size] sliding window over the history
-  public func bufferView(_ input: NodeID, size: Int) -> NodeID {
+  public func bufferView(_ input: NodeID, size: Int, hopSize: Int? = nil) -> NodeID {
     // Flat history: one slot per frame, no ring buffer
     let historyBase = alloc(vectorWidth: maxFrameCount)
     let writePosCellId = alloc()
@@ -558,6 +559,12 @@ extension Graph {
     // seq ensures write happens before read
     let result = n(.seq, writeOp, tensorRefNode)
     nodeToTensor[result] = tensorId
+
+    // Register hop-based temporality so downstream blocks run every hopSize frames
+    if let hopSize = hopSize {
+      let counterCell = alloc(vectorWidth: 1)
+      nodeHopRate[result] = (hopSize, counterCell)
+    }
 
     return result
   }
@@ -726,6 +733,24 @@ extension Graph {
     nodeHopRate[ifftNode] = (actualHopSize, counterCell)
 
     return ifftNode
+  }
+
+  /// Overlap-add: scatter-add a tensor window into a ring buffer, emit one sample per frame.
+  /// The scatter-add happens every `hopSize` frames (when the internal counter is 0).
+  /// Output runs every frame (reads from ring buffer).
+  ///
+  /// - Parameters:
+  ///   - input: Input tensor node (e.g., IFFT output of size windowSize)
+  ///   - windowSize: Size of the input window
+  ///   - hopSize: How often to scatter-add (every hopSize frames)
+  /// - Returns: Scalar node (one sample per frame)
+  public func overlapAdd(_ input: NodeID, windowSize: Int, hopSize: Int) -> NodeID {
+    let outputRingCell = alloc(vectorWidth: windowSize)
+    let readPosCell = alloc(vectorWidth: 1)
+    let counterCell = alloc(vectorWidth: 1)
+
+    return n(.overlapAdd(windowSize, hopSize, outputRingCell, readPosCell, counterCell),
+      [input], shape: .scalar)
   }
 
   /// Select a single row from a 2D tensor using a dynamic row index.

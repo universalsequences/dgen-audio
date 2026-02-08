@@ -93,6 +93,7 @@ public enum Op {
   // Hop-based execution control (for FFT/spectral processing)
   case beginHopCheck(CellID)  // if (memory[counterCell] == 0.0f) { - runs block only when counter is 0
   case endHopCheck  // } - closes the hop check conditional
+  case hopCounterIncrement(CellID, Int)  // counter increment + wrap: memory[cell] = (memory[cell]+1) >= hopSize ? 0 : memory[cell]+1
 
   public var isDefineGlobal: Bool {
     if case .defineGlobal = self { return true }

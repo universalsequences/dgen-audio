@@ -294,10 +294,6 @@ public class MetalCompiledKernel: CompiledKernelRuntime {
       sharedEncoder = commandBuffer.makeComputeCommandEncoder()
     }
     for (index, kernel) in kernels.enumerated() {
-      if firstDebug {
-        //print("   [DEBUG] Executing kernel \(index): \(kernel.name)  \(kernel.kind)")
-      }
-
       // Pick encoder: shared if available (non-debug), otherwise one per kernel
       let computeEncoder: MTLComputeCommandEncoder
       if let enc = sharedEncoder {

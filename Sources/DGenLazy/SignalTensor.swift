@@ -53,6 +53,11 @@ public class SignalTensor: LazyValue {
         self.grad = nil
     }
 
+    /// TensorOps conformance: view-only initializer
+    public required convenience init(_view nodeId: NodeID, graph: LazyGraph, shape: Shape, requiresGrad: Bool) {
+        self.init(nodeId: nodeId, graph: graph, shape: shape, requiresGrad: requiresGrad)
+    }
+
     // MARK: - Factory Methods
 
     /// Create a phasor with multiple frequencies

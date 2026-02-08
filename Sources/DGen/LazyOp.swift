@@ -176,6 +176,7 @@ public enum LazyOp {
   case peek  // Read from 2D tensor at (index, channel) with interpolation - lazy version
   case fft(Int, Int, CellID, CellID, CellID, CellID)  // FFT transform: windowSize, hopSize, scratchCell, ringBufferCell, writePosCell, counterCell
   case ifft(Int, Int, CellID, CellID, CellID, CellID)  // IFFT transform: windowSize, hopSize, scratchCell, outputRingCell, readPosCell, counterCell
+  case overlapAdd(Int, Int, CellID, CellID, CellID)  // Overlap-add: windowSize, hopSize, outputRingCell, readPosCell, counterCell
 
   // Gradient-specific operations (used by Gradients.swift)
   case neg  // Unary negation: -x

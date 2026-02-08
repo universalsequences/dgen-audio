@@ -880,6 +880,10 @@ extension LazyOp {
       // FFT gradients need special handling
       return node.inputs.map { _ in nil }
 
+    case .overlapAdd(_, _, _, _, _):
+      // overlapAdd gradient not implemented
+      return node.inputs.map { _ in nil }
+
     case .peek:
       // peek(tensor, index, channel) -> interpolated scalar read
       // Gradient scatters back to two tensor positions

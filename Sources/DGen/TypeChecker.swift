@@ -262,6 +262,10 @@ public func inferShape(op: LazyOp, inputs: [ValueShape], graph: Graph) throws ->
   case .ifft(_, _, _, _, _, _):
     return .scalar
 
+  // overlapAdd - outputs scalar (one sample per frame via ring buffer)
+  case .overlapAdd(_, _, _, _, _):
+    return .scalar
+
   // Inherited (elementwise) - includes all binary and unary math ops
   // Also includes stateful ops (phasor, accum, latch) that can operate element-wise on tensors
   case .add, .sub, .mul, .div, .sin, .cos, .exp, .sqrt, .tanh,
@@ -334,7 +338,9 @@ public func allocateTensorOutputs(graph: Graph, sortedNodes: [NodeID]) {
     guard let node = graph.nodes[nodeId] else { continue }
 
     // Skip if this node already has a tensor (e.g., tensorRef nodes or already-created views)
-    if graph.nodeToTensor[nodeId] != nil { continue }
+    if graph.nodeToTensor[nodeId] != nil {
+      continue
+    }
 
     // Only allocate for tensor-shaped outputs
     guard case .tensor(let shape) = node.shape else { continue }
@@ -362,7 +368,9 @@ public func allocateTensorOutputs(graph: Graph, sortedNodes: [NodeID]) {
       guard let inputId = node.inputs.first,
         let inputTensorId = graph.nodeToTensor[inputId],
         let inputTensor = graph.tensors[inputTensorId]
-      else { continue }
+      else {
+        continue
+      }
 
       let transform = ViewTransform.reshape(outputShape: newShape, inputShape: inputTensor.shape)
       var newTransforms = inputTensor.transforms
@@ -671,7 +679,6 @@ public func allocateTensorMemory(
     let allocSize = actuallyNeedsFrameAware ? tensorSize * frameCount : tensorSize
     let realCellId = graph.allocateLazyCell(lazyCellId, vectorWidth: allocSize)
     lazyToReal[lazyCellId] = realCellId
-
     if actuallyNeedsFrameAware {
       graph.frameAwareCells[realCellId] = (tensorSize: tensorSize, frameCount: frameCount)
     }
@@ -726,6 +733,7 @@ public func isIntrinsicallyFrameBased(_ op: LazyOp) -> Bool {
   case .historyReadWrite(_): return true  // combined temporal operation
   case .latch(_): return true  // conditional state update
   case .click(_): return true  // trigger/event based
+  case .overlapAdd(_, _, _, _, _): return true  // overlap-add emits one sample per frame
   default: return false
   }
 }
@@ -741,16 +749,11 @@ public func intrinsicHopRate(_ op: LazyOp, graph: Graph, nodeId: NodeID) -> (Int
   return nil
 }
 
-/// Returns the hop rate if the node produces hop-based output (FFT, IFFT)
-/// This is different from intrinsicHopRate - these nodes handle hop logic internally
-/// but their OUTPUT only changes every hopSize frames.
+/// Returns the hop rate if the node produces hop-based output.
+/// Any op can produce hop-based output by registering in graph.nodeHopRate.
+/// FFT/IFFT use this, and so does bufferView(hop:).
 public func producesHopBasedOutput(_ op: LazyOp, graph: Graph, nodeId: NodeID) -> (Int, CellID)? {
-  switch op {
-  case .fft(_, _, _, _, _, _), .ifft(_, _, _, _, _, _):
-    return graph.nodeHopRate[nodeId]
-  default:
-    return nil
-  }
+  return graph.nodeHopRate[nodeId]
 }
 
 /// Temporality propagation result containing both frame-based and hop-based node sets

@@ -306,10 +306,12 @@ public class Signal: LazyValue {
 
   /// Buffer the last N samples of this signal into a [1, N] tensor.
   /// Zero-copy ring buffer — the tensor IS the buffer. Composes with conv2d, sum, etc.
-  /// - Parameter size: Number of samples to buffer
+  /// - Parameters:
+  ///   - size: Number of samples to buffer
+  ///   - hop: If specified, downstream ops only execute every `hop` frames
   /// - Returns: SignalTensor of shape [1, size] backed by a ring buffer
-  public func buffer(size: Int) -> SignalTensor {
-    let nodeId = graph.graph.bufferView(self.nodeId, size: size)
+  public func buffer(size: Int, hop: Int? = nil) -> SignalTensor {
+    let nodeId = graph.graph.bufferView(self.nodeId, size: size, hopSize: hop)
     return SignalTensor(
       nodeId: nodeId, graph: graph, shape: [1, size],
       requiresGrad: self.requiresGrad)

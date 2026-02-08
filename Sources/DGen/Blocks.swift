@@ -1421,8 +1421,14 @@ public func emitThreadCountScaleOpIfNeeded(ctx: IRContext, block: Block, g: Grap
     ctx.tensorIndices[nodeId] = binIdx.lazy
   }
 
+  // Always set the decomposed frame index so currentFrameIndex() returns
+  // the correct value in ThreadCountScale blocks (needed by slidingWindow
+  // bounds checks, frame-aware tensor reads, etc.)
+  ctx.frameAwareTensorFrameIndex = frameIdx.lazy
+  ctx.frameAwareTensorElementIndex = binIdx.lazy
+
   // If this is a frame-based block with frame-aware tensor outputs,
-  // set context flags so currentFrameIndex() returns the correct frame
+  // also set the flag that controls frame-aware memory addressing
   if block.temporality == .frameBased {
     let hasFrameAwareOutput = block.nodes.contains { nodeId in
       if let tensorId = g.nodeToTensor[nodeId],
@@ -1434,8 +1440,6 @@ public func emitThreadCountScaleOpIfNeeded(ctx: IRContext, block: Block, g: Grap
     }
     if hasFrameAwareOutput {
       ctx.isInFrameAwareTensorBlock = true
-      ctx.frameAwareTensorFrameIndex = frameIdx.lazy
-      ctx.frameAwareTensorElementIndex = binIdx.lazy
     }
   }
 
@@ -1575,6 +1579,9 @@ public func emitBlockUOps(
   var emittedNodes: Set<NodeID> = []
   var bodyUops: [UOp] = []
 
+  let isHopBasedBlock: Bool
+  if case .hopBased = block.temporality { isHopBasedBlock = true } else { isHopBasedBlock = false }
+
   // Reset frame-aware tensor block context for each new block
   // These flags are set per-block in emitThreadCountScaleOpIfNeeded
   ctx.isInFrameAwareTensorBlock = false
@@ -1640,8 +1647,10 @@ public func emitBlockUOps(
     // Standard emission path
     // Thread count scaling is a Metal-specific parallelization optimization.
     // C backend uses sequential loops, so this would break feedback loop data flow.
+    // Hop-based blocks on Metal also use sequential loops — they run as scalar kernels
+    // with a frame loop + hop gating, so ThreadCountScale can't be used.
     let threadScaleUOps =
-      backend == .metal
+      (backend == .metal && !isHopBasedBlock)
       ? emitThreadCountScaleOpIfNeeded(ctx: ctx, block: block, g: g)
       : []
     bodyUops.append(contentsOf: threadScaleUOps)
@@ -1696,9 +1705,10 @@ public func emitBlockUOps(
   // Note: frame-aware tensor blocks DON'T use parallelRange (no loop)
   var uops: [UOp] = []
 
-  // C backend wraps tensor blocks in a sequential loop
+  // C backend and hop-based Metal blocks wrap tensor ops in a sequential loop
   // Skip if using shape-aware emission (it has its own loops)
-  if backend == .c, !useShapeAwareEmission, let tensorIndex = block.tensorIndex,
+  let needsTensorLoop = (backend == .c || isHopBasedBlock) && !useShapeAwareEmission
+  if needsTensorLoop, let tensorIndex = block.tensorIndex,
     let shape = block.shape
   {
     let count = shape.reduce(1, *)
@@ -1769,8 +1779,8 @@ public func emitBlockUOps(
     }
   }
 
-  // Close the tensor loop for C backend (skip if shape-aware emission has its own loops)
-  if backend == .c, !useShapeAwareEmission, block.tensorIndex != nil {
+  // Close the tensor loop for C backend and hop-based Metal blocks
+  if needsTensorLoop, block.tensorIndex != nil {
     uops.append(UOp(op: .endParallelRange, value: ctx.useVariable(src: nil)))
   }
   return uops

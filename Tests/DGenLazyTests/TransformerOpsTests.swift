@@ -594,7 +594,7 @@ final class TransformerOpsTests: XCTestCase {
       DGenConfig.debug = false
       losses.append(lossValue)
 
-      if epoch % 40 == 0 {
+      if epoch % 5 == 0 {
         print("Rhythm epoch \(epoch): loss=\(lossValue)")
       }
 

@@ -173,6 +173,8 @@ extension UOp {
             opStr = "\(ANSI.magenta)beginHopCheck\(ANSI.reset)(\(counterCell))"
         case .endHopCheck:
             opStr = "\(ANSI.magenta)endHopCheck\(ANSI.reset)"
+        case let .hopCounterIncrement(counterCell, hopSize):
+            opStr = "\(ANSI.magenta)hopCounterIncrement\(ANSI.reset)(\(counterCell), hopSize=\(hopSize))"
         }
 
         return "\(ANSI.bold)UOp\(ANSI.reset)(op: \(opStr), value: \(value))"

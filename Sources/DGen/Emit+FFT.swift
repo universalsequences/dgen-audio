@@ -352,6 +352,63 @@ extension LazyOp {
       // Use the output sample
       b.use(val: outputSample)
 
+    case .overlapAdd(let windowSize, let hopSize, let outputRingCell, let readPosCell, let counterCell):
+      // Overlap-add: scatter-add a window into a ring buffer, emit one sample per frame
+      // Input: tensor of size windowSize (time-domain samples from IFFT)
+      // Output: scalar (one sample per frame)
+
+      guard inputs.count == 1 else {
+        throw DGenError.insufficientInputs(
+          operator: "overlapAdd", expected: 1, actual: inputs.count)
+      }
+
+      // Get input tensor
+      guard let inputNodeId = node.inputs.first,
+        let inputTensorId = g.nodeToTensor[inputNodeId],
+        let inputTensor = g.tensors[inputTensorId]
+      else {
+        throw DGenError.tensorError(op: "overlapAdd", reason: "missing input tensor")
+      }
+
+      let winSizeFloat = b.constant(Float(windowSize))
+      let hopSizeFloat = b.constant(Float(hopSize))
+      let zero = b.constant(0.0)
+      let one = b.constant(1.0)
+
+      let readPos = b.memoryRead(readPosCell, zero)
+      let counter = b.memoryRead(counterCell, zero)
+
+      // Ring buffer read + clear
+      let outputSample = b.memoryRead(outputRingCell, b.cast(readPos, to: .int))
+      _ = b.memoryWrite(outputRingCell, b.cast(readPos, to: .int), zero)
+
+      // ReadPos advance
+      let nextReadPos = readPos + one
+      let wrappedReadPos = b.gswitch(nextReadPos >= winSizeFloat, zero, nextReadPos)
+      _ = b.memoryWrite(readPosCell, zero, wrappedReadPos)
+
+      // Counter advance
+      let nextCounter = counter + one
+      let wrappedCounter = b.gswitch(nextCounter >= hopSizeFloat, zero, nextCounter)
+      _ = b.memoryWrite(counterCell, zero, wrappedCounter)
+
+      // Scatter-add: when counter == 0, add input window to ring buffer
+      let shouldScatter = counter == zero
+      b.if_(shouldScatter) {
+        b.loop(windowSize) { i in
+          let sample = b.tensorRead(inputTensor, flatIdx: i, shape: [windowSize])
+          let outPos = readPos + i
+          let wrappedOutPos = b.gswitch(
+            outPos >= winSizeFloat, outPos - winSizeFloat, outPos)
+          let outPosInt = b.cast(wrappedOutPos, to: .int)
+          let existing = b.memoryRead(outputRingCell, outPosInt)
+          _ = b.memoryWrite(outputRingCell, outPosInt, existing + sample)
+        }
+      }
+
+      // Use the output sample (ring buffer read from current position)
+      b.use(val: outputSample)
+
     default: break
     }
   }

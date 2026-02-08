@@ -470,164 +470,7 @@ extension Tensor {
   }
 }
 
-// MARK: - Tensor View Operations
-
 extension Tensor {
-  /// Reshape tensor to a new shape (must have same total size)
-  ///
-  /// ```swift
-  /// let t = Tensor([[1, 2, 3], [4, 5, 6]])  // [2, 3]
-  /// let flat = t.reshape([6])               // [6]
-  /// let square = t.reshape([3, 2])          // [3, 2]
-  /// ```
-  public func reshape(_ newShape: Shape) -> Tensor {
-    let nodeId = try! graph.graph.reshape(self.nodeId, to: newShape)
-    return Tensor(nodeId: nodeId, graph: graph, shape: newShape, requiresGrad: requiresGrad)
-  }
-
-  /// Transpose tensor by permuting axes
-  /// Default (nil) reverses all axes: [H, W] -> [W, H]
-  ///
-  /// ```swift
-  /// let t = Tensor([[1, 2, 3], [4, 5, 6]])  // [2, 3]
-  /// let tT = t.transpose()                  // [3, 2]
-  /// let perm = t.transpose([1, 0])          // Same as above
-  /// ```
-  public func transpose(_ axes: [Int]? = nil) -> Tensor {
-    let nodeId = try! graph.graph.transpose(self.nodeId, axes: axes)
-    let newShape: Shape
-    if let axes = axes {
-      newShape = axes.map { shape[$0] }
-    } else {
-      newShape = shape.reversed()
-    }
-    return Tensor(nodeId: nodeId, graph: graph, shape: newShape, requiresGrad: requiresGrad)
-  }
-
-  /// Shrink/slice tensor along each axis
-  /// ranges: for each dimension, (start, end) or nil to keep all
-  ///
-  /// ```swift
-  /// let t = Tensor([[1, 2, 3], [4, 5, 6], [7, 8, 9]])  // [3, 3]
-  /// let row = t.shrink([(0, 1), nil])                   // [1, 3] first row
-  /// let col = t.shrink([nil, (1, 2)])                   // [3, 1] middle column
-  /// let sub = t.shrink([(0, 2), (1, 3)])                // [2, 2] top-right 2x2
-  /// ```
-  public func shrink(_ ranges: [(Int, Int)?]) -> Tensor {
-    let nodeId = try! graph.graph.shrink(self.nodeId, ranges: ranges)
-    var newShape = [Int]()
-    for (dim, range) in ranges.enumerated() {
-      if let (start, end) = range {
-        newShape.append(end - start)
-      } else {
-        newShape.append(shape[dim])
-      }
-    }
-    return Tensor(nodeId: nodeId, graph: graph, shape: newShape, requiresGrad: requiresGrad)
-  }
-
-  /// Pad tensor with zeros along each axis
-  /// padding: for each dimension, (left, right) padding amounts
-  ///
-  /// ```swift
-  /// let t = Tensor([[1, 2], [3, 4]])       // [2, 2]
-  /// let padded = t.pad([(1, 1), (1, 1)])   // [4, 4] with zeros around edges
-  /// ```
-  public func pad(_ padding: [(Int, Int)]) -> Tensor {
-    let nodeId = try! graph.graph.pad(self.nodeId, padding: padding)
-    let newShape = zip(shape, padding).map { dim, pad in
-      dim + pad.0 + pad.1
-    }
-    return Tensor(nodeId: nodeId, graph: graph, shape: newShape, requiresGrad: requiresGrad)
-  }
-
-  /// Repeat/tile tensor along each dimension
-  /// repeats: number of times to repeat along each axis
-  ///
-  /// ```swift
-  /// let t = Tensor([[1, 2], [3, 4]])     // [2, 2]
-  /// let tiled = t.repeat([2, 3])         // [4, 6] - 2x vertical, 3x horizontal
-  /// ```
-  public func `repeat`(_ repeats: [Int]) -> Tensor {
-    let nodeId = try! graph.graph.repeatView(self.nodeId, repeats: repeats)
-    let newShape = zip(shape, repeats).map { $0 * $1 }
-    return Tensor(nodeId: nodeId, graph: graph, shape: newShape, requiresGrad: requiresGrad)
-  }
-
-  /// Expand size-1 dimensions to target shape (broadcasting)
-  ///
-  /// ```swift
-  /// let t = Tensor([[1], [2], [3]])      // [3, 1]
-  /// let expanded = t.expand([3, 4])      // [3, 4] - column broadcast to 4 cols
-  /// ```
-  public func expand(_ targetShape: Shape) -> Tensor {
-    let nodeId = try! graph.graph.expandView(self.nodeId, to: targetShape)
-    return Tensor(nodeId: nodeId, graph: graph, shape: targetShape, requiresGrad: requiresGrad)
-  }
-
-  /// Extract sliding windows (im2col) for convolution
-  /// Transforms [H, W] -> [outH, outW, kH, kW] where each output position
-  /// contains its corresponding input window
-  ///
-  /// ```swift
-  /// let img = Tensor(shape: [5, 5], ...)     // 5x5 image
-  /// let windows = img.windows([3, 3])        // [3, 3, 3, 3] - 3x3 output, 3x3 windows
-  /// ```
-  public func windows(_ kernelShape: Shape) -> Tensor {
-    guard shape.count >= 2, kernelShape.count == 2 else {
-      fatalError("windows requires 2D input and kernel shape")
-    }
-    let H = shape[shape.count - 2]
-    let W = shape[shape.count - 1]
-    let kH = kernelShape[0]
-    let kW = kernelShape[1]
-    let outH = H - kH + 1
-    let outW = W - kW + 1
-
-    // Use asStrided to create the im2col view
-    let inputTensor = try! graph.graph.getTensor(self.nodeId)
-    let inStrides = inputTensor.strides
-
-    // Output strides: [outH, outW, kH, kW]
-    // Moving in outH/outW moves by input strides
-    // Moving in kH/kW also moves by input strides (within the window)
-    let outStrides = [
-      inStrides[inStrides.count - 2],  // outH stride = input row stride
-      inStrides[inStrides.count - 1],  // outW stride = 1 (usually)
-      inStrides[inStrides.count - 2],  // kH stride = input row stride
-      inStrides[inStrides.count - 1],  // kW stride = 1 (usually)
-    ]
-
-    let outShape = [outH, outW, kH, kW]
-    let nodeId = try! graph.graph.asStrided(self.nodeId, shape: outShape, strides: outStrides)
-    return Tensor(nodeId: nodeId, graph: graph, shape: outShape, requiresGrad: requiresGrad)
-  }
-
-  /// 2D Convolution with a kernel tensor
-  /// Convolves input [H, W] with kernel [kH, kW] to produce [outH, outW]
-  ///
-  /// ```swift
-  /// let laplacian = Tensor([[0, 1, 0], [1, -4, 1], [0, 1, 0]])
-  /// let membrane = state.conv2d(laplacian)   // [H-2, W-2] Laplacian result
-  /// ```
-  public func conv2d(_ kernel: Tensor) -> Tensor {
-    guard shape.count == 2, kernel.shape.count == 2 else {
-      fatalError("conv2d requires 2D input and 2D kernel tensor")
-    }
-    let nodeId = try! graph.graph.conv2dView(self.nodeId, kernel: kernel.nodeId)
-
-    let H = shape[0]
-    let W = shape[1]
-    let kH = kernel.shape[0]
-    let kW = kernel.shape[1]
-    let outH = H - kH + 1
-    let outW = W - kW + 1
-
-    return Tensor(
-      nodeId: nodeId, graph: graph, shape: [outH, outW],
-      requiresGrad: requiresGrad || kernel.requiresGrad)
-  }
-
   /// Matrix multiply: A[M,K] @ B[K,N] -> C[M,N]
   ///
   /// ```swift
@@ -709,6 +552,236 @@ extension SignalTensor {
   public func exp() -> SignalTensor { DGenLazy.exp(self) }
   public func tanh() -> SignalTensor { DGenLazy.tanh(self) }
   public func relu() -> SignalTensor { DGenLazy.relu(self) }
+}
+
+// MARK: - Tensor FFT / IFFT (Pure Tensor Ops)
+
+/// Compute N-point FFT using only tensor view + arithmetic operations.
+/// N must be a power of 2. Returns (real, imaginary) tensors of shape [N].
+public func tensorFFT(_ input: Tensor, N: Int) -> (re: Tensor, im: Tensor) {
+  let k = Int(Foundation.log2(Double(N)))
+  precondition(1 << k == N, "N must be a power of 2")
+
+  // Bit-reversal permutation via reshape→transpose→reshape
+  let twos = [Int](repeating: 2, count: k)
+  var re = input.reshape(twos)
+    .transpose(Array((0..<k).reversed()))
+    .reshape([N])
+  var im = Tensor.zeros([N])
+
+  // k butterfly stages
+  for s in 0..<k {
+    let half = 1 << s
+    let blocks = N / (2 * half)
+
+    let re3d = re.reshape([blocks, 2, half])
+    let im3d = im.reshape([blocks, 2, half])
+
+    let even_re = re3d.shrink([nil, (0, 1), nil]).reshape([blocks, half])
+    let odd_re = re3d.shrink([nil, (1, 2), nil]).reshape([blocks, half])
+    let even_im = im3d.shrink([nil, (0, 1), nil]).reshape([blocks, half])
+    let odd_im = im3d.shrink([nil, (1, 2), nil]).reshape([blocks, half])
+
+    // Twiddle factors: w[j] = exp(-2πij / (2·half))
+    var twRe = [Float](repeating: 0, count: half)
+    var twIm = [Float](repeating: 0, count: half)
+    for j in 0..<half {
+      let angle = -2.0 * Float.pi * Float(j) / Float(2 * half)
+      twRe[j] = Foundation.cos(angle)
+      twIm[j] = Foundation.sin(angle)
+    }
+
+    let twiddleRe = Tensor(twRe).reshape([1, half]).expand([blocks, half])
+    let twiddleIm = Tensor(twIm).reshape([1, half]).expand([blocks, half])
+
+    let t_re = odd_re * twiddleRe - odd_im * twiddleIm
+    let t_im = odd_re * twiddleIm + odd_im * twiddleRe
+
+    let top_re = even_re + t_re
+    let top_im = even_im + t_im
+    let bot_re = even_re - t_re
+    let bot_im = even_im - t_im
+
+    re = (top_re.pad([(0, 0), (0, half)]) + bot_re.pad([(0, 0), (half, 0)])).reshape([N])
+    im = (top_im.pad([(0, 0), (0, half)]) + bot_im.pad([(0, 0), (half, 0)])).reshape([N])
+  }
+
+  return (re, im)
+}
+
+/// Compute N-point IFFT using only tensor view + arithmetic operations.
+/// Same Cooley-Tukey butterfly as tensorFFT but with positive twiddle angles and 1/N normalization.
+/// N must be a power of 2. Returns real tensor of shape [N] (imaginary part discarded for real signals).
+public func tensorIFFT(_ re: Tensor, _ im: Tensor, N: Int) -> Tensor {
+  let k = Int(Foundation.log2(Double(N)))
+  precondition(1 << k == N, "N must be a power of 2")
+
+  // Bit-reversal permutation
+  let twos = [Int](repeating: 2, count: k)
+  var reBR = re.reshape(twos)
+    .transpose(Array((0..<k).reversed()))
+    .reshape([N])
+  var imBR = im.reshape(twos)
+    .transpose(Array((0..<k).reversed()))
+    .reshape([N])
+
+  // k butterfly stages with POSITIVE twiddle angles
+  for s in 0..<k {
+    let half = 1 << s
+    let blocks = N / (2 * half)
+
+    let re3d = reBR.reshape([blocks, 2, half])
+    let im3d = imBR.reshape([blocks, 2, half])
+
+    let even_re = re3d.shrink([nil, (0, 1), nil]).reshape([blocks, half])
+    let odd_re = re3d.shrink([nil, (1, 2), nil]).reshape([blocks, half])
+    let even_im = im3d.shrink([nil, (0, 1), nil]).reshape([blocks, half])
+    let odd_im = im3d.shrink([nil, (1, 2), nil]).reshape([blocks, half])
+
+    // POSITIVE twiddle: w[j] = exp(+2πij / (2·half))
+    var twRe = [Float](repeating: 0, count: half)
+    var twIm = [Float](repeating: 0, count: half)
+    for j in 0..<half {
+      let angle = 2.0 * Float.pi * Float(j) / Float(2 * half)
+      twRe[j] = Foundation.cos(angle)
+      twIm[j] = Foundation.sin(angle)
+    }
+
+    let twiddleRe = Tensor(twRe).reshape([1, half]).expand([blocks, half])
+    let twiddleIm = Tensor(twIm).reshape([1, half]).expand([blocks, half])
+
+    let t_re = odd_re * twiddleRe - odd_im * twiddleIm
+    let t_im = odd_re * twiddleIm + odd_im * twiddleRe
+
+    let top_re = even_re + t_re
+    let top_im = even_im + t_im
+    let bot_re = even_re - t_re
+    let bot_im = even_im - t_im
+
+    reBR = (top_re.pad([(0, 0), (0, half)]) + bot_re.pad([(0, 0), (half, 0)])).reshape([N])
+    imBR = (top_im.pad([(0, 0), (0, half)]) + bot_im.pad([(0, 0), (half, 0)])).reshape([N])
+  }
+
+  // Normalize by 1/N
+  return reBR * (1.0 / Float(N))
+}
+
+/// SignalTensor FFT variant: same algorithm, but input is frame-varying.
+/// Twiddle factors stay as static Tensor; mixed arithmetic promotes to SignalTensor.
+public func signalTensorFFT(_ input: SignalTensor, N: Int) -> (re: SignalTensor, im: SignalTensor) {
+  let k = Int(Foundation.log2(Double(N)))
+  precondition(1 << k == N, "N must be a power of 2")
+
+  let twos = [Int](repeating: 2, count: k)
+  var re = input.reshape(twos)
+    .transpose(Array((0..<k).reversed()))
+    .reshape([N])
+  var im = input.reshape([N]) * 0.0
+
+  for s in 0..<k {
+    let half = 1 << s
+    let blocks = N / (2 * half)
+
+    let re3d = re.reshape([blocks, 2, half])
+    let im3d = im.reshape([blocks, 2, half])
+
+    let even_re = re3d.shrink([nil, (0, 1), nil]).reshape([blocks, half])
+    let odd_re = re3d.shrink([nil, (1, 2), nil]).reshape([blocks, half])
+    let even_im = im3d.shrink([nil, (0, 1), nil]).reshape([blocks, half])
+    let odd_im = im3d.shrink([nil, (1, 2), nil]).reshape([blocks, half])
+
+    var twRe = [Float](repeating: 0, count: half)
+    var twIm = [Float](repeating: 0, count: half)
+    for j in 0..<half {
+      let angle = -2.0 * Float.pi * Float(j) / Float(2 * half)
+      twRe[j] = Foundation.cos(angle)
+      twIm[j] = Foundation.sin(angle)
+    }
+
+    let twiddleRe = Tensor(twRe).reshape([1, half]).expand([blocks, half])
+    let twiddleIm = Tensor(twIm).reshape([1, half]).expand([blocks, half])
+
+    let t_re = odd_re * twiddleRe - odd_im * twiddleIm
+    let t_im = odd_re * twiddleIm + odd_im * twiddleRe
+
+    let top_re = even_re + t_re
+    let top_im = even_im + t_im
+    let bot_re = even_re - t_re
+    let bot_im = even_im - t_im
+
+    re = (top_re.pad([(0, 0), (0, half)]) + bot_re.pad([(0, 0), (half, 0)])).reshape([N])
+    im = (top_im.pad([(0, 0), (0, half)]) + bot_im.pad([(0, 0), (half, 0)])).reshape([N])
+  }
+
+  return (re, im)
+}
+
+/// SignalTensor IFFT variant: positive twiddle angles, 1/N normalization.
+public func signalTensorIFFT(_ re: SignalTensor, _ im: SignalTensor, N: Int) -> SignalTensor {
+  let k = Int(Foundation.log2(Double(N)))
+  precondition(1 << k == N, "N must be a power of 2")
+
+  let twos = [Int](repeating: 2, count: k)
+  var reBR = re.reshape(twos)
+    .transpose(Array((0..<k).reversed()))
+    .reshape([N])
+  var imBR = im.reshape(twos)
+    .transpose(Array((0..<k).reversed()))
+    .reshape([N])
+
+  for s in 0..<k {
+    let half = 1 << s
+    let blocks = N / (2 * half)
+
+    let re3d = reBR.reshape([blocks, 2, half])
+    let im3d = imBR.reshape([blocks, 2, half])
+
+    let even_re = re3d.shrink([nil, (0, 1), nil]).reshape([blocks, half])
+    let odd_re = re3d.shrink([nil, (1, 2), nil]).reshape([blocks, half])
+    let even_im = im3d.shrink([nil, (0, 1), nil]).reshape([blocks, half])
+    let odd_im = im3d.shrink([nil, (1, 2), nil]).reshape([blocks, half])
+
+    // POSITIVE twiddle for IFFT
+    var twRe = [Float](repeating: 0, count: half)
+    var twIm = [Float](repeating: 0, count: half)
+    for j in 0..<half {
+      let angle = 2.0 * Float.pi * Float(j) / Float(2 * half)
+      twRe[j] = Foundation.cos(angle)
+      twIm[j] = Foundation.sin(angle)
+    }
+
+    let twiddleRe = Tensor(twRe).reshape([1, half]).expand([blocks, half])
+    let twiddleIm = Tensor(twIm).reshape([1, half]).expand([blocks, half])
+
+    let t_re = odd_re * twiddleRe - odd_im * twiddleIm
+    let t_im = odd_re * twiddleIm + odd_im * twiddleRe
+
+    let top_re = even_re + t_re
+    let top_im = even_im + t_im
+    let bot_re = even_re - t_re
+    let bot_im = even_im - t_im
+
+    reBR = (top_re.pad([(0, 0), (0, half)]) + bot_re.pad([(0, 0), (half, 0)])).reshape([N])
+    imBR = (top_im.pad([(0, 0), (0, half)]) + bot_im.pad([(0, 0), (half, 0)])).reshape([N])
+  }
+
+  // Normalize by 1/N
+  return reBR * (1.0 / Float(N))
+}
+
+// MARK: - Overlap-Add
+
+extension SignalTensor {
+  /// Overlap-add: scatter-add this tensor window into a ring buffer, emit one sample per frame.
+  /// Converts a hop-rate tensor (e.g., IFFT output) back to a frame-rate scalar signal.
+  ///
+  /// - Parameter hop: How many frames between scatter-adds
+  /// - Returns: Signal (one sample per frame)
+  public func overlapAdd(hop: Int) -> Signal {
+    let windowSize = shape.reduce(1, *)
+    let nodeId = graph.graph.overlapAdd(self.nodeId, windowSize: windowSize, hopSize: hop)
+    return Signal(nodeId: nodeId, graph: graph, requiresGrad: requiresGrad)
+  }
 }
 
 // MARK: - Higher-Order Operations
@@ -812,92 +885,9 @@ extension SignalTensor {
   }
 }
 
-// MARK: - SignalTensor Views
+// MARK: - SignalTensor Reductions
 
 extension SignalTensor {
-  /// Extract sliding windows (im2col) for convolution
-  /// Transforms [H, W] -> [outH, outW, kH, kW] where each output position
-  /// contains its corresponding input window
-  ///
-  /// ```swift
-  /// let state = history.read()                 // SignalTensor [5, 5]
-  /// let windows = state.windows([3, 3])        // SignalTensor [3, 3, 3, 3]
-  /// ```
-  public func windows(_ kernelShape: Shape) -> SignalTensor {
-    guard shape.count >= 2, kernelShape.count == 2 else {
-      fatalError("windows requires 2D input and kernel shape")
-    }
-    let H = shape[shape.count - 2]
-    let W = shape[shape.count - 1]
-    let kH = kernelShape[0]
-    let kW = kernelShape[1]
-    let outH = H - kH + 1
-    let outW = W - kW + 1
-
-    // Use asStrided to create the im2col view
-    let inputTensor = try! graph.graph.getTensor(self.nodeId)
-    let inStrides = inputTensor.strides
-
-    // Output strides: [outH, outW, kH, kW]
-    // Moving in outH/outW moves by input strides
-    // Moving in kH/kW also moves by input strides (within the window)
-    let outStrides = [
-      inStrides[inStrides.count - 2],  // outH stride = input row stride
-      inStrides[inStrides.count - 1],  // outW stride = 1 (usually)
-      inStrides[inStrides.count - 2],  // kH stride = input row stride
-      inStrides[inStrides.count - 1],  // kW stride = 1 (usually)
-    ]
-
-    let outShape = [outH, outW, kH, kW]
-    let nodeId = try! graph.graph.asStrided(self.nodeId, shape: outShape, strides: outStrides)
-    return SignalTensor(nodeId: nodeId, graph: graph, shape: outShape, requiresGrad: requiresGrad)
-  }
-
-  /// 2D Convolution with a kernel tensor
-  /// Convolves input [H, W] with kernel [kH, kW] to produce [outH, outW]
-  /// Perfect for membrane simulations with Laplacian kernels!
-  ///
-  /// ```swift
-  /// let laplacian = Tensor([[0, 1, 0], [1, -4, 1], [0, 1, 0]])
-  /// let state = history.read()               // SignalTensor [H, W]
-  /// let laplacianResult = state.conv2d(laplacian)  // SignalTensor [H-2, W-2]
-  /// ```
-  public func conv2d(_ kernel: Tensor) -> SignalTensor {
-    guard shape.count == 2, kernel.shape.count == 2 else {
-      fatalError("conv2d requires 2D input and 2D kernel tensor")
-    }
-    let nodeId = try! graph.graph.conv2dView(self.nodeId, kernel: kernel.nodeId)
-
-    let H = shape[0]
-    let W = shape[1]
-    let kH = kernel.shape[0]
-    let kW = kernel.shape[1]
-    let outH = H - kH + 1
-    let outW = W - kW + 1
-
-    return SignalTensor(
-      nodeId: nodeId, graph: graph, shape: [outH, outW],
-      requiresGrad: requiresGrad || kernel.requiresGrad)
-  }
-
-  /// Pad tensor with zeros along each axis (same-size convolution helper)
-  /// padding: for each dimension, (left, right) padding amounts
-  ///
-  /// Use this before conv2d to get same-size output (Dirichlet boundary conditions)
-  ///
-  /// ```swift
-  /// let state = history.read()                     // SignalTensor [4, 4]
-  /// let padded = state.pad([(1, 1), (1, 1)])       // SignalTensor [6, 6]
-  /// let laplacian = padded.conv2d(kernel3x3)      // SignalTensor [4, 4] (same size!)
-  /// ```
-  public func pad(_ padding: [(Int, Int)]) -> SignalTensor {
-    let nodeId = try! graph.graph.pad(self.nodeId, padding: padding)
-    let newShape = zip(shape, padding).map { dim, pad in
-      dim + pad.0 + pad.1
-    }
-    return SignalTensor(nodeId: nodeId, graph: graph, shape: newShape, requiresGrad: requiresGrad)
-  }
-
   /// Sum along a specific axis
   /// - Parameter axis: The axis to reduce (supports negative indexing)
   /// - Returns: SignalTensor with that dimension removed
