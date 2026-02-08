@@ -666,7 +666,7 @@ public func tensorIFFT(_ re: Tensor, _ im: Tensor, N: Int) -> Tensor {
   return reBR * (1.0 / Float(N))
 }
 
-/// SignalTensor FFT variant: same algorithm, but input is frame-varying.
+/// SignalTensor FFT variant: same algorithm, but input is a frame-varying tensor (usually buffered and hopped).
 /// Twiddle factors stay as static Tensor; mixed arithmetic promotes to SignalTensor.
 public func signalTensorFFT(_ input: SignalTensor, N: Int) -> (re: SignalTensor, im: SignalTensor) {
   let k = Int(Foundation.log2(Double(N)))
@@ -676,6 +676,9 @@ public func signalTensorFFT(_ input: SignalTensor, N: Int) -> (re: SignalTensor,
   var re = input.reshape(twos)
     .transpose(Array((0..<k).reversed()))
     .reshape([N])
+
+  // ugly trick to get a SignalTensor of all 0s to start accumulating on
+  // TODO - find a better way to express "give me a SignalTensor of 0s"
   var im = input.reshape([N]) * 0.0
 
   for s in 0..<k {
@@ -882,6 +885,193 @@ extension SignalTensor {
     return SignalTensor(
       nodeId: nodeId, graph: graph, shape: [numCols],
       requiresGrad: requiresGrad || rowIndex.requiresGrad)
+  }
+}
+
+// MARK: - Audio Effects (Signal)
+
+extension Signal {
+  /// Biquad filter with multiple filter types.
+  ///
+  /// ```swift
+  /// let audio = Signal.input()
+  /// let filtered = audio.biquad(cutoff: 1000, resonance: 1.0, gain: 1.0, mode: 0)
+  /// ```
+  ///
+  /// - Parameters:
+  ///   - cutoff: Cutoff/center frequency in Hz
+  ///   - resonance: Q factor / resonance
+  ///   - gain: Output gain (linear). For shelf filters, controls shelf amount.
+  ///   - mode: Filter type: 0=LP, 1=HP, 2=BP(skirt), 3=BP(peak), 4=AP, 5=Notch, 6=HiShelf, 7=LoShelf
+  /// - Returns: Filtered signal
+  public func biquad(cutoff: Signal, resonance: Signal, gain: Signal, mode: Signal) -> Signal {
+    let nodeId = graph.graph.biquad(
+      self.nodeId, cutoff.nodeId, resonance.nodeId, gain.nodeId, mode.nodeId)
+    let needsGrad = requiresGrad || cutoff.requiresGrad || resonance.requiresGrad
+      || gain.requiresGrad || mode.requiresGrad
+    return Signal(nodeId: nodeId, graph: graph, requiresGrad: needsGrad)
+  }
+
+  /// Biquad filter with Float parameters
+  public func biquad(cutoff: Float, resonance: Float, gain: Float, mode: Int) -> Signal {
+    return biquad(
+      cutoff: Signal.constant(cutoff),
+      resonance: Signal.constant(resonance),
+      gain: Signal.constant(gain),
+      mode: Signal.constant(Float(mode)))
+  }
+
+  /// Compressor with sidechain support.
+  ///
+  /// ```swift
+  /// let audio = Signal.input()
+  /// let compressed = audio.compressor(
+  ///   ratio: 4.0, threshold: -20.0, knee: 6.0,
+  ///   attack: 0.005, release: 0.1)
+  /// ```
+  ///
+  /// - Parameters:
+  ///   - ratio: Compression ratio (e.g. 4.0 = 4:1)
+  ///   - threshold: Threshold in dB
+  ///   - knee: Knee width in dB
+  ///   - attack: Attack time in seconds
+  ///   - release: Release time in seconds
+  ///   - sidechain: Optional sidechain input signal. When provided, the compressor
+  ///                uses this signal for level detection instead of the main input.
+  /// - Returns: Compressed signal
+  public func compressor(
+    ratio: Signal, threshold: Signal, knee: Signal,
+    attack: Signal, release: Signal,
+    sidechain: Signal? = nil
+  ) -> Signal {
+    let isSideChain = graph.node(.constant(sidechain != nil ? 1.0 : 0.0))
+    let sidechainNode = sidechain?.nodeId ?? graph.node(.constant(0.0))
+    let nodeId = graph.graph.compressor(
+      self.nodeId, ratio.nodeId, threshold.nodeId, knee.nodeId,
+      attack.nodeId, release.nodeId, isSideChain, sidechainNode)
+    let needsGrad = requiresGrad || ratio.requiresGrad || threshold.requiresGrad
+      || knee.requiresGrad || attack.requiresGrad || release.requiresGrad
+      || (sidechain?.requiresGrad ?? false)
+    return Signal(nodeId: nodeId, graph: graph, requiresGrad: needsGrad)
+  }
+
+  /// Compressor with Float parameters
+  public func compressor(
+    ratio: Float, threshold: Float, knee: Float,
+    attack: Float, release: Float
+  ) -> Signal {
+    return compressor(
+      ratio: Signal.constant(ratio),
+      threshold: Signal.constant(threshold),
+      knee: Signal.constant(knee),
+      attack: Signal.constant(attack),
+      release: Signal.constant(release))
+  }
+
+  /// Delay with linear interpolation for fractional delay times.
+  ///
+  /// ```swift
+  /// let audio = Signal.input()
+  /// let delayed = audio.delay(Signal.constant(4410))  // 100ms at 44.1kHz
+  /// ```
+  ///
+  /// - Parameter delayTimeInSamples: Delay time in samples (0 to 88000)
+  /// - Returns: Delayed signal
+  public func delay(_ delayTimeInSamples: Signal) -> Signal {
+    let nodeId = graph.graph.delay(self.nodeId, delayTimeInSamples.nodeId)
+    let needsGrad = requiresGrad || delayTimeInSamples.requiresGrad
+    return Signal(nodeId: nodeId, graph: graph, requiresGrad: needsGrad)
+  }
+
+  /// Delay with Float parameter
+  public func delay(_ delayTimeInSamples: Float) -> Signal {
+    return delay(Signal.constant(delayTimeInSamples))
+  }
+}
+
+// MARK: - Audio Effects (SignalTensor)
+
+extension SignalTensor {
+  /// Biquad filter applied element-wise to each signal in the tensor.
+  ///
+  /// Each element gets its own filter state (history cells).
+  /// Cutoff, resonance, gain, and mode are broadcast scalars.
+  ///
+  /// - Parameters:
+  ///   - cutoff: Cutoff/center frequency in Hz
+  ///   - resonance: Q factor / resonance
+  ///   - gain: Output gain (linear)
+  ///   - mode: Filter type: 0=LP, 1=HP, 2=BP(skirt), 3=BP(peak), 4=AP, 5=Notch, 6=HiShelf, 7=LoShelf
+  /// - Returns: Filtered signal tensor (same shape)
+  public func biquad(cutoff: Signal, resonance: Signal, gain: Signal, mode: Signal) -> SignalTensor {
+    let nodeId = graph.graph.biquad(
+      self.nodeId, cutoff.nodeId, resonance.nodeId, gain.nodeId, mode.nodeId)
+    let needsGrad = requiresGrad || cutoff.requiresGrad || resonance.requiresGrad
+      || gain.requiresGrad || mode.requiresGrad
+    return SignalTensor(nodeId: nodeId, graph: graph, shape: shape, requiresGrad: needsGrad)
+  }
+
+  /// Biquad filter with Float parameters
+  public func biquad(cutoff: Float, resonance: Float, gain: Float, mode: Int) -> SignalTensor {
+    return biquad(
+      cutoff: Signal.constant(cutoff),
+      resonance: Signal.constant(resonance),
+      gain: Signal.constant(gain),
+      mode: Signal.constant(Float(mode)))
+  }
+
+  /// Compressor applied element-wise to each signal in the tensor.
+  ///
+  /// - Parameters:
+  ///   - ratio: Compression ratio
+  ///   - threshold: Threshold in dB
+  ///   - knee: Knee width in dB
+  ///   - attack: Attack time in seconds
+  ///   - release: Release time in seconds
+  ///   - sidechain: Optional sidechain input signal
+  /// - Returns: Compressed signal tensor (same shape)
+  public func compressor(
+    ratio: Signal, threshold: Signal, knee: Signal,
+    attack: Signal, release: Signal,
+    sidechain: Signal? = nil
+  ) -> SignalTensor {
+    let isSideChain = graph.node(.constant(sidechain != nil ? 1.0 : 0.0))
+    let sidechainNode = sidechain?.nodeId ?? graph.node(.constant(0.0))
+    let nodeId = graph.graph.compressor(
+      self.nodeId, ratio.nodeId, threshold.nodeId, knee.nodeId,
+      attack.nodeId, release.nodeId, isSideChain, sidechainNode)
+    let needsGrad = requiresGrad || ratio.requiresGrad || threshold.requiresGrad
+      || knee.requiresGrad || attack.requiresGrad || release.requiresGrad
+      || (sidechain?.requiresGrad ?? false)
+    return SignalTensor(nodeId: nodeId, graph: graph, shape: shape, requiresGrad: needsGrad)
+  }
+
+  /// Compressor with Float parameters
+  public func compressor(
+    ratio: Float, threshold: Float, knee: Float,
+    attack: Float, release: Float
+  ) -> SignalTensor {
+    return compressor(
+      ratio: Signal.constant(ratio),
+      threshold: Signal.constant(threshold),
+      knee: Signal.constant(knee),
+      attack: Signal.constant(attack),
+      release: Signal.constant(release))
+  }
+
+  /// Delay applied element-wise to each signal in the tensor.
+  ///
+  /// - Parameter delayTimeInSamples: Delay time in samples (0 to 88000)
+  /// - Returns: Delayed signal tensor (same shape)
+  public func delay(_ delayTimeInSamples: Signal) -> SignalTensor {
+    let nodeId = graph.graph.delay(self.nodeId, delayTimeInSamples.nodeId)
+    let needsGrad = requiresGrad || delayTimeInSamples.requiresGrad
+    return SignalTensor(nodeId: nodeId, graph: graph, shape: shape, requiresGrad: needsGrad)
+  }
+
+  /// Delay with Float parameter
+  public func delay(_ delayTimeInSamples: Float) -> SignalTensor {
+    return delay(Signal.constant(delayTimeInSamples))
   }
 }
 

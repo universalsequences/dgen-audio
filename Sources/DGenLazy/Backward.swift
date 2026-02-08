@@ -112,10 +112,9 @@ extension LazyGraph {
     var tensorGrads: [NodeID: [Float]] = [:]
     var signalGrads: [NodeID: Float] = [:]
 
-    guard let memBuffer = context.runtime.getBuffer(name: "memory") else {
+    guard let memPtr = context.runtime.memoryPointer() else {
       return (tensorGrads, signalGrads)
     }
-    let memPtr = memBuffer.contents().assumingMemoryBound(to: Float.self)
 
     // Read tensor gradients
     for tensor in registry.tensors {
@@ -163,25 +162,34 @@ extension LazyGraph {
       graph.gradientSideEffects = []
     }
 
-    let context = try compile(frameCount: frameCount)
-    run(context: context, preserveState: false)
+    // Wrap compilation and execution in autoreleasepool to ensure Metal objects
+    // (MTLBuffer, MTLLibrary, MTLComputePipelineState, etc.) are freed each
+    // iteration. Without this, autoreleased Obj-C objects from Metal APIs
+    // accumulate across training epochs, causing multi-GB memory growth.
+    var lossValues: [Float] = []
+    try autoreleasepool {
+      let context = try compile(frameCount: frameCount)
+      run(context: context, preserveState: false)
 
-    let (tensorGrads, signalGrads) = readGradients(context: context)
+      let (tensorGrads, signalGrads) = readGradients(context: context)
 
-    // Populate .grad properties (gradients are data-only, not graph participants)
-    for tensor in parameterRegistry.tensors {
-      if let grads = tensorGrads[tensor.nodeId] {
-        tensor.grad = Tensor(nodeId: -1, graph: self, shape: [grads.count], data: grads)
+      // Populate .grad properties (gradients are data-only, not graph participants)
+      for tensor in parameterRegistry.tensors {
+        if let grads = tensorGrads[tensor.nodeId] {
+          tensor.grad = Tensor(nodeId: -1, graph: self, shape: [grads.count], data: grads)
+        }
       }
-    }
-    for signal in parameterRegistry.signals {
-      if let gradValue = signalGrads[signal.nodeId] {
-        signal.grad = Signal(nodeId: -1, graph: self, data: gradValue)
+      for signal in parameterRegistry.signals {
+        if let gradValue = signalGrads[signal.nodeId] {
+          signal.grad = Signal(nodeId: -1, graph: self, data: gradValue)
+        }
       }
-    }
 
-    let lossValues = readOutputs(context: context)
-    clearComputationGraph()
+      lossValues = readOutputs(context: context)
+      clearComputationGraph()
+      // context goes out of scope here → MetalCompiledKernel freed →
+      // autoreleasepool drains → underlying Metal objects released
+    }
     return lossValues
   }
 }

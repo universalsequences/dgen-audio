@@ -213,7 +213,8 @@ final class TensorFFTTests: XCTestCase {
     // cos²(x) averages to 0.5, so sum over N samples ≈ N/2
     // Total |X|² should ≈ N * N/2 = 2048
     let expectedEnergy = Float(N) * Float(N) / 2.0
-    XCTAssertEqual(totalEnergy, expectedEnergy, accuracy: expectedEnergy * 0.01, "Parseval's theorem")
+    XCTAssertEqual(
+      totalEnergy, expectedEnergy, accuracy: expectedEnergy * 0.01, "Parseval's theorem")
   }
 
   // MARK: - IFFT Round-Trip
@@ -386,7 +387,9 @@ final class TensorFFTTests: XCTestCase {
     let re3d2 = combined.reshape([blocks2, 2, half2])
     let even2 = re3d2.shrink([nil, (0, 1), nil]).reshape([blocks2, half2])
     let odd2 = re3d2.shrink([nil, (1, 2), nil]).reshape([blocks2, half2])
-    let tw2Re = Tensor([Foundation.cos(Float(0)), Foundation.cos(Float(-Float.pi / 2))]).reshape([1, half2]).expand([blocks2, half2])
+    let tw2Re = Tensor([Foundation.cos(Float(0)), Foundation.cos(Float(-Float.pi / 2))]).reshape([
+      1, half2,
+    ]).expand([blocks2, half2])
     let t2_re = odd2 * tw2Re
     let top2 = even2 + t2_re
     let bot2 = even2 - t2_re
@@ -541,7 +544,8 @@ final class TensorFFTTests: XCTestCase {
     let steadyState = Array(result.suffix(hop * 2))
     let expectedValue: Float = Float(N) / Float(hop)  // 2.0
     for (i, val) in steadyState.enumerated() {
-      XCTAssertEqual(val, expectedValue, accuracy: 0.01,
+      XCTAssertEqual(
+        val, expectedValue, accuracy: 0.01,
         "Steady-state sample \(i) should be \(expectedValue), got \(val)")
     }
   }
@@ -614,16 +618,19 @@ final class TensorFFTTests: XCTestCase {
       let dirMatch = (a > 0) == (n > 0)
       if dirMatch { matchCount += 1 }
       let relError = Swift.abs(a) > 1e-6 ? Swift.abs((a - n) / a) : Float.infinity
-      print(String(
-        format: "   %2d   | %12.5f | %12.5f | %@ (rel err %.2f%%)",
-        i, a, n, dirMatch ? "YES" : "NO", relError * 100))
+      print(
+        String(
+          format: "   %2d   | %12.5f | %12.5f | %@ (rel err %.2f%%)",
+          i, a, n, dirMatch ? "YES" : "NO", relError * 100))
     }
     print("Direction match: \(matchCount)/\(testedCount)")
 
-    XCTAssertGreaterThan(testedCount, 0,
+    XCTAssertGreaterThan(
+      testedCount, 0,
       "Should have testable gradient elements", file: file, line: line)
     let matchRate = Float(matchCount) / Float(testedCount)
-    XCTAssertGreaterThanOrEqual(matchRate, 0.8,
+    XCTAssertGreaterThanOrEqual(
+      matchRate, 0.8,
       "At least 80% of gradient directions should match numerical", file: file, line: line)
   }
 
@@ -674,9 +681,12 @@ final class TensorFFTTests: XCTestCase {
     let analyticalGrad = scale.grad!.getData()!
 
     // 2. Compute numerical gradient via central difference
-    let numGrad = try numericalGradient(count: N, epsilon: epsilon, lossAt: { data in
-      try self.overlapAddLoss(scaleData: data, N: N, hop: hop, freq: freq, totalFrames: totalFrames)
-    }, baseData: baseScale)
+    let numGrad = try numericalGradient(
+      count: N, epsilon: epsilon,
+      lossAt: { data in
+        try self.overlapAddLoss(
+          scaleData: data, N: N, hop: hop, freq: freq, totalFrames: totalFrames)
+      }, baseData: baseScale)
 
     // 3. Compare
     assertGradientDirectionsMatch(
@@ -709,9 +719,12 @@ final class TensorFFTTests: XCTestCase {
     let analyticalGrad = scale.grad!.getData()!
 
     // 2. Compute numerical gradient via central difference
-    let numGrad = try numericalGradient(count: N, epsilon: epsilon, lossAt: { data in
-      try self.fftOverlapAddLoss(scaleData: data, N: N, hop: hop, freq: freq, totalFrames: totalFrames)
-    }, baseData: baseScale)
+    let numGrad = try numericalGradient(
+      count: N, epsilon: epsilon,
+      lossAt: { data in
+        try self.fftOverlapAddLoss(
+          scaleData: data, N: N, hop: hop, freq: freq, totalFrames: totalFrames)
+      }, baseData: baseScale)
 
     // 3. Compare
     assertGradientDirectionsMatch(
@@ -774,4 +787,120 @@ final class TensorFFTTests: XCTestCase {
     // The output should have significant amplitude (not all zeros)
     XCTAssertGreaterThan(maxAbs, 0.1, "Output should not be all zeros after transient")
   }
+
+  // MARK: - Tensor-Based Spectral Loss
+
+  /// Verify tensor-based spectral loss: positive for different signals, zero for same.
+  /// Built entirely from tensorFFT + arithmetic — no custom Metal kernels.
+  func testTensorSpectralLossForward() throws {
+    let N = 8
+
+    // Cosine at bin 1
+    var cos1 = [Float](repeating: 0, count: N)
+    for n in 0..<N { cos1[n] = Foundation.cos(2.0 * Float.pi * Float(n) / Float(N)) }
+
+    // Cosine at bin 2
+    var cos2 = [Float](repeating: 0, count: N)
+    for n in 0..<N { cos2[n] = Foundation.cos(4.0 * Float.pi * Float(n) / Float(N)) }
+
+    // Different signals → per-bin magnitude differences should be non-zero
+    let a = Tensor(cos1)
+    let b = Tensor(cos2)
+    let (reA, imA) = tensorFFT(a, N: N)
+    let (reB, imB) = tensorFFT(b, N: N)
+    let magA = reA * reA + imA * imA
+    let magB = reB * reB + imB * imB
+    let diff = magA - magB
+    let lossBins = diff * diff  // [N] per-bin squared differences
+    let lossVals = try lossBins.toSignal(maxFrames: N).realize(frames: N)
+
+    print("\n=== Tensor Spectral Loss Forward ===")
+    print("Per-bin loss (different): \(lossVals)")
+    let totalLoss = lossVals.reduce(0, +)
+    XCTAssertGreaterThan(totalLoss, 0, "Different frequencies → positive spectral loss")
+
+    // Same signal → all per-bin differences should be zero
+    LazyGraphContext.reset()
+    let c = Tensor(cos1)
+    let d = Tensor(cos1)
+    let (reC, imC) = tensorFFT(c, N: N)
+    let (reD, imD) = tensorFFT(d, N: N)
+    let magC = reC * reC + imC * imC
+    let magD = reD * reD + imD * imD
+    let diff2 = magC - magD
+    let lossBins2 = diff2 * diff2
+    let lossVals2 = try lossBins2.toSignal(maxFrames: N).realize(frames: N)
+
+    print("Per-bin loss (same): \(lossVals2)")
+    for k in 0..<N {
+      XCTAssertEqual(lossVals2[k], 0.0, accuracy: 1e-6, "Bin \(k) loss should be 0 for same signal")
+    }
+  }
+
+  /// Train a time-domain signal to match a target's magnitude spectrum.
+  /// Proves backward() flows gradients through tensorFFT via autodiff.
+  func testTensorSpectralLossTraining() throws {
+    let N = 8
+    DGenConfig.kernelOutputPath = "/tmp/test_tensor_spectral_loss_training.metal"
+    defer { DGenConfig.kernelOutputPath = nil }
+
+    // Target: cosine at bin 1 — known magnitude spectrum
+    var targetData = [Float](repeating: 0, count: N)
+    for n in 0..<N {
+      targetData[n] = Foundation.cos(2.0 * Float.pi * Float(n) / Float(N))
+    }
+
+    // Learnable: start with different values
+    let learned = Tensor.param([N], data: [0.5, -0.3, 0.8, -0.1, 0.2, 0.7, -0.5, 0.4])
+    let target = Tensor(targetData)
+    let optimizer = Adam(params: [learned], lr: 0.05)
+
+    var firstLoss: Float = 0
+    var lastLoss: Float = 0
+
+    for epoch in 0..<200 {
+      let (reL, imL) = tensorFFT(learned, N: N)
+      let (reT, imT) = tensorFFT(target, N: N)
+      let magL = reL * reL + imL * imL
+      let magT = reT * reT + imT * imT
+      let diff = magL - magT
+      let loss = (diff * diff).sum()
+
+      let lossValue = try loss.backward(frameCount: 1).first ?? 0
+      if epoch == 0 { firstLoss = lossValue }
+      lastLoss = lossValue
+
+      if epoch % 5 == 0 {
+        print("Tensor spectral loss epoch \(epoch): \(lossValue)")
+      }
+
+      optimizer.step()
+      optimizer.zeroGrad()
+    }
+
+    print("Initial: \(firstLoss), Final: \(lastLoss)")
+    XCTAssertGreaterThan(firstLoss, 0, "Initial loss should be positive")
+    XCTAssertLessThan(lastLoss, firstLoss * 0.1, "Spectral loss should decrease >90%")
+
+    // Verify: compute DFT in Swift, check bin 1 dominates
+    let data = learned.getData()!
+    var binEnergies = [Float](repeating: 0, count: N)
+    for k in 0..<N {
+      var reK: Float = 0
+      var imK: Float = 0
+      for n in 0..<N {
+        let angle = -2.0 * Float.pi * Float(k) * Float(n) / Float(N)
+        reK += data[n] * Foundation.cos(angle)
+        imK += data[n] * Foundation.sin(angle)
+      }
+      binEnergies[k] = reK * reK + imK * imK
+    }
+
+    print("Bin energies: \(binEnergies)")
+    let topBin = binEnergies.enumerated().max(by: { $0.element < $1.element })!.offset
+    XCTAssert(
+      topBin == 1 || topBin == N - 1,
+      "Dominant bin should be 1 or \(N-1), got \(topBin)")
+  }
+
 }

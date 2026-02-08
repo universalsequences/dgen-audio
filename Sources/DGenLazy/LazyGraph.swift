@@ -5,6 +5,12 @@
 
 import DGen
 
+/// Weak reference wrapper for tracking tensors/signals without preventing deallocation
+internal class WeakRef<T: AnyObject> {
+  weak var value: T?
+  init(_ value: T) { self.value = value }
+}
+
 // MARK: - LazyGraph
 
 /// Internal graph that accumulates lazy operations
@@ -22,16 +28,16 @@ public class LazyGraph {
   internal var compilationCache: CompilationResult?
 
   /// Cached runtime (invalidated when graph changes)
-  internal var runtimeCache: MetalCompiledKernel?
+  internal var runtimeCache: LazyRuntime?
 
   /// Whether the graph has been modified since last compilation
   internal var isDirty: Bool = true
 
   /// Cache compiled kernels by graph structure hash (persists across graph clears)
-  internal var compilationCacheByStructure: [String: (CompilationResult, MetalCompiledKernel)] = [:]
+  internal var compilationCacheByStructure: [String: (CompilationResult, LazyRuntime)] = [:]
 
-  internal var tensors: [Tensor] = []
-  internal var signals: [Signal] = []
+  internal var tensors: [WeakRef<Tensor>] = []
+  internal var signals: [WeakRef<Signal>] = []
 
   public init(sampleRate: Float = DGenConfig.sampleRate,
               maxFrameCount: Int = DGenConfig.maxFrameCount) {
@@ -78,11 +84,11 @@ public class LazyGraph {
   }
 
   public func registerTensor(_ tensor: Tensor) {
-    tensors.append(tensor)
+    tensors.append(WeakRef(tensor))
   }
 
   public func registerSignal(_ signal: Signal) {
-    signals.append(signal)
+    signals.append(WeakRef(signal))
   }
 
   // MARK: - Graph Structure Hashing
@@ -169,12 +175,14 @@ public class LazyGraph {
     // 7. Increment identifier to signify we have a new graph
     id += 1
 
-    // 8. Refresh all tracked tensors and signals - recreates them in the fresh graph
-    for tensor in tensors {
-      tensor.refresh()
+    // 8. Prune dead refs and refresh surviving tensors/signals
+    tensors = tensors.filter { $0.value != nil }
+    for ref in tensors {
+      ref.value?.refresh()
     }
-    for signal in signals {
-      signal.refresh()
+    signals = signals.filter { $0.value != nil }
+    for ref in signals {
+      ref.value?.refresh()
     }
   }
 }

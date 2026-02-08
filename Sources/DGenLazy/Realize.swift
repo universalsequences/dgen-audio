@@ -6,15 +6,93 @@
 import Foundation
 import DGen
 
+// MARK: - LazyRuntime Protocol
+
+/// Abstraction over Metal and C runtimes for realize() execution
+public protocol LazyRuntime: AnyObject {
+    var cellAllocations: CellAllocations { get }
+    func zeroAllBuffers()
+    func runNoCopy(frameCount: Int)
+    func memoryPointer() -> UnsafeMutablePointer<Float>?
+    func outputsPointer() -> UnsafeMutablePointer<Float>?
+}
+
+extension MetalCompiledKernel: LazyRuntime {
+    public func memoryPointer() -> UnsafeMutablePointer<Float>? {
+        getBuffer(name: "memory")?.contents().assumingMemoryBound(to: Float.self)
+    }
+
+    public func outputsPointer() -> UnsafeMutablePointer<Float>? {
+        getBuffer(name: "outputs")?.contents().assumingMemoryBound(to: Float.self)
+    }
+}
+
+/// C backend runtime wrapper for lazy execution
+public class CLazyRuntime: LazyRuntime {
+    public let cellAllocations: CellAllocations
+    private let kernel: CCompiledKernel
+    private let memory: UnsafeMutablePointer<Float>
+    private let outputs: UnsafeMutablePointer<Float>
+    private let memorySize: Int
+    private let outputsSize: Int
+
+    public init(kernels: [CompiledKernel], cellAllocations: CellAllocations, memorySize: Int, frameCount: Int) throws {
+        self.cellAllocations = cellAllocations
+        self.memorySize = max(memorySize, 1024)
+        self.outputsSize = frameCount
+
+        // Concatenate all kernel sources into a single C file
+        let combinedSource = kernels.map { $0.source }.joined(separator: "\n\n")
+        self.kernel = CCompiledKernel(
+            source: combinedSource,
+            cellAllocations: cellAllocations,
+            memorySize: self.memorySize
+        )
+
+        self.memory = .allocate(capacity: self.memorySize)
+        self.memory.initialize(repeating: 0, count: self.memorySize)
+        self.outputs = .allocate(capacity: self.outputsSize)
+        self.outputs.initialize(repeating: 0, count: self.outputsSize)
+
+        try kernel.compileAndLoad()
+    }
+
+    public func zeroAllBuffers() {
+        memory.initialize(repeating: 0, count: memorySize)
+        outputs.initialize(repeating: 0, count: outputsSize)
+    }
+
+    public func runNoCopy(frameCount: Int) {
+        let inputs = [Float](repeating: 0, count: frameCount)
+        inputs.withUnsafeBufferPointer { inBuf in
+            kernel.runWithMemory(
+                outputs: outputs,
+                inputs: inBuf.baseAddress!,
+                memory: UnsafeMutableRawPointer(memory),
+                frameCount: frameCount
+            )
+        }
+    }
+
+    public func memoryPointer() -> UnsafeMutablePointer<Float>? { memory }
+    public func outputsPointer() -> UnsafeMutablePointer<Float>? { outputs }
+
+    deinit {
+        memory.deallocate()
+        outputs.deallocate()
+        kernel.cleanup()
+    }
+}
+
 // MARK: - Execution Context
 
 /// Stores compilation and runtime state for a realized graph
 public class ExecutionContext {
     let compilationResult: CompilationResult
-    let runtime: MetalCompiledKernel
+    let runtime: LazyRuntime
     let frameCount: Int
 
-    init(compilationResult: CompilationResult, runtime: MetalCompiledKernel, frameCount: Int) {
+    init(compilationResult: CompilationResult, runtime: LazyRuntime, frameCount: Int) {
         self.compilationResult = compilationResult
         self.runtime = runtime
         self.frameCount = frameCount
@@ -43,13 +121,24 @@ extension LazyGraph {
             writeKernelsToDisk(result, outputPath)
         }
 
-        // Create runtime
-        let runtime = try MetalCompiledKernel(
-            kernels: result.kernels,
-            cellAllocations: result.cellAllocations,
-            context: result.context,
-            frameCount: frameCount
-        )
+        // Create runtime based on backend
+        let runtime: LazyRuntime
+        switch DGenConfig.backend {
+        case .metal:
+            runtime = try MetalCompiledKernel(
+                kernels: result.kernels,
+                cellAllocations: result.cellAllocations,
+                context: result.context,
+                frameCount: frameCount
+            )
+        case .c:
+            runtime = try CLazyRuntime(
+                kernels: result.kernels,
+                cellAllocations: result.cellAllocations,
+                memorySize: result.totalMemorySlots,
+                frameCount: frameCount
+            )
+        }
 
         // Cache for reuse
         compilationCache = result
@@ -59,18 +148,16 @@ extension LazyGraph {
         return ExecutionContext(compilationResult: result, runtime: runtime, frameCount: frameCount)
     }
 
-    /// Inject tensor data into Metal memory buffer
+    /// Inject tensor data into memory buffer
     func injectTensorData(context: ExecutionContext) {
-        if let memBuffer = context.runtime.getBuffer(name: "memory") {
-            let memPtr = memBuffer.contents().assumingMemoryBound(to: Float.self)
+        if let memPtr = context.runtime.memoryPointer() {
             DGen.injectTensorData(result: context.compilationResult, memory: memPtr)
         }
     }
 
-    /// Inject Signal param values into Metal memory buffer
+    /// Inject Signal param values into memory buffer
     func injectSignalParams(context: ExecutionContext) {
-        guard let memBuffer = context.runtime.getBuffer(name: "memory") else { return }
-        let memPtr = memBuffer.contents().assumingMemoryBound(to: Float.self)
+        guard let memPtr = context.runtime.memoryPointer() else { return }
         let cellMappings = context.compilationResult.cellAllocations.cellMappings
 
         for signal in parameterRegistry.signals {
@@ -96,8 +183,7 @@ extension LazyGraph {
     /// Read output buffer
     func readOutputs(context: ExecutionContext) -> [Float] {
         var outputs = [Float](repeating: 0, count: context.frameCount)
-        if let outBuffer = context.runtime.getBuffer(name: "outputs") {
-            let outPtr = outBuffer.contents().assumingMemoryBound(to: Float.self)
+        if let outPtr = context.runtime.outputsPointer() {
             for i in 0..<context.frameCount {
                 outputs[i] = outPtr[i]
             }
@@ -111,8 +197,7 @@ extension LazyGraph {
 
         let physicalCellId = context.compilationResult.cellAllocations.cellMappings[tensor.cellId] ?? tensor.cellId
 
-        guard let memBuffer = context.runtime.getBuffer(name: "memory") else { return nil }
-        let memPtr = memBuffer.contents().assumingMemoryBound(to: Float.self)
+        guard let memPtr = context.runtime.memoryPointer() else { return nil }
 
         // Check if this is a frame-aware tensor (allocated as tensorSize * frameCount)
         // frameAwareCells uses the tensor's cellId (before physical remapping)
