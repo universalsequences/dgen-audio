@@ -359,19 +359,9 @@ public class MetalRenderer: Renderer, UOpEmitter {
     var currentKind: Kind? = nil
     var loopOpened = false
     var hasFrameLoop = false
-    var hopCheckOpen = false
-    var currentTemporality: Temporality? = nil
 
     func closeCurrentKernel() {
       guard let schedule = currentSchedule, loopOpened else { return }
-      // Close hop check if open (endHopCheck + counter increment, inside the frame loop)
-      if hopCheckOpen {
-        schedule.ops.append(UOp(op: .endHopCheck, value: .empty))
-        if case .hopBased(let hopSize, let counterCell) = currentTemporality {
-          schedule.ops.append(UOp(op: .hopCounterIncrement(counterCell, hopSize), value: .empty))
-        }
-        hopCheckOpen = false
-      }
       if hasFrameLoop && currentKind == .scalar {
         schedule.ops.append(UOp(op: .endLoop, value: .empty))
       }
@@ -392,13 +382,9 @@ public class MetalRenderer: Renderer, UOpEmitter {
       if true {
         closeCurrentKernel()
 
-        let isHopBasedBlock: Bool
-        if case .hopBased = block.temporality { isHopBasedBlock = true } else { isHopBasedBlock = false }
-        // Hop-based blocks run as scalar kernels (single thread with frame loop + hop gating)
-        let effectiveKind: Kind = isHopBasedBlock ? .scalar : block.kind
-        let scheduleItem = ScheduleItem(kind: effectiveKind, temporality: block.temporality)
+        let scheduleItem = ScheduleItem(kind: block.kind, temporality: block.temporality)
         scheduleItem.parallelPolicy = block.parallelPolicy
-        scheduleItem.threadCountScale = isHopBasedBlock ? nil : block.threadCountScale
+        scheduleItem.threadCountScale = block.threadCountScale
         scheduleItem.ops.append(UOp(op: .frameCount, value: .empty))
 
         for uop in block.ops {
@@ -416,22 +402,6 @@ public class MetalRenderer: Renderer, UOpEmitter {
           beginRange.kind = block.kind
           scheduleItem.ops.append(beginRange)
           hasFrameLoop = false
-        } else if isHopBasedBlock {
-          // Hop-based blocks: scalar kernel with frame loop + hop gating
-          // Runs single thread, loops through frames, only executes body on hop boundaries
-          var beginRange = UOp(op: .beginRange(.constant(0, 0), .constant(0, 1)), value: .empty)
-          beginRange.kind = .scalar
-          scheduleItem.ops.append(beginRange)
-
-          var beginLoop = UOp(op: .beginLoop(frameCountUOp, 1), value: .empty)
-          beginLoop.kind = .scalar
-          scheduleItem.ops.append(beginLoop)
-
-          if case .hopBased(_, let counterCell) = block.temporality {
-            scheduleItem.ops.append(UOp(op: .beginHopCheck(counterCell), value: .empty))
-            hopCheckOpen = true
-          }
-          hasFrameLoop = true
         } else if isScalar {
           // Scalar kernels: thread 0 loops through frameCount
           var beginRange = UOp(op: .beginRange(.constant(0, 0), .constant(0, 1)), value: .empty)
@@ -453,18 +423,15 @@ public class MetalRenderer: Renderer, UOpEmitter {
         }
 
         currentSchedule = scheduleItem
-        currentKind = effectiveKind
-        currentTemporality = block.temporality
+        currentKind = block.kind
         loopOpened = true
       }
 
       if let schedule = currentSchedule {
-        let hopBasedBody: Bool
-        if case .hopBased = block.temporality { hopBasedBody = true } else { hopBasedBody = false }
         for uop in block.ops {
           if case .defineGlobal = uop.op { continue }
           var typedUOp = uop
-          typedUOp.kind = hopBasedBody ? .scalar : block.kind
+          typedUOp.kind = block.kind
           schedule.ops.append(typedUOp)
         }
       }

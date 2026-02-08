@@ -240,6 +240,7 @@ public struct CompilationPipeline {
         graph: graph,
         blocks: finalBlocks,
         frameBasedNodes: temporalityResult.frameBasedNodes,
+        hopBasedNodes: temporalityResult.hopBasedNodes,
         feedbackClusterNodes: feedbackClusterNodes,
         backend: backend,
         frameCount: options.frameCount

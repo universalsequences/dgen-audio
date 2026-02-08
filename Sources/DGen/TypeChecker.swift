@@ -557,6 +557,7 @@ public func allocateTensorMemory(
   graph: Graph,
   blocks: [Block],
   frameBasedNodes: Set<NodeID>,
+  hopBasedNodes: [NodeID: (Int, CellID)] = [:],
   feedbackClusterNodes: Set<NodeID> = [],
   backend: Backend = .metal,
   frameCount: Int
@@ -617,7 +618,9 @@ public func allocateTensorMemory(
     // Check for intra-block consumption in frame-based tensor blocks
     // Tensors produced and consumed within a frame-based tensor block need frame-aware storage
     // because each frame runs in parallel and needs its own copy
-    let isFrameBasedBlock = block.temporality == .frameBased &&
+    let isHopBased: Bool
+    if case .hopBased = block.temporality { isHopBased = true } else { isHopBased = false }
+    let isFrameBasedBlock = (block.temporality == .frameBased || isHopBased) &&
       block.shape != nil  // Tensor block
 
     if isFrameBasedBlock {
@@ -648,7 +651,7 @@ public func allocateTensorMemory(
     let lazyCellId = tensor.cellId
     let nodeId = cellToNode[lazyCellId]
     let isOutbound = outboundCells.contains(lazyCellId)
-    let isFrameBased = nodeId.map { frameBasedNodes.contains($0) } ?? false
+    let isFrameBased = nodeId.map { frameBasedNodes.contains($0) || hopBasedNodes[$0] != nil } ?? false
 
     // For C backend only: exclude feedback loop tensors from frame-aware allocation.
     // They need persistent state across frames, not per-frame copies.

@@ -1427,9 +1427,12 @@ public func emitThreadCountScaleOpIfNeeded(ctx: IRContext, block: Block, g: Grap
   ctx.frameAwareTensorFrameIndex = frameIdx.lazy
   ctx.frameAwareTensorElementIndex = binIdx.lazy
 
-  // If this is a frame-based block with frame-aware tensor outputs,
+  // If this is a frame-based or hop-based block with frame-aware tensor outputs,
   // also set the flag that controls frame-aware memory addressing
-  if block.temporality == .frameBased {
+  let isParallelFrameBlock: Bool
+  if case .hopBased = block.temporality { isParallelFrameBlock = true }
+  else { isParallelFrameBlock = block.temporality == .frameBased }
+  if isParallelFrameBlock {
     let hasFrameAwareOutput = block.nodes.contains { nodeId in
       if let tensorId = g.nodeToTensor[nodeId],
         let tensor = g.tensors[tensorId]
@@ -1579,9 +1582,6 @@ public func emitBlockUOps(
   var emittedNodes: Set<NodeID> = []
   var bodyUops: [UOp] = []
 
-  let isHopBasedBlock: Bool
-  if case .hopBased = block.temporality { isHopBasedBlock = true } else { isHopBasedBlock = false }
-
   // Reset frame-aware tensor block context for each new block
   // These flags are set per-block in emitThreadCountScaleOpIfNeeded
   ctx.isInFrameAwareTensorBlock = false
@@ -1647,10 +1647,8 @@ public func emitBlockUOps(
     // Standard emission path
     // Thread count scaling is a Metal-specific parallelization optimization.
     // C backend uses sequential loops, so this would break feedback loop data flow.
-    // Hop-based blocks on Metal also use sequential loops — they run as scalar kernels
-    // with a frame loop + hop gating, so ThreadCountScale can't be used.
     let threadScaleUOps =
-      (backend == .metal && !isHopBasedBlock)
+      (backend == .metal)
       ? emitThreadCountScaleOpIfNeeded(ctx: ctx, block: block, g: g)
       : []
     bodyUops.append(contentsOf: threadScaleUOps)
@@ -1705,9 +1703,9 @@ public func emitBlockUOps(
   // Note: frame-aware tensor blocks DON'T use parallelRange (no loop)
   var uops: [UOp] = []
 
-  // C backend and hop-based Metal blocks wrap tensor ops in a sequential loop
+  // C backend wraps tensor ops in a sequential loop
   // Skip if using shape-aware emission (it has its own loops)
-  let needsTensorLoop = (backend == .c || isHopBasedBlock) && !useShapeAwareEmission
+  let needsTensorLoop = (backend == .c) && !useShapeAwareEmission
   if needsTensorLoop, let tensorIndex = block.tensorIndex,
     let shape = block.shape
   {
