@@ -409,6 +409,54 @@ extension LazyOp {
       // Use the output sample (ring buffer read from current position)
       b.use(val: outputSample)
 
+    case .overlapAddGradStore(let gradStoreCell):
+      // Store per-frame output gradient to shared memory for later gathering
+      let gradOutput = b.value(inputs[0])
+      let frameIdx = b.currentFrameIndex()
+      _ = b.memoryWrite(gradStoreCell, frameIdx, gradOutput)
+      b.use(val: b.constant(0.0))
+
+    case .overlapAddGradGather(let windowSize, let hopSize, let gradStoreCell, let gradInputCell):
+      // Gather stored gradients into per-frame gradient tensor
+      // For hop frame h: grad_input[h][i] = grad_output[h + offset(i)]
+      //   where offset(0) = windowSize, offset(i>0) = i
+      // For non-hop frames: grad_input = 0
+      _ = b.value(inputs[0])  // force dependency on store phase
+      let frameIdx = b.currentFrameIndex()
+      let frameCount = b.frameCount()
+      let hopSizeFloat = b.constant(Float(hopSize))
+      let winSizeFloat = b.constant(Float(windowSize))
+      let winSizeInt = b.intConstant(windowSize)
+      let zero = b.constant(0.0)
+
+      // Check if this is a hop frame: frameIdx % hopSize == 0
+      let frameFloat = b.cast(frameIdx, to: .float)
+      let modResult = frameFloat - b.floor(frameFloat / hopSizeFloat) * hopSizeFloat
+      let isHopFrame = modResult == zero
+
+      b.loop(windowSize) { i in
+        let iFloat = b.cast(i, to: .float)
+        // offset(0) = windowSize, offset(i>0) = i (all in float to avoid select ambiguity)
+        let offset = b.gswitch(iFloat == zero, winSizeFloat, iFloat)
+        let readFrame = frameFloat + offset
+        let frameCountFloat = b.cast(frameCount, to: .float)
+        let inBounds = readFrame < frameCountFloat
+
+        // Read stored gradient (clamped to avoid OOB)
+        let clampedFrame = b.min(readFrame, frameCountFloat - b.constant(1.0))
+        let gradVal = b.memoryRead(gradStoreCell, b.cast(clampedFrame, to: .int))
+
+        // Only use if hop frame AND in bounds
+        let validGrad = b.gswitch(isHopFrame, b.gswitch(inBounds, gradVal, zero), zero)
+
+        // Write to frame-indexed gradient tensor cell
+        let iInt = b.cast(i, to: .int)
+        let frameInt = b.cast(frameIdx, to: .int)
+        let writeIdx = frameInt * winSizeInt + iInt
+        _ = b.memoryWrite(gradInputCell, writeIdx, validGrad)
+      }
+      b.use(val: zero)
+
     default: break
     }
   }

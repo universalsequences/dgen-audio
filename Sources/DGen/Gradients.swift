@@ -876,13 +876,42 @@ extension LazyOp {
       // Gradient ops don't need their own gradients
       return node.inputs.map { _ in nil }
 
+    case .overlapAddGradStore(_), .overlapAddGradGather(_, _, _, _):
+      // Gradient ops don't need their own gradients
+      return node.inputs.map { _ in nil }
+
     case .fft(_, _, _, _, _, _), .ifft(_, _, _, _, _, _):
       // FFT gradients need special handling
       return node.inputs.map { _ in nil }
 
-    case .overlapAdd(_, _, _, _, _):
-      // overlapAdd gradient not implemented
-      return node.inputs.map { _ in nil }
+    case .overlapAdd(let windowSize, let hopSize, _, _, _):
+      // overlapAdd backward: two-phase gradient (store per-frame grad, then gather)
+      guard let tensorInput = node.inputs.first,
+        let inputNode = g.nodes[tensorInput],
+        case .tensor(let shape) = inputNode.shape
+      else { return [nil] }
+
+      let totalSize = shape.reduce(1, *)
+
+      // Phase 1: Store output gradient per frame
+      let gradStoreCell = g.alloc(vectorWidth: g.maxFrameCount)
+      let storeOp = g.n(.overlapAddGradStore(gradStoreCell: gradStoreCell),
+        [gradOutput])
+      g.addGradientSideEffect(storeOp)
+
+      // Phase 2: Gather into gradient tensor (frame-aware)
+      let gradInputCell = g.allocFrameAware(tensorSize: totalSize, frameCount: g.maxFrameCount)
+
+      let gatherOp = g.n(.overlapAddGradGather(
+        windowSize: windowSize, hopSize: hopSize,
+        gradStoreCell: gradStoreCell, gradInputCell: gradInputCell),
+        [storeOp])
+      g.addGradientSideEffect(gatherOp)
+
+      // Return gradient tensor sequenced after gather
+      let sequencedGrad = createSequencedGradTensor(
+        g, gradCell: gradInputCell, shape: shape, afterOp: gatherOp)
+      return [sequencedGrad]
 
     case .peek:
       // peek(tensor, index, channel) -> interpolated scalar read

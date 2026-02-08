@@ -1787,7 +1787,7 @@ public func emitBlockUOps(
 public func isReductionOp(_ op: LazyOp) -> Bool {
   switch op {
   case .sum, .tensorAccumulate, .peekRowGradReduce,
-    .selectRowGradReduce:
+    .selectRowGradReduce, .overlapAddGradGather:
     return true
   default:
     return false

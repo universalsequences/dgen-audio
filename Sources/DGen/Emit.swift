@@ -255,7 +255,7 @@ extension LazyOp {
       .peekRowGradWrite, .peekRowGradReduce:
       try emitRowSelection(b: b, ctx: ctx, g: g, node: node, inputs: inputs, nodeId: nodeId)
 
-    case .fft, .ifft, .overlapAdd:
+    case .fft, .ifft, .overlapAdd, .overlapAddGradStore, .overlapAddGradGather:
       try emitFFT(b: b, ctx: ctx, g: g, node: node, inputs: inputs, nodeId: nodeId)
 
     case .conv1d, .conv2d, .sum, .sumAxis, .maxAxis, .meanAxis, .reshape, .asStrided, .transpose, .shrink,

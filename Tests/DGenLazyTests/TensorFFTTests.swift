@@ -546,6 +546,201 @@ final class TensorFFTTests: XCTestCase {
     }
   }
 
+  // MARK: - OverlapAdd Gradient Helpers
+
+  /// Build buffer → scale → overlapAdd → squared loss pipeline, return sum of per-frame losses.
+  /// Forward-only (no backward). Resets graph internally.
+  private func overlapAddLoss(
+    scaleData: [Float], N: Int, hop: Int, freq: Float, totalFrames: Int
+  ) throws -> Float {
+    LazyGraphContext.reset()
+    let twoPi = Float(2.0 * Float.pi)
+    let phase = Signal.phasor(freq)
+    let sig = cos(phase * twoPi)
+    let window = sig.buffer(size: N, hop: hop)
+    let flat = window.reshape([N])
+    let scale = Tensor.param([N], data: scaleData)
+    let scaled = flat * scale
+    let output = scaled.overlapAdd(hop: hop)
+    let loss = output * output
+    let lossValues = try loss.realize(frames: totalFrames)
+    return lossValues.reduce(0, +)
+  }
+
+  /// Build buffer → FFT → IFFT → scale → overlapAdd → squared loss, return sum of losses.
+  private func fftOverlapAddLoss(
+    scaleData: [Float], N: Int, hop: Int, freq: Float, totalFrames: Int
+  ) throws -> Float {
+    LazyGraphContext.reset()
+    let twoPi = Float(2.0 * Float.pi)
+    let phase = Signal.phasor(freq)
+    let sig = cos(phase * twoPi)
+    let window = sig.buffer(size: N, hop: hop)
+    let flat = window.reshape([N])
+    let (re, im) = signalTensorFFT(flat, N: N)
+    let reconstructed = signalTensorIFFT(re, im, N: N)
+    let scale = Tensor.param([N], data: scaleData)
+    let scaled = reconstructed * scale
+    let output = scaled.overlapAdd(hop: hop)
+    let loss = output * output
+    let lossValues = try loss.realize(frames: totalFrames)
+    return lossValues.reduce(0, +)
+  }
+
+  // MARK: - OverlapAdd Gradient Tests (Numerical Verification)
+
+  func testOverlapAddGradientNumerical() throws {
+    // Finite difference check: buffer → scale → overlapAdd → squared loss
+    let N = 8
+    let hop = 4
+    let sr: Float = 2048.0
+    let freq: Float = 256.0
+    let totalFrames = N + 4 * hop
+    let epsilon: Float = 1e-3
+
+    DGenConfig.sampleRate = sr
+    defer { DGenConfig.sampleRate = 44100.0 }
+
+    let baseScale = [Float](repeating: 2.0, count: N)
+
+    // 1. Get analytical gradient via backward()
+    LazyGraphContext.reset()
+    let twoPi = Float(2.0 * Float.pi)
+    let phase = Signal.phasor(freq)
+    let sig = cos(phase * twoPi)
+    let window = sig.buffer(size: N, hop: hop)
+    let flat = window.reshape([N])
+    let scale = Tensor.param([N], data: baseScale)
+    let scaled = flat * scale
+    let output = scaled.overlapAdd(hop: hop)
+    let loss = output * output
+    _ = try loss.backward(frames: totalFrames)
+    let analyticalGrad = scale.grad!.getData()!
+
+    // 2. Compute numerical gradient for each element via central difference
+    var numericalGrad = [Float](repeating: 0, count: N)
+    for i in 0..<N {
+      var plusData = baseScale
+      plusData[i] += epsilon
+      let lossPlus = try overlapAddLoss(
+        scaleData: plusData, N: N, hop: hop, freq: freq, totalFrames: totalFrames)
+
+      var minusData = baseScale
+      minusData[i] -= epsilon
+      let lossMinus = try overlapAddLoss(
+        scaleData: minusData, N: N, hop: hop, freq: freq, totalFrames: totalFrames)
+
+      numericalGrad[i] = (lossPlus - lossMinus) / (2 * epsilon)
+    }
+
+    // 3. Compare
+    print("\n=== OverlapAdd Gradient: Analytical vs Numerical ===")
+    print("Element | Analytical    | Numerical     | Match?")
+    print("--------|---------------|---------------|-------")
+    var matchCount = 0
+    var testedCount = 0
+    for i in 0..<N {
+      let a = analyticalGrad[i]
+      let n = numericalGrad[i]
+      // Skip near-zero gradients (direction is meaningless)
+      let threshold: Float = 1e-4
+      if Swift.abs(a) < threshold && Swift.abs(n) < threshold {
+        print(String(format: "   %2d   | %12.5f | %12.5f | (both ~0)", i, a, n))
+        continue
+      }
+      testedCount += 1
+      let dirMatch = (a > 0) == (n > 0)
+      if dirMatch { matchCount += 1 }
+      let relError = Swift.abs(a) > 1e-6 ? Swift.abs((a - n) / a) : Float.infinity
+      print(String(
+        format: "   %2d   | %12.5f | %12.5f | %@ (rel err %.2f%%)",
+        i, a, n, dirMatch ? "YES" : "NO", relError * 100))
+    }
+    print("Direction match: \(matchCount)/\(testedCount)")
+
+    // At least 80% of tested elements should have matching direction
+    XCTAssertGreaterThan(testedCount, 0, "Should have testable gradient elements")
+    let matchRate = Float(matchCount) / Float(testedCount)
+    XCTAssertGreaterThanOrEqual(matchRate, 0.8,
+      "At least 80% of gradient directions should match numerical")
+  }
+
+  func testFFTIFFTOverlapAddGradientNumerical() throws {
+    // Finite difference check: buffer → FFT → IFFT → scale → overlapAdd → squared loss
+    let N = 16
+    let hop = 8
+    let sr: Float = 2048.0
+    let freq: Float = 256.0
+    let totalFrames = N + 4 * hop
+    let epsilon: Float = 1e-3
+
+    DGenConfig.sampleRate = sr
+    defer { DGenConfig.sampleRate = 44100.0 }
+
+    let baseScale = [Float](repeating: 1.0, count: N)
+
+    // 1. Get analytical gradient via backward()
+    LazyGraphContext.reset()
+    let twoPi = Float(2.0 * Float.pi)
+    let phase = Signal.phasor(freq)
+    let sig = cos(phase * twoPi)
+    let window = sig.buffer(size: N, hop: hop)
+    let flat = window.reshape([N])
+    let (re, im) = signalTensorFFT(flat, N: N)
+    let reconstructed = signalTensorIFFT(re, im, N: N)
+    let scale = Tensor.param([N], data: baseScale)
+    let scaled = reconstructed * scale
+    let output = scaled.overlapAdd(hop: hop)
+    let loss = output * output
+    _ = try loss.backward(frames: totalFrames)
+    let analyticalGrad = scale.grad!.getData()!
+
+    // 2. Compute numerical gradient via central difference
+    var numericalGrad = [Float](repeating: 0, count: N)
+    for i in 0..<N {
+      var plusData = baseScale
+      plusData[i] += epsilon
+      let lossPlus = try fftOverlapAddLoss(
+        scaleData: plusData, N: N, hop: hop, freq: freq, totalFrames: totalFrames)
+
+      var minusData = baseScale
+      minusData[i] -= epsilon
+      let lossMinus = try fftOverlapAddLoss(
+        scaleData: minusData, N: N, hop: hop, freq: freq, totalFrames: totalFrames)
+
+      numericalGrad[i] = (lossPlus - lossMinus) / (2 * epsilon)
+    }
+
+    // 3. Compare
+    print("\n=== FFT→IFFT→OverlapAdd Gradient: Analytical vs Numerical ===")
+    print("Element | Analytical    | Numerical     | Match?")
+    print("--------|---------------|---------------|-------")
+    var matchCount = 0
+    var testedCount = 0
+    for i in 0..<N {
+      let a = analyticalGrad[i]
+      let n = numericalGrad[i]
+      let threshold: Float = 1e-4
+      if Swift.abs(a) < threshold && Swift.abs(n) < threshold {
+        print(String(format: "   %2d   | %12.5f | %12.5f | (both ~0)", i, a, n))
+        continue
+      }
+      testedCount += 1
+      let dirMatch = (a > 0) == (n > 0)
+      if dirMatch { matchCount += 1 }
+      let relError = Swift.abs(a) > 1e-6 ? Swift.abs((a - n) / a) : Float.infinity
+      print(String(
+        format: "   %2d   | %12.5f | %12.5f | %@ (rel err %.2f%%)",
+        i, a, n, dirMatch ? "YES" : "NO", relError * 100))
+    }
+    print("Direction match: \(matchCount)/\(testedCount)")
+
+    XCTAssertGreaterThan(testedCount, 0, "Should have testable gradient elements")
+    let matchRate = Float(matchCount) / Float(testedCount)
+    XCTAssertGreaterThanOrEqual(matchRate, 0.8,
+      "At least 80% of gradient directions should match numerical")
+  }
+
   func testSignalFFTOverlapAdd() throws {
     let N = 64
     let hop = 16

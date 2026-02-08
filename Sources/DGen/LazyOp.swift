@@ -177,6 +177,12 @@ public enum LazyOp {
   case fft(Int, Int, CellID, CellID, CellID, CellID)  // FFT transform: windowSize, hopSize, scratchCell, ringBufferCell, writePosCell, counterCell
   case ifft(Int, Int, CellID, CellID, CellID, CellID)  // IFFT transform: windowSize, hopSize, scratchCell, outputRingCell, readPosCell, counterCell
   case overlapAdd(Int, Int, CellID, CellID, CellID)  // Overlap-add: windowSize, hopSize, outputRingCell, readPosCell, counterCell
+  // overlapAddGradStore: store per-frame output gradient to shared memory
+  case overlapAddGradStore(gradStoreCell: CellID)
+  // overlapAddGradGather: gather stored gradients into per-frame gradient tensor
+  case overlapAddGradGather(
+    windowSize: Int, hopSize: Int,
+    gradStoreCell: CellID, gradInputCell: CellID)
 
   // Gradient-specific operations (used by Gradients.swift)
   case neg  // Unary negation: -x
