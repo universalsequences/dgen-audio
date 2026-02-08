@@ -429,8 +429,12 @@ extension LazyOp {
       let winSizeInt = b.intConstant(windowSize)
       let zero = b.constant(0.0)
 
-      // Check if this is a hop frame: frameIdx % hopSize == 0
       let frameFloat = b.cast(frameIdx, to: .float)
+      let frameInt = b.cast(frameIdx, to: .int)
+      let frameCountFloat = b.cast(frameCount, to: .float)
+      let maxReadFrame = frameCountFloat - b.constant(1.0)
+
+      // Check if this is a hop frame: frameIdx % hopSize == 0
       let modResult = frameFloat - b.floor(frameFloat / hopSizeFloat) * hopSizeFloat
       let isHopFrame = modResult == zero
 
@@ -439,11 +443,10 @@ extension LazyOp {
         // offset(0) = windowSize, offset(i>0) = i (all in float to avoid select ambiguity)
         let offset = b.gswitch(iFloat == zero, winSizeFloat, iFloat)
         let readFrame = frameFloat + offset
-        let frameCountFloat = b.cast(frameCount, to: .float)
         let inBounds = readFrame < frameCountFloat
 
         // Read stored gradient (clamped to avoid OOB)
-        let clampedFrame = b.min(readFrame, frameCountFloat - b.constant(1.0))
+        let clampedFrame = b.min(readFrame, maxReadFrame)
         let gradVal = b.memoryRead(gradStoreCell, b.cast(clampedFrame, to: .int))
 
         // Only use if hop frame AND in bounds
@@ -451,7 +454,6 @@ extension LazyOp {
 
         // Write to frame-indexed gradient tensor cell
         let iInt = b.cast(i, to: .int)
-        let frameInt = b.cast(frameIdx, to: .int)
         let writeIdx = frameInt * winSizeInt + iInt
         _ = b.memoryWrite(gradInputCell, writeIdx, validGrad)
       }

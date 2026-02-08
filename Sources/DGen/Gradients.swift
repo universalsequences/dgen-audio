@@ -872,11 +872,8 @@ extension LazyOp {
       let zero = g.n(.constant(0.0), [])
       return [sequencedGrad, zero]
 
-    case .peekRowGradWrite(_, _, _, _, _, _, _), .peekRowGradReduce(_, _, _, _, _, _, _, _):
-      // Gradient ops don't need their own gradients
-      return node.inputs.map { _ in nil }
-
-    case .overlapAddGradStore(_), .overlapAddGradGather(_, _, _, _):
+    case .peekRowGradWrite(_, _, _, _, _, _, _), .peekRowGradReduce(_, _, _, _, _, _, _, _),
+      .overlapAddGradStore(_), .overlapAddGradGather(_, _, _, _):
       // Gradient ops don't need their own gradients
       return node.inputs.map { _ in nil }
 

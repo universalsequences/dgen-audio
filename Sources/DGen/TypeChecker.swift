@@ -267,9 +267,7 @@ public func inferShape(op: LazyOp, inputs: [ValueShape], graph: Graph) throws ->
     return .scalar
 
   // overlapAdd gradient ops - side-effect only, output scalar
-  case .overlapAddGradStore(_):
-    return .scalar
-  case .overlapAddGradGather(_, _, _, _):
+  case .overlapAddGradStore(_), .overlapAddGradGather(_, _, _, _):
     return .scalar
 
   // Inherited (elementwise) - includes all binary and unary math ops

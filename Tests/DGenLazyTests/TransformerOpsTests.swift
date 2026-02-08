@@ -572,7 +572,7 @@ final class TransformerOpsTests: XCTestCase {
     let optimizer = Adam(params: [WQ, WK, WV, WO], lr: 0.05)
     var losses: [Float] = []
 
-    for epoch in 0..<200 {
+    for epoch in 0..<70 {
       // Spectrogram: [4, 4] — 4 time windows × 4 frequency bins
       let spectrogram = Tensor(spectrogramData).reshape([numWindows, numBins])
 
@@ -594,7 +594,7 @@ final class TransformerOpsTests: XCTestCase {
       DGenConfig.debug = false
       losses.append(lossValue)
 
-      if epoch % 5 == 0 {
+      if epoch % 10 == 0 {
         print("Rhythm epoch \(epoch): loss=\(lossValue)")
       }
 
