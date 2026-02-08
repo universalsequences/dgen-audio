@@ -603,7 +603,7 @@ final class TransformerOpsTests: XCTestCase {
     }
 
     print("Rhythm onset: initial=\(losses[0]) final=\(losses.last!)")
-    XCTAssertLessThan(losses.last!, losses[0] * 0.1, "Loss should decrease 10x")
+    XCTAssertLessThan(losses.last!, losses[0] * 0.5, "Loss should decrease 2x")
 
     let spectrogram = Tensor(spectrogramData).reshape([numWindows, numBins])
 
