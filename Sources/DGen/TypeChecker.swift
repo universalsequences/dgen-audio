@@ -839,6 +839,11 @@ public func inferTemporality(graph: Graph, sortedNodes: [NodeID]) -> Temporality
       // This ensures we don't miss updates from faster-changing inputs
       let fastestRate = hopInputRates.min(by: { $0.0 < $1.0 })!
       hopBasedNodes[nodeId] = fastestRate
+      // Add counter node as temporal dependency so cross-block wiring works automatically
+      let counterNode = fastestRate.1
+      if !node.inputs.contains(counterNode) {
+        graph.nodes[nodeId]?.temporalDependencies.append(counterNode)
+      }
     }
     // If no frame-based or hop-based inputs, node remains static (not added to either set)
   }
