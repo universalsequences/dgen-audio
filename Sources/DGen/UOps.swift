@@ -78,6 +78,7 @@ public enum Op {
   case threadIndex
   case loadTape(Lazy, Lazy)
   case cast(Lazy, CastType)
+  case identity(Lazy)  // Identity copy: float t_new = t_old; Used when folding x*1, x+0, etc.
   case declareVar(Lazy)  // Declares and initializes a variable: float t = value;
   case reshape([Int])  // View op: reshape to new shape - renders to nothing but prevents SIMD
   case transpose([Int])  // View op: transpose with permutation - renders to nothing but prevents SIMD
@@ -165,6 +166,7 @@ public enum Op {
     case .beginParallelRange(let c, let s): return .beginParallelRange(c, s)
     case .output(let ch, let v): return .output(ch, r(v))
     case .cast(let e, let t): return .cast(r(e), t)
+    case .identity(let a): return .identity(r(a))
     case .declareVar(let v): return .declareVar(r(v))
     case .setFrameIndex(let i): return .setFrameIndex(r(i))
     case .loadTape(let v, let o): return .loadTape(r(v), r(o))

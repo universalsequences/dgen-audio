@@ -136,6 +136,8 @@ extension UOp {
             opStr = "\(ANSI.magenta)frameIndex\(ANSI.reset)"
         case .threadIndex:
             opStr = "\(ANSI.magenta)threadIndex\(ANSI.reset)"
+        case let .identity(a):
+            opStr = "\(ANSI.green)identity\(ANSI.reset)(\(a))"
         case let .cast(expr, castType):
             let typeStr = castType == .int ? "int" : "float"
             opStr = "\(ANSI.green)cast\(ANSI.reset)(\(expr), \(typeStr))"

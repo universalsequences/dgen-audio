@@ -1046,6 +1046,10 @@ public class CRenderer: Renderer {
       let baseIdx = "i"
       return emitAssign(uop, frameIndexOverride ?? baseIdx, ctx)
 
+    case .identity(let a):
+      let expr = uop.kind == .simd ? "\(g(a))" : "\(gi(a))"
+      return emitAssign(uop, expr, ctx)
+
     case .cast(let expr, let castType):
       let typeStr = castType == .int ? "int" : "float"
       return emitAssign(

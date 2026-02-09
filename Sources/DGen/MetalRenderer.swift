@@ -778,6 +778,9 @@ public class MetalRenderer: Renderer, UOpEmitter {
       let idx = (uop.kind == .simd) ? "id" : "i"
       return emitAssign(uop, idx, ctx)
 
+    case .identity(let a):
+      return emitAssign(uop, "\(gi(a))", ctx)
+
     case .cast(let expr, let castType):
       let typeStr = castType == .int ? "int" : "float"
       return emitAssign(uop, "(\(typeStr))\(g(expr))", ctx)

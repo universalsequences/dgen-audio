@@ -209,20 +209,34 @@ public struct Expr {
     return Expr(c, ctx: lhs.ctx, nodeId: lhs.nodeId, builder: lhs.builder, scalarType: resultType)
   }
 
+  // MARK: - Identity Emission
+
+  /// Emit an identity UOp (`float t_new = t_old;`) so the node produces a UOp
+  /// even when an arithmetic identity (x*1, x+0, etc.) is folded away.
+  /// Without this, the node has no emitted UOps, so it's never added to
+  /// `emittedNodes` and cross-block `defineGlobal` is skipped.
+  private static func emitIdentity(_ expr: Expr) -> Expr {
+    let dest = expr.builder.ctx.useVariable(src: nil)
+    var uop = UOp(op: .identity(expr.lazy), value: dest)
+    uop.scalarType = expr.scalarType
+    expr.builder.ops.append(uop)
+    return Expr(dest, ctx: expr.ctx, nodeId: expr.nodeId, builder: expr.builder, scalarType: expr.scalarType)
+  }
+
   // MARK: - Arithmetic Operators (with constant folding and identity elimination)
 
   /// Add. Folds constants, eliminates `x + 0` and `0 + x`.
   static func + (lhs: Expr, rhs: Expr) -> Expr {
     if let folded = foldConstants(lhs, rhs, op: +) { return folded }
-    if rhs.constantValue == 0, promotedType(lhs, rhs) == lhs.scalarType { return lhs }
-    if lhs.constantValue == 0, promotedType(lhs, rhs) == rhs.scalarType { return rhs }
+    if rhs.constantValue == 0, promotedType(lhs, rhs) == lhs.scalarType { return emitIdentity(lhs) }
+    if lhs.constantValue == 0, promotedType(lhs, rhs) == rhs.scalarType { return emitIdentity(rhs) }
     return emitBinaryOp(lhs, rhs, thunk: u_add)
   }
 
   /// Subtract. Folds constants, eliminates `x - 0` and `x - x`.
   static func - (lhs: Expr, rhs: Expr) -> Expr {
     if let folded = foldConstants(lhs, rhs, op: -) { return folded }
-    if rhs.constantValue == 0, promotedType(lhs, rhs) == lhs.scalarType { return lhs }
+    if rhs.constantValue == 0, promotedType(lhs, rhs) == lhs.scalarType { return emitIdentity(lhs) }
     if lhs.lazy == rhs.lazy { return makeTypedConstant(0, lhs, rhs) }
     return emitBinaryOp(lhs, rhs, thunk: u_sub)
   }
@@ -230,8 +244,8 @@ public struct Expr {
   /// Multiply. Folds constants, eliminates `x * 1` / `1 * x`, and `x * 0` / `0 * x`.
   static func * (lhs: Expr, rhs: Expr) -> Expr {
     if let folded = foldConstants(lhs, rhs, op: *) { return folded }
-    if rhs.constantValue == 1, promotedType(lhs, rhs) == lhs.scalarType { return lhs }
-    if lhs.constantValue == 1, promotedType(lhs, rhs) == rhs.scalarType { return rhs }
+    if rhs.constantValue == 1, promotedType(lhs, rhs) == lhs.scalarType { return emitIdentity(lhs) }
+    if lhs.constantValue == 1, promotedType(lhs, rhs) == rhs.scalarType { return emitIdentity(rhs) }
     if rhs.constantValue == 0 || lhs.constantValue == 0 {
       return makeTypedConstant(0, lhs, rhs)
     }
@@ -241,7 +255,7 @@ public struct Expr {
   /// Divide. Folds constants, eliminates `x / 1`.
   static func / (lhs: Expr, rhs: Expr) -> Expr {
     if let folded = foldConstants(lhs, rhs, op: /) { return folded }
-    if rhs.constantValue == 1, promotedType(lhs, rhs) == lhs.scalarType { return lhs }
+    if rhs.constantValue == 1, promotedType(lhs, rhs) == lhs.scalarType { return emitIdentity(lhs) }
     return emitBinaryOp(lhs, rhs, thunk: u_div)
   }
 
