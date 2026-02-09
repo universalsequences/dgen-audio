@@ -173,12 +173,10 @@ extension UOp {
             opStr = "\(ANSI.cyan)meanAxisMarker\(ANSI.reset)(node=\(nodeId), axis=\(axis), in=\(inShape), out=\(outShape), inFA=\(inFrameAware), outFA=\(outFrameAware))"
         case let .expandAxisMarker(nodeId, axis, inShape, outShape, inFrameAware, outFrameAware):
             opStr = "\(ANSI.cyan)expandAxisMarker\(ANSI.reset)(node=\(nodeId), axis=\(axis), in=\(inShape), out=\(outShape), inFA=\(inFrameAware), outFA=\(outFrameAware))"
-        case let .beginHopCheck(counterCell):
-            opStr = "\(ANSI.magenta)beginHopCheck\(ANSI.reset)(\(counterCell))"
+        case let .beginHopCheck(cond):
+            opStr = "\(ANSI.magenta)beginHopCheck\(ANSI.reset)(\(cond))"
         case .endHopCheck:
             opStr = "\(ANSI.magenta)endHopCheck\(ANSI.reset)"
-        case let .hopCounterIncrement(counterCell, hopSize):
-            opStr = "\(ANSI.magenta)hopCounterIncrement\(ANSI.reset)(\(counterCell), hopSize=\(hopSize))"
         }
 
         return "\(ANSI.bold)UOp\(ANSI.reset)(op: \(opStr), value: \(value))"

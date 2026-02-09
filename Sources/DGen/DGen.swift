@@ -27,9 +27,9 @@ open class Graph {
     /// Track allocation sizes for memory cells (especially large buffers like spectral scratch)
     public var cellAllocationSizes: [CellID: Int] = [:]
 
-    /// Tracks hop-based update rate for nodes (hopSize, counterCell)
+    /// Tracks hop-based update rate for nodes (hopSize, counterNodeId)
     /// Used for FFT/IFFT nodes and operations that inherit hop-based temporality
-    public var nodeHopRate: [NodeID: (Int, CellID)] = [:]
+    public var nodeHopRate: [NodeID: (Int, NodeID)] = [:]
 
     /// Sample rate for audio processing (default 44100 Hz)
     public var sampleRate: Float = 44100.0

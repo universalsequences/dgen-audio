@@ -295,7 +295,7 @@ public struct CompilationPipeline {
       for blockIdx in finalBlockIndices {
         let block = finalBlocks[blockIdx]
         context.lastBlockHasOwnFrameLoop = false
-        let ops = try emitBlockUOps(
+        let (ops, bodyEffectiveKind) = try emitBlockUOps(
           ctx: context,
           block: block,
           blocks: finalBlocks,
@@ -307,7 +307,10 @@ public struct CompilationPipeline {
         let (threadCountScale, filteredOps) = extractThreadCountScale(ops)
         var finalOps = filteredOps
         let effectiveKind: Kind
-        if backend == .c, threadCountScale != nil {
+        // For C backend: force scalar when threadCountScale is present (existing behavior)
+        // OR when the body ops are scalar (e.g. frame-based tensor blocks that can't use SIMD).
+        // Without this, the frame loop steps by 4 (SIMD) but body ops only process 1 frame.
+        if backend == .c, (threadCountScale != nil || bodyEffectiveKind == .scalar) {
           for i in 0..<finalOps.count {
             finalOps[i].kind = .scalar
           }

@@ -10,6 +10,12 @@ final class TensorFFTTests: XCTestCase {
   override func setUp() {
     super.setUp()
     LazyGraphContext.reset()
+    DGenConfig.backend = .metal
+  }
+
+  override func tearDown() {
+    DGenConfig.backend = .metal
+    super.tearDown()
   }
 
   // MARK: - Tests
@@ -464,6 +470,7 @@ final class TensorFFTTests: XCTestCase {
     let sr: Float = 2048.0
 
     DGenConfig.sampleRate = sr
+    DGenConfig.backend = .metal
     DGenConfig.kernelOutputPath = "/tmp/test_hop_full_fft.metal"
     defer {
       DGenConfig.sampleRate = 44100.0
@@ -527,7 +534,11 @@ final class TensorFFTTests: XCTestCase {
     let sr: Float = 2048.0
 
     DGenConfig.sampleRate = sr
-    defer { DGenConfig.sampleRate = 44100.0 }
+    DGenConfig.kernelOutputPath = "/tmp/test_hop_overlap_add_simple_c.txt"
+    defer {
+      DGenConfig.sampleRate = 44100.0
+      DGenConfig.kernelOutputPath = nil
+    }
     LazyGraphContext.reset()
 
     // Constant signal → buffer with hop → overlapAdd (skipping FFT/IFFT)

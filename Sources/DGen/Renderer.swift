@@ -254,10 +254,6 @@ public class CRenderer: Renderer {
         // Close previous hop check if open
         if hopCheckOpen {
           scheduleItem.ops.append(UOp(op: .endHopCheck, value: .empty))
-          // Counter increment + wrap (runs every frame, outside the hop check)
-          if case .hopBased(let prevHopSize, let prevCounterCell) = currentTemporality {
-            scheduleItem.ops.append(UOp(op: .hopCounterIncrement(prevCounterCell, prevHopSize), value: .empty))
-          }
           hopCheckOpen = false
         }
 
@@ -292,16 +288,29 @@ public class CRenderer: Renderer {
           )
           loopOpen = true
 
-        case .hopBased(_, let counterCell):
+        case .hopBased(_, let counterNodeId):
           // Hop-based: frame loop with conditional check inside
           // The block only executes when counter == 0
+          // Look up the counter node's Lazy value from ctx.values (set during block emission)
+          guard let counterLazy = ctx.values[counterNodeId] else {
+            fatalError("Hop counter node \(counterNodeId) not found in ctx.values")
+          }
           scheduleItem.ops.append(
             UOp(
               op: .beginLoop(frameCountUOp, block.kind == .scalar ? 1 : 4),
               value: .empty)
           )
+          // Hoist the counter's loadGlobal before beginHopCheck so the variable is declared
+          if case .variable(let vid, _) = counterLazy {
+            for uop in block.ops {
+              if case .loadGlobal(let id) = uop.op, id == vid {
+                scheduleItem.ops.append(uop)
+                break
+              }
+            }
+          }
           scheduleItem.ops.append(
-            UOp(op: .beginHopCheck(counterCell), value: .empty)
+            UOp(op: .beginHopCheck(counterLazy), value: .empty)
           )
           hopCheckOpen = true
           loopOpen = true
@@ -326,10 +335,6 @@ public class CRenderer: Renderer {
     // Close any open hop check
     if hopCheckOpen {
       scheduleItem.ops.append(UOp(op: .endHopCheck, value: .empty))
-      // Counter increment + wrap (runs every frame, outside the hop check)
-      if case .hopBased(let prevHopSize, let prevCounterCell) = currentTemporality {
-        scheduleItem.ops.append(UOp(op: .hopCounterIncrement(prevCounterCell, prevHopSize), value: .empty))
-      }
     }
 
     // Close any open loop
@@ -1135,12 +1140,10 @@ public class CRenderer: Renderer {
       return "}"
 
     // Hop-based execution: only run block when counter == 0
-    case .beginHopCheck(let counterCell):
-      return "if (memory[\(counterCell)] == 0.0f) {"
+    case .beginHopCheck(let cond):
+      return "if (\(g(cond)) == 0.0f) {"
     case .endHopCheck:
       return "}"
-    case .hopCounterIncrement(let counterCell, let hopSize):
-      return "{ float _ctr = memory[\(counterCell)] + 1.0f; memory[\(counterCell)] = _ctr >= \(hopSize).0f ? 0.0f : _ctr; }"
 
     default:
       return "/* \(uop.prettyDescription()) */"

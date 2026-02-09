@@ -563,7 +563,15 @@ extension Graph {
     // Register hop-based temporality so downstream blocks run every hopSize frames
     if let hopSize = hopSize {
       let counterCell = alloc(vectorWidth: 1)
-      nodeHopRate[result] = (hopSize, counterCell)
+      let hOne = n(.constant(1), [])
+      let hZero = n(.constant(0), [])
+      let hopConst = n(.constant(Float(hopSize)), [])
+      let counterAccum = n(.accum(counterCell), hOne, hZero, hZero, hopConst)
+      // counterAccum is a DIRECT INPUT — creates graph edge for dependency analysis
+      let seqResult = n(.seq, [writeOp, counterAccum, tensorRefNode], shape: .tensor(tensorShape))
+      nodeToTensor[seqResult] = tensorId
+      nodeHopRate[seqResult] = (hopSize, counterAccum)
+      return seqResult
     }
 
     return result
@@ -611,19 +619,29 @@ extension Graph {
     // Allocate write position cell (single float, 0.0 to windowSize-1)
     let writePosCell = alloc(vectorWidth: 1)
 
-    // Allocate counter cell for hop timing (single float, 0 to hopSize-1)
+    // Allocate counter cell for FFT internal hop timing (single float, 0 to hopSize-1)
     let counterCell = alloc(vectorWidth: 1)
+
+    // Separate accum counter for downstream hop-gating (via defineGlobal/loadGlobal)
+    let hopCounterCell = alloc(vectorWidth: 1)
+    let hOne = n(.constant(1), [])
+    let hZero = n(.constant(0), [])
+    let hopConst = n(.constant(Float(actualHopSize)), [])
+    let counterAccum = n(.accum(hopCounterCell), hOne, hZero, hZero, hopConst)
 
     let fftNode = n(
       .fft(windowSize, actualHopSize, scratchCell, ringBufferCell, writePosCell, counterCell),
       [signal], shape: .tensor([numBins, 2]))
     nodeToTensor[fftNode] = tensorId
 
-    // Register hop-based temporality for this FFT node
-    // This allows downstream operations to inherit hop-based execution
-    nodeHopRate[fftNode] = (actualHopSize, counterCell)
+    // Wrap in seq: counterAccum is direct input, fftNode is last (value)
+    let result = n(.seq, [counterAccum, fftNode], shape: .tensor([numBins, 2]))
+    nodeToTensor[result] = tensorId
 
-    return fftNode
+    // Register hop-based temporality for downstream operations
+    nodeHopRate[result] = (actualHopSize, counterAccum)
+
+    return result
   }
 
   /// Compute magnitude spectrum from FFT output.
@@ -720,19 +738,27 @@ extension Graph {
     // Allocate read position cell (single float, 0.0 to windowSize-1)
     let readPosCell = alloc(vectorWidth: 1)
 
-    // Allocate counter cell for hop timing (single float, 0 to hopSize-1)
+    // Allocate counter cell for IFFT internal hop timing (single float, 0 to hopSize-1)
     let counterCell = alloc(vectorWidth: 1)
+
+    // Separate accum counter for downstream hop-gating (via defineGlobal/loadGlobal)
+    let hopCounterCell = alloc(vectorWidth: 1)
+    let hOne = n(.constant(1), [])
+    let hZero = n(.constant(0), [])
+    let hopConst = n(.constant(Float(actualHopSize)), [])
+    let counterAccum = n(.accum(hopCounterCell), hOne, hZero, hZero, hopConst)
 
     let ifftNode = n(
       .ifft(windowSize, actualHopSize, scratchCell, outputRingCell, readPosCell, counterCell),
       [spectrum], shape: .scalar)
 
-    // Register hop-based temporality for this IFFT node
-    // Note: IFFT output is scalar (one sample per frame via overlap-add),
-    // but the expensive IFFT computation only runs every hopSize frames
-    nodeHopRate[ifftNode] = (actualHopSize, counterCell)
+    // Wrap in seq: counterAccum is direct input, ifftNode is last (value)
+    let result = n(.seq, [counterAccum, ifftNode], shape: .scalar)
 
-    return ifftNode
+    // Register hop-based temporality for downstream operations
+    nodeHopRate[result] = (actualHopSize, counterAccum)
+
+    return result
   }
 
   /// Overlap-add: scatter-add a tensor window into a ring buffer, emit one sample per frame.

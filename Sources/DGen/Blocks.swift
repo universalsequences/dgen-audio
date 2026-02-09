@@ -1591,7 +1591,7 @@ public func emitFrameTensorChainBlock(
 public func emitBlockUOps(
   ctx: IRContext, block: Block, blocks: [Block], g: Graph, backend: Backend = .metal,
   debug: Bool = false
-) throws -> [UOp] {
+) throws -> (uops: [UOp], effectiveKind: Kind) {
   var emittedNodes: Set<NodeID> = []
   var bodyUops: [UOp] = []
 
@@ -1793,7 +1793,15 @@ public func emitBlockUOps(
   // Instead, tensor data flows through memory cells which ARE properly indexed
   // by the tensor parallel range index (memory[cellId + tensorIndex]).
 
-  let outbound = findNodesWithOutboundDependencies(blocks, g, block: block)
+  var outbound = findNodesWithOutboundDependencies(blocks, g, block: block)
+  // Add hop counter nodes that live in this block but are needed by hop-gated blocks
+  let blockNodeSet = Set(block.nodes)
+  for otherBlock in blocks {
+    if case .hopBased(_, let counterNode) = otherBlock.temporality,
+       blockNodeSet.contains(counterNode), !outbound.contains(counterNode) {
+      outbound.append(counterNode)
+    }
+  }
   for nodeId in outbound {
     if emittedNodes.contains(nodeId) {
       // Skip defineGlobal for tensor-valued outputs - they use memory cells, not scratch buffers
@@ -1820,7 +1828,12 @@ public func emitBlockUOps(
     }
   }
 
-  let inbound = findNodesAsInboundDependencies(blocks, g, block: block)
+  var inbound = findNodesAsInboundDependencies(blocks, g, block: block)
+  // Add hop counter node as inbound if this block's temporality references it from another block
+  if case .hopBased(_, let counterNode) = block.temporality,
+     !blockNodeSet.contains(counterNode), !inbound.contains(counterNode) {
+    inbound.append(counterNode)
+  }
 
   for nodeId in inbound {
     if let lz = ctx.values[nodeId] {
@@ -1843,7 +1856,7 @@ public func emitBlockUOps(
   if needsTensorLoop, block.tensorIndex != nil {
     uops.append(UOp(op: .endParallelRange, value: ctx.useVariable(src: nil)))
   }
-  return uops
+  return (uops: uops, effectiveKind: effectiveKind)
 }
 
 /// Wraps emitted UOps with forward/reverse loops for correct BPTT.

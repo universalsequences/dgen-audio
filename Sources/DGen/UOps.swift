@@ -93,9 +93,8 @@ public enum Op {
   case expandAxisMarker(Int, Int, [Int], [Int], Bool, Bool)  // Marker: expandAxis(nodeId, axis, inShape, outShape, inFrameAware, outFrameAware)
 
   // Hop-based execution control (for FFT/spectral processing)
-  case beginHopCheck(CellID)  // if (memory[counterCell] == 0.0f) { - runs block only when counter is 0
+  case beginHopCheck(Lazy)  // if (counter == 0.0f) { - runs block only when counter is 0
   case endHopCheck  // } - closes the hop check conditional
-  case hopCounterIncrement(CellID, Int)  // counter increment + wrap: memory[cell] = (memory[cell]+1) >= hopSize ? 0 : memory[cell]+1
 
   public var isDefineGlobal: Bool {
     if case .defineGlobal = self { return true }
@@ -171,6 +170,7 @@ public enum Op {
     case .setFrameIndex(let i): return .setFrameIndex(r(i))
     case .loadTape(let v, let o): return .loadTape(r(v), r(o))
     case .beginIf(let c): return .beginIf(r(c))
+    case .beginHopCheck(let c): return .beginHopCheck(r(c))
     default: return self  // ops without Lazy inputs (load, endLoop, frameIndex, etc.)
     }
   }

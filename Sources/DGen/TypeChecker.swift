@@ -561,7 +561,7 @@ public func allocateTensorMemory(
   graph: Graph,
   blocks: [Block],
   frameBasedNodes: Set<NodeID>,
-  hopBasedNodes: [NodeID: (Int, CellID)] = [:],
+  hopBasedNodes: [NodeID: (Int, NodeID)] = [:],
   feedbackClusterNodes: Set<NodeID> = [],
   backend: Backend = .metal,
   frameCount: Int
@@ -750,7 +750,7 @@ public func isIntrinsicallyFrameBased(_ op: LazyOp) -> Bool {
 /// they handle their own internal hop logic (ring buffer writes run every frame,
 /// FFT computation only runs when counter == 0). However, their OUTPUT is hop-based,
 /// so downstream operations that consume FFT/IFFT output should inherit hop temporality.
-public func intrinsicHopRate(_ op: LazyOp, graph: Graph, nodeId: NodeID) -> (Int, CellID)? {
+public func intrinsicHopRate(_ op: LazyOp, graph: Graph, nodeId: NodeID) -> (Int, NodeID)? {
   // No ops are intrinsically hop-based from a rendering perspective
   // FFT/IFFT handle their own hop logic internally
   return nil
@@ -759,21 +759,21 @@ public func intrinsicHopRate(_ op: LazyOp, graph: Graph, nodeId: NodeID) -> (Int
 /// Returns the hop rate if the node produces hop-based output.
 /// Any op can produce hop-based output by registering in graph.nodeHopRate.
 /// FFT/IFFT use this, and so does bufferView(hop:).
-public func producesHopBasedOutput(_ op: LazyOp, graph: Graph, nodeId: NodeID) -> (Int, CellID)? {
+public func producesHopBasedOutput(_ op: LazyOp, graph: Graph, nodeId: NodeID) -> (Int, NodeID)? {
   return graph.nodeHopRate[nodeId]
 }
 
 /// Temporality propagation result containing both frame-based and hop-based node sets
 public struct TemporalityResult {
   public let frameBasedNodes: Set<NodeID>
-  public let hopBasedNodes: [NodeID: (Int, CellID)]
+  public let hopBasedNodes: [NodeID: (Int, NodeID)]
 }
 
 /// Infer temporality for all nodes. Returns sets of frame-based and hop-based nodes.
 ///
 /// Temporality Propagation Rules:
 /// - All static inputs → static output
-/// - All same hopBased(N, cell) inputs → hopBased(N, cell) output
+/// - All same hopBased(N, counterNode) inputs → hopBased(N, counterNode) output
 /// - Mixed hopBased rates → use fastest rate (smallest hopSize)
 /// - Any frameBased input → frameBased output
 /// - hopBased + static inputs → hopBased output
@@ -784,9 +784,9 @@ public struct TemporalityResult {
 /// - Operations consuming FFT/IFFT output inherit hop-based temporality
 public func inferTemporality(graph: Graph, sortedNodes: [NodeID]) -> TemporalityResult {
   var frameBasedNodes = Set<NodeID>()
-  var hopBasedNodes: [NodeID: (Int, CellID)] = [:]
+  var hopBasedNodes: [NodeID: (Int, NodeID)] = [:]
   // Track which nodes produce hop-based output (FFT/IFFT)
-  var hopProducingNodes: [NodeID: (Int, CellID)] = [:]
+  var hopProducingNodes: [NodeID: (Int, NodeID)] = [:]
 
   for nodeId in sortedNodes {
     guard let node = graph.nodes[nodeId] else { continue }
@@ -824,7 +824,7 @@ public func inferTemporality(graph: Graph, sortedNodes: [NodeID]) -> Temporality
     }
 
     // Check for hop-based inputs (either from hopBasedNodes or from hop-producing nodes like FFT)
-    var hopInputRates: [(Int, CellID)] = []
+    var hopInputRates: [(Int, NodeID)] = []
     for inputId in node.inputs {
       if let rate = hopBasedNodes[inputId] {
         hopInputRates.append(rate)
@@ -850,7 +850,7 @@ public func inferTemporality(graph: Graph, sortedNodes: [NodeID]) -> Temporality
 public func assignBlockTemporality(
   blocks: inout [Block],
   frameBasedNodes: Set<NodeID>,
-  hopBasedNodes: [NodeID: (Int, CellID)]
+  hopBasedNodes: [NodeID: (Int, NodeID)]
 ) {
   for i in 0..<blocks.count {
     blocks[i].temporality = determineBlockTemporality(
@@ -869,7 +869,7 @@ public func assignBlockTemporality(
 private func determineBlockTemporality(
   block: Block,
   frameBasedNodes: Set<NodeID>,
-  hopBasedNodes: [NodeID: (Int, CellID)]
+  hopBasedNodes: [NodeID: (Int, NodeID)]
 ) -> Temporality {
   if block.nodes.contains(where: { frameBasedNodes.contains($0) }) {
     return .frameBased
@@ -879,7 +879,7 @@ private func determineBlockTemporality(
   if let firstRate = hopRates.first {
     let allSameRate = hopRates.allSatisfy { $0.0 == firstRate.0 && $0.1 == firstRate.1 }
     if allSameRate {
-      return .hopBased(hopSize: firstRate.0, counter: firstRate.1)
+      return .hopBased(hopSize: firstRate.0, counterNode: firstRate.1)
     }
     return .frameBased
   }
@@ -890,7 +890,7 @@ private func determineBlockTemporality(
 public func splitBlockByStaticIfPossible(
   block: Block,
   frameBasedNodes: Set<NodeID>,
-  hopBasedNodes: [NodeID: (Int, CellID)],
+  hopBasedNodes: [NodeID: (Int, NodeID)],
   graph: Graph,
   fusableChains: [FrameDependentTensorChain] = []
 ) -> [Block] {
@@ -974,7 +974,7 @@ private struct TemporalitySegment {
 private func identifyTemporalitySegments(
   block: Block,
   frameBasedNodes: Set<NodeID>,
-  hopBasedNodes: [NodeID: (Int, CellID)],
+  hopBasedNodes: [NodeID: (Int, NodeID)],
   nodeToChain: [NodeID: FrameDependentTensorChain]
 ) -> [TemporalitySegment] {
   func isStatic(_ node: NodeID) -> Bool {
@@ -1055,7 +1055,7 @@ private func convertSegmentsToBlocks(
 public func extractStaticOpsIntoBlocks(
   blocks: [Block],
   frameBasedNodes: Set<NodeID>,
-  hopBasedNodes: [NodeID: (Int, CellID)],
+  hopBasedNodes: [NodeID: (Int, NodeID)],
   graph: Graph,
   fusableChains: [FrameDependentTensorChain] = []
 ) -> [Block] {
