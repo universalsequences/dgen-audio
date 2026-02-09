@@ -226,6 +226,7 @@ public struct CompilationPipeline {
     // temporality for global reduces (peekRowGradReduce/selectRowGradReduce)
     if backend == .metal {
       finalBlocks = splitReduceBlocks(g: graph, blocks: finalBlocks)
+      finalBlocks = splitMemoryBlocks(g: graph, blocks: finalBlocks)
     }
 
     // Step 4.6: Allocate real memory for lazy tensor cells
@@ -293,6 +294,7 @@ public struct CompilationPipeline {
     try time("emitBlockUOps") {
       for blockIdx in finalBlockIndices {
         let block = finalBlocks[blockIdx]
+        context.lastBlockHasOwnFrameLoop = false
         let ops = try emitBlockUOps(
           ctx: context,
           block: block,
@@ -301,6 +303,7 @@ public struct CompilationPipeline {
           backend: backend,
           debug: options.debug
         )
+        let hasOwnFrameLoop = context.lastBlockHasOwnFrameLoop
         let (threadCountScale, filteredOps) = extractThreadCountScale(ops)
         var finalOps = filteredOps
         let effectiveKind: Kind
@@ -315,12 +318,12 @@ public struct CompilationPipeline {
         let parallelPolicy = inferParallelPolicy(
           kind: effectiveKind, temporality: block.temporality, ops: finalOps)
         // Force new kernel for spectral passes (forward + backward) and scaled thread blocks
-        let forceNew = threadCountScale != nil
+        let forceNew = threadCountScale != nil || hasOwnFrameLoop
         uopBlocks.append(
           BlockUOps(
             ops: finalOps, kind: effectiveKind, temporality: block.temporality,
             parallelPolicy: parallelPolicy, forceNewKernel: forceNew,
-            threadCountScale: threadCountScale))
+            threadCountScale: threadCountScale, hasOwnFrameLoop: hasOwnFrameLoop))
       }
     }
 

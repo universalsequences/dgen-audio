@@ -9,6 +9,9 @@ public struct BlockUOps {
   public var forceNewKernel: Bool
   /// Optional: dispatch threads = frameCount * scale for this block
   public var threadCountScale: Int?
+  /// When true, the block contains its own frame loops (e.g., BPTT forward+reverse loops).
+  /// prepareSchedule should dispatch 1 thread with no additional frame loop wrapping.
+  public var hasOwnFrameLoop: Bool
 
   public init(
     ops: [UOp],
@@ -16,7 +19,8 @@ public struct BlockUOps {
     temporality: Temporality = .static_,
     parallelPolicy: ParallelPolicy = .serial,
     forceNewKernel: Bool = false,
-    threadCountScale: Int? = nil
+    threadCountScale: Int? = nil,
+    hasOwnFrameLoop: Bool = false
   ) {
     self.ops = ops
     self.kind = kind
@@ -24,6 +28,7 @@ public struct BlockUOps {
     self.parallelPolicy = parallelPolicy
     self.forceNewKernel = forceNewKernel
     self.threadCountScale = threadCountScale
+    self.hasOwnFrameLoop = hasOwnFrameLoop
   }
 }
 
@@ -272,6 +277,10 @@ public class CRenderer: Renderer {
         }
 
         // Open new loop based on temporality
+        if block.hasOwnFrameLoop {
+          // Block contains its own forward/backward frame loops (BPTT)
+          loopOpen = false
+        } else {
         switch block.temporality {
         case .frameBased:
           // Frame-based: standard frame loop
@@ -301,6 +310,7 @@ public class CRenderer: Renderer {
           // Static: no frame loop
           loopOpen = false
         }
+        }  // end else (not hasOwnFrameLoop)
 
         currentKind = block.kind
         currentTemporality = block.temporality
@@ -457,7 +467,7 @@ public class CRenderer: Renderer {
       switch uop.op {
       case .beginIf, .beginForLoop, .beginHopCheck:
         diff = 1
-      case .beginLoop:
+      case .beginLoop, .beginReverseLoop:
         diff = 1
         // Reset for each new loop scope - variables need to be redeclared
         loadedGlobal = [:]
@@ -990,6 +1000,8 @@ public class CRenderer: Renderer {
 
     case .beginLoop(let iters, let step):
       return "for (int i = 0; i < \(g(iters)); i += \(step)) {"
+    case .beginReverseLoop(let iters):
+      return "for (int i = \(g(iters)) - 1; i >= 0; i--) {"
     case .beginForLoop(let loopVar, let count):
       guard case .variable(let varId, _) = loopVar else {
         fatalError("beginForLoop requires variable")

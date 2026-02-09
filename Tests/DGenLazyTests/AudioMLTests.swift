@@ -133,9 +133,7 @@ final class AudioMLTests: XCTestCase {
       func envelope(_ rate: Signal) -> Signal {
         let (prev, write) = Signal.history()
         let seed = max(Signal.constant(1.0) - t, 0.0)  // 1 on frame 0, 0 after
-        let out = prev * rate + seed
-        write(out)
-        return out
+        return write(prev * rate + seed)
       }
 
       let freqEnv = envelope(freqDecay)

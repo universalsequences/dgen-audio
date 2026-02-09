@@ -143,8 +143,7 @@ final class FIRFilterTests: XCTestCase {
 
       // Teacher: one-pole IIR
       let (prev, write) = Signal.history()
-      let target = Signal.mix(phase, prev, alpha)
-      write(target)
+      let target = write(Signal.mix(phase, prev, alpha))
 
       // Student: FIR via buffer + conv2d → single dot product per frame
       // bufferSize == kernelSize so conv2d output is [1,1], .sum() collapses to scalar

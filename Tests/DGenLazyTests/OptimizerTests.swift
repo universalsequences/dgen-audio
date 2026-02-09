@@ -216,18 +216,14 @@ final class OptimizerTests: XCTestCase {
     func buildLearnable() -> Signal {
       let phase = Signal.phasor(440.0)
       let (prev, write) = Signal.history()
-      let out = Signal.mix(phase, prev, cutoff)
-      write(out)
-      return out
+      return write(Signal.mix(phase, prev, cutoff))
     }
 
     // Target filter (constant cutoff)
     func buildTarget() -> Signal {
       let phase = Signal.phasor(440.0)
       let (prev, write) = Signal.history()
-      let out = Signal.mix(phase, prev, targetCutoff)
-      write(out)
-      return out
+      return write(Signal.mix(phase, prev, targetCutoff))
     }
 
     let frameCount = 256
@@ -275,9 +271,7 @@ final class OptimizerTests: XCTestCase {
     func buildSynth() -> Signal {
       let trigger = Signal.click()
       let (prev, write) = Signal.history()
-      let out = gswitch(trigger, 1.0, prev * amp)
-      write(out)
-      return out
+      return write(gswitch(trigger, 1.0, prev * amp))
     }
 
     // Warmup — use constant target (no peek/accum) to test history alone
@@ -303,17 +297,13 @@ final class OptimizerTests: XCTestCase {
     func buildLearnable() -> Signal {
       let phase = Signal.phasor(440.0)
       let (prev, write) = Signal.history()
-      let out = Signal.mix(phase, prev, cutoff)
-      write(out)
-      return out
+      return write(Signal.mix(phase, prev, cutoff))
     }
 
     func buildTarget() -> Signal {
       let phase = Signal.phasor(440.0)
       let (prev, write) = Signal.history()
-      let out = Signal.mix(phase, prev, targetCutoff)
-      write(out)
-      return out
+      return write(Signal.mix(phase, prev, targetCutoff))
     }
 
     let frameCount = 256

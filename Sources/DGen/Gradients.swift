@@ -71,6 +71,20 @@ extension Graph {
       }
     }
 
+    // BPTT: Create carry cell writes for historyRead nodes.
+    // historyRead has no graph inputs, so it's pruned from reverseTopologicalOrder
+    // and its backward never runs. But the gradient w.r.t. historyRead's output
+    // (accumulated in grads[]) is the temporal carry that should be written to the
+    // carry cell for the previous frame to read.
+    for (nodeId, node) in nodes {
+      if case .historyRead(let cellId) = node.op, let gradNodeId = grads[nodeId] {
+        let carryCell = getGradCarryCell(for: cellId)
+        let zero = n(.seq, [gradNodeId, n(.constant(0.0), [])])
+        let writeNode = n(.memoryWrite(carryCell), [zero, gradNodeId])
+        addGradientSideEffect(writeNode)
+      }
+    }
+
     return grads
   }
 
@@ -572,27 +586,25 @@ extension LazyOp {
       let gradValue = g.n(.gswitch, [g.n(.gt, [cond, zero]), gradOutput, zero])
       return [gradValue, zero]
 
-    case .historyRead(let cellId):
-      // historyRead exposes previous state. The gradient w.r.t. this read's output
-      // must be passed to the previous timestep via the gradient carry cell.
-      // Stores gradient to carry cell for the previous timestep to read.
-      let carryCell = g.getGradCarryCell(for: cellId)
-      let zero = g.n(.constant(0.0), [])
-      // Store gradOutput to carry cell for previous timestep
-      let writeNode = g.n(.memoryWrite(carryCell), [zero, gradOutput])
-      // Register as side effect so it gets scheduled
-      g.addGradientSideEffect(writeNode)
-      return []  // No graph inputs
+    case .historyRead:
+      // historyRead has no graph inputs, so no gradients to return.
+      // The carry cell write for BPTT is handled in computeGradients() after
+      // the main loop, using the accumulated gradient from grads[historyRead].
+      return []
 
     case .historyWrite(let cellId):
-      // historyWrite stores current input into the cell.
-      // The gradient for the input comes from future reads via the carry cell.
-      // Reads gradient from carry cell written by the future timestep.
+      // historyWrite is pass-through: it stores the input AND outputs it.
+      // The gradient for the input is gradOutput (from downstream loss) PLUS
+      // the temporal carry gradient (from future timestep's historyRead.backward).
       let carryCell = g.getGradCarryCell(for: cellId)
-      let zero = g.n(.constant(0.0), [])
+      // Use seq to order the carry read AFTER gradOutput, ensuring the memoryRead
+      // node is a backward node (nodeId > lastForwardNodeId) and stays in the
+      // BPTT block alongside other backward ops.
+      let zero = g.n(.seq, [gradOutput, g.n(.constant(0.0), [])])
       // Read gradient from carry cell (from future timestep)
       let carryGrad = g.n(.memoryRead(carryCell), [zero])
-      return [carryGrad]
+      // Pass through downstream gradient + temporal carry
+      return [g.n(.add, [gradOutput, carryGrad])]
 
     case .historyReadWrite(let cellId):
       // Combined read/write - stores gradOutput to carry, reads carry as input gradient

@@ -49,6 +49,10 @@ public class IRContext {
   // The pre-computed frame index for the current frame-aware tensor block
   public var frameAwareTensorFrameIndex: Lazy?
 
+  /// Set to true by emitBlockUOps when the block contains its own forward/backward loops (BPTT).
+  /// The compilation pipeline checks this to set hasOwnFrameLoop on BlockUOps.
+  public var lastBlockHasOwnFrameLoop: Bool = false
+
   /// Clear tensor register tracking (call at start of each tensor block)
   public func clearTensorRegisters() {
     tensorCellToVar = [:]

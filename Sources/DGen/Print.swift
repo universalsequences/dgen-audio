@@ -109,6 +109,8 @@ extension UOp {
             opStr = "\(ANSI.green)latch\(ANSI.reset)(\(a), \(b))"
         case let .beginLoop(a, b):
             opStr = "\(ANSI.green)begin_loop\(ANSI.reset)(\(a), \(b))"
+        case let .beginReverseLoop(a):
+            opStr = "\(ANSI.green)begin_reverse_loop\(ANSI.reset)(\(a))"
         case let .beginForLoop(loopVar, count):
             opStr = "\(ANSI.green)beginForLoop\(ANSI.reset)(\(loopVar), \(count))"
         case let .defineConstant(constantId, value):

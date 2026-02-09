@@ -201,6 +201,7 @@ public class Signal: LazyValue {
   public static func click() -> Signal {
     let graph = LazyGraphContext.current
     let cellId = graph.alloc()
+    graph.cellInitialValues[cellId] = 1.0
     let nodeId = graph.node(.click(cellId))
     return Signal(nodeId: nodeId, graph: graph, requiresGrad: false)
   }
@@ -209,16 +210,19 @@ public class Signal: LazyValue {
 
   /// Create a history cell and return a reader for it
   /// Use this to build custom feedback loops
-  /// - Returns: Tuple of (read: Signal, write: (Signal) -> Void)
-  public static func history() -> (read: Signal, write: (Signal) -> Void) {
+  /// - Returns: Tuple of (read: Signal, write: (Signal) -> Signal)
+  /// The write closure stores the value and returns it (pass-through),
+  /// ensuring historyWrite is part of the computation graph for correct BPTT.
+  public static func history() -> (read: Signal, write: (Signal) -> Signal) {
     let graph = LazyGraphContext.current
     let cellId = graph.alloc()
 
     let readNode = graph.node(.historyRead(cellId))
     let readSignal = Signal(nodeId: readNode, graph: graph, requiresGrad: false, cellId: cellId)
 
-    let writeFunc: (Signal) -> Void = { value in
-      let _ = graph.node(.historyWrite(cellId), [value.nodeId])
+    let writeFunc: (Signal) -> Signal = { value in
+      let writeNode = graph.node(.historyWrite(cellId), [value.nodeId])
+      return Signal(nodeId: writeNode, graph: graph, requiresGrad: value.requiresGrad, cellId: cellId)
     }
 
     return (read: readSignal, write: writeFunc)

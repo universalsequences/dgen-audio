@@ -33,6 +33,9 @@ public class LazyGraph {
   /// Whether the graph has been modified since last compilation
   internal var isDirty: Bool = true
 
+  /// Initial values for stateful cells (e.g., click cells start at 1.0)
+  internal var cellInitialValues: [CellID: Float] = [:]
+
   /// Cache compiled kernels by graph structure hash (persists across graph clears)
   internal var compilationCacheByStructure: [String: (CompilationResult, LazyRuntime)] = [:]
 
@@ -162,12 +165,17 @@ public class LazyGraph {
     // 4. Clear gradient side effects
     graph.gradientSideEffects.removeAll()
     graph.tensorGradCells.removeAll()
+    graph.gradCarryCells.removeAll()
+    graph.lastForwardNodeId = nil
 
     // 5. Clear gradient cells from registry (they'll be recreated on next backward)
     parameterRegistry.tensorGradCells.removeAll()
     parameterRegistry.signalGradCells.removeAll()
 
-    // 6. Invalidate instance caches
+    // 6. Clear stateful cell initial values (recreated on next build)
+    cellInitialValues.removeAll()
+
+    // 7. Invalidate instance caches
     compilationCache = nil
     runtimeCache = nil
     isDirty = true

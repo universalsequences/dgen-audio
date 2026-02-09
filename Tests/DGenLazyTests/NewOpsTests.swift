@@ -198,8 +198,7 @@ final class NewOpsTests: XCTestCase {
   func testHistory() throws {
     let (prev, write) = Signal.history()
     let input = Signal.constant(1.0)
-    let integrated = prev + input
-    write(integrated)
+    let integrated = write(prev + input)
 
     let results = try integrated.realize(frames: 5)
 

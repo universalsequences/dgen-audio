@@ -1,4 +1,4 @@
-public enum Lazy: Equatable {
+public enum Lazy: Hashable {
   case constant(ConstantID, Float)
   case global(VarID)
   case variable(VarID, NodeID?)
@@ -63,6 +63,7 @@ public enum Op {
   case loadGlobal(VarID)
   case beginLoop(Lazy, Int)
   case beginForLoop(Lazy, Lazy)  // (loopVariable, count) - step is always 1
+  case beginReverseLoop(Lazy)  // reverse loop: for (int i = count-1; i >= 0; i--)
   case endLoop
   case beginRange(Lazy, Lazy)
   case endRange
@@ -112,6 +113,66 @@ public enum Op {
     }
   }
 
+  /// Returns a new Op with Lazy inputs remapped. Used for BPTT to redirect
+  /// backward ops from forward-loop variables to per-frame stored values.
+  public func remapLazyInputs(_ remap: [Lazy: Lazy]) -> Op {
+    func r(_ l: Lazy) -> Lazy { remap[l] ?? l }
+    switch self {
+    case .store(let c, let v): return .store(c, r(v))
+    case .delay1(let c, let a): return .delay1(c, r(a))
+    case .mse(let a, let b): return .mse(r(a), r(b))
+    case .mutate(let a, let b): return .mutate(r(a), r(b))
+    case .add(let a, let b): return .add(r(a), r(b))
+    case .sub(let a, let b): return .sub(r(a), r(b))
+    case .mul(let a, let b): return .mul(r(a), r(b))
+    case .div(let a, let b): return .div(r(a), r(b))
+    case .abs(let a): return .abs(r(a))
+    case .sign(let a): return .sign(r(a))
+    case .sin(let a): return .sin(r(a))
+    case .cos(let a): return .cos(r(a))
+    case .and(let a, let b): return .and(r(a), r(b))
+    case .or(let a, let b): return .or(r(a), r(b))
+    case .xor(let a, let b): return .xor(r(a), r(b))
+    case .tan(let a): return .tan(r(a))
+    case .tanh(let a): return .tanh(r(a))
+    case .exp(let a): return .exp(r(a))
+    case .log(let a): return .log(r(a))
+    case .log10(let a): return .log10(r(a))
+    case .sqrt(let a): return .sqrt(r(a))
+    case .pow(let a, let b): return .pow(r(a), r(b))
+    case .atan2(let a, let b): return .atan2(r(a), r(b))
+    case .mod(let a, let b): return .mod(r(a), r(b))
+    case .gt(let a, let b): return .gt(r(a), r(b))
+    case .gte(let a, let b): return .gte(r(a), r(b))
+    case .lte(let a, let b): return .lte(r(a), r(b))
+    case .lt(let a, let b): return .lt(r(a), r(b))
+    case .eq(let a, let b): return .eq(r(a), r(b))
+    case .min(let a, let b): return .min(r(a), r(b))
+    case .max(let a, let b): return .max(r(a), r(b))
+    case .floor(let a): return .floor(r(a))
+    case .ceil(let a): return .ceil(r(a))
+    case .round(let a): return .round(r(a))
+    case .memoryRead(let c, let o): return .memoryRead(c, r(o))
+    case .memoryWrite(let c, let o, let v): return .memoryWrite(c, r(o), r(v))
+    case .memoryAccumulate(let c, let o, let v): return .memoryAccumulate(c, r(o), r(v))
+    case .latch(let a, let b): return .latch(r(a), r(b))
+    case .gswitch(let c, let a, let b): return .gswitch(r(c), r(a), r(b))
+    case .selector(let m, let opts): return .selector(r(m), opts.map { r($0) })
+    case .beginForLoop(let v, let c): return .beginForLoop(r(v), r(c))
+    case .beginLoop(let i, let s): return .beginLoop(r(i), s)
+    case .beginReverseLoop(let i): return .beginReverseLoop(r(i))
+    case .beginRange(let s, let e): return .beginRange(r(s), r(e))
+    case .beginParallelRange(let c, let s): return .beginParallelRange(c, s)
+    case .output(let ch, let v): return .output(ch, r(v))
+    case .cast(let e, let t): return .cast(r(e), t)
+    case .declareVar(let v): return .declareVar(r(v))
+    case .setFrameIndex(let i): return .setFrameIndex(r(i))
+    case .loadTape(let v, let o): return .loadTape(r(v), r(o))
+    case .beginIf(let c): return .beginIf(r(c))
+    default: return self  // ops without Lazy inputs (load, endLoop, frameIndex, etc.)
+    }
+  }
+
   /// Returns a new Op with the cell ID remapped, or nil if no remapping is needed.
   public func withRemappedCellId(_ remapping: [CellID: CellID]) -> Op? {
     guard let cellId = memoryCellId, let newCellId = remapping[cellId] else {
@@ -137,4 +198,17 @@ public struct UOp {
   public var kindOverride: Kind? = nil
   public var tensorIndex: Lazy? = nil
   public var scalarType: CastType = .float  // int or float for variable declarations
+
+  public init(
+    op: Op, value: Lazy, kind: Kind? = nil,
+    kindOverride: Kind? = nil, tensorIndex: Lazy? = nil,
+    scalarType: CastType = .float
+  ) {
+    self.op = op
+    self.value = value
+    self.kind = kind
+    self.kindOverride = kindOverride
+    self.tensorIndex = tensorIndex
+    self.scalarType = scalarType
+  }
 }

@@ -236,7 +236,7 @@ public class MetalRenderer: Renderer, UOpEmitter {
       switch uop.op {
       case .memoryWrite, .memoryAccumulate, .store, .delay1, .output:
         return true
-      case .beginRange, .endRange, .beginLoop, .endLoop,
+      case .beginRange, .endRange, .beginLoop, .beginReverseLoop, .endLoop,
         .beginForLoop, .beginParallelRange, .endParallelRange,
         .beginIf, .endIf, .frameCount:
         break
@@ -389,7 +389,7 @@ public class MetalRenderer: Renderer, UOpEmitter {
         let isStaticScalar = block.temporality == .static_ && block.kind == .scalar
         let isScalar = block.kind == .scalar
 
-        if isStaticScalar {
+        if block.hasOwnFrameLoop || isStaticScalar {
           // Static scalar blocks: run once, no frame loop needed
           var beginRange = UOp(op: .beginRange(.constant(0, 0), .constant(0, 1)), value: .empty)
           beginRange.kind = block.kind
@@ -507,7 +507,7 @@ public class MetalRenderer: Renderer, UOpEmitter {
     for uop in scheduleItem.ops {
       var diff = 0
       switch uop.op {
-      case .beginIf, .beginLoop, .beginRange, .beginForLoop, .beginParallelRange:
+      case .beginIf, .beginLoop, .beginReverseLoop, .beginRange, .beginForLoop, .beginParallelRange:
         diff = 1
       case .endIf, .endLoop, .endRange, .endParallelRange:
         indent -= 1
@@ -757,6 +757,8 @@ public class MetalRenderer: Renderer, UOpEmitter {
       } else {
         return "for (uint i = 0; i < \(g(iters)); i += \(step)) {"
       }
+    case .beginReverseLoop(let iters):
+      return "for (int i = \(g(iters)) - 1; i >= 0; i--) {"
     case .beginForLoop(let loopVar, let count):
       guard case .variable(let varId, _) = loopVar else {
         fatalError("beginForLoop requires variable")

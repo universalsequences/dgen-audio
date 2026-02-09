@@ -168,6 +168,12 @@ extension LazyGraph {
             let physicalCell = cellMappings[cellId] ?? cellId
             memPtr[physicalCell] = value
         }
+
+        // Inject initial values for stateful cells (e.g., click cells)
+        for (cellId, value) in cellInitialValues {
+            let physicalCell = cellMappings[cellId] ?? cellId
+            memPtr[physicalCell] = value
+        }
     }
 
     /// Run the compiled graph

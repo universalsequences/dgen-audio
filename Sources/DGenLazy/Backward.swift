@@ -81,6 +81,10 @@ extension LazyGraph {
       return ([:], [:])
     }
 
+    // Record the last forward node ID before adding gradient nodes
+    // This is needed for BPTT loop splitting (forward loop vs reverse backward loop)
+    graph.lastForwardNodeId = graph.nodes.keys.max() ?? 0
+
     // Compute gradients using DGen's gradient infrastructure
     let gradients = graph.computeGradients(loss: loss, targets: targets)
 

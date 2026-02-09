@@ -305,6 +305,20 @@ final class AudioEffectsTests: XCTestCase {
     XCTAssertGreaterThan(peak, 0.1, "Delayed sine should produce non-zero output")
   }
 
+  func testDelayFeedback() throws {
+    // Feedback delay (echo): output = input + 0.5 * delay(output, 20)
+    // This creates a feedback loop that forces scalar execution.
+    let (c, metal) = try realizeBothBackends(frames: 256) {
+      let input = self.makeSine(440.0)
+      let (prev, write) = Signal.history()
+      let delayed = prev.delay(20.0)
+      let output = input + delayed * 0.5
+      let _ = write(output)
+      return output
+    }
+    assertClose(c, metal, accuracy: 1e-3, "delay feedback")
+  }
+
   // MARK: - Combined Effects
 
   func testBiquadThenCompressor() throws {

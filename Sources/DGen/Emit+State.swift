@@ -80,6 +80,8 @@ extension LazyOp {
 
     case .historyWrite(let cellId):
       // Unified history write - handles both scalar and tensor based on cellToTensor mapping
+      // historyWrite is pass-through: stores value AND outputs it for downstream use.
+      // This ensures historyWrite is in the computation graph for correct BPTT.
       if let tensorId = g.cellToTensor[cellId], g.tensors[tensorId] != nil {
         // Tensor write: copy from input tensor to history cell
         guard node.inputs.count >= 1 else {
@@ -97,13 +99,18 @@ extension LazyOp {
         // tload for cached register, but ALWAYS write - history persists across frames
         let value = b.tload(inputCellId, idx)
         _ = b.memoryWrite(cellId, b.cast(idx, to: .int), value)
+        // Pass-through: output is same as input tensor
+        ctx.values[nodeId] = .empty
       } else {
-        // Scalar write
+        // Scalar write + pass-through
         guard inputs.count == 1 else {
           throw DGenError.insufficientInputs(
             operator: "history write", expected: 1, actual: inputs.count)
         }
-        b.use(val: b.store(cellId, b.value(inputs[0])))
+        let inputVal = b.value(inputs[0])
+        _ = b.store(cellId, inputVal)
+        // Pass-through: output the input value so downstream ops can use it
+        b.use(val: inputVal)
       }
     case .param(let cellId):
       b.use(val: b.load(cellId))
