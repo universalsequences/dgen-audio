@@ -559,217 +559,39 @@ extension SignalTensor {
 /// Compute N-point FFT using only tensor view + arithmetic operations.
 /// N must be a power of 2. Returns (real, imaginary) tensors of shape [N].
 public func tensorFFT(_ input: Tensor, N: Int) -> (re: Tensor, im: Tensor) {
-  let k = Int(Foundation.log2(Double(N)))
-  precondition(1 << k == N, "N must be a power of 2")
-
-  // Bit-reversal permutation via reshape→transpose→reshape
-  let twos = [Int](repeating: 2, count: k)
-  var re = input.reshape(twos)
-    .transpose(Array((0..<k).reversed()))
-    .reshape([N])
-  var im = Tensor.zeros([N])
-
-  // k butterfly stages
-  for s in 0..<k {
-    let half = 1 << s
-    let blocks = N / (2 * half)
-
-    let re3d = re.reshape([blocks, 2, half])
-    let im3d = im.reshape([blocks, 2, half])
-
-    let even_re = re3d.shrink([nil, (0, 1), nil]).reshape([blocks, half])
-    let odd_re = re3d.shrink([nil, (1, 2), nil]).reshape([blocks, half])
-    let even_im = im3d.shrink([nil, (0, 1), nil]).reshape([blocks, half])
-    let odd_im = im3d.shrink([nil, (1, 2), nil]).reshape([blocks, half])
-
-    // Twiddle factors: w[j] = exp(-2πij / (2·half))
-    var twRe = [Float](repeating: 0, count: half)
-    var twIm = [Float](repeating: 0, count: half)
-    for j in 0..<half {
-      let angle = -2.0 * Float.pi * Float(j) / Float(2 * half)
-      twRe[j] = Foundation.cos(angle)
-      twIm[j] = Foundation.sin(angle)
-    }
-
-    let twiddleRe = Tensor(twRe).reshape([1, half]).expand([blocks, half])
-    let twiddleIm = Tensor(twIm).reshape([1, half]).expand([blocks, half])
-
-    let t_re = odd_re * twiddleRe - odd_im * twiddleIm
-    let t_im = odd_re * twiddleIm + odd_im * twiddleRe
-
-    let top_re = even_re + t_re
-    let top_im = even_im + t_im
-    let bot_re = even_re - t_re
-    let bot_im = even_im - t_im
-
-    re = (top_re.pad([(0, 0), (0, half)]) + bot_re.pad([(0, 0), (half, 0)])).reshape([N])
-    im = (top_im.pad([(0, 0), (0, half)]) + bot_im.pad([(0, 0), (half, 0)])).reshape([N])
-  }
-
-  return (re, im)
+  let (reId, imId) = input.graph.graph.tensorFFT(input.nodeId, N: N)
+  return (
+    Tensor(nodeId: reId, graph: input.graph, shape: [N], requiresGrad: input.requiresGrad),
+    Tensor(nodeId: imId, graph: input.graph, shape: [N], requiresGrad: input.requiresGrad)
+  )
 }
 
 /// Compute N-point IFFT using only tensor view + arithmetic operations.
 /// Same Cooley-Tukey butterfly as tensorFFT but with positive twiddle angles and 1/N normalization.
 /// N must be a power of 2. Returns real tensor of shape [N] (imaginary part discarded for real signals).
 public func tensorIFFT(_ re: Tensor, _ im: Tensor, N: Int) -> Tensor {
-  let k = Int(Foundation.log2(Double(N)))
-  precondition(1 << k == N, "N must be a power of 2")
-
-  // Bit-reversal permutation
-  let twos = [Int](repeating: 2, count: k)
-  var reBR = re.reshape(twos)
-    .transpose(Array((0..<k).reversed()))
-    .reshape([N])
-  var imBR = im.reshape(twos)
-    .transpose(Array((0..<k).reversed()))
-    .reshape([N])
-
-  // k butterfly stages with POSITIVE twiddle angles
-  for s in 0..<k {
-    let half = 1 << s
-    let blocks = N / (2 * half)
-
-    let re3d = reBR.reshape([blocks, 2, half])
-    let im3d = imBR.reshape([blocks, 2, half])
-
-    let even_re = re3d.shrink([nil, (0, 1), nil]).reshape([blocks, half])
-    let odd_re = re3d.shrink([nil, (1, 2), nil]).reshape([blocks, half])
-    let even_im = im3d.shrink([nil, (0, 1), nil]).reshape([blocks, half])
-    let odd_im = im3d.shrink([nil, (1, 2), nil]).reshape([blocks, half])
-
-    // POSITIVE twiddle: w[j] = exp(+2πij / (2·half))
-    var twRe = [Float](repeating: 0, count: half)
-    var twIm = [Float](repeating: 0, count: half)
-    for j in 0..<half {
-      let angle = 2.0 * Float.pi * Float(j) / Float(2 * half)
-      twRe[j] = Foundation.cos(angle)
-      twIm[j] = Foundation.sin(angle)
-    }
-
-    let twiddleRe = Tensor(twRe).reshape([1, half]).expand([blocks, half])
-    let twiddleIm = Tensor(twIm).reshape([1, half]).expand([blocks, half])
-
-    let t_re = odd_re * twiddleRe - odd_im * twiddleIm
-    let t_im = odd_re * twiddleIm + odd_im * twiddleRe
-
-    let top_re = even_re + t_re
-    let top_im = even_im + t_im
-    let bot_re = even_re - t_re
-    let bot_im = even_im - t_im
-
-    reBR = (top_re.pad([(0, 0), (0, half)]) + bot_re.pad([(0, 0), (half, 0)])).reshape([N])
-    imBR = (top_im.pad([(0, 0), (0, half)]) + bot_im.pad([(0, 0), (half, 0)])).reshape([N])
-  }
-
-  // Normalize by 1/N
-  return reBR * (1.0 / Float(N))
+  let resultId = re.graph.graph.tensorIFFT(re.nodeId, im.nodeId, N: N)
+  return Tensor(
+    nodeId: resultId, graph: re.graph, shape: [N],
+    requiresGrad: re.requiresGrad || im.requiresGrad)
 }
 
 /// SignalTensor FFT variant: same algorithm, but input is a frame-varying tensor (usually buffered and hopped).
 /// Twiddle factors stay as static Tensor; mixed arithmetic promotes to SignalTensor.
 public func signalTensorFFT(_ input: SignalTensor, N: Int) -> (re: SignalTensor, im: SignalTensor) {
-  let k = Int(Foundation.log2(Double(N)))
-  precondition(1 << k == N, "N must be a power of 2")
-
-  let twos = [Int](repeating: 2, count: k)
-  var re = input.reshape(twos)
-    .transpose(Array((0..<k).reversed()))
-    .reshape([N])
-
-  // ugly trick to get a SignalTensor of all 0s to start accumulating on
-  // TODO - find a better way to express "give me a SignalTensor of 0s"
-  var im = input.reshape([N]) * 0.0
-
-  for s in 0..<k {
-    let half = 1 << s
-    let blocks = N / (2 * half)
-
-    let re3d = re.reshape([blocks, 2, half])
-    let im3d = im.reshape([blocks, 2, half])
-
-    let even_re = re3d.shrink([nil, (0, 1), nil]).reshape([blocks, half])
-    let odd_re = re3d.shrink([nil, (1, 2), nil]).reshape([blocks, half])
-    let even_im = im3d.shrink([nil, (0, 1), nil]).reshape([blocks, half])
-    let odd_im = im3d.shrink([nil, (1, 2), nil]).reshape([blocks, half])
-
-    var twRe = [Float](repeating: 0, count: half)
-    var twIm = [Float](repeating: 0, count: half)
-    for j in 0..<half {
-      let angle = -2.0 * Float.pi * Float(j) / Float(2 * half)
-      twRe[j] = Foundation.cos(angle)
-      twIm[j] = Foundation.sin(angle)
-    }
-
-    let twiddleRe = Tensor(twRe).reshape([1, half]).expand([blocks, half])
-    let twiddleIm = Tensor(twIm).reshape([1, half]).expand([blocks, half])
-
-    let t_re = odd_re * twiddleRe - odd_im * twiddleIm
-    let t_im = odd_re * twiddleIm + odd_im * twiddleRe
-
-    let top_re = even_re + t_re
-    let top_im = even_im + t_im
-    let bot_re = even_re - t_re
-    let bot_im = even_im - t_im
-
-    re = (top_re.pad([(0, 0), (0, half)]) + bot_re.pad([(0, 0), (half, 0)])).reshape([N])
-    im = (top_im.pad([(0, 0), (0, half)]) + bot_im.pad([(0, 0), (half, 0)])).reshape([N])
-  }
-
-  return (re, im)
+  let (reId, imId) = input.graph.graph.tensorFFT(input.nodeId, N: N)
+  return (
+    SignalTensor(nodeId: reId, graph: input.graph, shape: [N], requiresGrad: input.requiresGrad),
+    SignalTensor(nodeId: imId, graph: input.graph, shape: [N], requiresGrad: input.requiresGrad)
+  )
 }
 
 /// SignalTensor IFFT variant: positive twiddle angles, 1/N normalization.
 public func signalTensorIFFT(_ re: SignalTensor, _ im: SignalTensor, N: Int) -> SignalTensor {
-  let k = Int(Foundation.log2(Double(N)))
-  precondition(1 << k == N, "N must be a power of 2")
-
-  let twos = [Int](repeating: 2, count: k)
-  var reBR = re.reshape(twos)
-    .transpose(Array((0..<k).reversed()))
-    .reshape([N])
-  var imBR = im.reshape(twos)
-    .transpose(Array((0..<k).reversed()))
-    .reshape([N])
-
-  for s in 0..<k {
-    let half = 1 << s
-    let blocks = N / (2 * half)
-
-    let re3d = reBR.reshape([blocks, 2, half])
-    let im3d = imBR.reshape([blocks, 2, half])
-
-    let even_re = re3d.shrink([nil, (0, 1), nil]).reshape([blocks, half])
-    let odd_re = re3d.shrink([nil, (1, 2), nil]).reshape([blocks, half])
-    let even_im = im3d.shrink([nil, (0, 1), nil]).reshape([blocks, half])
-    let odd_im = im3d.shrink([nil, (1, 2), nil]).reshape([blocks, half])
-
-    // POSITIVE twiddle for IFFT
-    var twRe = [Float](repeating: 0, count: half)
-    var twIm = [Float](repeating: 0, count: half)
-    for j in 0..<half {
-      let angle = 2.0 * Float.pi * Float(j) / Float(2 * half)
-      twRe[j] = Foundation.cos(angle)
-      twIm[j] = Foundation.sin(angle)
-    }
-
-    let twiddleRe = Tensor(twRe).reshape([1, half]).expand([blocks, half])
-    let twiddleIm = Tensor(twIm).reshape([1, half]).expand([blocks, half])
-
-    let t_re = odd_re * twiddleRe - odd_im * twiddleIm
-    let t_im = odd_re * twiddleIm + odd_im * twiddleRe
-
-    let top_re = even_re + t_re
-    let top_im = even_im + t_im
-    let bot_re = even_re - t_re
-    let bot_im = even_im - t_im
-
-    reBR = (top_re.pad([(0, 0), (0, half)]) + bot_re.pad([(0, 0), (half, 0)])).reshape([N])
-    imBR = (top_im.pad([(0, 0), (0, half)]) + bot_im.pad([(0, 0), (half, 0)])).reshape([N])
-  }
-
-  // Normalize by 1/N
-  return reBR * (1.0 / Float(N))
+  let resultId = re.graph.graph.tensorIFFT(re.nodeId, im.nodeId, N: N)
+  return SignalTensor(
+    nodeId: resultId, graph: re.graph, shape: [N],
+    requiresGrad: re.requiresGrad || im.requiresGrad)
 }
 
 // MARK: - Overlap-Add
