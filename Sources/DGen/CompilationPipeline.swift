@@ -349,7 +349,8 @@ public struct CompilationPipeline {
     let cellAllocations = time("remapMemorySlots") {
       remapVectorMemorySlots(
         &uopBlocks, cellSizes: graph.cellAllocationSizes,
-        voiceCellId: generatedVoiceCell ? voiceCellIdFinal : nil)
+        voiceCellId: generatedVoiceCell ? voiceCellIdFinal : nil,
+        graph: graph)
     }
 
     let renderer: Renderer = createRenderer(for: backend, options: options)
@@ -472,7 +473,8 @@ private func printUOpBlocks(_ uopBlocks: [BlockUOps], blocks: [Block]) {
 /// Remap memory slots to avoid conflicts between scalar and vector operations
 /// Returns the total number of memory slots needed after remapping
 func remapVectorMemorySlots(
-  _ uopBlocks: inout [BlockUOps], cellSizes: [CellID: Int], voiceCellId: CellID?
+  _ uopBlocks: inout [BlockUOps], cellSizes: [CellID: Int], voiceCellId: CellID?,
+  graph: Graph? = nil
 )
   -> CellAllocations
 {
@@ -513,11 +515,38 @@ func remapVectorMemorySlots(
     registerCell(voiceCellId, kind: .simd)
   }
 
-  // Second pass: create a remapping for vector cells
+  // Collect cells with injectable initial data (e.g. twiddle factors).
+  // These get placed at low physical offsets so their indices stay within
+  // Float32 exact integer range when passed through initial_state buffers.
+  var injectableCellIds: Set<CellID> = []
+  if let graph = graph {
+    for (_, tensor) in graph.tensors {
+      if tensor.data != nil {
+        injectableCellIds.insert(tensor.cellId)
+      }
+    }
+  }
+
+  // Second pass: create remapping.
+  // Strategy: injectable cells get placed at physical offset 0+.
+  // Any scalar cells whose logical IDs collide with that region get
+  // evicted to nextAvailableSlot instead of keeping identity mapping.
   var cellRemapping: [CellID: CellID] = [:]
   var nextAvailableSlot = (allCellIds.max() ?? -1) + 1
 
+  // Place injectable cells at low offsets starting from 0
+  var nextInjectableSlot = 0
+  var reservedRange = 0  // physical slots [0, reservedRange) are taken by injectables
+  for cellId in injectableCellIds.sorted() {
+    let allocSize = cellSizes[cellId] ?? 1
+    cellRemapping[cellId] = nextInjectableSlot
+    nextInjectableSlot += allocSize
+  }
+  reservedRange = nextInjectableSlot
+
+  // Now remap everything else
   for (cellId, kind) in memoryUsage.sorted(by: { $0.key < $1.key }) {
+    if injectableCellIds.contains(cellId) { continue }  // already placed
     let allocSize = cellSizes[cellId] ?? 1
 
     if kind == .simd {
@@ -528,7 +557,14 @@ func remapVectorMemorySlots(
       cellRemapping[cellId] = nextAvailableSlot
       nextAvailableSlot += allocSize
     } else {
-      cellRemapping[cellId] = cellId
+      // Scalar identity mapping — but if this cell's logical ID falls
+      // in the reserved injectable region, evict it to nextAvailableSlot
+      if cellId < reservedRange {
+        cellRemapping[cellId] = nextAvailableSlot
+        nextAvailableSlot += 1
+      } else {
+        cellRemapping[cellId] = cellId
+      }
     }
   }
 

@@ -378,21 +378,8 @@ extension LazyOp {
       let readPos = b.memoryRead(readPosCell, zero)
       let counter = b.memoryRead(counterCell, zero)
 
-      // Ring buffer read + clear
-      let outputSample = b.memoryRead(outputRingCell, b.cast(readPos, to: .int))
-      _ = b.memoryWrite(outputRingCell, b.cast(readPos, to: .int), zero)
-
-      // ReadPos advance
-      let nextReadPos = readPos + one
-      let wrappedReadPos = b.gswitch(nextReadPos >= winSizeFloat, zero, nextReadPos)
-      _ = b.memoryWrite(readPosCell, zero, wrappedReadPos)
-
-      // Counter advance
-      let nextCounter = counter + one
-      let wrappedCounter = b.gswitch(nextCounter >= hopSizeFloat, zero, nextCounter)
-      _ = b.memoryWrite(counterCell, zero, wrappedCounter)
-
-      // Scatter-add: when counter == 0, add input window to ring buffer
+      // Scatter-add FIRST: when counter == 0, add input window to ring buffer
+      // Must happen before read so hop boundary frames include the current window's contribution
       let shouldScatter = counter == zero
       b.if_(shouldScatter) {
         b.loop(windowSize) { i in
@@ -405,6 +392,20 @@ extension LazyOp {
           _ = b.memoryWrite(outputRingCell, outPosInt, existing + sample)
         }
       }
+
+      // Ring buffer read + clear (after scatter so current window is included)
+      let outputSample = b.memoryRead(outputRingCell, b.cast(readPos, to: .int))
+      _ = b.memoryWrite(outputRingCell, b.cast(readPos, to: .int), zero)
+
+      // ReadPos advance
+      let nextReadPos = readPos + one
+      let wrappedReadPos = b.gswitch(nextReadPos >= winSizeFloat, zero, nextReadPos)
+      _ = b.memoryWrite(readPosCell, zero, wrappedReadPos)
+
+      // Counter advance
+      let nextCounter = counter + one
+      let wrappedCounter = b.gswitch(nextCounter >= hopSizeFloat, zero, nextCounter)
+      _ = b.memoryWrite(counterCell, zero, wrappedCounter)
 
       // Use the output sample (ring buffer read from current position)
       b.use(val: outputSample)

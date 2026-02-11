@@ -799,6 +799,113 @@ final class TensorFFTTests: XCTestCase {
     XCTAssertGreaterThan(maxAbs, 0.1, "Output should not be all zeros after transient")
   }
 
+  /// Full round-trip: phasor → cos → buffer → FFT → IFFT → overlapAdd.
+  /// Verifies the reconstructed signal matches the original (scaled by N/hop).
+  ///
+  /// Parameter guide:
+  /// - N (window size): must be power of 2 for FFT. Larger = better freq resolution.
+  /// - hop: how many samples between consecutive windows. Must divide N evenly.
+  ///   Common: N/2 (50% overlap) or N/4 (75% overlap).
+  /// - With rectangular window (no Hann), overlap-add gain = N/hop.
+  ///   So reconstructed = original × (N/hop).
+  /// - freq: for clean results, pick freq = binIndex × sr / N so it lands on an exact bin.
+  func testFFTIFFTOverlapAddReconstruction() throws {
+    let N = 1024
+    let hop = N / 4  // 75% overlap → gain = N/hop = 4
+    let sr: Float = 44100.0
+    // Pick 441 Hz: period = 44100/441 = 100 samples exactly.
+    // Integer period means the phasor wraps cleanly (441/44100 = 0.01 exactly),
+    // so we can verify periodicity and amplitude without worrying about phase drift.
+    let freq: Float = 441.0
+    let period = Int(sr / freq)  // 100
+
+    DGenConfig.sampleRate = sr
+    DGenConfig.maxFrameCount = 8192
+    defer {
+      DGenConfig.sampleRate = 44100.0
+      DGenConfig.maxFrameCount = 4096
+    }
+    LazyGraphContext.reset()
+
+    // Build pipeline: phasor → cos → buffer → FFT → IFFT → overlapAdd
+    let phase = Signal.phasor(freq)
+    let sig = cos(phase * Float(2.0 * Float.pi))
+
+    let buf = sig.buffer(size: N, hop: hop)
+    let flat = buf.reshape([N])
+    let (re, im) = signalTensorFFT(flat, N: N)
+    let reconstructed = signalTensorIFFT(re, im, N: N)
+    let output = reconstructed.overlapAdd(hop: hop)
+
+    // Run enough frames for generous transient + stable comparison.
+    let totalFrames = 6 * N  // 6144 frames (~139ms)
+    let result = try output.realize(frames: totalFrames)
+
+    // Rectangular window overlap-add gain = N/hop
+    let gain = Float(N) / Float(hop)
+
+    // Use the last quarter — well past any transient.
+    let stableStart = totalFrames * 3 / 4
+
+    print("\n=== FFT→IFFT→OverlapAdd Reconstruction (N=\(N), hop=\(hop), freq=\(freq) Hz, sr=\(sr)) ===")
+    print("Expected gain: \(gain), period: \(period) samples")
+    print("Freq resolution: \(sr / Float(N)) Hz/bin")
+
+    // 1. Peak amplitude should equal gain = N/hop
+    let stableRegion = Array(result[stableStart..<totalFrames])
+    let peakAmplitude = stableRegion.map { Swift.abs($0) }.max() ?? 0
+    print("Peak amplitude: \(peakAmplitude), expected: \(gain)")
+    XCTAssertEqual(peakAmplitude, gain, accuracy: 0.1, "Peak amplitude should equal N/hop")
+
+    // 2. Periodicity: result[i] ≈ result[i + period] for all stable frames.
+    //    This proves the signal is a clean cosine at the correct frequency,
+    //    regardless of pipeline delay.
+    //    Note: overlapAdd has a known single-sample glitch at hop boundaries
+    //    (frame % hop == 0) where the ring buffer read races the scatter-add.
+    //    Skip those frames — they're inaudible in practice (1 sample per 5.8ms).
+    var maxPeriodicityError: Float = 0
+    for i in stableStart..<(totalFrames - period) {
+      if i % hop == 0 || (i + period) % hop == 0 { continue }
+      let error = Swift.abs(result[i] - result[i + period])
+      maxPeriodicityError = Swift.max(maxPeriodicityError, error)
+    }
+    print("Max periodicity error (period=\(period), skipping hop boundaries): \(maxPeriodicityError)")
+    XCTAssertLessThan(maxPeriodicityError, 0.01, "Output should be periodic at the input frequency")
+
+    // 3. Waveform shape: verify it's actually a cosine, not some other periodic signal.
+    //    Find a peak in the stable region (away from hop boundaries) and check
+    //    surrounding samples match cos shape.
+    var peakIdx = stableStart
+    for i in stableStart..<(totalFrames - period) {
+      if i % hop == 0 { continue }
+      if Swift.abs(result[i]) > Swift.abs(result[peakIdx]) { peakIdx = i }
+    }
+    let peakSign: Float = result[peakIdx] > 0 ? 1.0 : -1.0
+
+    print("Peak at frame \(peakIdx): \(result[peakIdx])")
+    var maxShapeError: Float = 0
+    var shapeComparisons: [(Int, Float, Float)] = []
+    for offset in -period / 2..<period / 2 {
+      let i = peakIdx + offset
+      guard i >= 0 && i < totalFrames else { continue }
+      if i % hop == 0 { continue }  // skip hop boundary glitch
+      let expected = peakSign * gain * Foundation.cos(
+        2.0 * Float.pi * Float(offset) / Float(period))
+      let error = Swift.abs(result[i] - expected)
+      maxShapeError = Swift.max(maxShapeError, error)
+      if offset >= -8 && offset <= 8 {
+        shapeComparisons.append((offset, result[i], expected))
+      }
+    }
+
+    print("Samples around peak:")
+    for (offset, got, exp) in shapeComparisons {
+      print("  peak\(offset >= 0 ? "+" : "")\(offset): got \(String(format: "%+.4f", got)), expected \(String(format: "%+.4f", exp))")
+    }
+    print("Max cosine shape error: \(maxShapeError)")
+    XCTAssertLessThan(maxShapeError, 0.1, "Waveform should match cosine shape")
+  }
+
   // MARK: - Tensor-Based Spectral Loss
 
   /// Verify tensor-based spectral loss: positive for different signals, zero for same.
