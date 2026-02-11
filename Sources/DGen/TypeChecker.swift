@@ -848,6 +848,22 @@ public func inferTemporality(graph: Graph, sortedNodes: [NodeID]) -> Temporality
     // If no frame-based or hop-based inputs, node remains static (not added to either set)
   }
 
+  // Propagate buffer position dependencies (slidingWindow circular buffer mode).
+  // Like hop counter propagation, this makes writePos a temporal dependency of all
+  // downstream nodes so defineGlobal/loadGlobal wiring detects it automatically.
+  var positionDeps = graph.nodePositionDep
+  for nodeId in sortedNodes {
+    guard let node = graph.nodes[nodeId] else { continue }
+    for inputId in node.inputs {
+      if let posNode = positionDeps[inputId], posNode != nodeId {
+        positionDeps[nodeId] = posNode
+        if !node.inputs.contains(posNode) && !node.temporalDependencies.contains(posNode) {
+          graph.nodes[nodeId]?.temporalDependencies.append(posNode)
+        }
+      }
+    }
+  }
+
   return TemporalityResult(frameBasedNodes: frameBasedNodes, hopBasedNodes: hopBasedNodes)
 }
 

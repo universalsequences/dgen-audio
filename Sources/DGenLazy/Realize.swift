@@ -307,14 +307,23 @@ extension LazyGraph {
                         }
                         currentShape = innerShape
 
-                    case .slidingWindow(let windowSize, let inputShape):
-                        // Sliding window: index i at frame f → base[f - windowSize + 1 + i]
+                    case .slidingWindow(let windowSize, let inputShape, let positionNode):
                         let lastDim = indices.count - 1
-                        let baseIdx = frame - windowSize + 1 + indices[lastDim]
-                        if baseIdx < 0 {
-                            inBounds = false
+                        if positionNode != nil {
+                            // Circular buffer mode: reconstruct per-frame writePos from accum cell
+                            // In single-shot DGenLazy execution, writePos == frame (accum starts at 0)
+                            let bufSize = inputShape[lastDim]
+                            let pos = frame  // In single-shot mode, position == frame index
+                            let raw = pos - windowSize + 1 + indices[lastDim]
+                            indices[lastDim] = ((raw % bufSize) + bufSize) % bufSize
                         } else {
-                            indices[lastDim] = baseIdx
+                            // Original mode: index i at frame f → base[f - windowSize + 1 + i]
+                            let baseIdx = frame - windowSize + 1 + indices[lastDim]
+                            if baseIdx < 0 {
+                                inBounds = false
+                            } else {
+                                indices[lastDim] = baseIdx
+                            }
                         }
                         currentShape = inputShape
                     }

@@ -31,6 +31,11 @@ open class Graph {
     /// Used for FFT/IFFT nodes and operations that inherit hop-based temporality
     public var nodeHopRate: [NodeID: (Int, NodeID)] = [:]
 
+    /// Tracks buffer position dependencies for slidingWindow circular buffer mode.
+    /// Maps bufferView result nodes to their writePos accum nodes.
+    /// Propagated via temporalDependencies so defineGlobal/loadGlobal wiring works.
+    public var nodePositionDep: [NodeID: NodeID] = [:]
+
     /// Sample rate for audio processing (default 44100 Hz)
     public var sampleRate: Float = 44100.0
 

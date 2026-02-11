@@ -223,18 +223,34 @@ extension IRBuilder {
       }
       return (newIndices, innerShape, inBoundsCheck)
 
-    case .slidingWindow(let windowSize, let inputShape):
-      // Sliding window: index i at frame f → base[f - windowSize + 1 + i]
-      let fi = currentFrameIndex()
+    case .slidingWindow(let windowSize, let inputShape, let positionNode):
       let wSize = intConstant(windowSize)
       let one = intConstant(1)
       var newIndices = indices
       let lastDim = newIndices.count - 1
-      let baseIdx = fi - wSize + one + newIndices[lastDim]
-      newIndices[lastDim] = baseIdx
-      // Early frames: out-of-bounds → 0 (reuse padding bounds-check infrastructure)
-      let boundsCheck = baseIdx >= intConstant(0)
-      return (newIndices, inputShape, combineBoundsChecks(inBoundsCheck, boundsCheck))
+
+      if let posNode = positionNode {
+        // Circular buffer mode: position comes from accum node (persists across runs)
+        guard let posLazy = ctx.values[posNode] else {
+          fatalError("slidingWindow positionNode \(posNode) not available in ctx.values")
+        }
+        let pos = cast(value(posLazy, scalarType: .float), to: .int)
+        let bufSize = intConstant(inputShape[lastDim])
+        // Window element j maps to (pos - windowSize + 1 + j) mod bufferSize
+        // Since pos >= 0 and windowSize <= bufferSize, (raw + bufSize) >= 1, so single add handles negative
+        let raw = pos - wSize + one + newIndices[lastDim]
+        let baseIdx = (raw + bufSize) % bufSize
+        newIndices[lastDim] = baseIdx
+        return (newIndices, inputShape, inBoundsCheck)
+      } else {
+        // Original mode: window indexed by frame position
+        let fi = currentFrameIndex()
+        let baseIdx = fi - wSize + one + newIndices[lastDim]
+        newIndices[lastDim] = baseIdx
+        // Early frames: out-of-bounds → 0 (reuse padding bounds-check infrastructure)
+        let boundsCheck = baseIdx >= intConstant(0)
+        return (newIndices, inputShape, combineBoundsChecks(inBoundsCheck, boundsCheck))
+      }
     }
   }
 

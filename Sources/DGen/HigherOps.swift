@@ -517,9 +517,14 @@ extension Graph {
     return n(.seq, writeOp, out)
   }
 
-  /// Buffer view: writes a scalar signal into a flat history array each frame,
+  /// Buffer view: writes a scalar signal into a circular buffer each frame,
   /// returns a [1, size] tensor view via a sliding window transform.
   /// Fully parallel — each frame writes to a unique slot. Composes with conv2d, sum, etc.
+  ///
+  /// Uses a circular buffer of size `maxFrameCount + size - 1` so that frame 0
+  /// of a subsequent kernel invocation can look back into the previous run's data.
+  /// The sliding window is positioned relative to the accum write head, not the
+  /// per-run frame index, enabling correct cross-block continuity for real-time streaming.
   ///
   /// - Parameters:
   ///   - input: Scalar signal to buffer
@@ -527,38 +532,43 @@ extension Graph {
   ///   - hopSize: If specified, downstream blocks only execute every hopSize frames
   /// - Returns: TensorRef node for a [1, size] sliding window over the history
   public func bufferView(_ input: NodeID, size: Int, hopSize: Int? = nil) -> NodeID {
-    // Flat history: one slot per frame, no ring buffer
-    let historyBase = alloc(vectorWidth: maxFrameCount)
+    // Circular buffer: extra (size - 1) slots for cross-block lookback
+    let bufferSize = maxFrameCount + size - 1
+    let historyBase = alloc(vectorWidth: bufferSize)
     let writePosCellId = alloc()
 
     let one = n(.constant(1.0))
     let zero = n(.constant(0.0))
-    let maxSize = n(.constant(Float(maxFrameCount)))
+    let maxSize = n(.constant(Float(bufferSize)))
 
-    // Write position counts 0, 1, 2, ..., maxFrameCount-1
+    // Write position accumulates globally across runs, wraps at bufferSize
     let writePos = n(.floor, n(.accum(writePosCellId), one, zero, zero, maxSize))
 
     // Write input sample at current position (parallel: each frame → unique slot)
     let writeOp = n(.memoryWrite(historyBase), writePos, input)
 
-    // Tensor view: [1, size] window into [1, maxFrameCount] base
+    // Tensor view: [1, size] window into [1, bufferSize] base
+    // slidingWindow uses writePos as position anchor (circular buffer mode)
     let tensorShape: Shape = [1, size]
-    let baseShape: Shape = [1, maxFrameCount]
+    let baseShape: Shape = [1, bufferSize]
     let tensorId = nextTensorId
     nextTensorId += 1
     let transform = ViewTransform.slidingWindow(
-      windowSize: size, inputShape: baseShape)
+      windowSize: size, inputShape: baseShape, positionNode: writePos)
     tensors[tensorId] = Tensor(
       id: tensorId, shape: tensorShape, cellId: historyBase,
       baseShape: baseShape, transforms: [transform])
     cellToTensor[historyBase] = tensorId
 
-    let tensorRefNode = n(.tensorRef(tensorId), [], shape: .tensor(tensorShape))
+    // writePos is a direct input to tensorRef — creates graph edge so the compiler
+    // passes its per-frame value via defineGlobal/loadGlobal to downstream tensor blocks
+    let tensorRefNode = n(.tensorRef(tensorId), [writePos], shape: .tensor(tensorShape))
     nodeToTensor[tensorRefNode] = tensorId
 
     // seq ensures write happens before read
     let result = n(.seq, writeOp, tensorRefNode)
     nodeToTensor[result] = tensorId
+    nodePositionDep[result] = writePos
 
     // Register hop-based temporality so downstream blocks run every hopSize frames
     if let hopSize = hopSize {
@@ -571,6 +581,7 @@ extension Graph {
       let seqResult = n(.seq, [writeOp, counterAccum, tensorRefNode], shape: .tensor(tensorShape))
       nodeToTensor[seqResult] = tensorId
       nodeHopRate[seqResult] = (hopSize, counterAccum)
+      nodePositionDep[seqResult] = writePos
       return seqResult
     }
 

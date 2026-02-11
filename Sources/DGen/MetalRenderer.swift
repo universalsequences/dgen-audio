@@ -352,9 +352,14 @@ public class MetalRenderer: Renderer, UOpEmitter {
     var currentKind: Kind? = nil
     var loopOpened = false
     var hasFrameLoop = false
+    var hopCheckOpen = false
 
     func closeCurrentKernel() {
       guard let schedule = currentSchedule, loopOpened else { return }
+      if hopCheckOpen {
+        schedule.ops.append(UOp(op: .endHopCheck, value: .empty))
+        hopCheckOpen = false
+      }
       if hasFrameLoop && currentKind == .scalar {
         schedule.ops.append(UOp(op: .endLoop, value: .empty))
       }
@@ -406,6 +411,17 @@ public class MetalRenderer: Renderer, UOpEmitter {
           beginLoop.kind = block.kind
           scheduleItem.ops.append(beginLoop)
           hasFrameLoop = true
+
+          // Hop-based scalar: wrap body in hop check conditional
+          if case .hopBased(_, let counterNodeId) = block.temporality {
+            guard let counterLazy = ctx.values[counterNodeId] else {
+              fatalError("Hop counter node \(counterNodeId) not found in ctx.values")
+            }
+            var hopCheck = UOp(op: .beginHopCheck(counterLazy), value: .empty)
+            hopCheck.kind = block.kind
+            scheduleItem.ops.append(hopCheck)
+            hopCheckOpen = true
+          }
         } else {
           // SIMD kernels: each thread processes one frame
           let rangeEnd = scaledFrameCount(block.threadCountScale, scheduleItem)
@@ -413,6 +429,17 @@ public class MetalRenderer: Renderer, UOpEmitter {
           beginRange.kind = block.kind
           scheduleItem.ops.append(beginRange)
           hasFrameLoop = true
+
+          // Hop-based SIMD: wrap body in hop check conditional
+          if case .hopBased(_, let counterNodeId) = block.temporality {
+            guard let counterLazy = ctx.values[counterNodeId] else {
+              fatalError("Hop counter node \(counterNodeId) not found in ctx.values")
+            }
+            var hopCheck = UOp(op: .beginHopCheck(counterLazy), value: .empty)
+            hopCheck.kind = block.kind
+            scheduleItem.ops.append(hopCheck)
+            hopCheckOpen = true
+          }
         }
 
         currentSchedule = scheduleItem
@@ -507,9 +534,9 @@ public class MetalRenderer: Renderer, UOpEmitter {
     for uop in scheduleItem.ops {
       var diff = 0
       switch uop.op {
-      case .beginIf, .beginLoop, .beginReverseLoop, .beginRange, .beginForLoop, .beginParallelRange:
+      case .beginIf, .beginLoop, .beginReverseLoop, .beginRange, .beginForLoop, .beginParallelRange, .beginHopCheck:
         diff = 1
-      case .endIf, .endLoop, .endRange, .endParallelRange:
+      case .endIf, .endLoop, .endRange, .endParallelRange, .endHopCheck:
         indent -= 1
       default:
         break
@@ -856,6 +883,12 @@ public class MetalRenderer: Renderer, UOpEmitter {
         return "}"
       }
       return "} atomic_thread_fence(metal::mem_flags::mem_device, metal::memory_order_seq_cst);"
+
+    // Hop-based execution: only run block when counter == 0
+    case .beginHopCheck(let cond):
+      return "if (\(g(cond)) == 0.0) {"
+    case .endHopCheck:
+      return "}"
 
     default:
       return "/* \(uop.prettyDescription()) */"

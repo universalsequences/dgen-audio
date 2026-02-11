@@ -42,7 +42,9 @@ public enum ViewTransform: Equatable {
   /// Sliding window into a flat history array, indexed by frame
   /// windowSize: number of elements visible in the window
   /// inputShape: shape of the base history array
-  case slidingWindow(windowSize: Int, inputShape: [Int])
+  /// positionNode: if set, use this node's value as the write head position (circular buffer mode)
+  ///              instead of currentFrameIndex(). Enables cross-block continuity for real-time streaming.
+  case slidingWindow(windowSize: Int, inputShape: [Int], positionNode: NodeID? = nil)
 
   public static func == (lhs: ViewTransform, rhs: ViewTransform) -> Bool {
     switch (lhs, rhs) {
@@ -71,8 +73,8 @@ public enum ViewTransform: Equatable {
       return lt == rt && lis == ris
     case (.repeatTile(let li, let lo), .repeatTile(let ri, let ro)):
       return li == ri && lo == ro
-    case (.slidingWindow(let lw, let lis), .slidingWindow(let rw, let ris)):
-      return lw == rw && lis == ris
+    case (.slidingWindow(let lw, let lis, let lp), .slidingWindow(let rw, let ris, let rp)):
+      return lw == rw && lis == ris && lp == rp
     default:
       return false
     }
@@ -284,7 +286,7 @@ public struct Tensor {
         currentStrides = strides
         currentOffset = offset
 
-      case .pad, .repeatTile, .slidingWindow:
+      case .pad, .repeatTile, .slidingWindow(_, _, _):
         // Non-composable: fall back to chain walker
         return ComposedTransformResult(views: [], isFullyComposed: false)
       }
