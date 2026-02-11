@@ -32,6 +32,9 @@ public enum DGenConfig {
 
     /// Enable debug output during compilation (prints block structure, etc.)
     public static var debug: Bool = false
+
+    /// Enable buffer liveness analysis and reuse to reduce memory allocations
+    public static var enableBufferReuse: Bool = true
 }
 
 // MARK: - Type Aliases for Convenience

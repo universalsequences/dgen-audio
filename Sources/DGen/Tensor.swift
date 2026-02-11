@@ -314,10 +314,6 @@ public func injectTensorData(
     // Get physical memory offset from cell mapping
     let physicalOffset = cellAllocations.cellMappings[tensor.cellId] ?? tensor.cellId
 
-    if verbose {
-      print("injectTensorData: cellId=\(tensor.cellId) → physicalOffset=\(physicalOffset), size=\(tensor.size), shape=\(tensor.shape)")
-    }
-
     // Copy data into memory
     for (i, value) in data.enumerated() {
       if i < tensor.size {
@@ -327,7 +323,6 @@ public func injectTensorData(
     }
     tensorCount += 1
   }
-  print("injectTensorData: \(tensorCount) tensors injected, maxMemoryIdx=\(maxIdx), totalMemorySlots=\(cellAllocations.totalMemorySlots)")
 }
 
 /// Inject tensor data using CompilationResult (convenience overload)
@@ -346,7 +341,9 @@ public func injectTensorData(
 /// Used by the Engine to inject DGen-internal tensor data (e.g. twiddle factors)
 /// through the AudioGraph param initialization path.
 /// IMPORTANT: Returns physical memory offsets (after cell remapping), not raw cellIds.
-public func collectTensorInitData(graph: Graph, cellAllocations: CellAllocations) -> [(Int, [Float])] {
+public func collectTensorInitData(graph: Graph, cellAllocations: CellAllocations) -> [(
+  Int, [Float]
+)] {
   var result: [(Int, [Float])] = []
   for (_, tensor) in graph.tensors {
     guard let data = tensor.data else { continue }

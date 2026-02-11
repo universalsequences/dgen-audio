@@ -113,7 +113,7 @@ extension LazyGraph {
         let result = try CompilationPipeline.compile(
             graph: graph,
             backend: DGenConfig.backend,
-            options: .init(frameCount: frameCount, debug: DGenConfig.debug)
+            options: .init(frameCount: frameCount, debug: DGenConfig.debug, enableBufferReuse: DGenConfig.enableBufferReuse)
         )
 
         // Write kernels to disk if path is configured

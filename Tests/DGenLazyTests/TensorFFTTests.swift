@@ -847,7 +847,9 @@ final class TensorFFTTests: XCTestCase {
     // Use the last quarter — well past any transient.
     let stableStart = totalFrames * 3 / 4
 
-    print("\n=== FFT→IFFT→OverlapAdd Reconstruction (N=\(N), hop=\(hop), freq=\(freq) Hz, sr=\(sr)) ===")
+    print(
+      "\n=== FFT→IFFT→OverlapAdd Reconstruction (N=\(N), hop=\(hop), freq=\(freq) Hz, sr=\(sr)) ==="
+    )
     print("Expected gain: \(gain), period: \(period) samples")
     print("Freq resolution: \(sr / Float(N)) Hz/bin")
 
@@ -869,7 +871,8 @@ final class TensorFFTTests: XCTestCase {
       let error = Swift.abs(result[i] - result[i + period])
       maxPeriodicityError = Swift.max(maxPeriodicityError, error)
     }
-    print("Max periodicity error (period=\(period), skipping hop boundaries): \(maxPeriodicityError)")
+    print(
+      "Max periodicity error (period=\(period), skipping hop boundaries): \(maxPeriodicityError)")
     XCTAssertLessThan(maxPeriodicityError, 0.01, "Output should be periodic at the input frequency")
 
     // 3. Waveform shape: verify it's actually a cosine, not some other periodic signal.
@@ -889,8 +892,10 @@ final class TensorFFTTests: XCTestCase {
       let i = peakIdx + offset
       guard i >= 0 && i < totalFrames else { continue }
       if i % hop == 0 { continue }  // skip hop boundary glitch
-      let expected = peakSign * gain * Foundation.cos(
-        2.0 * Float.pi * Float(offset) / Float(period))
+      let expected =
+        peakSign * gain
+        * Foundation.cos(
+          2.0 * Float.pi * Float(offset) / Float(period))
       let error = Swift.abs(result[i] - expected)
       maxShapeError = Swift.max(maxShapeError, error)
       if offset >= -8 && offset <= 8 {
@@ -900,7 +905,9 @@ final class TensorFFTTests: XCTestCase {
 
     print("Samples around peak:")
     for (offset, got, exp) in shapeComparisons {
-      print("  peak\(offset >= 0 ? "+" : "")\(offset): got \(String(format: "%+.4f", got)), expected \(String(format: "%+.4f", exp))")
+      print(
+        "  peak\(offset >= 0 ? "+" : "")\(offset): got \(String(format: "%+.4f", got)), expected \(String(format: "%+.4f", exp))"
+      )
     }
     print("Max cosine shape error: \(maxShapeError)")
     XCTAssertLessThan(maxShapeError, 0.1, "Waveform should match cosine shape")
@@ -960,7 +967,6 @@ final class TensorFFTTests: XCTestCase {
   func testTensorSpectralLossTraining() throws {
     let N = 8
     DGenConfig.kernelOutputPath = "/tmp/test_tensor_spectral_loss_training.metal"
-    defer { DGenConfig.kernelOutputPath = nil }
 
     // Target: cosine at bin 1 — known magnitude spectrum
     var targetData = [Float](repeating: 0, count: N)
@@ -985,10 +991,11 @@ final class TensorFFTTests: XCTestCase {
       let loss = (diff * diff).sum()
 
       let lossValue = try loss.backward(frameCount: 1).first ?? 0
+      DGenConfig.kernelOutputPath = nil
       if epoch == 0 { firstLoss = lossValue }
       lastLoss = lossValue
 
-      if epoch % 5 == 0 {
+      if epoch % 50 == 0 {
         print("Tensor spectral loss epoch \(epoch): \(lossValue)")
       }
 

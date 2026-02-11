@@ -56,6 +56,7 @@ public struct CompilationPipeline {
     public let forceScalar: Bool
     public let voiceCount: Int
     public let voiceCellId: Int?
+    public let enableBufferReuse: Bool
 
     public init(
       frameCount: Int = 128,
@@ -63,7 +64,8 @@ public struct CompilationPipeline {
       printBlockStructure: Bool = false,
       forceScalar: Bool = false,
       voiceCount: Int = 1,
-      voiceCellId: Int? = nil
+      voiceCellId: Int? = nil,
+      enableBufferReuse: Bool = false
     ) {
       self.frameCount = frameCount
       self.debug = debug
@@ -71,6 +73,7 @@ public struct CompilationPipeline {
       self.forceScalar = forceScalar
       self.voiceCount = voiceCount
       self.voiceCellId = voiceCellId
+      self.enableBufferReuse = enableBufferReuse
     }
   }
 
@@ -350,7 +353,8 @@ public struct CompilationPipeline {
       remapVectorMemorySlots(
         &uopBlocks, cellSizes: graph.cellAllocationSizes,
         voiceCellId: generatedVoiceCell ? voiceCellIdFinal : nil,
-        graph: graph)
+        graph: graph,
+        enableBufferReuse: options.enableBufferReuse)
     }
 
     let renderer: Renderer = createRenderer(for: backend, options: options)
@@ -474,7 +478,8 @@ private func printUOpBlocks(_ uopBlocks: [BlockUOps], blocks: [Block]) {
 /// Returns the total number of memory slots needed after remapping
 func remapVectorMemorySlots(
   _ uopBlocks: inout [BlockUOps], cellSizes: [CellID: Int], voiceCellId: CellID?,
-  graph: Graph? = nil
+  graph: Graph? = nil,
+  enableBufferReuse: Bool = false
 )
   -> CellAllocations
 {
@@ -527,12 +532,86 @@ func remapVectorMemorySlots(
     }
   }
 
+  // Liveness analysis: compute first/last use of each cell across all blocks.
+  // Cells with non-overlapping lifetimes can share the same physical memory.
+  // Only performed when enableBufferReuse is true.
+  struct LivenessInterval {
+    let cellId: CellID
+    let firstUse: Int
+    let lastUse: Int
+    let size: Int
+    let kind: Kind
+    let canReceiveReuse: Bool  // false for memoryAccumulate cells (need zeroed memory)
+  }
+
+  var reuseEligible: Set<CellID> = []
+  var intervals: [LivenessInterval] = []
+
+  if enableBufferReuse {
+    var persistentCells: Set<CellID> = []  // load/store/delay1 — survive across frames
+    var accumulateCells: Set<CellID> = []  // memoryAccumulate — need zeroed memory
+    var cellFirstUse: [CellID: Int] = [:]
+    var cellLastUse: [CellID: Int] = [:]
+
+    // Compute liveness at BLOCK granularity, not UOp granularity.
+    // A cell used anywhere in a block is live for the entire block's execution,
+    // since a kernel reads/writes all its cells concurrently within the loop.
+    // Using the block index ensures two cells in the same kernel never share memory.
+    for (blockIndex, block) in uopBlocks.enumerated() {
+      for uop in block.ops {
+        if let cellId = uop.op.memoryCellId {
+          switch uop.op {
+          case .load, .store, .delay1:
+            persistentCells.insert(cellId)
+          case .memoryAccumulate:
+            accumulateCells.insert(cellId)
+          default:
+            break
+          }
+          if cellFirstUse[cellId] == nil {
+            cellFirstUse[cellId] = blockIndex
+          }
+          cellLastUse[cellId] = blockIndex
+        }
+      }
+    }
+
+    // Determine which cells are eligible for buffer reuse.
+    // Excluded: injectable (precomputed data), persistent (scalar feedback),
+    // voice cell, and dual-use cells.
+    // Frame-aware cells ARE eligible — their frame-indexed addressing is an
+    // internal layout detail; inter-block liveness is the same as any other cell.
+    // Accumulate cells can DONATE memory but cannot RECEIVE reused memory
+    // (memoryAccumulate does += which expects zero; stale data corrupts results).
+    for cellId in memoryUsage.keys {
+      if injectableCellIds.contains(cellId) { continue }
+      if persistentCells.contains(cellId) { continue }
+      if cellId == voiceCellId { continue }
+      reuseEligible.insert(cellId)
+    }
+
+    // Build sorted liveness intervals for eligible cells
+    for cellId in reuseEligible.sorted() {
+      guard let first = cellFirstUse[cellId], let last = cellLastUse[cellId] else { continue }
+      let size = cellSizes[cellId] ?? 1
+      let kind = memoryUsage[cellId] ?? .scalar
+      let canReceiveReuse = !accumulateCells.contains(cellId)
+      intervals.append(LivenessInterval(
+        cellId: cellId, firstUse: first, lastUse: last, size: size, kind: kind,
+        canReceiveReuse: canReceiveReuse))
+    }
+    intervals.sort { $0.firstUse < $1.firstUse }
+  }
+
   // Second pass: create remapping.
-  // Strategy: injectable cells get placed at physical offset 0+.
-  // Any scalar cells whose logical IDs collide with that region get
-  // evicted to nextAvailableSlot instead of keeping identity mapping.
+  // Strategy: injectable cells → physical offset 0+,
+  // eligible cells → greedy interval-based reuse,
+  // remaining cells → packed sequentially.
   var cellRemapping: [CellID: CellID] = [:]
-  var nextAvailableSlot = (allCellIds.max() ?? -1) + 1
+  // When buffer reuse is enabled, pack everything contiguously (no identity mapping)
+  // to avoid huge gaps from high cell IDs. Without reuse, use identity mapping for
+  // single-element scalars to minimize remapping overhead.
+  var nextAvailableSlot = enableBufferReuse ? 0 : (allCellIds.max() ?? -1) + 1
 
   // Place injectable cells at low offsets starting from 0
   var nextInjectableSlot = 0
@@ -543,10 +622,63 @@ func remapVectorMemorySlots(
     nextInjectableSlot += allocSize
   }
   reservedRange = nextInjectableSlot
+  if enableBufferReuse {
+    nextAvailableSlot = max(nextAvailableSlot, reservedRange)
+  }
 
-  // Now remap everything else
+  // Greedy interval-based allocation for reuse-eligible cells.
+  // freeRegions tracks allocated regions that may become available for reuse.
+  var freeRegions: [(offset: Int, size: Int, availableAfter: Int)] = []
+  var reusedCount = 0
+
+  for interval in intervals {
+    let needsAlignment = interval.kind == .simd
+    let allocSize = needsAlignment ? max(4, interval.size) : interval.size
+
+    // Find best-fit free region: must be available and large enough, prefer least waste.
+    // Accumulate cells (memoryAccumulate) skip reuse — they do += and need zeroed memory.
+    // They still DONATE their region to later cells after their last use.
+    var bestIdx: Int? = nil
+    var bestWaste = Int.max
+    var bestOffset = 0
+
+    if interval.canReceiveReuse {
+      for (idx, region) in freeRegions.enumerated() {
+        guard region.availableAfter < interval.firstUse else { continue }
+        let effectiveOffset = needsAlignment ? ((region.offset + 3) / 4) * 4 : region.offset
+        let usableSize = region.size - (effectiveOffset - region.offset)
+        guard usableSize >= interval.size else { continue }
+        let waste = usableSize - interval.size
+        if waste < bestWaste {
+          bestWaste = waste
+          bestIdx = idx
+          bestOffset = effectiveOffset
+        }
+      }
+    }
+
+    if let idx = bestIdx {
+      cellRemapping[interval.cellId] = bestOffset
+      freeRegions[idx].availableAfter = interval.lastUse
+      reusedCount += 1
+    } else {
+      // No reusable region — allocate fresh
+      let offset: Int
+      if needsAlignment {
+        offset = ((nextAvailableSlot + 3) / 4) * 4
+        nextAvailableSlot = offset + allocSize
+      } else {
+        offset = nextAvailableSlot
+        nextAvailableSlot += allocSize
+      }
+      cellRemapping[interval.cellId] = offset
+      freeRegions.append((offset: offset, size: allocSize, availableAfter: interval.lastUse))
+    }
+  }
+
+  // Remap non-eligible, non-injectable cells with original logic
   for (cellId, kind) in memoryUsage.sorted(by: { $0.key < $1.key }) {
-    if injectableCellIds.contains(cellId) { continue }  // already placed
+    if injectableCellIds.contains(cellId) || reuseEligible.contains(cellId) { continue }
     let allocSize = cellSizes[cellId] ?? 1
 
     if kind == .simd {
@@ -556,15 +688,12 @@ func remapVectorMemorySlots(
     } else if allocSize > 1 {
       cellRemapping[cellId] = nextAvailableSlot
       nextAvailableSlot += allocSize
+    } else if enableBufferReuse || cellId < reservedRange {
+      // Pack contiguously when buffer reuse is on (no identity mapping gaps)
+      cellRemapping[cellId] = nextAvailableSlot
+      nextAvailableSlot += 1
     } else {
-      // Scalar identity mapping — but if this cell's logical ID falls
-      // in the reserved injectable region, evict it to nextAvailableSlot
-      if cellId < reservedRange {
-        cellRemapping[cellId] = nextAvailableSlot
-        nextAvailableSlot += 1
-      } else {
-        cellRemapping[cellId] = cellId
-      }
+      cellRemapping[cellId] = cellId
     }
   }
 
