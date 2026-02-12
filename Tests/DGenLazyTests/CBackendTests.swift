@@ -91,4 +91,23 @@ final class CBackendTests: XCTestCase {
 
         XCTAssertEqual(result, [11, 22, 33, 44])
     }
+
+    // MARK: - SIMD Verification
+
+    func testElementWiseMulSIMD() throws {
+        // 8-element contiguous tensors: element-wise mul should SIMD-ify
+        DGenConfig.kernelOutputPath = "/tmp/test_simd_elemwise_mul.c"
+        let a = Tensor([1, 2, 3, 4, 5, 6, 7, 8])
+        let b = Tensor([10, 20, 30, 40, 50, 60, 70, 80])
+        let result = try (a * b).realize()
+
+        XCTAssertEqual(result, [10, 40, 90, 160, 250, 360, 490, 640])
+
+        // Verify SIMD intrinsics in generated C
+        let source = try String(contentsOfFile: "/tmp/test_simd_elemwise_mul.c", encoding: .utf8)
+        XCTAssert(source.contains("vmulq_f32"), "Element-wise mul should use SIMD intrinsics")
+        XCTAssert(source.contains("vld1q_f32"), "Tensor reads should use SIMD loads")
+        XCTAssert(source.contains("vst1q_f32"), "Tensor writes should use SIMD stores")
+        DGenConfig.kernelOutputPath = nil
+    }
 }

@@ -30,6 +30,12 @@ extension IRBuilder {
 
     // For tensors with transforms, use tensorRead which handles the transform chain
     if !tensor.transforms.isEmpty {
+      // Fast path: when shapes match (no broadcasting needed), use tensorRead(flatIdx:)
+      // which has contiguous detection — avoids flatToMultiIndex int div/mod UOps,
+      // keeping element loops SIMD-eligible on C backend.
+      if tensor.shape == outShape {
+        return tensorRead(tensor, flatIdx: value(loopIdx, scalarType: .int), shape: outShape)
+      }
       let indices = flatToMultiIndex(value(loopIdx, scalarType: .int), outShape)
       let broadcastedIndices = broadcastIndices(
         outputIndices: indices, outputShape: outShape, inputTensor: tensor)

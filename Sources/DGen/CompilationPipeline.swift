@@ -324,6 +324,14 @@ public struct CompilationPipeline {
         } else {
           effectiveKind = block.kind
         }
+        // Post-override SIMD upgrade: scan individual loops within scalar blocks
+        // and upgrade eligible ones to SIMD. This runs AFTER the block-level scalar
+        // override above, which may have forced the entire block to scalar due to
+        // blockers in one loop (e.g., sum reduction) even though other loops
+        // (e.g., element-wise mul) are SIMD-safe.
+        if backend == .c {
+          upgradeElementLoopsToSIMD(&finalOps)
+        }
         let parallelPolicy = inferParallelPolicy(
           kind: effectiveKind, temporality: block.temporality, ops: finalOps)
         // Force new kernel for spectral passes (forward + backward) and scaled thread blocks

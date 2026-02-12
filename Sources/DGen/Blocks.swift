@@ -1055,6 +1055,152 @@ private func containsSIMDBlockers(_ uops: [UOp], backend: Backend) -> Bool {
   return false
 }
 
+/// Post-emission pass: upgrade eligible element loops to SIMD.
+///
+/// Handles both loop types:
+/// - `beginParallelRange(count, 1)` / `endParallelRange` — standard tensor element loops
+///   (forced to scalar by the pipeline when the block has SIMD blockers elsewhere)
+/// - `beginForLoop(loopVar, count)` / `endLoop` — shape-transition inner element loops
+///
+/// Only for C backend. The renderer already supports SIMD: `beginParallelRange` with incr=4
+/// emits `for (int simdN = 0; simdN < count; simdN += 4)`, and `memoryRead` with `.simd` kind
+/// emits `vld1q_f32`. This pass identifies contiguous element loops that can use SIMD.
+///
+/// Eligibility: element count divisible by 4, no stateful/control-flow/non-contiguous ops,
+/// no int-typed arithmetic (which indicates index decomposition or frame-aware offsets).
+public func upgradeElementLoopsToSIMD(_ uops: inout [UOp]) {
+  var i = 0
+  while i < uops.count {
+    // Match both loop types and extract element count + loop variable
+    let elementCount: Int
+    let loopVar: Lazy
+    let isParallelRange: Bool
+
+    switch uops[i].op {
+    case .beginParallelRange(let count, _):
+      elementCount = count
+      loopVar = uops[i].value
+      isParallelRange = true
+
+    case .beginForLoop(let lv, let countLazy):
+      guard case .constant(_, let countFloat) = countLazy else {
+        i += 1
+        continue
+      }
+      elementCount = Int(countFloat)
+      loopVar = lv
+      isParallelRange = false
+
+    default:
+      i += 1
+      continue
+    }
+
+    // Must be divisible by 4
+    guard elementCount >= 4 && elementCount % 4 == 0 else {
+      i += 1
+      continue
+    }
+
+    // Find matching end (track nesting depth)
+    let beginIdx = i
+    var depth = 1
+    var endIdx: Int? = nil
+    for j in (beginIdx + 1)..<uops.count {
+      switch uops[j].op {
+      case .beginForLoop, .beginLoop, .beginReverseLoop, .beginParallelRange:
+        depth += 1
+      case .endLoop, .endParallelRange:
+        depth -= 1
+        if depth == 0 {
+          endIdx = j
+        }
+      default:
+        break
+      }
+      if endIdx != nil { break }
+    }
+
+    guard let endIdx = endIdx else {
+      i += 1
+      continue
+    }
+
+    // Extract loop variable's VarID for offset matching
+    let loopVarId: VarID?
+    if case .variable(let vid, _) = loopVar {
+      loopVarId = vid
+    } else {
+      loopVarId = nil
+    }
+
+    // Check for blocker UOps in the loop body
+    var hasBlocker = false
+    for k in (beginIdx + 1)..<endIdx {
+      switch uops[k].op {
+      // Stateful ops
+      case .load, .store, .delay1, .memoryAccumulate:
+        hasBlocker = true
+      // Inherently scalar ops
+      case .noise, .latch:
+        hasBlocker = true
+      // Control flow (nested loops, conditionals)
+      case .beginForLoop, .endLoop, .beginParallelRange, .endParallelRange,
+           .beginIf, .endIf, .gswitch:
+        hasBlocker = true
+      // Non-contiguous access
+      case .broadcastAccess:
+        hasBlocker = true
+      // Hop gating
+      case .beginHopCheck, .endHopCheck:
+        hasBlocker = true
+      // Accumulator (mutate is used by sum reduction — cross-iteration dependency)
+      case .mutate:
+        hasBlocker = true
+      // Int-typed arithmetic (index decomposition / frame-aware offsets)
+      case .add, .sub, .mul, .div:
+        if uops[k].scalarType == .int {
+          hasBlocker = true
+        }
+      // Memory access with non-loop-variable offset — scalar variable would be
+      // broadcast to float32x4_t in SIMD mode, which can't be cast to int for indexing
+      case .memoryRead(_, let offset), .memoryWrite(_, let offset, _):
+        if case .variable(let vid, _) = offset, vid != loopVarId {
+          hasBlocker = true
+        }
+      default:
+        break
+      }
+      if hasBlocker { break }
+    }
+
+    guard !hasBlocker else {
+      i = endIdx + 1
+      continue
+    }
+
+    // Upgrade to SIMD
+    uops[beginIdx] = UOp(
+      op: .beginParallelRange(elementCount, 4),
+      value: loopVar,
+      kind: .simd
+    )
+
+    for k in (beginIdx + 1)..<endIdx {
+      uops[k].kind = .simd
+    }
+
+    if isParallelRange {
+      uops[endIdx].kind = .simd
+    } else {
+      // Replace endLoop → endParallelRange
+      uops[endIdx] = UOp(op: .endParallelRange, value: uops[endIdx].value, kind: .simd)
+    }
+
+    i = endIdx + 1
+  }
+}
+
 /// Check if a scalar block has multiple tensor shapes (shape transitions)
 /// Returns the list of (nodeIndex, shape) pairs where shape changes
 public func detectShapeTransitions(block: Block, g: Graph) -> [(nodeIndex: Int, shape: [Int])] {
@@ -1369,20 +1515,16 @@ public func emitScalarBlockWithShapeTransitions(
     // Check if this tensor region is hop-based in a frame-based block.
     // In the C backend, tensor ops with tensor inputs get forced into scalar blocks
     // even when they're hop-based. Without hop-gating, the element loop runs every
-    // frame instead of only on hop boundaries — wasteful and semantically wrong
-    // for downstream accumulation. Wrap the region in beginHopCheck/endHopCheck.
+    // frame instead of only on hop boundaries. Wrap the region in beginHopCheck/endHopCheck.
     let regionHopCounter: Lazy?
     if block.temporality == .frameBased {
-      var counterLazy: Lazy? = nil
-      for nodeIndex in transition.nodeIndex..<regionEnd {
-        let nodeId = block.nodes[nodeIndex]
-        if let hopInfo = ctx.hopBasedNodes[nodeId],
-           let lazy = ctx.values[hopInfo.1] {
-          counterLazy = lazy
-          break
+      regionHopCounter = (transition.nodeIndex..<regionEnd).lazy
+        .compactMap { idx -> Lazy? in
+          let nodeId = block.nodes[idx]
+          guard let (_, counterNodeId) = ctx.hopBasedNodes[nodeId] else { return nil }
+          return ctx.values[counterNodeId]
         }
-      }
-      regionHopCounter = counterLazy
+        .first
     } else {
       regionHopCounter = nil
     }
