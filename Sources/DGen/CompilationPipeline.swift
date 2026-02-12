@@ -179,7 +179,7 @@ public struct CompilationPipeline {
 
     // Fuse adjacent blocks of the same kind to reduce cross-block communication
     let fusedBlocks = time("fuseBlocks1") {
-      fuseBlocks(blocks, graph)
+      fuseBlocks(blocks)
     }
 
     let context = IRContext(g: graph)

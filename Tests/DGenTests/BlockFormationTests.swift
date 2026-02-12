@@ -97,7 +97,7 @@ final class BlockFormationTests: XCTestCase {
         printBlockStructure(blocks: blocks, graph: g, scalarSet: scalarNodeSet, title: "After partitionIntoBlocks")
 
         // Step 6: Fuse blocks
-        let fusedBlocks = fuseBlocks(blocks, g)
+        let fusedBlocks = fuseBlocks(blocks)
         printBlockStructure(blocks: fusedBlocks, graph: g, scalarSet: scalarNodeSet, title: "After fuseBlocks")
 
         // Step 7: Isolate spectral passes (shouldn't affect this test)
@@ -105,7 +105,7 @@ final class BlockFormationTests: XCTestCase {
         printBlockStructure(blocks: isolatedBlocks, graph: g, scalarSet: scalarNodeSet, title: "After isolateSpectralPasses")
 
         // Step 8: Re-fuse
-        let reFusedBlocks = fuseBlocks(isolatedBlocks, g)
+        let reFusedBlocks = fuseBlocks(isolatedBlocks)
         printBlockStructure(blocks: reFusedBlocks, graph: g, scalarSet: scalarNodeSet, title: "After second fuseBlocks")
 
         // Step 9: Determine tensor blocks
@@ -306,9 +306,9 @@ final class BlockFormationTests: XCTestCase {
         allocateTensorOutputs(graph: g, sortedNodes: sortedNodes)
 
         let blocks = partitionIntoBlocks(sorted: sortedNodes, scalar: scalarNodeSet, g: g, debug: true)
-        let fusedBlocks = fuseBlocks(blocks, g)
+        let fusedBlocks = fuseBlocks(blocks)
         let isolatedBlocks = isolateSpectralPasses(fusedBlocks, g)
-        let reFusedBlocks = fuseBlocks(isolatedBlocks, g)
+        let reFusedBlocks = fuseBlocks(isolatedBlocks)
 
         let context = IRContext(g: g)
         let tensorBlocks = determineTensorBlocks(reFusedBlocks, g, context)
@@ -357,9 +357,9 @@ final class BlockFormationTests: XCTestCase {
         allocateTensorOutputs(graph: g, sortedNodes: sortedNodes)
 
         let blocks = partitionIntoBlocks(sorted: sortedNodes, scalar: scalarNodeSet, g: g, debug: true)
-        let fusedBlocks = fuseBlocks(blocks, g)
+        let fusedBlocks = fuseBlocks(blocks)
         let isolatedBlocks = isolateSpectralPasses(fusedBlocks, g)
-        let reFusedBlocks = fuseBlocks(isolatedBlocks, g)
+        let reFusedBlocks = fuseBlocks(isolatedBlocks)
 
         let context = IRContext(g: g)
         let tensorBlocks = determineTensorBlocks(reFusedBlocks, g, context)
