@@ -1080,18 +1080,11 @@ public func detectShapeTransitions(block: Block, g: Graph) -> [(nodeIndex: Int, 
     guard let node = g.nodes[nodeId] else { continue }
 
     if case .tensor(let shape) = node.shape {
-      // Skip view-only and data-only ops for shape transition detection.
+      // Skip view-only ops for shape transition detection.
       // These emit no compute code (just marker UOps rendered as comments
       // or set ctx.values). Letting them trigger region boundaries creates
       // empty element loops.
-      switch node.op {
-      case .reshape, .transpose, .shrink, .pad, .expandView:
-        // Don't update currentShape — view ops are transparent for region grouping.
-        // The next compute op will use the view's output shape to start a new region if needed.
-        continue
-      default:
-        break
-      }
+      if node.op.isViewOnly { continue }
 
       // Check for shape change
       var needsNewRegion = shape != currentShape
@@ -1397,14 +1390,8 @@ public func emitScalarBlockWithShapeTransitions(
     for nodeIndex in transition.nodeIndex..<regionEnd {
       let nodeId = block.nodes[nodeIndex]
       guard let node = g.nodes[nodeId] else { continue }
-      if case .tensor = node.shape {
-        continue  // tensor nodes go in the loop
-      }
-      if case .reshape = node.op { continue }
-      if case .transpose = node.op { continue }
-      if case .shrink = node.op { continue }
-      if case .pad = node.op { continue }
-      if case .expandView = node.op { continue }
+      if case .tensor = node.shape { continue }
+      if node.op.isViewOnly { continue }
       // Scalar node in a tensor region — emit outside the element loop
       emittedNodes.insert(nodeId)
       for uop in try node.op.emit(ctx: ctx, g: g, nodeId: nodeId) {
@@ -1717,18 +1704,8 @@ public func emitBlockUOps(
         // These have single-cell state and their own scalar emit path. Giving them a
         // tensor index causes indexed memory access on single-cell state:
         // memory[cell + idx] for idx=0..N corrupts adjacent memory.
-        let isInherentlyScalarOp: Bool
-        if let node = g.nodes[nodeId] {
-          switch node.op {
-          case .accum, .phasor, .click, .latch, .noise:
-            isInherentlyScalarOp = true
-          default:
-            isInherentlyScalarOp = false
-          }
-        } else {
-          isInherentlyScalarOp = false
-        }
-        if !isInherentlyScalarOp {
+        let isScalarOp = g.nodes[nodeId]?.op.isInherentlyScalar ?? false
+        if !isScalarOp {
           ctx.tensorIndices[nodeId] = tensorIndex
         }
       }

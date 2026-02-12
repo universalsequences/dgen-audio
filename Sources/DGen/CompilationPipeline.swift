@@ -961,76 +961,58 @@ func determineTensorBlocks(_ blocks: [Block], _ graph: Graph, _ ctx: IRContext) 
     return newBlock
   }
 
+  // Assign tensorIndex from the first tensor-shaped node in the block
+  func assignTensorIndex(to block: inout Block, graph: Graph, ctx: IRContext) {
+    for nodeId in block.nodes {
+      if let node = graph.nodes[nodeId], case .tensor(let shape) = node.shape {
+        if block.tensorIndex == nil {
+          block.tensorIndex = ctx.useVariable(src: nil)
+          block.shape = shape
+        }
+        break
+      }
+    }
+  }
+
   for block in blocks {
     // CRITICAL: Scalar blocks (feedback clusters) must NOT be split!
     // They contain history read/write ops that must execute sequentially together.
     // But we still need to set up tensorIndex for tensor operations inside.
     if block.kind == .scalar {
       // Find the first tensor-shaped node (excluding view-only ops)
-      var firstTensorIdx: Int? = nil
-      for (idx, nodeId) in block.nodes.enumerated() {
-        if let node = graph.nodes[nodeId], case .tensor = node.shape {
-          switch node.op {
-          case .reshape, .transpose, .shrink, .pad, .expandView:
-            continue
-          default:
-            firstTensorIdx = idx
-            break
-          }
-          if firstTensorIdx != nil { break }
-        }
-      }
+      let firstTensorIdx = block.nodes.enumerated().first { (_, nodeId) in
+        guard let node = graph.nodes[nodeId], case .tensor = node.shape else { return false }
+        return !node.op.isViewOnly
+      }?.offset
 
       // Split scalar blocks when the leading scalar nodes contain stateful ops
       // (accum, phasor, etc.) that must NOT execute inside the tensor element loop.
       // The C backend wraps blocks with tensorIndex in beginParallelRange, which would
       // cause these ops to execute N times per frame instead of once.
-      let scalarPrefixHasStatefulOps: Bool
+      let needsSplit: Bool
       if let splitIdx = firstTensorIdx, splitIdx > 0 {
-        scalarPrefixHasStatefulOps = block.nodes[0..<splitIdx].contains { nodeId in
-          guard let node = graph.nodes[nodeId] else { return false }
-          switch node.op {
-          case .accum, .phasor, .click, .latch, .noise:
-            return true
-          default:
-            return false
-          }
+        needsSplit = block.nodes[0..<splitIdx].contains { nodeId in
+          graph.nodes[nodeId]?.op.isInherentlyScalar ?? false
         }
       } else {
-        scalarPrefixHasStatefulOps = false
+        needsSplit = false
       }
 
-      if let splitIdx = firstTensorIdx, splitIdx > 0, scalarPrefixHasStatefulOps {
-        // Emit scalar prefix as its own block (no tensorIndex)
-        var scalarBlock = Block(kind: block.kind)
-        scalarBlock.temporality = block.temporality
+      if let splitIdx = firstTensorIdx, needsSplit {
+        // Scalar prefix as its own block (no tensorIndex)
+        var scalarBlock = makeBlock(from: block)
         scalarBlock.nodes = Array(block.nodes[0..<splitIdx])
         determined.append(scalarBlock)
 
-        // Emit tensor suffix with tensorIndex
-        var tensorBlock = Block(kind: block.kind)
-        tensorBlock.temporality = block.temporality
+        // Tensor suffix with tensorIndex
+        var tensorBlock = makeBlock(from: block)
         tensorBlock.nodes = Array(block.nodes[splitIdx...])
-        for nodeId in tensorBlock.nodes {
-          if let node = graph.nodes[nodeId], case .tensor(let shape) = node.shape {
-            tensorBlock.tensorIndex = ctx.useVariable(src: nil)
-            tensorBlock.shape = shape
-            break
-          }
-        }
+        assignTensorIndex(to: &tensorBlock, graph: graph, ctx: ctx)
         determined.append(tensorBlock)
       } else {
         // No split needed — assign tensorIndex to entire block
         var modifiedBlock = block
-        for nodeId in block.nodes {
-          if let node = graph.nodes[nodeId], case .tensor(let shape) = node.shape {
-            if modifiedBlock.tensorIndex == nil {
-              modifiedBlock.tensorIndex = ctx.useVariable(src: nil)
-              modifiedBlock.shape = shape
-            }
-            break
-          }
-        }
+        assignTensorIndex(to: &modifiedBlock, graph: graph, ctx: ctx)
         determined.append(modifiedBlock)
       }
       continue
@@ -1066,19 +1048,12 @@ func determineTensorBlocks(_ blocks: [Block], _ graph: Graph, _ ctx: IRContext) 
           continue
         }
 
-        // Skip view operations for tensor block grouping.
-        //
-        // These are metadata-only changes - they set ctx.values[nodeId] = .empty
-        // and emit only marker UOps (rendered as comments). If we let them
-        // trigger tensor block splits, we'd get empty parallel loops.
-        // The operations that USE these views (mul, add, etc.) will create
-        // the actual tensor blocks with proper element counts.
-        switch node.op {
-        case .reshape, .transpose, .shrink, .pad, .expandView:
+        // Skip view-only ops for tensor block grouping.
+        // These emit no compute code (just marker UOps). Letting them trigger
+        // tensor block splits would create empty parallel loops.
+        if node.op.isViewOnly {
           currentBlock.nodes.append(nodeId)
           continue
-        default:
-          break
         }
 
         if case .conv2d = node.op {

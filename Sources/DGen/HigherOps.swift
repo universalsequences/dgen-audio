@@ -566,24 +566,22 @@ extension Graph {
     let tensorRefNode = n(.tensorRef(tensorId), [writePos], shape: .tensor(tensorShape))
     nodeToTensor[tensorRefNode] = tensorId
 
-    // seq ensures write happens before read
-    // When hop-based, include counterAccum in seq to ensure it runs before tensor ops.
-    // The block splitting in determineTensorBlocks separates the scalar accum from the
-    // tensor loop so it doesn't execute N times per frame.
+    // seq ensures write happens before read.
+    // When hop-based, include counterAccum in seq so determineTensorBlocks can
+    // split it into a separate scalar block (avoiding N executions per frame).
+    let result: NodeID
     if let hopSize = hopSize {
       let counterCell = alloc(vectorWidth: 1)
       let hOne = n(.constant(1), [])
       let hZero = n(.constant(0), [])
       let hopConst = n(.constant(Float(hopSize)), [])
       let counterAccum = n(.accum(counterCell), hOne, hZero, hZero, hopConst)
-      let seqResult = n(.seq, writeOp, counterAccum, tensorRefNode)
-      nodeToTensor[seqResult] = tensorId
-      nodeHopRate[seqResult] = (hopSize, counterAccum)
-      nodePositionDep[seqResult] = writePos
-      return seqResult
+      result = n(.seq, writeOp, counterAccum, tensorRefNode)
+      nodeHopRate[result] = (hopSize, counterAccum)
+    } else {
+      result = n(.seq, writeOp, tensorRefNode)
     }
 
-    let result = n(.seq, writeOp, tensorRefNode)
     nodeToTensor[result] = tensorId
     nodePositionDep[result] = writePos
     return result

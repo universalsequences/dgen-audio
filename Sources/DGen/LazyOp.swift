@@ -190,4 +190,28 @@ public enum LazyOp {
   case expandAxis(Shape, Int)  // Broadcast along a specific axis (sumAxis backward)
   case gradPhasor(NodeID)  // Gradient for phasor: needs frame index context
   case gradDeterministicPhasor  // Gradient for deterministic phasor
+
+  /// View-only ops: metadata transforms that emit no compute code.
+  /// Used to skip these ops during shape transition detection, tensor block
+  /// splitting, and scalar node extraction.
+  public var isViewOnly: Bool {
+    switch self {
+    case .reshape, .transpose, .shrink, .pad, .expandView:
+      return true
+    default:
+      return false
+    }
+  }
+
+  /// Inherently scalar stateful ops with single-cell state.
+  /// These must not receive a tensorIndex (which would cause indexed memory
+  /// access on single-cell state, corrupting adjacent memory).
+  public var isInherentlyScalar: Bool {
+    switch self {
+    case .accum, .phasor, .click, .latch, .noise:
+      return true
+    default:
+      return false
+    }
+  }
 }

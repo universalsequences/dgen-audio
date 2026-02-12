@@ -88,6 +88,46 @@ for _ in 0..<100 {
 // weights converges to ~[1, 0, 1, 0]
 ```
 
+### Hop-Gated FFT Pipeline
+
+When processing audio in overlapping windows, most of the heavy computation (FFT, spectral processing, IFFT) only needs to run every *hop* frames — not every sample. DGen handles this automatically via **hop gating**.
+
+```swift
+let sig = sin(Signal.phasor(440.0) * 2.0 * Float.pi)
+
+// buffer(hop:) collects samples into a sliding window.
+// With N=1024 and hop=256, the FFT only runs every 256 frames.
+let buf = sig.buffer(size: 1024, hop: 256)
+
+// Everything downstream of a hop-gated buffer is also hop-gated:
+// these tensor ops (FFT butterflies, multiplies) run once per hop,
+// not once per frame.
+let flat = buf.reshape([1024])
+let (re, im) = signalTensorFFT(flat, N: 1024)
+// ... spectral processing ...
+let recon = signalTensorIFFT(re, im, N: 1024)
+
+// overlapAdd converts back to frame-based (one sample per frame).
+// It scatter-adds each hop's window into a ring buffer and emits
+// one sample every frame — this is where hop-gated → frame-based.
+let out = recon.overlapAdd(hop: 256)
+
+let samples = try out.realize(frames: 4096)
+```
+
+The execution timeline looks like this:
+
+```
+Frame:    0    1    2   ...  255  256  257  ...  511  512 ...
+          │    │    │         │    │    │         │    │
+buffer:   ✓    ✓    ✓    ✓    ✓    ✓    ✓    ✓    ✓    ✓   ← writes every frame
+FFT:      ✓                        ✓                   ✓   ← runs every 256 frames
+IFFT:     ✓                        ✓                   ✓
+overlap:  ✓    ✓    ✓    ✓    ✓    ✓    ✓    ✓    ✓    ✓   ← emits every frame
+```
+
+The `buffer(hop:)` call creates an internal hop counter. On each frame, it writes the input sample to a circular buffer. Every *hop* frames the counter resets, triggering the downstream tensor blocks (FFT, IFFT). The `overlapAdd` node runs every frame regardless — it reads from its own ring buffer, returning the accumulated result of all previous overlapping windows.
+
 ## Backend Support
 
 | Backend | Forward | Backward | Notes |

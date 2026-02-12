@@ -915,112 +915,92 @@ final class TensorFFTTests: XCTestCase {
 
   // MARK: - Dual Hop-Based FFT Pipelines
 
-  /// Two independent hop-based FFT→IFFT→overlapAdd pipelines in the same graph.
+  /// Build a cosine -> buffer -> FFT -> IFFT -> overlapAdd pipeline as a Signal.
+  private func fftRoundtripSignal(freq: Float, N: Int, hop: Int) -> Signal {
+    let sig = cos(Signal.phasor(freq) * Float(2.0 * Float.pi))
+    let flat = sig.buffer(size: N, hop: hop).reshape([N])
+    let (re, im) = signalTensorFFT(flat, N: N)
+    let recon = signalTensorIFFT(re, im, N: N)
+    return recon.overlapAdd(hop: hop)
+  }
+
+  /// Configure DGenConfig for C-backend hop-based FFT tests.
+  private func withCBackendConfig(
+    sampleRate: Float, kernelOutputPath: String,
+    body: () throws -> Void
+  ) rethrows {
+    DGenConfig.backend = .c
+    DGenConfig.sampleRate = sampleRate
+    DGenConfig.maxFrameCount = 8192
+    DGenConfig.kernelOutputPath = kernelOutputPath
+    defer {
+      DGenConfig.sampleRate = 44100.0
+      DGenConfig.maxFrameCount = 4096
+      DGenConfig.kernelOutputPath = nil
+      DGenConfig.backend = .metal
+    }
+    try body()
+  }
+
+  /// Compute peak amplitude in the last quarter of a realized signal.
+  private func stableRegionPeak(_ result: [Float]) -> Float {
+    let stableStart = result.count * 3 / 4
+    return result[stableStart...].map { Swift.abs($0) }.max() ?? 0
+  }
+
+  /// Two independent hop-based FFT->IFFT->overlapAdd pipelines in the same graph.
   /// Regression test: having two separate buffer(hop:) calls creates two counter nodes.
   /// If blocks from both pipelines get fused, determineBlockTemporality must still
   /// assign .hopBased (not fall back to .frameBased) when both have the same hop size.
   func testSingleFFTPipelineOnC() throws {
-    // Minimal test: one FFT pipeline on C backend
     let N = 64
-    let hop = N / 4  // 16
-    let sr: Float = 2048.0
-    let freq: Float = 256.0
+    let hop = N / 4
 
-    DGenConfig.backend = .c
-    DGenConfig.sampleRate = sr
-    DGenConfig.maxFrameCount = 8192
-    DGenConfig.kernelOutputPath = "/tmp/test_single_fft_c.c"
-    defer {
-      DGenConfig.sampleRate = 44100.0
-      DGenConfig.maxFrameCount = 4096
-      DGenConfig.kernelOutputPath = nil
-      DGenConfig.backend = .metal
+    try withCBackendConfig(sampleRate: 2048.0, kernelOutputPath: "/tmp/test_single_fft_c.c") {
+      LazyGraphContext.reset()
+      let out = fftRoundtripSignal(freq: 256.0, N: N, hop: hop)
+
+      let totalFrames = 4 * N
+      let result = try out.realize(frames: totalFrames)
+      let gain = Float(N) / Float(hop)
+      let peak = stableRegionPeak(result)
+
+      print("\n=== Single FFT [C] (N=\(N), hop=\(hop)) ===")
+      print("Peak: \(peak), expected ~\(gain)")
+
+      XCTAssertGreaterThan(peak, gain * 0.5,
+        "Single FFT pipeline on C should produce signal")
     }
-    LazyGraphContext.reset()
-
-    let sig = cos(Signal.phasor(freq) * Float(2.0 * Float.pi))
-    let buf = sig.buffer(size: N, hop: hop)
-    let flat = buf.reshape([N])
-    let (re, im) = signalTensorFFT(flat, N: N)
-    let recon = signalTensorIFFT(re, im, N: N)
-    let out = recon.overlapAdd(hop: hop)
-
-    let totalFrames = 4 * N
-    let result = try out.realize(frames: totalFrames)
-
-    let gain = Float(N) / Float(hop)  // 4.0
-    let stableStart = totalFrames * 3 / 4
-    let stableRegion = Array(result[stableStart..<totalFrames])
-    let peakAmplitude = stableRegion.map { Swift.abs($0) }.max() ?? 0
-
-    print("\n=== Single FFT [C] (N=\(N), hop=\(hop)) ===")
-    print("First 16 output:")
-    for i in 0..<min(16, result.count) {
-      print("  [\(i)] = \(result[i])")
-    }
-    print("Peak: \(peakAmplitude), expected ≈ \(gain)")
-
-    XCTAssertGreaterThan(peakAmplitude, gain * 0.5,
-      "Single FFT pipeline on C should produce signal")
   }
 
   func testDualHopBasedFFTPipelines() throws {
     let N = 64
-    let hop = N / 4  // 16
-    let sr: Float = 2048.0
-    let freqA: Float = 256.0
-    let freqB: Float = 128.0
+    let hop = N / 4
 
-    DGenConfig.backend = .c
-    DGenConfig.sampleRate = sr
-    DGenConfig.maxFrameCount = 8192
-    DGenConfig.kernelOutputPath = "/tmp/test_dual_hop_fft.c"
-    defer {
-      DGenConfig.sampleRate = 44100.0
-      DGenConfig.maxFrameCount = 4096
-      DGenConfig.kernelOutputPath = nil
-      DGenConfig.backend = .metal
-    }
-    LazyGraphContext.reset()
+    try withCBackendConfig(sampleRate: 2048.0, kernelOutputPath: "/tmp/test_dual_hop_fft.c") {
+      LazyGraphContext.reset()
+      let outA = fftRoundtripSignal(freq: 256.0, N: N, hop: hop)
+      let outB = fftRoundtripSignal(freq: 128.0, N: N, hop: hop)
+      let mixed = outA + outB
 
-    let twoPi = Float(2.0 * Float.pi)
+      let totalFrames = 4 * N
+      let result = try mixed.realize(frames: totalFrames)
+      let gain = Float(N) / Float(hop)
+      let peak = stableRegionPeak(result)
 
-    let sigA = cos(Signal.phasor(freqA) * twoPi)
-    let bufA = sigA.buffer(size: N, hop: hop)
-    let flatA = bufA.reshape([N])
-    let (reA, imA) = signalTensorFFT(flatA, N: N)
-    let reconA = signalTensorIFFT(reA, imA, N: N)
-    let outA = reconA.overlapAdd(hop: hop)
+      print("\n=== Dual Hop FFT [C] (N=\(N), hop=\(hop)) ===")
+      print("Peak: \(peak), expected ~\(gain * 2)")
 
-    let sigB = cos(Signal.phasor(freqB) * twoPi)
-    let bufB = sigB.buffer(size: N, hop: hop)
-    let flatB = bufB.reshape([N])
-    let (reB, imB) = signalTensorFFT(flatB, N: N)
-    let reconB = signalTensorIFFT(reB, imB, N: N)
-    let outB = reconB.overlapAdd(hop: hop)
+      XCTAssertGreaterThan(peak, gain * 0.5,
+        "Output should not be zero -- both pipelines must produce signal")
 
-    let mixed = outA + outB
-
-    let totalFrames = 4 * N
-    let result = try mixed.realize(frames: totalFrames)
-
-    let gain = Float(N) / Float(hop)  // 4.0
-    let stableStart = totalFrames * 3 / 4
-    let stableRegion = Array(result[stableStart..<totalFrames])
-    let peakAmplitude = stableRegion.map { Swift.abs($0) }.max() ?? 0
-
-    print("\n=== Dual Hop FFT [C] (N=\(N), hop=\(hop)) ===")
-    print("Peak: \(peakAmplitude), expected ≈ \(gain * 2)")
-
-    XCTAssertGreaterThan(peakAmplitude, gain * 0.5,
-      "Output should not be zero — both pipelines must produce signal")
-
-    let kernelPath = "/tmp/test_dual_hop_fft.c"
-    if let kernelSource = try? String(contentsOfFile: kernelPath, encoding: .utf8) {
-      let hopCheckCount = kernelSource.components(separatedBy: "== 0.0f) {").count - 1
-      print("Hop checks in kernel: \(hopCheckCount)")
-      XCTAssertGreaterThanOrEqual(hopCheckCount, 1,
-        "Tensor blocks must have hop gating in the kernel")
+      let kernelPath = "/tmp/test_dual_hop_fft.c"
+      if let kernelSource = try? String(contentsOfFile: kernelPath, encoding: .utf8) {
+        let hopCheckCount = kernelSource.components(separatedBy: "== 0.0f) {").count - 1
+        print("Hop checks in kernel: \(hopCheckCount)")
+        XCTAssertGreaterThanOrEqual(hopCheckCount, 1,
+          "Tensor blocks must have hop gating in the kernel")
+      }
     }
   }
 
