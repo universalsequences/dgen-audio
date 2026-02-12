@@ -243,6 +243,13 @@ public func * (lhs: SignalTensor, rhs: SignalTensor) -> SignalTensor {
     return SignalTensor(nodeId: nodeId, graph: lhs.graph, shape: outShape, requiresGrad: lhs.requiresGrad || rhs.requiresGrad)
 }
 
+// SignalTensor / SignalTensor
+public func / (lhs: SignalTensor, rhs: SignalTensor) -> SignalTensor {
+    let nodeId = lhs.graph.node(.div, [lhs.nodeId, rhs.nodeId])
+    let outShape = broadcastShape(lhs.shape, rhs.shape)
+    return SignalTensor(nodeId: nodeId, graph: lhs.graph, shape: outShape, requiresGrad: lhs.requiresGrad || rhs.requiresGrad)
+}
+
 // SignalTensor - SignalTensor
 public func - (lhs: SignalTensor, rhs: SignalTensor) -> SignalTensor {
     let nodeId = lhs.graph.node(.sub, [lhs.nodeId, rhs.nodeId])
@@ -283,6 +290,13 @@ public func + (lhs: SignalTensor, rhs: Float) -> SignalTensor {
 public func * (lhs: SignalTensor, rhs: Float) -> SignalTensor {
     let rhsNode = lhs.graph.node(.constant(rhs))
     let nodeId = lhs.graph.node(.mul, [lhs.nodeId, rhsNode])
+    return SignalTensor(nodeId: nodeId, graph: lhs.graph, shape: lhs.shape, requiresGrad: lhs.requiresGrad)
+}
+
+// SignalTensor - Float
+public func - (lhs: SignalTensor, rhs: Float) -> SignalTensor {
+    let rhsNode = lhs.graph.node(.constant(rhs))
+    let nodeId = lhs.graph.node(.sub, [lhs.nodeId, rhsNode])
     return SignalTensor(nodeId: nodeId, graph: lhs.graph, shape: lhs.shape, requiresGrad: lhs.requiresGrad)
 }
 

@@ -22,8 +22,9 @@ public class IRContext {
   public var outboundTensorCells: Set<CellID> = []
   public var tensorCellToVar: [CellID: Lazy] = [:]
 
-  // Frame-based nodes from temporality analysis (set during compilation)
+  // Temporality data from analysis (set during compilation)
   public var frameBasedNodes: Set<NodeID> = []
+  public var hopBasedNodes: [NodeID: (Int, NodeID)] = [:]
 
   // Nodes that are part of frame-dependent tensor chains (for SIMD-across-frames optimization)
   public var frameTensorChainNodes: Set<NodeID> = []

@@ -137,6 +137,11 @@ public func tanh(_ x: SignalTensor) -> SignalTensor {
   return SignalTensor(nodeId: nodeId, graph: x.graph, shape: x.shape, requiresGrad: x.requiresGrad)
 }
 
+public func sqrt(_ x: SignalTensor) -> SignalTensor {
+  let nodeId = x.graph.node(.sqrt, [x.nodeId])
+  return SignalTensor(nodeId: nodeId, graph: x.graph, shape: x.shape, requiresGrad: x.requiresGrad)
+}
+
 // MARK: - Binary Math Functions
 
 public func pow(_ x: Tensor, _ y: Tensor) -> Tensor {
@@ -552,6 +557,7 @@ extension SignalTensor {
   public func exp() -> SignalTensor { DGenLazy.exp(self) }
   public func tanh() -> SignalTensor { DGenLazy.tanh(self) }
   public func relu() -> SignalTensor { DGenLazy.relu(self) }
+  public func sqrt() -> SignalTensor { DGenLazy.sqrt(self) }
 }
 
 // MARK: - Tensor FFT / IFFT (Pure Tensor Ops)

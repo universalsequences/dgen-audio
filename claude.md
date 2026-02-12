@@ -65,6 +65,28 @@ for epoch in 0..<epochs {
 }
 ```
 
+## Testing: Tensor/Signal Creation Order Matters
+
+**Always create `Tensor` objects AFTER `LazyGraphContext.reset()`, not before.**
+
+`Tensor` and `Signal` objects store an internal `nodeId` pointing to their graph node. When `LazyGraphContext.reset()` creates a new graph, objects created before the reset hold stale `nodeId`s. The `refresh()` mechanism re-creates them in the new graph, but only when they're used in an operator (e.g., `*`, `+`). If a `Tensor` is created before `reset()` and the `refresh()` fires correctly, it gets a new valid `nodeId`. But if anything goes wrong with refresh detection, the stale `nodeId` silently aliases an unrelated node in the new graph (e.g., the audio input), causing operations to produce wrong results with no error.
+
+```swift
+// BAD — hannWindow created before reset, may alias wrong node
+let hannWindow = Tensor(hannData)
+LazyGraphContext.reset()
+let flat = sig.buffer(size: N, hop: hop).reshape([N])
+let windowed = flat * hannWindow  // hannWindow.nodeId may be stale!
+
+// GOOD — create after reset
+LazyGraphContext.reset()
+let hannWindow = Tensor(hannData)
+let flat = sig.buffer(size: N, hop: hop).reshape([N])
+let windowed = flat * hannWindow  // hannWindow.nodeId is valid
+```
+
+**Symptoms of stale nodeId**: Operations compile and run without errors but produce wrong results. A multiplication by a tensor window becomes a no-op (multiply by 1.0). The generated kernel shows missing operations with no obvious cause.
+
 ## Metal GPU Synchronization
 
 1. **`atomic_thread_fence` does NOT sync between threads** - it only orders memory operations within a single thread. For cross-thread synchronization, split into separate kernels.

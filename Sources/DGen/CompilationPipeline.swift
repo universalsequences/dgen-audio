@@ -223,6 +223,9 @@ public struct CompilationPipeline {
         frameBasedNodes: temporalityResult.frameBasedNodes,
         hopBasedNodes: temporalityResult.hopBasedNodes
       )
+      // Store temporality data on IRContext for use during block emission
+      // (e.g., emitScalarBlockWithShapeTransitions needs per-node hop info)
+      context.hopBasedNodes = temporalityResult.hopBasedNodes
     }
 
     // Split reduce blocks AFTER temporality assignment so we can override

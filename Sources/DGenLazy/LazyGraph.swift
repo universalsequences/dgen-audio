@@ -16,7 +16,12 @@ internal class WeakRef<T: AnyObject> {
 /// Internal graph that accumulates lazy operations
 /// Users don't create this directly; it's managed implicitly
 public class LazyGraph {
-  public var id: Int = 0
+  private static var _nextId: Int = 1
+  public var id: Int = {
+    let id = LazyGraph._nextId
+    LazyGraph._nextId += 1
+    return id
+  }()
 
   /// The underlying DGen graph
   internal let graph: Graph

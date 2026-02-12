@@ -887,22 +887,6 @@ public func isolateSpectralPasses(_ blocks: [Block], _ g: Graph) -> [Block] {
   return result
 }
 
-public func splitBlocksIfNeeded(_ blocks: [Block], backend: Backend) -> [Block] {
-  if case .c = backend {
-    return blocks
-  }
-
-  var split: [Block] = []
-  for b in blocks {
-    if b.kind == .simd {
-      // only split simd since scalar blocks must be executed together
-    } else {
-      split.append(b)
-    }
-  }
-  return split
-}
-
 extension LazyOp {
   var isOutput: Bool {
     if case .output = self { return true }
@@ -1018,6 +1002,7 @@ public func findOutboundTensorCells(_ blks: [Block], _ g: Graph, block: Block) -
             }
           }
         }
+
       }
 
       // Also check historyRead/historyWrite operations that reference tensor cells
@@ -1381,12 +1366,37 @@ public func emitScalarBlockWithShapeTransitions(
     // Create element loop variable for this region
     let elemVar = ctx.useVariable(src: nil)
 
+    // Check if this tensor region is hop-based in a frame-based block.
+    // In the C backend, tensor ops with tensor inputs get forced into scalar blocks
+    // even when they're hop-based. Without hop-gating, the element loop runs every
+    // frame instead of only on hop boundaries — wasteful and semantically wrong
+    // for downstream accumulation. Wrap the region in beginHopCheck/endHopCheck.
+    let regionHopCounter: Lazy?
+    if block.temporality == .frameBased {
+      var counterLazy: Lazy? = nil
+      for nodeIndex in transition.nodeIndex..<regionEnd {
+        let nodeId = block.nodes[nodeIndex]
+        if let hopInfo = ctx.hopBasedNodes[nodeId],
+           let lazy = ctx.values[hopInfo.1] {
+          counterLazy = lazy
+          break
+        }
+      }
+      regionHopCounter = counterLazy
+    } else {
+      regionHopCounter = nil
+    }
+
     // Separate scalar-shaped nodes from tensor-shaped nodes in this region.
     // Scalar nodes (e.g., hop counter accum) can get interleaved with tensor ops
     // from a different pipeline due to topological ordering. Emitting them inside
     // the element loop would give them a tensorIndex, causing indexed memory access
     // on single-cell state (e.g., memory[cell + t2] for 64 iterations instead of
     // memory[cell] once). Emit them BEFORE the element loop without tensorIndices.
+    if let counterLazy = regionHopCounter {
+      uops.append(UOp(op: .beginHopCheck(counterLazy), value: .empty))
+    }
+
     for nodeIndex in transition.nodeIndex..<regionEnd {
       let nodeId = block.nodes[nodeIndex]
       guard let node = g.nodes[nodeId] else { continue }
@@ -1433,6 +1443,10 @@ public func emitScalarBlockWithShapeTransitions(
       var endLoop = UOp(op: .endLoop, value: .empty)
       endLoop.kind = .scalar
       uops.append(endLoop)
+    }
+
+    if regionHopCounter != nil {
+      uops.append(UOp(op: .endHopCheck, value: .empty))
     }
 
     // Clear tensor registers after each region so next region reads from memory

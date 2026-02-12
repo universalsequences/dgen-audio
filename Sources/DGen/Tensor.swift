@@ -1,3 +1,5 @@
+import Foundation
+
 /// Represents a single view transformation applied to a tensor.
 /// Transforms are stored in order from base tensor to final view shape.
 /// To read an element: walk backwards through transforms, mapping output indices to base indices.
@@ -393,6 +395,16 @@ extension Graph {
   public func zeros(shape: Shape) -> NodeID {
     let size = shape.reduce(1, *)
     return tensor(shape: shape, data: [Float](repeating: 0.0, count: size))
+  }
+
+  /// Create a tensor filled with ones
+  public func hann(N: Int) -> NodeID {
+    var hannData = [Float](repeating: 0, count: N)
+    let twoPi = Float(2.0 * Float.pi)
+    for i in 0..<N {
+      hannData[i] = 0.5 * (1.0 - Foundation.cos(twoPi * Float(i) / Float(N)))
+    }
+    return tensor(shape: [N], data: hannData)
   }
 
   /// Create a tensor filled with ones
