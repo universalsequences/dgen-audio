@@ -1080,6 +1080,19 @@ public func detectShapeTransitions(block: Block, g: Graph) -> [(nodeIndex: Int, 
     guard let node = g.nodes[nodeId] else { continue }
 
     if case .tensor(let shape) = node.shape {
+      // Skip view-only and data-only ops for shape transition detection.
+      // These emit no compute code (just marker UOps rendered as comments
+      // or set ctx.values). Letting them trigger region boundaries creates
+      // empty element loops.
+      switch node.op {
+      case .reshape, .transpose, .shrink, .pad, .expandView:
+        // Don't update currentShape — view ops are transparent for region grouping.
+        // The next compute op will use the view's output shape to start a new region if needed.
+        continue
+      default:
+        break
+      }
+
       // Check for shape change
       var needsNewRegion = shape != currentShape
 
