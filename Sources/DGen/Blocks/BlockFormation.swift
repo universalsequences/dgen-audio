@@ -1,14 +1,9 @@
 /// Block partitioning, fusion, spectral isolation, tensor/reduce/memory splitting.
 import Foundation
 
-// Helper function to check if adding a node to a block would exceed the node limit
-func wouldExceedNodeLimit(_ block: Block, maxNodesPerBlock: Int) -> Bool {
-  return block.nodes.count >= maxNodesPerBlock
-}
-
 // Block partitioning that works with feedback group-aware sorted nodes
 public func partitionIntoBlocks(
-  sorted: [NodeID], scalar: Set<NodeID>, g: Graph, maxNodesPerBlock: Int = Int.max,
+  sorted: [NodeID], scalar: Set<NodeID>, g: Graph,
   debug: Bool = false
 ) -> [Block] {
   var blocks: [Block] = []
@@ -32,47 +27,28 @@ public func partitionIntoBlocks(
         if targetBlockIdx != -1 { break }
       }
 
-      // Check if we can add to an existing block that contains the dependency
-      var addedToExistingBlock = false
       if targetBlockIdx != -1 && targetBlockIdx < blocks.count {
-        if !wouldExceedNodeLimit(blocks[targetBlockIdx], maxNodesPerBlock: maxNodesPerBlock) {
-          blocks[targetBlockIdx].nodes.append(nodeId)
-          addedToExistingBlock = true
-          if debug {
-            print(
-              "📍 Placed output node \(nodeId) in block \(targetBlockIdx) with its dependency"
-            )
-          }
+        blocks[targetBlockIdx].nodes.append(nodeId)
+        if debug {
+          print(
+            "📍 Placed output node \(nodeId) in block \(targetBlockIdx) with its dependency"
+          )
         }
-      }
-
-      if !addedToExistingBlock {
-        // If we have a current block and the dependency isn't found yet,
-        // the dependency is likely in the current block
-        if let current = currentBlock,
-          !wouldExceedNodeLimit(current, maxNodesPerBlock: maxNodesPerBlock)
-        {
-          currentBlock!.nodes.append(nodeId)
-          if debug {
-            print("📍 Placed output node \(nodeId) in current block")
-          }
-        } else {
-          // Last resort - finish current block and start new one
-          if let current = currentBlock {
-            blocks.append(current)
-          }
-          currentBlock = Block(kind: kind)
-          currentBlock!.nodes.append(nodeId)
+      } else if currentBlock != nil {
+        currentBlock!.nodes.append(nodeId)
+        if debug {
+          print("📍 Placed output node \(nodeId) in current block")
         }
+      } else {
+        currentBlock = Block(kind: kind)
+        currentBlock!.nodes.append(nodeId)
       }
       continue
     }
 
     // Regular node handling - group consecutive nodes of same kind together
     if let current = currentBlock {
-      if current.kind == kind
-        && !wouldExceedNodeLimit(current, maxNodesPerBlock: maxNodesPerBlock)
-      {
+      if current.kind == kind {
         currentBlock!.nodes.append(nodeId)
       } else {
         blocks.append(current)
@@ -80,7 +56,6 @@ public func partitionIntoBlocks(
         currentBlock!.nodes.append(nodeId)
       }
     } else {
-      // Start first block
       currentBlock = Block(kind: kind)
       currentBlock!.nodes.append(nodeId)
     }
@@ -286,7 +261,8 @@ public func splitMemoryBlocks(g: Graph, blocks: [Block]) -> [Block] {
   var result: [Block] = []
   for block in blocks {
     if block.kind == .scalar {
-      result.append(block); continue
+      result.append(block)
+      continue
     }
     var writtenCells: Set<CellID> = []
     var splitIndex: Int? = nil
@@ -295,23 +271,31 @@ public func splitMemoryBlocks(g: Graph, blocks: [Block]) -> [Block] {
       switch node.op {
       case .memoryWrite(let base): writtenCells.insert(base)
       case .memoryRead(let base):
-        if writtenCells.contains(base) { splitIndex = i; break }
+        if writtenCells.contains(base) {
+          splitIndex = i
+          break
+        }
       default: break
       }
       if splitIndex != nil { break }
     }
-    guard let splitIndex else { result.append(block); continue }
+    guard let splitIndex else {
+      result.append(block)
+      continue
+    }
     // Pre-read block (includes memoryWrite)
     if splitIndex > 0 {
       var pre = Block(kind: .simd)
       pre.nodes = Array(block.nodes[0..<splitIndex])
-      pre.shape = block.shape; pre.temporality = block.temporality
+      pre.shape = block.shape
+      pre.temporality = block.temporality
       result.append(pre)
     }
     // Post block (memoryRead onward) — recursively split if more conflicts
     var post = Block(kind: .simd)
     post.nodes = Array(block.nodes[splitIndex...])
-    post.shape = block.shape; post.temporality = block.temporality
+    post.shape = block.shape
+    post.temporality = block.temporality
     result.append(contentsOf: splitMemoryBlocks(g: g, blocks: [post]))
   }
   return result
