@@ -898,8 +898,11 @@ private func determineBlockTemporality(
 
   let hopRates = block.nodes.compactMap { hopBasedNodes[$0] }
   if let firstRate = hopRates.first {
-    let allSameRate = hopRates.allSatisfy { $0.0 == firstRate.0 && $0.1 == firstRate.1 }
-    if allSameRate {
+    // Only require same hopSize — different counter nodes from independent
+    // bufferView(hop:) calls tick in lockstep (same start, same increment, same wrap)
+    // so any counter at the same rate works for gating.
+    let allSameHopSize = hopRates.allSatisfy { $0.0 == firstRate.0 }
+    if allSameHopSize {
       return .hopBased(hopSize: firstRate.0, counterNode: firstRate.1)
     }
     return .frameBased

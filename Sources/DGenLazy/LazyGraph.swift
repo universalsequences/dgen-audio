@@ -162,7 +162,8 @@ public class LazyGraph {
     graph.frameAwareCells.removeAll()
     graph.cellAllocationSizes.removeAll()
 
-    // 4. Clear gradient side effects
+    // 4. Clear persistent cells and gradient side effects
+    graph.persistentCells.removeAll()
     graph.gradientSideEffects.removeAll()
     graph.tensorGradCells.removeAll()
     graph.gradCarryCells.removeAll()

@@ -52,6 +52,10 @@ open class Graph {
     /// Used for tensors with outbound dependencies that need tensorSize * frameCount cells.
     public var frameAwareCells: [CellID: (tensorSize: Int, frameCount: Int)] = [:]
 
+    /// Cells that persist data across frame iterations (circular buffers, ring buffers, etc.)
+    /// These must not be shared with other cells during buffer reuse optimization.
+    public var persistentCells: Set<CellID> = []
+
     /// Nodes that should have their tensor results materialized in memory (for realize())
     public var materializeNodes: Set<NodeID> = []
 

@@ -535,6 +535,7 @@ extension Graph {
     // Circular buffer: extra (size - 1) slots for cross-block lookback
     let bufferSize = maxFrameCount + size - 1
     let historyBase = alloc(vectorWidth: bufferSize)
+    persistentCells.insert(historyBase)
     let writePosCellId = alloc()
 
     let one = n(.constant(1.0))
@@ -566,25 +567,25 @@ extension Graph {
     nodeToTensor[tensorRefNode] = tensorId
 
     // seq ensures write happens before read
-    let result = n(.seq, writeOp, tensorRefNode)
-    nodeToTensor[result] = tensorId
-    nodePositionDep[result] = writePos
-
-    // Register hop-based temporality so downstream blocks run every hopSize frames
+    // When hop-based, include counterAccum in seq to ensure it runs before tensor ops.
+    // The block splitting in determineTensorBlocks separates the scalar accum from the
+    // tensor loop so it doesn't execute N times per frame.
     if let hopSize = hopSize {
       let counterCell = alloc(vectorWidth: 1)
       let hOne = n(.constant(1), [])
       let hZero = n(.constant(0), [])
       let hopConst = n(.constant(Float(hopSize)), [])
       let counterAccum = n(.accum(counterCell), hOne, hZero, hZero, hopConst)
-      // counterAccum is a DIRECT INPUT — creates graph edge for dependency analysis
-      let seqResult = n(.seq, [writeOp, counterAccum, tensorRefNode], shape: .tensor(tensorShape))
+      let seqResult = n(.seq, writeOp, counterAccum, tensorRefNode)
       nodeToTensor[seqResult] = tensorId
       nodeHopRate[seqResult] = (hopSize, counterAccum)
       nodePositionDep[seqResult] = writePos
       return seqResult
     }
 
+    let result = n(.seq, writeOp, tensorRefNode)
+    nodeToTensor[result] = tensorId
+    nodePositionDep[result] = writePos
     return result
   }
 
@@ -785,6 +786,9 @@ extension Graph {
     let outputRingCell = alloc(vectorWidth: windowSize)
     let readPosCell = alloc(vectorWidth: 1)
     let counterCell = alloc(vectorWidth: 1)
+    persistentCells.insert(outputRingCell)
+    persistentCells.insert(readPosCell)
+    persistentCells.insert(counterCell)
 
     return n(.overlapAdd(windowSize, hopSize, outputRingCell, readPosCell, counterCell),
       [input], shape: .scalar)

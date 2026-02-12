@@ -1388,6 +1388,32 @@ public func emitScalarBlockWithShapeTransitions(
     // Create element loop variable for this region
     let elemVar = ctx.useVariable(src: nil)
 
+    // Separate scalar-shaped nodes from tensor-shaped nodes in this region.
+    // Scalar nodes (e.g., hop counter accum) can get interleaved with tensor ops
+    // from a different pipeline due to topological ordering. Emitting them inside
+    // the element loop would give them a tensorIndex, causing indexed memory access
+    // on single-cell state (e.g., memory[cell + t2] for 64 iterations instead of
+    // memory[cell] once). Emit them BEFORE the element loop without tensorIndices.
+    for nodeIndex in transition.nodeIndex..<regionEnd {
+      let nodeId = block.nodes[nodeIndex]
+      guard let node = g.nodes[nodeId] else { continue }
+      if case .tensor = node.shape {
+        continue  // tensor nodes go in the loop
+      }
+      if case .reshape = node.op { continue }
+      if case .transpose = node.op { continue }
+      if case .shrink = node.op { continue }
+      if case .pad = node.op { continue }
+      if case .expandView = node.op { continue }
+      // Scalar node in a tensor region — emit outside the element loop
+      emittedNodes.insert(nodeId)
+      for uop in try node.op.emit(ctx: ctx, g: g, nodeId: nodeId) {
+        var typedUop = uop
+        typedUop.kind = .scalar
+        uops.append(typedUop)
+      }
+    }
+
     // Emit beginForLoop for element iteration (skip for conv-only regions)
     if !isConvOnlyRegion {
       var beginLoop = UOp(
@@ -1398,9 +1424,10 @@ public func emitScalarBlockWithShapeTransitions(
       uops.append(beginLoop)
     }
 
-    // Emit ops for nodes in this region
+    // Emit ops for tensor nodes in this region
     for nodeIndex in transition.nodeIndex..<regionEnd {
       let nodeId = block.nodes[nodeIndex]
+      if emittedNodes.contains(nodeId) { continue }  // already emitted above
       // Set tensor index for this node to the element loop variable
       ctx.tensorIndices[nodeId] = elemVar
 
@@ -1686,7 +1713,24 @@ public func emitBlockUOps(
 
     for nodeId in block.nodes {
       if !emittedThreadScale, let tensorIndex = block.tensorIndex {
-        ctx.tensorIndices[nodeId] = tensorIndex
+        // Don't give tensorIndex to inherently scalar stateful ops (accum, phasor, etc.)
+        // These have single-cell state and their own scalar emit path. Giving them a
+        // tensor index causes indexed memory access on single-cell state:
+        // memory[cell + idx] for idx=0..N corrupts adjacent memory.
+        let isInherentlyScalarOp: Bool
+        if let node = g.nodes[nodeId] {
+          switch node.op {
+          case .accum, .phasor, .click, .latch, .noise:
+            isInherentlyScalarOp = true
+          default:
+            isInherentlyScalarOp = false
+          }
+        } else {
+          isInherentlyScalarOp = false
+        }
+        if !isInherentlyScalarOp {
+          ctx.tensorIndices[nodeId] = tensorIndex
+        }
       }
 
       // Track where backward UOps start

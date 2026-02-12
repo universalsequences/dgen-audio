@@ -548,7 +548,10 @@ func remapVectorMemorySlots(
   var intervals: [LivenessInterval] = []
 
   if enableBufferReuse {
-    var persistentCells: Set<CellID> = []  // load/store/delay1 — survive across frames
+    // Persistent cells: survive across frame iterations, must not be reused.
+    // Includes load/store/delay1 cells (detected from UOps) AND cells explicitly
+    // marked as persistent by graph construction (circular buffers, ring buffers).
+    var persistentCells: Set<CellID> = graph?.persistentCells ?? []
     var accumulateCells: Set<CellID> = []  // memoryAccumulate — need zeroed memory
     var cellFirstUse: [CellID: Int] = [:]
     var cellLastUse: [CellID: Int] = [:]
@@ -963,18 +966,73 @@ func determineTensorBlocks(_ blocks: [Block], _ graph: Graph, _ ctx: IRContext) 
     // They contain history read/write ops that must execute sequentially together.
     // But we still need to set up tensorIndex for tensor operations inside.
     if block.kind == .scalar {
-      var modifiedBlock = block
-      // Set up tensor index for the first tensor op in this scalar block
-      for nodeId in block.nodes {
-        if let node = graph.nodes[nodeId], case .tensor(let shape) = node.shape {
-          if modifiedBlock.tensorIndex == nil {
-            modifiedBlock.tensorIndex = ctx.useVariable(src: nil)
-            modifiedBlock.shape = shape
+      // Find the first tensor-shaped node (excluding view-only ops)
+      var firstTensorIdx: Int? = nil
+      for (idx, nodeId) in block.nodes.enumerated() {
+        if let node = graph.nodes[nodeId], case .tensor = node.shape {
+          switch node.op {
+          case .reshape, .transpose, .shrink, .pad, .expandView:
+            continue
+          default:
+            firstTensorIdx = idx
+            break
           }
-          break  // Only need to assign once per block
+          if firstTensorIdx != nil { break }
         }
       }
-      determined.append(modifiedBlock)
+
+      // Split scalar blocks when the leading scalar nodes contain stateful ops
+      // (accum, phasor, etc.) that must NOT execute inside the tensor element loop.
+      // The C backend wraps blocks with tensorIndex in beginParallelRange, which would
+      // cause these ops to execute N times per frame instead of once.
+      let scalarPrefixHasStatefulOps: Bool
+      if let splitIdx = firstTensorIdx, splitIdx > 0 {
+        scalarPrefixHasStatefulOps = block.nodes[0..<splitIdx].contains { nodeId in
+          guard let node = graph.nodes[nodeId] else { return false }
+          switch node.op {
+          case .accum, .phasor, .click, .latch, .noise:
+            return true
+          default:
+            return false
+          }
+        }
+      } else {
+        scalarPrefixHasStatefulOps = false
+      }
+
+      if let splitIdx = firstTensorIdx, splitIdx > 0, scalarPrefixHasStatefulOps {
+        // Emit scalar prefix as its own block (no tensorIndex)
+        var scalarBlock = Block(kind: block.kind)
+        scalarBlock.temporality = block.temporality
+        scalarBlock.nodes = Array(block.nodes[0..<splitIdx])
+        determined.append(scalarBlock)
+
+        // Emit tensor suffix with tensorIndex
+        var tensorBlock = Block(kind: block.kind)
+        tensorBlock.temporality = block.temporality
+        tensorBlock.nodes = Array(block.nodes[splitIdx...])
+        for nodeId in tensorBlock.nodes {
+          if let node = graph.nodes[nodeId], case .tensor(let shape) = node.shape {
+            tensorBlock.tensorIndex = ctx.useVariable(src: nil)
+            tensorBlock.shape = shape
+            break
+          }
+        }
+        determined.append(tensorBlock)
+      } else {
+        // No split needed — assign tensorIndex to entire block
+        var modifiedBlock = block
+        for nodeId in block.nodes {
+          if let node = graph.nodes[nodeId], case .tensor(let shape) = node.shape {
+            if modifiedBlock.tensorIndex == nil {
+              modifiedBlock.tensorIndex = ctx.useVariable(src: nil)
+              modifiedBlock.shape = shape
+            }
+            break
+          }
+        }
+        determined.append(modifiedBlock)
+      }
       continue
     }
     var innerBlocks: [Block] = []
