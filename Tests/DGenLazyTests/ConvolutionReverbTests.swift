@@ -51,6 +51,38 @@ final class ConvolutionReverbTests: XCTestCase {
     return (re, im)
   }
 
+  /// Build a Hann window as a Tensor of length N
+  private func makeHannWindow(N: Int) -> Tensor {
+    let twoPi = Float(2.0 * Float.pi)
+    var data = [Float](repeating: 0, count: N)
+    for i in 0..<N {
+      data[i] = 0.5 * (1.0 - Foundation.cos(twoPi * Float(i) / Float(N)))
+    }
+    return Tensor(data)
+  }
+
+  /// Assert that C and Metal backend results match in the stable region
+  private func assertBackendsMatch(
+    _ resultsByBackend: [String: [Float]],
+    stableStart: Int,
+    totalFrames: Int,
+    tolerance: Float = 0.01,
+    file: StaticString = #filePath,
+    line: UInt = #line
+  ) {
+    guard let cResult = resultsByBackend["c"],
+          let metalResult = resultsByBackend["metal"] else { return }
+    var maxDiff: Float = 0
+    for i in stableStart..<totalFrames {
+      maxDiff = Swift.max(maxDiff, abs(cResult[i] - metalResult[i]))
+    }
+    print("\n=== Backend comparison: max diff = \(maxDiff) ===")
+    XCTAssertLessThan(
+      maxDiff, tolerance,
+      "C and Metal backends should produce matching results",
+      file: file, line: line)
+  }
+
   /// Naive circular convolution in Swift for reference
   private func circularConvolve(_ x: [Float], _ h: [Float]) -> [Float] {
     let N = x.count
@@ -375,16 +407,7 @@ final class ConvolutionReverbTests: XCTestCase {
         "[\(ext)] Convolution with identity IR should match direct FFT→IFFT")
     }
 
-    // Compare backends
-    if let cResult = resultsByBackend["c"], let metalResult = resultsByBackend["metal"] {
-      let stableStart = N + 2 * hop
-      var maxDiff: Float = 0
-      for i in stableStart..<totalFrames {
-        maxDiff = Swift.max(maxDiff, abs(cResult[i] - metalResult[i]))
-      }
-      print("\n=== Backend comparison: max diff = \(maxDiff) ===")
-      XCTAssertLessThan(maxDiff, 0.01, "C and Metal backends should produce matching results")
-    }
+    assertBackendsMatch(resultsByBackend, stableStart: N + 2 * hop, totalFrames: totalFrames)
   }
 
   /// Frequency-domain filtering: zero out bins to create a brick-wall filter.
@@ -599,12 +622,7 @@ final class ConvolutionReverbTests: XCTestCase {
       DGenConfig.kernelOutputPath = "/tmp/test_vocoder_windowed.\(ext)"
       defer { DGenConfig.kernelOutputPath = nil }
 
-      // Build Hann window as a static Tensor
-      var hannData = [Float](repeating: 0, count: N)
-      for i in 0..<N {
-        hannData[i] = 0.5 * (1.0 - Foundation.cos(twoPi * Float(i) / Float(N)))
-      }
-      let hannWindow = Tensor(hannData)
+      let hannWindow = makeHannWindow(N: N)
 
       // --- Windowed vocoder ---
       LazyGraphContext.reset()
@@ -645,16 +663,7 @@ final class ConvolutionReverbTests: XCTestCase {
       XCTAssertGreaterThan(windowedPeak, 0.01, "[\(ext)] Windowed output should not be silent")
     }
 
-    // Compare backends
-    if let cResult = resultsByBackend["c"], let metalResult = resultsByBackend["metal"] {
-      let stableStart = N + 4 * hop
-      var maxDiff: Float = 0
-      for i in stableStart..<totalFrames {
-        maxDiff = Swift.max(maxDiff, abs(cResult[i] - metalResult[i]))
-      }
-      print("\n=== Backend comparison: max diff = \(maxDiff) ===")
-      XCTAssertLessThan(maxDiff, 0.01, "C and Metal backends should produce matching results")
-    }
+    assertBackendsMatch(resultsByBackend, stableStart: N + 4 * hop, totalFrames: totalFrames)
   }
 
   /// Hann-windowed FFT→IFFT pipeline: verifies the full windowed STFT chain
@@ -677,12 +686,7 @@ final class ConvolutionReverbTests: XCTestCase {
       DGenConfig.kernelOutputPath = "/tmp/test_windowed_identity.\(ext)"
       defer { DGenConfig.kernelOutputPath = nil }
 
-      // Build Hann window
-      var hannData = [Float](repeating: 0, count: N)
-      for i in 0..<N {
-        hannData[i] = 0.5 * (1.0 - Foundation.cos(twoPi * Float(i) / Float(N)))
-      }
-      let hannWindow = Tensor(hannData)
+      let hannWindow = makeHannWindow(N: N)
 
       // Windowed FFT→IFFT pipeline
       LazyGraphContext.reset()
@@ -720,16 +724,7 @@ final class ConvolutionReverbTests: XCTestCase {
         "[\(ext)] Output should be periodic at the input frequency")
     }
 
-    // Compare backends
-    if let cResult = resultsByBackend["c"], let metalResult = resultsByBackend["metal"] {
-      let stableStart = N + 4 * hop
-      var maxDiff: Float = 0
-      for i in stableStart..<totalFrames {
-        maxDiff = Swift.max(maxDiff, abs(cResult[i] - metalResult[i]))
-      }
-      print("\n=== Backend comparison: max diff = \(maxDiff) ===")
-      XCTAssertLessThan(maxDiff, 0.01, "C and Metal backends should produce matching results")
-    }
+    assertBackendsMatch(resultsByBackend, stableStart: N + 4 * hop, totalFrames: totalFrames)
   }
 
   /// Minimal test: buffer * hann → overlapAdd (no FFT) to isolate windowing scaling
@@ -741,7 +736,6 @@ final class ConvolutionReverbTests: XCTestCase {
     DGenConfig.sampleRate = sr
     defer { DGenConfig.sampleRate = 44100.0 }
 
-    let twoPi = Float(2.0 * Float.pi)
     let totalFrames = N + 8 * hop
     var resultsByBackend: [String: [Float]] = [:]
 
@@ -750,11 +744,7 @@ final class ConvolutionReverbTests: XCTestCase {
       DGenConfig.kernelOutputPath = "/tmp/test_windowed_ola_scale.\(ext)"
       defer { DGenConfig.kernelOutputPath = nil }
 
-      var hannData = [Float](repeating: 0, count: N)
-      for i in 0..<N {
-        hannData[i] = 0.5 * (1.0 - Foundation.cos(twoPi * Float(i) / Float(N)))
-      }
-      let hannWindow = Tensor(hannData)
+      let hannWindow = makeHannWindow(N: N)
 
       // Just buffer → window → overlapAdd (no FFT)
       LazyGraphContext.reset()
@@ -777,16 +767,7 @@ final class ConvolutionReverbTests: XCTestCase {
       XCTAssertEqual(mean, 2.0, accuracy: 0.01, "[\(ext)] Hann COLA at 75% overlap should be ~2.0")
     }
 
-    // Compare backends
-    if let cResult = resultsByBackend["c"], let metalResult = resultsByBackend["metal"] {
-      let stableStart = N + 4 * hop
-      var maxDiff: Float = 0
-      for i in stableStart..<totalFrames {
-        maxDiff = Swift.max(maxDiff, abs(cResult[i] - metalResult[i]))
-      }
-      print("\n=== Backend comparison: max diff = \(maxDiff) ===")
-      XCTAssertLessThan(maxDiff, 0.01, "C and Metal backends should produce matching results")
-    }
+    assertBackendsMatch(resultsByBackend, stableStart: N + 4 * hop, totalFrames: totalFrames)
   }
 
   /// Larger FFT size to test scaling (N=64)

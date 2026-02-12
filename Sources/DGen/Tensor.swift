@@ -397,7 +397,7 @@ extension Graph {
     return tensor(shape: shape, data: [Float](repeating: 0.0, count: size))
   }
 
-  /// Create a tensor filled with ones
+  /// Create a Hann window tensor of length N
   public func hann(N: Int) -> NodeID {
     var hannData = [Float](repeating: 0, count: N)
     let twoPi = Float(2.0 * Float.pi)

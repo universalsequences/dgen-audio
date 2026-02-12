@@ -24,6 +24,7 @@ public class IRContext {
 
   // Temporality data from analysis (set during compilation)
   public var frameBasedNodes: Set<NodeID> = []
+  /// Maps hop-based nodes to their (hopSize, counterNodeId) info
   public var hopBasedNodes: [NodeID: (Int, NodeID)] = [:]
 
   // Nodes that are part of frame-dependent tensor chains (for SIMD-across-frames optimization)

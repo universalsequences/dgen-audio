@@ -1373,7 +1373,7 @@ final class GraphGradientTests: XCTestCase {
 
     // Check scalar nodes
     let feedbackClusters = findFeedbackLoops(g)
-    let scalarSet = scalarNodes(g, feedbackClusters: feedbackClusters)
+    let scalarSet = findSequentialNodes(g, feedbackClusters: feedbackClusters)
 
     print("\nNode analysis:")
     for (nodeId, node) in g.nodes.sorted(by: { $0.key < $1.key }) {

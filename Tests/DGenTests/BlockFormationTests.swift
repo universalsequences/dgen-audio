@@ -58,7 +58,7 @@ final class BlockFormationTests: XCTestCase {
         print(feedbackClusters)
 
         // Step 2: Get scalar nodes
-        let scalarNodeSet = scalarNodes(g, feedbackClusters: feedbackClusters, backend: .c)
+        let scalarNodeSet = findSequentialNodes(g, feedbackClusters: feedbackClusters, backend: .c)
         print("\n=== Scalar Nodes ===")
         for nodeId in scalarNodeSet.sorted() {
             if let node = g.nodes[nodeId] {
@@ -67,7 +67,7 @@ final class BlockFormationTests: XCTestCase {
         }
 
         // Step 3: Topological sort
-        let sortedNodes = topoWithCorridors(g, feedbackClusters: feedbackClusters, scalarNodeSet: scalarNodeSet, debug: true)
+        let sortedNodes = topologicalSort(g, feedbackClusters: feedbackClusters, scalarNodeSet: scalarNodeSet, debug: true)
         print("\n=== Sorted Nodes ===")
         for nodeId in sortedNodes {
             if let node = g.nodes[nodeId] {
@@ -88,13 +88,13 @@ final class BlockFormationTests: XCTestCase {
         }
 
         // Step 5: Determine blocks (simple)
-        let blocks = determineBlocksSimple(
+        let blocks = partitionIntoBlocks(
             sorted: sortedNodes,
             scalar: scalarNodeSet,
             g: g,
             debug: true
         )
-        printBlockStructure(blocks: blocks, graph: g, scalarSet: scalarNodeSet, title: "After determineBlocksSimple")
+        printBlockStructure(blocks: blocks, graph: g, scalarSet: scalarNodeSet, title: "After partitionIntoBlocks")
 
         // Step 6: Fuse blocks
         let fusedBlocks = fuseBlocks(blocks, g)
@@ -217,7 +217,7 @@ final class BlockFormationTests: XCTestCase {
 
         // Compile and check
         let feedbackClusters = findFeedbackLoops(g)
-        let scalarNodeSet = scalarNodes(g, feedbackClusters: feedbackClusters, backend: .c)
+        let scalarNodeSet = findSequentialNodes(g, feedbackClusters: feedbackClusters, backend: .c)
 
         print("\n=== User Patch Scalar Nodes ===")
         for nodeId in scalarNodeSet.sorted() {
@@ -299,13 +299,13 @@ final class BlockFormationTests: XCTestCase {
 
         // Step through compilation
         let feedbackClusters = findFeedbackLoops(g)
-        let scalarNodeSet = scalarNodes(g, feedbackClusters: feedbackClusters, backend: .c)
-        let sortedNodes = topoWithCorridors(g, feedbackClusters: feedbackClusters, scalarNodeSet: scalarNodeSet, debug: true)
+        let scalarNodeSet = findSequentialNodes(g, feedbackClusters: feedbackClusters, backend: .c)
+        let sortedNodes = topologicalSort(g, feedbackClusters: feedbackClusters, scalarNodeSet: scalarNodeSet, debug: true)
 
         try inferShapes(graph: g, sortedNodes: sortedNodes)
         allocateTensorOutputs(graph: g, sortedNodes: sortedNodes)
 
-        let blocks = determineBlocksSimple(sorted: sortedNodes, scalar: scalarNodeSet, g: g, debug: true)
+        let blocks = partitionIntoBlocks(sorted: sortedNodes, scalar: scalarNodeSet, g: g, debug: true)
         let fusedBlocks = fuseBlocks(blocks, g)
         let isolatedBlocks = isolateSpectralPasses(fusedBlocks, g)
         let reFusedBlocks = fuseBlocks(isolatedBlocks, g)
@@ -350,13 +350,13 @@ final class BlockFormationTests: XCTestCase {
 
         // Step through compilation
         let feedbackClusters = findFeedbackLoops(g)
-        let scalarNodeSet = scalarNodes(g, feedbackClusters: feedbackClusters, backend: .c)
-        let sortedNodes = topoWithCorridors(g, feedbackClusters: feedbackClusters, scalarNodeSet: scalarNodeSet, debug: true)
+        let scalarNodeSet = findSequentialNodes(g, feedbackClusters: feedbackClusters, backend: .c)
+        let sortedNodes = topologicalSort(g, feedbackClusters: feedbackClusters, scalarNodeSet: scalarNodeSet, debug: true)
 
         try inferShapes(graph: g, sortedNodes: sortedNodes)
         allocateTensorOutputs(graph: g, sortedNodes: sortedNodes)
 
-        let blocks = determineBlocksSimple(sorted: sortedNodes, scalar: scalarNodeSet, g: g, debug: true)
+        let blocks = partitionIntoBlocks(sorted: sortedNodes, scalar: scalarNodeSet, g: g, debug: true)
         let fusedBlocks = fuseBlocks(blocks, g)
         let isolatedBlocks = isolateSpectralPasses(fusedBlocks, g)
         let reFusedBlocks = fuseBlocks(isolatedBlocks, g)

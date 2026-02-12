@@ -8,8 +8,8 @@ public struct CompilationResult {
   /// Topologically sorted node IDs
   public let sortedNodes: [NodeID]
 
-  /// Set of nodes that must execute in scalar mode
-  public let scalarNodes: Set<NodeID>
+  /// Set of nodes that must execute sequentially (not SIMD-parallelizable)
+  public let sequentialNodes: Set<NodeID>
 
   /// Blocks before sorting by dependencies
   public let blocks: [Block]
@@ -100,7 +100,7 @@ public struct CompilationPipeline {
       return result
     }
 
-    // Step 1: Topological sort that respects scalar corridors
+    // Step 1: Topological sort that respects feedback groups
     let feedbackClusters = time("findFeedbackLoops") {
       findFeedbackLoops(graph)
     }
@@ -116,14 +116,14 @@ public struct CompilationPipeline {
       foldConstants(graph, options: options)
     }
 
-    let scalarNodeSet = time("scalarNodes") {
+    let scalarNodeSet = time("findSequentialNodes") {
       options.forceScalar
         ? Set(graph.nodes.keys)
-        : scalarNodes(graph, feedbackClusters: feedbackClusters, backend: backend)
+        : findSequentialNodes(graph, feedbackClusters: feedbackClusters, backend: backend)
     }
 
-    let sortedNodes = time("topoWithCorridors") {
-      topoWithCorridors(
+    let sortedNodes = time("topologicalSort") {
+      topologicalSort(
         graph, feedbackClusters: feedbackClusters, scalarNodeSet: scalarNodeSet,
         debug: false)
     }
@@ -167,9 +167,9 @@ public struct CompilationPipeline {
       }
     }
 
-    // Step 3: Determine blocks (simplified since corridors are already grouped)
+    // Step 3: Determine blocks (feedback groups are already grouped)
     let blocks = time("determineBlocks") {
-      determineBlocksSimple(
+      partitionIntoBlocks(
         sorted: sortedNodes,
         scalar: finalScalarSet,
         g: graph,
@@ -177,10 +177,7 @@ public struct CompilationPipeline {
       )
     }
 
-    // Since we're using corridor-aware topological sort, blocks are already properly ordered
     // Fuse adjacent blocks of the same kind to reduce cross-block communication
-
-    // rather than having a different buffer for each value we could have one giant array and significantly reduce the number of cross-chain-blocks needed
     let fusedBlocks = time("fuseBlocks1") {
       fuseBlocks(blocks, graph)
     }
@@ -404,7 +401,7 @@ public struct CompilationPipeline {
     return CompilationResult(
       graph: graph,
       sortedNodes: sortedNodes,
-      scalarNodes: finalScalarSet,
+      sequentialNodes: finalScalarSet,
       blocks: finalBlocks,
       sortedBlockIndices: finalBlockIndices,
       sortedBlocks: finalBlocks,
@@ -480,267 +477,6 @@ private func printUOpBlocks(_ uopBlocks: [BlockUOps], blocks: [Block]) {
         print("\(String(repeating: "  ", count: indentLevel))\(uop.prettyDescription())")
       }
     }
-  }
-}
-
-// MARK: - Memory Layout Remapping
-
-/// Remap memory slots to avoid conflicts between scalar and vector operations
-/// Returns the total number of memory slots needed after remapping
-func remapVectorMemorySlots(
-  _ uopBlocks: inout [BlockUOps], cellSizes: [CellID: Int], voiceCellId: CellID?,
-  graph: Graph? = nil,
-  enableBufferReuse: Bool = false
-)
-  -> CellAllocations
-{
-  // Collect all memory operations and their execution modes
-  var memoryUsage: [CellID: Kind] = [:]
-  var allCellIds: Set<CellID> = []
-  var cellUsedInMultipleModes: Set<CellID> = []
-
-  // Helper to register a cell's usage and detect multi-mode access
-  func registerCell(_ cellId: CellID, kind: Kind) {
-    allCellIds.insert(cellId)
-
-    if let existingKind = memoryUsage[cellId] {
-      if existingKind != kind {
-        // Cell used in multiple execution modes
-        cellUsedInMultipleModes.insert(cellId)
-        // Upgrade to SIMD if any block uses it as SIMD
-        // (SIMD needs 4x space, scalar can still access first element)
-        if kind == .simd || existingKind == .simd {
-          memoryUsage[cellId] = .simd
-        }
-      }
-    } else {
-      memoryUsage[cellId] = kind
-    }
-  }
-
-  // First pass: identify which memory cells are used in which execution modes
-  for block in uopBlocks {
-    for uop in block.ops {
-      if let cellId = uop.op.memoryCellId {
-        registerCell(cellId, kind: block.kind)
-      }
-    }
-  }
-
-  if let voiceCellId = voiceCellId {
-    registerCell(voiceCellId, kind: .simd)
-  }
-
-  // Collect cells with injectable initial data (e.g. twiddle factors).
-  // These get placed at low physical offsets so their indices stay within
-  // Float32 exact integer range when passed through initial_state buffers.
-  var injectableCellIds: Set<CellID> = []
-  if let graph = graph {
-    for (_, tensor) in graph.tensors {
-      if tensor.data != nil {
-        injectableCellIds.insert(tensor.cellId)
-      }
-    }
-  }
-
-  // Liveness analysis: compute first/last use of each cell across all blocks.
-  // Cells with non-overlapping lifetimes can share the same physical memory.
-  // Only performed when enableBufferReuse is true.
-  struct LivenessInterval {
-    let cellId: CellID
-    let firstUse: Int
-    let lastUse: Int
-    let size: Int
-    let kind: Kind
-    let canReceiveReuse: Bool  // false for memoryAccumulate cells (need zeroed memory)
-  }
-
-  var reuseEligible: Set<CellID> = []
-  var intervals: [LivenessInterval] = []
-
-  if enableBufferReuse {
-    // Persistent cells: survive across frame iterations, must not be reused.
-    // Includes load/store/delay1 cells (detected from UOps) AND cells explicitly
-    // marked as persistent by graph construction (circular buffers, ring buffers).
-    var persistentCells: Set<CellID> = graph?.persistentCells ?? []
-    var accumulateCells: Set<CellID> = []  // memoryAccumulate — need zeroed memory
-    var cellFirstUse: [CellID: Int] = [:]
-    var cellLastUse: [CellID: Int] = [:]
-
-    // Compute liveness at BLOCK granularity, not UOp granularity.
-    // A cell used anywhere in a block is live for the entire block's execution,
-    // since a kernel reads/writes all its cells concurrently within the loop.
-    // Using the block index ensures two cells in the same kernel never share memory.
-    for (blockIndex, block) in uopBlocks.enumerated() {
-      for uop in block.ops {
-        if let cellId = uop.op.memoryCellId {
-          switch uop.op {
-          case .load, .store, .delay1:
-            persistentCells.insert(cellId)
-          case .memoryAccumulate:
-            accumulateCells.insert(cellId)
-          default:
-            break
-          }
-          if cellFirstUse[cellId] == nil {
-            cellFirstUse[cellId] = blockIndex
-          }
-          cellLastUse[cellId] = blockIndex
-        }
-      }
-    }
-
-    // Determine which cells are eligible for buffer reuse.
-    // Excluded: injectable (precomputed data), persistent (scalar feedback),
-    // voice cell, and dual-use cells.
-    // Frame-aware cells ARE eligible — their frame-indexed addressing is an
-    // internal layout detail; inter-block liveness is the same as any other cell.
-    // Accumulate cells can DONATE memory but cannot RECEIVE reused memory
-    // (memoryAccumulate does += which expects zero; stale data corrupts results).
-    for cellId in memoryUsage.keys {
-      if injectableCellIds.contains(cellId) { continue }
-      if persistentCells.contains(cellId) { continue }
-      if cellId == voiceCellId { continue }
-      reuseEligible.insert(cellId)
-    }
-
-    // Build sorted liveness intervals for eligible cells
-    for cellId in reuseEligible.sorted() {
-      guard let first = cellFirstUse[cellId], let last = cellLastUse[cellId] else { continue }
-      let size = cellSizes[cellId] ?? 1
-      let kind = memoryUsage[cellId] ?? .scalar
-      let canReceiveReuse = !accumulateCells.contains(cellId)
-      intervals.append(LivenessInterval(
-        cellId: cellId, firstUse: first, lastUse: last, size: size, kind: kind,
-        canReceiveReuse: canReceiveReuse))
-    }
-    intervals.sort { $0.firstUse < $1.firstUse }
-  }
-
-  // Second pass: create remapping.
-  // Strategy: injectable cells → physical offset 0+,
-  // eligible cells → greedy interval-based reuse,
-  // remaining cells → packed sequentially.
-  var cellRemapping: [CellID: CellID] = [:]
-  // When buffer reuse is enabled, pack everything contiguously (no identity mapping)
-  // to avoid huge gaps from high cell IDs. Without reuse, use identity mapping for
-  // single-element scalars to minimize remapping overhead.
-  var nextAvailableSlot = enableBufferReuse ? 0 : (allCellIds.max() ?? -1) + 1
-
-  // Place injectable cells at low offsets starting from 0
-  var nextInjectableSlot = 0
-  var reservedRange = 0  // physical slots [0, reservedRange) are taken by injectables
-  for cellId in injectableCellIds.sorted() {
-    let allocSize = cellSizes[cellId] ?? 1
-    cellRemapping[cellId] = nextInjectableSlot
-    nextInjectableSlot += allocSize
-  }
-  reservedRange = nextInjectableSlot
-  if enableBufferReuse {
-    nextAvailableSlot = max(nextAvailableSlot, reservedRange)
-  }
-
-  // Greedy interval-based allocation for reuse-eligible cells.
-  // freeRegions tracks allocated regions that may become available for reuse.
-  var freeRegions: [(offset: Int, size: Int, availableAfter: Int)] = []
-  var reusedCount = 0
-
-  for interval in intervals {
-    let needsAlignment = interval.kind == .simd
-    let allocSize = needsAlignment ? max(4, interval.size) : interval.size
-
-    // Find best-fit free region: must be available and large enough, prefer least waste.
-    // Accumulate cells (memoryAccumulate) skip reuse — they do += and need zeroed memory.
-    // They still DONATE their region to later cells after their last use.
-    var bestIdx: Int? = nil
-    var bestWaste = Int.max
-    var bestOffset = 0
-
-    if interval.canReceiveReuse {
-      for (idx, region) in freeRegions.enumerated() {
-        guard region.availableAfter < interval.firstUse else { continue }
-        let effectiveOffset = needsAlignment ? ((region.offset + 3) / 4) * 4 : region.offset
-        let usableSize = region.size - (effectiveOffset - region.offset)
-        guard usableSize >= interval.size else { continue }
-        let waste = usableSize - interval.size
-        if waste < bestWaste {
-          bestWaste = waste
-          bestIdx = idx
-          bestOffset = effectiveOffset
-        }
-      }
-    }
-
-    if let idx = bestIdx {
-      cellRemapping[interval.cellId] = bestOffset
-      freeRegions[idx].availableAfter = interval.lastUse
-      reusedCount += 1
-    } else {
-      // No reusable region — allocate fresh
-      let offset: Int
-      if needsAlignment {
-        offset = ((nextAvailableSlot + 3) / 4) * 4
-        nextAvailableSlot = offset + allocSize
-      } else {
-        offset = nextAvailableSlot
-        nextAvailableSlot += allocSize
-      }
-      cellRemapping[interval.cellId] = offset
-      freeRegions.append((offset: offset, size: allocSize, availableAfter: interval.lastUse))
-    }
-  }
-
-  // Remap non-eligible, non-injectable cells with original logic
-  for (cellId, kind) in memoryUsage.sorted(by: { $0.key < $1.key }) {
-    if injectableCellIds.contains(cellId) || reuseEligible.contains(cellId) { continue }
-    let allocSize = cellSizes[cellId] ?? 1
-
-    if kind == .simd {
-      let alignedSlot = ((nextAvailableSlot + 3) / 4) * 4
-      cellRemapping[cellId] = alignedSlot
-      nextAvailableSlot = alignedSlot + max(4, allocSize)
-    } else if allocSize > 1 {
-      cellRemapping[cellId] = nextAvailableSlot
-      nextAvailableSlot += allocSize
-    } else if enableBufferReuse || cellId < reservedRange {
-      // Pack contiguously when buffer reuse is on (no identity mapping gaps)
-      cellRemapping[cellId] = nextAvailableSlot
-      nextAvailableSlot += 1
-    } else {
-      cellRemapping[cellId] = cellId
-    }
-  }
-
-  // Third pass: apply the remapping to all UOps
-  for blockIndex in 0..<uopBlocks.count {
-    for uopIndex in 0..<uopBlocks[blockIndex].ops.count {
-      let uop = uopBlocks[blockIndex].ops[uopIndex]
-      if let remappedOp = uop.op.withRemappedCellId(cellRemapping) {
-        uopBlocks[blockIndex].ops[uopIndex] = UOp(
-          op: remappedOp,
-          value: uop.value,
-          kind: uop.kind
-        )
-      }
-    }
-  }
-
-  return CellAllocations(
-    totalMemorySlots: nextAvailableSlot,
-    cellMappings: cellRemapping,
-    cellKinds: memoryUsage
-  )
-}
-
-public struct CellAllocations {
-  public let cellKinds: [CellID: Kind]
-  public let cellMappings: [CellID: CellID]
-  public let totalMemorySlots: Int
-
-  public init(totalMemorySlots: Int, cellMappings: [CellID: CellID], cellKinds: [CellID: Kind]) {
-    self.cellKinds = cellKinds
-    self.cellMappings = cellMappings
-    self.totalMemorySlots = totalMemorySlots
   }
 }
 
@@ -960,205 +696,4 @@ private func evaluateConstantOp(_ op: LazyOp, _ inputs: [Float]) -> Float? {
   default:
     return nil
   }
-}
-
-func determineTensorBlocks(_ blocks: [Block], _ graph: Graph, _ ctx: IRContext) -> [Block] {
-  var determined: [Block] = []
-
-  // Helper to create a new block preserving original properties
-  func makeBlock(from original: Block) -> Block {
-    var newBlock = Block(kind: original.kind)
-    newBlock.temporality = original.temporality
-    return newBlock
-  }
-
-  // Assign tensorIndex from the first tensor-shaped node in the block
-  func assignTensorIndex(to block: inout Block, graph: Graph, ctx: IRContext) {
-    for nodeId in block.nodes {
-      if let node = graph.nodes[nodeId], case .tensor(let shape) = node.shape {
-        if block.tensorIndex == nil {
-          block.tensorIndex = ctx.useVariable(src: nil)
-          block.shape = shape
-        }
-        break
-      }
-    }
-  }
-
-  for block in blocks {
-    // CRITICAL: Scalar blocks (feedback clusters) must NOT be split!
-    // They contain history read/write ops that must execute sequentially together.
-    // But we still need to set up tensorIndex for tensor operations inside.
-    if block.kind == .scalar {
-      // Find the first tensor-shaped node (excluding view-only ops)
-      let firstTensorIdx = block.nodes.enumerated().first { (_, nodeId) in
-        guard let node = graph.nodes[nodeId], case .tensor = node.shape else { return false }
-        return !node.op.isViewOnly
-      }?.offset
-
-      // Split scalar blocks when the leading scalar nodes contain stateful ops
-      // (accum, phasor, etc.) that must NOT execute inside the tensor element loop.
-      // The C backend wraps blocks with tensorIndex in beginParallelRange, which would
-      // cause these ops to execute N times per frame instead of once.
-      let needsSplit: Bool
-      if let splitIdx = firstTensorIdx, splitIdx > 0 {
-        needsSplit = block.nodes[0..<splitIdx].contains { nodeId in
-          graph.nodes[nodeId]?.op.isInherentlyScalar ?? false
-        }
-      } else {
-        needsSplit = false
-      }
-
-      if let splitIdx = firstTensorIdx, needsSplit {
-        // Scalar prefix as its own block (no tensorIndex)
-        var scalarBlock = makeBlock(from: block)
-        scalarBlock.nodes = Array(block.nodes[0..<splitIdx])
-        determined.append(scalarBlock)
-
-        // Tensor suffix with tensorIndex
-        var tensorBlock = makeBlock(from: block)
-        tensorBlock.nodes = Array(block.nodes[splitIdx...])
-        assignTensorIndex(to: &tensorBlock, graph: graph, ctx: ctx)
-        determined.append(tensorBlock)
-      } else {
-        // No split needed — assign tensorIndex to entire block
-        var modifiedBlock = block
-        assignTensorIndex(to: &modifiedBlock, graph: graph, ctx: ctx)
-        determined.append(modifiedBlock)
-      }
-      continue
-    }
-    var innerBlocks: [Block] = []
-    var currentBlock = makeBlock(from: block)
-    var currentShape: Shape? = nil
-    for nodeId in block.nodes {
-      if let node = graph.nodes[nodeId] {
-        // Skip tensorRef nodes for tensor block grouping decisions.
-        //
-        // tensorRef nodes are just data containers - they emit nothing (return []).
-        // If we let them create tensor blocks, we'd get empty parallel loops:
-        //   for (int simd1 = 0; simd1 < 16; simd1+=4) { }  // empty!
-        //
-        // Instead, tensorRef nodes stay in whatever block they're in but don't
-        // trigger new tensor block creation. The actual tensor OPERATIONS (mul, add, etc.)
-        // that process tensor data will create the tensor blocks.
-        if case .tensorRef = node.op {
-          if case .tensor(let shape) = node.shape {
-            // If shape differs, split the block first
-            if currentShape != nil && shape != currentShape {
-              if currentBlock.nodes.count > 0 {
-                innerBlocks.append(currentBlock)
-              }
-              currentBlock = makeBlock(from: block)
-            }
-            currentBlock.shape = shape
-            currentBlock.tensorIndex = ctx.useVariable(src: nil)
-            currentShape = shape
-          }
-          currentBlock.nodes.append(nodeId)
-          continue
-        }
-
-        // Skip view-only ops for tensor block grouping.
-        // These emit no compute code (just marker UOps). Letting them trigger
-        // tensor block splits would create empty parallel loops.
-        if node.op.isViewOnly {
-          currentBlock.nodes.append(nodeId)
-          continue
-        }
-
-        if case .conv2d = node.op {
-          if currentShape != nil {
-            if currentBlock.nodes.count > 0 {
-              innerBlocks.append(currentBlock)
-            }
-            // regular node
-            currentBlock = makeBlock(from: block)
-          }
-          currentShape = nil
-
-        } else if case .fft = node.op {
-          // FFT is a bulk tensor operation that handles all tensor writes internally
-          // It needs its own scalar block - don't mix with SIMD ops
-          if currentBlock.nodes.count > 0 {
-            innerBlocks.append(currentBlock)
-          }
-          // Create isolated block for FFT
-          currentBlock = makeBlock(from: block)
-          currentBlock.kind = .scalar  // Force scalar execution
-          currentBlock.nodes.append(nodeId)
-          innerBlocks.append(currentBlock)
-          // Start fresh block for nodes after FFT
-          currentBlock = makeBlock(from: block)
-          currentShape = nil
-          continue  // Skip the append at end of loop
-        } else if case .constant = node.op {
-          // do nothing
-        } else if case .ifft = node.op {
-          // IFFT is a bulk operation that handles spectrum-to-time conversion
-          // It needs its own scalar block - don't mix with SIMD ops
-          if currentBlock.nodes.count > 0 {
-            innerBlocks.append(currentBlock)
-          }
-          // Create isolated block for IFFT
-          currentBlock = makeBlock(from: block)
-          currentBlock.kind = .scalar  // Force scalar execution
-          currentBlock.nodes.append(nodeId)
-          innerBlocks.append(currentBlock)
-          // Start fresh block for nodes after IFFT
-          currentBlock = makeBlock(from: block)
-          currentShape = nil
-          continue  // Skip the append at end of loop
-        } else if case .overlapAdd = node.op {
-          // overlapAdd has internal loops (scatter-add) — needs its own scalar block
-          if currentBlock.nodes.count > 0 {
-            innerBlocks.append(currentBlock)
-          }
-          currentBlock = makeBlock(from: block)
-          currentBlock.kind = .scalar
-          currentBlock.nodes.append(nodeId)
-          innerBlocks.append(currentBlock)
-          currentBlock = makeBlock(from: block)
-          currentShape = nil
-          continue
-        } else if case .tensor(let shape) = node.shape {
-          if shape != currentShape {
-            // Axis reduces (sumAxis, maxAxis, meanAxis) can stay in the same block
-            // as their input — each output thread reduces over an independent slice.
-            // Don't change block kind — shape-transition emission handles the different
-            // element counts via per-region loops while keeping the block parallelizable.
-            if currentShape != nil && isAxisReduceOp(node.op) {
-              currentShape = shape
-            } else {
-              if currentBlock.nodes.count > 0 {
-                innerBlocks.append(currentBlock)
-              }
-              // tensor block
-              currentBlock = makeBlock(from: block)
-              currentBlock.tensorIndex = ctx.useVariable(src: nil)
-              currentBlock.shape = shape
-              currentShape = shape
-            }
-          }
-        } else {
-          if currentShape != nil {
-            if currentBlock.nodes.count > 0 {
-              innerBlocks.append(currentBlock)
-            }
-            // regular node
-            currentBlock = makeBlock(from: block)
-          }
-          currentShape = nil
-        }
-      }
-      currentBlock.nodes.append(nodeId)
-    }
-    if currentBlock.nodes.count > 0 {
-      innerBlocks.append(currentBlock)
-    }
-    for block in innerBlocks {
-      determined.append(block)
-    }
-  }
-  return determined
 }

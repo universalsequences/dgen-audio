@@ -17,11 +17,7 @@ internal class WeakRef<T: AnyObject> {
 /// Users don't create this directly; it's managed implicitly
 public class LazyGraph {
   private static var _nextId: Int = 1
-  public var id: Int = {
-    let id = LazyGraph._nextId
-    LazyGraph._nextId += 1
-    return id
-  }()
+  public var id: Int
 
   /// The underlying DGen graph
   internal let graph: Graph
@@ -49,6 +45,8 @@ public class LazyGraph {
 
   public init(sampleRate: Float = DGenConfig.sampleRate,
               maxFrameCount: Int = DGenConfig.maxFrameCount) {
+    self.id = LazyGraph._nextId
+    LazyGraph._nextId += 1
     self.graph = Graph(sampleRate: sampleRate, maxFrameCount: maxFrameCount)
   }
 

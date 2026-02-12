@@ -95,7 +95,7 @@ final class IdentityFoldingCrossBlockTests: XCTestCase {
   // MARK: - Nested feedback (allpass filter) with identity folding
 
   /// Allpass filters in series use history() feedback + delay, creating
-  /// scalar corridors with cross-block dependencies. Identity folds on
+  /// feedback groups with cross-block dependencies. Identity folds on
   /// the output path must not break the defineGlobal chain.
   func testNestedFeedbackAllpassWithMulByOne() throws {
     func allpass(_ input: Signal, _ delayTime: Signal, _ delayMult: Signal) -> Signal {
