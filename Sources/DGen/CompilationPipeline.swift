@@ -122,6 +122,12 @@ public struct CompilationPipeline {
     let sortedNodes: [NodeID]
   }
 
+  /// Temporality analysis artifacts used by later block/layout passes.
+  private struct BlockTemporalityResult {
+    let frameBasedNodes: Set<NodeID>
+    let hopBasedNodes: [NodeID: (Int, NodeID)]
+  }
+
   /// Compile a graph with the specified backend and options
   public static func compile(
     graph: Graph,
@@ -144,15 +150,28 @@ public struct CompilationPipeline {
       graph: graph, sortedNodes: prep.sortedNodes, scalarNodeSet: finalScalarSet, context: context,
       timings: &timings)
 
-    assignTemporalityAndAllocateTensorMemory(
+    let temporalityResult = inferAndAssignTemporality(
       graph: graph,
       sortedNodes: prep.sortedNodes,
-      feedbackClusters: prep.feedbackClusters,
       blocks: &finalBlocks,
+      context: context,
+      timings: &timings
+    )
+    applyBackendBlockSafetySplitsIfNeeded(
+      graph: graph,
+      backend: backend,
+      blocks: &finalBlocks
+    )
+    materializeTensorMemory(
+      graph: graph,
+      blocks: finalBlocks,
+      temporality: temporalityResult,
+      feedbackClusters: prep.feedbackClusters,
       context: context,
       backend: backend,
       frameCount: options.frameCount,
-      timings: &timings)
+      timings: &timings
+    )
 
     let finalBlockIndices = Array(0..<finalBlocks.count)
     if options.printBlockStructure {
@@ -255,7 +274,8 @@ public struct CompilationPipeline {
     }
 
     timings.measure("allocateTensorOutputs") {
-      allocateTensorOutputs(graph: graph, sortedNodes: sortedNodes)
+      TensorOutputBindingPass.bindTensorOutputsAndReserveLazyCells(
+        graph: graph, sortedNodes: sortedNodes)
     }
 
     return GraphPreparationResult(
@@ -306,36 +326,54 @@ public struct CompilationPipeline {
     }
   }
 
-  /// Applies temporality metadata, backend-specific block splitting, and tensor memory allocation.
-  private static func assignTemporalityAndAllocateTensorMemory(
-    graph: Graph, sortedNodes: [NodeID], feedbackClusters: [[NodeID]], blocks: inout [Block],
-    context: IRContext, backend: Backend, frameCount: Int, timings: inout PipelineTimings
-  ) {
+  /// Infers temporality and assigns block temporality metadata.
+  private static func inferAndAssignTemporality(
+    graph: Graph, sortedNodes: [NodeID], blocks: inout [Block], context: IRContext,
+    timings: inout PipelineTimings
+  ) -> BlockTemporalityResult {
     let temporalityResult = timings.measure("inferTemporality") {
-      inferTemporality(graph: graph, sortedNodes: sortedNodes)
+      TemporalityPass.inferTemporality(graph: graph, sortedNodes: sortedNodes)
     }
 
     timings.measure("assignTemporality") {
-      assignBlockTemporality(
+      TemporalityPass.assignBlockTemporality(
         blocks: &blocks,
         frameBasedNodes: temporalityResult.frameBasedNodes,
         hopBasedNodes: temporalityResult.hopBasedNodes
       )
       context.hopBasedNodes = temporalityResult.hopBasedNodes
     }
+    return BlockTemporalityResult(
+      frameBasedNodes: temporalityResult.frameBasedNodes,
+      hopBasedNodes: temporalityResult.hopBasedNodes
+    )
+  }
 
-    if backend == .metal {
-      blocks = splitReduceBlocks(g: graph, blocks: blocks)
-      blocks = splitMemoryBlocks(g: graph, blocks: blocks)
-    }
+  /// Applies backend-specific block splits that require hard kernel boundaries.
+  private static func applyBackendBlockSafetySplitsIfNeeded(
+    graph: Graph, backend: Backend, blocks: inout [Block]
+  ) {
+    blocks = BackendBlockSafetySplitPass.applyIfNeeded(graph: graph, blocks: blocks, backend: backend)
+  }
 
+  /// Materializes lazy tensor cells after temporality and backend block layout are finalized.
+  private static func materializeTensorMemory(
+    graph: Graph,
+    blocks: [Block],
+    temporality: BlockTemporalityResult,
+    feedbackClusters: [[NodeID]],
+    context: IRContext,
+    backend: Backend,
+    frameCount: Int,
+    timings: inout PipelineTimings
+  ) {
     timings.measure("allocateTensorMemory") {
       let feedbackClusterNodes = Set(feedbackClusters.flatMap { $0 })
-      allocateTensorMemory(
+      TensorMemoryMaterializationPass.allocateTensorMemory(
         graph: graph,
         blocks: blocks,
-        frameBasedNodes: temporalityResult.frameBasedNodes,
-        hopBasedNodes: temporalityResult.hopBasedNodes,
+        frameBasedNodes: temporality.frameBasedNodes,
+        hopBasedNodes: temporality.hopBasedNodes,
         feedbackClusterNodes: feedbackClusterNodes,
         backend: backend,
         frameCount: frameCount

@@ -192,15 +192,15 @@ final class TypeCheckerTests: XCTestCase {
     // MARK: - Temporality Inference Tests
 
     func testPhasorIsFrameBased() {
-        XCTAssertTrue(isIntrinsicallyFrameBased(.phasor(0)))
+        XCTAssertTrue(TemporalityPass.isIntrinsicallyFrameBased(.phasor(0)))
     }
 
     func testConstantIsNotFrameBased() {
-        XCTAssertFalse(isIntrinsicallyFrameBased(.constant(1.0)))
+        XCTAssertFalse(TemporalityPass.isIntrinsicallyFrameBased(.constant(1.0)))
     }
 
     func testHistoryReadIsFrameBased() {
-        XCTAssertTrue(isIntrinsicallyFrameBased(.historyRead(0)))
+        XCTAssertTrue(TemporalityPass.isIntrinsicallyFrameBased(.historyRead(0)))
     }
 
     func testTemporalityPropagates() {
@@ -215,7 +215,7 @@ final class TypeCheckerTests: XCTestCase {
         let scaled = g.n(.mul, phasor, scale)
 
         let sortedNodes = [freq, phasor, scale, scaled]
-        let temporalityResult = inferTemporality(graph: g, sortedNodes: sortedNodes)
+        let temporalityResult = TemporalityPass.inferTemporality(graph: g, sortedNodes: sortedNodes)
         let frameBased = temporalityResult.frameBasedNodes
 
         XCTAssertFalse(frameBased.contains(freq))  // constant is static

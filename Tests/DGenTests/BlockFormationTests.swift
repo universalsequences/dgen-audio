@@ -78,7 +78,7 @@ final class BlockFormationTests: XCTestCase {
 
         // Step 4: Shape inference
         try inferShapes(graph: g, sortedNodes: sortedNodes)
-        allocateTensorOutputs(graph: g, sortedNodes: sortedNodes)
+        TensorOutputBindingPass.bindTensorOutputsAndReserveLazyCells(graph: g, sortedNodes: sortedNodes)
 
         print("\n=== Node Shapes After Inference ===")
         for nodeId in sortedNodes {
@@ -114,7 +114,7 @@ final class BlockFormationTests: XCTestCase {
         printBlockStructure(blocks: tensorBlocks, graph: g, scalarSet: scalarNodeSet, title: "After determineTensorBlocks")
 
         // Step 10: Infer temporality
-        let temporalityResult = inferTemporality(graph: g, sortedNodes: sortedNodes)
+        let temporalityResult = TemporalityPass.inferTemporality(graph: g, sortedNodes: sortedNodes)
         let frameBasedNodes = temporalityResult.frameBasedNodes
         print("\n=== Frame-Based Nodes ===")
         for nodeId in frameBasedNodes.sorted() {
@@ -124,7 +124,7 @@ final class BlockFormationTests: XCTestCase {
         }
 
         var finalBlocks = tensorBlocks
-        assignBlockTemporality(
+        TemporalityPass.assignBlockTemporality(
             blocks: &finalBlocks,
             frameBasedNodes: frameBasedNodes,
             hopBasedNodes: temporalityResult.hopBasedNodes
@@ -303,7 +303,7 @@ final class BlockFormationTests: XCTestCase {
         let sortedNodes = topologicalSort(g, feedbackClusters: feedbackClusters, scalarNodeSet: scalarNodeSet, debug: true)
 
         try inferShapes(graph: g, sortedNodes: sortedNodes)
-        allocateTensorOutputs(graph: g, sortedNodes: sortedNodes)
+        TensorOutputBindingPass.bindTensorOutputsAndReserveLazyCells(graph: g, sortedNodes: sortedNodes)
 
         let blocks = partitionIntoBlocks(sorted: sortedNodes, scalar: scalarNodeSet, g: g, debug: true)
         let fusedBlocks = fuseBlocks(blocks)
@@ -313,9 +313,9 @@ final class BlockFormationTests: XCTestCase {
         let context = IRContext(g: g)
         let tensorBlocks = determineTensorBlocks(reFusedBlocks, g, context)
 
-        let temporalityResult = inferTemporality(graph: g, sortedNodes: sortedNodes)
+        let temporalityResult = TemporalityPass.inferTemporality(graph: g, sortedNodes: sortedNodes)
         var finalBlocks = tensorBlocks
-        assignBlockTemporality(
+        TemporalityPass.assignBlockTemporality(
             blocks: &finalBlocks,
             frameBasedNodes: temporalityResult.frameBasedNodes,
             hopBasedNodes: temporalityResult.hopBasedNodes
@@ -354,7 +354,7 @@ final class BlockFormationTests: XCTestCase {
         let sortedNodes = topologicalSort(g, feedbackClusters: feedbackClusters, scalarNodeSet: scalarNodeSet, debug: true)
 
         try inferShapes(graph: g, sortedNodes: sortedNodes)
-        allocateTensorOutputs(graph: g, sortedNodes: sortedNodes)
+        TensorOutputBindingPass.bindTensorOutputsAndReserveLazyCells(graph: g, sortedNodes: sortedNodes)
 
         let blocks = partitionIntoBlocks(sorted: sortedNodes, scalar: scalarNodeSet, g: g, debug: true)
         let fusedBlocks = fuseBlocks(blocks)
@@ -364,9 +364,9 @@ final class BlockFormationTests: XCTestCase {
         let context = IRContext(g: g)
         let tensorBlocks = determineTensorBlocks(reFusedBlocks, g, context)
 
-        let temporalityResult = inferTemporality(graph: g, sortedNodes: sortedNodes)
+        let temporalityResult = TemporalityPass.inferTemporality(graph: g, sortedNodes: sortedNodes)
         var finalBlocks = tensorBlocks
-        assignBlockTemporality(
+        TemporalityPass.assignBlockTemporality(
             blocks: &finalBlocks,
             frameBasedNodes: temporalityResult.frameBasedNodes,
             hopBasedNodes: temporalityResult.hopBasedNodes
