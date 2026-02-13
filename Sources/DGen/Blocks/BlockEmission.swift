@@ -313,8 +313,9 @@ private func prepareOutboundTensorCells(
 
 /// Emits the standard (non shape-aware) body UOps for a block.
 ///
-/// This path handles optional thread scaling, per-node emission, and BPTT wrapping when the
-/// block contains a forward/backward split with carry-state history writes.
+/// This path handles optional thread scaling, per-node emission, and Backpropagation Through
+/// Time (BPTT) wrapping when the block contains a forward/backward split with carry-state
+/// history writes.
 ///
 /// - Parameters:
 ///   - ctx: Emission context used by node emitters.
@@ -471,22 +472,23 @@ private func applyKind(_ kind: Kind, to bodyUops: inout [UOp]) {
 /// outer tensor loop wrapper from this helper.
 ///
 /// - Parameters:
+///   - ctx: Emission context used for loop-close bookkeeping values.
 ///   - bodyUops: Emitted block body operations.
 ///   - block: Block metadata containing tensor index and shape.
 ///   - backend: Target backend.
 ///   - useShapeAwareEmission: Whether body UOps already include element loops.
 ///   - simdIncrement: Loop increment for tensor iteration.
 ///   - effectiveKind: Final operation kind applied to the loop wrapper.
-/// - Returns: Tuple of final UOps and whether a tensor loop wrapper was added.
+/// - Returns: Final UOps, including both loop begin/end when wrapping is required.
 private func wrapBodyUOpsWithTensorLoopIfNeeded(
-  bodyUops: [UOp], block: Block, backend: Backend,
+  ctx: IRContext, bodyUops: [UOp], block: Block, backend: Backend,
   useShapeAwareEmission: Bool, simdIncrement: Int, effectiveKind: Kind
-) -> (uops: [UOp], needsTensorLoop: Bool) {
+) -> [UOp] {
   // Build final UOps array with parallelRange wrapper if needed.
   // Note: frame-aware tensor blocks DON'T use parallelRange (no loop).
   var uops: [UOp] = []
 
-  // C backend wraps tensor ops in a sequential loop.
+  // C uses an explicit sequential tensor loop; Metal uses thread-grid iteration
   // Skip if using shape-aware emission (it has its own loops).
   let needsTensorLoop = (backend == .c) && !useShapeAwareEmission
   if needsTensorLoop, let tensorIndex = block.tensorIndex,
@@ -499,7 +501,13 @@ private func wrapBodyUOpsWithTensorLoopIfNeeded(
   }
 
   uops.append(contentsOf: bodyUops)
-  return (uops: uops, needsTensorLoop: needsTensorLoop)
+
+  // Close the tensor loop wrapper for C backend non shape-aware emission.
+  if needsTensorLoop, block.tensorIndex != nil {
+    uops.append(UOp(op: .endParallelRange, value: ctx.useVariable(src: nil)))
+  }
+
+  return uops
 }
 
 /// Inserts cross-block global define/load operations for scalar dependencies.
@@ -611,18 +619,13 @@ public func emitBlockUOps(
   let simdPlan = determineSIMDPlan(bodyUops: bodyUops, block: block, backend: backend)
   applyKind(simdPlan.effectiveKind, to: &bodyUops)
 
-  var (uops, needsTensorLoop) = wrapBodyUOpsWithTensorLoopIfNeeded(
-    bodyUops: bodyUops, block: block, backend: backend,
+  var uops = wrapBodyUOpsWithTensorLoopIfNeeded(
+    ctx: ctx, bodyUops: bodyUops, block: block, backend: backend,
     useShapeAwareEmission: useShapeAwareEmission,
     simdIncrement: simdPlan.simdIncrement, effectiveKind: simdPlan.effectiveKind)
 
   wireCrossBlockGlobals(
     uops: &uops, emittedNodes: emittedNodes, ctx: ctx, block: block, blocks: blocks, g: g)
-
-  // Close the tensor loop for C backend and hop-based Metal blocks.
-  if needsTensorLoop, block.tensorIndex != nil {
-    uops.append(UOp(op: .endParallelRange, value: ctx.useVariable(src: nil)))
-  }
 
   return (uops: uops, effectiveKind: simdPlan.effectiveKind)
 }

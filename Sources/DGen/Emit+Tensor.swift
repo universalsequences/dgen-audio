@@ -183,6 +183,8 @@ extension LazyOp {
 
         // Read from input tensor — or compute inline if fused with expand
         let val: Expr
+        // Fusion fast-path: if this input cell was produced by a skipped expand/mul region,
+        // compute the product from its original source tensors inline while reducing.
         if let (aTensor, bTensor) = ctx.inlineableReduceInputs[inTensor.cellId] {
           // Fused path: compute A * B inline instead of reading from memory.
           // The mul's input tensors have view transforms (reshape, expand) that

@@ -6,3 +6,13 @@ type_design_doc.md
 /tape_example
 test_run_with_debug
 .DS_Store
+tinygrad_fft_1024_full.txt
+tinygrad_fft_256.py
+tinygrad_fft_64_full.txt
+TINYGRAD_FFT_ANALYSIS.md
+tinygrad_fft_output.txt
+tinygrad_fft_simple.py
+TINYGRAD_FFT_SUMMARY.md
+tinygrad_fft_test.py
+tinygrad_kernel_example.metal
+TINYGRAD_KERNEL_STATS.txt

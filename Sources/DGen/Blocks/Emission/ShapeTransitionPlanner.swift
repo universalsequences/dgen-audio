@@ -124,6 +124,206 @@ func computeShapeAwareOutboundCells(
   return outbound
 }
 
+/// Candidate for fusing an expand/mul region into the following axis-reduce region.
+private struct FusableReduceCandidate {
+  let transitionIndex: Int
+  let reduceNodeId: NodeID
+  let mulNodeId: NodeID
+  let regionNodeSlice: ArraySlice<NodeID>
+  let regionNodeSet: Set<NodeID>
+  let intermediateCell: CellID
+  let mulInputTensors: (Tensor, Tensor)
+}
+
+/// Returns true when an op is allowed in a skipped expand/matmul-prep region.
+///
+/// - Parameter op: Operation to classify.
+/// - Returns: `true` if the op is metadata or reshape/expand plumbing and safe to skip.
+private func isAllowedExpandRegionOp(_ op: LazyOp) -> Bool {
+  switch op {
+  case .tensorRef(_), .reshape(_), .transpose(_), .expand(_),
+    .expandAxis(_, _), .expandView(_), .shrink(_), .constant(_):
+    return true
+  default:
+    return false
+  }
+}
+
+/// Finds the node range covered by a transition, excluding the next transition boundary.
+///
+/// - Parameters:
+///   - transitionIndex: Region transition index.
+///   - transitions: All shape transitions.
+///   - block: Block containing the nodes.
+/// - Returns: Node slice for the transition region, or `nil` when there is no following transition.
+private func regionNodeSlice(
+  transitionIndex: Int,
+  transitions: [(nodeIndex: Int, shape: [Int])],
+  block: Block
+) -> ArraySlice<NodeID>? {
+  let nextIdx = transitionIndex + 1
+  guard nextIdx < transitions.count else { return nil }
+  let start = transitions[transitionIndex].nodeIndex
+  let end = transitions[nextIdx].nodeIndex
+  return block.nodes[start..<end]
+}
+
+/// Finds the leading axis-reduce node of the next transition.
+///
+/// - Parameters:
+///   - transitionIndex: Current transition index.
+///   - transitions: All shape transitions.
+///   - block: Block containing the nodes.
+///   - g: Graph containing node definitions.
+/// - Returns: Node ID of the next region's reduce op when it is axis-reduce.
+private func nextAxisReduceNodeId(
+  transitionIndex: Int,
+  transitions: [(nodeIndex: Int, shape: [Int])],
+  block: Block,
+  g: Graph
+) -> NodeID? {
+  let nextIdx = transitionIndex + 1
+  guard nextIdx < transitions.count else { return nil }
+  let nodeId = block.nodes[transitions[nextIdx].nodeIndex]
+  guard let node = g.nodes[nodeId], isAxisReduceOp(node.op) else { return nil }
+  return nodeId
+}
+
+/// Extracts mul producer metadata for an axis-reduce, validating regional ownership.
+///
+/// - Parameters:
+///   - reduceNodeId: Axis-reduce node ID.
+///   - regionNodeSet: Node IDs belonging to the candidate expand region.
+///   - blockOutbound: Tensor cells required by later blocks.
+///   - g: Graph containing node/tensor metadata.
+/// - Returns: Mul node ID, intermediate product cell, and mul input tensors when valid.
+private func extractMulProducerInfo(
+  reduceNodeId: NodeID,
+  regionNodeSet: Set<NodeID>,
+  blockOutbound: Set<CellID>,
+  g: Graph
+) -> (mulNodeId: NodeID, intermediateCell: CellID, mulInputTensors: (Tensor, Tensor))? {
+  guard let reduceNode = g.nodes[reduceNodeId],
+    let mulNodeId = reduceNode.inputs.first,
+    let mulNode = g.nodes[mulNodeId],
+    case .mul = mulNode.op,
+    mulNode.inputs.count == 2,
+    regionNodeSet.contains(mulNodeId)
+  else { return nil }
+
+  guard let intermediateTensorId = g.nodeToTensor[mulNodeId],
+    let intermediateTensor = g.tensors[intermediateTensorId]
+  else { return nil }
+  let intermediateCell = intermediateTensor.cellId
+  guard !blockOutbound.contains(intermediateCell) else { return nil }
+
+  guard let aTensorId = g.nodeToTensor[mulNode.inputs[0]],
+    let aTensor = g.tensors[aTensorId],
+    let bTensorId = g.nodeToTensor[mulNode.inputs[1]],
+    let bTensor = g.tensors[bTensorId]
+  else { return nil }
+
+  return (
+    mulNodeId: mulNodeId,
+    intermediateCell: intermediateCell,
+    mulInputTensors: (aTensor, bTensor)
+  )
+}
+
+/// Validates that all nodes in the region are safe expand/matmul-prep operations.
+///
+/// - Parameters:
+///   - regionNodeSlice: Ordered nodes in the candidate region.
+///   - mulNodeId: Mul node that may be fused into the following reduce.
+///   - g: Graph containing node definitions.
+/// - Returns: `true` when every non-mul op is allowed in skipped regions.
+private func regionContainsOnlyExpandPrepOps(
+  regionNodeSlice: ArraySlice<NodeID>,
+  mulNodeId: NodeID,
+  g: Graph
+) -> Bool {
+  regionNodeSlice.allSatisfy { nodeId in
+    guard let node = g.nodes[nodeId] else { return true }
+    if nodeId == mulNodeId { return true }
+    return isAllowedExpandRegionOp(node.op)
+  }
+}
+
+/// Checks if nodes in the candidate region are consumed outside the region and reduce.
+///
+/// - Parameters:
+///   - regionNodeSet: Candidate region nodes.
+///   - reduceNodeId: Reduce node allowed to consume region outputs.
+///   - g: Graph containing full consumer relationships.
+/// - Returns: `true` when an external consumer exists and fusion would be unsafe.
+private func hasExternalConsumersOutsideRegion(
+  regionNodeSet: Set<NodeID>,
+  reduceNodeId: NodeID,
+  g: Graph
+) -> Bool {
+  let allowedConsumers = regionNodeSet.union([reduceNodeId])
+  let externallyVisibleNodes = regionNodeSet.filter { nodeId in
+    guard let node = g.nodes[nodeId] else { return false }
+    if case .tensorRef(_) = node.op { return false }
+    return true
+  }
+
+  guard !externallyVisibleNodes.isEmpty else { return false }
+  for (consumerId, consumerNode) in g.nodes {
+    guard !allowedConsumers.contains(consumerId) else { continue }
+    if consumerNode.inputs.contains(where: { externallyVisibleNodes.contains($0) }) {
+      return true
+    }
+  }
+  return false
+}
+
+/// Attempts to build a fusion candidate for one transition pair.
+///
+/// - Parameters:
+///   - transitionIndex: Current transition index.
+///   - block: Block under analysis.
+///   - transitions: Shape transitions for this block.
+///   - blockOutbound: Tensor cells that cannot be removed due to cross-block use.
+///   - g: Graph containing node/tensor metadata.
+/// - Returns: Candidate when all structural and safety checks pass; otherwise `nil`.
+private func makeFusableReduceCandidate(
+  transitionIndex: Int,
+  block: Block,
+  transitions: [(nodeIndex: Int, shape: [Int])],
+  blockOutbound: Set<CellID>,
+  g: Graph
+) -> FusableReduceCandidate? {
+  guard let regionSlice = regionNodeSlice(
+    transitionIndex: transitionIndex, transitions: transitions, block: block),
+    let reduceNodeId = nextAxisReduceNodeId(
+      transitionIndex: transitionIndex, transitions: transitions, block: block, g: g)
+  else { return nil }
+
+  let regionSet = Set(regionSlice)
+  guard let mulInfo = extractMulProducerInfo(
+    reduceNodeId: reduceNodeId, regionNodeSet: regionSet, blockOutbound: blockOutbound, g: g)
+  else { return nil }
+
+  guard regionContainsOnlyExpandPrepOps(
+    regionNodeSlice: regionSlice, mulNodeId: mulInfo.mulNodeId, g: g)
+  else { return nil }
+
+  guard !hasExternalConsumersOutsideRegion(
+    regionNodeSet: regionSet, reduceNodeId: reduceNodeId, g: g)
+  else { return nil }
+
+  return FusableReduceCandidate(
+    transitionIndex: transitionIndex,
+    reduceNodeId: reduceNodeId,
+    mulNodeId: mulInfo.mulNodeId,
+    regionNodeSlice: regionSlice,
+    regionNodeSet: regionSet,
+    intermediateCell: mulInfo.intermediateCell,
+    mulInputTensors: mulInfo.mulInputTensors
+  )
+}
+
 /// Detect fusable expand->axis-reduce pairs where we can skip the expand region
 /// and have sumAxis compute the product inline.
 /// Returns the set of transition indices whose regions should be skipped.
@@ -148,79 +348,20 @@ func detectFusableReduces(
 ) -> Set<Int> {
   var skipRegions = Set<Int>()
 
-  for (idx, transition) in transitions.enumerated() {
-    let nextIdx = idx + 1
-    guard nextIdx < transitions.count else { continue }
+  for transitionIndex in transitions.indices {
+    guard let candidate = makeFusableReduceCandidate(
+      transitionIndex: transitionIndex,
+      block: block,
+      transitions: transitions,
+      blockOutbound: blockOutbound,
+      g: g
+    ) else { continue }
 
-    let nextTransition = transitions[nextIdx]
-    let regionEnd = nextTransition.nodeIndex
-
-    // Next region must start with an axis reduce
-    let nextNodeId = block.nodes[nextTransition.nodeIndex]
-    guard let nextNode = g.nodes[nextNodeId],
-      isAxisReduceOp(nextNode.op)
-    else { continue }
-
-    // Axis reduce's input must be a mul in this region
-    let mulNodeId = nextNode.inputs[0]
-    guard let mulNode = g.nodes[mulNodeId],
-      case .mul = mulNode.op,
-      mulNode.inputs.count == 2
-    else { continue }
-    let regionSlice = block.nodes[transition.nodeIndex..<regionEnd]
-    let regionSet = Set(regionSlice)
-    guard regionSet.contains(mulNodeId) else { continue }
-
-    // Get the intermediate tensor (mul's output)
-    // Only fuse if it's not needed by later blocks (block-level outbound)
-    guard let intermediateTensorId = g.nodeToTensor[mulNodeId],
-      let intermediateTensor = g.tensors[intermediateTensorId]
-    else { continue }
-    let intermediateCell = intermediateTensor.cellId
-    guard !blockOutbound.contains(intermediateCell) else { continue }
-
-    // Get mul's input tensors for inline computation
-    guard let aTensorId = g.nodeToTensor[mulNode.inputs[0]],
-      let aTensor = g.tensors[aTensorId],
-      let bTensorId = g.nodeToTensor[mulNode.inputs[1]],
-      let bTensor = g.tensors[bTensorId]
-    else { continue }
-
-    // Only skip if ALL nodes in the region are matmul-expand related
-    // AND no node in the region is consumed by anything outside the region + sumAxis.
-    let allExpandRelated = regionSlice.allSatisfy { nid in
-      guard let n = g.nodes[nid] else { return true }
-      if nid == mulNodeId { return true }
-      switch n.op {
-      case .tensorRef(_), .reshape(_), .transpose(_), .expand,
-        .expandAxis(_, _), .expandView, .shrink(_), .constant(_):
-        return true
-      default:
-        return false
-      }
-    }
-    guard allExpandRelated else { continue }
-
-    // Check that no non-tensorRef node in the region is consumed outside the region.
-    // Must scan ALL graph nodes since ctx.values is shared across blocks.
-    let safeConsumers = regionSet.union([nextNodeId])  // region nodes + the sumAxis
-    let skippableNodeIds = regionSet.filter { nid in
-      if let n = g.nodes[nid], case .tensorRef(_) = n.op { return false }
-      return true
-    }
-    var hasExternalConsumers = false
-    for (consumerId, consumerNode) in g.nodes {
-      guard !safeConsumers.contains(consumerId) else { continue }
-      if consumerNode.inputs.contains(where: { skippableNodeIds.contains($0) }) {
-        hasExternalConsumers = true
-        break
-      }
-    }
-    guard !hasExternalConsumers else { continue }
-
-    skipRegions.insert(idx)
-    outbound.remove(intermediateCell)
-    ctx.inlineableReduceInputs[intermediateCell] = (aTensor, bTensor)
+    // This region no longer needs materialization; sumAxis will compute A*B inline.
+    // Record it in ctx.inlineableReduceInputs using the skipped product cell as lookup key.
+    skipRegions.insert(candidate.transitionIndex)
+    outbound.remove(candidate.intermediateCell)
+    ctx.inlineableReduceInputs[candidate.intermediateCell] = candidate.mulInputTensors
   }
 
   return skipRegions

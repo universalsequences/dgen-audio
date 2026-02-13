@@ -313,7 +313,7 @@ public struct CompilationPipeline {
         // For C backend: force scalar when threadCountScale is present (existing behavior)
         // OR when the body ops are scalar (e.g. frame-based tensor blocks that can't use SIMD).
         // Without this, the frame loop steps by 4 (SIMD) but body ops only process 1 frame.
-        if backend == .c, (threadCountScale != nil || bodyEffectiveKind == .scalar) {
+        if backend == .c, threadCountScale != nil || bodyEffectiveKind == .scalar {
           for i in 0..<finalOps.count {
             finalOps[i].kind = .scalar
           }
@@ -386,17 +386,17 @@ public struct CompilationPipeline {
 
     // Print timing summary
     let pipelineTotal = (CFAbsoluteTimeGetCurrent() - pipelineStart) * 1000
-    /*
-    print(
-      "⏱️ [DGen Pipeline] Total: \(String(format: "%.1f", pipelineTotal))ms | nodes: \(graph.nodes.count)"
-    )
-    let sortedTimings = timings.sorted { $0.1 > $1.1 }
-    for (label, ms) in sortedTimings.prefix(10) {
-      let pct = (ms / pipelineTotal) * 100
+    if options.debug {
       print(
-        "   \(String(format: "%6.1f", ms))ms (\(String(format: "%4.1f", pct))%) - \(label)")
+        "⏱️ [DGen Pipeline] Total: \(String(format: "%.1f", pipelineTotal))ms | nodes: \(graph.nodes.count)"
+      )
+      let sortedTimings = timings.sorted { $0.1 > $1.1 }
+      for (label, ms) in sortedTimings.prefix(10) {
+        let pct = (ms / pipelineTotal) * 100
+        print(
+          "   \(String(format: "%6.1f", ms))ms (\(String(format: "%4.1f", pct))%) - \(label)")
+      }
     }
-    */
 
     return CompilationResult(
       graph: graph,
@@ -462,7 +462,7 @@ extension CompilationResult {
 private func printUOpBlocks(_ uopBlocks: [BlockUOps], blocks: [Block]) {
   for (i, uopBlock) in uopBlocks.enumerated() {
     print(
-      "block #\(i+1) kind=\(uopBlock.kind) threadCountScale\(uopBlock.threadCountScale) shape=\(blocks[i].shape) tensorIndex=\(blocks[i].tensorIndex) nodes=\(blocks[i].nodes)"
+      "block #\(i+1) kind=\(uopBlock.kind) threadCountScale\(uopBlock.threadCountScale!) shape=\(blocks[i].shape!) tensorIndex=\(blocks[i].tensorIndex!) nodes=\(blocks[i].nodes)"
     )
     var indentLevel = 0
     for uop in uopBlock.ops {

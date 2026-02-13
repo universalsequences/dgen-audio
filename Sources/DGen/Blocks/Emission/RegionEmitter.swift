@@ -84,6 +84,8 @@ public func emitScalarBlockWithShapeTransitions(
   ctx: IRContext, block: Block, blocks: [Block], g: Graph,
   transitions: [(nodeIndex: Int, shape: [Int])]
 ) throws -> [UOp] {
+  // Reset per-block fusion metadata for sumAxis inline-product optimization.
+  // detectFusableReduces repopulates this map for the current block only.
   ctx.inlineableReduceInputs = [:]
 
   // Analysis: compute outbound cells and detect fusable reduces

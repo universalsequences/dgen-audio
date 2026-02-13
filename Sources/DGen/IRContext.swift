@@ -60,9 +60,13 @@ public class IRContext {
     tensorCellToVar = [:]
   }
 
-  /// Fused axis reduce: maps intermediate cellId → (inputA tensor, inputB tensor)
-  /// When sumAxis sees its input cell here, it computes A * B inline
-  /// instead of reading the pre-computed product from memory.
+  /// Fusion scratch map used by `sumAxis` during shape-aware emission.
+  ///
+  /// Key: cell ID of a skipped intermediate tensor (`mul` output).
+  /// Value: `(A, B)` source tensors for that skipped product.
+  ///
+  /// If `sumAxis` sees its input cell in this map, it computes `A * B` inline while reducing
+  /// instead of loading a separately materialized intermediate tensor from memory.
   public var inlineableReduceInputs: [CellID: (Tensor, Tensor)] = [:]
 
   /// Check if a node is part of a frame-dependent tensor chain
@@ -91,6 +95,12 @@ public class IRContext {
     return 0
   }
 
+  /// Allocates or reuses a constant Lazy value and optionally records it for a source node.
+  ///
+  /// - Parameters:
+  ///   - src: Source node ID whose `ctx.values` entry should point to the constant.
+  ///   - value: Constant float value.
+  /// - Returns: A `Lazy.constant` with stable constant ID reuse by value.
   public func useConstant(src: NodeID?, value: Float) -> Lazy {
     if let existing = constantIdByValue[value] {
       let constant = Lazy.constant(existing, value)
@@ -108,6 +118,12 @@ public class IRContext {
     return constant
   }
 
+  /// Allocates a fresh variable Lazy value and optionally records node/value ownership.
+  ///
+  /// - Parameters:
+  ///   - src: Source node ID for value tracking in `ctx.values` and `ctx.variables`.
+  ///   - trackInValues: If true, stores the new variable in `ctx.values[src]`.
+  /// - Returns: A unique `Lazy.variable`.
   public func useVariable(src: NodeID?, trackInValues: Bool = true) -> Lazy {
     let varId = self.varIdx + 1
     self.varIdx = varId
