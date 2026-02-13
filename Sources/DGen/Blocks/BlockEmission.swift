@@ -183,12 +183,32 @@ private func emitStandardBlockBodyUOps(
   var bodyUops: [UOp] = []
   var hasOwnFrameLoop = false
 
+  let statefulTensorDecision = StatefulTensorParallelPolicy.decide(
+    block: block,
+    graph: g,
+    backend: backend
+  )
+
   // Thread count scaling is a Metal-specific parallelization optimization.
   // C backend uses sequential loops, so this would break feedback loop data flow.
-  let threadScaleUOps =
-    (backend == .metal)
-    ? emitThreadCountScaleOpIfNeeded(ctx: ctx, block: block, g: g)
-    : []
+  let threadScaleUOps: [UOp]
+  var emittedStatefulTensorThreadIndex = false
+  if backend == .metal, statefulTensorDecision.enabled {
+    // Specialized stateful-tensor scalar mode:
+    // keep scalar frame loop, but use thread id as tensor index (id < tensorSize).
+    let setup = IRBuilder(ctx: ctx, nodeId: block.nodes.last ?? -1)
+    let tensorIdx = setup.threadIndex()
+    threadScaleUOps = setup.ops
+    for nodeId in block.nodes {
+      ctx.tensorIndices[nodeId] = tensorIdx.lazy
+    }
+    emittedStatefulTensorThreadIndex = true
+  } else {
+    threadScaleUOps =
+      (backend == .metal)
+      ? emitThreadCountScaleOpIfNeeded(ctx: ctx, block: block, g: g)
+      : []
+  }
   bodyUops.append(contentsOf: threadScaleUOps)
   let emittedThreadScale = !threadScaleUOps.isEmpty
 
@@ -197,7 +217,7 @@ private func emitStandardBlockBodyUOps(
   let lastForwardId = g.lastForwardNodeId
 
   for nodeId in block.nodes {
-    if !emittedThreadScale, let tensorIndex = block.tensorIndex {
+    if !emittedThreadScale, !emittedStatefulTensorThreadIndex, let tensorIndex = block.tensorIndex {
       // Don't give tensorIndex to inherently scalar stateful ops (accum, phasor, etc.)
       // These have single-cell state and their own scalar emit path. Giving them a
       // tensor index causes indexed memory access on single-cell state:

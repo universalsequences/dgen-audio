@@ -9,6 +9,9 @@ public struct BlockUOps {
   public var forceNewKernel: Bool
   /// Optional: dispatch threads = frameCount * scale for this block
   public var threadCountScale: Int?
+  /// Optional: dispatch a fixed number of threads for this block.
+  /// Used for scalar frame loops that parallelize over tensor elements (id < tensorSize).
+  public var threadCountOverride: Int?
   /// When true, the block contains its own frame loops (e.g., BPTT forward+reverse loops).
   /// prepareSchedule should dispatch 1 thread with no additional frame loop wrapping.
   public var hasOwnFrameLoop: Bool
@@ -20,6 +23,7 @@ public struct BlockUOps {
     parallelPolicy: ParallelPolicy = .serial,
     forceNewKernel: Bool = false,
     threadCountScale: Int? = nil,
+    threadCountOverride: Int? = nil,
     hasOwnFrameLoop: Bool = false
   ) {
     self.ops = ops
@@ -28,6 +32,7 @@ public struct BlockUOps {
     self.parallelPolicy = parallelPolicy
     self.forceNewKernel = forceNewKernel
     self.threadCountScale = threadCountScale
+    self.threadCountOverride = threadCountOverride
     self.hasOwnFrameLoop = hasOwnFrameLoop
   }
 }
@@ -35,6 +40,9 @@ public struct BlockUOps {
 public enum ParallelPolicy {
   case serial
   case threadParallel
+  /// Scalar frame loop with fixed thread dispatch over tensor elements.
+  /// Kernel pattern: `if (id < tensorSize) { for (i < frameCount) { ... } }`
+  case tensorElementParallel
 }
 
 public enum Device {
@@ -60,6 +68,7 @@ public class ScheduleItem {
   public var temporality: Temporality = .frameBased
   public var parallelPolicy: ParallelPolicy = .serial
   public var threadCountScale: Int? = nil
+  public var threadCountOverride: Int? = nil
 
   init(kind: Kind, temporality: Temporality = .frameBased) {
     self.kind = kind

@@ -406,6 +406,7 @@ public struct CompilationPipeline {
           UOpBlockFinalization.finalize(
             emittedOps: emission.uops,
             block: block,
+            graph: graph,
             backend: backend,
             bodyEffectiveKind: emission.effectiveKind,
             hasOwnFrameLoop: emission.hasOwnFrameLoop

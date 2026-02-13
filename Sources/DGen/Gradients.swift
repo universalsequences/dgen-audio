@@ -933,8 +933,6 @@ extension LazyOp {
       // Gradient ops don't need their own gradients
       return node.inputs.map { _ in nil }
 
-
-
     case .overlapAdd(let windowSize, let hopSize, _, _, _):
       // overlapAdd backward: two-phase gradient (store per-frame grad, then gather)
       guard let tensorInput = node.inputs.first,
@@ -946,16 +944,18 @@ extension LazyOp {
 
       // Phase 1: Store output gradient per frame
       let gradStoreCell = g.alloc(vectorWidth: g.maxFrameCount)
-      let storeOp = g.n(.overlapAddGradStore(gradStoreCell: gradStoreCell),
+      let storeOp = g.n(
+        .overlapAddGradStore(gradStoreCell: gradStoreCell),
         [gradOutput])
       g.addGradientSideEffect(storeOp)
 
       // Phase 2: Gather into gradient tensor (frame-aware)
       let gradInputCell = g.allocFrameAware(tensorSize: totalSize, frameCount: g.maxFrameCount)
 
-      let gatherOp = g.n(.overlapAddGradGather(
-        windowSize: windowSize, hopSize: hopSize,
-        gradStoreCell: gradStoreCell, gradInputCell: gradInputCell),
+      let gatherOp = g.n(
+        .overlapAddGradGather(
+          windowSize: windowSize, hopSize: hopSize,
+          gradStoreCell: gradStoreCell, gradInputCell: gradInputCell),
         [storeOp])
       g.addGradientSideEffect(gatherOp)
 
@@ -987,7 +987,7 @@ extension LazyOp {
       let gradCell = getOrCreateGradCell(g, tensorInput: tensorInput, totalSize: totalSize)
       let zero = g.n(.constant(0.0), [])
 
-      if DGenGradientConfig.useDeterministicPeekGradients {
+      if false {  //DGenGradientConfig.useDeterministicPeekGradients {
         // Deterministic two-phase write+reduce:
         // 1) write per-frame grad + interpolation metadata
         // 2) reduce over frames to build tensor gradient

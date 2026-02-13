@@ -14,10 +14,16 @@ extension UOpBlockFinalization {
   static func finalize(
     emittedOps: [UOp],
     block: Block,
+    graph: Graph,
     backend: Backend,
     bodyEffectiveKind: Kind,
     hasOwnFrameLoop: Bool
   ) -> BlockUOps {
+    let statefulTensorDecision = StatefulTensorParallelPolicy.decide(
+      block: block,
+      graph: graph,
+      backend: backend
+    )
     let (threadCountScale, strippedOps) = extractThreadCountScale(from: emittedOps)
     var finalOps = strippedOps
     let effectiveKind = resolveEffectiveKind(
@@ -35,10 +41,12 @@ extension UOpBlockFinalization {
     let parallelPolicy = inferParallelPolicy(
       kind: effectiveKind,
       temporality: block.temporality,
-      ops: finalOps
+      ops: finalOps,
+      statefulTensorDecision: statefulTensorDecision
     )
+    let threadCountOverride = statefulTensorDecision.enabled ? statefulTensorDecision.tensorSize : nil
 
-    let forceNewKernel = threadCountScale != nil || hasOwnFrameLoop
+    let forceNewKernel = threadCountScale != nil || threadCountOverride != nil || hasOwnFrameLoop
 
     return BlockUOps(
       ops: finalOps,
@@ -47,6 +55,7 @@ extension UOpBlockFinalization {
       parallelPolicy: parallelPolicy,
       forceNewKernel: forceNewKernel,
       threadCountScale: threadCountScale,
+      threadCountOverride: threadCountOverride,
       hasOwnFrameLoop: hasOwnFrameLoop
     )
   }
@@ -92,8 +101,13 @@ extension UOpBlockFinalization {
   private static func inferParallelPolicy(
     kind: Kind,
     temporality: Temporality,
-    ops: [UOp]
+    ops: [UOp],
+    statefulTensorDecision: StatefulTensorParallelPolicy.Decision
   ) -> ParallelPolicy {
+    if statefulTensorDecision.enabled {
+      return .tensorElementParallel
+    }
+
     guard temporality == .static_, kind == .scalar else { return .serial }
 
     let hasParallelRange = ops.contains {

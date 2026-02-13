@@ -222,6 +222,10 @@ private func analyzeOneKernel(
 private func computeThreadCount(
   _ item: ScheduleItem, frameCount: Int
 ) -> Int {
+  if let override = item.threadCountOverride {
+    return max(1, override)
+  }
+
   // Static blocks run once — they don't multiply by frameCount.
   // Static scalar blocks dispatch 1 thread (body loops internally or uses parallelRange).
   // Static SIMD blocks with threadCountScale dispatch threadCountScale threads.

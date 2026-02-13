@@ -88,6 +88,11 @@ final class KernelAnalysisTests: XCTestCase {
 
     let kernelSource = try String(contentsOfFile: kernelPath, encoding: .utf8)
     XCTAssertTrue(kernelSource.contains("kernel void"))
+    // Stateful tensor phasor should dispatch one thread per tensor element
+    // and loop sequentially over frames inside that thread.
+    XCTAssertTrue(kernelSource.contains("// KERNEL 0\n// Kind: scalar"))
+    XCTAssertTrue(kernelSource.contains("if (id >= 0 && id < (uint)(4))"))
+    XCTAssertTrue(kernelSource.contains("for (uint i = 0; i < frameCount; i += 1)"))
     print("Wrote tensor-phasor kernel dump to \(kernelPath)")
   }
 

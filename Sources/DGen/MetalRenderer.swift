@@ -13,6 +13,7 @@ public class MetalRenderer: Renderer, UOpEmitter {
   private var useReducedGradsSum = false
   private var staticGlobalVars: Set<VarID> = []
   private var currentThreadCountScale: Int? = nil
+  private var currentThreadCountOverride: Int? = nil
   /// Track scalarType of emitted UOps by their VarID for offset type lookups
   private var varScalarTypes: [VarID: CastType] = [:]
 
@@ -48,6 +49,7 @@ public class MetalRenderer: Renderer, UOpEmitter {
     return fused.enumerated().map { (i, entry) in
       let scheduleItem = entry.item
       let parallelCount = entry.threadCount
+      let threadCountOverride = parallelCount ?? scheduleItem.threadCountOverride
 
       // Always use _0, _1 suffix to avoid 'kernel' being a reserved word in Metal
       let kernelName = "\(name)_\(i)"
@@ -101,7 +103,7 @@ public class MetalRenderer: Renderer, UOpEmitter {
       }
 
       let threadGroupSize: Int? =
-        (scheduleItem.kind == .scalar && parallelCount == nil) ? 1 : nil
+        (scheduleItem.kind == .scalar && threadCountOverride == nil) ? 1 : nil
 
       return CompiledKernel(
         name: kernelName,
@@ -109,7 +111,7 @@ public class MetalRenderer: Renderer, UOpEmitter {
         kind: scheduleItem.kind,
         buffers: bufferNames,
         threadGroupSize: threadGroupSize,
-        threadCount: parallelCount,
+        threadCount: threadCountOverride,
         threadCountScale: scheduleItem.threadCountScale,
         needsReducedGradsSum: useReduced,
         memorySize: max(totalMemorySlots, 1024)  // Match memory size calculation from render method
@@ -202,7 +204,9 @@ public class MetalRenderer: Renderer, UOpEmitter {
     for segment in segments {
       if segment.ops.isEmpty { continue }
       let item = ScheduleItem(kind: scheduleItem.kind, temporality: scheduleItem.temporality)
+      item.parallelPolicy = scheduleItem.parallelPolicy
       item.threadCountScale = scheduleItem.threadCountScale
+      item.threadCountOverride = scheduleItem.threadCountOverride
       item.ops.append(contentsOf: prefixOps)
       if segment.parallelCount == nil {
         item.ops.append(beginRangeOp)
@@ -376,6 +380,7 @@ public class MetalRenderer: Renderer, UOpEmitter {
         let scheduleItem = ScheduleItem(kind: block.kind, temporality: block.temporality)
         scheduleItem.parallelPolicy = block.parallelPolicy
         scheduleItem.threadCountScale = block.threadCountScale
+        scheduleItem.threadCountOverride = block.threadCountOverride
         scheduleItem.ops.append(UOp(op: .frameCount, value: .empty))
 
         for uop in block.ops {
@@ -394,6 +399,32 @@ public class MetalRenderer: Renderer, UOpEmitter {
           scheduleItem.ops.append(beginRange)
           hasFrameLoop = false
         } else if isScalar {
+          if block.parallelPolicy == .tensorElementParallel,
+            let tensorThreads = block.threadCountOverride
+          {
+            // Scalar frame loop, but one GPU thread per tensor element.
+            var beginRange = UOp(
+              op: .beginRange(.constant(0, 0), .constant(0, Float(tensorThreads))),
+              value: .empty
+            )
+            beginRange.kind = block.kind
+            scheduleItem.ops.append(beginRange)
+
+            var beginLoop = UOp(op: .beginLoop(frameCountUOp, 1), value: .empty)
+            beginLoop.kind = block.kind
+            scheduleItem.ops.append(beginLoop)
+            hasFrameLoop = true
+
+            if case .hopBased(_, let counterNodeId) = block.temporality {
+              guard let counterLazy = ctx.values[counterNodeId] else {
+                fatalError("Hop counter node \(counterNodeId) not found in ctx.values")
+              }
+              var hopCheck = UOp(op: .beginHopCheck(counterLazy), value: .empty)
+              hopCheck.kind = block.kind
+              scheduleItem.ops.append(hopCheck)
+              hopCheckOpen = true
+            }
+          } else {
           // Scalar kernels: thread 0 loops through frameCount
           var beginRange = UOp(op: .beginRange(.constant(0, 0), .constant(0, 1)), value: .empty)
           beginRange.kind = block.kind
@@ -414,6 +445,7 @@ public class MetalRenderer: Renderer, UOpEmitter {
             hopCheck.kind = block.kind
             scheduleItem.ops.append(hopCheck)
             hopCheckOpen = true
+          }
           }
         } else {
           // SIMD kernels: each thread processes one frame
@@ -462,6 +494,7 @@ public class MetalRenderer: Renderer, UOpEmitter {
     varScalarTypes.removeAll()  // Reset type tracking for new kernel
     frameIndexOverride = nil
     currentThreadCountScale = scheduleItem.threadCountScale
+    currentThreadCountOverride = scheduleItem.threadCountOverride
     currentTemporality = scheduleItem.temporality  // Set temporality for gradient indexing
     let (inputs, outputs) = analyzeDependencies(scheduleItem: scheduleItem, ctx: ctx)
 
@@ -795,7 +828,10 @@ public class MetalRenderer: Renderer, UOpEmitter {
 
     case .threadIndex:
       // In Metal, threadIndex maps to 'id' (thread_position_in_grid)
-      let idx = (uop.kind == .simd) ? "id" : "i"
+      let idx =
+        (uop.kind == .simd || currentThreadCountOverride != nil)
+        ? "id"
+        : "i"
       return emitAssign(uop, idx, ctx)
 
     case .identity(let a):
