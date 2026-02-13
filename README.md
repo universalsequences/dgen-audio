@@ -1,6 +1,45 @@
 # DGen
 
-A Swift DSP compiler inspired by [Max/MSP's Gen~](https://docs.cycling74.com/max8/vignettes/gen_overview) with automatic differentiation. Compiles computation graphs to optimized **Metal** (forward + backward) and **C** (forward) backends.
+An experimental differentiable DSP compiler written in Swift. Targets **Metal** (GPU, forward + backward) and **C** (CPU SIMD, forward-only).
+
+## Why
+
+ML frameworks like PyTorch and tinygrad are built for parallel tensor computation. DSP is fundamentally different — signal processing has **temporal feedback** (filters, delays, accumulators) that creates sample-by-sample dependencies. These frameworks have no good answer for this:
+
+```python
+# PyTorch: phasor → one-pole filter → spectral processing
+# Feedback forces a Python for-loop. No GPU, no autodiff through it.
+output = torch.zeros(num_frames)
+phase = 0.0
+y_prev = 0.0
+for n in range(num_frames):
+    phase = (phase + freq / sr) % 1.0
+    x = math.sin(2 * math.pi * phase)
+    y_prev = x + coeff * y_prev
+    output[n] = y_prev
+
+# Only NOW can you use tensors, but the sequential part already killed performance
+spectrum = torch.fft.rfft(output.reshape(num_windows, window_size))
+```
+
+DGen lets you write the same thing naturally:
+
+```swift
+let osc = sin(Signal.phasor(freq) * 2.0 * .pi)
+let (prev, write) = Signal.history()
+let filtered = write(Signal.mix(osc, prev, coeff))
+let spectrum = filtered.buffer(size: 1024, hop: 256).reshape([1024]).fft()
+```
+
+The compiler analyzes the graph, determines that the phasor and filter feedback **must** run sequentially, and parallelizes everything else (the FFT, any downstream tensor ops) across frames automatically — Metal threads or C SIMD.
+
+You also get the full tensor operation library (conv2d, matmul, reshape, transpose, FFT, etc.) alongside DSP primitives. This turns out to be genuinely useful for DSP on its own — for example, a 2D membrane physical model becomes a simple `conv2d` with a Laplacian kernel, replacing pages of nested for-loops in traditional gen~-like systems.
+
+## Status
+
+**Forward pass**: solid and useful. Multiple backends, automatic parallelism, rich tensor + DSP primitive library.
+
+**Backward pass (training)**: the machinery works — gradients flow through temporal feedback (BPTT), spectral operations, and the full tensor op library. Transformers, differentiable FFTs, and complex patches all differentiate correctly. But I haven't yet proven it can learn something non-trivial end-to-end (e.g., DDSP-style synthesis, learning a drum sound from audio). Until that's demonstrated, consider training support experimental.
 
 ## Quick Start
 
@@ -119,11 +158,11 @@ The execution timeline looks like this:
 
 ```
 Frame:    0    1    2   ...  255  256  257  ...  511  512 ...
-          │    │    │         │    │    │         │    │
-buffer:   ✓    ✓    ✓    ✓    ✓    ✓    ✓    ✓    ✓    ✓   ← writes every frame
-FFT:      ✓                        ✓                   ✓   ← runs every 256 frames
-IFFT:     ✓                        ✓                   ✓
-overlap:  ✓    ✓    ✓    ✓    ✓    ✓    ✓    ✓    ✓    ✓   ← emits every frame
+          |    |    |         |    |    |         |    |
+buffer:   *    *    *    *    *    *    *    *    *    *   <- writes every frame
+FFT:      *                        *                   *   <- runs every 256 frames
+IFFT:     *                        *                   *
+overlap:  *    *    *    *    *    *    *    *    *    *   <- emits every frame
 ```
 
 The `buffer(hop:)` call creates an internal hop counter. On each frame, it writes the input sample to a circular buffer. Every *hop* frames the counter resets, triggering the downstream tensor blocks (FFT, IFFT). The `overlapAdd` node runs every frame regardless — it reads from its own ring buffer, returning the accumulated result of all previous overlapping windows.
@@ -134,6 +173,8 @@ The `buffer(hop:)` call creates an internal hop counter. On each frame, it write
 |---------|---------|----------|-------|
 | Metal   | ✓       | ✓        | GPU-accelerated, full autodiff |
 | C       | ✓       | —        | SIMD-optimized for Apple Silicon |
+
+The C backend generates kernels with a process function signature compatible with [audiograph](https://github.com/universalsequences/audiograph), so compiled patches can be used as nodes in a larger audio graph.
 
 ## Building
 
