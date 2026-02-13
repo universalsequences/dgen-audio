@@ -251,23 +251,16 @@ public func inferShape(op: LazyOp, inputs: [ValueShape], graph: Graph) throws ->
     return .tensor([numCols])  // Output is [numCols]
 
   // FFT - outputs [numBins, 2] tensor where numBins = windowSize/2 + 1
-  // Note: FFT is a bulk operation that handles all tensor writes internally,
-  // so it should not be wrapped in parallelRange (handled in CompilationPipeline)
-  case .fft(let windowSize, _, _, _, _, _):
-    let numBins = windowSize / 2 + 1
-    return .tensor([numBins, 2])
-
-  // IFFT - outputs scalar (one sample per frame via overlap-add)
-  // Takes spectrum tensor [numBins, 2] as input, reconstructs time-domain signal
-  case .ifft(_, _, _, _, _, _):
-    return .scalar
-
   // overlapAdd - outputs scalar (one sample per frame via ring buffer)
   case .overlapAdd(_, _, _, _, _):
     return .scalar
 
   // overlapAdd gradient ops - side-effect only, output scalar
   case .overlapAddGradStore(_), .overlapAddGradGather(_, _, _, _):
+    return .scalar
+
+  // bufferView gradient ops - side-effect only, output scalar
+  case .bufferViewGradStore(_, _), .bufferViewGradRead(_, _):
     return .scalar
 
   // Inherited (elementwise) - includes all binary and unary math ops
@@ -634,7 +627,9 @@ public func allocateTensorMemory(
           if let inputNode = graph.nodes[inputId], case .tensor = inputNode.shape {
             if let tensorId = graph.nodeToTensor[inputId], let tensor = graph.tensors[tensorId] {
               // Only add if produced in this same block and is frame-based
-              if producedCells.contains(tensor.cellId) && frameBasedNodes.contains(inputId) {
+              let isFrameAwareTemporalInput =
+                frameBasedNodes.contains(inputId) || hopBasedNodes[inputId] != nil
+              if producedCells.contains(tensor.cellId) && isFrameAwareTemporalInput {
                 intraBlockFrameAwareCells.insert(tensor.cellId)
               }
             }

@@ -165,7 +165,7 @@ public func isolateSpectralPasses(_ blocks: [Block], _ g: Graph) -> [Block] {
 public func isReductionOp(_ op: LazyOp) -> Bool {
   switch op {
   case .sum, .tensorAccumulate, .peekRowGradReduce,
-    .selectRowGradReduce, .overlapAddGradGather:
+    .selectRowGradReduce, .overlapAddGradGather, .bufferViewGradRead:
     return true
   default:
     return false
@@ -181,6 +181,62 @@ public func isAxisReduceOp(_ op: LazyOp) -> Bool {
   default:
     return false
   }
+}
+
+/// Detect `add(pad(a), pad(b))` tensor joins that represent concat-by-padding.
+/// Keeping this shape transition inside the current block fuses FFT butterfly
+/// math with its pad+concat join into one kernel.
+private func isPadConcatFusionTransition(
+  nodeId: NodeID,
+  graph: Graph,
+  currentShape: Shape
+) -> Bool {
+  guard let node = graph.nodes[nodeId] else { return false }
+  guard case .add = node.op else { return false }
+  guard node.inputs.count == 2 else { return false }
+
+  var paddings: [[(Int, Int)]] = []
+  for inputId in node.inputs {
+    guard let padNode = graph.nodes[inputId] else { return false }
+    guard case .pad(let padding) = padNode.op else { return false }
+    guard let padInputId = padNode.inputs.first,
+      let padInputNode = graph.nodes[padInputId],
+      case .tensor(let padInputShape) = padInputNode.shape
+    else { return false }
+    guard padInputShape == currentShape, padding.count == currentShape.count else { return false }
+    paddings.append(padding)
+  }
+  guard paddings.count == 2 else { return false }
+
+  let padA = paddings[0]
+  let padB = paddings[1]
+  var concatAxis: Int? = nil
+
+  for axis in 0..<currentShape.count {
+    let a = padA[axis]
+    let b = padB[axis]
+
+    if a == (0, 0), b == (0, 0) { continue }
+
+    let complementaryPadding =
+      (a.0 == 0 && b.1 == 0 && a.1 > 0 && b.0 > 0 && a.1 == b.0)
+      || (b.0 == 0 && a.1 == 0 && b.1 > 0 && a.0 > 0 && b.1 == a.0)
+
+    guard complementaryPadding else { return false }
+    guard concatAxis == nil else { return false }
+    concatAxis = axis
+  }
+
+  guard let axis = concatAxis else { return false }
+  guard case .tensor(let outputShape) = node.shape else { return false }
+  guard outputShape.count == currentShape.count else { return false }
+
+  for dim in 0..<outputShape.count where dim != axis {
+    guard outputShape[dim] == currentShape[dim] else { return false }
+  }
+
+  let expectedConcatDim = currentShape[axis] + padA[axis].0 + padA[axis].1
+  return outputShape[axis] == expectedConcatDim
 }
 
 public func splitReduceBlocks(g: Graph, blocks: [Block]) -> [Block] {
@@ -416,38 +472,8 @@ func determineTensorBlocks(_ blocks: [Block], _ graph: Graph, _ ctx: IRContext) 
           }
           currentShape = nil
 
-        } else if case .fft = node.op {
-          // FFT is a bulk tensor operation that handles all tensor writes internally
-          // It needs its own scalar block - don't mix with SIMD ops
-          if currentBlock.nodes.count > 0 {
-            innerBlocks.append(currentBlock)
-          }
-          // Create isolated block for FFT
-          currentBlock = makeBlock(from: block)
-          currentBlock.kind = .scalar  // Force scalar execution
-          currentBlock.nodes.append(nodeId)
-          innerBlocks.append(currentBlock)
-          // Start fresh block for nodes after FFT
-          currentBlock = makeBlock(from: block)
-          currentShape = nil
-          continue  // Skip the append at end of loop
         } else if case .constant = node.op {
           // do nothing
-        } else if case .ifft = node.op {
-          // IFFT is a bulk operation that handles spectrum-to-time conversion
-          // It needs its own scalar block - don't mix with SIMD ops
-          if currentBlock.nodes.count > 0 {
-            innerBlocks.append(currentBlock)
-          }
-          // Create isolated block for IFFT
-          currentBlock = makeBlock(from: block)
-          currentBlock.kind = .scalar  // Force scalar execution
-          currentBlock.nodes.append(nodeId)
-          innerBlocks.append(currentBlock)
-          // Start fresh block for nodes after IFFT
-          currentBlock = makeBlock(from: block)
-          currentShape = nil
-          continue  // Skip the append at end of loop
         } else if case .overlapAdd = node.op {
           // overlapAdd has internal loops (scatter-add) — needs its own scalar block
           if currentBlock.nodes.count > 0 {
@@ -466,7 +492,13 @@ func determineTensorBlocks(_ blocks: [Block], _ graph: Graph, _ ctx: IRContext) 
             // as their input — each output thread reduces over an independent slice.
             // Don't change block kind — shape-transition emission handles the different
             // element counts via per-region loops while keeping the block parallelizable.
-            if currentShape != nil && isAxisReduceOp(node.op) {
+            if let previousShape = currentShape,
+              isAxisReduceOp(node.op)
+                || isPadConcatFusionTransition(
+                  nodeId: nodeId,
+                  graph: graph,
+                  currentShape: previousShape)
+            {
               currentShape = shape
             } else {
               if currentBlock.nodes.count > 0 {

@@ -637,7 +637,42 @@ extension LazyOp {
       return []  // Leaf node
 
     case .seq:
-      // Gradient flows only to the last input
+      // Detect bufferView pattern: seq(memoryWrite(cellId), ..., tensorRef(tensorId))
+      // where tensor.cellId == memoryWrite's cellId
+      if node.inputs.count >= 2,
+        let firstNode = g.nodes[node.inputs[0]],
+        let lastNode = g.nodes[node.inputs[node.inputs.count - 1]],
+        case .memoryWrite(let cellId) = firstNode.op,
+        case .tensorRef(let tensorId) = lastNode.op,
+        let tensor = g.tensors[tensorId],
+        tensor.cellId == cellId,
+        case .tensor(let shape) = lastNode.shape
+      {
+        // bufferView backward: convert tensor gradient → scalar gradient
+        let windowSize = shape.reduce(1, *)
+
+        // Allocate frame-indexed gradient cell
+        let gradCell = g.allocFrameAware(tensorSize: windowSize, frameCount: g.maxFrameCount)
+
+        // Phase 1: Store gradient tensor elements to frame-indexed cell
+        let storeOp = g.n(
+          .bufferViewGradStore(gradCell: gradCell, windowSize: windowSize),
+          [gradOutput])
+        g.addGradientSideEffect(storeOp)
+
+        // Phase 2: Read scalar gradient per frame (cross-frame sum)
+        let readOp = g.n(
+          .bufferViewGradRead(gradCell: gradCell, windowSize: windowSize),
+          [storeOp])
+
+        // Scalar gradient goes to memoryWrite (input 0), zero for others
+        let zero = g.n(.constant(0.0), [])
+        return node.inputs.enumerated().map { (i, _) in
+          i == 0 ? readOp : zero
+        }
+      }
+
+      // Default: gradient flows only to the last input
       let zero = g.n(.constant(0.0), [])
       return node.inputs.enumerated().map { (i, _) in
         i == node.inputs.count - 1 ? gradOutput : zero
@@ -885,13 +920,12 @@ extension LazyOp {
       return [sequencedGrad, zero]
 
     case .peekRowGradWrite(_, _, _, _, _, _, _), .peekRowGradReduce(_, _, _, _, _, _, _, _),
-      .overlapAddGradStore(_), .overlapAddGradGather(_, _, _, _):
+      .overlapAddGradStore(_), .overlapAddGradGather(_, _, _, _),
+      .bufferViewGradStore(_, _), .bufferViewGradRead(_, _):
       // Gradient ops don't need their own gradients
       return node.inputs.map { _ in nil }
 
-    case .fft(_, _, _, _, _, _), .ifft(_, _, _, _, _, _):
-      // FFT gradients need special handling
-      return node.inputs.map { _ in nil }
+
 
     case .overlapAdd(let windowSize, let hopSize, _, _, _):
       // overlapAdd backward: two-phase gradient (store per-frame grad, then gather)
