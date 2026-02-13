@@ -77,6 +77,43 @@ public struct CompilationPipeline {
     }
   }
 
+  /// Aggregates per-pass timing so compile flow can stay linear and readable.
+  private struct PipelineTimings {
+    let startedAt: CFAbsoluteTime = CFAbsoluteTimeGetCurrent()
+    var entries: [(label: String, elapsedMs: Double)] = []
+
+    /// Runs a pass, records elapsed milliseconds, and returns the pass result.
+    mutating func measure<T>(_ label: String, _ pass: () throws -> T) rethrows -> T {
+      let passStart = CFAbsoluteTimeGetCurrent()
+      let result = try pass()
+      let elapsedMs = (CFAbsoluteTimeGetCurrent() - passStart) * 1000
+      entries.append((label: label, elapsedMs: elapsedMs))
+      return result
+    }
+
+    /// Prints the heaviest pass timings when debug mode is enabled.
+    func printSummaryIfNeeded(enabled: Bool, nodeCount: Int) {
+      guard enabled else { return }
+      let totalMs = (CFAbsoluteTimeGetCurrent() - startedAt) * 1000
+      print(
+        "⏱️ [DGen Pipeline] Total: \(String(format: "%.1f", totalMs))ms | nodes: \(nodeCount)"
+      )
+      let sorted = entries.sorted { $0.elapsedMs > $1.elapsedMs }
+      for (label, ms) in sorted.prefix(10) {
+        let pct = totalMs > 0 ? (ms / totalMs) * 100 : 0
+        print(
+          "   \(String(format: "%6.1f", ms))ms (\(String(format: "%4.1f", pct))%) - \(label)")
+      }
+    }
+  }
+
+  /// Output of graph analysis passes that feed block partitioning.
+  private struct GraphPreparationResult {
+    let feedbackClusters: [[NodeID]]
+    let scalarNodeSet: Set<NodeID>
+    let sortedNodes: [NodeID]
+  }
+
   /// Compile a graph with the specified backend and options
   public static func compile(
     graph: Graph,
@@ -84,295 +121,62 @@ public struct CompilationPipeline {
     options: Options = Options(),
     name: String = "kernel"
   ) throws -> CompilationResult {
-    precondition(
-      options.frameCount <= graph.maxFrameCount,
-      "frameCount (\(options.frameCount)) exceeds graph.maxFrameCount (\(graph.maxFrameCount)). "
-        + "Set graph.maxFrameCount to at least \(options.frameCount) before compilation."
-    )
-    let pipelineStart = CFAbsoluteTimeGetCurrent()
-    var timings: [(String, Double)] = []
+    validateFrameCount(options, graph: graph)
+    var timings = PipelineTimings()
 
-    func time<T>(_ label: String, _ block: () throws -> T) rethrows -> T {
-      let start = CFAbsoluteTimeGetCurrent()
-      let result = try block()
-      let elapsed = (CFAbsoluteTimeGetCurrent() - start) * 1000
-      timings.append((label, elapsed))
-      return result
-    }
-
-    // Step 1: Topological sort that respects feedback groups
-    let feedbackClusters = time("findFeedbackLoops") {
-      findFeedbackLoops(graph)
-    }
-
-    // Step 1.5: Combine history operations that are not in feedback loops
-    time("combineHistoryOps") {
-      combineHistoryOpsNotInFeedback(
-        graph, feedbackClusters: feedbackClusters, options: options)
-    }
-
-    // Step 1.6: Fold constant expressions
-    time("foldConstants") {
-      foldConstants(graph, options: options)
-    }
-
-    let scalarNodeSet = time("findSequentialNodes") {
-      options.forceScalar
-        ? Set(graph.nodes.keys)
-        : findSequentialNodes(graph, feedbackClusters: feedbackClusters, backend: backend)
-    }
-
-    let sortedNodes = time("topologicalSort") {
-      topologicalSort(
-        graph, feedbackClusters: feedbackClusters, scalarNodeSet: scalarNodeSet,
-        debug: false)
-    }
-
-    try time("inferShapes") {
-      try inferShapes(graph: graph, sortedNodes: sortedNodes)
-    }
-
-    time("allocateTensorOutputs") {
-      allocateTensorOutputs(graph: graph, sortedNodes: sortedNodes)
-    }
-
-    // Step 2: Determine scalar nodes and create blocks
-
-    // Step 2.5: Handle seq operators - if any input to seq is scalar, make all inputs scalar
-    // But don't re-add SIMD-safe operations (they use atomics and can run in parallel)
-    var finalScalarSet = scalarNodeSet
-    time("seqScalarPropagate") {
-      // Build set of SIMD-safe nodes that should never be marked scalar
-      var simdSafe = Set<NodeID>()
-      for (nodeId, node) in graph.nodes {
-        switch node.op {
-        case .memoryAccumulate(_), .tensorAccumulate(_):
-          simdSafe.insert(nodeId)
-        default: break
-        }
-      }
-
-      for (_, node) in graph.nodes {
-        if case .seq = node.op {
-          let hasScalarInput = node.inputs.contains { finalScalarSet.contains($0) }
-          if hasScalarInput {
-            for inputId in node.inputs {
-              // Don't add SIMD-safe nodes to scalar set
-              if !simdSafe.contains(inputId) {
-                finalScalarSet.insert(inputId)
-              }
-            }
-          }
-        }
-      }
-    }
-
-    // Step 3: Determine blocks (feedback groups are already grouped)
-    let blocks = time("determineBlocks") {
-      partitionIntoBlocks(
-        sorted: sortedNodes,
-        scalar: finalScalarSet,
-        g: graph,
-        debug: false
-      )
-    }
-
-    // Fuse adjacent blocks of the same kind to reduce cross-block communication
-    let fusedBlocks = time("fuseBlocks1") {
-      fuseBlocks(blocks)
+    let prep = try runGraphPreparationPasses(
+      graph: graph, backend: backend, options: options, timings: &timings)
+    let finalScalarSet = timings.measure("seqScalarPropagate") {
+      propagateSeqScalarInputs(graph: graph, initialScalarSet: prep.scalarNodeSet)
     }
 
     let context = IRContext(g: graph)
+    var finalBlocks = buildInitialBlocks(
+      graph: graph, sortedNodes: prep.sortedNodes, scalarNodeSet: finalScalarSet, context: context,
+      timings: &timings)
 
-    // finally separate tensor blocks of shared size into their own blocks
-    let seperatedBlocks = time("tensorBlocks") {
-      determineTensorBlocks(fusedBlocks, graph, context)
-    }
-
-    var finalBlocks = seperatedBlocks.compactMap { $0 }
-
-    // Isolate spectral loss passes into their own blocks to prevent race conditions
-    // This ensures FFT forward pass completes before gradient pass runs
-    // Only do this if the graph has spectral loss ops (to avoid modifying blocks unnecessarily)
-    let hasSpectralLossOps = graph.nodes.values.contains { node in
-      switch node.op {
-      case .spectralLossFFT, .spectralLossFFTGradInline, .spectralLossFFTGradSpec,
-        .spectralLossFFTGradIFFT, .spectralLossFFTGradRead, .spectralLossFFTGradRead2:
-        return true
-      default:
-        return false
-      }
-    }
-
-    if hasSpectralLossOps {
-      finalBlocks = isolateSpectralPasses(finalBlocks, graph)
-    }
-
-    // Step 4: Infer temporality and assign to blocks
-    // This now includes hop-based temporality for FFT/IFFT and downstream operations
-    let temporalityResult = time("inferTemporality") {
-      inferTemporality(graph: graph, sortedNodes: sortedNodes)
-    }
-
-    time("assignTemporality") {
-      assignBlockTemporality(
-        blocks: &finalBlocks,
-        frameBasedNodes: temporalityResult.frameBasedNodes,
-        hopBasedNodes: temporalityResult.hopBasedNodes
-      )
-      // Store temporality data on IRContext for use during block emission
-      // (e.g., emitScalarBlockWithShapeTransitions needs per-node hop info)
-      context.hopBasedNodes = temporalityResult.hopBasedNodes
-    }
-
-    // Split reduce blocks AFTER temporality assignment so we can override
-    // temporality for global reduces (peekRowGradReduce/selectRowGradReduce)
-    if backend == .metal {
-      finalBlocks = splitReduceBlocks(g: graph, blocks: finalBlocks)
-      finalBlocks = splitMemoryBlocks(g: graph, blocks: finalBlocks)
-    }
-
-    // Step 4.6: Allocate real memory for lazy tensor cells
-    // Now that we know temporality, we can allocate the right sizes:
-    // - Frame-based outbound tensors: tensorSize * frameCount
-    // - Static outbound tensors: tensorSize
-    // - Non-outbound tensors: no allocation (register-only)
-    time("allocateTensorMemory") {
-      // Convert feedback clusters to a flat set of nodes
-      let feedbackClusterNodes = Set(feedbackClusters.flatMap { $0 })
-      allocateTensorMemory(
-        graph: graph,
-        blocks: finalBlocks,
-        frameBasedNodes: temporalityResult.frameBasedNodes,
-        hopBasedNodes: temporalityResult.hopBasedNodes,
-        feedbackClusterNodes: feedbackClusterNodes,
-        backend: backend,
-        frameCount: options.frameCount
-      )
-      // Populate IRContext's frameAwareTensorCells from graph.frameAwareCells
-      // This is needed for tstore/tload to use frame-indexed addressing
-      for cellId in graph.frameAwareCells.keys {
-        context.frameAwareTensorCells.insert(cellId)
-      }
-    }
+    assignTemporalityAndAllocateTensorMemory(
+      graph: graph,
+      sortedNodes: prep.sortedNodes,
+      feedbackClusters: prep.feedbackClusters,
+      blocks: &finalBlocks,
+      context: context,
+      backend: backend,
+      frameCount: options.frameCount,
+      timings: &timings)
 
     let finalBlockIndices = Array(0..<finalBlocks.count)
-
-    // Step 5: Convert blocks to UOp blocks
-    var uopBlocks = [BlockUOps]()
-
-    func inferParallelPolicy(
-      kind: Kind, temporality: Temporality, ops: [UOp]
-    ) -> ParallelPolicy {
-      guard temporality == .static_, kind == .scalar else { return .serial }
-
-      var hasParallelRange = false
-
-      for uop in ops {
-        switch uop.op {
-        case .beginParallelRange:
-          hasParallelRange = true
-        default:
-          break
-        }
-      }
-      if hasParallelRange { return .threadParallel }
-      return .serial
+    if options.printBlockStructure {
+      printBlockStructure(blocks: finalBlocks, sortedIndices: finalBlockIndices)
     }
 
-    func extractThreadCountScale(_ ops: [UOp]) -> (Int?, [UOp]) {
-      var scale: Int? = nil
-      var filtered: [UOp] = []
-      filtered.reserveCapacity(ops.count)
-      for op in ops {
-        if case .setThreadCountScale(let s) = op.op {
-          scale = s
-          continue
-        }
-        filtered.append(op)
-      }
-      return (scale, filtered)
-    }
-
-    try time("emitBlockUOps") {
-      for blockIdx in finalBlockIndices {
-        let block = finalBlocks[blockIdx]
-        context.lastBlockHasOwnFrameLoop = false
-        let (ops, bodyEffectiveKind) = try emitBlockUOps(
-          ctx: context,
-          block: block,
-          blocks: finalBlocks,
-          g: graph,
-          backend: backend,
-          debug: options.debug
-        )
-        let hasOwnFrameLoop = context.lastBlockHasOwnFrameLoop
-        let (threadCountScale, filteredOps) = extractThreadCountScale(ops)
-        var finalOps = filteredOps
-        let effectiveKind: Kind
-        // For C backend: force scalar when threadCountScale is present (existing behavior)
-        // OR when the body ops are scalar (e.g. frame-based tensor blocks that can't use SIMD).
-        // Without this, the frame loop steps by 4 (SIMD) but body ops only process 1 frame.
-        if backend == .c, threadCountScale != nil || bodyEffectiveKind == .scalar {
-          for i in 0..<finalOps.count {
-            finalOps[i].kind = .scalar
-          }
-          effectiveKind = .scalar
-        } else {
-          effectiveKind = block.kind
-        }
-        // Post-override SIMD upgrade: scan individual loops within scalar blocks
-        // and upgrade eligible ones to SIMD. This runs AFTER the block-level scalar
-        // override above, which may have forced the entire block to scalar due to
-        // blockers in one loop (e.g., sum reduction) even though other loops
-        // (e.g., element-wise mul) are SIMD-safe.
-        if backend == .c {
-          upgradeElementLoopsToSIMD(&finalOps)
-        }
-        let parallelPolicy = inferParallelPolicy(
-          kind: effectiveKind, temporality: block.temporality, ops: finalOps)
-        // Force new kernel for spectral passes (forward + backward) and scaled thread blocks
-        let forceNew = threadCountScale != nil || hasOwnFrameLoop
-        uopBlocks.append(
-          BlockUOps(
-            ops: finalOps, kind: effectiveKind, temporality: block.temporality,
-            parallelPolicy: parallelPolicy, forceNewKernel: forceNew,
-            threadCountScale: threadCountScale, hasOwnFrameLoop: hasOwnFrameLoop))
-      }
-    }
-
+    var uopBlocks = try emitBlocksToUOpBlocks(
+      graph: graph, blocks: finalBlocks, context: context, backend: backend, options: options,
+      timings: &timings)
     uopBlocks.removeAll { $0.ops.isEmpty }
 
     if options.debug {
       printUOpBlocks(uopBlocks, blocks: finalBlocks)
     }
 
-    // Step 7: Lower UOp blocks to compiled kernels
-    // Ensure a dedicated voice cell exists when voiceCount > 1
-    var voiceCellIdFinal: Int? = options.voiceCellId
-    var generatedVoiceCell = false
-    if options.voiceCount > 1 && voiceCellIdFinal == nil {
-      voiceCellIdFinal = graph.alloc()  // Reserve a cell for voice index
-      generatedVoiceCell = true
-    }
-
-    // Step 6: Fix memory slot conflicts for vector operations
-    let cellAllocations = time("remapMemorySlots") {
+    let voiceCellState = ensureVoiceCell(graph: graph, options: options)
+    let cellAllocations = timings.measure("remapMemorySlots") {
       remapVectorMemorySlots(
-        &uopBlocks, cellSizes: graph.cellAllocationSizes,
-        voiceCellId: generatedVoiceCell ? voiceCellIdFinal : nil,
+        &uopBlocks,
+        cellSizes: graph.cellAllocationSizes,
+        voiceCellId: voiceCellState.generated ? voiceCellState.id : nil,
         graph: graph,
         enableBufferReuse: options.enableBufferReuse)
     }
 
-    let renderer: Renderer = createRenderer(for: backend, options: options)
-    if let cr = renderer as? CRenderer {
-      cr.voiceCount = options.voiceCount
-      if let voiceCellId = voiceCellIdFinal {
-        cr.voiceCellIdOpt = cellAllocations.cellMappings[voiceCellId]
-      }
-    }
-    let kernels = try time("lowerUOpBlocks") {
+    let renderer = createRenderer(for: backend, options: options)
+    configureRendererVoiceState(
+      renderer: renderer,
+      voiceCount: options.voiceCount,
+      voiceCellId: voiceCellState.id,
+      cellAllocations: cellAllocations)
+
+    let kernels = try timings.measure("lowerUOpBlocks") {
       try lowerUOpBlocks(
         &uopBlocks,
         renderer: renderer,
@@ -384,23 +188,11 @@ public struct CompilationPipeline {
       )
     }
 
-    // Print timing summary
-    let pipelineTotal = (CFAbsoluteTimeGetCurrent() - pipelineStart) * 1000
-    if options.debug {
-      print(
-        "⏱️ [DGen Pipeline] Total: \(String(format: "%.1f", pipelineTotal))ms | nodes: \(graph.nodes.count)"
-      )
-      let sortedTimings = timings.sorted { $0.1 > $1.1 }
-      for (label, ms) in sortedTimings.prefix(10) {
-        let pct = (ms / pipelineTotal) * 100
-        print(
-          "   \(String(format: "%6.1f", ms))ms (\(String(format: "%4.1f", pct))%) - \(label)")
-      }
-    }
+    timings.printSummaryIfNeeded(enabled: options.debug, nodeCount: graph.nodes.count)
 
     return CompilationResult(
       graph: graph,
-      sortedNodes: sortedNodes,
+      sortedNodes: prep.sortedNodes,
       sequentialNodes: finalScalarSet,
       blocks: finalBlocks,
       sortedBlockIndices: finalBlockIndices,
@@ -411,8 +203,293 @@ public struct CompilationPipeline {
       backend: backend,
       totalMemorySlots: cellAllocations.totalMemorySlots,
       cellAllocations: cellAllocations,
-      voiceCellId: voiceCellIdFinal,
+      voiceCellId: voiceCellState.id,
     )
+  }
+
+  /// Enforces frame-count bounds before any mutating compile pass runs.
+  private static func validateFrameCount(_ options: Options, graph: Graph) {
+    precondition(
+      options.frameCount <= graph.maxFrameCount,
+      "frameCount (\(options.frameCount)) exceeds graph.maxFrameCount (\(graph.maxFrameCount)). "
+        + "Set graph.maxFrameCount to at least \(options.frameCount) before compilation."
+    )
+  }
+
+  /// Runs graph-level analysis passes that prepare sorting and scalar execution decisions.
+  private static func runGraphPreparationPasses(
+    graph: Graph, backend: Backend, options: Options, timings: inout PipelineTimings
+  ) throws -> GraphPreparationResult {
+    let feedbackClusters = timings.measure("findFeedbackLoops") {
+      findFeedbackLoops(graph)
+    }
+
+    timings.measure("combineHistoryOps") {
+      combineHistoryOpsNotInFeedback(
+        graph, feedbackClusters: feedbackClusters, options: options)
+    }
+
+    timings.measure("foldConstants") {
+      foldConstants(graph, options: options)
+    }
+
+    let scalarNodeSet = timings.measure("findSequentialNodes") {
+      options.forceScalar
+        ? Set(graph.nodes.keys)
+        : findSequentialNodes(graph, feedbackClusters: feedbackClusters, backend: backend)
+    }
+
+    let sortedNodes = timings.measure("topologicalSort") {
+      topologicalSort(
+        graph, feedbackClusters: feedbackClusters, scalarNodeSet: scalarNodeSet,
+        debug: false)
+    }
+
+    try timings.measure("inferShapes") {
+      try inferShapes(graph: graph, sortedNodes: sortedNodes)
+    }
+
+    timings.measure("allocateTensorOutputs") {
+      allocateTensorOutputs(graph: graph, sortedNodes: sortedNodes)
+    }
+
+    return GraphPreparationResult(
+      feedbackClusters: feedbackClusters,
+      scalarNodeSet: scalarNodeSet,
+      sortedNodes: sortedNodes)
+  }
+
+  /// Propagates scalar requirements through `seq` inputs while preserving SIMD-safe atomics.
+  private static func propagateSeqScalarInputs(
+    graph: Graph, initialScalarSet: Set<NodeID>
+  ) -> Set<NodeID> {
+    let simdSafeNodes = findSIMDSafeAtomicNodes(graph: graph)
+    var scalarSet = initialScalarSet
+
+    for node in graph.nodes.values {
+      guard case .seq = node.op else { continue }
+      let hasScalarInput = node.inputs.contains { scalarSet.contains($0) }
+      guard hasScalarInput else { continue }
+      for inputId in node.inputs where !simdSafeNodes.contains(inputId) {
+        scalarSet.insert(inputId)
+      }
+    }
+
+    return scalarSet
+  }
+
+  /// Finds nodes that intentionally stay SIMD-safe even when traversed by scalar propagation.
+  private static func findSIMDSafeAtomicNodes(graph: Graph) -> Set<NodeID> {
+    var simdSafe = Set<NodeID>()
+    for (nodeId, node) in graph.nodes {
+      switch node.op {
+      case .memoryAccumulate(_), .tensorAccumulate(_):
+        simdSafe.insert(nodeId)
+      default:
+        break
+      }
+    }
+    return simdSafe
+  }
+
+  /// Builds executable blocks before temporality-aware rewrites.
+  private static func buildInitialBlocks(
+    graph: Graph, sortedNodes: [NodeID], scalarNodeSet: Set<NodeID>, context: IRContext,
+    timings: inout PipelineTimings
+  ) -> [Block] {
+    let blocks = timings.measure("determineBlocks") {
+      partitionIntoBlocks(
+        sorted: sortedNodes,
+        scalar: scalarNodeSet,
+        g: graph,
+        debug: false
+      )
+    }
+
+    let fusedBlocks = timings.measure("fuseBlocks1") {
+      fuseBlocks(blocks)
+    }
+
+    let separatedBlocks = timings.measure("tensorBlocks") {
+      determineTensorBlocks(fusedBlocks, graph, context)
+    }
+
+    var finalBlocks = separatedBlocks.compactMap { $0 }
+    if graphContainsSpectralLossOps(graph) {
+      finalBlocks = isolateSpectralPasses(finalBlocks, graph)
+    }
+    return finalBlocks
+  }
+
+  /// Checks whether the graph needs spectral-pass isolation to prevent pass overlap.
+  private static func graphContainsSpectralLossOps(_ graph: Graph) -> Bool {
+    graph.nodes.values.contains { node in
+      switch node.op {
+      case .spectralLossFFT, .spectralLossFFTGradInline, .spectralLossFFTGradSpec,
+        .spectralLossFFTGradIFFT, .spectralLossFFTGradRead, .spectralLossFFTGradRead2:
+        return true
+      default:
+        return false
+      }
+    }
+  }
+
+  /// Applies temporality metadata, backend-specific block splitting, and tensor memory allocation.
+  private static func assignTemporalityAndAllocateTensorMemory(
+    graph: Graph, sortedNodes: [NodeID], feedbackClusters: [[NodeID]], blocks: inout [Block],
+    context: IRContext, backend: Backend, frameCount: Int, timings: inout PipelineTimings
+  ) {
+    let temporalityResult = timings.measure("inferTemporality") {
+      inferTemporality(graph: graph, sortedNodes: sortedNodes)
+    }
+
+    timings.measure("assignTemporality") {
+      assignBlockTemporality(
+        blocks: &blocks,
+        frameBasedNodes: temporalityResult.frameBasedNodes,
+        hopBasedNodes: temporalityResult.hopBasedNodes
+      )
+      context.hopBasedNodes = temporalityResult.hopBasedNodes
+    }
+
+    if backend == .metal {
+      blocks = splitReduceBlocks(g: graph, blocks: blocks)
+      blocks = splitMemoryBlocks(g: graph, blocks: blocks)
+    }
+
+    timings.measure("allocateTensorMemory") {
+      let feedbackClusterNodes = Set(feedbackClusters.flatMap { $0 })
+      allocateTensorMemory(
+        graph: graph,
+        blocks: blocks,
+        frameBasedNodes: temporalityResult.frameBasedNodes,
+        hopBasedNodes: temporalityResult.hopBasedNodes,
+        feedbackClusterNodes: feedbackClusterNodes,
+        backend: backend,
+        frameCount: frameCount
+      )
+      for cellId in graph.frameAwareCells.keys {
+        context.frameAwareTensorCells.insert(cellId)
+      }
+    }
+  }
+
+  /// Emits UOp blocks and applies backend-specific post-processing on emitted ops.
+  private static func emitBlocksToUOpBlocks(
+    graph: Graph, blocks: [Block], context: IRContext, backend: Backend, options: Options,
+    timings: inout PipelineTimings
+  ) throws -> [BlockUOps] {
+    var uopBlocks = [BlockUOps]()
+
+    try timings.measure("emitBlockUOps") {
+      for block in blocks {
+        context.lastBlockHasOwnFrameLoop = false
+        let (ops, bodyEffectiveKind) = try emitBlockUOps(
+          ctx: context,
+          block: block,
+          blocks: blocks,
+          g: graph,
+          backend: backend,
+          debug: options.debug
+        )
+
+        let hasOwnFrameLoop = context.lastBlockHasOwnFrameLoop
+        let (threadCountScale, strippedOps) = extractThreadCountScale(from: ops)
+        var finalOps = strippedOps
+        let effectiveKind = resolveEffectiveKind(
+          backend: backend,
+          blockKind: block.kind,
+          bodyEffectiveKind: bodyEffectiveKind,
+          threadCountScale: threadCountScale,
+          ops: &finalOps)
+
+        if backend == .c {
+          upgradeElementLoopsToSIMD(&finalOps)
+        }
+
+        let parallelPolicy = inferParallelPolicy(
+          kind: effectiveKind, temporality: block.temporality, ops: finalOps)
+        let forceNewKernel = threadCountScale != nil || hasOwnFrameLoop
+
+        uopBlocks.append(
+          BlockUOps(
+            ops: finalOps,
+            kind: effectiveKind,
+            temporality: block.temporality,
+            parallelPolicy: parallelPolicy,
+            forceNewKernel: forceNewKernel,
+            threadCountScale: threadCountScale,
+            hasOwnFrameLoop: hasOwnFrameLoop))
+      }
+    }
+
+    return uopBlocks
+  }
+
+  /// Removes thread-scale directives from ops and returns the last scale encountered.
+  private static func extractThreadCountScale(from ops: [UOp]) -> (Int?, [UOp]) {
+    var scale: Int? = nil
+    var filtered: [UOp] = []
+    filtered.reserveCapacity(ops.count)
+    for op in ops {
+      if case .setThreadCountScale(let s) = op.op {
+        scale = s
+        continue
+      }
+      filtered.append(op)
+    }
+    return (scale, filtered)
+  }
+
+  /// Resolves final block kind after backend-specific scalar constraints.
+  private static func resolveEffectiveKind(
+    backend: Backend, blockKind: Kind, bodyEffectiveKind: Kind, threadCountScale: Int?,
+    ops: inout [UOp]
+  ) -> Kind {
+    let mustForceScalar =
+      backend == .c && (threadCountScale != nil || bodyEffectiveKind == .scalar)
+    guard mustForceScalar else { return blockKind }
+
+    for i in ops.indices {
+      ops[i].kind = .scalar
+    }
+    return .scalar
+  }
+
+  /// Infers whether a block can launch with thread-level parallel policy.
+  private static func inferParallelPolicy(
+    kind: Kind, temporality: Temporality, ops: [UOp]
+  ) -> ParallelPolicy {
+    guard temporality == .static_, kind == .scalar else { return .serial }
+    let hasParallelRange = ops.contains {
+      if case .beginParallelRange = $0.op { return true }
+      return false
+    }
+    return hasParallelRange ? .threadParallel : .serial
+  }
+
+  /// Ensures a voice-index cell exists when multi-voice rendering is requested.
+  private static func ensureVoiceCell(
+    graph: Graph, options: Options
+  ) -> (id: Int?, generated: Bool) {
+    var voiceCellId = options.voiceCellId
+    var generated = false
+    if options.voiceCount > 1 && voiceCellId == nil {
+      voiceCellId = graph.alloc()
+      generated = true
+    }
+    return (voiceCellId, generated)
+  }
+
+  /// Applies mapped voice-cell state to renderers that expose voice configuration.
+  private static func configureRendererVoiceState(
+    renderer: Renderer, voiceCount: Int, voiceCellId: Int?, cellAllocations: CellAllocations
+  ) {
+    guard let cRenderer = renderer as? CRenderer else { return }
+    cRenderer.voiceCount = voiceCount
+    if let voiceCellId {
+      cRenderer.voiceCellIdOpt = cellAllocations.cellMappings[voiceCellId]
+    }
   }
 
   /// Create a renderer for the specified backend
@@ -461,8 +538,12 @@ extension CompilationResult {
 
 private func printUOpBlocks(_ uopBlocks: [BlockUOps], blocks: [Block]) {
   for (i, uopBlock) in uopBlocks.enumerated() {
+    let block = i < blocks.count ? blocks[i] : nil
+    let shape = String(describing: block?.shape)
+    let tensorIndex = String(describing: block?.tensorIndex)
+    let nodes = block?.nodes ?? []
     print(
-      "block #\(i+1) kind=\(uopBlock.kind) threadCountScale\(uopBlock.threadCountScale!) shape=\(blocks[i].shape!) tensorIndex=\(blocks[i].tensorIndex!) nodes=\(blocks[i].nodes)"
+      "block #\(i+1) kind=\(uopBlock.kind) threadCountScale=\(String(describing: uopBlock.threadCountScale)) shape=\(shape) tensorIndex=\(tensorIndex) nodes=\(nodes)"
     )
     var indentLevel = 0
     for uop in uopBlock.ops {
