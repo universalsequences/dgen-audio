@@ -107,18 +107,10 @@ public func isolateSpectralPasses(_ blocks: [Block], _ g: Graph) -> [Block] {
     newBlock.temporality = original.temporality
     newBlock.tensorIndex = original.tensorIndex
     newBlock.shape = original.shape
-    newBlock.frameTensorChain = original.frameTensorChain
     return newBlock
   }
 
   for block in blocks {
-    // Don't split blocks that are part of a frame tensor chain
-    // These have special threading requirements
-    if block.frameTensorChain != nil {
-      result.append(block)
-      continue
-    }
-
     var currentNodes: [NodeID] = []
 
     for nodeId in block.nodes {

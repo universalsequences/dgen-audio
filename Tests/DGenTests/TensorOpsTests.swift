@@ -1517,7 +1517,7 @@ final class CTensorOpsTests: XCTestCase {
         }
 
         // NOTE: 1D to 2D broadcasting needs proper implementation
-        // Currently the type checker supports broadcasting shapes, but code gen
+        // Currently shape inference supports broadcasting shapes, but code gen
         // doesn't properly handle strided access for broadcast dimensions.
         // Skipping this test until broadcasting code gen is implemented.
 

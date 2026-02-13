@@ -269,8 +269,8 @@ public struct CompilationPipeline {
         debug: false)
     }
 
-    try timings.measure("inferShapes") {
-      try inferShapes(graph: graph, sortedNodes: sortedNodes)
+    try timings.measure("shapeInference") {
+      try ShapeInferencePass.inferNodeShapes(graph: graph, sortedNodes: sortedNodes)
     }
 
     timings.measure("allocateTensorOutputs") {
