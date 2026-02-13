@@ -727,6 +727,7 @@ extension LazyOp {
       // avoiding the O(N²) DFT recomputation of GradInline.
       let sig1 = node.inputs[0]
       let sig2 = node.inputs[1]
+      let hopCounter = node.inputs.count > 2 ? node.inputs[2] : nil
       let fftSize = windowSize * 2
 
       // Allocate per-frame gradient spectrum cells (complex: real + imag)
@@ -740,6 +741,8 @@ extension LazyOp {
       // Step 1: Compute gradient w.r.t. complex spectrum from forward's stored data
       // sig1/sig2 are ordering-only inputs — they ensure GradSpec runs after the
       // forward FFT (which also depends on sig1/sig2) in the topological sort
+      var gradSpecInputs: [NodeID] = [gradOutput, sig1, sig2]
+      if let hopCounter { gradSpecInputs.append(hopCounter) }
       let gradSpec = g.n(
         .spectralLossFFTGradSpec(
           windowSize: windowSize,
@@ -749,11 +752,13 @@ extension LazyOp {
           mag2Cell: mag2Cell,
           gradSpec1Cell: gradSpec1Cell,
           gradSpec2Cell: gradSpec2Cell
-        ), [gradOutput, sig1, sig2])
+        ), gradSpecInputs)
 
       g.addGradientSideEffect(gradSpec)
 
       // Step 2: IFFT gradient spectrum → time-domain gradients
+      var gradIFFTInputs: [NodeID] = [gradSpec]
+      if let hopCounter { gradIFFTInputs.append(hopCounter) }
       let gradIFFT = g.n(
         .spectralLossFFTGradIFFT(
           windowSize: windowSize,
@@ -762,23 +767,25 @@ extension LazyOp {
           gradTime1Cell: gradTime1Cell,
           gradTime2Cell: gradTime2Cell,
           windowCell: windowCell
-        ), [gradSpec])
+        ), gradIFFTInputs)
 
       g.addGradientSideEffect(gradIFFT)
 
       // Step 3: Read the gradient for the current frame's sample
+      var gradReadInputs: [NodeID] = [gradIFFT]
+      if let hopCounter { gradReadInputs.append(hopCounter) }
       let gradPassResult = g.n(
         .spectralLossFFTGradRead(
           windowSize: windowSize,
           gradTime1Cell: gradTime1Cell,
           gradTime2Cell: gradTime2Cell
-        ), [gradIFFT])
+        ), gradReadInputs)
 
       let grad2Node = g.n(
         .spectralLossFFTGradRead2(
           windowSize: windowSize,
           gradTime2Cell: gradTime2Cell
-        ), [gradIFFT])
+        ), gradReadInputs)
 
       return [gradPassResult, grad2Node]
 

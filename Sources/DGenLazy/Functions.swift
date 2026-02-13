@@ -633,19 +633,22 @@ extension SignalTensor {
 ///   - sig2: Second signal (typically the teacher/target signal)
 ///   - windowSize: FFT window size (must be power of 2)
 ///   - useHannWindow: Whether to apply Hann window before FFT (default: true)
+///   - hop: Compute spectral terms every `hop` frames (default: 1)
 /// - Returns: Scalar loss signal (per frame)
 public func spectralLossFFT(
   _ sig1: Signal,
   _ sig2: Signal,
   windowSize: Int,
   useHannWindow: Bool = true,
+  hop: Int = 1,
   normalize: Bool = false
 ) -> Signal {
   let nodeId = sig1.graph.graph.spectralLossFFT(
     sig1.nodeId,
     sig2.nodeId,
     windowSize: windowSize,
-    useHannWindow: useHannWindow
+    useHannWindow: useHannWindow,
+    hop: hop
   )
   let loss = Signal(
     nodeId: nodeId, graph: sig1.graph, requiresGrad: sig1.requiresGrad || sig2.requiresGrad)

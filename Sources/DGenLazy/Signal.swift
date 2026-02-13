@@ -189,6 +189,22 @@ public class Signal: LazyValue {
     return SignalTensor.phasor(freqs, reset: reset)
   }
 
+  /// Create a stateful phasor (forced non-deterministic form).
+  /// For scalar frequencies this is equivalent to `phasor(_:)`.
+  public static func statefulPhasor(_ freq: Signal, reset: Signal? = nil) -> Signal {
+    let graph = freq.graph
+    let cellId = graph.alloc()
+    let resetNode = reset?.nodeId ?? graph.node(.constant(0.0))
+    let nodeId = graph.node(.phasor(cellId), [freq.nodeId, resetNode])
+    let needsGrad = freq.requiresGrad || (reset?.requiresGrad ?? false)
+    return Signal(nodeId: nodeId, graph: graph, requiresGrad: needsGrad, cellId: cellId)
+  }
+
+  /// Create a stateful phasor for tensor frequencies.
+  public static func statefulPhasor(_ freqs: Tensor, reset: Signal? = nil) -> SignalTensor {
+    return SignalTensor.statefulPhasor(freqs, reset: reset)
+  }
+
   /// Create a white noise signal
   public static func noise() -> Signal {
     let graph = LazyGraphContext.current

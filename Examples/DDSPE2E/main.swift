@@ -206,6 +206,7 @@ struct DDSPE2EMain {
       --grad-clip <float>
       --spectral-windows <csv-int-list>
       --spectral-weight <float>
+      --spectral-hop-divisor <int>
       --spectral-warmup-steps <int>
       --spectral-ramp-steps <int>
       --mse-weight <float>

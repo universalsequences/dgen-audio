@@ -30,7 +30,8 @@ let package = Package(
         .executableTarget(
             name: "DDSPE2E",
             dependencies: ["DGenLazy"],
-            path: "Examples/DDSPE2E"
+            path: "Examples/DDSPE2E",
+            exclude: ["README.md"]
         ),
         .target(
             name: "DGenLazy",

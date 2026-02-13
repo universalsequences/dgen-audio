@@ -80,6 +80,25 @@ public class SignalTensor: LazyValue {
             tensorId: freqs.tensorId
         )
     }
+
+    /// Create a stateful phasor with multiple frequencies.
+    /// This preserves frame-to-frame phasor state and is useful for truly time-varying frequency tensors.
+    public static func statefulPhasor(_ freqs: Tensor, reset: Signal? = nil) -> SignalTensor {
+        let graph = freqs.graph
+        let resetNode = reset?.nodeId ?? graph.node(.constant(0.0))
+        let stateWidth = Swift.max(1, freqs.shape.reduce(1, *))
+        let cellId = graph.alloc(vectorWidth: stateWidth)
+        let nodeId = graph.node(.phasor(cellId), [freqs.nodeId, resetNode])
+
+        let needsGrad = freqs.requiresGrad || (reset?.requiresGrad ?? false)
+        return SignalTensor(
+            nodeId: nodeId,
+            graph: graph,
+            shape: freqs.shape,
+            requiresGrad: needsGrad,
+            tensorId: freqs.tensorId
+        )
+    }
 }
 
 // MARK: - SignalTensor Properties
@@ -113,4 +132,3 @@ extension SignalTensor {
         return Signal(nodeId: nodeId, graph: graph, requiresGrad: requiresGrad)
     }
 }
-

@@ -185,6 +185,7 @@ enum DDSPE2ETrainer {
       "lr": "\(config.learningRate)",
       "mseWeight": "\(config.mseLossWeight)",
       "spectralWeightTarget": "\(config.spectralWeight)",
+      "spectralHopDivisor": "\(config.spectralHopDivisor)",
       "spectralWarmupSteps": "\(config.spectralWarmupSteps)",
       "spectralRampSteps": "\(config.spectralRampSteps)",
     ]
@@ -245,6 +246,7 @@ enum DDSPE2ETrainer {
         prediction: prediction,
         target: target,
         spectralWindowSizes: config.spectralWindowSizes,
+        spectralHopDivisor: config.spectralHopDivisor,
         frameCount: frameCount,
         mseWeight: config.mseLossWeight,
         spectralWeight: spectralWeight

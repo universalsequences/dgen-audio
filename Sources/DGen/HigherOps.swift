@@ -47,11 +47,13 @@ extension Graph {
     _ sig1: NodeID,
     _ sig2: NodeID,
     windowSize: Int,
-    useHannWindow: Bool = true
+    useHannWindow: Bool = true,
+    hop: Int = 1
   ) -> NodeID {
     precondition(
       windowSize > 0 && (windowSize & (windowSize - 1)) == 0,
       "windowSize must be a power of 2")
+    precondition(hop >= 1, "hop must be >= 1")
 
     let numBins = windowSize / 2 + 1
 
@@ -72,6 +74,18 @@ extension Graph {
     // Allocate scratch for per-frame squared differences
     let scratchCell = alloc(vectorWidth: numBins * maxFrameCount)
 
+    // Optional hop counter: when hop > 1, spectral kernels only execute on frames where counter == 0.
+    // We pass the counter value as an extra input so both forward and backward can gate work.
+    var inputs = [sig1, sig2]
+    if hop > 1 {
+      let counterCell = alloc(vectorWidth: 1)
+      let one = n(.constant(1), [])
+      let zero = n(.constant(0), [])
+      let hopConst = n(.constant(Float(hop)), [])
+      let counterAccum = n(.accum(counterCell), one, zero, zero, hopConst)
+      inputs.append(counterAccum)
+    }
+
     // Create the spectralLossFFT node with all resources
     return n(
       .spectralLossFFT(
@@ -83,7 +97,7 @@ extension Graph {
         mag1Cell: mag1Cell,
         mag2Cell: mag2Cell,
         scratchCell: scratchCell
-      ), [sig1, sig2])
+      ), inputs)
   }
 
   /// Delta: returns the difference between current and previous input value

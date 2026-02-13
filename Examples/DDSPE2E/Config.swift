@@ -29,6 +29,7 @@ struct DDSPE2EConfig: Codable {
   var gradClip: Float = 1.0
   var spectralWindowSizes: [Int] = []
   var spectralWeight: Float = 0.0
+  var spectralHopDivisor: Int = 4
   var spectralWarmupSteps: Int = 100
   var spectralRampSteps: Int = 200
   var mseLossWeight: Float = 1.0
@@ -59,6 +60,7 @@ struct DDSPE2EConfig: Codable {
     case gradClip
     case spectralWindowSizes
     case spectralWeight
+    case spectralHopDivisor
     case spectralWarmupSteps
     case spectralRampSteps
     case mseLossWeight
@@ -93,6 +95,7 @@ struct DDSPE2EConfig: Codable {
     gradClip = try c.decodeIfPresent(Float.self, forKey: .gradClip) ?? d.gradClip
     spectralWindowSizes = try c.decodeIfPresent([Int].self, forKey: .spectralWindowSizes) ?? d.spectralWindowSizes
     spectralWeight = try c.decodeIfPresent(Float.self, forKey: .spectralWeight) ?? d.spectralWeight
+    spectralHopDivisor = try c.decodeIfPresent(Int.self, forKey: .spectralHopDivisor) ?? d.spectralHopDivisor
     spectralWarmupSteps = try c.decodeIfPresent(Int.self, forKey: .spectralWarmupSteps) ?? d.spectralWarmupSteps
     spectralRampSteps = try c.decodeIfPresent(Int.self, forKey: .spectralRampSteps) ?? d.spectralRampSteps
     mseLossWeight = try c.decodeIfPresent(Float.self, forKey: .mseLossWeight) ?? d.mseLossWeight
@@ -138,6 +141,9 @@ struct DDSPE2EConfig: Codable {
     }
     if let value = options["spectral-weight"] {
       spectralWeight = try parseFloat(value, key: "spectral-weight")
+    }
+    if let value = options["spectral-hop-divisor"] {
+      spectralHopDivisor = try parseInt(value, key: "spectral-hop-divisor")
     }
     if let value = options["spectral-warmup-steps"] {
       spectralWarmupSteps = try parseInt(value, key: "spectral-warmup-steps")
@@ -224,6 +230,9 @@ struct DDSPE2EConfig: Codable {
     }
     guard spectralWeight >= 0 else {
       throw ConfigError.invalid("spectralWeight must be >= 0")
+    }
+    guard spectralHopDivisor > 0 else {
+      throw ConfigError.invalid("spectralHopDivisor must be > 0")
     }
     guard spectralWarmupSteps >= 0 else {
       throw ConfigError.invalid("spectralWarmupSteps must be >= 0")

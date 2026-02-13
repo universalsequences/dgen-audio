@@ -6,6 +6,7 @@ enum DDSPTrainingLosses {
     prediction: Signal,
     target: Signal,
     spectralWindowSizes: [Int],
+    spectralHopDivisor: Int,
     frameCount: Int,
     mseWeight: Float,
     spectralWeight: Float
@@ -20,7 +21,8 @@ enum DDSPTrainingLosses {
     if spectralWeight > 0, !usableWindows.isEmpty {
       var spec = Signal.constant(0.0)
       for w in usableWindows {
-        spec = spec + spectralLossFFT(prediction, target, windowSize: w, normalize: true)
+        let hop = max(1, w / max(1, spectralHopDivisor))
+        spec = spec + spectralLossFFT(prediction, target, windowSize: w, hop: hop, normalize: true)
       }
       spec = spec * (1.0 / Float(usableWindows.count))
       total = total + spec * spectralWeight

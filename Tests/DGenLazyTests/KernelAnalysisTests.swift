@@ -69,6 +69,28 @@ final class KernelAnalysisTests: XCTestCase {
     print("Signal - Kernels: \(analysis.kernelCount), Work: \(analysis.work), Span: \(analysis.span)")
   }
 
+  func testDumpTensorPhasorKernel() throws {
+    DGenConfig.sampleRate = 1000.0
+    let previousKernelPath = DGenConfig.kernelOutputPath
+    let kernelPath = "/tmp/tensor_phasor_simple.metal"
+    DGenConfig.kernelOutputPath = kernelPath
+    defer {
+      DGenConfig.kernelOutputPath = previousKernelPath
+    }
+
+    LazyGraphContext.reset()
+
+    let freqs = Tensor([100.0, 200.0, 300.0, 400.0])
+    let phases = Signal.statefulPhasor(freqs)
+    let signal = sin(phases * 2.0 * Float.pi).sum()
+
+    _ = try signal.realize(frames: 64)
+
+    let kernelSource = try String(contentsOfFile: kernelPath, encoding: .utf8)
+    XCTAssertTrue(kernelSource.contains("kernel void"))
+    print("Wrote tensor-phasor kernel dump to \(kernelPath)")
+  }
+
   // MARK: - Per-Kernel Breakdown
 
   func testKernelBreakdown() throws {
