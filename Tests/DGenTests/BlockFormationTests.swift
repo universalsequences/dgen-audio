@@ -385,4 +385,93 @@ final class BlockFormationTests: XCTestCase {
         )
         print(result.source)
     }
+
+    // MARK: - determineTensorBlocks Targeted Tests
+
+    func testDetermineTensorBlocksSplitsScalarPrefixForInherentlyScalarOps() throws {
+        let g = Graph()
+
+        let tensor = g.tensor(shape: [4], data: [1, 2, 3, 4])
+        let seed = g.n(.constant(1.0))
+        let accumNode = g.n(.accum(g.alloc()), seed)
+        let tensorAdd = g.n(.add, tensor, g.n(.constant(0.5)))
+
+        try inferShapes(graph: g, sortedNodes: [tensor, seed, accumNode, tensorAdd])
+
+        var block = Block(kind: .scalar)
+        block.nodes = [accumNode, tensorAdd]
+
+        let result = determineTensorBlocks([block], g, IRContext(g: g))
+
+        XCTAssertEqual(result.count, 2)
+        XCTAssertEqual(result[0].nodes, [accumNode])
+        XCTAssertNil(result[0].tensorIndex)
+        XCTAssertEqual(result[1].nodes, [tensorAdd])
+        XCTAssertNotNil(result[1].tensorIndex)
+        XCTAssertEqual(result[1].shape, [4])
+    }
+
+    func testDetermineTensorBlocksIsolatesOverlapAddAsScalarBlock() throws {
+        let g = Graph()
+
+        let tensor = g.tensor(shape: [4], data: [1, 2, 3, 4])
+        let mul = g.n(.mul, tensor, g.n(.constant(2.0)))
+        let overlapAdd = g.n(.overlapAdd(8, 4, g.alloc(), g.alloc(), g.alloc()), mul)
+        let post = g.n(.add, tensor, g.n(.constant(1.0)))
+
+        try inferShapes(graph: g, sortedNodes: [tensor, mul, overlapAdd, post])
+
+        var block = Block(kind: .simd)
+        block.nodes = [mul, overlapAdd, post]
+
+        let result = determineTensorBlocks([block], g, IRContext(g: g))
+
+        XCTAssertEqual(result.count, 3)
+        XCTAssertEqual(result[0].nodes, [mul])
+        XCTAssertEqual(result[1].nodes, [overlapAdd])
+        XCTAssertEqual(result[1].kind, .scalar)
+        XCTAssertEqual(result[2].nodes, [post])
+        XCTAssertNotNil(result[0].tensorIndex)
+        XCTAssertNotNil(result[2].tensorIndex)
+    }
+
+    func testDetermineTensorBlocksSplitsOnNonFusableShapeTransition() throws {
+        let g = Graph()
+
+        let matrix = g.tensor(shape: [2, 3], data: [1, 2, 3, 4, 5, 6])
+        let matrixAdd = g.n(.add, matrix, g.n(.constant(1.0)))
+        let row = g.n(.selectRow, matrixAdd, g.n(.constant(0.0)))
+
+        try inferShapes(graph: g, sortedNodes: [matrix, matrixAdd, row])
+
+        var block = Block(kind: .simd)
+        block.nodes = [matrixAdd, row]
+
+        let result = determineTensorBlocks([block], g, IRContext(g: g))
+
+        XCTAssertEqual(result.count, 2)
+        XCTAssertEqual(result[0].nodes, [matrixAdd])
+        XCTAssertEqual(result[1].nodes, [row])
+        XCTAssertEqual(result[0].shape, [2, 3])
+        XCTAssertEqual(result[1].shape, [3])
+    }
+
+    func testDetermineTensorBlocksKeepsAxisReduceTransitionInSameBlock() throws {
+        let g = Graph()
+
+        let input = g.tensor(shape: [2, 3], data: [1, 2, 3, 4, 5, 6])
+        let reduced = g.n(.sumAxis(1), input)
+        let post = g.n(.add, reduced, g.n(.constant(1.0)))
+
+        try inferShapes(graph: g, sortedNodes: [input, reduced, post])
+
+        var block = Block(kind: .simd)
+        block.nodes = [input, reduced, post]
+
+        let result = determineTensorBlocks([block], g, IRContext(g: g))
+
+        XCTAssertEqual(result.count, 1)
+        XCTAssertEqual(result[0].nodes, [input, reduced, post])
+        XCTAssertNotNil(result[0].tensorIndex)
+    }
 }

@@ -402,179 +402,186 @@ public func splitMemoryBlocks(g: Graph, blocks: [Block]) -> [Block] {
   return result
 }
 
+/// Creates an empty derived block that preserves non-node metadata needed for grouping.
+private func makeTensorGroupingBlock(from original: Block) -> Block {
+  var newBlock = Block(kind: original.kind)
+  newBlock.temporality = original.temporality
+  return newBlock
+}
+
+/// Appends `currentBlock` to `grouped` when non-empty.
+private func appendCurrentGroupingBlockIfNeeded(
+  _ currentBlock: inout Block, grouped: inout [Block]
+) {
+  if !currentBlock.nodes.isEmpty {
+    grouped.append(currentBlock)
+  }
+}
+
+/// Assigns tensor loop metadata from the first tensor-shaped node in `block`.
+private func assignTensorIndexFromFirstTensorNode(
+  to block: inout Block, graph: Graph, ctx: IRContext
+) {
+  for nodeId in block.nodes {
+    guard let node = graph.nodes[nodeId], case .tensor(let shape) = node.shape else { continue }
+    guard block.tensorIndex == nil else { break }
+    block.tensorIndex = ctx.useVariable(src: nil)
+    block.shape = shape
+    break
+  }
+}
+
+/// Returns the first tensor-shaped, non-view node offset in a scalar block.
+private func firstNonViewTensorOffset(in block: Block, graph: Graph) -> Int? {
+  block.nodes.enumerated().first { (_, nodeId) in
+    guard let node = graph.nodes[nodeId], case .tensor = node.shape else { return false }
+    return !node.op.isViewOnly
+  }?.offset
+}
+
+/// Returns true when a scalar block prefix contains inherently-scalar stateful ops.
+///
+/// When true, the scalar prefix must be split out so tensor loop wrapping does not run
+/// these stateful ops once per tensor element.
+private func scalarPrefixNeedsSplit(
+  block: Block, firstTensorOffset: Int, graph: Graph
+) -> Bool {
+  guard firstTensorOffset > 0 else { return false }
+  return block.nodes[0..<firstTensorOffset].contains { nodeId in
+    graph.nodes[nodeId]?.op.isInherentlyScalar ?? false
+  }
+}
+
+/// Splits scalar blocks only when needed to keep inherently scalar state ops out of tensor loops.
+private func splitScalarBlockForTensorGrouping(
+  _ block: Block, graph: Graph, ctx: IRContext
+) -> [Block] {
+  guard let firstTensorOffset = firstNonViewTensorOffset(in: block, graph: graph) else {
+    var modified = block
+    assignTensorIndexFromFirstTensorNode(to: &modified, graph: graph, ctx: ctx)
+    return [modified]
+  }
+
+  guard scalarPrefixNeedsSplit(block: block, firstTensorOffset: firstTensorOffset, graph: graph)
+  else {
+    var modified = block
+    assignTensorIndexFromFirstTensorNode(to: &modified, graph: graph, ctx: ctx)
+    return [modified]
+  }
+
+  var scalarPrefix = makeTensorGroupingBlock(from: block)
+  scalarPrefix.nodes = Array(block.nodes[0..<firstTensorOffset])
+
+  var tensorSuffix = makeTensorGroupingBlock(from: block)
+  tensorSuffix.nodes = Array(block.nodes[firstTensorOffset...])
+  assignTensorIndexFromFirstTensorNode(to: &tensorSuffix, graph: graph, ctx: ctx)
+
+  return [scalarPrefix, tensorSuffix]
+}
+
+/// Groups non-scalar blocks by tensor shape while preserving special-case execution constraints.
+private func groupRegularTensorBlock(
+  _ block: Block, graph: Graph, ctx: IRContext
+) -> [Block] {
+  var grouped: [Block] = []
+  var currentBlock = makeTensorGroupingBlock(from: block)
+  var currentShape: Shape? = nil
+
+  for nodeId in block.nodes {
+    guard let node = graph.nodes[nodeId] else {
+      currentBlock.nodes.append(nodeId)
+      continue
+    }
+
+    // tensorRef only seeds tensor loop metadata; it should not force standalone compute blocks.
+    if case .tensorRef = node.op {
+      if case .tensor(let shape) = node.shape {
+        if currentShape != nil && shape != currentShape {
+          appendCurrentGroupingBlockIfNeeded(&currentBlock, grouped: &grouped)
+          currentBlock = makeTensorGroupingBlock(from: block)
+        }
+        currentBlock.shape = shape
+        currentBlock.tensorIndex = ctx.useVariable(src: nil)
+        currentShape = shape
+      }
+      currentBlock.nodes.append(nodeId)
+      continue
+    }
+
+    // View-only ops emit metadata markers and should not split tensor execution regions.
+    if node.op.isViewOnly {
+      currentBlock.nodes.append(nodeId)
+      continue
+    }
+
+    if case .conv2d = node.op {
+      if currentShape != nil {
+        appendCurrentGroupingBlockIfNeeded(&currentBlock, grouped: &grouped)
+        currentBlock = makeTensorGroupingBlock(from: block)
+      }
+      currentShape = nil
+
+    } else if case .constant = node.op {
+      // Constants do not affect grouping state.
+    } else if case .overlapAdd = node.op {
+      // overlapAdd has its own internal frame/scatter loop and must be isolated.
+      appendCurrentGroupingBlockIfNeeded(&currentBlock, grouped: &grouped)
+
+      var overlapAddBlock = makeTensorGroupingBlock(from: block)
+      overlapAddBlock.kind = .scalar
+      overlapAddBlock.nodes.append(nodeId)
+      grouped.append(overlapAddBlock)
+
+      currentBlock = makeTensorGroupingBlock(from: block)
+      currentShape = nil
+      continue
+    } else if case .tensor(let shape) = node.shape {
+      if shape != currentShape {
+        // Axis reduces and concat-by-padding transitions stay in-region even when shape changes.
+        if let previousShape = currentShape,
+          isAxisReduceOp(node.op)
+            || isConcatByPaddingFusionTransition(
+              nodeId: nodeId, graph: graph, currentShape: previousShape)
+        {
+          currentShape = shape
+        } else {
+          appendCurrentGroupingBlockIfNeeded(&currentBlock, grouped: &grouped)
+          currentBlock = makeTensorGroupingBlock(from: block)
+          currentBlock.tensorIndex = ctx.useVariable(src: nil)
+          currentBlock.shape = shape
+          currentShape = shape
+        }
+      }
+    } else {
+      if currentShape != nil {
+        appendCurrentGroupingBlockIfNeeded(&currentBlock, grouped: &grouped)
+        currentBlock = makeTensorGroupingBlock(from: block)
+      }
+      currentShape = nil
+    }
+
+    currentBlock.nodes.append(nodeId)
+  }
+
+  appendCurrentGroupingBlockIfNeeded(&currentBlock, grouped: &grouped)
+  return grouped
+}
+
+/// Annotates/splits blocks for tensor loop emission.
+///
+/// Scalar blocks are preserved unless a scalar prefix must be split out to protect stateful ops.
+/// Non-scalar blocks are grouped by tensor shape with explicit handling for conv/overlap/view
+/// semantics required by the emission backend.
 func determineTensorBlocks(_ blocks: [Block], _ graph: Graph, _ ctx: IRContext) -> [Block] {
   var determined: [Block] = []
 
-  // Helper to create a new block preserving original properties
-  func makeBlock(from original: Block) -> Block {
-    var newBlock = Block(kind: original.kind)
-    newBlock.temporality = original.temporality
-    return newBlock
-  }
-
-  // Assign tensorIndex from the first tensor-shaped node in the block
-  func assignTensorIndex(to block: inout Block, graph: Graph, ctx: IRContext) {
-    for nodeId in block.nodes {
-      if let node = graph.nodes[nodeId], case .tensor(let shape) = node.shape {
-        if block.tensorIndex == nil {
-          block.tensorIndex = ctx.useVariable(src: nil)
-          block.shape = shape
-        }
-        break
-      }
-    }
-  }
-
   for block in blocks {
-    // CRITICAL: Scalar blocks (feedback clusters) must NOT be split!
-    // They contain history read/write ops that must execute sequentially together.
-    // But we still need to set up tensorIndex for tensor operations inside.
     if block.kind == .scalar {
-      // Find the first tensor-shaped node (excluding view-only ops)
-      let firstTensorIdx = block.nodes.enumerated().first { (_, nodeId) in
-        guard let node = graph.nodes[nodeId], case .tensor = node.shape else { return false }
-        return !node.op.isViewOnly
-      }?.offset
-
-      // Split scalar blocks when the leading scalar nodes contain stateful ops
-      // (accum, phasor, etc.) that must NOT execute inside the tensor element loop.
-      // The C backend wraps blocks with tensorIndex in beginParallelRange, which would
-      // cause these ops to execute N times per frame instead of once.
-      let needsSplit: Bool
-      if let splitIdx = firstTensorIdx, splitIdx > 0 {
-        needsSplit = block.nodes[0..<splitIdx].contains { nodeId in
-          graph.nodes[nodeId]?.op.isInherentlyScalar ?? false
-        }
-      } else {
-        needsSplit = false
-      }
-
-      if let splitIdx = firstTensorIdx, needsSplit {
-        // Scalar prefix as its own block (no tensorIndex)
-        var scalarBlock = makeBlock(from: block)
-        scalarBlock.nodes = Array(block.nodes[0..<splitIdx])
-        determined.append(scalarBlock)
-
-        // Tensor suffix with tensorIndex
-        var tensorBlock = makeBlock(from: block)
-        tensorBlock.nodes = Array(block.nodes[splitIdx...])
-        assignTensorIndex(to: &tensorBlock, graph: graph, ctx: ctx)
-        determined.append(tensorBlock)
-      } else {
-        // No split needed — assign tensorIndex to entire block
-        var modifiedBlock = block
-        assignTensorIndex(to: &modifiedBlock, graph: graph, ctx: ctx)
-        determined.append(modifiedBlock)
-      }
+      determined.append(contentsOf: splitScalarBlockForTensorGrouping(block, graph: graph, ctx: ctx))
       continue
     }
-    var innerBlocks: [Block] = []
-    var currentBlock = makeBlock(from: block)
-    var currentShape: Shape? = nil
-    for nodeId in block.nodes {
-      if let node = graph.nodes[nodeId] {
-        // Skip tensorRef nodes for tensor block grouping decisions.
-        //
-        // tensorRef nodes are just data containers - they emit nothing (return []).
-        // If we let them create tensor blocks, we'd get empty parallel loops:
-        //   for (int simd1 = 0; simd1 < 16; simd1+=4) { }  // empty!
-        //
-        // Instead, tensorRef nodes stay in whatever block they're in but don't
-        // trigger new tensor block creation. The actual tensor OPERATIONS (mul, add, etc.)
-        // that process tensor data will create the tensor blocks.
-        if case .tensorRef = node.op {
-          if case .tensor(let shape) = node.shape {
-            // If shape differs, split the block first
-            if currentShape != nil && shape != currentShape {
-              if currentBlock.nodes.count > 0 {
-                innerBlocks.append(currentBlock)
-              }
-              currentBlock = makeBlock(from: block)
-            }
-            currentBlock.shape = shape
-            currentBlock.tensorIndex = ctx.useVariable(src: nil)
-            currentShape = shape
-          }
-          currentBlock.nodes.append(nodeId)
-          continue
-        }
-
-        // Skip view-only ops for tensor block grouping.
-        // These emit no compute code (just marker UOps). Letting them trigger
-        // tensor block splits would create empty parallel loops.
-        if node.op.isViewOnly {
-          currentBlock.nodes.append(nodeId)
-          continue
-        }
-
-        if case .conv2d = node.op {
-          if currentShape != nil {
-            if currentBlock.nodes.count > 0 {
-              innerBlocks.append(currentBlock)
-            }
-            // regular node
-            currentBlock = makeBlock(from: block)
-          }
-          currentShape = nil
-
-        } else if case .constant = node.op {
-          // do nothing
-        } else if case .overlapAdd = node.op {
-          // overlapAdd has internal loops (scatter-add) — needs its own scalar block
-          if currentBlock.nodes.count > 0 {
-            innerBlocks.append(currentBlock)
-          }
-          currentBlock = makeBlock(from: block)
-          currentBlock.kind = .scalar
-          currentBlock.nodes.append(nodeId)
-          innerBlocks.append(currentBlock)
-          currentBlock = makeBlock(from: block)
-          currentShape = nil
-          continue
-        } else if case .tensor(let shape) = node.shape {
-          if shape != currentShape {
-            // Axis reduces (sumAxis, maxAxis, meanAxis) can stay in the same block
-            // as their input — each output thread reduces over an independent slice.
-            // Don't change block kind — shape-transition emission handles the different
-            // element counts via per-region loops while keeping the block parallelizable.
-            if let previousShape = currentShape,
-              isAxisReduceOp(node.op)
-                || isConcatByPaddingFusionTransition(
-                  nodeId: nodeId,
-                  graph: graph,
-                  currentShape: previousShape)
-            {
-              currentShape = shape
-            } else {
-              if currentBlock.nodes.count > 0 {
-                innerBlocks.append(currentBlock)
-              }
-              // tensor block
-              currentBlock = makeBlock(from: block)
-              currentBlock.tensorIndex = ctx.useVariable(src: nil)
-              currentBlock.shape = shape
-              currentShape = shape
-            }
-          }
-        } else {
-          if currentShape != nil {
-            if currentBlock.nodes.count > 0 {
-              innerBlocks.append(currentBlock)
-            }
-            // regular node
-            currentBlock = makeBlock(from: block)
-          }
-          currentShape = nil
-        }
-      }
-      currentBlock.nodes.append(nodeId)
-    }
-    if currentBlock.nodes.count > 0 {
-      innerBlocks.append(currentBlock)
-    }
-    for block in innerBlocks {
-      determined.append(block)
-    }
+    determined.append(contentsOf: groupRegularTensorBlock(block, graph: graph, ctx: ctx))
   }
+
   return determined
 }
