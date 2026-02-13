@@ -35,6 +35,13 @@ public enum DGenConfig {
 
     /// Enable buffer liveness analysis and reuse to reduce memory allocations
     public static var enableBufferReuse: Bool = true
+
+    /// Toggle `peek` backward strategy.
+    /// `true`: deterministic write+reduce.
+    /// `false`: atomic scatter (usually faster).
+    public static var useDeterministicPeekGradients: Bool = false {
+        didSet { DGenGradientConfig.useDeterministicPeekGradients = useDeterministicPeekGradients }
+    }
 }
 
 // MARK: - Type Aliases for Convenience

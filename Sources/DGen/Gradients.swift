@@ -920,6 +920,7 @@ extension LazyOp {
       return [sequencedGrad, zero]
 
     case .peekRowGradWrite(_, _, _, _, _, _, _), .peekRowGradReduce(_, _, _, _, _, _, _, _),
+      .peekGradWrite(_, _, _, _, _, _, _), .peekGradReduce(_, _, _, _, _, _, _),
       .overlapAddGradStore(_), .overlapAddGradGather(_, _, _, _),
       .bufferViewGradStore(_, _), .bufferViewGradRead(_, _):
       // Gradient ops don't need their own gradients
@@ -958,16 +959,13 @@ extension LazyOp {
 
     case .peek:
       // peek(tensor, index, channel) -> interpolated scalar read
-      // Gradient scatters back to two tensor positions
       guard node.inputs.count == 3 else {
         return [nil, nil, nil]
       }
 
       let tensorInput = node.inputs[0]
       guard let inputNode = g.nodes[tensorInput],
-        case .tensor(let originalShape) = inputNode.shape,
-        let tensorId = g.nodeToTensor[tensorInput],
-        let tensor = g.tensors[tensorId]
+        case .tensor(let originalShape) = inputNode.shape
       else {
         let zero = g.n(.constant(0.0), [])
         return [nil, zero, zero]
@@ -977,61 +975,93 @@ extension LazyOp {
       let channelSize = shape[0]
       let numChannels = shape[1]
       let totalSize = channelSize * numChannels
-      let tensorCellId = tensor.cellId
 
       // Get or create gradient cell for this tensor
-      let gradCell: CellID
-      if let existing = g.gradCarryCells[tensorCellId] {
-        gradCell = existing
-      } else {
-        gradCell = g.alloc(vectorWidth: totalSize)
-        g.gradCarryCells[tensorCellId] = gradCell
+      let gradCell = getOrCreateGradCell(g, tensorInput: tensorInput, totalSize: totalSize)
+      let zero = g.n(.constant(0.0), [])
+
+      if DGenGradientConfig.useDeterministicPeekGradients {
+        // Deterministic two-phase write+reduce:
+        // 1) write per-frame grad + interpolation metadata
+        // 2) reduce over frames to build tensor gradient
+        let gradWriteCell = g.alloc(vectorWidth: g.maxFrameCount)
+        let floorPosCell = g.alloc(vectorWidth: g.maxFrameCount)
+        let nextPosCell = g.alloc(vectorWidth: g.maxFrameCount)
+        let fracCell = g.alloc(vectorWidth: g.maxFrameCount)
+
+        let writeOp = g.n(
+          .peekGradWrite(
+            gradWriteCell: gradWriteCell,
+            floorPosCell: floorPosCell,
+            nextPosCell: nextPosCell,
+            fracCell: fracCell,
+            channelSize: channelSize,
+            numChannels: numChannels,
+            maxFrameCount: g.maxFrameCount
+          ),
+          [gradOutput, node.inputs[1], node.inputs[2]]
+        )
+        g.addGradientSideEffect(writeOp)
+
+        let reduceOp = g.n(
+          .peekGradReduce(
+            gradWriteCell: gradWriteCell,
+            floorPosCell: floorPosCell,
+            nextPosCell: nextPosCell,
+            fracCell: fracCell,
+            gradCell: gradCell,
+            totalSize: totalSize,
+            maxFrameCount: g.maxFrameCount
+          ),
+          [writeOp]
+        )
+        g.addGradientSideEffect(reduceOp)
+
+        let sequencedGrad = createSequencedGradTensor(
+          g,
+          gradCell: gradCell,
+          shape: originalShape,
+          afterOp: reduceOp
+        )
+        return [sequencedGrad, zero, zero]
       }
 
-      // Recompute interpolation positions (same logic as forward)
+      // Legacy fast scatter path:
+      // dL/d(tensor[pos1]) += gradOut * (1-frac)
+      // dL/d(tensor[pos2]) += gradOut * frac
       let index = node.inputs[1]
       let channel = node.inputs[2]
-
       let one = g.n(.constant(1.0), [])
-      let zero = g.n(.constant(0.0), [])
       let channelSizeFloat = g.n(.constant(Float(channelSize)), [])
 
-      // Wrap index within channel using modulo
       let wrappedIndex = g.n(.mod, [index, channelSizeFloat])
       let isNegative = g.n(.lt, [wrappedIndex, zero])
       let positiveIndex = g.n(
         .gswitch, [isNegative, g.n(.add, [wrappedIndex, channelSizeFloat]), wrappedIndex])
 
-      // Clamp channel to valid range [0, numChannels-1]
       let numChannelsMinusOne = g.n(.constant(Float(numChannels - 1)), [])
       let clampedChannel = g.n(
         .floor, [g.n(.max, [zero, g.n(.min, [channel, numChannelsMinusOne])])])
       let channelOffset = g.n(.mul, [channelSizeFloat, clampedChannel])
 
-      // Calculate final read position
       let finalReadPos = g.n(.add, [channelOffset, positiveIndex])
       let flooredPos = g.n(.floor, [finalReadPos])
       let frac = g.n(.sub, [finalReadPos, flooredPos])
 
-      // Next position with wrapping at channel boundary
       let nextPos = g.n(.add, [flooredPos, one])
       let nextChannelOffset = g.n(.add, [channelOffset, channelSizeFloat])
       let nextPosWrapped = g.n(
         .gswitch, [g.n(.gte, [nextPos, nextChannelOffset]), channelOffset, nextPos])
 
-      // Scatter gradients: dL/d(tensor[pos1]) += gradOut * (1-frac)
-      //                    dL/d(tensor[pos2]) += gradOut * frac
       let oneMinusFrac = g.n(.sub, [one, frac])
       let grad1 = g.n(.mul, [gradOutput, oneMinusFrac])
       let grad2 = g.n(.mul, [gradOutput, frac])
 
       let scatter1 = g.n(.memoryAccumulate(gradCell), [flooredPos, grad1])
       let scatter2 = g.n(.memoryAccumulate(gradCell), [nextPosWrapped, grad2])
-
       g.addGradientSideEffect(scatter1)
       g.addGradientSideEffect(scatter2)
 
-      // Tensor gradient handled via side effects, index/channel gradients are zero
       return [nil, zero, zero]
 
     // MARK: Logical ops (non-differentiable)
