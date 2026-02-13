@@ -183,60 +183,113 @@ public func isAxisReduceOp(_ op: LazyOp) -> Bool {
   }
 }
 
-/// Detect `add(pad(a), pad(b))` tensor joins that represent concat-by-padding.
-/// Keeping this shape transition inside the current block fuses FFT butterfly
-/// math with its pad+concat join into one kernel.
-private func isPadConcatFusionTransition(
+/// Detect concat-by-padding joins represented as add trees over padded tensors:
+/// `add(...add(pad(x0), pad(x1))..., pad(xN))`.
+/// Keeping this shape transition inside the current block fuses butterfly math
+/// with its pad+concat join into one kernel.
+private func isConcatByPaddingFusionTransition(
   nodeId: NodeID,
   graph: Graph,
   currentShape: Shape
 ) -> Bool {
   guard let node = graph.nodes[nodeId] else { return false }
   guard case .add = node.op else { return false }
-  guard node.inputs.count == 2 else { return false }
+  guard case .tensor(let outputShape) = node.shape else { return false }
+  guard outputShape.count == currentShape.count else { return false }
 
-  var paddings: [[(Int, Int)]] = []
-  for inputId in node.inputs {
-    guard let padNode = graph.nodes[inputId] else { return false }
-    guard case .pad(let padding) = padNode.op else { return false }
-    guard let padInputId = padNode.inputs.first,
-      let padInputNode = graph.nodes[padInputId],
-      case .tensor(let padInputShape) = padInputNode.shape
-    else { return false }
-    guard padInputShape == currentShape, padding.count == currentShape.count else { return false }
-    paddings.append(padding)
+  func collectPadLeaves(_ currentNodeId: NodeID) -> [[(Int, Int)]]? {
+    guard let currentNode = graph.nodes[currentNodeId] else { return nil }
+
+    switch currentNode.op {
+    case .add:
+      guard currentNode.inputs.count == 2 else { return nil }
+      guard let left = collectPadLeaves(currentNode.inputs[0]),
+        let right = collectPadLeaves(currentNode.inputs[1])
+      else { return nil }
+      return left + right
+
+    case .pad(let padding):
+      guard currentNode.inputs.count == 1 else { return nil }
+      guard padding.count == currentShape.count else { return nil }
+      guard let padInputNode = graph.nodes[currentNode.inputs[0]],
+        case .tensor(let padInputShape) = padInputNode.shape,
+        padInputShape == currentShape
+      else { return nil }
+      guard case .tensor(let padOutputShape) = currentNode.shape,
+        padOutputShape == outputShape
+      else { return nil }
+      return [padding]
+
+    default:
+      return nil
+    }
   }
-  guard paddings.count == 2 else { return false }
 
-  let padA = paddings[0]
-  let padB = paddings[1]
+  guard let paddings = collectPadLeaves(nodeId), paddings.count >= 2 else { return false }
+
   var concatAxis: Int? = nil
 
   for axis in 0..<currentShape.count {
-    let a = padA[axis]
-    let b = padB[axis]
-
-    if a == (0, 0), b == (0, 0) { continue }
-
-    let complementaryPadding =
-      (a.0 == 0 && b.1 == 0 && a.1 > 0 && b.0 > 0 && a.1 == b.0)
-      || (b.0 == 0 && a.1 == 0 && b.1 > 0 && a.0 > 0 && b.1 == a.0)
-
-    guard complementaryPadding else { return false }
-    guard concatAxis == nil else { return false }
-    concatAxis = axis
+    let hasPaddingOnAxis = paddings.contains { padding in
+      let p = padding[axis]
+      return p != (0, 0)
+    }
+    if hasPaddingOnAxis {
+      guard concatAxis == nil else { return false }
+      concatAxis = axis
+    }
   }
 
   guard let axis = concatAxis else { return false }
-  guard case .tensor(let outputShape) = node.shape else { return false }
-  guard outputShape.count == currentShape.count else { return false }
 
   for dim in 0..<outputShape.count where dim != axis {
     guard outputShape[dim] == currentShape[dim] else { return false }
   }
 
-  let expectedConcatDim = currentShape[axis] + padA[axis].0 + padA[axis].1
-  return outputShape[axis] == expectedConcatDim
+  let baseConcatDim = currentShape[axis]
+  let outputConcatDim = outputShape[axis]
+  guard outputConcatDim > baseConcatDim else { return false }
+
+  struct Segment {
+    let start: Int
+    let end: Int
+  }
+
+  var segments: [Segment] = []
+  segments.reserveCapacity(paddings.count)
+
+  for padding in paddings {
+    // Non-concat axes must be unchanged.
+    for dim in 0..<padding.count where dim != axis {
+      guard padding[dim] == (0, 0) else { return false }
+    }
+
+    let concatPadding = padding[axis]
+    let start = concatPadding.0
+    let end = start + baseConcatDim
+    let expectedDim = start + baseConcatDim + concatPadding.1
+
+    guard start >= 0, concatPadding.1 >= 0 else { return false }
+    guard end <= outputConcatDim else { return false }
+    guard expectedDim == outputConcatDim else { return false }
+
+    segments.append(Segment(start: start, end: end))
+  }
+
+  // Require a full non-overlapping cover of the concat dimension.
+  segments.sort { lhs, rhs in
+    if lhs.start != rhs.start { return lhs.start < rhs.start }
+    return lhs.end < rhs.end
+  }
+
+  var cursor = 0
+  for segment in segments {
+    guard segment.start == cursor else { return false }
+    guard segment.end > segment.start else { return false }
+    cursor = segment.end
+  }
+
+  return cursor == outputConcatDim
 }
 
 public func splitReduceBlocks(g: Graph, blocks: [Block]) -> [Block] {
@@ -494,7 +547,7 @@ func determineTensorBlocks(_ blocks: [Block], _ graph: Graph, _ ctx: IRContext) 
             // element counts via per-region loops while keeping the block parallelizable.
             if let previousShape = currentShape,
               isAxisReduceOp(node.op)
-                || isPadConcatFusionTransition(
+                || isConcatByPaddingFusionTransition(
                   nodeId: nodeId,
                   graph: graph,
                   currentShape: previousShape)
