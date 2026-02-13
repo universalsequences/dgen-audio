@@ -13,7 +13,7 @@ final class ConstantFoldingTests: XCTestCase {
         let sum = g.n(.add, a, b)
         _ = g.n(.output(0), sum)
 
-        foldConstants(g, options: .init(debug: true))
+        GraphPrepPasses.foldConstants(g, options: .init(debug: true))
 
         // The sum node should now be a constant with value 5.0
         if case .constant(let value) = g.nodes[sum]?.op {
@@ -30,7 +30,7 @@ final class ConstantFoldingTests: XCTestCase {
         let product = g.n(.mul, a, b)
         _ = g.n(.output(0), product)
 
-        foldConstants(g, options: .init(debug: true))
+        GraphPrepPasses.foldConstants(g, options: .init(debug: true))
 
         if case .constant(let value) = g.nodes[product]?.op {
             XCTAssertEqual(value, 10.0, accuracy: 0.0001)
@@ -46,7 +46,7 @@ final class ConstantFoldingTests: XCTestCase {
         let quotient = g.n(.div, a, b)
         _ = g.n(.output(0), quotient)
 
-        foldConstants(g, options: .init(debug: true))
+        GraphPrepPasses.foldConstants(g, options: .init(debug: true))
 
         if case .constant(let value) = g.nodes[quotient]?.op {
             XCTAssertEqual(value, 2.5, accuracy: 0.0001)
@@ -62,7 +62,7 @@ final class ConstantFoldingTests: XCTestCase {
         let quotient = g.n(.div, a, b)
         _ = g.n(.output(0), quotient)
 
-        foldConstants(g, options: .init(debug: true))
+        GraphPrepPasses.foldConstants(g, options: .init(debug: true))
 
         // Division by zero should NOT be folded
         if case .div = g.nodes[quotient]?.op {
@@ -81,7 +81,7 @@ final class ConstantFoldingTests: XCTestCase {
         let cmp = g.n(.gt, a, b)
         _ = g.n(.output(0), cmp)
 
-        foldConstants(g, options: .init(debug: true))
+        GraphPrepPasses.foldConstants(g, options: .init(debug: true))
 
         if case .constant(let value) = g.nodes[cmp]?.op {
             XCTAssertEqual(value, 1.0, accuracy: 0.0001)  // true
@@ -97,7 +97,7 @@ final class ConstantFoldingTests: XCTestCase {
         let cmp = g.n(.eq, a, b)
         _ = g.n(.output(0), cmp)
 
-        foldConstants(g, options: .init(debug: true))
+        GraphPrepPasses.foldConstants(g, options: .init(debug: true))
 
         if case .constant(let value) = g.nodes[cmp]?.op {
             XCTAssertEqual(value, 1.0, accuracy: 0.0001)  // true
@@ -116,7 +116,7 @@ final class ConstantFoldingTests: XCTestCase {
         let result = g.n(.gswitch, cond, ifTrue, ifFalse)
         _ = g.n(.output(0), result)
 
-        foldConstants(g, options: .init(debug: true))
+        GraphPrepPasses.foldConstants(g, options: .init(debug: true))
 
         if case .constant(let value) = g.nodes[result]?.op {
             XCTAssertEqual(value, 100.0, accuracy: 0.0001)  // should select ifTrue
@@ -133,7 +133,7 @@ final class ConstantFoldingTests: XCTestCase {
         let result = g.n(.gswitch, cond, ifTrue, ifFalse)
         _ = g.n(.output(0), result)
 
-        foldConstants(g, options: .init(debug: true))
+        GraphPrepPasses.foldConstants(g, options: .init(debug: true))
 
         if case .constant(let value) = g.nodes[result]?.op {
             XCTAssertEqual(value, 200.0, accuracy: 0.0001)  // should select ifFalse
@@ -153,7 +153,7 @@ final class ConstantFoldingTests: XCTestCase {
         let result = g.n(.selector, mode, opt1, opt2, opt3)
         _ = g.n(.output(0), result)
 
-        foldConstants(g, options: .init(debug: true))
+        GraphPrepPasses.foldConstants(g, options: .init(debug: true))
 
         if case .constant(let value) = g.nodes[result]?.op {
             XCTAssertEqual(value, 10.0, accuracy: 0.0001)
@@ -171,7 +171,7 @@ final class ConstantFoldingTests: XCTestCase {
         let result = g.n(.selector, mode, opt1, opt2, opt3)
         _ = g.n(.output(0), result)
 
-        foldConstants(g, options: .init(debug: true))
+        GraphPrepPasses.foldConstants(g, options: .init(debug: true))
 
         if case .constant(let value) = g.nodes[result]?.op {
             XCTAssertEqual(value, 30.0, accuracy: 0.0001)
@@ -192,7 +192,7 @@ final class ConstantFoldingTests: XCTestCase {
         let product = g.n(.mul, sum, c)  // 20.0
         _ = g.n(.output(0), product)
 
-        foldConstants(g, options: .init(debug: true))
+        GraphPrepPasses.foldConstants(g, options: .init(debug: true))
 
         // Both sum and product should be folded
         if case .constant(let sumValue) = g.nodes[sum]?.op {
@@ -219,7 +219,7 @@ final class ConstantFoldingTests: XCTestCase {
         let result = g.n(.gswitch, cmp, lowpassCoeff, otherCoeff)
         _ = g.n(.output(0), result)
 
-        foldConstants(g, options: .init(debug: true))
+        GraphPrepPasses.foldConstants(g, options: .init(debug: true))
 
         // Comparison should fold to 1.0, then gswitch should fold to lowpassCoeff
         if case .constant(let value) = g.nodes[result]?.op {
@@ -239,7 +239,7 @@ final class ConstantFoldingTests: XCTestCase {
         let product = g.n(.mul, phasor, constant)
         _ = g.n(.output(0), product)
 
-        foldConstants(g, options: .init(debug: true))
+        GraphPrepPasses.foldConstants(g, options: .init(debug: true))
 
         // Product should NOT be folded because phasor is not a constant
         if case .mul = g.nodes[product]?.op {
@@ -257,7 +257,7 @@ final class ConstantFoldingTests: XCTestCase {
         let result = g.n(.sin, x)
         _ = g.n(.output(0), result)
 
-        foldConstants(g, options: .init(debug: true))
+        GraphPrepPasses.foldConstants(g, options: .init(debug: true))
 
         if case .constant(let value) = g.nodes[result]?.op {
             XCTAssertEqual(value, 0.0, accuracy: 0.0001)
@@ -272,7 +272,7 @@ final class ConstantFoldingTests: XCTestCase {
         let result = g.n(.cos, x)
         _ = g.n(.output(0), result)
 
-        foldConstants(g, options: .init(debug: true))
+        GraphPrepPasses.foldConstants(g, options: .init(debug: true))
 
         if case .constant(let value) = g.nodes[result]?.op {
             XCTAssertEqual(value, 1.0, accuracy: 0.0001)
@@ -287,7 +287,7 @@ final class ConstantFoldingTests: XCTestCase {
         let result = g.n(.sqrt, x)
         _ = g.n(.output(0), result)
 
-        foldConstants(g, options: .init(debug: true))
+        GraphPrepPasses.foldConstants(g, options: .init(debug: true))
 
         if case .constant(let value) = g.nodes[result]?.op {
             XCTAssertEqual(value, 4.0, accuracy: 0.0001)
@@ -302,7 +302,7 @@ final class ConstantFoldingTests: XCTestCase {
         let result = g.n(.sqrt, x)
         _ = g.n(.output(0), result)
 
-        foldConstants(g, options: .init(debug: true))
+        GraphPrepPasses.foldConstants(g, options: .init(debug: true))
 
         // sqrt of negative should NOT be folded
         if case .sqrt = g.nodes[result]?.op {
@@ -334,7 +334,7 @@ final class ConstantFoldingTests: XCTestCase {
             }
         }
 
-        foldConstants(g, options: .init(debug: true))
+        GraphPrepPasses.foldConstants(g, options: .init(debug: true))
 
         // Count nodes after
         var constantCountAfter = 0

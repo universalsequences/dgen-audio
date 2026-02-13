@@ -1,4 +1,4 @@
-/// Block emission: UOp generation, dependency analysis, SIMD upgrade, shape transitions, BPTT.
+/// Block emission: UOp generation, dependency analysis, shape transitions, BPTT.
 import Foundation
 
 // MARK: - SIMD Analysis
@@ -28,154 +28,6 @@ private func containsSIMDBlockers(_ uops: [UOp], backend: Backend) -> Bool {
     }
   }
   return false
-}
-
-/// Post-emission pass: upgrade eligible element loops to SIMD.
-///
-/// Handles both loop types:
-/// - `beginParallelRange(count, 1)` / `endParallelRange` — standard tensor element loops
-///   (forced to scalar by the pipeline when the block has SIMD blockers elsewhere)
-/// - `beginForLoop(loopVar, count)` / `endLoop` — shape-transition inner element loops
-///
-/// Only for C backend. The renderer already supports SIMD: `beginParallelRange` with incr=4
-/// emits `for (int simdN = 0; simdN < count; simdN += 4)`, and `memoryRead` with `.simd` kind
-/// emits `vld1q_f32`. This pass identifies contiguous element loops that can use SIMD.
-///
-/// Eligibility: element count divisible by 4, no stateful/control-flow/non-contiguous ops,
-/// no int-typed arithmetic (which indicates index decomposition or frame-aware offsets).
-///
-/// - Parameter uops: Emitted operations to analyze and mutate in place.
-public func upgradeElementLoopsToSIMD(_ uops: inout [UOp]) {
-  var i = 0
-  while i < uops.count {
-    // Match both loop types and extract element count + loop variable
-    let elementCount: Int
-    let loopVar: Lazy
-    let isParallelRange: Bool
-
-    switch uops[i].op {
-    case .beginParallelRange(let count, _):
-      elementCount = count
-      loopVar = uops[i].value
-      isParallelRange = true
-
-    case .beginForLoop(let lv, let countLazy):
-      guard case .constant(_, let countFloat) = countLazy else {
-        i += 1
-        continue
-      }
-      elementCount = Int(countFloat)
-      loopVar = lv
-      isParallelRange = false
-
-    default:
-      i += 1
-      continue
-    }
-
-    // Must be divisible by 4
-    guard elementCount >= 4 && elementCount % 4 == 0 else {
-      i += 1
-      continue
-    }
-
-    // Find matching end (track nesting depth)
-    let beginIdx = i
-    var depth = 1
-    var endIdx: Int? = nil
-    for j in (beginIdx + 1)..<uops.count {
-      switch uops[j].op {
-      case .beginForLoop, .beginLoop, .beginReverseLoop, .beginParallelRange:
-        depth += 1
-      case .endLoop, .endParallelRange:
-        depth -= 1
-        if depth == 0 {
-          endIdx = j
-        }
-      default:
-        break
-      }
-      if endIdx != nil { break }
-    }
-
-    guard let endIdx = endIdx else {
-      i += 1
-      continue
-    }
-
-    // Extract loop variable's VarID for offset matching
-    let loopVarId: VarID?
-    if case .variable(let vid, _) = loopVar {
-      loopVarId = vid
-    } else {
-      loopVarId = nil
-    }
-
-    // Check for blocker UOps in the loop body
-    var hasBlocker = false
-    for k in (beginIdx + 1)..<endIdx {
-      switch uops[k].op {
-      // Stateful ops
-      case .load, .store, .delay1, .memoryAccumulate:
-        hasBlocker = true
-      // Inherently scalar ops
-      case .noise, .latch:
-        hasBlocker = true
-      // Control flow (nested loops, conditionals)
-      case .beginForLoop, .endLoop, .beginParallelRange, .endParallelRange,
-        .beginIf, .endIf, .gswitch:
-        hasBlocker = true
-      // Non-contiguous access
-      case .broadcastAccess:
-        hasBlocker = true
-      // Hop gating
-      case .beginHopCheck, .endHopCheck:
-        hasBlocker = true
-      // Accumulator (mutate is used by sum reduction — cross-iteration dependency)
-      case .mutate:
-        hasBlocker = true
-      // Int-typed arithmetic (index decomposition / frame-aware offsets)
-      case .add, .sub, .mul, .div:
-        if uops[k].scalarType == .int {
-          hasBlocker = true
-        }
-      // Memory access with non-loop-variable offset — scalar variable would be
-      // broadcast to float32x4_t in SIMD mode, which can't be cast to int for indexing
-      case .memoryRead(_, let offset), .memoryWrite(_, let offset, _):
-        if case .variable(let vid, _) = offset, vid != loopVarId {
-          hasBlocker = true
-        }
-      default:
-        break
-      }
-      if hasBlocker { break }
-    }
-
-    guard !hasBlocker else {
-      i = endIdx + 1
-      continue
-    }
-
-    // Upgrade to SIMD
-    uops[beginIdx] = UOp(
-      op: .beginParallelRange(elementCount, 4),
-      value: loopVar,
-      kind: .simd
-    )
-
-    for k in (beginIdx + 1)..<endIdx {
-      uops[k].kind = .simd
-    }
-
-    if isParallelRange {
-      uops[endIdx].kind = .simd
-    } else {
-      // Replace endLoop → endParallelRange
-      uops[endIdx] = UOp(op: .endParallelRange, value: uops[endIdx].value, kind: .simd)
-    }
-
-    i = endIdx + 1
-  }
 }
 
 // MARK: - Thread Count Scale
@@ -323,12 +175,13 @@ private func prepareOutboundTensorCells(
 ///   - g: Graph containing node definitions and forward/backward partition metadata.
 ///   - backend: Target backend to gate backend-specific setup (e.g., thread scaling).
 ///   - emittedNodes: Accumulator of node IDs successfully emitted.
-/// - Returns: Ordered block body UOps for downstream wrapping.
+/// - Returns: Ordered block body UOps plus whether this body already owns frame looping (BPTT).
 private func emitStandardBlockBodyUOps(
   ctx: IRContext, block: Block, g: Graph, backend: Backend,
   emittedNodes: inout Set<NodeID>
-) throws -> [UOp] {
+) throws -> (uops: [UOp], hasOwnFrameLoop: Bool) {
   var bodyUops: [UOp] = []
+  var hasOwnFrameLoop = false
 
   // Thread count scaling is a Metal-specific parallelization optimization.
   // C backend uses sequential loops, so this would break feedback loop data flow.
@@ -380,10 +233,10 @@ private func emitStandardBlockBodyUOps(
       g: g,
       ctx: ctx
     )
-    ctx.lastBlockHasOwnFrameLoop = true
+    hasOwnFrameLoop = true
   }
 
-  return bodyUops
+  return (uops: bodyUops, hasOwnFrameLoop: hasOwnFrameLoop)
 }
 
 /// Selects the body emission strategy for a block.
@@ -397,13 +250,13 @@ private func emitStandardBlockBodyUOps(
 ///   - useShapeAwareEmission: Whether to emit using per-region shape-aware loops.
 ///   - shapeTransitions: Shape-transition boundaries used by shape-aware emission.
 ///   - emittedNodes: Accumulator of emitted nodes for cross-block global wiring.
-/// - Returns: Emitted body UOps for the selected strategy.
+/// - Returns: Emitted body UOps plus whether emission inserted an internal frame loop.
 private func emitBlockBodyUOps(
   ctx: IRContext, block: Block, blocks: [Block], g: Graph, backend: Backend,
   useShapeAwareEmission: Bool,
   shapeTransitions: [(nodeIndex: Int, shape: [Int])],
   emittedNodes: inout Set<NodeID>
-) throws -> [UOp] {
+) throws -> (uops: [UOp], hasOwnFrameLoop: Bool) {
   if useShapeAwareEmission {
     // Use specialized emission with per-shape element loops.
     let shapeAwareUOps = try emitScalarBlockWithShapeTransitions(
@@ -412,7 +265,7 @@ private func emitBlockBodyUOps(
     for nodeId in block.nodes {
       emittedNodes.insert(nodeId)
     }
-    return shapeAwareUOps
+    return (uops: shapeAwareUOps, hasOwnFrameLoop: false)
   }
   return try emitStandardBlockBodyUOps(
     ctx: ctx, block: block, g: g, backend: backend, emittedNodes: &emittedNodes)
@@ -592,11 +445,11 @@ private func wireCrossBlockGlobals(
 ///   - g: Graph containing nodes, tensors, and metadata used by emitters.
 ///   - backend: Target backend (`.metal` by default).
 ///   - debug: Reserved debug toggle (currently ignored).
-/// - Returns: Final UOps and the block effective kind used for rendering decisions.
+/// - Returns: Final UOps, block effective kind, and whether emission inserted its own frame loop.
 public func emitBlockUOps(
   ctx: IRContext, block: Block, blocks: [Block], g: Graph, backend: Backend = .metal,
   debug: Bool = false
-) throws -> (uops: [UOp], effectiveKind: Kind) {
+) throws -> (uops: [UOp], effectiveKind: Kind, hasOwnFrameLoop: Bool) {
   _ = debug
   resetFrameAwareBlockContext(ctx)
 
@@ -611,10 +464,11 @@ public func emitBlockUOps(
     shapeTransitions: shapeTransitions, hasMultipleShapes: hasMultipleShapes)
 
   var emittedNodes: Set<NodeID> = []
-  var bodyUops = try emitBlockBodyUOps(
+  let bodyEmission = try emitBlockBodyUOps(
     ctx: ctx, block: block, blocks: blocks, g: g, backend: backend,
     useShapeAwareEmission: useShapeAwareEmission, shapeTransitions: shapeTransitions,
     emittedNodes: &emittedNodes)
+  var bodyUops = bodyEmission.uops
 
   let simdPlan = determineSIMDPlan(bodyUops: bodyUops, block: block, backend: backend)
   applyKind(simdPlan.effectiveKind, to: &bodyUops)
@@ -627,5 +481,9 @@ public func emitBlockUOps(
   wireCrossBlockGlobals(
     uops: &uops, emittedNodes: emittedNodes, ctx: ctx, block: block, blocks: blocks, g: g)
 
-  return (uops: uops, effectiveKind: simdPlan.effectiveKind)
+  return (
+    uops: uops,
+    effectiveKind: simdPlan.effectiveKind,
+    hasOwnFrameLoop: bodyEmission.hasOwnFrameLoop
+  )
 }

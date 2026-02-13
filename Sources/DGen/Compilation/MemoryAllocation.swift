@@ -14,6 +14,10 @@ public struct CellAllocations {
 }
 
 /// Remap memory slots to avoid conflicts between scalar and vector operations
+///
+/// - Parameter voiceCellId:
+///   Optional synthesized voice-index cell used by MC rendering. This cell may not appear in UOps,
+///   so remapping must reserve/address it explicitly when present.
 /// Returns the total number of memory slots needed after remapping
 func remapVectorMemorySlots(
   _ uopBlocks: inout [BlockUOps], cellSizes: [CellID: Int], voiceCellId: CellID?,
