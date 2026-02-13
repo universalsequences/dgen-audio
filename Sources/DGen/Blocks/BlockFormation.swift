@@ -157,7 +157,16 @@ public func isolateSpectralPasses(_ blocks: [Block], _ g: Graph) -> [Block] {
 public func isReductionOp(_ op: LazyOp) -> Bool {
   switch op {
   case .sum, .tensorAccumulate, .peekRowGradReduce,
-    .selectRowGradReduce, .overlapAddGradGather, .bufferViewGradRead:
+    .selectRowGradReduce, .peekGradReduce, .overlapAddGradGather, .bufferViewGradRead:
+    return true
+  default:
+    return false
+  }
+}
+
+public func isGlobalReductionOp(_ op: LazyOp) -> Bool {
+  switch op {
+  case .peekRowGradReduce, .selectRowGradReduce, .peekGradReduce, .tensorAccumulate:
     return true
   default:
     return false
@@ -288,15 +297,13 @@ public func splitReduceBlocks(g: Graph, blocks: [Block]) -> [Block] {
   var splitBlocks: [Block] = []
 
   for block in blocks {
-    // Don't split scalar blocks - they run frame-by-frame serially and need
-    // all operations to stay together for feedback cycles to work correctly
-    if block.kind == .scalar {
-      splitBlocks.append(block)
-      continue
-    }
-
     let reductionOpIndex = block.nodes.firstIndex { nodeId in
       guard let node = g.nodes[nodeId] else { return false }
+      if block.kind == .scalar {
+        // Scalar frame-loop blocks must stay intact for feedback/stateful ops,
+        // except global reductions which must run once outside the frame loop.
+        return isGlobalReductionOp(node.op)
+      }
       return isReductionOp(node.op)
     }
 
@@ -307,7 +314,7 @@ public func splitReduceBlocks(g: Graph, blocks: [Block]) -> [Block] {
 
     // Pre-reduction block
     if reductionOpIndex > 0 {
-      var preReductionBlock = Block(kind: .simd)
+      var preReductionBlock = Block(kind: block.kind)
       preReductionBlock.nodes = Array(block.nodes[0..<reductionOpIndex])
       preReductionBlock.shape = block.shape
       preReductionBlock.temporality = block.temporality
@@ -316,19 +323,13 @@ public func splitReduceBlocks(g: Graph, blocks: [Block]) -> [Block] {
 
     // Reduction block
     // Global reduces run once total, not per-frame:
-    // - peekRowGradReduce/selectRowGradReduce: reduction ops with internal frame loops
+    // - peekRowGradReduce/selectRowGradReduce/peekGradReduce: reduction ops with internal frame loops
     // - tensorAccumulate: atomic gradient accumulation, loops over frames internally
     let reductionNode = g.nodes[block.nodes[reductionOpIndex]]
-    let isGlobalReduce: Bool
-    switch reductionNode?.op {
-    case .peekRowGradReduce, .selectRowGradReduce, .tensorAccumulate:
-      isGlobalReduce = true
-    default:
-      isGlobalReduce = false
-    }
+    let isGlobalReduce = reductionNode.map { isGlobalReductionOp($0.op) } ?? false
 
     // Global reduces need kind=.scalar AND temporality=.static_ to run once total
-    var reductionBlock = Block(kind: isGlobalReduce ? .scalar : .simd)
+    var reductionBlock = Block(kind: isGlobalReduce ? .scalar : block.kind)
     reductionBlock.nodes = [block.nodes[reductionOpIndex]]
     reductionBlock.temporality = isGlobalReduce ? .static_ : block.temporality
 
@@ -342,8 +343,11 @@ public func splitReduceBlocks(g: Graph, blocks: [Block]) -> [Block] {
 
     // Post-reduction block - recursively split if it contains more reductions
     if reductionOpIndex < block.nodes.count - 1 {
-      var postReductionBlock = Block(kind: .simd)
-      postReductionBlock.nodes = Array(block.nodes[reductionOpIndex + 1..<block.nodes.count])
+      let postNodes = Array(block.nodes[reductionOpIndex + 1..<block.nodes.count])
+      let canPromotePostToSIMD = block.kind == .scalar && isGlobalReduce
+
+      var postReductionBlock = Block(kind: canPromotePostToSIMD ? .simd : block.kind)
+      postReductionBlock.nodes = postNodes
       postReductionBlock.shape = block.shape
       postReductionBlock.temporality = block.temporality
       // Recursively split the post-reduction block in case it has more reductions
@@ -473,6 +477,7 @@ private func splitScalarBlockForTensorGrouping(
   scalarPrefix.nodes = Array(block.nodes[0..<firstTensorOffset])
 
   var tensorSuffix = makeTensorGroupingBlock(from: block)
+  tensorSuffix.kind = .simd
   tensorSuffix.nodes = Array(block.nodes[firstTensorOffset...])
   assignTensorIndexFromFirstTensorNode(to: &tensorSuffix, graph: graph, ctx: ctx)
 

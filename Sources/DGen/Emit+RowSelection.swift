@@ -342,6 +342,104 @@ extension LazyOp {
 
       b.use(val: zero)
 
+    case .peekGradWrite(
+      let gradWriteCell, let floorPosCell, let nextPosCell, let fracCell,
+      let channelSize, let numChannels, _):
+      // Write per-frame scalar grad and interpolation metadata for peek backward.
+      // Inputs: [gradOutput (scalar), index, channel]
+      guard node.inputs.count == 3 else {
+        throw DGenError.insufficientInputs(
+          operator: "peekGradWrite", expected: 3, actual: node.inputs.count)
+      }
+
+      let gradOutput = b.value(inputs[0])
+      let index = try b.readInput(node, inputs, at: 1)
+      let channel = try b.readInput(node, inputs, at: 2)
+
+      let one = b.constant(1.0)
+      let zero = b.constant(0.0)
+      let channelSizeFloat = b.constant(Float(channelSize))
+
+      // Wrap index within channel using modulo
+      let wrappedIndex = b.mod(index, channelSizeFloat)
+      let isNegative = wrappedIndex < zero
+      let positiveIndex = b.gswitch(isNegative, wrappedIndex + channelSizeFloat, wrappedIndex)
+
+      // Clamp channel to valid range [0, numChannels-1]
+      let clampedChannel = b.floor(
+        b.max(zero, b.min(channel, b.constant(Float(numChannels - 1)))))
+      let channelOffset = channelSizeFloat * clampedChannel
+
+      // Calculate final read position
+      let finalReadPos = channelOffset + positiveIndex
+      let floorPos = b.floor(finalReadPos)
+      let frac = finalReadPos - floorPos
+
+      // Next position with wrapping at channel boundary
+      let nextPos = floorPos + one
+      let nextChannelOffset = channelOffset + channelSizeFloat
+      let nextPosWrapped = b.gswitch(nextPos >= nextChannelOffset, channelOffset, nextPos)
+
+      // Frame-indexed storage
+      let frameIdx = b.frameIndex()
+      let slot = b.cast(frameIdx, to: .int)
+      _ = b.memoryWrite(gradWriteCell, slot, gradOutput)
+      _ = b.memoryWrite(floorPosCell, slot, floorPos)
+      _ = b.memoryWrite(nextPosCell, slot, nextPosWrapped)
+      _ = b.memoryWrite(fracCell, slot, frac)
+
+      b.use(val: zero)
+
+    case .peekGradReduce(
+      let gradWriteCell, let floorPosCell, let nextPosCell, let fracCell,
+      let gradCell, let totalSize, let maxFrameCount):
+      // Sum per-frame peek contributions into tensor gradient.
+      // Input: [peekGradWritePass] (dependency ordering only)
+      guard node.inputs.count == 1 else {
+        throw DGenError.insufficientInputs(
+          operator: "peekGradReduce", expected: 1, actual: node.inputs.count)
+      }
+
+      _ = b.value(inputs[0])  // Force dependency on write pass
+
+      let zero = b.constant(0.0)
+      let one = b.constant(1.0)
+      let half = b.constant(0.5)
+      let frameCount = b.frameCount()
+
+      b.parallelRange(totalSize) { tensorPos in
+        let tensorPosFloat = b.cast(tensorPos, to: .float)
+        let gradSum = b.float(0.0)
+
+        b.loop(maxFrameCount) { frameIdx in
+          let frameFloat = b.cast(frameIdx, to: .float)
+          let inBounds = frameFloat < frameCount
+          let slot = b.cast(frameIdx, to: .int)
+
+          let gradOutput = b.memoryRead(gradWriteCell, slot)
+          let floorPos = b.memoryRead(floorPosCell, slot)
+          let nextPos = b.memoryRead(nextPosCell, slot)
+          let frac = b.memoryRead(fracCell, slot)
+          let oneMinusFrac = one - frac
+
+          let isFloorMatch = b.abs(floorPos - tensorPosFloat) < half
+          let isNextMatch = b.abs(nextPos - tensorPosFloat) < half
+
+          let floorValid = inBounds * isFloorMatch
+          let nextValid = inBounds * isNextMatch
+
+          let floorContrib = b.gswitch(floorValid > zero, gradOutput * oneMinusFrac, zero)
+          let nextContrib = b.gswitch(nextValid > zero, gradOutput * frac, zero)
+
+          gradSum.accumulate(floorContrib)
+          gradSum.accumulate(nextContrib)
+        }
+
+        _ = b.memoryAccumulate(gradCell, b.cast(tensorPos, to: .int), gradSum.value)
+      }
+
+      b.use(val: zero)
+
     default: break
     }
   }

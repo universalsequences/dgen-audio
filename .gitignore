@@ -16,3 +16,12 @@ TINYGRAD_FFT_SUMMARY.md
 tinygrad_fft_test.py
 tinygrad_kernel_example.metal
 TINYGRAD_KERNEL_STATS.txt
+/datasets/tinysol/
+/.ddsp_cache_eval/
+/.ddsp_runs_eval/
+/.dsp_run_eval/
+/.dsp_runs_eval/
+/.ddsp_cache_tinysol
+/.ddsp_cache_tinysol_mini2
+/.ddsp_cache_tinysol_mixcheck
+/.ddsp_runs_tinysol

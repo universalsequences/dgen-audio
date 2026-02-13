@@ -127,6 +127,16 @@ public enum LazyOp {
   case peekRowGradReduce(
     floorGradCell: CellID, ceilGradCell: CellID, rowIdxCell: CellID, fracCell: CellID,
     gradCell: CellID, numRows: Int, numCols: Int, maxFrameCount: Int)
+  // peekGradWrite: write per-frame scalar gradient and interpolation metadata for peek backward
+  // Input: [gradOutput (scalar), index, channel]
+  case peekGradWrite(
+    gradWriteCell: CellID, floorPosCell: CellID, nextPosCell: CellID, fracCell: CellID,
+    channelSize: Int, numChannels: Int, maxFrameCount: Int)
+  // peekGradReduce: sum per-frame peek contributions into tensor gradient
+  // Input: [peekGradWritePass] (for ordering)
+  case peekGradReduce(
+    gradWriteCell: CellID, floorPosCell: CellID, nextPosCell: CellID, fracCell: CellID,
+    gradCell: CellID, totalSize: Int, maxFrameCount: Int)
   // selectRowGradWrite: write gradient to frame-indexed storage (deterministic, no atomics)
   // Input: [gradOutput (1D tensor), rowIndex]
   // Writes to gradWriteCell[frame * numCols + col] and rowIdxCell[frame]

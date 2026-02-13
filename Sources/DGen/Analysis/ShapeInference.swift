@@ -217,6 +217,10 @@ public func inferShape(op: LazyOp, inputs: [ValueShape], graph: Graph) throws ->
   case .bufferViewGradStore(_, _), .bufferViewGradRead(_, _):
     return .scalar
 
+  // peek gradient ops - side-effect only, output scalar
+  case .peekGradWrite(_, _, _, _, _, _, _), .peekGradReduce(_, _, _, _, _, _, _):
+    return .scalar
+
   // Inherited (elementwise) - includes all binary and unary math ops
   // Also includes stateful ops (phasor, accum, latch) that can operate element-wise on tensors
   case .add, .sub, .mul, .div, .sin, .cos, .exp, .sqrt, .tanh,

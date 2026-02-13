@@ -56,10 +56,9 @@ public class MetalRenderer: Renderer, UOpEmitter {
       let useReduced = bufferRequirements.needsReducedGradsSum
       useReducedGradsSum = useReduced
 
-      // Render parallelRange loops as thread-parallel only for split static kernels
-      // Exception: static scalar blocks always use loop mode (they run once, no threading)
-      let isStaticScalar = scheduleItem.temporality == .static_ && scheduleItem.kind == .scalar
-      parallelRangeMode = (parallelCount == nil || isStaticScalar) ? .loop : .thread
+      // Render parallelRange loops as thread-parallel only for split static kernels.
+      // When `parallelCount` is set, beginParallelRange is lowered as `_pr = id`.
+      parallelRangeMode = (parallelCount == nil) ? .loop : .thread
       let source = render(
         name: kernelName, scheduleItem: scheduleItem, ctx: ctx, graph: graph,
         totalMemorySlots: totalMemorySlots)
@@ -128,19 +127,6 @@ public class MetalRenderer: Renderer, UOpEmitter {
       return [SplitScheduleItem(item: scheduleItem, threadCount: nil)]
     }
 
-    // Check if this kernel contains atomic operations (memoryAccumulate).
-    // If so, parallelRanges should NOT be thread-parallelized because:
-    // - Each thread would run the full for loop
-    // - With atomics, this causes N× overcounting (N threads × full loop each)
-    // Instead, keep threadCount = nil so only 1 thread runs the loop.
-    let hasAtomics = scheduleItem.ops.contains { op in
-      if case .memoryAccumulate = op.op { return true }
-      return false
-    }
-    if hasAtomics {
-      return [SplitScheduleItem(item: scheduleItem, threadCount: nil)]
-    }
-
     let ops = scheduleItem.ops
     guard
       let beginRangeIdx = ops.firstIndex(where: {
@@ -162,6 +148,7 @@ public class MetalRenderer: Renderer, UOpEmitter {
     var segments: [(ops: [UOp], parallelCount: Int?)] = []
     var current: [UOp] = []
     var parallelDepth = 0
+    var maxParallelDepth = 0
     var currentParallelCount: Int? = nil
 
     for op in coreOps {
@@ -171,11 +158,12 @@ public class MetalRenderer: Renderer, UOpEmitter {
           if !current.isEmpty {
             segments.append((ops: current, parallelCount: nil))
             current.removeAll(keepingCapacity: true)
-          }
-          currentParallelCount = count
         }
-        parallelDepth += 1
-        current.append(op)
+        currentParallelCount = count
+      }
+      parallelDepth += 1
+      if parallelDepth > maxParallelDepth { maxParallelDepth = parallelDepth }
+      current.append(op)
       case .endParallelRange:
         current.append(op)
         parallelDepth -= 1
@@ -191,6 +179,11 @@ public class MetalRenderer: Renderer, UOpEmitter {
 
     // Unbalanced parallel range - fall back to original kernel
     if parallelDepth != 0 {
+      return [SplitScheduleItem(item: scheduleItem, threadCount: nil)]
+    }
+    // Thread-mode lowering maps `beginParallelRange` to `_pr = id`.
+    // Nested parallel ranges are not representable in that mode yet.
+    if maxParallelDepth > 1 {
       return [SplitScheduleItem(item: scheduleItem, threadCount: nil)]
     }
     if !current.isEmpty {
