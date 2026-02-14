@@ -177,29 +177,29 @@ extension LazyOp {
       _ = b.value(inputs[0])  // Force dependency on write pass
 
       let numColsFloat = b.constant(Float(numCols))
+      let numColsInt = b.intConstant(numCols)
       let zero = b.constant(0.0)
-
-      b.parallelRange(numRows) { rowIdx in
+      let totalElems = numRows * numCols
+      b.parallelRange(totalElems) { flatIdx in
+        let rowIdx = flatIdx / numColsInt
+        let colIdx = flatIdx - rowIdx * numColsInt
         let rowFloat = b.cast(rowIdx, to: .float)
+        let colFloat = b.cast(colIdx, to: .float)
+        let gradSum = b.float(0.0)
 
-        b.parallelRange(numCols) { colIdx in
-          let colFloat = b.cast(colIdx, to: .float)
-          let gradSum = b.float(0.0)
-
-          b.loop(maxFrameCount) { frameIdx in
-            let frameFloat = b.cast(frameIdx, to: .float)
-            let selectedRow = b.memoryRead(rowIdxCell, b.cast(frameIdx, to: .int))
-            let isMatch = b.abs(selectedRow - rowFloat) < b.constant(0.5)
-            let readPos = frameFloat * numColsFloat + colFloat
-            let gradValue = b.memoryRead(gradWriteCell, b.cast(readPos, to: .int))
-            let contribution = b.gswitch(isMatch, gradValue, zero)
-            gradSum.accumulate(contribution)
-          }
-
-          // Row-major layout to match tensorRead: offset = row * numCols + col
-          let destPos = rowFloat * numColsFloat + colFloat
-          _ = b.memoryAccumulate(gradCell, b.cast(destPos, to: .int), gradSum.value)
+        b.loop(maxFrameCount) { frameIdx in
+          let frameFloat = b.cast(frameIdx, to: .float)
+          let selectedRow = b.memoryRead(rowIdxCell, b.cast(frameIdx, to: .int))
+          let isMatch = b.abs(selectedRow - rowFloat) < b.constant(0.5)
+          let readPos = frameFloat * numColsFloat + colFloat
+          let gradValue = b.memoryRead(gradWriteCell, b.cast(readPos, to: .int))
+          let contribution = b.gswitch(isMatch, gradValue, zero)
+          gradSum.accumulate(contribution)
         }
+
+        // Row-major layout to match tensorRead: offset = row * numCols + col
+        let destPos = rowFloat * numColsFloat + colFloat
+        _ = b.memoryAccumulate(gradCell, b.cast(destPos, to: .int), gradSum.value)
       }
 
       b.use(val: zero)
@@ -300,44 +300,44 @@ extension LazyOp {
       _ = b.value(inputs[0])  // Force dependency on write pass
 
       let numColsFloat = b.constant(Float(numCols))
+      let numColsInt = b.intConstant(numCols)
       let zero = b.constant(0.0)
       let maxFrameCountFloat = b.constant(Float(maxFrameCount))
       let frameCount = b.frameCount()
-
-      b.parallelRange(numRows) { rowIdx in
+      let totalElems = numRows * numCols
+      b.parallelRange(totalElems) { flatIdx in
+        let rowIdx = flatIdx / numColsInt
+        let colIdx = flatIdx - rowIdx * numColsInt
         let rowFloat = b.cast(rowIdx, to: .float)
+        let colFloat = b.cast(colIdx, to: .float)
+        let gradSum = b.float(0.0)
 
-        b.parallelRange(numCols) { colIdx in
-          let colFloat = b.cast(colIdx, to: .float)
-          let gradSum = b.float(0.0)
+        b.loop(maxFrameCount) { frameIdx in
+          let frameFloat = b.cast(frameIdx, to: .float)
+          let inBounds = frameFloat < frameCount
+          let readPos = frameFloat * numColsFloat + colFloat
 
-          b.loop(maxFrameCount) { frameIdx in
-            let frameFloat = b.cast(frameIdx, to: .float)
-            let inBounds = frameFloat < frameCount
-            let readPos = frameFloat * numColsFloat + colFloat
+          // Floor row contribution
+          let floorRow = b.memoryRead(rowIdxCell, b.cast(frameIdx, to: .int))
+          let isFloorMatch = b.abs(floorRow - rowFloat) < b.constant(0.5)
+          let floorGrad = b.memoryRead(floorGradCell, b.cast(readPos, to: .int))
+          let floorValid = inBounds * isFloorMatch
+          let floorContrib = b.gswitch(floorValid > zero, floorGrad, zero)
+          gradSum.accumulate(floorContrib)
 
-            // Floor row contribution
-            let floorRow = b.memoryRead(rowIdxCell, b.cast(frameIdx, to: .int))
-            let isFloorMatch = b.abs(floorRow - rowFloat) < b.constant(0.5)
-            let floorGrad = b.memoryRead(floorGradCell, b.cast(readPos, to: .int))
-            let floorValid = inBounds * isFloorMatch
-            let floorContrib = b.gswitch(floorValid > zero, floorGrad, zero)
-            gradSum.accumulate(floorContrib)
-
-            // Ceil row contribution (index stored at frame + maxFrameCount)
-            let ceilSlot = frameFloat + maxFrameCountFloat
-            let ceilRow = b.memoryRead(rowIdxCell, b.cast(ceilSlot, to: .int))
-            let isCeilMatch = b.abs(ceilRow - rowFloat) < b.constant(0.5)
-            let ceilGrad = b.memoryRead(ceilGradCell, b.cast(readPos, to: .int))
-            let ceilValid = inBounds * isCeilMatch
-            let ceilContrib = b.gswitch(ceilValid > zero, ceilGrad, zero)
-            gradSum.accumulate(ceilContrib)
-          }
-
-          // Row-major layout to match tensorRead: offset = row * numCols + col
-          let destPos = rowFloat * numColsFloat + colFloat
-          _ = b.memoryAccumulate(gradCell, b.cast(destPos, to: .int), gradSum.value)
+          // Ceil row contribution (index stored at frame + maxFrameCount)
+          let ceilSlot = frameFloat + maxFrameCountFloat
+          let ceilRow = b.memoryRead(rowIdxCell, b.cast(ceilSlot, to: .int))
+          let isCeilMatch = b.abs(ceilRow - rowFloat) < b.constant(0.5)
+          let ceilGrad = b.memoryRead(ceilGradCell, b.cast(readPos, to: .int))
+          let ceilValid = inBounds * isCeilMatch
+          let ceilContrib = b.gswitch(ceilValid > zero, ceilGrad, zero)
+          gradSum.accumulate(ceilContrib)
         }
+
+        // Row-major layout to match tensorRead: offset = row * numCols + col
+        let destPos = rowFloat * numColsFloat + colFloat
+        _ = b.memoryAccumulate(gradCell, b.cast(destPos, to: .int), gradSum.value)
       }
 
       b.use(val: zero)
