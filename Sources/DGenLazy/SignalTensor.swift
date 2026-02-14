@@ -99,6 +99,25 @@ public class SignalTensor: LazyValue {
             tensorId: freqs.tensorId
         )
     }
+
+    /// Create a stateful phasor with a frame-varying tensor of frequencies.
+    /// Each tensor element keeps its own phase state across frames.
+    public static func statefulPhasor(_ freqs: SignalTensor, reset: Signal? = nil) -> SignalTensor {
+        let graph = freqs.graph
+        let resetNode = reset?.nodeId ?? graph.node(.constant(0.0))
+        let stateWidth = Swift.max(1, freqs.shape.reduce(1, *))
+        let cellId = graph.alloc(vectorWidth: stateWidth)
+        let nodeId = graph.node(.phasor(cellId), [freqs.nodeId, resetNode])
+
+        let needsGrad = freqs.requiresGrad || (reset?.requiresGrad ?? false)
+        return SignalTensor(
+            nodeId: nodeId,
+            graph: graph,
+            shape: freqs.shape,
+            requiresGrad: needsGrad,
+            tensorId: freqs.tensorId
+        )
+    }
 }
 
 // MARK: - SignalTensor Properties

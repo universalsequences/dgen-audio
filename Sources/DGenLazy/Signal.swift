@@ -205,6 +205,11 @@ public class Signal: LazyValue {
     return SignalTensor.statefulPhasor(freqs, reset: reset)
   }
 
+  /// Create a stateful phasor for frame-varying tensor frequencies.
+  public static func statefulPhasor(_ freqs: SignalTensor, reset: Signal? = nil) -> SignalTensor {
+    return SignalTensor.statefulPhasor(freqs, reset: reset)
+  }
+
   /// Create a white noise signal
   public static func noise() -> Signal {
     let graph = LazyGraphContext.current

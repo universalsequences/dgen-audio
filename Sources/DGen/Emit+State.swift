@@ -50,16 +50,20 @@ extension LazyOp {
       if ctx.frameAwareTensorCells.contains(tensor.cellId),
         let (tensorSize, frameCount) = ctx.g.frameAwareCells[tensor.cellId]
       {
-        // Frame-aware: sum across all frames (each at frameIdx * tensorSize + elemIdx)
+        // Frame-aware: sum across all frames (each at frameIdx * tensorSize + elemIdx).
+        // Each parallel lane owns one elemIdx, so reduce locally first, then do a single
+        // accumulate to avoid frameCount atomics per element.
         let tensorSizeInt = b.intConstant(tensorSize)
         b.parallelRange(size) { elemIdx in
           let elemIdxInt = b.cast(elemIdx, to: .int)
+          let localSum = b.float(0.0)
           b.loop(frameCount) { frameIdx in
             let frameIdxInt = b.cast(frameIdx, to: .int)
             let readPos = frameIdxInt * tensorSizeInt + elemIdxInt
             let val = b.memoryRead(tensor.cellId, readPos)
-            _ = b.memoryAccumulate(cellId, elemIdxInt, val)
+            localSum.accumulate(val)
           }
+          _ = b.memoryWrite(cellId, elemIdxInt, localSum.value)
         }
       } else if !tensor.transforms.isEmpty {
         // Use tensorRead to walk the transform chain

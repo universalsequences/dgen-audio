@@ -42,6 +42,12 @@ public enum DGenConfig {
     public static var useDeterministicPeekGradients: Bool = false {
         didSet { DGenGradientConfig.useDeterministicPeekGradients = useDeterministicPeekGradients }
     }
+
+    /// Debug toggle for legacy `peek` backward behavior:
+    /// when enabled, `peek` does not propagate tensor-input gradients upstream.
+    public static var dropPeekTensorInputGradient: Bool = false {
+        didSet { DGenGradientConfig.dropPeekTensorInputGradient = dropPeekTensorInputGradient }
+    }
 }
 
 // MARK: - Type Aliases for Convenience

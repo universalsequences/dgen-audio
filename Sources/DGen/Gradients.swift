@@ -34,6 +34,7 @@ extension Graph {
   public func computeGradients(loss: NodeID, targets: Set<NodeID>) -> [NodeID: NodeID] {
     var grads: [NodeID: NodeID] = [:]
     gradientSideEffects = []
+    accumulatedGradProxyCellByNode.removeAll()
 
     // Seed: gradient of loss w.r.t. itself = 1.0
     grads[loss] = n(.constant(1.0), [])
@@ -63,8 +64,20 @@ extension Graph {
         guard let grad = grad else { continue }
 
         if let existing = grads[inputId] {
-          // Multiple paths contribute to this gradient -> add them
-          grads[inputId] = n(.add, [existing, grad])
+          // Multiple paths contribute to this gradient.
+          // For accumulated grad proxies (same backing grad cell), chain with seq
+          // so we keep one read of the shared accumulated cell instead of adding
+          // two tensor reads (which double-counts and can explode kernel work).
+          if let existingCell = accumulatedGradProxyCellByNode[existing],
+            let newCell = accumulatedGradProxyCellByNode[grad],
+            existingCell == newCell
+          {
+            let merged = n(.seq, [existing, grad])
+            accumulatedGradProxyCellByNode[merged] = existingCell
+            grads[inputId] = merged
+          } else {
+            grads[inputId] = n(.add, [existing, grad])
+          }
         } else {
           grads[inputId] = grad
         }
@@ -1069,7 +1082,26 @@ extension LazyOp {
       g.addGradientSideEffect(scatter1)
       g.addGradientSideEffect(scatter2)
 
-      return [nil, zero, zero]
+      if DGenGradientConfig.dropPeekTensorInputGradient {
+        // Legacy behavior (fast but wrong for upstream learning): accumulate into grad cell
+        // for direct tensor params, but do not return a tensor-input gradient node.
+        return [nil, zero, zero]
+      }
+
+      // Keep the fast scatter accumulation path, but also return a proper tensor gradient
+      // for upstream backpropagation. Without this, peek() acts as a gradient sink and
+      // decoder weights upstream of tensor-producing ops (e.g., matmul -> sigmoid -> peek)
+      // receive no gradients.
+      let scatterDone = g.n(.seq, [scatter1, scatter2])
+      let sequencedGrad = createSequencedGradTensor(
+        g,
+        gradCell: gradCell,
+        shape: originalShape,
+        afterOp: scatterDone
+      )
+      g.accumulatedGradProxyCellByNode[sequencedGrad] = gradCell
+
+      return [sequencedGrad, zero, zero]
 
     // MARK: Logical ops (non-differentiable)
 
