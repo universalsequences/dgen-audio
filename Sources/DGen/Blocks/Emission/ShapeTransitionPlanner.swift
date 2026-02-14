@@ -406,21 +406,106 @@ func detectInlineableMulReduceNodes(
 
   // Skip mul emission only when all consumers are sumAxis ops in this same block.
   for mulNodeId in candidateMulNodes {
-    let consumers = g.nodes.compactMap { consumerId, consumer in
+    if shouldSkipInlineReduceProducer(nodeId: mulNodeId, blockNodeSet: blockNodeSet, g: g) {
+      ctx.skippedTensorComputeNodes.insert(mulNodeId)
+    }
+  }
+}
+
+/// Detect `sumAxis(expandAxis(X))` patterns that can inline `expandAxis` reads into `sumAxis`.
+///
+/// This avoids materializing the expanded tensor in backward matmul regions where `expandAxis`
+/// outputs are only consumed by axis reductions.
+func detectInlineableExpandAxisReduceNodes(
+  block: Block,
+  g: Graph,
+  ctx: IRContext
+) {
+  guard block.temporality == .frameBased else { return }
+
+  let blockNodeSet = Set(block.nodes)
+  for expandNodeId in block.nodes {
+    guard let expandNode = g.nodes[expandNodeId],
+      case .expandAxis(let targetShape, let rawAxis) = expandNode.op,
+      let expandTensorId = g.nodeToTensor[expandNodeId],
+      let expandTensor = g.tensors[expandTensorId],
+      let sourceTensorId = g.nodeToTensor[expandNode.inputs[0]],
+      let sourceTensor = g.tensors[sourceTensorId]
+    else { continue }
+
+    let normalizedAxis = rawAxis < 0 ? targetShape.count + rawAxis : rawAxis
+    guard normalizedAxis >= 0, normalizedAxis < targetShape.count else { continue }
+    guard sourceTensor.shape.count + 1 == targetShape.count else { continue }
+
+    ctx.inlineableExpandAxisInputs[expandTensor.cellId] = (source: sourceTensor, axis: normalizedAxis)
+
+    if shouldSkipInlineExpandAxisProducer(nodeId: expandNodeId, blockNodeSet: blockNodeSet, g: g) {
+      ctx.skippedTensorComputeNodes.insert(expandNodeId)
+    }
+  }
+}
+
+/// Returns `true` when producer node can be skipped because every consumer is a `sumAxis`
+/// in this same block.
+private func shouldSkipInlineReduceProducer(
+  nodeId: NodeID,
+  blockNodeSet: Set<NodeID>,
+  g: Graph
+) -> Bool {
+  let consumers = g.nodes.compactMap { consumerId, consumer in
+    consumer.inputs.contains(nodeId) ? consumerId : nil
+  }
+  guard !consumers.isEmpty else { return false }
+
+  return consumers.allSatisfy { consumerId in
+    guard blockNodeSet.contains(consumerId),
+      let consumerNode = g.nodes[consumerId],
+      case .sumAxis = consumerNode.op
+    else { return false }
+    return true
+  }
+}
+
+/// Returns `true` when an `expandAxis` producer can be skipped because every consumer is
+/// either:
+/// - `sumAxis` in this block, or
+/// - `mul` in this block where that mul is only consumed by `sumAxis` in this block.
+private func shouldSkipInlineExpandAxisProducer(
+  nodeId: NodeID,
+  blockNodeSet: Set<NodeID>,
+  g: Graph
+) -> Bool {
+  let consumers = g.nodes.compactMap { consumerId, consumer in
+    consumer.inputs.contains(nodeId) ? consumerId : nil
+  }
+  guard !consumers.isEmpty else { return false }
+
+  func mulConsumersAreAllSumAxis(_ mulNodeId: NodeID) -> Bool {
+    let mulConsumers = g.nodes.compactMap { consumerId, consumer in
       consumer.inputs.contains(mulNodeId) ? consumerId : nil
     }
-    guard !consumers.isEmpty else { continue }
-
-    let canSkip = consumers.allSatisfy { consumerId in
+    guard !mulConsumers.isEmpty else { return false }
+    return mulConsumers.allSatisfy { consumerId in
       guard blockNodeSet.contains(consumerId),
         let consumerNode = g.nodes[consumerId],
         case .sumAxis = consumerNode.op
       else { return false }
       return true
     }
+  }
 
-    if canSkip {
-      ctx.skippedTensorComputeNodes.insert(mulNodeId)
+  return consumers.allSatisfy { consumerId in
+    guard blockNodeSet.contains(consumerId), let consumerNode = g.nodes[consumerId] else {
+      return false
+    }
+
+    switch consumerNode.op {
+    case .sumAxis:
+      return true
+    case .mul:
+      return mulConsumersAreAllSumAxis(consumerId)
+    default:
+      return false
     }
   }
 }

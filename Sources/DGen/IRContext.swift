@@ -65,6 +65,15 @@ public class IRContext {
   /// instead of loading a separately materialized intermediate tensor from memory.
   public var inlineableReduceInputs: [CellID: (Tensor, Tensor)] = [:]
 
+  /// Fusion scratch map for `expandAxis -> sumAxis` patterns.
+  ///
+  /// Key: cell ID of the `expandAxis` output tensor.
+  /// Value: source tensor and normalized expanded axis.
+  ///
+  /// If `sumAxis` sees its input cell in this map, it reconstructs the source indices
+  /// by dropping the expanded axis and reads directly from the source tensor.
+  public var inlineableExpandAxisInputs: [CellID: (source: Tensor, axis: Int)] = [:]
+
   /// Tensor compute nodes that should not emit code because their work is inlined
   /// into downstream reductions.
   public var skippedTensorComputeNodes: Set<NodeID> = []

@@ -174,13 +174,41 @@ extension LazyOp {
         inBaseFlatIdx = inBaseFlatIdx + inStaticIndices[i] * b.intConstant(inStrides[i])
       }
 
+      func readInlineReduceTensor(_ tensor: Tensor, indices: [Expr]) -> Expr {
+        if let expandInput = ctx.inlineableExpandAxisInputs[tensor.cellId] {
+          var sourceIndices: [Expr] = []
+          sourceIndices.reserveCapacity(Swift.max(0, indices.count - 1))
+          for dim in 0..<indices.count where dim != expandInput.axis {
+            sourceIndices.append(indices[dim])
+          }
+          return readInlineReduceTensor(expandInput.source, indices: sourceIndices)
+        }
+
+        if tensor.padding != nil {
+          return b.tensorRead(tensor, indices: indices)
+        }
+        if ctx.frameAwareTensorCells.contains(tensor.cellId) {
+          let elemIdx = b.tensorMemoryIndex(tensor, indices: indices)
+          return b.frameAwareTensorRead(
+            cellId: tensor.cellId,
+            tensorSize: tensor.shape.reduce(1, *),
+            elemIdx: elemIdx
+          )
+        }
+        if tensor.transforms.isEmpty {
+          let elemIdx = b.tensorMemoryIndex(tensor, indices: indices)
+          return b.memoryRead(tensor.cellId, elemIdx)
+        }
+        return b.tensorRead(tensor, indices: indices)
+      }
+
       b.loop(inShape[axis]) { reduceIdx in
         let rIdx = reduceIdx
         let inFlatIdx = inBaseFlatIdx + rIdx * axisStride
 
-        // Read from input tensor — or compute inline if fused with expand
+        // Read from input tensor — or compute inline if fused with skipped producers.
         let val: Expr
-        // Fusion fast-path: if this input cell was produced by a skipped expand/mul region,
+        // Fusion fast-path: if this input cell was produced by a skipped mul region,
         // compute the product from its original source tensors inline while reducing.
         if let (aTensor, bTensor) = ctx.inlineableReduceInputs[inTensor.cellId] {
           var inIndices = inStaticIndices
@@ -193,31 +221,19 @@ extension LazyOp {
             outputIndices: inIndices, outputShape: inShape, inputTensor: aTensor)
           let broadcastedB = b.broadcastIndices(
             outputIndices: inIndices, outputShape: inShape, inputTensor: bTensor)
-
-          let aVal: Expr
-          if ctx.frameAwareTensorCells.contains(aTensor.cellId) {
-            let aElemIdx = b.tensorMemoryIndex(aTensor, indices: broadcastedA)
-            aVal = b.frameAwareTensorRead(
-              cellId: aTensor.cellId,
-              tensorSize: aTensor.shape.reduce(1, *),
-              elemIdx: aElemIdx
-            )
-          } else {
-            aVal = b.tensorRead(aTensor, indices: broadcastedA)
-          }
-
-          let bVal: Expr
-          if ctx.frameAwareTensorCells.contains(bTensor.cellId) {
-            let bElemIdx = b.tensorMemoryIndex(bTensor, indices: broadcastedB)
-            bVal = b.frameAwareTensorRead(
-              cellId: bTensor.cellId,
-              tensorSize: bTensor.shape.reduce(1, *),
-              elemIdx: bElemIdx
-            )
-          } else {
-            bVal = b.tensorRead(bTensor, indices: broadcastedB)
-          }
+          let aVal = readInlineReduceTensor(aTensor, indices: broadcastedA)
+          let bVal = readInlineReduceTensor(bTensor, indices: broadcastedB)
           val = aVal * bVal
+        } else if let expandInput = ctx.inlineableExpandAxisInputs[inTensor.cellId] {
+          var inIndices = inStaticIndices
+          inIndices[axis] = rIdx
+
+          var sourceIndices: [Expr] = []
+          sourceIndices.reserveCapacity(Swift.max(0, inIndices.count - 1))
+          for dim in 0..<inIndices.count where dim != expandInput.axis {
+            sourceIndices.append(inIndices[dim])
+          }
+          val = readInlineReduceTensor(expandInput.source, indices: sourceIndices)
         } else if inTensor.padding != nil {
           var inIndices = inStaticIndices
           inIndices[axis] = rIdx
