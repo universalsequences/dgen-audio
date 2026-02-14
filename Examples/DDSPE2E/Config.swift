@@ -1,5 +1,10 @@
 import Foundation
 
+enum GradientClipMode: String, Codable {
+  case element
+  case global
+}
+
 struct DDSPE2EConfig: Codable {
   var sampleRate: Float = 16_000.0
   var chunkSize: Int = 16_384
@@ -29,6 +34,8 @@ struct DDSPE2EConfig: Codable {
   var noiseFIRKernelSize: Int = 15
   var learningRate: Float = 0.001
   var gradClip: Float = 1.0
+  var gradClipMode: GradientClipMode = .element
+  var normalizeGradByFrames: Bool = true
   var spectralWindowSizes: [Int] = []
   var spectralWeight: Float = 0.0
   var spectralHopDivisor: Int = 4
@@ -62,6 +69,8 @@ struct DDSPE2EConfig: Codable {
     case noiseFIRKernelSize
     case learningRate
     case gradClip
+    case gradClipMode
+    case normalizeGradByFrames
     case spectralWindowSizes
     case spectralWeight
     case spectralHopDivisor
@@ -101,6 +110,9 @@ struct DDSPE2EConfig: Codable {
       try c.decodeIfPresent(Int.self, forKey: .noiseFIRKernelSize) ?? d.noiseFIRKernelSize
     learningRate = try c.decodeIfPresent(Float.self, forKey: .learningRate) ?? d.learningRate
     gradClip = try c.decodeIfPresent(Float.self, forKey: .gradClip) ?? d.gradClip
+    gradClipMode = try c.decodeIfPresent(GradientClipMode.self, forKey: .gradClipMode) ?? d.gradClipMode
+    normalizeGradByFrames =
+      try c.decodeIfPresent(Bool.self, forKey: .normalizeGradByFrames) ?? d.normalizeGradByFrames
     spectralWindowSizes = try c.decodeIfPresent([Int].self, forKey: .spectralWindowSizes) ?? d.spectralWindowSizes
     spectralWeight = try c.decodeIfPresent(Float.self, forKey: .spectralWeight) ?? d.spectralWeight
     spectralHopDivisor = try c.decodeIfPresent(Int.self, forKey: .spectralHopDivisor) ?? d.spectralHopDivisor
@@ -149,6 +161,15 @@ struct DDSPE2EConfig: Codable {
     }
     if let value = options["grad-clip"] {
       gradClip = try parseFloat(value, key: "grad-clip")
+    }
+    if let value = options["clip-mode"] {
+      guard let mode = GradientClipMode(rawValue: value.lowercased()) else {
+        throw ConfigError.invalid("Invalid clip mode for --clip-mode: \(value) (expected element|global)")
+      }
+      gradClipMode = mode
+    }
+    if let value = options["normalize-grad-by-frames"] {
+      normalizeGradByFrames = parseBool(value)
     }
     if let value = options["spectral-windows"] {
       spectralWindowSizes = try parseIntList(value, key: "spectral-windows")

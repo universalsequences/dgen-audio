@@ -75,6 +75,34 @@ swift run DDSPE2E train \
   --spectral-hop-divisor 4
 ```
 
+7. One-step gradient probe from a saved checkpoint (MSE vs spectral):
+
+```bash
+# MSE-only contribution at a fixed model state
+swift run DDSPE2E train \
+  --cache .ddsp_cache_tinysol \
+  --mode m2 \
+  --steps 1 \
+  --lr 1e-9 \
+  --init-checkpoint runs/<run>/checkpoints/model_step_00001200.json \
+  --mse-weight 1.0 \
+  --spectral-weight 0
+
+# Spectral-only contribution at the same model state
+swift run DDSPE2E train \
+  --cache .ddsp_cache_tinysol \
+  --mode m2 \
+  --steps 1 \
+  --lr 1e-9 \
+  --init-checkpoint runs/<run>/checkpoints/model_step_00001200.json \
+  --mse-weight 0 \
+  --spectral-weight 1.0 \
+  --spectral-windows 64,128,256 \
+  --spectral-hop-divisor 4 \
+  --spectral-warmup-steps 0 \
+  --spectral-ramp-steps 0
+```
+
 ## Spectral Hop Divisor
 
 For each spectral window `w`, the effective hop is:
@@ -123,6 +151,7 @@ Set `--spectral-hop-divisor 1` to effectively disable hop sparsification for tha
 - `--log-every <int>` (default: `10`)
 - `--checkpoint-every <int>` (default: `100`)
 - `--kernel-dump [path]` (train only; use `true` to write to `<run-dir>/kernels.metal`)
+- `--init-checkpoint <model-checkpoint-json>` (train only; initializes model weights from a saved checkpoint)
 
 ## Outputs
 

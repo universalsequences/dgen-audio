@@ -13,9 +13,11 @@ enum DDSPTrainingLosses {
   ) -> Signal {
     let usableWindows = spectralWindowSizes.filter { $0 > 1 && $0 <= frameCount }
     var total = Signal.constant(0.0)
+    var hasTerm = false
 
     if mseWeight > 0 {
       total = total + mse(prediction, target) * mseWeight
+      hasTerm = true
     }
 
     if spectralWeight > 0, !usableWindows.isEmpty {
@@ -26,9 +28,10 @@ enum DDSPTrainingLosses {
       }
       spec = spec * (1.0 / Float(usableWindows.count))
       total = total + spec * spectralWeight
+      hasTerm = true
     }
 
-    // Avoid accidental zero-loss graph if both weights are zero.
-    return total + mse(prediction, target) * 0.0
+    // Preserve a valid scalar loss signal without forcing extra loss terms into the graph.
+    return hasTerm ? total : Signal.constant(0.0)
   }
 }

@@ -111,6 +111,7 @@ struct DDSPE2EMain {
       rawValue: options["kernel-dump"],
       runDir: runDirs.root
     )
+    let initCheckpointPath = options["init-checkpoint"]
 
     let steps = Int(options["steps"] ?? "200") ?? 200
     let split = parseSplit(options["split"]) ?? .train
@@ -124,7 +125,8 @@ struct DDSPE2EMain {
         steps: steps,
         split: split,
         mode: mode,
-        kernelDumpPath: kernelDumpPath
+        kernelDumpPath: kernelDumpPath,
+        initCheckpointPath: initCheckpointPath
       ),
       logger: log
     )
@@ -206,6 +208,8 @@ struct DDSPE2EMain {
       --noise-fir-size <int>
       --lr <float>
       --grad-clip <float>
+      --clip-mode <element|global>
+      --normalize-grad-by-frames <true|false>
       --spectral-windows <csv-int-list>
       --spectral-weight <float>
       --spectral-hop-divisor <int>
@@ -215,6 +219,7 @@ struct DDSPE2EMain {
       --log-every <int>
       --checkpoint-every <int>
       --kernel-dump [path]
+      --init-checkpoint <model-checkpoint-json>
 
     Examples:
       swift run DDSPE2E dump-config --output ddsp_config.json

@@ -27,3 +27,5 @@ TINYGRAD_KERNEL_STATS.txt
 /.ddsp_runs_tinysol
 runs
 testtrain.sh
+docs/SPECTRAL_HOP_GRADIENT_ISSUE.md
+/.ddsp_cache_overfit1

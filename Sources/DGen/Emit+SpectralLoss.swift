@@ -28,7 +28,8 @@ extension LazyOp {
       let winSizeFloat = b.constant(Float(windowSize))
       let zero = b.constant(0.0)
       let one = b.constant(1.0)
-      let frameIdx = b.threadIndex()
+      // Use logical frame index (respects setFrameIndex in scaled-thread kernels).
+      let frameIdx = b.frameIndex()
 
       // Per-frame base offsets for thread-local scratch memory (integer to avoid float32 precision loss)
       let fftBaseOffset = frameIdx * b.intConstant(fftSize)
@@ -202,7 +203,7 @@ extension LazyOp {
       let gradOutput = b.value(inputs[0])
       let hopCounter: Expr? = inputs.count > 3 ? b.value(inputs[3]) : nil
       let eps = b.constant(1e-8)
-      let frameIdx = b.threadIndex()
+      let frameIdx = b.frameIndex()
       let zero = b.constant(0.0)
 
       // Per-frame base offsets (integer arithmetic for precision)
@@ -283,7 +284,7 @@ extension LazyOp {
       let zero = b.constant(0.0)
       let one = b.constant(1.0)
       let hopCounter: Expr? = inputs.count > 1 ? b.value(inputs[1]) : nil
-      let frameIdx = b.threadIndex()
+      let frameIdx = b.frameIndex()
 
       // Per-frame base offsets (integer arithmetic for precision)
       let gradSpecBase = frameIdx * b.intConstant(fftSize)
@@ -417,7 +418,7 @@ extension LazyOp {
       let zero = b.constant(0.0)
       let one = b.constant(1.0)
       let eps = b.constant(1e-8)
-      let frameIdx = b.threadIndex()
+      let frameIdx = b.frameIndex()
 
       // Frame-indexed base offset for this frame's gradient storage (integer arithmetic)
       let frameBase = frameIdx * b.intConstant(windowSize)
@@ -530,7 +531,7 @@ extension LazyOp {
       let _ = b.value(inputs[0])
       let hopCounter: Expr? = inputs.count > 1 ? b.value(inputs[1]) : nil
 
-      let frameIdx = b.threadIndex()
+      let frameIdx = b.frameIndex()
       let winSizeInt = b.intConstant(windowSize)
       let winSizeFloat = b.constant(Float(windowSize))
       let frameCount = b.frameCount()
@@ -571,7 +572,7 @@ extension LazyOp {
       let _ = b.value(inputs[0])
       let hopCounter: Expr? = inputs.count > 1 ? b.value(inputs[1]) : nil
 
-      let frameIdx = b.threadIndex()
+      let frameIdx = b.frameIndex()
       let winSizeInt = b.intConstant(windowSize)
       let winSizeFloat = b.constant(Float(windowSize))
       let frameCount = b.frameCount()

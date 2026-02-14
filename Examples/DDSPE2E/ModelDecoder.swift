@@ -103,8 +103,31 @@ final class DDSPDecoderModel {
     ]
   }
 
+  func loadSnapshots(_ snapshots: [NamedTensorSnapshot]) {
+    let byName = Dictionary(uniqueKeysWithValues: snapshots.map { ($0.name, $0) })
+    loadTensor(W1, from: byName["W1"])
+    loadTensor(b1, from: byName["b1"])
+    loadTensor(W_harm, from: byName["W_harm"])
+    loadTensor(b_harm, from: byName["b_harm"])
+    loadTensor(W_hgain, from: byName["W_hgain"])
+    loadTensor(b_hgain, from: byName["b_hgain"])
+    loadTensor(W_noise, from: byName["W_noise"])
+    loadTensor(b_noise, from: byName["b_noise"])
+  }
+
   private func snapshot(_ name: String, _ tensor: Tensor) -> NamedTensorSnapshot {
     NamedTensorSnapshot(name: name, shape: tensor.shape, data: tensor.getData() ?? [])
+  }
+
+  private func loadTensor(_ tensor: Tensor, from snapshot: NamedTensorSnapshot?) {
+    guard let snapshot else { return }
+    guard snapshot.shape == tensor.shape else {
+      return
+    }
+    guard snapshot.data.count == tensor.shape.reduce(1, *) else {
+      return
+    }
+    tensor.updateDataLazily(snapshot.data)
   }
 
   private static func randomArray(

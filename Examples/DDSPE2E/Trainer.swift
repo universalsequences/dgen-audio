@@ -42,6 +42,7 @@ struct TrainerOptions {
   var split: DatasetSplit
   var mode: TrainMode
   var kernelDumpPath: String?
+  var initCheckpointPath: String?
 }
 
 enum DDSPE2ETrainer {
@@ -56,6 +57,18 @@ enum DDSPE2ETrainer {
 
     var l2Norm: Float {
       Float(Foundation.sqrt(sumSquares))
+    }
+  }
+
+  private struct ClipStats {
+    var totalCount: Int = 0
+    var finiteCount: Int = 0
+    var clippedCount: Int = 0
+    var nonFiniteCount: Int = 0
+
+    var clippedFraction: Double {
+      guard finiteCount > 0 else { return 0 }
+      return Double(clippedCount) / Double(finiteCount)
     }
   }
 
@@ -182,6 +195,11 @@ enum DDSPE2ETrainer {
     LazyGraphContext.reset()
 
     let model = DDSPDecoderModel(config: config)
+    if let checkpointPath = options.initCheckpointPath {
+      let checkpoint = try CheckpointStore.readModelState(from: URL(fileURLWithPath: checkpointPath))
+      model.loadSnapshots(checkpoint.params)
+      logger("Loaded model checkpoint: \(checkpointPath) (step=\(checkpoint.step))")
+    }
     let optimizer = Adam(params: model.parameters, lr: config.learningRate)
 
     let resolvedConfigURL = runDirs.root.appendingPathComponent("resolved_config.json")
@@ -198,6 +216,9 @@ enum DDSPE2ETrainer {
       "hiddenSize": "\(config.modelHiddenSize)",
       "lr": "\(config.learningRate)",
       "mseWeight": "\(config.mseLossWeight)",
+      "gradClipMode": config.gradClipMode.rawValue,
+      "gradClip": "\(config.gradClip)",
+      "normalizeGradByFrames": "\(config.normalizeGradByFrames)",
       "spectralWeightTarget": "\(config.spectralWeight)",
       "spectralHopDivisor": "\(config.spectralHopDivisor)",
       "spectralWarmupSteps": "\(config.spectralWarmupSteps)",
@@ -319,7 +340,13 @@ enum DDSPE2ETrainer {
 
       let tOptStart = CFAbsoluteTimeGetCurrent()
       let preClipGradStats = shouldLog ? summarizeGradients(params: model.parameters) : nil
-      sanitizeAndClipGradients(params: model.parameters, clip: config.gradClip)
+      let gradScale = config.normalizeGradByFrames ? (1.0 / Float(max(1, frameCount))) : 1.0
+      let clipStats = sanitizeAndClipGradients(
+        params: model.parameters,
+        clip: config.gradClip,
+        mode: config.gradClipMode,
+        gradScale: gradScale
+      )
       let postClipGradStats = shouldLog ? summarizeGradients(params: model.parameters) : nil
       optimizer.step()
       optimizer.zeroGrad()
@@ -342,12 +369,17 @@ enum DDSPE2ETrainer {
       if shouldLog {
         let gradInfo: String
         if let pre = preClipGradStats, let post = postClipGradStats {
+          let clipPct = clipStats.clippedFraction * 100.0
           gradInfo =
             " gL2=\(format(pre.l2Norm)) gMax=\(format(pre.maxAbs)) "
             + "gNZ=\(pre.nonZeroCount)/\(pre.finiteCount) "
             + "gFinite=\(pre.finiteCount)/\(pre.totalCount) "
             + "gParams=\(pre.paramsWithGrad)/\(pre.paramCount) "
-            + "gMaxPostClip=\(format(post.maxAbs))"
+            + "gMaxPostClip=\(format(post.maxAbs)) "
+            + "gScale=\(format(gradScale)) "
+            + "gClipMode=\(config.gradClipMode.rawValue) "
+            + "gClip=\(clipStats.clippedCount)/\(clipStats.finiteCount) (\(format(clipPct))%) "
+            + "gNonFinite=\(clipStats.nonFiniteCount)"
         } else {
           gradInfo = ""
         }
@@ -409,30 +441,130 @@ enum DDSPE2ETrainer {
     )
   }
 
-  private static func sanitizeAndClipGradients(params: [any LazyValue], clip: Float) {
+  private static func sanitizeAndClipGradients(
+    params: [any LazyValue],
+    clip: Float,
+    mode: GradientClipMode,
+    gradScale: Float
+  ) -> ClipStats {
+    switch mode {
+    case .element:
+      return sanitizeAndClipGradientsElementwise(params: params, clip: clip, gradScale: gradScale)
+    case .global:
+      return sanitizeAndClipGradientsGlobalNorm(params: params, clip: clip, gradScale: gradScale)
+    }
+  }
+
+  private static func sanitizeAndClipGradientsElementwise(
+    params: [any LazyValue],
+    clip: Float,
+    gradScale: Float
+  ) -> ClipStats {
+    var stats = ClipStats()
     for param in params {
       if let tensor = param as? Tensor, let gradTensor = tensor.grad, let gradData = gradTensor.getData() {
         let cleaned = gradData.map { g -> Float in
-          if !g.isFinite { return 0 }
-          if g > clip { return clip }
-          if g < -clip { return -clip }
-          return g
+          stats.totalCount += 1
+          if !g.isFinite {
+            stats.nonFiniteCount += 1
+            return 0
+          }
+          stats.finiteCount += 1
+          let scaled = g * gradScale
+          if scaled > clip {
+            stats.clippedCount += 1
+            return clip
+          }
+          if scaled < -clip {
+            stats.clippedCount += 1
+            return -clip
+          }
+          return scaled
         }
         gradTensor.updateDataLazily(cleaned)
       } else if let signal = param as? Signal, let gradSignal = signal.grad, let g = gradSignal.data {
+        stats.totalCount += 1
         let cleaned: Float
         if !g.isFinite {
+          stats.nonFiniteCount += 1
           cleaned = 0
-        } else if g > clip {
+        } else if g * gradScale > clip {
+          stats.finiteCount += 1
+          stats.clippedCount += 1
           cleaned = clip
-        } else if g < -clip {
+        } else if g * gradScale < -clip {
+          stats.finiteCount += 1
+          stats.clippedCount += 1
           cleaned = -clip
         } else {
-          cleaned = g
+          stats.finiteCount += 1
+          cleaned = g * gradScale
         }
         gradSignal.updateDataLazily(cleaned)
       }
     }
+    return stats
+  }
+
+  private static func sanitizeAndClipGradientsGlobalNorm(
+    params: [any LazyValue],
+    clip: Float,
+    gradScale: Float
+  ) -> ClipStats {
+    var stats = ClipStats()
+    var sumSquares: Double = 0.0
+
+    // Pass 1: sanitize non-finite gradients and compute global norm over finite values.
+    for param in params {
+      if let tensor = param as? Tensor, let gradTensor = tensor.grad, let gradData = gradTensor.getData() {
+        let cleaned = gradData.map { g -> Float in
+          stats.totalCount += 1
+          if !g.isFinite {
+            stats.nonFiniteCount += 1
+            return 0
+          }
+          let scaled = g * gradScale
+          stats.finiteCount += 1
+          sumSquares += Double(scaled) * Double(scaled)
+          return scaled
+        }
+        gradTensor.updateDataLazily(cleaned)
+      } else if let signal = param as? Signal, let gradSignal = signal.grad, let g = gradSignal.data {
+        stats.totalCount += 1
+        if !g.isFinite {
+          stats.nonFiniteCount += 1
+          gradSignal.updateDataLazily(0)
+        } else {
+          let scaled = g * gradScale
+          stats.finiteCount += 1
+          sumSquares += Double(scaled) * Double(scaled)
+          gradSignal.updateDataLazily(scaled)
+        }
+      }
+    }
+
+    let globalNorm = Foundation.sqrt(sumSquares)
+    guard globalNorm.isFinite, globalNorm > 0 else {
+      return stats
+    }
+    guard globalNorm > Double(clip) else {
+      return stats
+    }
+
+    let scale = Float(Double(clip) / globalNorm)
+    stats.clippedCount = stats.finiteCount
+
+    // Pass 2: apply global scaling.
+    for param in params {
+      if let tensor = param as? Tensor, let gradTensor = tensor.grad, let gradData = gradTensor.getData() {
+        let scaled = gradData.map { $0.isFinite ? ($0 * scale) : 0 }
+        gradTensor.updateDataLazily(scaled)
+      } else if let signal = param as? Signal, let gradSignal = signal.grad, let g = gradSignal.data {
+        gradSignal.updateDataLazily(g.isFinite ? (g * scale) : 0)
+      }
+    }
+
+    return stats
   }
 
   private static func summarizeGradients(params: [any LazyValue]) -> GradientStats {

@@ -55,4 +55,10 @@ enum CheckpointStore {
     let url = checkpointsDir.appendingPathComponent(fileName)
     try data.write(to: url)
   }
+
+  static func readModelState(from url: URL) throws -> ModelCheckpoint {
+    let data = try Data(contentsOf: url)
+    let decoder = JSONDecoder()
+    return try decoder.decode(ModelCheckpoint.self, from: data)
+  }
 }
