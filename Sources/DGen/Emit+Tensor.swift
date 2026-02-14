@@ -175,13 +175,18 @@ extension LazyOp {
       }
 
       func readInlineReduceTensor(_ tensor: Tensor, indices: [Expr]) -> Expr {
-        if let expandInput = ctx.inlineableExpandAxisInputs[tensor.cellId] {
-          var sourceIndices: [Expr] = []
-          sourceIndices.reserveCapacity(Swift.max(0, indices.count - 1))
-          for dim in 0..<indices.count where dim != expandInput.axis {
-            sourceIndices.append(indices[dim])
+        if let source = ctx.inlineReduceSources[tensor.cellId] {
+          switch source {
+          case .expandAxis(let sourceTensor, let axis):
+            var sourceIndices: [Expr] = []
+            sourceIndices.reserveCapacity(Swift.max(0, indices.count - 1))
+            for dim in 0..<indices.count where dim != axis {
+              sourceIndices.append(indices[dim])
+            }
+            return readInlineReduceTensor(sourceTensor, indices: sourceIndices)
+          case .mul:
+            break
           }
-          return readInlineReduceTensor(expandInput.source, indices: sourceIndices)
         }
 
         if tensor.padding != nil {
@@ -210,7 +215,9 @@ extension LazyOp {
         let val: Expr
         // Fusion fast-path: if this input cell was produced by a skipped mul region,
         // compute the product from its original source tensors inline while reducing.
-        if let (aTensor, bTensor) = ctx.inlineableReduceInputs[inTensor.cellId] {
+        if let source = ctx.inlineReduceSources[inTensor.cellId],
+          case .mul(let aTensor, let bTensor) = source
+        {
           var inIndices = inStaticIndices
           inIndices[axis] = rIdx
           // Fused path: compute A * B inline instead of reading from memory.
@@ -224,16 +231,18 @@ extension LazyOp {
           let aVal = readInlineReduceTensor(aTensor, indices: broadcastedA)
           let bVal = readInlineReduceTensor(bTensor, indices: broadcastedB)
           val = aVal * bVal
-        } else if let expandInput = ctx.inlineableExpandAxisInputs[inTensor.cellId] {
+        } else if let source = ctx.inlineReduceSources[inTensor.cellId],
+          case .expandAxis(let sourceTensor, let expandedAxis) = source
+        {
           var inIndices = inStaticIndices
           inIndices[axis] = rIdx
 
           var sourceIndices: [Expr] = []
           sourceIndices.reserveCapacity(Swift.max(0, inIndices.count - 1))
-          for dim in 0..<inIndices.count where dim != expandInput.axis {
+          for dim in 0..<inIndices.count where dim != expandedAxis {
             sourceIndices.append(inIndices[dim])
           }
-          val = readInlineReduceTensor(expandInput.source, indices: sourceIndices)
+          val = readInlineReduceTensor(sourceTensor, indices: sourceIndices)
         } else if inTensor.padding != nil {
           var inIndices = inStaticIndices
           inIndices[axis] = rIdx

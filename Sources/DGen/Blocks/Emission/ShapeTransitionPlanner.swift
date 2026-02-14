@@ -358,10 +358,13 @@ func detectFusableReduces(
     ) else { continue }
 
     // This region no longer needs materialization; sumAxis will compute A*B inline.
-    // Record it in ctx.inlineableReduceInputs using the skipped product cell as lookup key.
+    // Record source recipe keyed by the skipped product cell.
     skipRegions.insert(candidate.transitionIndex)
     outbound.remove(candidate.intermediateCell)
-    ctx.inlineableReduceInputs[candidate.intermediateCell] = candidate.mulInputTensors
+    ctx.inlineReduceSources[candidate.intermediateCell] = .mul(
+      a: candidate.mulInputTensors.0,
+      b: candidate.mulInputTensors.1
+    )
   }
 
   return skipRegions
@@ -400,7 +403,7 @@ func detectInlineableMulReduceNodes(
       let bTensor = g.tensors[bTensorId]
     else { continue }
 
-    ctx.inlineableReduceInputs[mulTensor.cellId] = (aTensor, bTensor)
+    ctx.inlineReduceSources[mulTensor.cellId] = .mul(a: aTensor, b: bTensor)
     candidateMulNodes.insert(mulNodeId)
   }
 
@@ -437,7 +440,10 @@ func detectInlineableExpandAxisReduceNodes(
     guard normalizedAxis >= 0, normalizedAxis < targetShape.count else { continue }
     guard sourceTensor.shape.count + 1 == targetShape.count else { continue }
 
-    ctx.inlineableExpandAxisInputs[expandTensor.cellId] = (source: sourceTensor, axis: normalizedAxis)
+    ctx.inlineReduceSources[expandTensor.cellId] = .expandAxis(
+      source: sourceTensor,
+      axis: normalizedAxis
+    )
 
     if shouldSkipInlineExpandAxisProducer(nodeId: expandNodeId, blockNodeSet: blockNodeSet, g: g) {
       ctx.skippedTensorComputeNodes.insert(expandNodeId)
@@ -452,9 +458,7 @@ private func shouldSkipInlineReduceProducer(
   blockNodeSet: Set<NodeID>,
   g: Graph
 ) -> Bool {
-  let consumers = g.nodes.compactMap { consumerId, consumer in
-    consumer.inputs.contains(nodeId) ? consumerId : nil
-  }
+  let consumers = consumersOf(nodeId, g: g)
   guard !consumers.isEmpty else { return false }
 
   return consumers.allSatisfy { consumerId in
@@ -475,15 +479,11 @@ private func shouldSkipInlineExpandAxisProducer(
   blockNodeSet: Set<NodeID>,
   g: Graph
 ) -> Bool {
-  let consumers = g.nodes.compactMap { consumerId, consumer in
-    consumer.inputs.contains(nodeId) ? consumerId : nil
-  }
+  let consumers = consumersOf(nodeId, g: g)
   guard !consumers.isEmpty else { return false }
 
   func mulConsumersAreAllSumAxis(_ mulNodeId: NodeID) -> Bool {
-    let mulConsumers = g.nodes.compactMap { consumerId, consumer in
-      consumer.inputs.contains(mulNodeId) ? consumerId : nil
-    }
+    let mulConsumers = consumersOf(mulNodeId, g: g)
     guard !mulConsumers.isEmpty else { return false }
     return mulConsumers.allSatisfy { consumerId in
       guard blockNodeSet.contains(consumerId),
@@ -507,6 +507,12 @@ private func shouldSkipInlineExpandAxisProducer(
     default:
       return false
     }
+  }
+}
+
+private func consumersOf(_ nodeId: NodeID, g: Graph) -> [NodeID] {
+  g.nodes.compactMap { consumerId, consumer in
+    consumer.inputs.contains(nodeId) ? consumerId : nil
   }
 }
 

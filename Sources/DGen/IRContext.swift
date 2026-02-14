@@ -56,23 +56,19 @@ public class IRContext {
     tensorCellToVar = [:]
   }
 
+  /// Source recipe for a tensor whose computation can be inlined directly inside `sumAxis`.
+  public enum InlineReduceSource {
+    /// Skipped `mul(A, B)` producer.
+    case mul(a: Tensor, b: Tensor)
+    /// Skipped `expandAxis(source, axis)` producer.
+    case expandAxis(source: Tensor, axis: Int)
+  }
+
   /// Fusion scratch map used by `sumAxis` during shape-aware emission.
   ///
-  /// Key: cell ID of a skipped intermediate tensor (`mul` output).
-  /// Value: `(A, B)` source tensors for that skipped product.
-  ///
-  /// If `sumAxis` sees its input cell in this map, it computes `A * B` inline while reducing
-  /// instead of loading a separately materialized intermediate tensor from memory.
-  public var inlineableReduceInputs: [CellID: (Tensor, Tensor)] = [:]
-
-  /// Fusion scratch map for `expandAxis -> sumAxis` patterns.
-  ///
-  /// Key: cell ID of the `expandAxis` output tensor.
-  /// Value: source tensor and normalized expanded axis.
-  ///
-  /// If `sumAxis` sees its input cell in this map, it reconstructs the source indices
-  /// by dropping the expanded axis and reads directly from the source tensor.
-  public var inlineableExpandAxisInputs: [CellID: (source: Tensor, axis: Int)] = [:]
+  /// Key: cell ID of a skipped producer tensor.
+  /// Value: source recipe used to reconstruct values directly in the reduction loop.
+  public var inlineReduceSources: [CellID: InlineReduceSource] = [:]
 
   /// Tensor compute nodes that should not emit code because their work is inlined
   /// into downstream reductions.
