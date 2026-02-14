@@ -193,8 +193,30 @@ extension LazyOp {
             outputIndices: inIndices, outputShape: inShape, inputTensor: aTensor)
           let broadcastedB = b.broadcastIndices(
             outputIndices: inIndices, outputShape: inShape, inputTensor: bTensor)
-          let aVal = b.tensorRead(aTensor, indices: broadcastedA)
-          let bVal = b.tensorRead(bTensor, indices: broadcastedB)
+
+          let aVal: Expr
+          if ctx.frameAwareTensorCells.contains(aTensor.cellId) {
+            let aElemIdx = b.tensorMemoryIndex(aTensor, indices: broadcastedA)
+            aVal = b.frameAwareTensorRead(
+              cellId: aTensor.cellId,
+              tensorSize: aTensor.shape.reduce(1, *),
+              elemIdx: aElemIdx
+            )
+          } else {
+            aVal = b.tensorRead(aTensor, indices: broadcastedA)
+          }
+
+          let bVal: Expr
+          if ctx.frameAwareTensorCells.contains(bTensor.cellId) {
+            let bElemIdx = b.tensorMemoryIndex(bTensor, indices: broadcastedB)
+            bVal = b.frameAwareTensorRead(
+              cellId: bTensor.cellId,
+              tensorSize: bTensor.shape.reduce(1, *),
+              elemIdx: bElemIdx
+            )
+          } else {
+            bVal = b.tensorRead(bTensor, indices: broadcastedB)
+          }
           val = aVal * bVal
         } else if inTensor.padding != nil {
           var inIndices = inStaticIndices

@@ -378,6 +378,10 @@ func detectInlineableMulReduceNodes(
   g: Graph,
   ctx: IRContext
 ) {
+  // Safety gate: this fallback is intended for frame-based matmul-backward style regions.
+  // Keep static-only tensor programs on the conservative path to avoid behavioral drift.
+  guard block.temporality == .frameBased else { return }
+
   let blockNodeSet = Set(block.nodes)
   var candidateMulNodes = Set<NodeID>()
 
