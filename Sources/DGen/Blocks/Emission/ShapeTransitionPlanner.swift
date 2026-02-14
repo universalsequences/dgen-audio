@@ -367,6 +367,60 @@ func detectFusableReduces(
   return skipRegions
 }
 
+/// Detect `sumAxis(mul(A, B))` patterns that can inline the `mul` into `sumAxis`
+/// without skipping the whole shape region.
+///
+/// This is a fallback for multi-consumer matmul-backward regions where full
+/// transition skipping is not possible. It marks eligible mul nodes so emission
+/// skips materializing their outputs, while sumAxis reads A/B directly.
+func detectInlineableMulReduceNodes(
+  block: Block,
+  g: Graph,
+  ctx: IRContext
+) {
+  let blockNodeSet = Set(block.nodes)
+  var candidateMulNodes = Set<NodeID>()
+
+  for nodeId in block.nodes {
+    guard let reduceNode = g.nodes[nodeId],
+      case .sumAxis = reduceNode.op,
+      let mulNodeId = reduceNode.inputs.first,
+      let mulNode = g.nodes[mulNodeId],
+      case .mul = mulNode.op,
+      mulNode.inputs.count == 2,
+      let mulTensorId = g.nodeToTensor[mulNodeId],
+      let mulTensor = g.tensors[mulTensorId],
+      let aTensorId = g.nodeToTensor[mulNode.inputs[0]],
+      let aTensor = g.tensors[aTensorId],
+      let bTensorId = g.nodeToTensor[mulNode.inputs[1]],
+      let bTensor = g.tensors[bTensorId]
+    else { continue }
+
+    ctx.inlineableReduceInputs[mulTensor.cellId] = (aTensor, bTensor)
+    candidateMulNodes.insert(mulNodeId)
+  }
+
+  // Skip mul emission only when all consumers are sumAxis ops in this same block.
+  for mulNodeId in candidateMulNodes {
+    let consumers = g.nodes.compactMap { consumerId, consumer in
+      consumer.inputs.contains(mulNodeId) ? consumerId : nil
+    }
+    guard !consumers.isEmpty else { continue }
+
+    let canSkip = consumers.allSatisfy { consumerId in
+      guard blockNodeSet.contains(consumerId),
+        let consumerNode = g.nodes[consumerId],
+        case .sumAxis = consumerNode.op
+      else { return false }
+      return true
+    }
+
+    if canSkip {
+      ctx.skippedTensorComputeNodes.insert(mulNodeId)
+    }
+  }
+}
+
 /// Convert transitions into structured EmissionRegions.
 /// Includes a scalar preamble (nodes before first transition) as a region with shape [1].
 ///

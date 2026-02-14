@@ -45,6 +45,9 @@ private func emitRegion(
     }
 
     for nodeId in region.tensorNodes {
+      if ctx.skippedTensorComputeNodes.contains(nodeId) {
+        continue
+      }
       ctx.tensorIndices[nodeId] = elemVar
       if let node = g.nodes[nodeId] {
         for uop in try node.op.emit(ctx: ctx, g: g, nodeId: nodeId) {
@@ -87,6 +90,7 @@ public func emitScalarBlockWithShapeTransitions(
   // Reset per-block fusion metadata for sumAxis inline-product optimization.
   // detectFusableReduces repopulates this map for the current block only.
   ctx.inlineableReduceInputs = [:]
+  ctx.skippedTensorComputeNodes = []
 
   // Analysis: compute outbound cells and detect fusable reduces
   let blockOutbound = findOutboundTensorCells(blocks, g, block: block)
@@ -95,6 +99,7 @@ public func emitScalarBlockWithShapeTransitions(
   let skipRegions = detectFusableReduces(
     block: block, g: g, transitions: transitions,
     blockOutbound: blockOutbound, outbound: &outbound, ctx: ctx)
+  detectInlineableMulReduceNodes(block: block, g: g, ctx: ctx)
   ctx.outboundTensorCells = outbound
   ctx.clearTensorRegisters()
 

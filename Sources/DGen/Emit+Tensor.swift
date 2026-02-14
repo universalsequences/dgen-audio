@@ -150,42 +150,41 @@ extension LazyOp {
         outStrides[i] = outStrides[i + 1] * outShape[i + 1]
       }
 
+      // outIdx is invariant across reduction iterations: decode once.
+      var outIndices = [Expr]()
+      var remaining = b.cast(outIdx, to: .int)
+      for i in 0..<outShape.count {
+        let stride = b.intConstant(outStrides[i])
+        let idx = remaining / stride
+        outIndices.append(idx)
+        remaining = remaining - idx * stride
+      }
+
+      // Build the non-reduction input indices once and precompute their flat contribution.
+      var inStaticIndices = [Expr](repeating: b.intConstant(0), count: inShape.count)
+      var outDim = 0
+      for i in 0..<inShape.count {
+        if i == axis { continue }
+        inStaticIndices[i] = outIndices[outDim]
+        outDim += 1
+      }
+      let axisStride = b.intConstant(inStrides[axis])
+      var inBaseFlatIdx: Expr = b.intConstant(0)
+      for i in 0..<inShape.count where i != axis {
+        inBaseFlatIdx = inBaseFlatIdx + inStaticIndices[i] * b.intConstant(inStrides[i])
+      }
+
       b.loop(inShape[axis]) { reduceIdx in
         let rIdx = reduceIdx
-
-        // Convert flat outIdx to multi-dimensional output indices
-        var outIndices = [Expr]()
-        var remaining = b.cast(outIdx, to: .int)
-        for i in 0..<outShape.count {
-          let stride = b.intConstant(outStrides[i])
-          let idx = remaining / stride
-          outIndices.append(idx)
-          remaining = remaining - idx * stride
-        }
-
-        // Build input indices by inserting rIdx at the reduction axis
-        var inIndices = [Expr]()
-        var outDim = 0
-        for i in 0..<inShape.count {
-          if i == axis {
-            inIndices.append(rIdx)
-          } else {
-            inIndices.append(outIndices[outDim])
-            outDim += 1
-          }
-        }
-
-        // Compute flat input index from multi-dimensional indices
-        var inFlatIdx: Expr = b.intConstant(0)
-        for i in 0..<inShape.count {
-          inFlatIdx = inFlatIdx + inIndices[i] * b.intConstant(inStrides[i])
-        }
+        let inFlatIdx = inBaseFlatIdx + rIdx * axisStride
 
         // Read from input tensor — or compute inline if fused with expand
         let val: Expr
         // Fusion fast-path: if this input cell was produced by a skipped expand/mul region,
         // compute the product from its original source tensors inline while reducing.
         if let (aTensor, bTensor) = ctx.inlineableReduceInputs[inTensor.cellId] {
+          var inIndices = inStaticIndices
+          inIndices[axis] = rIdx
           // Fused path: compute A * B inline instead of reading from memory.
           // The mul's input tensors have view transforms (reshape, expand) that
           // handle broadcasting — tensorRead walks the transform chain to map
@@ -198,26 +197,33 @@ extension LazyOp {
           let bVal = b.tensorRead(bTensor, indices: broadcastedB)
           val = aVal * bVal
         } else if inTensor.padding != nil {
+          var inIndices = inStaticIndices
+          inIndices[axis] = rIdx
           // Padded tensor: must use tensorRead for padding bounds checking
           val = b.tensorRead(inTensor, indices: inIndices)
         } else if inIsFrameAware {
           // Non-padded frame-aware tensor: use direct frame-aware read
           val = b.frameAwareTensorRead(
             cellId: inTensor.cellId, tensorSize: inTensorSize, elemIdx: inFlatIdx)
+        } else if inTensor.transforms.isEmpty {
+          // Contiguous non-frame-aware tensor: direct linear read.
+          val = b.memoryRead(inTensor.cellId, inFlatIdx)
         } else {
+          var inIndices = inStaticIndices
+          inIndices[axis] = rIdx
           // Non-padded, non-frame-aware: use tensorRead
           val = b.tensorRead(inTensor, indices: inIndices)
         }
 
         sumAcc.accumulate(val)
+      }
 
-        // Write with frame-aware addressing if needed
-        if outIsFrameAware {
-          _ = b.frameAwareTensorWrite(
-            cellId: outCell, tensorSize: outTensorSize, elemIdx: outIdx, value: sumAcc.value)
-        } else {
-          _ = b.memoryWrite(outCell, b.cast(outIdx, to: .int), sumAcc.value)
-        }
+      // Write final sum once after the reduction loop.
+      if outIsFrameAware {
+        _ = b.frameAwareTensorWrite(
+          cellId: outCell, tensorSize: outTensorSize, elemIdx: outIdx, value: sumAcc.value)
+      } else {
+        _ = b.memoryWrite(outCell, b.cast(outIdx, to: .int), sumAcc.value)
       }
 
     case .maxAxis(let axis):

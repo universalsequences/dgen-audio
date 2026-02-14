@@ -65,6 +65,10 @@ public class IRContext {
   /// instead of loading a separately materialized intermediate tensor from memory.
   public var inlineableReduceInputs: [CellID: (Tensor, Tensor)] = [:]
 
+  /// Tensor compute nodes that should not emit code because their work is inlined
+  /// into downstream reductions.
+  public var skippedTensorComputeNodes: Set<NodeID> = []
+
   /// Check if a node is part of a frame-dependent tensor chain
   public func isPartOfFrameTensorChain(_ nodeId: NodeID) -> Bool {
     return frameTensorChainNodes.contains(nodeId)
