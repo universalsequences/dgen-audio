@@ -45,6 +45,20 @@ struct TrainerOptions {
 }
 
 enum DDSPE2ETrainer {
+  private struct GradientStats {
+    var paramCount: Int = 0
+    var paramsWithGrad: Int = 0
+    var totalCount: Int = 0
+    var finiteCount: Int = 0
+    var nonZeroCount: Int = 0
+    var sumSquares: Double = 0
+    var maxAbs: Float = 0
+
+    var l2Norm: Float {
+      Float(Foundation.sqrt(sumSquares))
+    }
+  }
+
   static func run(
     dataset: CachedDataset,
     config: DDSPE2EConfig,
@@ -206,17 +220,29 @@ enum DDSPE2ETrainer {
     var minLoss = Float.greatestFiniteMagnitude
     var minStep = 0
     var validUpdates = 0
+    var totalStepMs: Double = 0
+    var totalLoadMs: Double = 0
+    var totalGraphMs: Double = 0
+    var totalBackwardMs: Double = 0
+    var totalOptMs: Double = 0
+    var maxStepMs: Double = 0
+    var maxStep = 0
+    var emaStepMs: Double = 0
+    let emaAlpha: Double = 0.1
 
     var logLines = [String]()
-    logLines.append("step,loss,chunk_id")
+    logLines.append("step,loss,chunk_id,step_ms,load_ms,graph_ms,backward_ms,opt_ms")
 
     for step in 0..<steps {
+      let tStepStart = CFAbsoluteTimeGetCurrent()
+
       if step > 0, step % order.count == 0, config.shuffleChunks {
         order.shuffle(using: &rng)
       }
 
       let entry = splitEntries[order[step % order.count]]
       let chunk = try dataset.loadChunk(entry)
+      let tAfterLoad = CFAbsoluteTimeGetCurrent()
       let frameCount = chunk.audio.count
 
       // Conditioning features [F, 3] -> (f0Norm, loudNorm, uv)
@@ -251,14 +277,34 @@ enum DDSPE2ETrainer {
         mseWeight: config.mseLossWeight,
         spectralWeight: spectralWeight
       )
+      let tAfterGraph = CFAbsoluteTimeGetCurrent()
 
       let lossValues = try loss.backward(frames: frameCount)
+      let tAfterBackward = CFAbsoluteTimeGetCurrent()
       let stepLoss = lossValues.reduce(0, +) / Float(max(1, lossValues.count))
 
-      logLines.append("\(step),\(stepLoss),\(entry.id)")
+      let shouldLog = step == 0 || step == steps - 1 || step % config.logEvery == 0
+      let loadMs = (tAfterLoad - tStepStart) * 1000.0
+      let graphMs = (tAfterGraph - tAfterLoad) * 1000.0
+      let backwardMs = (tAfterBackward - tAfterGraph) * 1000.0
 
       if !stepLoss.isFinite || stepLoss > 1e6 {
-        logger("step=\(step) unstable loss=\(stepLoss); skipping update")
+        let stepMs = (CFAbsoluteTimeGetCurrent() - tStepStart) * 1000.0
+        totalStepMs += stepMs
+        totalLoadMs += loadMs
+        totalGraphMs += graphMs
+        totalBackwardMs += backwardMs
+        if stepMs > maxStepMs {
+          maxStepMs = stepMs
+          maxStep = step
+        }
+        emaStepMs = step == 0 ? stepMs : (emaStepMs * (1.0 - emaAlpha) + stepMs * emaAlpha)
+        logLines.append("\(step),\(stepLoss),\(entry.id),\(stepMs),\(loadMs),\(graphMs),\(backwardMs),0")
+        logger(
+          "step=\(step) unstable loss=\(stepLoss); skipping update "
+            + "tStepMs=\(format(Double(stepMs))) tLoadMs=\(format(Double(loadMs))) "
+            + "tGraphMs=\(format(Double(graphMs))) tBackwardMs=\(format(Double(backwardMs)))"
+        )
         continue
       }
 
@@ -269,14 +315,46 @@ enum DDSPE2ETrainer {
         minStep = step
       }
 
+      let tOptStart = CFAbsoluteTimeGetCurrent()
+      let preClipGradStats = shouldLog ? summarizeGradients(params: model.parameters) : nil
       sanitizeAndClipGradients(params: model.parameters, clip: config.gradClip)
+      let postClipGradStats = shouldLog ? summarizeGradients(params: model.parameters) : nil
       optimizer.step()
       optimizer.zeroGrad()
+      let tAfterOpt = CFAbsoluteTimeGetCurrent()
+      let optMs = (tAfterOpt - tOptStart) * 1000.0
+      let stepMs = (tAfterOpt - tStepStart) * 1000.0
+      totalStepMs += stepMs
+      totalLoadMs += loadMs
+      totalGraphMs += graphMs
+      totalBackwardMs += backwardMs
+      totalOptMs += optMs
+      if stepMs > maxStepMs {
+        maxStepMs = stepMs
+        maxStep = step
+      }
+      emaStepMs = step == 0 ? stepMs : (emaStepMs * (1.0 - emaAlpha) + stepMs * emaAlpha)
+      logLines.append("\(step),\(stepLoss),\(entry.id),\(stepMs),\(loadMs),\(graphMs),\(backwardMs),\(optMs)")
       validUpdates += 1
 
-      if step == 0 || step == steps - 1 || step % config.logEvery == 0 {
+      if shouldLog {
+        let gradInfo: String
+        if let pre = preClipGradStats, let post = postClipGradStats {
+          gradInfo =
+            " gL2=\(format(pre.l2Norm)) gMax=\(format(pre.maxAbs)) "
+            + "gNZ=\(pre.nonZeroCount)/\(pre.finiteCount) "
+            + "gFinite=\(pre.finiteCount)/\(pre.totalCount) "
+            + "gParams=\(pre.paramsWithGrad)/\(pre.paramCount) "
+            + "gMaxPostClip=\(format(post.maxAbs))"
+        } else {
+          gradInfo = ""
+        }
         logger(
-          "step=\(step) loss=\(format(stepLoss)) specW=\(format(spectralWeight)) chunk=\(entry.id)")
+          "step=\(step) loss=\(format(stepLoss)) specW=\(format(spectralWeight)) "
+            + "chunk=\(entry.id)\(gradInfo) "
+            + "tStepMs=\(format(Double(stepMs))) tEMAms=\(format(Double(emaStepMs))) "
+            + "tLoadMs=\(format(Double(loadMs))) tGraphMs=\(format(Double(graphMs))) "
+            + "tBackwardMs=\(format(Double(backwardMs))) tOptMs=\(format(Double(optMs)))")
       }
 
       if step > 0, step % config.checkpointEvery == 0 {
@@ -293,6 +371,7 @@ enum DDSPE2ETrainer {
     }
 
     let first = firstLoss ?? lastFiniteLoss
+    let denomSteps = Double(max(1, steps))
     let summary: [String: String] = [
       "steps": "\(steps)",
       "validUpdates": "\(validUpdates)",
@@ -301,6 +380,13 @@ enum DDSPE2ETrainer {
       "minLoss": "\(minLoss)",
       "minStep": "\(minStep)",
       "reduction": "\(first / max(lastFiniteLoss, 1e-12))",
+      "avgStepMs": "\(totalStepMs / denomSteps)",
+      "avgLoadMs": "\(totalLoadMs / denomSteps)",
+      "avgGraphMs": "\(totalGraphMs / denomSteps)",
+      "avgBackwardMs": "\(totalBackwardMs / denomSteps)",
+      "avgOptMs": "\(totalOptMs / denomSteps)",
+      "maxStepMs": "\(maxStepMs)",
+      "maxStep": "\(maxStep)",
     ]
 
     try CheckpointStore.writeModelState(
@@ -315,7 +401,9 @@ enum DDSPE2ETrainer {
 
     logger("M2 training complete")
     logger(
-      "firstLoss=\(format(first)) finalLoss=\(format(lastFiniteLoss)) reduction=\(format(first / max(lastFiniteLoss, 1e-12))) validUpdates=\(validUpdates)"
+      "firstLoss=\(format(first)) finalLoss=\(format(lastFiniteLoss)) reduction=\(format(first / max(lastFiniteLoss, 1e-12))) "
+        + "validUpdates=\(validUpdates) avgStepMs=\(format(totalStepMs / denomSteps)) "
+        + "avgBackwardMs=\(format(totalBackwardMs / denomSteps)) maxStepMs=\(format(maxStepMs))@\(maxStep)"
     )
   }
 
@@ -343,6 +431,47 @@ enum DDSPE2ETrainer {
         gradSignal.updateDataLazily(cleaned)
       }
     }
+  }
+
+  private static func summarizeGradients(params: [any LazyValue]) -> GradientStats {
+    var stats = GradientStats()
+    stats.paramCount = params.count
+
+    for param in params {
+      if let tensor = param as? Tensor, let gradTensor = tensor.grad, let gradData = gradTensor.getData() {
+        stats.paramsWithGrad += 1
+        for g in gradData {
+          stats.totalCount += 1
+          if g.isFinite {
+            stats.finiteCount += 1
+            let absG = Swift.abs(g)
+            if absG > 0 {
+              stats.nonZeroCount += 1
+            }
+            if absG > stats.maxAbs {
+              stats.maxAbs = absG
+            }
+            stats.sumSquares += Double(g) * Double(g)
+          }
+        }
+      } else if let signal = param as? Signal, let gradSignal = signal.grad, let g = gradSignal.data {
+        stats.paramsWithGrad += 1
+        stats.totalCount += 1
+        if g.isFinite {
+          stats.finiteCount += 1
+          let absG = Swift.abs(g)
+          if absG > 0 {
+            stats.nonZeroCount += 1
+          }
+          if absG > stats.maxAbs {
+            stats.maxAbs = absG
+          }
+          stats.sumSquares += Double(g) * Double(g)
+        }
+      }
+    }
+
+    return stats
   }
 
   private static func spectralWeightForStep(
@@ -392,5 +521,9 @@ enum DDSPE2ETrainer {
 
   private static func format(_ value: Float) -> String {
     String(format: "%.6f", value)
+  }
+
+  private static func format(_ value: Double) -> String {
+    String(format: "%.3f", value)
   }
 }

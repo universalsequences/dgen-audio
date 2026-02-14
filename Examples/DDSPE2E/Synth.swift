@@ -30,18 +30,12 @@ enum DDSPSynth {
     let uv = uvTensor.peek(playhead).clip(0.0, 1.0)
 
     let twoPi = Float.pi * 2.0
-    var harmonic = Signal.constant(0.0)
-
-    for h in 0..<numHarmonics {
-      let amp = controls.harmonicAmps.peek(
-        playhead,
-        channel: Signal.constant(Float(h))
-      )
-      let harmonicIndex = Float(h + 1)
-      let freq = max(f0 * harmonicIndex, 20.0)
-      let osc = sin(Signal.phasor(freq) * twoPi)
-      harmonic = harmonic + osc * amp * uv
-    }
+    let harmonicIndices = Tensor((0..<numHarmonics).map { Float($0 + 1) })
+    let ampsAtTime = controls.harmonicAmps.peekRow(playhead)
+    let harmonicFreqs = harmonicIndices * f0
+    let harmonicPhases = Signal.statefulPhasor(harmonicFreqs)
+    let harmonicSines = sin(harmonicPhases * twoPi)
+    let harmonic = (harmonicSines * ampsAtTime).sum() * uv
 
     let harmonicGain = controls.harmonicGain.peek(playhead, channel: Signal.constant(0.0))
     let harmonicOut = harmonic * harmonicGain * (1.0 / Float(max(1, numHarmonics)))

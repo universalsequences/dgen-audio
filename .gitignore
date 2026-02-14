@@ -25,3 +25,5 @@ TINYGRAD_KERNEL_STATS.txt
 /.ddsp_cache_tinysol_mini2
 /.ddsp_cache_tinysol_mixcheck
 /.ddsp_runs_tinysol
+runs
+testtrain.sh
