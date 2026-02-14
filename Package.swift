@@ -44,7 +44,7 @@ let package = Package(
         ),
         .testTarget(
             name: "DGenLazyTests",
-            dependencies: ["DGenLazy", "DGen"],
+            dependencies: ["DGenLazy", "DGen", "DDSPE2E"],
             path: "Tests/DGenLazyTests"
         ),
     ]

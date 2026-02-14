@@ -27,6 +27,8 @@ public class MetalRenderer: Renderer, UOpEmitter {
     totalMemorySlots: Int,
     name: String = "kernel"
   ) -> [CompiledKernel] {
+    repairCrossKernelVarDependencies(scheduleItems, ctx: ctx)
+
     staticGlobalVars.removeAll()
     for item in scheduleItems {
       guard item.temporality == .static_ else { continue }
@@ -39,7 +41,7 @@ public class MetalRenderer: Renderer, UOpEmitter {
 
     let expanded = scheduleItems.flatMap { item in
       if item.parallelPolicy == .threadParallel {
-        return splitStaticParallelRanges(item)
+        return splitStaticParallelRanges(item, ctx: ctx)
       }
       return [SplitScheduleItem(item: item, threadCount: nil)]
     }
@@ -119,12 +121,105 @@ public class MetalRenderer: Renderer, UOpEmitter {
     }
   }
 
+  private func repairCrossKernelVarDependencies(_ scheduleItems: [ScheduleItem], ctx: IRContext) {
+    guard scheduleItems.count > 1 else { return }
+
+    let excluded: Set<VarID> = [-1]  // -1 is frameCount sentinel
+    let existingGlobals = Set(ctx.globals)
+
+    let defsByKernel = scheduleItems.map { variableIdsDefined(in: $0.ops).subtracting(excluded) }
+    let usesByKernel = scheduleItems.map { variableIdsUsed(in: $0.ops).subtracting(excluded) }
+
+    var producerToVars: [Int: Set<VarID>] = [:]
+    var consumerToVars: [Int: Set<VarID>] = [:]
+    var newlyPromoted = Set<VarID>()
+
+    for consumerIdx in scheduleItems.indices {
+      let unresolved = usesByKernel[consumerIdx]
+        .subtracting(defsByKernel[consumerIdx])
+        .subtracting(existingGlobals)
+      guard !unresolved.isEmpty else { continue }
+
+      for varId in unresolved {
+        var producerIdx: Int? = nil
+        var scan = consumerIdx - 1
+        while scan >= 0 {
+          if defsByKernel[scan].contains(varId) {
+            producerIdx = scan
+            break
+          }
+          scan -= 1
+        }
+        guard let producerIdx else { continue }
+
+        producerToVars[producerIdx, default: []].insert(varId)
+        consumerToVars[consumerIdx, default: []].insert(varId)
+        newlyPromoted.insert(varId)
+      }
+    }
+
+    guard !newlyPromoted.isEmpty else { return }
+    for varId in newlyPromoted where !ctx.globals.contains(varId) {
+      ctx.globals.append(varId)
+    }
+
+    for (kernelIdx, vars) in producerToVars {
+      for varId in vars {
+        insertDefineGlobalIfMissing(varId, in: scheduleItems[kernelIdx])
+      }
+    }
+    for (kernelIdx, vars) in consumerToVars {
+      for varId in vars {
+        insertLoadGlobalIfMissing(varId, in: scheduleItems[kernelIdx])
+      }
+    }
+  }
+
+  private func insertDefineGlobalIfMissing(_ varId: VarID, in scheduleItem: ScheduleItem) {
+    let hasDefine = scheduleItem.ops.contains {
+      if case .defineGlobal(let existing) = $0.op { return existing == varId }
+      return false
+    }
+    guard !hasDefine else { return }
+
+    var define = UOp(op: .defineGlobal(varId), value: .global(varId))
+    define.kind = scheduleItem.kind
+    scheduleItem.ops.insert(define, at: globalPrologueInsertionIndex(in: scheduleItem))
+  }
+
+  private func insertLoadGlobalIfMissing(_ varId: VarID, in scheduleItem: ScheduleItem) {
+    let hasLoad = scheduleItem.ops.contains {
+      if case .loadGlobal(let existing) = $0.op { return existing == varId }
+      return false
+    }
+    guard !hasLoad else { return }
+
+    var load = UOp(op: .loadGlobal(varId), value: .variable(varId, nil))
+    load.kind = scheduleItem.kind
+    scheduleItem.ops.insert(load, at: globalPrologueInsertionIndex(in: scheduleItem))
+  }
+
+  private func globalPrologueInsertionIndex(in scheduleItem: ScheduleItem) -> Int {
+    var index = 0
+    while index < scheduleItem.ops.count {
+      switch scheduleItem.ops[index].op {
+      case .frameCount, .defineGlobal, .loadGlobal:
+        index += 1
+      default:
+        return index
+      }
+    }
+    return index
+  }
+
   private struct SplitScheduleItem {
     let item: ScheduleItem
     let threadCount: Int?
   }
 
-  private func splitStaticParallelRanges(_ scheduleItem: ScheduleItem) -> [SplitScheduleItem] {
+  private func splitStaticParallelRanges(_ scheduleItem: ScheduleItem, ctx: IRContext)
+    -> [SplitScheduleItem]
+  {
     guard scheduleItem.temporality == .static_, scheduleItem.kind == .scalar else {
       return [SplitScheduleItem(item: scheduleItem, threadCount: nil)]
     }
@@ -197,6 +292,15 @@ public class MetalRenderer: Renderer, UOpEmitter {
       return [SplitScheduleItem(item: scheduleItem, threadCount: nil)]
     }
 
+    // Safety guard: do not split if a later segment reads a non-global temp
+    // that was defined in an earlier segment. Splitting would move the use into
+    // a separate kernel where that local variable is out of scope.
+    if hasCrossSegmentLocalVariableDependency(
+      prefixOps: prefixOps, segments: segments, globalVarIds: Set(ctx.globals))
+    {
+      return [SplitScheduleItem(item: scheduleItem, threadCount: nil)]
+    }
+
     let beginRangeOp = ops[beginRangeIdx]
     let endRangeOp = ops[endRangeIdx]
 
@@ -221,6 +325,93 @@ public class MetalRenderer: Renderer, UOpEmitter {
     return splitItems.isEmpty
       ? [SplitScheduleItem(item: scheduleItem, threadCount: nil)]
       : splitItems
+  }
+
+  private func variableIdsDefined(in ops: [UOp]) -> Set<VarID> {
+    var defs = Set<VarID>()
+    for op in ops {
+      if case .variable(let varId, _) = op.value {
+        defs.insert(varId)
+      }
+    }
+    return defs
+  }
+
+  private func variableIdsUsed(in lazy: Lazy) -> Set<VarID> {
+    if case .variable(let varId, _) = lazy { return [varId] }
+    return []
+  }
+
+  private func variableIdsUsed(in op: Op) -> Set<VarID> {
+    switch op {
+    case .store(_, let a), .delay1(_, let a), .abs(let a), .sign(let a), .sin(let a), .cos(let a),
+      .tan(let a), .tanh(let a), .exp(let a), .log(let a), .log10(let a), .sqrt(let a),
+      .floor(let a), .ceil(let a), .round(let a), .beginIf(let a), .beginReverseLoop(let a),
+      .beginHopCheck(let a), .setFrameIndex(let a), .identity(let a), .declareVar(let a),
+      .cast(let a, _), .loadTape(let a, _), .output(_, let a):
+      return variableIdsUsed(in: a)
+
+    case .mutate(let a, let b), .add(let a, let b), .sub(let a, let b), .mul(let a, let b),
+      .div(let a, let b), .pow(let a, let b), .atan2(let a, let b), .mod(let a, let b),
+      .gt(let a, let b), .gte(let a, let b), .lte(let a, let b), .lt(let a, let b),
+      .eq(let a, let b), .min(let a, let b), .max(let a, let b), .and(let a, let b),
+      .or(let a, let b), .xor(let a, let b), .beginRange(let a, let b), .beginForLoop(let a, let b):
+      return variableIdsUsed(in: a).union(variableIdsUsed(in: b))
+
+    case .memoryRead(_, let a), .beginLoop(let a, _):
+      return variableIdsUsed(in: a)
+
+    case .memoryWrite(_, let a, let b), .memoryAccumulate(_, let a, let b):
+      return variableIdsUsed(in: a).union(variableIdsUsed(in: b))
+
+    case .latch(let a, let b):
+      return variableIdsUsed(in: a).union(variableIdsUsed(in: b))
+
+    case .gswitch(let c, let a, let b):
+      return variableIdsUsed(in: c).union(variableIdsUsed(in: a)).union(variableIdsUsed(in: b))
+
+    case .selector(let m, let opts):
+      return opts.reduce(variableIdsUsed(in: m)) { acc, lazy in
+        acc.union(variableIdsUsed(in: lazy))
+      }
+
+    case .mse(let a, let b):
+      return variableIdsUsed(in: a).union(variableIdsUsed(in: b))
+
+    default:
+      return []
+    }
+  }
+
+  private func variableIdsUsed(in ops: [UOp]) -> Set<VarID> {
+    ops.reduce(into: Set<VarID>()) { acc, uop in
+      acc.formUnion(variableIdsUsed(in: uop.op))
+      if let tensorIndex = uop.tensorIndex {
+        acc.formUnion(variableIdsUsed(in: tensorIndex))
+      }
+    }
+  }
+
+  private func hasCrossSegmentLocalVariableDependency(
+    prefixOps: [UOp],
+    segments: [(ops: [UOp], parallelCount: Int?)],
+    globalVarIds: Set<VarID>
+  ) -> Bool {
+    let excluded: Set<VarID> = globalVarIds.union([-1])  // -1 is frameCount sentinel
+    let prefixDefs = variableIdsDefined(in: prefixOps)
+    var priorSegmentDefs = Set<VarID>()
+
+    for segment in segments {
+      let uses = variableIdsUsed(in: segment.ops).subtracting(excluded)
+      if !uses.intersection(priorSegmentDefs).isEmpty {
+        return true
+      }
+
+      let defs = variableIdsDefined(in: segment.ops).subtracting(excluded).subtracting(prefixDefs)
+      priorSegmentDefs.formUnion(defs)
+    }
+
+    return false
   }
 
   private func isNoOpStaticKernel(_ scheduleItem: ScheduleItem, ctx: IRContext) -> Bool {

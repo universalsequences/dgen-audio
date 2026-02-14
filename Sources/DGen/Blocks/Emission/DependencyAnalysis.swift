@@ -40,6 +40,13 @@ func findNodesWithOutboundDependencies(_ blks: [Block], _ g: Graph, block: Block
         guard let producerIdx = nodeBlock[dep], producerIdx == thisIdx else { continue }
         if let depNode = g.nodes[dep], case .seq = depNode.op {
           if let lastInput = depNode.inputs.last { needed.insert(lastInput) }
+          // Preserve seq temporal deps (e.g., buffer write-position dependencies)
+          // so cross-kernel global wiring can carry them across block boundaries.
+          for temporalDep in depNode.temporalDependencies {
+            if let temporalProducer = nodeBlock[temporalDep], temporalProducer == thisIdx {
+              needed.insert(temporalDep)
+            }
+          }
         } else {
           needed.insert(dep)
         }
@@ -64,7 +71,20 @@ func findNodesAsInboundDependencies(_ blks: [Block], _ g: Graph, block: Block) -
   for nodeId in block.nodes {
     guard let node = g.nodes[nodeId] else { continue }
     for dep in node.allDependencies {
-      if let producerIdx = nodeBlock[dep], producerIdx != thisIdx {
+      guard let producerIdx = nodeBlock[dep], producerIdx != thisIdx else { continue }
+      if let depNode = g.nodes[dep], case .seq = depNode.op {
+        if let lastInput = depNode.inputs.last,
+          let lastInputProducer = nodeBlock[lastInput],
+          lastInputProducer != thisIdx
+        {
+          needed.insert(lastInput)
+        }
+        for temporalDep in depNode.temporalDependencies {
+          if let temporalProducer = nodeBlock[temporalDep], temporalProducer != thisIdx {
+            needed.insert(temporalDep)
+          }
+        }
+      } else {
         needed.insert(dep)
       }
     }

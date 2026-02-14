@@ -202,6 +202,8 @@ struct DDSPE2EMain {
       --shuffle <true|false>
       --model-hidden <int>
       --harmonics <int>
+      --static-fir-noise <true|false>
+      --noise-fir-size <int>
       --lr <float>
       --grad-clip <float>
       --spectral-windows <csv-int-list>

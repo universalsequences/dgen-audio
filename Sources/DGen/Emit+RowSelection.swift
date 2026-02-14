@@ -290,7 +290,6 @@ extension LazyOp {
     case .peekRowGradReduce(
       let floorGradCell, let ceilGradCell, let rowIdxCell, _,
       let gradCell, let numRows, let numCols, let maxFrameCount):
-      // Sum gradient contributions from all frames for each tensor position (floor and ceil).
       // Input: [gradWritePass] (dependency ordering only)
       guard node.inputs.count == 1 else {
         throw DGenError.insufficientInputs(
@@ -304,40 +303,77 @@ extension LazyOp {
       let zero = b.constant(0.0)
       let maxFrameCountFloat = b.constant(Float(maxFrameCount))
       let frameCount = b.frameCount()
-      let totalElems = numRows * numCols
-      b.parallelRange(totalElems) { flatIdx in
-        let rowIdx = flatIdx / numColsInt
-        let colIdx = flatIdx - rowIdx * numColsInt
-        let rowFloat = b.cast(rowIdx, to: .float)
-        let colFloat = b.cast(colIdx, to: .float)
-        let gradSum = b.float(0.0)
-
-        b.loop(maxFrameCount) { frameIdx in
+      if DGenGradientConfig.useFastPeekRowGradReduce {
+        // Fast scatter-add path:
+        // parallelize over (frame, col), then atomically add to floor/ceil row bins.
+        let maxRow = b.constant(Float(Swift.max(0, numRows - 1)))
+        let totalElems = maxFrameCount * numCols
+        b.parallelRange(totalElems) { flatIdx in
+          let frameIdx = flatIdx / numColsInt
+          let colIdx = flatIdx - frameIdx * numColsInt
           let frameFloat = b.cast(frameIdx, to: .float)
+          let colFloat = b.cast(colIdx, to: .float)
           let inBounds = frameFloat < frameCount
           let readPos = frameFloat * numColsFloat + colFloat
 
-          // Floor row contribution
-          let floorRow = b.memoryRead(rowIdxCell, b.cast(frameIdx, to: .int))
-          let isFloorMatch = b.abs(floorRow - rowFloat) < b.constant(0.5)
+          // Floor contribution.
+          let floorRowRaw = b.memoryRead(rowIdxCell, b.cast(frameIdx, to: .int))
+          // Match legacy "< 0.5" row compare semantics by rounding to nearest row.
+          let floorRowRounded = b.floor(floorRowRaw + b.constant(0.5))
+          let floorRow = b.min(b.max(floorRowRounded, zero), maxRow)
           let floorGrad = b.memoryRead(floorGradCell, b.cast(readPos, to: .int))
-          let floorValid = inBounds * isFloorMatch
-          let floorContrib = b.gswitch(floorValid > zero, floorGrad, zero)
-          gradSum.accumulate(floorContrib)
+          let floorContrib = b.gswitch(inBounds > zero, floorGrad, zero)
+          let floorDest = floorRow * numColsFloat + colFloat
+          _ = b.memoryAccumulate(gradCell, b.cast(floorDest, to: .int), floorContrib)
 
-          // Ceil row contribution (index stored at frame + maxFrameCount)
+          // Ceil contribution (index stored at frame + maxFrameCount).
           let ceilSlot = frameFloat + maxFrameCountFloat
-          let ceilRow = b.memoryRead(rowIdxCell, b.cast(ceilSlot, to: .int))
-          let isCeilMatch = b.abs(ceilRow - rowFloat) < b.constant(0.5)
+          let ceilRowRaw = b.memoryRead(rowIdxCell, b.cast(ceilSlot, to: .int))
+          let ceilRowRounded = b.floor(ceilRowRaw + b.constant(0.5))
+          let ceilRow = b.min(b.max(ceilRowRounded, zero), maxRow)
           let ceilGrad = b.memoryRead(ceilGradCell, b.cast(readPos, to: .int))
-          let ceilValid = inBounds * isCeilMatch
-          let ceilContrib = b.gswitch(ceilValid > zero, ceilGrad, zero)
-          gradSum.accumulate(ceilContrib)
+          let ceilContrib = b.gswitch(inBounds > zero, ceilGrad, zero)
+          let ceilDest = ceilRow * numColsFloat + colFloat
+          _ = b.memoryAccumulate(gradCell, b.cast(ceilDest, to: .int), ceilContrib)
         }
+      } else {
+        // Legacy row-bin scan path:
+        // for each (row,col), scan all frames and sum matching floor/ceil contributions.
+        let totalElems = numRows * numCols
+        b.parallelRange(totalElems) { flatIdx in
+          let rowIdx = flatIdx / numColsInt
+          let colIdx = flatIdx - rowIdx * numColsInt
+          let rowFloat = b.cast(rowIdx, to: .float)
+          let colFloat = b.cast(colIdx, to: .float)
+          let gradSum = b.float(0.0)
 
-        // Row-major layout to match tensorRead: offset = row * numCols + col
-        let destPos = rowFloat * numColsFloat + colFloat
-        _ = b.memoryAccumulate(gradCell, b.cast(destPos, to: .int), gradSum.value)
+          b.loop(maxFrameCount) { frameIdx in
+            let frameFloat = b.cast(frameIdx, to: .float)
+            let inBounds = frameFloat < frameCount
+            let readPos = frameFloat * numColsFloat + colFloat
+
+            // Floor row contribution
+            let floorRow = b.memoryRead(rowIdxCell, b.cast(frameIdx, to: .int))
+            let isFloorMatch = b.abs(floorRow - rowFloat) < b.constant(0.5)
+            let floorGrad = b.memoryRead(floorGradCell, b.cast(readPos, to: .int))
+            let floorValid = inBounds * isFloorMatch
+            let floorContrib = b.gswitch(floorValid > zero, floorGrad, zero)
+            gradSum.accumulate(floorContrib)
+
+            // Ceil row contribution (index stored at frame + maxFrameCount)
+            let ceilSlot = frameFloat + maxFrameCountFloat
+            let ceilRow = b.memoryRead(rowIdxCell, b.cast(ceilSlot, to: .int))
+            let isCeilMatch = b.abs(ceilRow - rowFloat) < b.constant(0.5)
+            let ceilGrad = b.memoryRead(ceilGradCell, b.cast(readPos, to: .int))
+            let ceilValid = inBounds * isCeilMatch
+            let ceilContrib = b.gswitch(ceilValid > zero, ceilGrad, zero)
+            gradSum.accumulate(ceilContrib)
+          }
+
+          // Row-major layout to match tensorRead: offset = row * numCols + col
+          let destPos = rowFloat * numColsFloat + colFloat
+          _ = b.memoryAccumulate(gradCell, b.cast(destPos, to: .int), gradSum.value)
+        }
       }
 
       b.use(val: zero)

@@ -25,6 +25,8 @@ struct DDSPE2EConfig: Codable {
   // M2 decoder-only model/training parameters
   var modelHiddenSize: Int = 32
   var numHarmonics: Int = 16
+  var enableStaticFIRNoise: Bool = false
+  var noiseFIRKernelSize: Int = 15
   var learningRate: Float = 0.001
   var gradClip: Float = 1.0
   var spectralWindowSizes: [Int] = []
@@ -56,6 +58,8 @@ struct DDSPE2EConfig: Codable {
     case maxChunksPerFile
     case modelHiddenSize
     case numHarmonics
+    case enableStaticFIRNoise
+    case noiseFIRKernelSize
     case learningRate
     case gradClip
     case spectralWindowSizes
@@ -91,6 +95,10 @@ struct DDSPE2EConfig: Codable {
     maxChunksPerFile = try c.decodeIfPresent(Int.self, forKey: .maxChunksPerFile)
     modelHiddenSize = try c.decodeIfPresent(Int.self, forKey: .modelHiddenSize) ?? d.modelHiddenSize
     numHarmonics = try c.decodeIfPresent(Int.self, forKey: .numHarmonics) ?? d.numHarmonics
+    enableStaticFIRNoise =
+      try c.decodeIfPresent(Bool.self, forKey: .enableStaticFIRNoise) ?? d.enableStaticFIRNoise
+    noiseFIRKernelSize =
+      try c.decodeIfPresent(Int.self, forKey: .noiseFIRKernelSize) ?? d.noiseFIRKernelSize
     learningRate = try c.decodeIfPresent(Float.self, forKey: .learningRate) ?? d.learningRate
     gradClip = try c.decodeIfPresent(Float.self, forKey: .gradClip) ?? d.gradClip
     spectralWindowSizes = try c.decodeIfPresent([Int].self, forKey: .spectralWindowSizes) ?? d.spectralWindowSizes
@@ -129,6 +137,12 @@ struct DDSPE2EConfig: Codable {
     }
     if let value = options["harmonics"] {
       numHarmonics = try parseInt(value, key: "harmonics")
+    }
+    if let value = options["static-fir-noise"] {
+      enableStaticFIRNoise = parseBool(value)
+    }
+    if let value = options["noise-fir-size"] {
+      noiseFIRKernelSize = try parseInt(value, key: "noise-fir-size")
     }
     if let value = options["lr"] {
       learningRate = try parseFloat(value, key: "lr")
@@ -216,6 +230,9 @@ struct DDSPE2EConfig: Codable {
     }
     guard numHarmonics > 0 else {
       throw ConfigError.invalid("numHarmonics must be > 0")
+    }
+    guard noiseFIRKernelSize > 1 else {
+      throw ConfigError.invalid("noiseFIRKernelSize must be > 1")
     }
     guard learningRate > 0 else {
       throw ConfigError.invalid("learningRate must be > 0")

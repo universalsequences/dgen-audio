@@ -258,7 +258,9 @@ enum DDSPE2ETrainer {
         f0Frames: chunk.f0Hz,
         uvFrames: chunk.uvMask,
         frameCount: frameCount,
-        numHarmonics: config.numHarmonics
+        numHarmonics: config.numHarmonics,
+        enableStaticFIRNoise: config.enableStaticFIRNoise,
+        noiseFIRKernelSize: config.noiseFIRKernelSize
       )
 
       let target = Tensor(chunk.audio).toSignal(maxFrames: frameCount)

@@ -7,7 +7,9 @@ enum DDSPSynth {
     f0Frames: [Float],
     uvFrames: [Float],
     frameCount: Int,
-    numHarmonics: Int
+    numHarmonics: Int,
+    enableStaticFIRNoise: Bool,
+    noiseFIRKernelSize: Int
   ) -> Signal {
     let featureFrames = max(1, f0Frames.count)
     let featureMaxIndex = Float(max(0, featureFrames - 1))
@@ -40,9 +42,20 @@ enum DDSPSynth {
     let harmonicGain = controls.harmonicGain.peek(playhead, channel: Signal.constant(0.0))
     let harmonicOut = harmonic * harmonicGain * (1.0 / Float(max(1, numHarmonics)))
 
-    // Keep M2 baseline stable by using harmonic-only output first.
-    // Noise branch stays in the model for future milestones.
-    _ = controls.noiseGain.peek(playhead, channel: Signal.constant(0.0))
-    return harmonicOut
+    guard enableStaticFIRNoise else {
+      _ = controls.noiseGain.peek(playhead, channel: Signal.constant(0.0))
+      return harmonicOut
+    }
+
+    // Simple static FIR-filtered noise branch (non-frame-conditioned kernel).
+    let firSize = max(2, noiseFIRKernelSize)
+    let firTap = 1.0 / Float(firSize)
+    let firKernel = Tensor([Float](repeating: firTap, count: firSize)).reshape([1, firSize])
+
+    let noiseGain = controls.noiseGain.peek(playhead, channel: Signal.constant(0.0))
+    let noiseExcitation = Signal.noise()
+    let filteredNoise = noiseExcitation.buffer(size: firSize).conv2d(firKernel).sum()
+    let noiseOut = filteredNoise * noiseGain * (1.0 - uv)
+    return harmonicOut + noiseOut
   }
 }
