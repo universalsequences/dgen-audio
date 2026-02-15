@@ -1393,13 +1393,13 @@ final class GraphGradientTests: XCTestCase {
     print("\nKernels generated: \(result.kernels.count)")
     for (i, kernel) in result.kernels.enumerated() {
       print(
-        "  Kernel \(i): kind=\(kernel.kind) threadGroupSize=\(String(describing: kernel.threadGroupSize)) threadCount=\(String(describing: kernel.threadCount))"
+        "  Kernel \(i): frameOrder=\(kernel.frameOrder) threadGroupSize=\(String(describing: kernel.threadGroupSize)) threadCount=\(String(describing: kernel.threadCount))"
       )
     }
 
     // Write kernels for inspection
     let allKernels = result.kernels.enumerated().map {
-      "// KERNEL \($0.offset)\n// Kind: \($0.element.kind)\n// ThreadGroupSize: \($0.element.threadGroupSize ?? -1)\n\n\($0.element.source)"
+      "// KERNEL \($0.offset)\n// FrameOrder: \($0.element.frameOrder)\n// ThreadGroupSize: \($0.element.threadGroupSize ?? -1)\n\n\($0.element.source)"
     }.joined(separator: "\n\n// ========================================\n\n")
     try? allKernels.write(
       toFile: "/tmp/matmul_sum_debug.metal", atomically: true, encoding: .utf8)

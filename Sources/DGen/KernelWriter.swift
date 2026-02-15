@@ -5,7 +5,7 @@ public func writeKernelsToDisk(_ result: CompilationResult, _ filename: String) 
   let allKernels = result.kernels.enumerated().map {
     """
     // KERNEL \($0.offset)
-    // Kind: \($0.element.kind)
+    // FrameOrder: \($0.element.frameOrder)
     // ThreadCountScale \($0.element.threadCountScale)
     // ThreadGroupSize \($0.element.threadGroupSize)
     // ThreadCount \($0.element.threadCount)

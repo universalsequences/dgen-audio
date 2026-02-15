@@ -8,7 +8,7 @@ extension UOpBlockFinalization {
   ///
   /// Finalization is where pipeline-level policies are applied:
   /// - strip `setThreadCountScale` directives into `threadCountScale` metadata
-  /// - enforce scalar kind when backend legality requires it
+  /// - enforce scalar vectorWidth when backend legality requires it
   /// - run C-backend SIMD loop upgrades
   /// - infer launch policy and kernel split hints
   static func finalize(
@@ -16,7 +16,8 @@ extension UOpBlockFinalization {
     block: Block,
     graph: Graph,
     backend: Backend,
-    bodyEffectiveKind: Kind,
+    bodyFrameOrder: FrameOrder,
+    bodyVectorWidth: Int,
     hasOwnFrameLoop: Bool
   ) -> BlockUOps {
     let statefulTensorDecision = StatefulTensorParallelPolicy.decide(
@@ -26,10 +27,11 @@ extension UOpBlockFinalization {
     )
     let (threadCountScale, strippedOps) = extractThreadCountScale(from: emittedOps)
     var finalOps = strippedOps
-    let effectiveKind = resolveEffectiveKind(
+    let (effectiveFrameOrder, effectiveVectorWidth) = resolveVectorWidth(
       backend: backend,
-      blockKind: block.kind,
-      bodyEffectiveKind: bodyEffectiveKind,
+      blockFrameOrder: block.frameOrder,
+      bodyFrameOrder: bodyFrameOrder,
+      bodyVectorWidth: bodyVectorWidth,
       threadCountScale: threadCountScale,
       ops: &finalOps
     )
@@ -39,7 +41,7 @@ extension UOpBlockFinalization {
     }
 
     let parallelPolicy = inferParallelPolicy(
-      kind: effectiveKind,
+      frameOrder: effectiveFrameOrder,
       temporality: block.temporality,
       ops: finalOps,
       statefulTensorDecision: statefulTensorDecision
@@ -50,7 +52,8 @@ extension UOpBlockFinalization {
 
     return BlockUOps(
       ops: finalOps,
-      kind: effectiveKind,
+      frameOrder: effectiveFrameOrder,
+      vectorWidth: effectiveVectorWidth,
       temporality: block.temporality,
       parallelPolicy: parallelPolicy,
       forceNewKernel: forceNewKernel,
@@ -77,29 +80,30 @@ extension UOpBlockFinalization {
     return (scale, filtered)
   }
 
-  /// Resolves final block kind after backend-specific scalar constraints.
-  private static func resolveEffectiveKind(
+  /// Resolves final frame order and vector width after backend-specific scalar constraints.
+  private static func resolveVectorWidth(
     backend: Backend,
-    blockKind: Kind,
-    bodyEffectiveKind: Kind,
+    blockFrameOrder: FrameOrder,
+    bodyFrameOrder: FrameOrder,
+    bodyVectorWidth: Int,
     threadCountScale: Int?,
     ops: inout [UOp]
-  ) -> Kind {
+  ) -> (FrameOrder, Int) {
     let mustForceScalar =
-      backend == .c && (threadCountScale != nil || bodyEffectiveKind == .scalar)
+      backend == .c && (threadCountScale != nil || bodyVectorWidth <= 1)
     guard !mustForceScalar else {
       for i in ops.indices {
-        ops[i].kind = .scalar
+        ops[i].vectorWidth = 1
       }
-      return .scalar
+      return (blockFrameOrder, 1)
     }
 
-    return blockKind
+    return (blockFrameOrder, bodyVectorWidth)
   }
 
   /// Infers whether finalized scalar static blocks can launch with thread-level parallel policy.
   private static func inferParallelPolicy(
-    kind: Kind,
+    frameOrder: FrameOrder,
     temporality: Temporality,
     ops: [UOp],
     statefulTensorDecision: StatefulTensorParallelPolicy.Decision
@@ -108,7 +112,7 @@ extension UOpBlockFinalization {
       return .tensorElementParallel
     }
 
-    guard temporality == .static_, kind == .scalar else { return .serial }
+    guard temporality == .static_, frameOrder == .sequential else { return .serial }
 
     let hasParallelRange = ops.contains {
       if case .beginParallelRange = $0.op { return true }

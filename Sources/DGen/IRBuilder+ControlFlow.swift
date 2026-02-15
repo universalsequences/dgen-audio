@@ -54,9 +54,9 @@ extension IRBuilder {
   /// (frameCount × tensorSize threads). In this case, skips emitting a loop and uses the
   /// pre-computed element index from the context.
   ///
-  /// The `kind` parameter can be `.simd` to mark all emitted UOps for SIMD vectorization
+  /// The `vectorWidth` parameter can be set to 4 to mark all emitted UOps for SIMD vectorization
   /// (4-wide increment, NEON intrinsics in C renderer).
-  public func parallelRange(_ count: Int, body: (Expr) -> Void, kind: Kind? = .scalar) {
+  public func parallelRange(_ count: Int, body: (Expr) -> Void, vectorWidth: Int = 1) {
     // In frame-aware tensor blocks, the parallelism is already handled by flat threading.
     // Use the pre-computed element index instead of creating a loop.
     if ctx.isInFrameAwareTensorBlock, let elemIdx = ctx.frameAwareTensorElementIndex {
@@ -65,17 +65,17 @@ extension IRBuilder {
     }
 
     let indexVar = ctx.useVariable(src: nodeId)
-
-    var incr = 1
-    if case .simd = kind {
-      incr = 4
-    }
+    let incr = vectorWidth > 1 ? 4 : 1
 
     ops.append(UOp(op: .beginParallelRange(count, incr), value: indexVar))
     body(value(indexVar, scalarType: .int))
     ops.append(UOp(op: .endParallelRange, value: ctx.useVariable(src: nil)))
-    if case .simd = kind {
-      ops = ops.map { UOp(op: $0.op, value: $0.value, kind: $0.kind, kindOverride: .simd) }
+    if vectorWidth > 1 {
+      ops = ops.map {
+        var uop = $0
+        uop.vectorWidth = vectorWidth
+        return uop
+      }
     }
   }
 

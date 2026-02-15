@@ -10,7 +10,7 @@ import Foundation
 
 public struct KernelStats {
   public let name: String
-  public let kind: Kind
+  public let frameOrder: FrameOrder
   public let threadCountScale: Int?
   public let temporality: Temporality
   public let work: Int
@@ -203,7 +203,7 @@ private func analyzeOneKernel(
 
   return KernelStats(
     name: name,
-    kind: item.kind,
+    frameOrder: item.frameOrder,
     threadCountScale: item.threadCountScale,
     temporality: item.temporality,
     work: work,
@@ -230,19 +230,19 @@ private func computeThreadCount(
   // Static scalar blocks dispatch 1 thread (body loops internally or uses parallelRange).
   // Static SIMD blocks with threadCountScale dispatch threadCountScale threads.
   if item.temporality == .static_ {
-    if item.kind == .scalar {
+    if item.frameOrder == .sequential {
       return 1
     }
-    // Static SIMD: dispatch threadCountScale threads (no frameCount multiplier)
+    // Static parallel: dispatch threadCountScale threads (no frameCount multiplier)
     return item.threadCountScale ?? 1
   }
 
-  switch item.kind {
-  case .simd:
-    // Frame-based SIMD: each thread handles one unit of work
+  switch item.frameOrder {
+  case .parallel:
+    // Frame-based parallel: each thread handles one unit of work
     return frameCount * (item.threadCountScale ?? 1)
-  case .scalar:
-    // Frame-based scalar: single thread, body loops internally
+  case .sequential:
+    // Frame-based sequential: single thread, body loops internally
     return 1
   }
 }

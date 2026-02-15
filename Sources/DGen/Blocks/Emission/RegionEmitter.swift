@@ -26,7 +26,7 @@ private func emitRegion(
     guard let node = g.nodes[nodeId] else { continue }
     for uop in try node.op.emit(ctx: ctx, g: g, nodeId: nodeId) {
       var typedUop = uop
-      typedUop.kind = .scalar
+      typedUop.vectorWidth = 1
       uops.append(typedUop)
     }
   }
@@ -45,7 +45,7 @@ private func emitRegion(
         if let node = g.nodes[nodeId] {
           for uop in try node.op.emit(ctx: ctx, g: g, nodeId: nodeId) {
             var typedUop = uop
-            typedUop.kind = .scalar
+            typedUop.vectorWidth = 1
             uops.append(typedUop)
           }
         }
@@ -55,11 +55,10 @@ private func emitRegion(
       let elementCount = region.shape.reduce(1, *)
 
       if !region.isConvOnly {
-        var beginLoop = UOp(
+        let beginLoop = UOp(
           op: .beginForLoop(elemVar, .constant(0, Float(elementCount))),
           value: elemVar
         )
-        beginLoop.kind = .scalar
         uops.append(beginLoop)
       }
 
@@ -68,15 +67,14 @@ private func emitRegion(
         if let node = g.nodes[nodeId] {
           for uop in try node.op.emit(ctx: ctx, g: g, nodeId: nodeId) {
             var typedUop = uop
-            typedUop.kind = .scalar
+            typedUop.vectorWidth = 1
             uops.append(typedUop)
           }
         }
       }
 
       if !region.isConvOnly {
-        var endLoop = UOp(op: .endLoop, value: .empty)
-        endLoop.kind = .scalar
+        let endLoop = UOp(op: .endLoop, value: .empty)
         uops.append(endLoop)
       }
     }

@@ -1,11 +1,12 @@
 /// Core block types for the compilation pipeline.
 import Foundation
 
-public enum Kind { case simd, scalar }
+/// Whether frames in this block depend on each other.
+public enum FrameOrder { case sequential, parallel }
 
 // corresponds to one kernel (metal backends) or for loop (in C backend)
 public struct Block: Equatable {
-  public var kind: Kind
+  public var frameOrder: FrameOrder
   public var nodes: [NodeID] = []
   public var temporality: Temporality = .static_
 
@@ -36,12 +37,12 @@ public struct Block: Equatable {
 
   public var shape: Shape?
 
-  public init(kind: Kind) {
-    self.kind = kind
+  public init(frameOrder: FrameOrder) {
+    self.frameOrder = frameOrder
   }
 
   public static func == (lhs: Block, rhs: Block) -> Bool {
-    return lhs.kind == rhs.kind && lhs.nodes == rhs.nodes
+    return lhs.frameOrder == rhs.frameOrder && lhs.nodes == rhs.nodes
       && lhs.temporality == rhs.temporality && lhs.tensorIndex == rhs.tensorIndex
       && lhs.shape == rhs.shape
   }

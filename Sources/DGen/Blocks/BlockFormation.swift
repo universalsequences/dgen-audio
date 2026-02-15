@@ -11,7 +11,7 @@ public func partitionIntoBlocks(
 
   for nodeId in sorted {
     let isScalar = scalar.contains(nodeId)
-    let kind: Kind = isScalar ? .scalar : .simd
+    let frameOrder: FrameOrder = isScalar ? .sequential : .parallel
 
     // Special handling for output nodes - they go in the same block as their dependencies
     if let node = g.nodes[nodeId], case .output = node.op {
@@ -40,7 +40,7 @@ public func partitionIntoBlocks(
           print("📍 Placed output node \(nodeId) in current block")
         }
       } else {
-        currentBlock = Block(kind: kind)
+        currentBlock = Block(frameOrder: frameOrder)
         currentBlock!.nodes.append(nodeId)
       }
       continue
@@ -48,15 +48,15 @@ public func partitionIntoBlocks(
 
     // Regular node handling - group consecutive nodes of same kind together
     if let current = currentBlock {
-      if current.kind == kind {
+      if current.frameOrder == frameOrder {
         currentBlock!.nodes.append(nodeId)
       } else {
         blocks.append(current)
-        currentBlock = Block(kind: kind)
+        currentBlock = Block(frameOrder: frameOrder)
         currentBlock!.nodes.append(nodeId)
       }
     } else {
-      currentBlock = Block(kind: kind)
+      currentBlock = Block(frameOrder: frameOrder)
       currentBlock!.nodes.append(nodeId)
     }
   }
@@ -72,7 +72,7 @@ public func partitionIntoBlocks(
   if debug {
     print("📦 Created \(blocks.count) blocks")
     for (i, block) in blocks.enumerated() {
-      print("  Block \(i) (\(block.kind)): \(block.nodes)")
+      print("  Block \(i) (\(block.frameOrder)): \(block.nodes)")
     }
   }
 
@@ -84,7 +84,7 @@ public func fuseBlocks(_ blocks: [Block]) -> [Block] {
   var fused: [Block] = []
   for b in blocks {
     if b.nodes.isEmpty { continue }
-    if let lastIdx = fused.indices.last, fused[lastIdx].kind == b.kind {
+    if let lastIdx = fused.indices.last, fused[lastIdx].frameOrder == b.frameOrder {
       fused[lastIdx].nodes.append(contentsOf: b.nodes)
     } else {
       fused.append(b)
@@ -102,7 +102,7 @@ public func isolateSpectralPasses(_ blocks: [Block], _ g: Graph) -> [Block] {
 
   // Helper to create a new block with the same properties as the original
   func makeBlock(from original: Block, nodes: [NodeID]) -> Block {
-    var newBlock = Block(kind: original.kind)
+    var newBlock = Block(frameOrder: original.frameOrder)
     newBlock.nodes = nodes
     newBlock.temporality = original.temporality
     newBlock.tensorIndex = original.tensorIndex
@@ -139,7 +139,7 @@ public func isolateSpectralPasses(_ blocks: [Block], _ g: Graph) -> [Block] {
         // Clear shape/tensorIndex: FFT butterflies are single-threaded per frame
         // and must NOT inherit the parent block's ThreadCountScale (e.g. from matmul).
         var spectralBlock = makeBlock(from: block, nodes: [nodeId])
-        spectralBlock.kind = .simd
+        spectralBlock.frameOrder = .parallel
         spectralBlock.shape = nil
         spectralBlock.tensorIndex = nil
         result.append(spectralBlock)
@@ -303,7 +303,7 @@ public func splitReduceBlocks(g: Graph, blocks: [Block]) -> [Block] {
   for block in blocks {
     let reductionOpIndex = block.nodes.firstIndex { nodeId in
       guard let node = g.nodes[nodeId] else { return false }
-      if block.kind == .scalar {
+      if block.frameOrder == .sequential {
         // Scalar frame-loop blocks must stay intact for feedback/stateful ops,
         // except global reductions which must run once outside the frame loop.
         return isGlobalReductionOp(node.op)
@@ -318,7 +318,7 @@ public func splitReduceBlocks(g: Graph, blocks: [Block]) -> [Block] {
 
     // Pre-reduction block
     if reductionOpIndex > 0 {
-      var preReductionBlock = Block(kind: block.kind)
+      var preReductionBlock = Block(frameOrder: block.frameOrder)
       preReductionBlock.nodes = Array(block.nodes[0..<reductionOpIndex])
       preReductionBlock.shape = block.shape
       preReductionBlock.temporality = block.temporality
@@ -332,8 +332,8 @@ public func splitReduceBlocks(g: Graph, blocks: [Block]) -> [Block] {
     let reductionNode = g.nodes[block.nodes[reductionOpIndex]]
     let isGlobalReduce = reductionNode.map { isGlobalReductionOp($0.op) } ?? false
 
-    // Global reduces need kind=.scalar AND temporality=.static_ to run once total
-    var reductionBlock = Block(kind: isGlobalReduce ? .scalar : block.kind)
+    // Global reduces need frameOrder=.sequential AND temporality=.static_ to run once total
+    var reductionBlock = Block(frameOrder: isGlobalReduce ? .sequential : block.frameOrder)
     reductionBlock.nodes = [block.nodes[reductionOpIndex]]
     reductionBlock.temporality = isGlobalReduce ? .static_ : block.temporality
 
@@ -348,9 +348,9 @@ public func splitReduceBlocks(g: Graph, blocks: [Block]) -> [Block] {
     // Post-reduction block - recursively split if it contains more reductions
     if reductionOpIndex < block.nodes.count - 1 {
       let postNodes = Array(block.nodes[reductionOpIndex + 1..<block.nodes.count])
-      let canPromotePostToSIMD = block.kind == .scalar && isGlobalReduce
+      let canPromotePostToSIMD = block.frameOrder == .sequential && isGlobalReduce
 
-      var postReductionBlock = Block(kind: canPromotePostToSIMD ? .simd : block.kind)
+      var postReductionBlock = Block(frameOrder: canPromotePostToSIMD ? .parallel : block.frameOrder)
       postReductionBlock.nodes = postNodes
       postReductionBlock.shape = block.shape
       postReductionBlock.temporality = block.temporality
@@ -369,7 +369,7 @@ public func splitReduceBlocks(g: Graph, blocks: [Block]) -> [Block] {
 public func splitMemoryBlocks(g: Graph, blocks: [Block]) -> [Block] {
   var result: [Block] = []
   for block in blocks {
-    if block.kind == .scalar {
+    if block.frameOrder == .sequential {
       result.append(block)
       continue
     }
@@ -394,14 +394,14 @@ public func splitMemoryBlocks(g: Graph, blocks: [Block]) -> [Block] {
     }
     // Pre-read block (includes memoryWrite)
     if splitIndex > 0 {
-      var pre = Block(kind: .simd)
+      var pre = Block(frameOrder: .parallel)
       pre.nodes = Array(block.nodes[0..<splitIndex])
       pre.shape = block.shape
       pre.temporality = block.temporality
       result.append(pre)
     }
     // Post block (memoryRead onward) — recursively split if more conflicts
-    var post = Block(kind: .simd)
+    var post = Block(frameOrder: .parallel)
     post.nodes = Array(block.nodes[splitIndex...])
     post.shape = block.shape
     post.temporality = block.temporality
@@ -412,7 +412,7 @@ public func splitMemoryBlocks(g: Graph, blocks: [Block]) -> [Block] {
 
 /// Creates an empty derived block that preserves non-node metadata needed for grouping.
 private func makeTensorGroupingBlock(from original: Block) -> Block {
-  var newBlock = Block(kind: original.kind)
+  var newBlock = Block(frameOrder: original.frameOrder)
   newBlock.temporality = original.temporality
   return newBlock
 }
@@ -481,7 +481,7 @@ private func splitScalarBlockForTensorGrouping(
   scalarPrefix.nodes = Array(block.nodes[0..<firstTensorOffset])
 
   var tensorSuffix = makeTensorGroupingBlock(from: block)
-  tensorSuffix.kind = .simd
+  tensorSuffix.frameOrder = .parallel
   tensorSuffix.nodes = Array(block.nodes[firstTensorOffset...])
   assignTensorIndexFromFirstTensorNode(to: &tensorSuffix, graph: graph, ctx: ctx)
 
@@ -537,7 +537,7 @@ private func groupRegularTensorBlock(
       appendCurrentGroupingBlockIfNeeded(&currentBlock, grouped: &grouped)
 
       var overlapAddBlock = makeTensorGroupingBlock(from: block)
-      overlapAddBlock.kind = .scalar
+      overlapAddBlock.frameOrder = .sequential
       overlapAddBlock.nodes.append(nodeId)
       grouped.append(overlapAddBlock)
 
@@ -585,7 +585,7 @@ func determineTensorBlocks(_ blocks: [Block], _ graph: Graph, _ ctx: IRContext) 
   var determined: [Block] = []
 
   for block in blocks {
-    if block.kind == .scalar {
+    if block.frameOrder == .sequential {
       determined.append(contentsOf: splitScalarBlockForTensorGrouping(block, graph: graph, ctx: ctx))
       continue
     }

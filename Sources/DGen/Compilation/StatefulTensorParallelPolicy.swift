@@ -16,7 +16,7 @@ enum StatefulTensorParallelPolicy {
   /// - excludes tensor history read/write blocks
   static func decide(block: Block, graph: Graph, backend: Backend) -> Decision {
     guard backend == .metal else { return Decision(enabled: false, tensorSize: 0) }
-    guard block.kind == .scalar else { return Decision(enabled: false, tensorSize: 0) }
+    guard block.frameOrder == .sequential else { return Decision(enabled: false, tensorSize: 0) }
     guard let shape = block.shape else { return Decision(enabled: false, tensorSize: 0) }
     let tensorSize = shape.reduce(1, *)
     guard tensorSize > 1 else { return Decision(enabled: false, tensorSize: tensorSize) }

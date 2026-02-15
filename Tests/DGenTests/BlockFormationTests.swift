@@ -15,7 +15,7 @@ final class BlockFormationTests: XCTestCase {
     ) {
         print("\n=== \(title) ===")
         for (idx, block) in blocks.enumerated() {
-            print("Block \(idx): kind=\(block.kind), temporality=\(block.temporality), shape=\(block.shape ?? [])")
+            print("Block \(idx): frameOrder=\(block.frameOrder), temporality=\(block.temporality), shape=\(block.shape ?? [])")
             for nodeId in block.nodes {
                 if let node = graph.nodes[nodeId] {
                     let isScalar = scalarSet.contains(nodeId)
@@ -164,9 +164,9 @@ final class BlockFormationTests: XCTestCase {
             if pIdx != mIdx || mIdx != cIdx {
                 print("\n*** BUG: Frame-based tensor ops are in DIFFERENT blocks! ***")
                 print("This causes the 'static' issue because cos runs in a separate SIMD block")
-                print("phasor block kind: \(finalBlocks[pIdx].kind)")
-                print("mul block kind: \(finalBlocks[mIdx].kind)")
-                print("cos block kind: \(finalBlocks[cIdx].kind)")
+                print("phasor block frameOrder: \(finalBlocks[pIdx].frameOrder)")
+                print("mul block frameOrder: \(finalBlocks[mIdx].frameOrder)")
+                print("cos block frameOrder: \(finalBlocks[cIdx].frameOrder)")
             }
         }
 
@@ -398,7 +398,7 @@ final class BlockFormationTests: XCTestCase {
 
         try inferShapes(graph: g, sortedNodes: [tensor, seed, accumNode, tensorAdd])
 
-        var block = Block(kind: .scalar)
+        var block = Block(frameOrder: .sequential)
         block.nodes = [accumNode, tensorAdd]
 
         let result = determineTensorBlocks([block], g, IRContext(g: g))
@@ -421,7 +421,7 @@ final class BlockFormationTests: XCTestCase {
 
         try inferShapes(graph: g, sortedNodes: [tensor, mul, overlapAdd, post])
 
-        var block = Block(kind: .simd)
+        var block = Block(frameOrder: .parallel)
         block.nodes = [mul, overlapAdd, post]
 
         let result = determineTensorBlocks([block], g, IRContext(g: g))
@@ -429,7 +429,7 @@ final class BlockFormationTests: XCTestCase {
         XCTAssertEqual(result.count, 3)
         XCTAssertEqual(result[0].nodes, [mul])
         XCTAssertEqual(result[1].nodes, [overlapAdd])
-        XCTAssertEqual(result[1].kind, .scalar)
+        XCTAssertEqual(result[1].frameOrder, .sequential)
         XCTAssertEqual(result[2].nodes, [post])
         XCTAssertNotNil(result[0].tensorIndex)
         XCTAssertNotNil(result[2].tensorIndex)
@@ -444,7 +444,7 @@ final class BlockFormationTests: XCTestCase {
 
         try inferShapes(graph: g, sortedNodes: [matrix, matrixAdd, row])
 
-        var block = Block(kind: .simd)
+        var block = Block(frameOrder: .parallel)
         block.nodes = [matrixAdd, row]
 
         let result = determineTensorBlocks([block], g, IRContext(g: g))
@@ -465,7 +465,7 @@ final class BlockFormationTests: XCTestCase {
 
         try inferShapes(graph: g, sortedNodes: [input, reduced, post])
 
-        var block = Block(kind: .simd)
+        var block = Block(frameOrder: .parallel)
         block.nodes = [input, reduced, post]
 
         let result = determineTensorBlocks([block], g, IRContext(g: g))

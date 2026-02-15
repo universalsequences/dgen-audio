@@ -408,7 +408,8 @@ public struct CompilationPipeline {
             block: block,
             graph: graph,
             backend: backend,
-            bodyEffectiveKind: emission.effectiveKind,
+            bodyFrameOrder: emission.frameOrder,
+            bodyVectorWidth: emission.vectorWidth,
             hasOwnFrameLoop: emission.hasOwnFrameLoop
           )
         )
@@ -433,7 +434,7 @@ public struct CompilationPipeline {
     print("Block structure:")
     for (i, blockIdx) in sortedIndices.enumerated() {
       let block = blocks[blockIdx]
-      print("  Block \(i) (orig \(blockIdx), \(block.kind)): \(block.nodes)")
+      print("  Block \(i) (orig \(blockIdx), \(block.frameOrder)): \(block.nodes)")
     }
   }
 }
@@ -466,7 +467,7 @@ private func printUOpBlocks(_ uopBlocks: [BlockUOps], blocks: [Block]) {
     let tensorIndex = String(describing: block?.tensorIndex)
     let nodes = block?.nodes ?? []
     print(
-      "block #\(i+1) kind=\(uopBlock.kind) threadCountScale=\(String(describing: uopBlock.threadCountScale)) shape=\(shape) tensorIndex=\(tensorIndex) nodes=\(nodes)"
+      "block #\(i+1) frameOrder=\(uopBlock.frameOrder) vectorWidth=\(uopBlock.vectorWidth) threadCountScale=\(String(describing: uopBlock.threadCountScale)) shape=\(shape) tensorIndex=\(tensorIndex) nodes=\(nodes)"
     )
     var indentLevel = 0
     for uop in uopBlock.ops {

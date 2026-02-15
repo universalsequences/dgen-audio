@@ -2,12 +2,12 @@
 import Foundation
 
 public struct CellAllocations {
-  public let cellKinds: [CellID: Kind]
+  public let cellVectorWidths: [CellID: Int]
   public let cellMappings: [CellID: CellID]
   public let totalMemorySlots: Int
 
-  public init(totalMemorySlots: Int, cellMappings: [CellID: CellID], cellKinds: [CellID: Kind]) {
-    self.cellKinds = cellKinds
+  public init(totalMemorySlots: Int, cellMappings: [CellID: CellID], cellVectorWidths: [CellID: Int]) {
+    self.cellVectorWidths = cellVectorWidths
     self.cellMappings = cellMappings
     self.totalMemorySlots = totalMemorySlots
   }
@@ -27,26 +27,26 @@ func remapVectorMemorySlots(
   -> CellAllocations
 {
   // Collect all memory operations and their execution modes
-  var memoryUsage: [CellID: Kind] = [:]
+  var memoryUsage: [CellID: Int] = [:]  // vectorWidth per cell
   var allCellIds: Set<CellID> = []
   var cellUsedInMultipleModes: Set<CellID> = []
 
   // Helper to register a cell's usage and detect multi-mode access
-  func registerCell(_ cellId: CellID, kind: Kind) {
+  func registerCell(_ cellId: CellID, vectorWidth: Int) {
     allCellIds.insert(cellId)
 
-    if let existingKind = memoryUsage[cellId] {
-      if existingKind != kind {
+    if let existingWidth = memoryUsage[cellId] {
+      if existingWidth != vectorWidth {
         // Cell used in multiple execution modes
         cellUsedInMultipleModes.insert(cellId)
         // Upgrade to SIMD if any block uses it as SIMD
         // (SIMD needs 4x space, scalar can still access first element)
-        if kind == .simd || existingKind == .simd {
-          memoryUsage[cellId] = .simd
+        if vectorWidth > 1 || existingWidth > 1 {
+          memoryUsage[cellId] = max(vectorWidth, existingWidth)
         }
       }
     } else {
-      memoryUsage[cellId] = kind
+      memoryUsage[cellId] = vectorWidth
     }
   }
 
@@ -54,13 +54,13 @@ func remapVectorMemorySlots(
   for block in uopBlocks {
     for uop in block.ops {
       if let cellId = uop.op.memoryCellId {
-        registerCell(cellId, kind: block.kind)
+        registerCell(cellId, vectorWidth: block.vectorWidth)
       }
     }
   }
 
   if let voiceCellId = voiceCellId {
-    registerCell(voiceCellId, kind: .simd)
+    registerCell(voiceCellId, vectorWidth: 4)
   }
 
   // Collect cells with injectable initial data (e.g. twiddle factors).
@@ -83,7 +83,7 @@ func remapVectorMemorySlots(
     let firstUse: Int
     let lastUse: Int
     let size: Int
-    let kind: Kind
+    let vectorWidth: Int
     let canReceiveReuse: Bool  // false for memoryAccumulate cells (need zeroed memory)
   }
 
@@ -140,10 +140,10 @@ func remapVectorMemorySlots(
     for cellId in reuseEligible.sorted() {
       guard let first = cellFirstUse[cellId], let last = cellLastUse[cellId] else { continue }
       let size = cellSizes[cellId] ?? 1
-      let kind = memoryUsage[cellId] ?? .scalar
+      let vw = memoryUsage[cellId] ?? 1
       let canReceiveReuse = !accumulateCells.contains(cellId)
       intervals.append(LivenessInterval(
-        cellId: cellId, firstUse: first, lastUse: last, size: size, kind: kind,
+        cellId: cellId, firstUse: first, lastUse: last, size: size, vectorWidth: vw,
         canReceiveReuse: canReceiveReuse))
     }
     intervals.sort { $0.firstUse < $1.firstUse }
@@ -178,7 +178,7 @@ func remapVectorMemorySlots(
   var reusedCount = 0
 
   for interval in intervals {
-    let needsAlignment = interval.kind == .simd
+    let needsAlignment = interval.vectorWidth > 1
     let allocSize = needsAlignment ? max(4, interval.size) : interval.size
 
     // Find best-fit free region: must be available and large enough, prefer least waste.
@@ -223,11 +223,11 @@ func remapVectorMemorySlots(
   }
 
   // Remap non-eligible, non-injectable cells with original logic
-  for (cellId, kind) in memoryUsage.sorted(by: { $0.key < $1.key }) {
+  for (cellId, vw) in memoryUsage.sorted(by: { $0.key < $1.key }) {
     if injectableCellIds.contains(cellId) || reuseEligible.contains(cellId) { continue }
     let allocSize = cellSizes[cellId] ?? 1
 
-    if kind == .simd {
+    if vw > 1 {
       let alignedSlot = ((nextAvailableSlot + 3) / 4) * 4
       cellRemapping[cellId] = alignedSlot
       nextAvailableSlot = alignedSlot + max(4, allocSize)
@@ -251,7 +251,8 @@ func remapVectorMemorySlots(
         uopBlocks[blockIndex].ops[uopIndex] = UOp(
           op: remappedOp,
           value: uop.value,
-          kind: uop.kind
+          vectorWidth: uop.vectorWidth,
+          scalarType: uop.scalarType
         )
       }
     }
@@ -260,6 +261,6 @@ func remapVectorMemorySlots(
   return CellAllocations(
     totalMemorySlots: nextAvailableSlot,
     cellMappings: cellRemapping,
-    cellKinds: memoryUsage
+    cellVectorWidths: memoryUsage
   )
 }

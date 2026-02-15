@@ -2,7 +2,8 @@ import Foundation
 
 public struct BlockUOps {
   public var ops: [UOp]
-  public let kind: Kind
+  public let frameOrder: FrameOrder
+  public let vectorWidth: Int
   public let temporality: Temporality
   public var parallelPolicy: ParallelPolicy
   /// When true, this block starts a new kernel (prevents fusion with previous block)
@@ -18,7 +19,8 @@ public struct BlockUOps {
 
   public init(
     ops: [UOp],
-    kind: Kind,
+    frameOrder: FrameOrder,
+    vectorWidth: Int = 1,
     temporality: Temporality = .static_,
     parallelPolicy: ParallelPolicy = .serial,
     forceNewKernel: Bool = false,
@@ -27,7 +29,8 @@ public struct BlockUOps {
     hasOwnFrameLoop: Bool = false
   ) {
     self.ops = ops
-    self.kind = kind
+    self.frameOrder = frameOrder
+    self.vectorWidth = vectorWidth
     self.temporality = temporality
     self.parallelPolicy = parallelPolicy
     self.forceNewKernel = forceNewKernel
@@ -53,7 +56,7 @@ public enum Device {
 public struct CompiledKernel {
   public let name: String
   public let source: String
-  public let kind: Kind
+  public let frameOrder: FrameOrder
   public let temporality: Temporality
   public let buffers: [String]  // names of inputs/outputs
   public let threadGroupSize: Int?  // for Metal: nil means runtime-determined, 1 for scalar
@@ -65,14 +68,16 @@ public struct CompiledKernel {
 
 public class ScheduleItem {
   public var ops: [UOp] = []
-  public let kind: Kind
+  public let frameOrder: FrameOrder
+  public let vectorWidth: Int
   public var temporality: Temporality = .frameBased
   public var parallelPolicy: ParallelPolicy = .serial
   public var threadCountScale: Int? = nil
   public var threadCountOverride: Int? = nil
 
-  init(kind: Kind, temporality: Temporality = .frameBased) {
-    self.kind = kind
+  init(frameOrder: FrameOrder, vectorWidth: Int = 1, temporality: Temporality = .frameBased) {
+    self.frameOrder = frameOrder
+    self.vectorWidth = vectorWidth
     self.temporality = temporality
   }
 }
@@ -118,7 +123,7 @@ func extractVarId(_ lazy: Lazy) -> VarID {
 
 protocol UOpEmitter {
   func emit(_ uop: UOp, ctx: IRContext) -> String
-  func emitLazy(_ lazy: Lazy, ctx: IRContext, kind: Kind?, isOut: Bool) -> String
+  func emitLazy(_ lazy: Lazy, ctx: IRContext, isOut: Bool) -> String
 }
 
 open class Renderer {
@@ -205,7 +210,7 @@ public class CRenderer: Renderer {
       return CompiledKernel(
         name: kernelName,
         source: source,
-        kind: scheduleItem.kind,
+        frameOrder: scheduleItem.frameOrder,
         temporality: scheduleItem.temporality,
         buffers: buffers,
         threadGroupSize: 1,  // C execution is scalar for now
@@ -233,15 +238,15 @@ public class CRenderer: Renderer {
       }
     }
 
-    let scheduleItem = ScheduleItem(kind: .scalar)
+    let scheduleItem = ScheduleItem(frameOrder: .sequential)
     scheduleItems.append(scheduleItem)
 
     // Add frameCount UOp that will render to function parameter
     scheduleItem.ops.append(UOp(op: .frameCount, value: .empty))
     let frameCountUOp = Lazy.variable(-1, nil)  // Special variable ID for frameCount
 
-    // Merge adjacent blocks of the same kind into a single loop to reduce passes
-    var currentKind: Kind? = nil
+    // Merge adjacent blocks of the same frameOrder into a single loop to reduce passes
+    var currentFrameOrder: FrameOrder? = nil
     var currentTemporality: Temporality? = nil
     var currentThreadCountScale: Int? = nil
     var hopCheckOpen = false  // Track if we have an open hop check conditional
@@ -257,7 +262,7 @@ public class CRenderer: Renderer {
 
     for block in uopBlocks {
       let needsNewLoop =
-        currentKind != block.kind
+        currentFrameOrder != block.frameOrder
         || currentTemporality != block.temporality
         || currentThreadCountScale != block.threadCountScale
 
@@ -294,7 +299,7 @@ public class CRenderer: Renderer {
           let loopCount = scaledFrameCount(block.threadCountScale)
           scheduleItem.ops.append(
             UOp(
-              op: .beginLoop(loopCount, block.kind == .scalar ? 1 : 4),
+              op: .beginLoop(loopCount, block.vectorWidth),
               value: .empty)
           )
           loopOpen = true
@@ -308,7 +313,7 @@ public class CRenderer: Renderer {
           }
           scheduleItem.ops.append(
             UOp(
-              op: .beginLoop(frameCountUOp, block.kind == .scalar ? 1 : 4),
+              op: .beginLoop(frameCountUOp, block.vectorWidth),
               value: .empty)
           )
           // Hoist the counter's loadGlobal before beginHopCheck so the variable is declared
@@ -332,7 +337,7 @@ public class CRenderer: Renderer {
         }
         }  // end else (not hasOwnFrameLoop)
 
-        currentKind = block.kind
+        currentFrameOrder = block.frameOrder
         currentTemporality = block.temporality
         currentThreadCountScale = block.threadCountScale
       }
@@ -526,11 +531,11 @@ public class CRenderer: Renderer {
   }
 
   /// Render a Lazy value, optionally as an integer literal for int-typed constants
-  private func emitLazyTyped(_ lazy: Lazy, ctx: IRContext, kind: Kind?, asInt: Bool) -> String {
+  private func emitLazyTyped(_ lazy: Lazy, ctx: IRContext, vectorWidth: Int, asInt: Bool) -> String {
     if asInt, case .constant(_, let val) = lazy {
       return "\(Int(val))"
     }
-    return emitLazy(lazy, ctx: ctx, kind: kind, isOut: false)
+    return emitLazy(lazy, ctx: ctx, vectorWidth: vectorWidth, isOut: false)
   }
 
   /// Check if a Lazy offset was emitted as an int-typed variable
@@ -540,8 +545,8 @@ public class CRenderer: Renderer {
   }
 
   func emit(_ uop: UOp, ctx: IRContext) -> String {
-    let g = { self.emitLazy($0, ctx: ctx, kind: uop.kind, isOut: false) }
-    let gi = { self.emitLazyTyped($0, ctx: ctx, kind: uop.kind, asInt: uop.scalarType == .int) }
+    let g = { self.emitLazy($0, ctx: ctx, vectorWidth: uop.vectorWidth, isOut: false) }
+    let gi = { self.emitLazyTyped($0, ctx: ctx, vectorWidth: uop.vectorWidth, asInt: uop.scalarType == .int) }
 
     switch uop.op {
     case .defineConstant(let constantId, let val):
@@ -551,25 +556,25 @@ public class CRenderer: Renderer {
       return "/* t\(varId) declared globally */"
 
     case .add(let a, let b):
-      let expr = uop.kind == .simd ? "vaddq_f32(\(g(a)), \(g(b)))" : "\(gi(a)) + \(gi(b))"
+      let expr = uop.vectorWidth > 1 ? "vaddq_f32(\(g(a)), \(g(b)))" : "\(gi(a)) + \(gi(b))"
       return emitAssign(uop, expr, ctx)
 
     case .mul(let a, let b):
-      let expr = uop.kind == .simd ? "vmulq_f32(\(g(a)), \(g(b)))" : "\(gi(a)) * \(gi(b))"
+      let expr = uop.vectorWidth > 1 ? "vmulq_f32(\(g(a)), \(g(b)))" : "\(gi(a)) * \(gi(b))"
       return emitAssign(uop, expr, ctx)
 
     case .sub(let a, let b):
-      let expr = uop.kind == .simd ? "vsubq_f32(\(g(a)), \(g(b)))" : "\(gi(a)) - \(gi(b))"
+      let expr = uop.vectorWidth > 1 ? "vsubq_f32(\(g(a)), \(g(b)))" : "\(gi(a)) - \(gi(b))"
       return emitAssign(uop, expr, ctx)
 
     case .div(let a, let b):
-      if uop.scalarType == .int && uop.kind != .simd {
+      if uop.scalarType == .int && uop.vectorWidth <= 1 {
         return emitAssign(uop, "\(gi(a)) / \(gi(b))", ctx)
       }
       // Strength-reduce division by constant to multiply by reciprocal
       switch b {
       case .constant(_, let val):
-        if uop.kind == .simd {
+        if uop.vectorWidth > 1 {
           let expr = "vmulq_f32(\(g(a)), vdupq_n_f32(\(1.0/val)f))"
           return emitAssign(uop, expr, ctx)
         } else {
@@ -577,18 +582,18 @@ public class CRenderer: Renderer {
           return emitAssign(uop, expr, ctx)
         }
       default:
-        let expr = uop.kind == .simd ? "vdivq_f32(\(g(a)), \(g(b)))" : "\(g(a)) / \(g(b))"
+        let expr = uop.vectorWidth > 1 ? "vdivq_f32(\(g(a)), \(g(b)))" : "\(g(a)) / \(g(b))"
         return emitAssign(uop, expr, ctx)
       }
 
     case .mod(let a, let b):
-      if uop.scalarType == .int && uop.kind != .simd {
+      if uop.scalarType == .int && uop.vectorWidth <= 1 {
         return emitAssign(uop, "\(gi(a)) % \(gi(b))", ctx)
       }
       // Fast modulo for constant denominator: a - floor(a / b) * b
       switch b {
       case .constant(_, let val):
-        if uop.kind == .simd {
+        if uop.vectorWidth > 1 {
           if val == 1.0 {
             let expr = "vsubq_f32(\(g(a)), vrndmq_f32(\(g(a))))"
             return emitAssign(uop, expr, ctx)
@@ -608,7 +613,7 @@ public class CRenderer: Renderer {
         }
       default:
         let expr =
-          uop.kind == .simd ? "vfmodq_f32(\(g(a)), \(g(b)))" : "fmodf(\(g(a)), \(g(b)))"
+          uop.vectorWidth > 1 ? "vfmodq_f32(\(g(a)), \(g(b)))" : "fmodf(\(g(a)), \(g(b)))"
         return emitAssign(uop, expr, ctx)
       }
 
@@ -617,13 +622,13 @@ public class CRenderer: Renderer {
       switch b {
       case .constant(_, let val):
         if val == 1.0 {
-          return emitAssign(uop, uop.kind == .simd ? "\(g(a))" : "\(g(a))", ctx)
+          return emitAssign(uop, uop.vectorWidth > 1 ? "\(g(a))" : "\(g(a))", ctx)
         } else if val == 2.0 {
           let expr =
-            uop.kind == .simd ? "vmulq_f32(\(g(a)), \(g(a)))" : "(\(g(a)) * \(g(a)))"
+            uop.vectorWidth > 1 ? "vmulq_f32(\(g(a)), \(g(a)))" : "(\(g(a)) * \(g(a)))"
           return emitAssign(uop, expr, ctx)
         } else if val == 3.0 {
-          if uop.kind == .simd {
+          if uop.vectorWidth > 1 {
             let expr = "vmulq_f32(vmulq_f32(\(g(a)), \(g(a))), \(g(a)))"
             return emitAssign(uop, expr, ctx)
           } else {
@@ -631,7 +636,7 @@ public class CRenderer: Renderer {
             return emitAssign(uop, expr, ctx)
           }
         } else if val == 4.0 {
-          if uop.kind == .simd {
+          if uop.vectorWidth > 1 {
             let t2 = "vmulq_f32(\(g(a)), \(g(a)))"
             let expr = "vmulq_f32(\(t2), \(t2))"
             return emitAssign(uop, expr, ctx)
@@ -640,19 +645,19 @@ public class CRenderer: Renderer {
             return emitAssign(uop, expr, ctx)
           }
         } else if val == 0.5 {
-          let expr = uop.kind == .simd ? "vsqrtf(\(g(a)))" : "sqrtf(\(g(a)))"
+          let expr = uop.vectorWidth > 1 ? "vsqrtf(\(g(a)))" : "sqrtf(\(g(a)))"
           return emitAssign(uop, expr, ctx)
         } else if val == 0.0 {
-          let expr = uop.kind == .simd ? "vdupq_n_f32(1.0f)" : "1.0f"
+          let expr = uop.vectorWidth > 1 ? "vdupq_n_f32(1.0f)" : "1.0f"
           return emitAssign(uop, expr, ctx)
         }
         // Fallback
-        let expr = uop.kind == .simd ? "vpowf(\(g(a)), \(g(b)))" : "powf(\(g(a)), \(g(b)))"
+        let expr = uop.vectorWidth > 1 ? "vpowf(\(g(a)), \(g(b)))" : "powf(\(g(a)), \(g(b)))"
         return emitAssign(uop, expr, ctx)
       default:
         // If base is constant, emit exp(b * log(base)) which is faster than generic pow
         if case .constant(_, let baseVal) = a {
-          if uop.kind == .simd {
+          if uop.vectorWidth > 1 {
             let expr = "vexpf(vmulq_f32(\(g(b)), vdupq_n_f32(logf(\(baseVal)f))))"
             return emitAssign(uop, expr, ctx)
           } else {
@@ -660,24 +665,24 @@ public class CRenderer: Renderer {
             return emitAssign(uop, expr, ctx)
           }
         }
-        let expr = uop.kind == .simd ? "vpowf(\(g(a)), \(g(b)))" : "powf(\(g(a)), \(g(b)))"
+        let expr = uop.vectorWidth > 1 ? "vpowf(\(g(a)), \(g(b)))" : "powf(\(g(a)), \(g(b)))"
         return emitAssign(uop, expr, ctx)
       }
 
     case .min(let a, let b):
-      let expr = uop.kind == .simd ? "vminq_f32(\(g(a)), \(g(b)))" : "fminf(\(g(a)), \(g(b)))"
+      let expr = uop.vectorWidth > 1 ? "vminq_f32(\(g(a)), \(g(b)))" : "fminf(\(g(a)), \(g(b)))"
       return emitAssign(uop, expr, ctx)
 
     case .max(let a, let b):
-      let expr = uop.kind == .simd ? "vmaxq_f32(\(g(a)), \(g(b)))" : "fmaxf(\(g(a)), \(g(b)))"
+      let expr = uop.vectorWidth > 1 ? "vmaxq_f32(\(g(a)), \(g(b)))" : "fmaxf(\(g(a)), \(g(b)))"
       return emitAssign(uop, expr, ctx)
 
     case .abs(let a):
-      let expr = uop.kind == .simd ? "vabsq_f32(\(g(a)))" : "fabs(\(g(a)))"
+      let expr = uop.vectorWidth > 1 ? "vabsq_f32(\(g(a)))" : "fabs(\(g(a)))"
       return emitAssign(uop, expr, ctx)
 
     case .sign(let a):
-      if uop.kind == .simd {
+      if uop.vectorWidth > 1 {
         // For SIMD: return -1.0 for negative, 1.0 for positive, 0.0 for zero
         let expr =
           "vbslq_f32(vcltq_f32(\(g(a)), vdupq_n_f32(0.0f)), vdupq_n_f32(-1.0f), vbslq_f32(vcgtq_f32(\(g(a)), vdupq_n_f32(0.0f)), vdupq_n_f32(1.0f), vdupq_n_f32(0.0f)))"
@@ -688,23 +693,23 @@ public class CRenderer: Renderer {
       }
 
     case .floor(let a):
-      let expr = uop.kind == .simd ? "vrndmq_f32(\(g(a)))" : "floorf(\(g(a)))"
+      let expr = uop.vectorWidth > 1 ? "vrndmq_f32(\(g(a)))" : "floorf(\(g(a)))"
       return emitAssign(uop, expr, ctx)
 
     case .ceil(let a):
-      let expr = uop.kind == .simd ? "vrndpq_f32(\(g(a)))" : "ceilf(\(g(a)))"
+      let expr = uop.vectorWidth > 1 ? "vrndpq_f32(\(g(a)))" : "ceilf(\(g(a)))"
       return emitAssign(uop, expr, ctx)
 
     case .round(let a):
       let expr =
-        uop.kind == .simd
+        uop.vectorWidth > 1
         ? "vrndaq_f32(\(g(a)))"
         : "roundf(\(g(a)))"
       return emitAssign(uop, expr, ctx)
 
     case .noise(let cellId):
       // Xorshift32 PRNG - better spectral properties than LCG
-      if uop.kind == .simd {
+      if uop.vectorWidth > 1 {
         // For SIMD, generate 4 random values using 4 sequential xorshift updates
         let expr = """
           ({
@@ -737,7 +742,7 @@ public class CRenderer: Renderer {
       }
 
     case .memoryRead(let base, let offset):
-      if uop.kind == .simd {
+      if uop.vectorWidth > 1 {
         let offsetExpr = g(offset)
         // Check offset type to determine how to handle it
         let offsetType: EmittedType
@@ -772,7 +777,7 @@ public class CRenderer: Renderer {
       }
 
     case .memoryWrite(let base, let offset, let value):
-      if uop.kind == .simd {
+      if uop.vectorWidth > 1 {
         let offsetExpr = g(offset)
         let valueExpr = g(value)
         // Check offset type to determine how to handle it
@@ -801,50 +806,50 @@ public class CRenderer: Renderer {
         return "memory[\(base) + \(cast)\(g(offset))] = \(g(value));"
       }
     case .sin(let a):
-      let expr = uop.kind == .simd ? "vsinf(\(g(a)))" : "sinf(\(g(a)))"
+      let expr = uop.vectorWidth > 1 ? "vsinf(\(g(a)))" : "sinf(\(g(a)))"
       return emitAssign(uop, expr, ctx)
 
     case .cos(let a):
-      let expr = uop.kind == .simd ? "vcosf(\(g(a)))" : "cosf(\(g(a)))"
+      let expr = uop.vectorWidth > 1 ? "vcosf(\(g(a)))" : "cosf(\(g(a)))"
       return emitAssign(uop, expr, ctx)
 
     case .tan(let a):
-      let expr = uop.kind == .simd ? "vtanf(\(g(a)))" : "tanf(\(g(a)))"
+      let expr = uop.vectorWidth > 1 ? "vtanf(\(g(a)))" : "tanf(\(g(a)))"
       return emitAssign(uop, expr, ctx)
 
     case .tanh(let a):
-      let expr = uop.kind == .simd ? "vtanhf(\(g(a)))" : "tanhf(\(g(a)))"
+      let expr = uop.vectorWidth > 1 ? "vtanhf(\(g(a)))" : "tanhf(\(g(a)))"
       return emitAssign(uop, expr, ctx)
 
     case .exp(let a):
-      let expr = uop.kind == .simd ? "vexpf(\(g(a)))" : "expf(\(g(a)))"
+      let expr = uop.vectorWidth > 1 ? "vexpf(\(g(a)))" : "expf(\(g(a)))"
       return emitAssign(uop, expr, ctx)
 
     case .log(let a):
-      let expr = uop.kind == .simd ? "vlogf(\(g(a)))" : "logf(\(g(a)))"
+      let expr = uop.vectorWidth > 1 ? "vlogf(\(g(a)))" : "logf(\(g(a)))"
       return emitAssign(uop, expr, ctx)
 
     case .log10(let a):
       let expr =
-        uop.kind == .simd
+        uop.vectorWidth > 1
         ? "vmulq_f32(vlogf(\(g(a))), vdupq_n_f32((float)M_LOG10E))"  // log10(x) = ln(x) * log10(e)
         : "log10f(\(g(a)))"
       return emitAssign(uop, expr, ctx)
 
     case .sqrt(let a):
-      let expr = uop.kind == .simd ? "vsqrtf(\(g(a)))" : "sqrtf(\(g(a)))"
+      let expr = uop.vectorWidth > 1 ? "vsqrtf(\(g(a)))" : "sqrtf(\(g(a)))"
       return emitAssign(uop, expr, ctx)
 
     case .and(let a, let b):
       let expr =
-        uop.kind == .simd
+        uop.vectorWidth > 1
         ? "simd_and_f32(\(g(a)), \(g(b)))"
         : "(((\(g(a)) != 0.0f) && (\(g(b)) != 0.0f)) ? 1.0f : 0.0f)"
       return emitAssign(uop, expr, ctx)
 
     case .or(let a, let b):
       let expr =
-        uop.kind == .simd
+        uop.vectorWidth > 1
         ? "simd_or_f32(\(g(a)), \(g(b)))"
         : "(((\(g(a)) != 0.0f) || (\(g(b)) != 0.0f)) ? 1.0f : 0.0f)"
       return emitAssign(uop, expr, ctx)
@@ -852,35 +857,35 @@ public class CRenderer: Renderer {
     case .xor(let a, let b):
       // XOR: true iff exactly one is non-zero
       let expr =
-        uop.kind == .simd
+        uop.vectorWidth > 1
         ? "simd_xor_f32(\(g(a)), \(g(b)))"
         : "((((\(g(a)) != 0.0f) ^ ((\(g(b)) != 0.0f))) ? 1.0f : 0.0f))"
       return emitAssign(uop, expr, ctx)
     case .atan2(let y, let x):
-      let expr = uop.kind == .simd ? "vatan2f(\(g(y)), \(g(x)))" : "atan2f(\(g(y)), \(g(x)))"
+      let expr = uop.vectorWidth > 1 ? "vatan2f(\(g(y)), \(g(x)))" : "atan2f(\(g(y)), \(g(x)))"
       return emitAssign(uop, expr, ctx)
 
     case .gt(let a, let b):
       let expr =
-        uop.kind == .simd
+        uop.vectorWidth > 1
         ? "vbslq_f32(vcgtq_f32(\(g(a)), \(g(b))), vdupq_n_f32(1.0f), vdupq_n_f32(0.0f))"
         : "\(g(a)) > \(g(b))"
       return emitAssign(uop, expr, ctx)
     case .gte(let a, let b):
       let expr =
-        uop.kind == .simd
+        uop.vectorWidth > 1
         ? "vbslq_f32(vcgeq_f32(\(g(a)), \(g(b))), vdupq_n_f32(1.0f), vdupq_n_f32(0.0f))"
         : "\(g(a)) >= \(g(b))"
       return emitAssign(uop, expr, ctx)
     case .lte(let a, let b):
       let expr =
-        uop.kind == .simd
+        uop.vectorWidth > 1
         ? "vbslq_f32(vcleq_f32(\(g(a)), \(g(b))), vdupq_n_f32(1.0f), vdupq_n_f32(0.0f))"
         : "\(g(a)) <= \(g(b))"
       return emitAssign(uop, expr, ctx)
     case .lt(let a, let b):
       let expr =
-        uop.kind == .simd
+        uop.vectorWidth > 1
         ? "vbslq_f32(vcltq_f32(\(g(a)), \(g(b))), vdupq_n_f32(1.0f), vdupq_n_f32(0.0f))"
         : "\(g(a)) < \(g(b))"
       return emitAssign(uop, expr, ctx)
@@ -888,7 +893,7 @@ public class CRenderer: Renderer {
       // Constant-fold equality when both operands are constants
       switch (a, b) {
       case (.constant(_, let av), .constant(_, let bv)):
-        if uop.kind == .simd {
+        if uop.vectorWidth > 1 {
           let expr = (av == bv) ? "vdupq_n_f32(1.0f)" : "vdupq_n_f32(0.0f)"
           return emitAssign(uop, expr, ctx)
         } else {
@@ -896,14 +901,14 @@ public class CRenderer: Renderer {
         }
       default:
         let expr =
-          uop.kind == .simd
+          uop.vectorWidth > 1
           ? "vbslq_f32(vceqq_f32(\(g(a)), \(g(b))), vdupq_n_f32(1.0f), vdupq_n_f32(0.0f))"
           : "\(g(a)) == \(g(b))"
         return emitAssign(uop, expr, ctx)
       }
 
     case .gswitch(let cond, let a, let b):
-      if uop.kind == .simd {
+      if uop.vectorWidth > 1 {
         // For SIMD: use vbslq_f32 to select between a and b based on condition > 0
         let mask = "vcgtq_f32(\(g(cond)), vdupq_n_f32(0.0f))"
         let expr = "vbslq_f32(\(mask), \(g(a)), \(g(b)))"
@@ -913,7 +918,7 @@ public class CRenderer: Renderer {
         return emitAssign(uop, expr, ctx)
       }
     case .delay1(let cell, let curr):
-      if uop.kind == .simd {
+      if uop.vectorWidth > 1 {
         // Return delayed value, and also persist current vector into memory for next chunk
         let expr = "vextq_f32(vld1q_f32(&memory[\(cell)]), \(g(curr)), 3)"
         let assign = emitAssign(uop, expr, ctx)
@@ -924,7 +929,7 @@ public class CRenderer: Renderer {
         return "\(assign) memory[\(cell)] = \(g(curr));"
       }
     case .selector(let mode, let options):
-      if uop.kind == .simd {
+      if uop.vectorWidth > 1 {
         // For SIMD: if mode <= 0 return 0, if mode <= 1 return options[0], etc.
         var expr = "vdupq_n_f32(0.0f)"  // Default to 0 if mode <= 0
 
@@ -952,14 +957,14 @@ public class CRenderer: Renderer {
       }
 
     case .store(let cell, let val):
-      if uop.kind == .simd {
+      if uop.vectorWidth > 1 {
         // For SIMD: store all 4 vector elements to consecutive memory slots
         return "vst1q_f32(&memory[\(cell)], \(g(val)));"
       } else {
         return "memory[\(cell)] = \(g(val));"
       }
     case .load(let cell):
-      if uop.kind == .simd {
+      if uop.vectorWidth > 1 {
         // For SIMD: load 4 consecutive memory slots into vector
         return emitAssign(uop, "vld1q_f32(&memory[\(cell)])", ctx)
       } else {
@@ -969,7 +974,7 @@ public class CRenderer: Renderer {
       // loadTape reads from global tape buffer with bounds checking
       // In C, this is handled at compile-time (no runtime bounds check for now)
       let varId = g(val)  // The signal/variable to load from
-      if uop.kind == .simd {
+      if uop.vectorWidth > 1 {
         // SIMD: load 4 consecutive frames from tape starting at [offset + i]
         return emitAssign(uop, "vld1q_f32(&tape[\(varId)][\(g(offset))])", ctx)
       } else {
@@ -979,11 +984,11 @@ public class CRenderer: Renderer {
     case .endIf: return "}"
 
     case .mutate(let a, let b):
-      return "\(emitLazy(a, ctx: ctx, kind: uop.kind, isOut: true)) = \(g(b));"
+      return "\(emitLazy(a, ctx: ctx, vectorWidth: uop.vectorWidth, isOut: true)) = \(g(b));"
 
     case .input(let channel):
       let idxExpr = frameIndexOverride ?? "i"
-      if uop.kind == .simd {
+      if uop.vectorWidth > 1 {
         // For SIMD: load 4 consecutive memory slots into vector
         let ptr = "in[\(channel)] + i"
         return emitAssign(uop, "vld1q_f32(\(ptr))", ctx)
@@ -993,7 +998,7 @@ public class CRenderer: Renderer {
       }
     case .output(let channel, let val):
       let idxExpr = frameIndexOverride ?? "i"
-      if uop.kind == .simd {
+      if uop.vectorWidth > 1 {
         // When overriding frame index, fall back to scalar stores for correctness
         if frameIndexOverride != nil {
           let idx = "(int)(\(idxExpr))"
@@ -1037,10 +1042,10 @@ public class CRenderer: Renderer {
       // Use the parallel range loop variable if inside one, otherwise 'i'
       let loopVar = parallelRangeVarStack.last ?? "i"
       // For SIMD, create a vector of sequential indices: {idx, idx+1, idx+2, idx+3}
-      if uop.kind == .simd {
+      if uop.vectorWidth > 1 {
         let varId = extractVarId(uop.value)
         varEmittedTypes[varId] = .float32x4
-        let lhs = emitLazy(uop.value, ctx: ctx, kind: uop.kind, isOut: true)
+        let lhs = emitLazy(uop.value, ctx: ctx, vectorWidth: uop.vectorWidth, isOut: true)
         return
           "float32x4_t \(lhs) = (float32x4_t){(float)\(loopVar), (float)(\(loopVar)+1), (float)(\(loopVar)+2), (float)(\(loopVar)+3)};"
       } else {
@@ -1063,7 +1068,7 @@ public class CRenderer: Renderer {
       return emitAssign(uop, frameIndexOverride ?? baseIdx, ctx)
 
     case .identity(let a):
-      let expr = uop.kind == .simd ? "\(g(a))" : "\(gi(a))"
+      let expr = uop.vectorWidth > 1 ? "\(g(a))" : "\(gi(a))"
       return emitAssign(uop, expr, ctx)
 
     case .cast(let expr, let castType):
@@ -1089,7 +1094,7 @@ public class CRenderer: Renderer {
         frameIndexOverride
         ?? (currentThreadCountScale == nil ? baseIdx : "(\(baseIdx) / \(currentThreadCountScale!))")
 
-      if uop.kind == .simd {
+      if uop.vectorWidth > 1 {
         // Create a proper SIMD variable declaration for loadGlobal
         if staticGlobalVars.contains(id) {
           return "float32x4_t simd\(id) = vdupq_n_f32(t\(id)[0]);"
@@ -1115,7 +1120,7 @@ public class CRenderer: Renderer {
     case .beginParallelRange(let count, var incr):
       // For scalar blocks, always use incr=1 even if the UOp specifies incr=4
       // This fixes the mismatch where a scalar block has a SIMD parallel range
-      if uop.kind == .scalar || uop.kind == nil {
+      if uop.vectorWidth <= 1 {
         incr = 1
       }
       let pre = incr == 4 ? "simd" : "t"
@@ -1161,15 +1166,15 @@ public class CRenderer: Renderer {
     }
   }
 
-  func emitLazy(_ lazy: Lazy, ctx: IRContext, kind: Kind?, isOut: Bool) -> String {
+  func emitLazy(_ lazy: Lazy, ctx: IRContext, vectorWidth: Int, isOut: Bool) -> String {
     switch lazy {
     case .constant(let constantId, let val):
-      return kind == .simd ? "c\(constantId)" : "\(val)"
+      return vectorWidth > 1 ? "c\(constantId)" : "\(val)"
     case .variable(let id, _):
       if id == -1 {  // Special case for frameCount
         return "frameCount"
       } else if ctx.globals.contains(id) {
-        if kind == .simd {
+        if vectorWidth > 1 {
           return isOut ? "t\(id) + i" : "simd\(id)"
         } else {
           if !isOut, staticGlobalVars.contains(id) {
@@ -1183,7 +1188,7 @@ public class CRenderer: Renderer {
           return "t\(id)[\(idx)]"
         }
       } else {
-        if kind == .simd {
+        if vectorWidth > 1 {
           return "simd\(id)"
         } else {
           return "t\(id)"
@@ -1191,7 +1196,7 @@ public class CRenderer: Renderer {
       }
     case .global(let id):
       // Global variables are always accessed through global buffers
-      if kind == .simd {
+      if vectorWidth > 1 {
         return isOut ? "t\(id) + i" : "simd\(id)"
       } else {
         if !isOut, staticGlobalVars.contains(id) {
@@ -1215,7 +1220,7 @@ public class CRenderer: Renderer {
     let varId = extractVarId(uop.value)
     let isGlobal = ctx.globals.contains(varId)
 
-    if uop.kind == .simd {
+    if uop.vectorWidth > 1 {
       // Track type as float32x4 (or float if forced)
       varEmittedTypes[varId] = forceFloatType ? .float_ : .float32x4
 
@@ -1223,10 +1228,10 @@ public class CRenderer: Renderer {
         // For global variables, we need both a local variable declaration
         // AND a store to the global buffer for cross-block transfer
         let localVar = "simd\(varId)"
-        let globalStore = emitLazy(uop.value, ctx: ctx, kind: uop.kind, isOut: true)
+        let globalStore = emitLazy(uop.value, ctx: ctx, vectorWidth: uop.vectorWidth, isOut: true)
         return "float32x4_t \(localVar) = \(expr); vst1q_f32(\(globalStore), \(localVar));"
       } else {
-        let lhs = emitLazy(uop.value, ctx: ctx, kind: uop.kind, isOut: true)
+        let lhs = emitLazy(uop.value, ctx: ctx, vectorWidth: uop.vectorWidth, isOut: true)
         let type = forceFloatType ? "float" : "float32x4_t"
         return "\(type) \(lhs) = \(expr);"
       }
@@ -1236,7 +1241,7 @@ public class CRenderer: Renderer {
       varEmittedTypes[varId] = isInt ? .int_ : .float_
 
       let lhs = emitLazy(
-        uop.value, ctx: ctx, kind: uop.kind, isOut: true)
+        uop.value, ctx: ctx, vectorWidth: uop.vectorWidth, isOut: true)
       if isGlobal {
         return "\(lhs) = \(expr);"
       }

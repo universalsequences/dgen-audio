@@ -110,17 +110,17 @@ public func upgradeElementLoopsToSIMD(_ uops: inout [UOp]) {
     uops[beginIdx] = UOp(
       op: .beginParallelRange(elementCount, 4),
       value: loopVar,
-      kind: .simd
+      vectorWidth: 4
     )
 
     for k in (beginIdx + 1)..<endIdx {
-      uops[k].kind = .simd
+      uops[k].vectorWidth = 4
     }
 
     if isParallelRange {
-      uops[endIdx].kind = .simd
+      uops[endIdx].vectorWidth = 4
     } else {
-      uops[endIdx] = UOp(op: .endParallelRange, value: uops[endIdx].value, kind: .simd)
+      uops[endIdx] = UOp(op: .endParallelRange, value: uops[endIdx].value, vectorWidth: 4)
     }
 
     i = endIdx + 1

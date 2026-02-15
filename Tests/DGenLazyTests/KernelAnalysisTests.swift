@@ -116,7 +116,7 @@ final class KernelAnalysisTests: XCTestCase {
     XCTAssertTrue(kernelSource.contains("kernel void"))
     // Stateful tensor phasor should dispatch one thread per tensor element
     // and loop sequentially over frames inside that thread.
-    XCTAssertTrue(kernelSource.contains("// KERNEL 0\n// Kind: scalar"))
+    XCTAssertTrue(kernelSource.contains("// KERNEL 0\n// FrameOrder: sequential"))
     XCTAssertTrue(kernelSource.contains("if (id >= 0 && id < (uint)(4))"))
     XCTAssertTrue(kernelSource.contains("for (uint i = 0; i < frameCount; i += 1)"))
     print("Wrote tensor-phasor kernel dump to \(kernelPath)")
@@ -148,7 +148,7 @@ final class KernelAnalysisTests: XCTestCase {
 
     let kernelSource = try String(contentsOfFile: kernelPath, encoding: .utf8)
     XCTAssertTrue(kernelSource.contains("kernel void"))
-    XCTAssertTrue(kernelSource.contains("// KERNEL 0\n// Kind: scalar"))
+    XCTAssertTrue(kernelSource.contains("// KERNEL 0\n// FrameOrder: sequential"))
     XCTAssertTrue(kernelSource.contains("if (id >= 0 && id < (uint)(4))"))
     XCTAssertTrue(kernelSource.contains("for (uint i = 0; i < frameCount; i += 1)"))
     print("Wrote signal-tensor phasor kernel dump to \(kernelPath)")
@@ -227,8 +227,8 @@ final class KernelAnalysisTests: XCTestCase {
     let legacy = try runMode(label: "legacy_drop", dropPeekTensorInputGradient: true)
     let fixed = try runMode(label: "fixed_upstream", dropPeekTensorInputGradient: false)
 
-    let legacyScalar = legacy.analysis.kernels.filter { $0.kind == .scalar }
-    let fixedScalar = fixed.analysis.kernels.filter { $0.kind == .scalar }
+    let legacyScalar = legacy.analysis.kernels.filter { $0.frameOrder == .sequential }
+    let fixedScalar = fixed.analysis.kernels.filter { $0.frameOrder == .sequential }
     let legacyScalarWork = legacyScalar.reduce(0) { $0 + $1.work }
     let fixedScalarWork = fixedScalar.reduce(0) { $0 + $1.work }
 
@@ -343,8 +343,8 @@ final class KernelAnalysisTests: XCTestCase {
     let scalarLoop = try runVariant(label: "scalar_loop", useTensorPhasor: false)
     let tensorPhasor = try runVariant(label: "peekrow_tensor_phasor", useTensorPhasor: true)
 
-    let scalarLoopScalar = scalarLoop.analysis.kernels.filter { $0.kind == .scalar }
-    let tensorPhasorScalar = tensorPhasor.analysis.kernels.filter { $0.kind == .scalar }
+    let scalarLoopScalar = scalarLoop.analysis.kernels.filter { $0.frameOrder == .sequential }
+    let tensorPhasorScalar = tensorPhasor.analysis.kernels.filter { $0.frameOrder == .sequential }
     let scalarLoopScalarWork = scalarLoopScalar.reduce(0) { $0 + $1.work }
     let tensorPhasorScalarWork = tensorPhasorScalar.reduce(0) { $0 + $1.work }
 
@@ -377,7 +377,7 @@ final class KernelAnalysisTests: XCTestCase {
     let analysis = try c.analyze()
 
     for kernel in analysis.kernels {
-      print("\(kernel.name): kind=\(kernel.kind), work=\(kernel.work), span=\(kernel.span), "
+      print("\(kernel.name): frameOrder=\(kernel.frameOrder), work=\(kernel.work), span=\(kernel.span), "
             + "arith=\(kernel.arithmeticOps), trans=\(kernel.transcendentalOps), mem=\(kernel.memoryOps)")
     }
 

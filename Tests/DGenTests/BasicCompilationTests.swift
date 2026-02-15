@@ -23,7 +23,7 @@ final class BasicCompilationTests: XCTestCase {
         // Print the UOps
         print("=== UOp Blocks ===")
         for (blockIndex, block) in compilationResult.uopBlocks.enumerated() {
-            print("Block \(blockIndex) (\(block.kind)):")
+            print("Block \(blockIndex) (\(block.frameOrder)):")
             for (opIndex, uop) in block.ops.enumerated() {
                 print("  [\(opIndex)] \(uop.op) -> \(uop.value)")
             }

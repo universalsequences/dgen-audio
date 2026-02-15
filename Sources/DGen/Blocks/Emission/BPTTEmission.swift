@@ -212,8 +212,7 @@ private func buildBPTTPlan(
 ///   - result: UOp output buffer updated in place.
 ///   - frameCountVar: Lazy frame-count variable used by loop renderers.
 private func appendForwardLoopStart(result: inout [UOp], frameCountVar: Lazy) {
-  var beginFwd = UOp(op: .beginLoop(frameCountVar, 1), value: .empty)
-  beginFwd.kind = .scalar
+  let beginFwd = UOp(op: .beginLoop(frameCountVar, 1), value: .empty)
   result.append(beginFwd)
 }
 
@@ -231,9 +230,9 @@ private func appendPerFrameStores(
   for (nodeId, cell) in perFrameCells.sorted(by: { $0.key < $1.key }) {
     guard let lz = ctx.values[nodeId] else { continue }
     let frameIdxVar = ctx.useVariable(src: nil)
-    result.append(UOp(op: .frameIndex, value: frameIdxVar, kind: .scalar, scalarType: .int))
+    result.append(UOp(op: .frameIndex, value: frameIdxVar, scalarType: .int))
     let storeVar = ctx.useVariable(src: nil)
-    result.append(UOp(op: .memoryWrite(cell, frameIdxVar, lz), value: storeVar, kind: .scalar))
+    result.append(UOp(op: .memoryWrite(cell, frameIdxVar, lz), value: storeVar))
   }
 }
 
@@ -243,8 +242,7 @@ private func appendPerFrameStores(
 ///   - result: UOp output buffer updated in place.
 ///   - frameCountVar: Lazy frame-count variable used by loop renderers.
 private func appendBackwardLoopStart(result: inout [UOp], frameCountVar: Lazy) {
-  var beginBwd = UOp(op: .beginReverseLoop(frameCountVar), value: .empty)
-  beginBwd.kind = .scalar
+  let beginBwd = UOp(op: .beginReverseLoop(frameCountVar), value: .empty)
   result.append(beginBwd)
 }
 
@@ -267,16 +265,16 @@ private func appendBackwardReloadsAndBuildRemapping(
   for (nodeId, cell) in perFrameCells.sorted(by: { $0.key < $1.key }) {
     guard let originalLz = ctx.values[nodeId] else { continue }
     let frameIdxVar = ctx.useVariable(src: nil)
-    result.append(UOp(op: .frameIndex, value: frameIdxVar, kind: .scalar, scalarType: .int))
+    result.append(UOp(op: .frameIndex, value: frameIdxVar, scalarType: .int))
     let loadedVar = ctx.useVariable(src: nil)
-    result.append(UOp(op: .memoryRead(cell, frameIdxVar), value: loadedVar, kind: .scalar))
+    result.append(UOp(op: .memoryRead(cell, frameIdxVar), value: loadedVar))
     valueRemapping[originalLz] = loadedVar
   }
 
   let zeroConst = ctx.useConstant(src: nil, value: 0.0)
   for carry in carryCellReads {
     let carryReadVar = ctx.useVariable(src: nil)
-    result.append(UOp(op: .memoryRead(carry.cellId, zeroConst), value: carryReadVar, kind: .scalar))
+    result.append(UOp(op: .memoryRead(carry.cellId, zeroConst), value: carryReadVar))
     valueRemapping[carry.originalLazy] = carryReadVar
   }
 
@@ -326,7 +324,7 @@ private func appendRemappedBackwardUOps(
         UOp(
           op: uop.op.remapLazyInputs(valueRemapping),
           value: uop.value,
-          kind: uop.kind,
+          vectorWidth: uop.vectorWidth,
           scalarType: uop.scalarType
         ))
     }
@@ -358,7 +356,7 @@ private func appendCarryCellWrites(
         let remappedGradLz = valueRemapping[gradLz] ?? gradLz
         let writeVar = ctx.useVariable(src: nil)
         result.append(
-          UOp(op: .memoryWrite(cell, zeroConst, remappedGradLz), value: writeVar, kind: .scalar))
+          UOp(op: .memoryWrite(cell, zeroConst, remappedGradLz), value: writeVar))
       }
     }
   }
@@ -368,8 +366,7 @@ private func appendCarryCellWrites(
 ///
 /// - Parameter result: UOp output buffer updated in place.
 private func appendScalarLoopEnd(result: inout [UOp]) {
-  var endLoop = UOp(op: .endLoop, value: .empty)
-  endLoop.kind = .scalar
+  let endLoop = UOp(op: .endLoop, value: .empty)
   result.append(endLoop)
 }
 

@@ -196,20 +196,18 @@ public enum Op {
 public struct UOp {
   public let op: Op
   public let value: Lazy
-  public var kind: Kind? = nil  // SIMD or Scalar
-  public var kindOverride: Kind? = nil
+  public var vectorWidth: Int = 1  // 1 = scalar, 4 = SIMD (C NEON)
   public var tensorIndex: Lazy? = nil
   public var scalarType: CastType = .float  // int or float for variable declarations
 
   public init(
-    op: Op, value: Lazy, kind: Kind? = nil,
-    kindOverride: Kind? = nil, tensorIndex: Lazy? = nil,
+    op: Op, value: Lazy, vectorWidth: Int = 1,
+    tensorIndex: Lazy? = nil,
     scalarType: CastType = .float
   ) {
     self.op = op
     self.value = value
-    self.kind = kind
-    self.kindOverride = kindOverride
+    self.vectorWidth = vectorWidth
     self.tensorIndex = tensorIndex
     self.scalarType = scalarType
   }

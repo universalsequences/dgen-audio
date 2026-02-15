@@ -292,16 +292,16 @@ private func emitBlockBodyUOps(
     ctx: ctx, block: block, g: g, backend: backend, emittedNodes: &emittedNodes)
 }
 
-/// Computes final SIMD/scalar execution kind and loop increment for the block body.
+/// Computes final vector width and loop increment for the block body.
 ///
 /// - Parameters:
 ///   - bodyUops: Emitted body operations used to detect SIMD blockers.
 ///   - block: Block metadata containing shape, temporality, and tensor-loop context.
 ///   - backend: Target backend controlling SIMD constraints.
-/// - Returns: Tuple with effective UOp kind and tensor-loop increment (`1` or `4`).
-private func determineSIMDPlan(
+/// - Returns: Tuple with frame order, vector width, and tensor-loop increment.
+private func determineVectorPlan(
   bodyUops: [UOp], block: Block, backend: Backend
-) -> (effectiveKind: Kind, simdIncrement: Int) {
+) -> (frameOrder: FrameOrder, vectorWidth: Int, simdIncrement: Int) {
   // Analyze emitted UOps to determine if SIMD is safe.
   // SIMD is safe if: tensor block + size divisible by 4 + no SIMD blockers + not frame-based.
   let hasSIMDBlockers = containsSIMDBlockers(bodyUops, backend: backend)
@@ -320,23 +320,24 @@ private func determineSIMDPlan(
     simdIncrement = 1
   }
 
-  let effectiveKind: Kind
+  let vectorWidth: Int
   if block.tensorIndex != nil {
-    effectiveKind = canUseSIMD ? .simd : .scalar
+    vectorWidth = canUseSIMD ? 4 : 1
   } else {
-    effectiveKind = block.kind
+    // Preserve block's frame order for dispatch, vectorWidth=1 (no SIMD for non-tensor blocks)
+    vectorWidth = 1
   }
-  return (effectiveKind: effectiveKind, simdIncrement: simdIncrement)
+  return (frameOrder: block.frameOrder, vectorWidth: vectorWidth, simdIncrement: simdIncrement)
 }
 
-/// Applies a uniform execution kind to every emitted body UOp.
+/// Applies a uniform vector width to every emitted body UOp.
 ///
 /// - Parameters:
-///   - kind: Kind to apply (`.scalar` or `.simd`).
+///   - vectorWidth: Vector width to apply (1 = scalar, 4 = SIMD).
 ///   - bodyUops: UOps updated in place.
-private func applyKind(_ kind: Kind, to bodyUops: inout [UOp]) {
+private func applyVectorWidth(_ vectorWidth: Int, to bodyUops: inout [UOp]) {
   for i in 0..<bodyUops.count {
-    bodyUops[i].kind = kind
+    bodyUops[i].vectorWidth = vectorWidth
   }
 }
 
@@ -356,7 +357,7 @@ private func applyKind(_ kind: Kind, to bodyUops: inout [UOp]) {
 /// - Returns: Final UOps, including both loop begin/end when wrapping is required.
 private func wrapBodyUOpsWithTensorLoopIfNeeded(
   ctx: IRContext, bodyUops: [UOp], block: Block, backend: Backend,
-  useShapeAwareEmission: Bool, simdIncrement: Int, effectiveKind: Kind
+  useShapeAwareEmission: Bool, simdIncrement: Int, vectorWidth: Int
 ) -> [UOp] {
   // Build final UOps array with parallelRange wrapper if needed.
   // Note: frame-aware tensor blocks DON'T use parallelRange (no loop).
@@ -370,7 +371,7 @@ private func wrapBodyUOpsWithTensorLoopIfNeeded(
   {
     let count = shape.reduce(1, *)
     var loopUOp = UOp(op: .beginParallelRange(count, simdIncrement), value: tensorIndex)
-    loopUOp.kind = effectiveKind  // Match loop wrapper kind to body operations
+    loopUOp.vectorWidth = vectorWidth
     uops.append(loopUOp)
   }
 
@@ -413,10 +414,7 @@ private func wireCrossBlockGlobals(
       if let lz = ctx.values[nodeId] {
         switch lz {
         case .variable(let a, _):
-          var defineGlobalUOp = UOp(op: .defineGlobal(a), value: .global(a))
-          // Use block.kind (frame loop kind), not effectiveKind (tensor loop kind)
-          // Globals are indexed by frame loop, not tensor loop
-          defineGlobalUOp.kind = block.kind
+          let defineGlobalUOp = UOp(op: .defineGlobal(a), value: .global(a))
           uops.insert(defineGlobalUOp, at: 0)
           // Only append if not already in globals to maintain stable ordering
           if !ctx.globals.contains(a) {
@@ -437,9 +435,7 @@ private func wireCrossBlockGlobals(
         // Skip variables without defineGlobal (tensor-valued nodes use memory cells instead)
         guard ctx.globals.contains(a) else { continue }
 
-        var loadGlobalUOp = UOp(op: .loadGlobal(a), value: .variable(a, nil))
-        // Globals are indexed by frame loop, not tensor loop
-        loadGlobalUOp.kind = block.kind
+        let loadGlobalUOp = UOp(op: .loadGlobal(a), value: .variable(a, nil))
         uops.insert(loadGlobalUOp, at: 0)
       default:
         break
@@ -466,11 +462,11 @@ private func wireCrossBlockGlobals(
 ///   - g: Graph containing nodes, tensors, and metadata used by emitters.
 ///   - backend: Target backend (`.metal` by default).
 ///   - debug: Reserved debug toggle (currently ignored).
-/// - Returns: Final UOps, block effective kind, and whether emission inserted its own frame loop.
+/// - Returns: Final UOps, frame order, vector width, and whether emission inserted its own frame loop.
 public func emitBlockUOps(
   ctx: IRContext, block: Block, blocks: [Block], g: Graph, backend: Backend = .metal,
   debug: Bool = false
-) throws -> (uops: [UOp], effectiveKind: Kind, hasOwnFrameLoop: Bool) {
+) throws -> (uops: [UOp], frameOrder: FrameOrder, vectorWidth: Int, hasOwnFrameLoop: Bool) {
   _ = debug
   resetFrameAwareBlockContext(ctx)
 
@@ -491,20 +487,21 @@ public func emitBlockUOps(
     emittedNodes: &emittedNodes)
   var bodyUops = bodyEmission.uops
 
-  let simdPlan = determineSIMDPlan(bodyUops: bodyUops, block: block, backend: backend)
-  applyKind(simdPlan.effectiveKind, to: &bodyUops)
+  let vectorPlan = determineVectorPlan(bodyUops: bodyUops, block: block, backend: backend)
+  applyVectorWidth(vectorPlan.vectorWidth, to: &bodyUops)
 
   var uops = wrapBodyUOpsWithTensorLoopIfNeeded(
     ctx: ctx, bodyUops: bodyUops, block: block, backend: backend,
     useShapeAwareEmission: useShapeAwareEmission,
-    simdIncrement: simdPlan.simdIncrement, effectiveKind: simdPlan.effectiveKind)
+    simdIncrement: vectorPlan.simdIncrement, vectorWidth: vectorPlan.vectorWidth)
 
   wireCrossBlockGlobals(
     uops: &uops, emittedNodes: emittedNodes, ctx: ctx, block: block, blocks: blocks, g: g)
 
   return (
     uops: uops,
-    effectiveKind: simdPlan.effectiveKind,
+    frameOrder: vectorPlan.frameOrder,
+    vectorWidth: vectorPlan.vectorWidth,
     hasOwnFrameLoop: bodyEmission.hasOwnFrameLoop
   )
 }
