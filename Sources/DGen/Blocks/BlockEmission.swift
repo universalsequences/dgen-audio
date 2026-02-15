@@ -64,13 +64,7 @@ public func emitThreadCountScaleOpIfNeeded(ctx: IRContext, block: Block, g: Grap
 
   // If this is a frame-based or hop-based block with frame-aware tensor outputs,
   // also set the flag that controls frame-aware memory addressing
-  let isParallelFrameBlock: Bool
-  if case .hopBased = block.temporality {
-    isParallelFrameBlock = true
-  } else {
-    isParallelFrameBlock = block.temporality == .frameBased
-  }
-  if isParallelFrameBlock {
+  if block.temporality != .static_ {
     let hasFrameAwareOutput = block.nodes.contains { nodeId in
       if let tensorId = g.nodeToTensor[nodeId],
         let tensor = g.tensors[tensorId]
@@ -305,29 +299,21 @@ private func determineVectorPlan(
   // Analyze emitted UOps to determine if SIMD is safe.
   // SIMD is safe if: tensor block + size divisible by 4 + no SIMD blockers + not frame-based.
   let hasSIMDBlockers = containsSIMDBlockers(bodyUops, backend: backend)
-  let canUseSIMD: Bool
-  let simdIncrement: Int
 
+  let canUseSIMD: Bool
   if let shape = block.shape, block.tensorIndex != nil {
     let size = shape.reduce(1, *)
     // Frame-based tensor blocks must run element-by-element per frame
     // because their values change every frame (e.g., downstream of phasor(tensor)).
     let isFrameBased = block.temporality == .frameBased
     canUseSIMD = !hasSIMDBlockers && !isFrameBased && (size % 4 == 0)
-    simdIncrement = canUseSIMD ? 4 : 1
   } else {
     canUseSIMD = false
-    simdIncrement = 1
   }
 
-  let vectorWidth: Int
-  if block.tensorIndex != nil {
-    vectorWidth = canUseSIMD ? 4 : 1
-  } else {
-    // Preserve block's frame order for dispatch, vectorWidth=1 (no SIMD for non-tensor blocks)
-    vectorWidth = 1
-  }
-  return (frameOrder: block.frameOrder, vectorWidth: vectorWidth, simdIncrement: simdIncrement)
+  // vectorWidth and simdIncrement are always the same: 4 for SIMD, 1 otherwise
+  let width = canUseSIMD ? 4 : 1
+  return (frameOrder: block.frameOrder, vectorWidth: width, simdIncrement: width)
 }
 
 /// Applies a uniform vector width to every emitted body UOp.

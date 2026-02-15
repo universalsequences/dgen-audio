@@ -556,25 +556,25 @@ public class CRenderer: Renderer {
       return "/* t\(varId) declared globally */"
 
     case .add(let a, let b):
-      let expr = uop.vectorWidth > 1 ? "vaddq_f32(\(g(a)), \(g(b)))" : "\(gi(a)) + \(gi(b))"
+      let expr = uop.isSimd ? "vaddq_f32(\(g(a)), \(g(b)))" : "\(gi(a)) + \(gi(b))"
       return emitAssign(uop, expr, ctx)
 
     case .mul(let a, let b):
-      let expr = uop.vectorWidth > 1 ? "vmulq_f32(\(g(a)), \(g(b)))" : "\(gi(a)) * \(gi(b))"
+      let expr = uop.isSimd ? "vmulq_f32(\(g(a)), \(g(b)))" : "\(gi(a)) * \(gi(b))"
       return emitAssign(uop, expr, ctx)
 
     case .sub(let a, let b):
-      let expr = uop.vectorWidth > 1 ? "vsubq_f32(\(g(a)), \(g(b)))" : "\(gi(a)) - \(gi(b))"
+      let expr = uop.isSimd ? "vsubq_f32(\(g(a)), \(g(b)))" : "\(gi(a)) - \(gi(b))"
       return emitAssign(uop, expr, ctx)
 
     case .div(let a, let b):
-      if uop.scalarType == .int && uop.vectorWidth <= 1 {
+      if uop.scalarType == .int && !uop.isSimd {
         return emitAssign(uop, "\(gi(a)) / \(gi(b))", ctx)
       }
       // Strength-reduce division by constant to multiply by reciprocal
       switch b {
       case .constant(_, let val):
-        if uop.vectorWidth > 1 {
+        if uop.isSimd {
           let expr = "vmulq_f32(\(g(a)), vdupq_n_f32(\(1.0/val)f))"
           return emitAssign(uop, expr, ctx)
         } else {
@@ -582,18 +582,18 @@ public class CRenderer: Renderer {
           return emitAssign(uop, expr, ctx)
         }
       default:
-        let expr = uop.vectorWidth > 1 ? "vdivq_f32(\(g(a)), \(g(b)))" : "\(g(a)) / \(g(b))"
+        let expr = uop.isSimd ? "vdivq_f32(\(g(a)), \(g(b)))" : "\(g(a)) / \(g(b))"
         return emitAssign(uop, expr, ctx)
       }
 
     case .mod(let a, let b):
-      if uop.scalarType == .int && uop.vectorWidth <= 1 {
+      if uop.scalarType == .int && !uop.isSimd {
         return emitAssign(uop, "\(gi(a)) % \(gi(b))", ctx)
       }
       // Fast modulo for constant denominator: a - floor(a / b) * b
       switch b {
       case .constant(_, let val):
-        if uop.vectorWidth > 1 {
+        if uop.isSimd {
           if val == 1.0 {
             let expr = "vsubq_f32(\(g(a)), vrndmq_f32(\(g(a))))"
             return emitAssign(uop, expr, ctx)
@@ -613,7 +613,7 @@ public class CRenderer: Renderer {
         }
       default:
         let expr =
-          uop.vectorWidth > 1 ? "vfmodq_f32(\(g(a)), \(g(b)))" : "fmodf(\(g(a)), \(g(b)))"
+          uop.isSimd ? "vfmodq_f32(\(g(a)), \(g(b)))" : "fmodf(\(g(a)), \(g(b)))"
         return emitAssign(uop, expr, ctx)
       }
 
@@ -622,13 +622,13 @@ public class CRenderer: Renderer {
       switch b {
       case .constant(_, let val):
         if val == 1.0 {
-          return emitAssign(uop, uop.vectorWidth > 1 ? "\(g(a))" : "\(g(a))", ctx)
+          return emitAssign(uop, "\(g(a))", ctx)
         } else if val == 2.0 {
           let expr =
-            uop.vectorWidth > 1 ? "vmulq_f32(\(g(a)), \(g(a)))" : "(\(g(a)) * \(g(a)))"
+            uop.isSimd ? "vmulq_f32(\(g(a)), \(g(a)))" : "(\(g(a)) * \(g(a)))"
           return emitAssign(uop, expr, ctx)
         } else if val == 3.0 {
-          if uop.vectorWidth > 1 {
+          if uop.isSimd {
             let expr = "vmulq_f32(vmulq_f32(\(g(a)), \(g(a))), \(g(a)))"
             return emitAssign(uop, expr, ctx)
           } else {
@@ -636,7 +636,7 @@ public class CRenderer: Renderer {
             return emitAssign(uop, expr, ctx)
           }
         } else if val == 4.0 {
-          if uop.vectorWidth > 1 {
+          if uop.isSimd {
             let t2 = "vmulq_f32(\(g(a)), \(g(a)))"
             let expr = "vmulq_f32(\(t2), \(t2))"
             return emitAssign(uop, expr, ctx)
@@ -645,19 +645,19 @@ public class CRenderer: Renderer {
             return emitAssign(uop, expr, ctx)
           }
         } else if val == 0.5 {
-          let expr = uop.vectorWidth > 1 ? "vsqrtf(\(g(a)))" : "sqrtf(\(g(a)))"
+          let expr = uop.isSimd ? "vsqrtf(\(g(a)))" : "sqrtf(\(g(a)))"
           return emitAssign(uop, expr, ctx)
         } else if val == 0.0 {
-          let expr = uop.vectorWidth > 1 ? "vdupq_n_f32(1.0f)" : "1.0f"
+          let expr = uop.isSimd ? "vdupq_n_f32(1.0f)" : "1.0f"
           return emitAssign(uop, expr, ctx)
         }
         // Fallback
-        let expr = uop.vectorWidth > 1 ? "vpowf(\(g(a)), \(g(b)))" : "powf(\(g(a)), \(g(b)))"
+        let expr = uop.isSimd ? "vpowf(\(g(a)), \(g(b)))" : "powf(\(g(a)), \(g(b)))"
         return emitAssign(uop, expr, ctx)
       default:
         // If base is constant, emit exp(b * log(base)) which is faster than generic pow
         if case .constant(_, let baseVal) = a {
-          if uop.vectorWidth > 1 {
+          if uop.isSimd {
             let expr = "vexpf(vmulq_f32(\(g(b)), vdupq_n_f32(logf(\(baseVal)f))))"
             return emitAssign(uop, expr, ctx)
           } else {
@@ -665,24 +665,24 @@ public class CRenderer: Renderer {
             return emitAssign(uop, expr, ctx)
           }
         }
-        let expr = uop.vectorWidth > 1 ? "vpowf(\(g(a)), \(g(b)))" : "powf(\(g(a)), \(g(b)))"
+        let expr = uop.isSimd ? "vpowf(\(g(a)), \(g(b)))" : "powf(\(g(a)), \(g(b)))"
         return emitAssign(uop, expr, ctx)
       }
 
     case .min(let a, let b):
-      let expr = uop.vectorWidth > 1 ? "vminq_f32(\(g(a)), \(g(b)))" : "fminf(\(g(a)), \(g(b)))"
+      let expr = uop.isSimd ? "vminq_f32(\(g(a)), \(g(b)))" : "fminf(\(g(a)), \(g(b)))"
       return emitAssign(uop, expr, ctx)
 
     case .max(let a, let b):
-      let expr = uop.vectorWidth > 1 ? "vmaxq_f32(\(g(a)), \(g(b)))" : "fmaxf(\(g(a)), \(g(b)))"
+      let expr = uop.isSimd ? "vmaxq_f32(\(g(a)), \(g(b)))" : "fmaxf(\(g(a)), \(g(b)))"
       return emitAssign(uop, expr, ctx)
 
     case .abs(let a):
-      let expr = uop.vectorWidth > 1 ? "vabsq_f32(\(g(a)))" : "fabs(\(g(a)))"
+      let expr = uop.isSimd ? "vabsq_f32(\(g(a)))" : "fabs(\(g(a)))"
       return emitAssign(uop, expr, ctx)
 
     case .sign(let a):
-      if uop.vectorWidth > 1 {
+      if uop.isSimd {
         // For SIMD: return -1.0 for negative, 1.0 for positive, 0.0 for zero
         let expr =
           "vbslq_f32(vcltq_f32(\(g(a)), vdupq_n_f32(0.0f)), vdupq_n_f32(-1.0f), vbslq_f32(vcgtq_f32(\(g(a)), vdupq_n_f32(0.0f)), vdupq_n_f32(1.0f), vdupq_n_f32(0.0f)))"
@@ -693,23 +693,20 @@ public class CRenderer: Renderer {
       }
 
     case .floor(let a):
-      let expr = uop.vectorWidth > 1 ? "vrndmq_f32(\(g(a)))" : "floorf(\(g(a)))"
+      let expr = uop.isSimd ? "vrndmq_f32(\(g(a)))" : "floorf(\(g(a)))"
       return emitAssign(uop, expr, ctx)
 
     case .ceil(let a):
-      let expr = uop.vectorWidth > 1 ? "vrndpq_f32(\(g(a)))" : "ceilf(\(g(a)))"
+      let expr = uop.isSimd ? "vrndpq_f32(\(g(a)))" : "ceilf(\(g(a)))"
       return emitAssign(uop, expr, ctx)
 
     case .round(let a):
-      let expr =
-        uop.vectorWidth > 1
-        ? "vrndaq_f32(\(g(a)))"
-        : "roundf(\(g(a)))"
+      let expr = uop.isSimd ? "vrndaq_f32(\(g(a)))" : "roundf(\(g(a)))"
       return emitAssign(uop, expr, ctx)
 
     case .noise(let cellId):
       // Xorshift32 PRNG - better spectral properties than LCG
-      if uop.vectorWidth > 1 {
+      if uop.isSimd {
         // For SIMD, generate 4 random values using 4 sequential xorshift updates
         let expr = """
           ({
@@ -742,7 +739,7 @@ public class CRenderer: Renderer {
       }
 
     case .memoryRead(let base, let offset):
-      if uop.vectorWidth > 1 {
+      if uop.isSimd {
         let offsetExpr = g(offset)
         // Check offset type to determine how to handle it
         let offsetType: EmittedType
@@ -777,7 +774,7 @@ public class CRenderer: Renderer {
       }
 
     case .memoryWrite(let base, let offset, let value):
-      if uop.vectorWidth > 1 {
+      if uop.isSimd {
         let offsetExpr = g(offset)
         let valueExpr = g(value)
         // Check offset type to determine how to handle it
@@ -806,50 +803,50 @@ public class CRenderer: Renderer {
         return "memory[\(base) + \(cast)\(g(offset))] = \(g(value));"
       }
     case .sin(let a):
-      let expr = uop.vectorWidth > 1 ? "vsinf(\(g(a)))" : "sinf(\(g(a)))"
+      let expr = uop.isSimd ? "vsinf(\(g(a)))" : "sinf(\(g(a)))"
       return emitAssign(uop, expr, ctx)
 
     case .cos(let a):
-      let expr = uop.vectorWidth > 1 ? "vcosf(\(g(a)))" : "cosf(\(g(a)))"
+      let expr = uop.isSimd ? "vcosf(\(g(a)))" : "cosf(\(g(a)))"
       return emitAssign(uop, expr, ctx)
 
     case .tan(let a):
-      let expr = uop.vectorWidth > 1 ? "vtanf(\(g(a)))" : "tanf(\(g(a)))"
+      let expr = uop.isSimd ? "vtanf(\(g(a)))" : "tanf(\(g(a)))"
       return emitAssign(uop, expr, ctx)
 
     case .tanh(let a):
-      let expr = uop.vectorWidth > 1 ? "vtanhf(\(g(a)))" : "tanhf(\(g(a)))"
+      let expr = uop.isSimd ? "vtanhf(\(g(a)))" : "tanhf(\(g(a)))"
       return emitAssign(uop, expr, ctx)
 
     case .exp(let a):
-      let expr = uop.vectorWidth > 1 ? "vexpf(\(g(a)))" : "expf(\(g(a)))"
+      let expr = uop.isSimd ? "vexpf(\(g(a)))" : "expf(\(g(a)))"
       return emitAssign(uop, expr, ctx)
 
     case .log(let a):
-      let expr = uop.vectorWidth > 1 ? "vlogf(\(g(a)))" : "logf(\(g(a)))"
+      let expr = uop.isSimd ? "vlogf(\(g(a)))" : "logf(\(g(a)))"
       return emitAssign(uop, expr, ctx)
 
     case .log10(let a):
       let expr =
-        uop.vectorWidth > 1
+        uop.isSimd
         ? "vmulq_f32(vlogf(\(g(a))), vdupq_n_f32((float)M_LOG10E))"  // log10(x) = ln(x) * log10(e)
         : "log10f(\(g(a)))"
       return emitAssign(uop, expr, ctx)
 
     case .sqrt(let a):
-      let expr = uop.vectorWidth > 1 ? "vsqrtf(\(g(a)))" : "sqrtf(\(g(a)))"
+      let expr = uop.isSimd ? "vsqrtf(\(g(a)))" : "sqrtf(\(g(a)))"
       return emitAssign(uop, expr, ctx)
 
     case .and(let a, let b):
       let expr =
-        uop.vectorWidth > 1
+        uop.isSimd
         ? "simd_and_f32(\(g(a)), \(g(b)))"
         : "(((\(g(a)) != 0.0f) && (\(g(b)) != 0.0f)) ? 1.0f : 0.0f)"
       return emitAssign(uop, expr, ctx)
 
     case .or(let a, let b):
       let expr =
-        uop.vectorWidth > 1
+        uop.isSimd
         ? "simd_or_f32(\(g(a)), \(g(b)))"
         : "(((\(g(a)) != 0.0f) || (\(g(b)) != 0.0f)) ? 1.0f : 0.0f)"
       return emitAssign(uop, expr, ctx)
@@ -857,35 +854,35 @@ public class CRenderer: Renderer {
     case .xor(let a, let b):
       // XOR: true iff exactly one is non-zero
       let expr =
-        uop.vectorWidth > 1
+        uop.isSimd
         ? "simd_xor_f32(\(g(a)), \(g(b)))"
         : "((((\(g(a)) != 0.0f) ^ ((\(g(b)) != 0.0f))) ? 1.0f : 0.0f))"
       return emitAssign(uop, expr, ctx)
     case .atan2(let y, let x):
-      let expr = uop.vectorWidth > 1 ? "vatan2f(\(g(y)), \(g(x)))" : "atan2f(\(g(y)), \(g(x)))"
+      let expr = uop.isSimd ? "vatan2f(\(g(y)), \(g(x)))" : "atan2f(\(g(y)), \(g(x)))"
       return emitAssign(uop, expr, ctx)
 
     case .gt(let a, let b):
       let expr =
-        uop.vectorWidth > 1
+        uop.isSimd
         ? "vbslq_f32(vcgtq_f32(\(g(a)), \(g(b))), vdupq_n_f32(1.0f), vdupq_n_f32(0.0f))"
         : "\(g(a)) > \(g(b))"
       return emitAssign(uop, expr, ctx)
     case .gte(let a, let b):
       let expr =
-        uop.vectorWidth > 1
+        uop.isSimd
         ? "vbslq_f32(vcgeq_f32(\(g(a)), \(g(b))), vdupq_n_f32(1.0f), vdupq_n_f32(0.0f))"
         : "\(g(a)) >= \(g(b))"
       return emitAssign(uop, expr, ctx)
     case .lte(let a, let b):
       let expr =
-        uop.vectorWidth > 1
+        uop.isSimd
         ? "vbslq_f32(vcleq_f32(\(g(a)), \(g(b))), vdupq_n_f32(1.0f), vdupq_n_f32(0.0f))"
         : "\(g(a)) <= \(g(b))"
       return emitAssign(uop, expr, ctx)
     case .lt(let a, let b):
       let expr =
-        uop.vectorWidth > 1
+        uop.isSimd
         ? "vbslq_f32(vcltq_f32(\(g(a)), \(g(b))), vdupq_n_f32(1.0f), vdupq_n_f32(0.0f))"
         : "\(g(a)) < \(g(b))"
       return emitAssign(uop, expr, ctx)
@@ -893,7 +890,7 @@ public class CRenderer: Renderer {
       // Constant-fold equality when both operands are constants
       switch (a, b) {
       case (.constant(_, let av), .constant(_, let bv)):
-        if uop.vectorWidth > 1 {
+        if uop.isSimd {
           let expr = (av == bv) ? "vdupq_n_f32(1.0f)" : "vdupq_n_f32(0.0f)"
           return emitAssign(uop, expr, ctx)
         } else {
@@ -901,14 +898,14 @@ public class CRenderer: Renderer {
         }
       default:
         let expr =
-          uop.vectorWidth > 1
+          uop.isSimd
           ? "vbslq_f32(vceqq_f32(\(g(a)), \(g(b))), vdupq_n_f32(1.0f), vdupq_n_f32(0.0f))"
           : "\(g(a)) == \(g(b))"
         return emitAssign(uop, expr, ctx)
       }
 
     case .gswitch(let cond, let a, let b):
-      if uop.vectorWidth > 1 {
+      if uop.isSimd {
         // For SIMD: use vbslq_f32 to select between a and b based on condition > 0
         let mask = "vcgtq_f32(\(g(cond)), vdupq_n_f32(0.0f))"
         let expr = "vbslq_f32(\(mask), \(g(a)), \(g(b)))"
@@ -918,7 +915,7 @@ public class CRenderer: Renderer {
         return emitAssign(uop, expr, ctx)
       }
     case .delay1(let cell, let curr):
-      if uop.vectorWidth > 1 {
+      if uop.isSimd {
         // Return delayed value, and also persist current vector into memory for next chunk
         let expr = "vextq_f32(vld1q_f32(&memory[\(cell)]), \(g(curr)), 3)"
         let assign = emitAssign(uop, expr, ctx)
@@ -929,7 +926,7 @@ public class CRenderer: Renderer {
         return "\(assign) memory[\(cell)] = \(g(curr));"
       }
     case .selector(let mode, let options):
-      if uop.vectorWidth > 1 {
+      if uop.isSimd {
         // For SIMD: if mode <= 0 return 0, if mode <= 1 return options[0], etc.
         var expr = "vdupq_n_f32(0.0f)"  // Default to 0 if mode <= 0
 
@@ -957,14 +954,14 @@ public class CRenderer: Renderer {
       }
 
     case .store(let cell, let val):
-      if uop.vectorWidth > 1 {
+      if uop.isSimd {
         // For SIMD: store all 4 vector elements to consecutive memory slots
         return "vst1q_f32(&memory[\(cell)], \(g(val)));"
       } else {
         return "memory[\(cell)] = \(g(val));"
       }
     case .load(let cell):
-      if uop.vectorWidth > 1 {
+      if uop.isSimd {
         // For SIMD: load 4 consecutive memory slots into vector
         return emitAssign(uop, "vld1q_f32(&memory[\(cell)])", ctx)
       } else {
@@ -974,7 +971,7 @@ public class CRenderer: Renderer {
       // loadTape reads from global tape buffer with bounds checking
       // In C, this is handled at compile-time (no runtime bounds check for now)
       let varId = g(val)  // The signal/variable to load from
-      if uop.vectorWidth > 1 {
+      if uop.isSimd {
         // SIMD: load 4 consecutive frames from tape starting at [offset + i]
         return emitAssign(uop, "vld1q_f32(&tape[\(varId)][\(g(offset))])", ctx)
       } else {
@@ -988,7 +985,7 @@ public class CRenderer: Renderer {
 
     case .input(let channel):
       let idxExpr = frameIndexOverride ?? "i"
-      if uop.vectorWidth > 1 {
+      if uop.isSimd {
         // For SIMD: load 4 consecutive memory slots into vector
         let ptr = "in[\(channel)] + i"
         return emitAssign(uop, "vld1q_f32(\(ptr))", ctx)
@@ -998,7 +995,7 @@ public class CRenderer: Renderer {
       }
     case .output(let channel, let val):
       let idxExpr = frameIndexOverride ?? "i"
-      if uop.vectorWidth > 1 {
+      if uop.isSimd {
         // When overriding frame index, fall back to scalar stores for correctness
         if frameIndexOverride != nil {
           let idx = "(int)(\(idxExpr))"
@@ -1042,7 +1039,7 @@ public class CRenderer: Renderer {
       // Use the parallel range loop variable if inside one, otherwise 'i'
       let loopVar = parallelRangeVarStack.last ?? "i"
       // For SIMD, create a vector of sequential indices: {idx, idx+1, idx+2, idx+3}
-      if uop.vectorWidth > 1 {
+      if uop.isSimd {
         let varId = extractVarId(uop.value)
         varEmittedTypes[varId] = .float32x4
         let lhs = emitLazy(uop.value, ctx: ctx, vectorWidth: uop.vectorWidth, isOut: true)
@@ -1068,7 +1065,7 @@ public class CRenderer: Renderer {
       return emitAssign(uop, frameIndexOverride ?? baseIdx, ctx)
 
     case .identity(let a):
-      let expr = uop.vectorWidth > 1 ? "\(g(a))" : "\(gi(a))"
+      let expr = uop.isSimd ? "\(g(a))" : "\(gi(a))"
       return emitAssign(uop, expr, ctx)
 
     case .cast(let expr, let castType):
@@ -1094,7 +1091,7 @@ public class CRenderer: Renderer {
         frameIndexOverride
         ?? (currentThreadCountScale == nil ? baseIdx : "(\(baseIdx) / \(currentThreadCountScale!))")
 
-      if uop.vectorWidth > 1 {
+      if uop.isSimd {
         // Create a proper SIMD variable declaration for loadGlobal
         if staticGlobalVars.contains(id) {
           return "float32x4_t simd\(id) = vdupq_n_f32(t\(id)[0]);"
@@ -1120,7 +1117,7 @@ public class CRenderer: Renderer {
     case .beginParallelRange(let count, var incr):
       // For scalar blocks, always use incr=1 even if the UOp specifies incr=4
       // This fixes the mismatch where a scalar block has a SIMD parallel range
-      if uop.vectorWidth <= 1 {
+      if !uop.isSimd {
         incr = 1
       }
       let pre = incr == 4 ? "simd" : "t"
@@ -1220,7 +1217,7 @@ public class CRenderer: Renderer {
     let varId = extractVarId(uop.value)
     let isGlobal = ctx.globals.contains(varId)
 
-    if uop.vectorWidth > 1 {
+    if uop.isSimd {
       // Track type as float32x4 (or float if forced)
       varEmittedTypes[varId] = forceFloatType ? .float_ : .float32x4
 

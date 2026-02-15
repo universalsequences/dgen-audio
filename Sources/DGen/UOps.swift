@@ -200,6 +200,9 @@ public struct UOp {
   public var tensorIndex: Lazy? = nil
   public var scalarType: CastType = .float  // int or float for variable declarations
 
+  /// Whether this UOp uses SIMD vectorization (vectorWidth > 1).
+  public var isSimd: Bool { vectorWidth > 1 }
+
   public init(
     op: Op, value: Lazy, vectorWidth: Int = 1,
     tensorIndex: Lazy? = nil,

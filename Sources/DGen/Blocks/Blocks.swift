@@ -2,7 +2,12 @@
 import Foundation
 
 /// Whether frames in this block depend on each other.
-public enum FrameOrder { case sequential, parallel }
+public enum FrameOrder {
+  case sequential, parallel
+
+  public var isParallel: Bool { self == .parallel }
+  public var isSequential: Bool { self == .sequential }
+}
 
 // corresponds to one kernel (metal backends) or for loop (in C backend)
 public struct Block: Equatable {
