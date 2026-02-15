@@ -215,6 +215,9 @@ enum DDSPE2ETrainer {
       "numHarmonics": "\(config.numHarmonics)",
       "hiddenSize": "\(config.modelHiddenSize)",
       "lr": "\(config.learningRate)",
+      "lrSchedule": config.lrSchedule.rawValue,
+      "lrMin": "\(config.lrMin)",
+      "lrWarmupSteps": "\(config.lrWarmupSteps)",
       "mseWeight": "\(config.mseLossWeight)",
       "gradClipMode": config.gradClipMode.rawValue,
       "gradClip": "\(config.gradClip)",
@@ -274,6 +277,18 @@ enum DDSPE2ETrainer {
 
     for step in 0..<steps {
       let tStepStart = CFAbsoluteTimeGetCurrent()
+
+      // Update learning rate per schedule
+      let currentLR = computeLR(
+        step: step,
+        totalSteps: steps,
+        maxLR: config.learningRate,
+        minLR: config.lrMin,
+        schedule: config.lrSchedule,
+        warmupSteps: config.lrWarmupSteps,
+        halfLife: config.lrHalfLife
+      )
+      optimizer.lr = currentLR
 
       if step > 0, step % order.count == 0, config.shuffleChunks {
         order.shuffle(using: &rng)
@@ -405,7 +420,7 @@ enum DDSPE2ETrainer {
           gradInfo = ""
         }
         logger(
-          "step=\(step) loss=\(format(stepLoss)) specW=\(format(spectralWeight)) "
+          "step=\(step) loss=\(formatLoss(stepLoss)) lr=\(formatLR(currentLR)) specW=\(format(spectralWeight)) "
             + "chunk=\(entry.id)\(gradInfo) "
             + "tStepMs=\(format(Double(stepMs))) tEMAms=\(format(Double(emaStepMs))) "
             + "tLoadMs=\(format(Double(loadMs))) tGraphMs=\(format(Double(graphMs))) "
@@ -456,7 +471,7 @@ enum DDSPE2ETrainer {
 
     logger("M2 training complete")
     logger(
-      "firstLoss=\(format(first)) finalLoss=\(format(lastFiniteLoss)) reduction=\(format(first / max(lastFiniteLoss, 1e-12))) "
+      "firstLoss=\(formatLoss(first)) finalLoss=\(formatLoss(lastFiniteLoss)) reduction=\(format(first / max(lastFiniteLoss, 1e-12))) "
         + "validUpdates=\(validUpdates) avgStepMs=\(format(totalStepMs / denomSteps)) "
         + "avgBackwardMs=\(format(totalBackwardMs / denomSteps)) maxStepMs=\(format(maxStepMs))@\(maxStep)"
     )
@@ -676,8 +691,53 @@ enum DDSPE2ETrainer {
     try data.write(to: url)
   }
 
+  private static func computeLR(
+    step: Int,
+    totalSteps: Int,
+    maxLR: Float,
+    minLR: Float,
+    schedule: LRSchedule,
+    warmupSteps: Int,
+    halfLife: Int = 50
+  ) -> Float {
+    switch schedule {
+    case .none:
+      return maxLR
+    case .cosine:
+      // Linear warmup from minLR to maxLR
+      if warmupSteps > 0, step < warmupSteps {
+        let t = Float(step) / Float(warmupSteps)
+        return minLR + (maxLR - minLR) * t
+      }
+      // Cosine decay from maxLR to minLR
+      let decaySteps = totalSteps - warmupSteps
+      guard decaySteps > 0 else { return maxLR }
+      let progress = Float(step - warmupSteps) / Float(decaySteps)
+      let cosineDecay = 0.5 * (1.0 + cos(Float.pi * progress))
+      return minLR + (maxLR - minLR) * cosineDecay
+    case .exp:
+      // Linear warmup from minLR to maxLR
+      if warmupSteps > 0, step < warmupSteps {
+        let t = Float(step) / Float(warmupSteps)
+        return minLR + (maxLR - minLR) * t
+      }
+      // Exponential decay: LR halves every `halfLife` steps
+      let decayStep = Float(step - warmupSteps)
+      let decay = pow(0.5, decayStep / Float(halfLife))
+      return max(minLR, minLR + (maxLR - minLR) * decay)
+    }
+  }
+
   private static func format(_ value: Float) -> String {
     String(format: "%.6f", value)
+  }
+
+  private static func formatLoss(_ value: Float) -> String {
+    String(format: "%.4e", value)
+  }
+
+  private static func formatLR(_ value: Float) -> String {
+    String(format: "%.2e", value)
   }
 
   private static func format(_ value: Double) -> String {

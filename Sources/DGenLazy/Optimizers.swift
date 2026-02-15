@@ -122,8 +122,8 @@ public class SGD: Optimizer {
 /// opt.zeroGrad()
 /// ```
 public class Adam: Optimizer {
-  /// Learning rate
-  public let lr: Float
+  /// Learning rate (mutable for LR scheduling)
+  public var lr: Float
 
   /// First moment decay rate
   public let beta1: Float

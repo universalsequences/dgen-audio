@@ -111,6 +111,7 @@ public class MetalRenderer: Renderer, UOpEmitter {
         name: kernelName,
         source: source,
         kind: scheduleItem.kind,
+        temporality: scheduleItem.temporality,
         buffers: bufferNames,
         threadGroupSize: threadGroupSize,
         threadCount: threadCountOverride,
@@ -580,12 +581,18 @@ public class MetalRenderer: Renderer, UOpEmitter {
           }
         }
 
-        let isStaticScalar = block.temporality == .static_ && block.kind == .scalar
+        let isStatic = block.temporality == .static_
         let isScalar = block.kind == .scalar
 
-        if block.hasOwnFrameLoop || isStaticScalar {
-          // Static scalar blocks: run once, no frame loop needed
-          var beginRange = UOp(op: .beginRange(.constant(0, 0), .constant(0, 1)), value: .empty)
+        if block.hasOwnFrameLoop || isStatic {
+          // Static blocks: dispatch threadCountScale threads (or 1) with no frame loop.
+          let rangeEnd: Lazy
+          if block.kind != .scalar, let scale = block.threadCountScale {
+            rangeEnd = .constant(0, Float(scale))
+          } else {
+            rangeEnd = .constant(0, 1)
+          }
+          var beginRange = UOp(op: .beginRange(.constant(0, 0), rangeEnd), value: .empty)
           beginRange.kind = block.kind
           scheduleItem.ops.append(beginRange)
           hasFrameLoop = false

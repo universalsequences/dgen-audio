@@ -1,0 +1,22 @@
+    swift run -c release DDSPE2E train \
+    --cache .ddsp_cache_overfit1 \
+    --mode m2 \
+    --split train \
+    --steps 3000 \
+    --shuffle false \
+    --seed 1 \
+    --lr 0.5 \
+    --lr-schedule cosine \
+    --lr-warmup-steps 0 \
+    --lr-min 1e-2 \
+    --grad-clip 1.0 \
+    --mse-weight 0 \
+    --spectral-weight 1.0 \
+    --spectral-windows 512,1024 \
+    --spectral-hop-divisor 4 \
+    --spectral-warmup-steps 0 \
+    --spectral-ramp-steps 0 \
+    --log-every 1 \
+    --model-hidden 64 \
+    --harmonics 64 \
+    --run-name lr_cosine_05 --model-layers 2  --lr-schedule exp --lr-half-life 1500 --kernel-dump test_kernel.metal

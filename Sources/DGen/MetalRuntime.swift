@@ -314,7 +314,16 @@ public class MetalCompiledKernel: CompiledKernelRuntime {
       }
 
       let totalThreads: Int
-      if let scale = kernel.threadCountScale {
+      if kernel.temporality == .static_ {
+        // Static blocks: dispatch threadCountScale threads (or override, or 1)
+        if let scale = kernel.threadCountScale {
+          totalThreads = max(1, scale)
+        } else if let override = kernel.threadCount {
+          totalThreads = max(1, override)
+        } else {
+          totalThreads = 1
+        }
+      } else if let scale = kernel.threadCountScale {
         totalThreads = max(1, frameCount * scale)
       } else if let overrideThreads = kernel.threadCount {
         totalThreads = max(1, overrideThreads)

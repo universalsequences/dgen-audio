@@ -280,7 +280,8 @@ private func emitBlockBodyUOps(
   if useShapeAwareEmission {
     // Use specialized emission with per-shape element loops.
     let shapeAwareUOps = try emitScalarBlockWithShapeTransitions(
-      ctx: ctx, block: block, blocks: blocks, g: g, transitions: shapeTransitions
+      ctx: ctx, block: block, blocks: blocks, g: g, transitions: shapeTransitions,
+      backend: backend
     )
     for nodeId in block.nodes {
       emittedNodes.insert(nodeId)

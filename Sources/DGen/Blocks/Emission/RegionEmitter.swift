@@ -12,7 +12,8 @@ import Foundation
 ///   - g: Graph containing node definitions.
 /// - Returns: UOps for exactly one region.
 private func emitRegion(
-  _ region: EmissionRegion, ctx: IRContext, g: Graph
+  _ region: EmissionRegion, ctx: IRContext, g: Graph,
+  parallelElemIdx: Lazy? = nil
 ) throws -> [UOp] {
   var uops: [UOp] = []
 
@@ -37,33 +38,47 @@ private func emitRegion(
     : region.tensorNodes.filter { !ctx.skippedTensorComputeNodes.contains($0) }
 
   if !activeTensorNodes.isEmpty {
-    let elemVar = ctx.useVariable(src: nil)
-    let elementCount = region.shape.reduce(1, *)
-
-    if !region.isConvOnly {
-      var beginLoop = UOp(
-        op: .beginForLoop(elemVar, .constant(0, Float(elementCount))),
-        value: elemVar
-      )
-      beginLoop.kind = .scalar
-      uops.append(beginLoop)
-    }
-
-    for nodeId in activeTensorNodes {
-      ctx.tensorIndices[nodeId] = elemVar
-      if let node = g.nodes[nodeId] {
-        for uop in try node.op.emit(ctx: ctx, g: g, nodeId: nodeId) {
-          var typedUop = uop
-          typedUop.kind = .scalar
-          uops.append(typedUop)
+    // When parallelElemIdx is provided, each thread handles one element — no loop needed.
+    if let elemIdx = parallelElemIdx, !region.isConvOnly {
+      for nodeId in activeTensorNodes {
+        ctx.tensorIndices[nodeId] = elemIdx
+        if let node = g.nodes[nodeId] {
+          for uop in try node.op.emit(ctx: ctx, g: g, nodeId: nodeId) {
+            var typedUop = uop
+            typedUop.kind = .scalar
+            uops.append(typedUop)
+          }
         }
       }
-    }
+    } else {
+      let elemVar = ctx.useVariable(src: nil)
+      let elementCount = region.shape.reduce(1, *)
 
-    if !region.isConvOnly {
-      var endLoop = UOp(op: .endLoop, value: .empty)
-      endLoop.kind = .scalar
-      uops.append(endLoop)
+      if !region.isConvOnly {
+        var beginLoop = UOp(
+          op: .beginForLoop(elemVar, .constant(0, Float(elementCount))),
+          value: elemVar
+        )
+        beginLoop.kind = .scalar
+        uops.append(beginLoop)
+      }
+
+      for nodeId in activeTensorNodes {
+        ctx.tensorIndices[nodeId] = elemVar
+        if let node = g.nodes[nodeId] {
+          for uop in try node.op.emit(ctx: ctx, g: g, nodeId: nodeId) {
+            var typedUop = uop
+            typedUop.kind = .scalar
+            uops.append(typedUop)
+          }
+        }
+      }
+
+      if !region.isConvOnly {
+        var endLoop = UOp(op: .endLoop, value: .empty)
+        endLoop.kind = .scalar
+        uops.append(endLoop)
+      }
     }
   }
 
@@ -87,7 +102,8 @@ private func emitRegion(
 /// - Returns: Ordered UOps spanning all planned regions for the block.
 public func emitScalarBlockWithShapeTransitions(
   ctx: IRContext, block: Block, blocks: [Block], g: Graph,
-  transitions: [(nodeIndex: Int, shape: [Int])]
+  transitions: [(nodeIndex: Int, shape: [Int])],
+  backend: Backend = .c
 ) throws -> [UOp] {
   // Reset per-block sumAxis fusion metadata; detection repopulates it for this block.
   ctx.inlineReduceSources = [:]
@@ -110,7 +126,47 @@ public func emitScalarBlockWithShapeTransitions(
     block: block, g: g, ctx: ctx,
     transitions: transitions, skipRegions: skipRegions)
 
-  // Emit each region
+  // Metal: parallelize elements across threads when a single active region has uniform
+  // element count. Guards: no scalar nodes (would execute per-thread), no conv (own loops),
+  // single active region (cross-region deps would race without barriers).
+  if backend == .metal {
+    var uniformCount: Int? = nil
+    var canParallelize = true
+    var activeRegionCount = 0
+    for region in regions {
+      // Scalar nodes are per-frame operations (atomic adds, gradient writes, etc.)
+      // that must not be duplicated across element threads.
+      if !region.scalarNodes.isEmpty && !region.isSkipped {
+        canParallelize = false; break
+      }
+      let active = region.isSkipped ? [] : region.tensorNodes
+      guard !active.isEmpty else { continue }
+      activeRegionCount += 1
+      if region.isConvOnly { canParallelize = false; break }
+      let count = region.shape.reduce(1, *)
+      if count <= 1 { continue }
+      if let existing = uniformCount {
+        if existing != count { canParallelize = false; break }
+      } else {
+        uniformCount = count
+      }
+    }
+    // Multiple active regions may have cross-region data dependencies (e.g., sumAxis
+    // reading from a preceding mul). Without inter-thread barriers within a kernel,
+    // parallelizing would cause race conditions.
+    if activeRegionCount > 1 { canParallelize = false }
+    if canParallelize, let elemCount = uniformCount {
+      let setup = IRBuilder(ctx: ctx, nodeId: block.nodes[block.nodes.count - 1])
+      let (_, elemIdx) = setup.setupFlatThreading(tensorSize: elemCount)
+      var uops: [UOp] = setup.ops
+      for region in regions {
+        uops += try emitRegion(region, ctx: ctx, g: g, parallelElemIdx: elemIdx.lazy)
+      }
+      return uops
+    }
+  }
+
+  // Fallback: sequential element loops per region.
   var uops: [UOp] = []
   for region in regions {
     uops += try emitRegion(region, ctx: ctx, g: g)

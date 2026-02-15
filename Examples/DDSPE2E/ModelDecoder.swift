@@ -16,11 +16,12 @@ struct NamedTensorSnapshot: Codable {
 final class DDSPDecoderModel {
   let inputSize: Int = 3
   let hiddenSize: Int
+  let numLayers: Int
   let numHarmonics: Int
 
-  // Shared trunk
-  let W1: Tensor
-  let b1: Tensor
+  // Trunk layers: [(W, b), ...]
+  let trunkWeights: [Tensor]
+  let trunkBiases: [Tensor]
 
   // Heads
   let W_harm: Tensor
@@ -34,22 +35,27 @@ final class DDSPDecoderModel {
 
   init(config: DDSPE2EConfig) {
     self.hiddenSize = config.modelHiddenSize
+    self.numLayers = max(1, config.modelNumLayers)
     self.numHarmonics = config.numHarmonics
 
     var rng = SeededGenerator(seed: config.seed)
 
-    self.W1 = Tensor.param([inputSize, hiddenSize], data: Self.randomArray(
-      count: inputSize * hiddenSize,
-      scale: 0.08,
-      rng: &rng
-    ))
-    self.b1 = Tensor.param([1, hiddenSize], data: [Float](repeating: 0.0, count: hiddenSize))
+    var weights: [Tensor] = []
+    var biases: [Tensor] = []
+    for i in 0..<numLayers {
+      let fanIn = i == 0 ? inputSize : hiddenSize
+      let scale: Float = sqrt(2.0 / Float(fanIn)) * 0.5
+      let W = Tensor.param([fanIn, hiddenSize], data: Self.randomArray(
+        count: fanIn * hiddenSize, scale: scale, rng: &rng))
+      let b = Tensor.param([1, hiddenSize], data: [Float](repeating: 0.0, count: hiddenSize))
+      weights.append(W)
+      biases.append(b)
+    }
+    self.trunkWeights = weights
+    self.trunkBiases = biases
 
     self.W_harm = Tensor.param([hiddenSize, numHarmonics], data: Self.randomArray(
-      count: hiddenSize * numHarmonics,
-      scale: 0.06,
-      rng: &rng
-    ))
+      count: hiddenSize * numHarmonics, scale: 0.06, rng: &rng))
     self.b_harm = Tensor.param([1, numHarmonics], data: [Float](repeating: 0.0, count: numHarmonics))
 
     self.W_hgain = Tensor.param([hiddenSize, 1], data: Self.randomArray(count: hiddenSize, scale: 0.05, rng: &rng))
@@ -64,12 +70,21 @@ final class DDSPDecoderModel {
   }
 
   var parameters: [any LazyValue] {
-    [W1, b1, W_harm, b_harm, W_hgain, b_hgain, W_noise, b_noise]
+    var params: [any LazyValue] = []
+    for i in 0..<numLayers {
+      params.append(trunkWeights[i])
+      params.append(trunkBiases[i])
+    }
+    params.append(contentsOf: [W_harm, b_harm, W_hgain, b_hgain, W_noise, b_noise])
+    return params
   }
 
   func forward(features: Tensor) -> DecoderControls {
-    // trunk: [F,3] -> [F,H]
-    let hidden = tanh(features.matmul(W1) + b1)
+    // trunk: [F,3] -> [F,H] -> ... -> [F,H]
+    var hidden = features
+    for i in 0..<numLayers {
+      hidden = tanh(hidden.matmul(trunkWeights[i]) + trunkBiases[i])
+    }
 
     // harmonic amplitudes [F,K]
     let harmLogits = hidden.matmul(W_harm) + b_harm
@@ -91,22 +106,28 @@ final class DDSPDecoderModel {
   }
 
   func snapshots() -> [NamedTensorSnapshot] {
-    return [
-      snapshot("W1", W1),
-      snapshot("b1", b1),
+    var snaps: [NamedTensorSnapshot] = []
+    for i in 0..<numLayers {
+      snaps.append(snapshot("W\(i+1)", trunkWeights[i]))
+      snaps.append(snapshot("b\(i+1)", trunkBiases[i]))
+    }
+    snaps.append(contentsOf: [
       snapshot("W_harm", W_harm),
       snapshot("b_harm", b_harm),
       snapshot("W_hgain", W_hgain),
       snapshot("b_hgain", b_hgain),
       snapshot("W_noise", W_noise),
       snapshot("b_noise", b_noise),
-    ]
+    ])
+    return snaps
   }
 
   func loadSnapshots(_ snapshots: [NamedTensorSnapshot]) {
     let byName = Dictionary(uniqueKeysWithValues: snapshots.map { ($0.name, $0) })
-    loadTensor(W1, from: byName["W1"])
-    loadTensor(b1, from: byName["b1"])
+    for i in 0..<numLayers {
+      loadTensor(trunkWeights[i], from: byName["W\(i+1)"])
+      loadTensor(trunkBiases[i], from: byName["b\(i+1)"])
+    }
     loadTensor(W_harm, from: byName["W_harm"])
     loadTensor(b_harm, from: byName["b_harm"])
     loadTensor(W_hgain, from: byName["W_hgain"])

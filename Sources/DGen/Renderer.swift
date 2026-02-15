@@ -54,6 +54,7 @@ public struct CompiledKernel {
   public let name: String
   public let source: String
   public let kind: Kind
+  public let temporality: Temporality
   public let buffers: [String]  // names of inputs/outputs
   public let threadGroupSize: Int?  // for Metal: nil means runtime-determined, 1 for scalar
   public let threadCount: Int?  // for Metal: override total threads (non-frame dispatch)
@@ -205,6 +206,7 @@ public class CRenderer: Renderer {
         name: kernelName,
         source: source,
         kind: scheduleItem.kind,
+        temporality: scheduleItem.temporality,
         buffers: buffers,
         threadGroupSize: 1,  // C execution is scalar for now
         threadCount: nil,
