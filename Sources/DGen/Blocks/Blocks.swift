@@ -8,7 +8,32 @@ public struct Block: Equatable {
   public var kind: Kind
   public var nodes: [NodeID] = []
   public var temporality: Temporality = .static_
+
+  /// Logical element iterator for tensor blocks — identifies which tensor element the
+  /// current execution is processing (0..<tensorSize). `nil` for pure scalar blocks.
+  ///
+  /// Lifecycle:
+  ///
+  ///     BlockFormation:  block.tensorIndex = ctx.useVariable()   // mint fresh VarID
+  ///                                ↓
+  ///     BlockEmission:   ctx.tensorIndices[nodeId] = tensorIndex // propagate to each node
+  ///                                ↓
+  ///          ┌─────────────────────┼─────────────────────┐
+  ///          C backend             │               Metal backend
+  ///          ↓                     │                     ↓
+  ///     beginParallelRange    Node emitters         threadIndex or
+  ///       (loop var)          read from             setupFlatThreading
+  ///          ↓                ctx.tensorIndices           ↓
+  ///     for(_pr=0; _pr<N)          ↓                if(id < N)
+  ///                         memoryRead/Write
+  ///                         at [cell + idx]
+  ///
+  /// Created in `determineTensorBlocks` (BlockFormation.swift) as a fresh VarID.
+  /// Propagated to per-node `ctx.tensorIndices` during emission. Realized as a
+  /// `for` loop variable (C) or thread ID (Metal). Node emitters use it to index
+  /// into tensor memory cells for reads, writes, and per-element state.
   public var tensorIndex: Lazy?
+
   public var shape: Shape?
 
   public init(kind: Kind) {

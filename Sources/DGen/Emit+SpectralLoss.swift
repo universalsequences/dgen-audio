@@ -523,13 +523,19 @@ extension LazyOp {
       // Read gradient for signal 1 from frame-indexed storage
       // Sample at position p appears in windows at frames p, p+1, ..., p+windowSize-1
       // We must sum contributions from all these windows (but only if the window exists)
+      //
+      // NOTE: GradRead must NOT be hop-gated. Every sample contributes to the loss
+      // through nearby hop-aligned windows. The gradTime cells already have zeros on
+      // non-hop frames (GradIFFT handles this), so the summation naturally includes
+      // only valid contributions without explicit gating.
       guard inputs.count >= 1 else {
         throw DGenError.insufficientInputs(
           operator: "spectralLossFFTGradRead", expected: 1, actual: inputs.count)
       }
       // Force dependency on gradPass by reading its value (should be 0, just for ordering)
       let _ = b.value(inputs[0])
-      let hopCounter: Expr? = inputs.count > 1 ? b.value(inputs[1]) : nil
+      // Read hop counter to maintain dependency, but don't gate on it
+      if inputs.count > 1 { let _ = b.value(inputs[1]) }
 
       let frameIdx = b.frameIndex()
       let winSizeInt = b.intConstant(windowSize)
@@ -538,24 +544,21 @@ extension LazyOp {
       let p = frameIdx  // absolute sample position (int)
 
       let gradSum = b.float(0.0)
-      let shouldRun = hopCounter.map { $0 == b.constant(0.0) } ?? (b.constant(1.0) > b.constant(0.0))
-      b.if_(shouldRun) {
-        // Sum contributions from all windows that contain sample p
-        b.loop(windowSize) { i in
-          let iInt = b.cast(i, to: .int)
-          let iFloat = b.cast(i, to: .float)
-          let pFloat = b.cast(p, to: .float)
-          let w = pFloat + iFloat  // window frame index (float for comparisons)
-          let offsetInt = winSizeInt - b.intConstant(1) - iInt  // offset in that window (int)
-          // Clamp index to valid range to prevent out-of-bounds read
-          let clampedW = b.min(w, b.cast(frameCount, to: .float) - b.constant(1.0))
-          let idx = b.cast(clampedW, to: .int) * winSizeInt + offsetInt
-          // Read is now safe, but only accumulate if in bounds
-          let contrib = b.memoryRead(gradTime1Cell, idx)
-          let inBounds = w < b.cast(frameCount, to: .float)
-          let safeContrib = b.gswitch(inBounds, contrib, b.constant(0.0))
-          gradSum.accumulate(safeContrib)
-        }
+      // Sum contributions from all windows that contain sample p
+      b.loop(windowSize) { i in
+        let iInt = b.cast(i, to: .int)
+        let iFloat = b.cast(i, to: .float)
+        let pFloat = b.cast(p, to: .float)
+        let w = pFloat + iFloat  // window frame index (float for comparisons)
+        let offsetInt = winSizeInt - b.intConstant(1) - iInt  // offset in that window (int)
+        // Clamp index to valid range to prevent out-of-bounds read
+        let clampedW = b.min(w, b.cast(frameCount, to: .float) - b.constant(1.0))
+        let idx = b.cast(clampedW, to: .int) * winSizeInt + offsetInt
+        // Read is now safe, but only accumulate if in bounds
+        let contrib = b.memoryRead(gradTime1Cell, idx)
+        let inBounds = w < b.cast(frameCount, to: .float)
+        let safeContrib = b.gswitch(inBounds, contrib, b.constant(0.0))
+        gradSum.accumulate(safeContrib)
       }
       // Normalize to prevent gradient explosion while allowing learning
       let numBinsFloat = b.constant(Float(windowSize / 2 + 1))
@@ -565,12 +568,14 @@ extension LazyOp {
 
     case .spectralLossFFTGradRead2(let windowSize, let gradTime2Cell):
       // Read gradient for signal 2 from frame-indexed storage
+      // Same as GradRead: must NOT be hop-gated (see comment above)
       guard inputs.count >= 1 else {
         throw DGenError.insufficientInputs(
           operator: "spectralLossFFTGradRead2", expected: 1, actual: inputs.count)
       }
       let _ = b.value(inputs[0])
-      let hopCounter: Expr? = inputs.count > 1 ? b.value(inputs[1]) : nil
+      // Read hop counter to maintain dependency, but don't gate on it
+      if inputs.count > 1 { let _ = b.value(inputs[1]) }
 
       let frameIdx = b.frameIndex()
       let winSizeInt = b.intConstant(windowSize)
@@ -579,21 +584,18 @@ extension LazyOp {
       let p = frameIdx  // absolute sample position (int)
 
       let gradSum = b.float(0.0)
-      let shouldRun2 = hopCounter.map { $0 == b.constant(0.0) } ?? (b.constant(1.0) > b.constant(0.0))
-      b.if_(shouldRun2) {
-        b.loop(windowSize) { i in
-          let iInt = b.cast(i, to: .int)
-          let iFloat = b.cast(i, to: .float)
-          let pFloat = b.cast(p, to: .float)
-          let w = pFloat + iFloat  // window frame index (float for comparisons)
-          let offsetInt = winSizeInt - b.intConstant(1) - iInt  // offset in that window (int)
-          let clampedW = b.min(w, b.cast(frameCount, to: .float) - b.constant(1.0))
-          let idx = b.cast(clampedW, to: .int) * winSizeInt + offsetInt
-          let contrib = b.memoryRead(gradTime2Cell, idx)
-          let inBounds = w < b.cast(frameCount, to: .float)
-          let safeContrib = b.gswitch(inBounds, contrib, b.constant(0.0))
-          gradSum.accumulate(safeContrib)
-        }
+      b.loop(windowSize) { i in
+        let iInt = b.cast(i, to: .int)
+        let iFloat = b.cast(i, to: .float)
+        let pFloat = b.cast(p, to: .float)
+        let w = pFloat + iFloat  // window frame index (float for comparisons)
+        let offsetInt = winSizeInt - b.intConstant(1) - iInt  // offset in that window (int)
+        let clampedW = b.min(w, b.cast(frameCount, to: .float) - b.constant(1.0))
+        let idx = b.cast(clampedW, to: .int) * winSizeInt + offsetInt
+        let contrib = b.memoryRead(gradTime2Cell, idx)
+        let inBounds = w < b.cast(frameCount, to: .float)
+        let safeContrib = b.gswitch(inBounds, contrib, b.constant(0.0))
+        gradSum.accumulate(safeContrib)
       }
       let numBinsFloat2 = b.constant(Float(windowSize / 2 + 1))
       let normFactor2 = b.sqrt(numBinsFloat2 * winSizeFloat)

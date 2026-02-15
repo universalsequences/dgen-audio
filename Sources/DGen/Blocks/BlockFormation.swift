@@ -135,9 +135,13 @@ public func isolateSpectralPasses(_ blocks: [Block], _ g: Graph) -> [Block] {
         }
 
         // Add spectral pass in its own SIMD block — spectral ops are always
-        // parallel across frames, even when their inputs come from scalar blocks
+        // parallel across frames, even when their inputs come from scalar blocks.
+        // Clear shape/tensorIndex: FFT butterflies are single-threaded per frame
+        // and must NOT inherit the parent block's ThreadCountScale (e.g. from matmul).
         var spectralBlock = makeBlock(from: block, nodes: [nodeId])
         spectralBlock.kind = .simd
+        spectralBlock.shape = nil
+        spectralBlock.tensorIndex = nil
         result.append(spectralBlock)
       } else {
         // Accumulate non-spectral nodes

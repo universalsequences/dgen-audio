@@ -229,6 +229,24 @@ enum DDSPE2ETrainer {
     logger("Run directory: \(runDirs.root.path)")
     logger("Starting M2 decoder-only training")
 
+    // Pre-allocate data tensors ONCE before the training loop.
+    // This matches the test pattern: define tensors ahead of time,
+    // then use updateDataLazily to inject new chunk data each iteration.
+    let firstEntry = splitEntries[0]
+    let firstChunkFeatureFrames = firstEntry.featureFrames
+    let frameCount = max(config.chunkSize, 1)
+
+    let featuresTensor = Tensor(
+      [[Float]](repeating: [Float](repeating: 0, count: 3), count: firstChunkFeatureFrames)
+    )
+    let targetTensor = Tensor([Float](repeating: 0, count: frameCount))
+    let synthTensors = DDSPSynth.PreallocatedTensors(
+      featureFrames: firstChunkFeatureFrames,
+      numHarmonics: config.numHarmonics,
+      enableFIRNoise: config.enableStaticFIRNoise,
+      firKernelSize: config.noiseFIRKernelSize
+    )
+
     var order = Array(splitEntries.indices)
     var rng = SeededGenerator(seed: config.seed)
     if config.shuffleChunks {
@@ -264,27 +282,30 @@ enum DDSPE2ETrainer {
       let entry = splitEntries[order[step % order.count]]
       let chunk = try dataset.loadChunk(entry)
       let tAfterLoad = CFAbsoluteTimeGetCurrent()
-      let frameCount = chunk.audio.count
 
-      // Conditioning features [F, 3] -> (f0Norm, loudNorm, uv)
-      let features = makeConditioningTensor(
+      // Inject new chunk data into pre-allocated tensors
+      let conditioningData = makeConditioningData(
         f0Hz: chunk.f0Hz,
         loudnessDB: chunk.loudnessDB,
         uvMask: chunk.uvMask
       )
+      featuresTensor.updateDataLazily(conditioningData)
+      targetTensor.updateDataLazily(chunk.audio)
+      synthTensors.updateChunkData(f0Frames: chunk.f0Hz, uvFrames: chunk.uvMask)
 
-      let controls = model.forward(features: features)
+      // Build graph using pre-allocated tensors
+      let controls = model.forward(features: featuresTensor)
       let prediction = DDSPSynth.renderSignal(
         controls: controls,
-        f0Frames: chunk.f0Hz,
-        uvFrames: chunk.uvMask,
+        tensors: synthTensors,
+        featureFrames: chunk.f0Hz.count,
         frameCount: frameCount,
         numHarmonics: config.numHarmonics,
         enableStaticFIRNoise: config.enableStaticFIRNoise,
         noiseFIRKernelSize: config.noiseFIRKernelSize
       )
 
-      let target = Tensor(chunk.audio).toSignal(maxFrames: frameCount)
+      let target = targetTensor.toSignal(maxFrames: frameCount)
       let spectralWeight = spectralWeightForStep(
         step: step,
         targetWeight: config.spectralWeight,
@@ -622,28 +643,30 @@ enum DDSPE2ETrainer {
     return targetWeight * alpha
   }
 
-  private static func makeConditioningTensor(
+  /// Compute conditioning features as flat [Float] data (row-major [N, 3]).
+  /// Used with pre-allocated tensor via updateDataLazily.
+  private static func makeConditioningData(
     f0Hz: [Float],
     loudnessDB: [Float],
     uvMask: [Float]
-  ) -> Tensor {
+  ) -> [Float] {
     let n = min(f0Hz.count, min(loudnessDB.count, uvMask.count))
-    if n == 0 {
-      return Tensor([[0.0, 0.0, 0.0]])
-    }
+    if n == 0 { return [0.0, 0.0, 0.0] }
 
-    var rows = [[Float]]()
-    rows.reserveCapacity(n)
+    var flat = [Float]()
+    flat.reserveCapacity(n * 3)
 
     for i in 0..<n {
       let uv = min(1.0, max(0.0, uvMask[i]))
       let safeF0 = max(1.0, f0Hz[i])
       let f0Norm = log2(safeF0 / 440.0)
       let loudNorm = min(1.0, max(0.0, (loudnessDB[i] + 80.0) / 80.0))
-      rows.append([f0Norm, loudNorm, uv])
+      flat.append(f0Norm)
+      flat.append(loudNorm)
+      flat.append(uv)
     }
 
-    return Tensor(rows)
+    return flat
   }
 
   private static func writeJSON<T: Encodable>(_ value: T, to url: URL) throws {
