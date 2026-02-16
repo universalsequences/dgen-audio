@@ -268,6 +268,10 @@ public func inferShape(op: LazyOp, inputs: [ValueShape], graph: Graph) throws ->
     // ExpandAxis broadcasts along an axis
     return .tensor(targetShape)
 
+  case .gemm(let M, let N, _):
+    // GEMM produces an [M, N] output matrix
+    return .tensor([M, N])
+
   // everything else is a scalar
   default: return .scalar
   }

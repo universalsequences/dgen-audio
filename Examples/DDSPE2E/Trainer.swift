@@ -239,12 +239,17 @@ enum DDSPE2ETrainer {
     let firstChunkFeatureFrames = firstEntry.featureFrames
     let frameCount = max(config.chunkSize, 1)
 
+    // Pad feature frames to next multiple of 8 for GEMM eligibility.
+    // Set to firstChunkFeatureFrames to disable padding for debugging.
+    let paddedFeatureFrames = ((firstChunkFeatureFrames + 7) / 8) * 8
+    logger("Feature frames: \(firstChunkFeatureFrames) → padded: \(paddedFeatureFrames)")
+
     let featuresTensor = Tensor(
-      [[Float]](repeating: [Float](repeating: 0, count: 3), count: firstChunkFeatureFrames)
+      [[Float]](repeating: [Float](repeating: 0, count: 3), count: paddedFeatureFrames)
     )
     let targetTensor = Tensor([Float](repeating: 0, count: frameCount))
     let synthTensors = DDSPSynth.PreallocatedTensors(
-      featureFrames: firstChunkFeatureFrames,
+      featureFrames: paddedFeatureFrames,
       numHarmonics: config.numHarmonics,
       enableFIRNoise: config.enableStaticFIRNoise,
       firKernelSize: config.noiseFIRKernelSize
@@ -298,15 +303,27 @@ enum DDSPE2ETrainer {
       let chunk = try dataset.loadChunk(entry)
       let tAfterLoad = CFAbsoluteTimeGetCurrent()
 
-      // Inject new chunk data into pre-allocated tensors
-      let conditioningData = makeConditioningData(
+      // Inject new chunk data into pre-allocated tensors (padded to GEMM-aligned size)
+      var conditioningData = makeConditioningData(
         f0Hz: chunk.f0Hz,
         loudnessDB: chunk.loudnessDB,
         uvMask: chunk.uvMask
       )
+      let paddingRows = paddedFeatureFrames * 3 - conditioningData.count
+      if paddingRows > 0 {
+        conditioningData.append(contentsOf: [Float](repeating: 0, count: paddingRows))
+      }
       featuresTensor.updateDataLazily(conditioningData)
       targetTensor.updateDataLazily(chunk.audio)
-      synthTensors.updateChunkData(f0Frames: chunk.f0Hz, uvFrames: chunk.uvMask)
+
+      var paddedF0 = chunk.f0Hz
+      var paddedUV = chunk.uvMask
+      let framePadding = paddedFeatureFrames - paddedF0.count
+      if framePadding > 0 {
+        paddedF0.append(contentsOf: [Float](repeating: 0, count: framePadding))
+        paddedUV.append(contentsOf: [Float](repeating: 0, count: framePadding))
+      }
+      synthTensors.updateChunkData(f0Frames: paddedF0, uvFrames: paddedUV)
 
       // Build graph using pre-allocated tensors
       let controls = model.forward(features: featuresTensor)

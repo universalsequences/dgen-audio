@@ -96,9 +96,10 @@ public enum Op {
   case beginHopCheck(Lazy)  // if (counter == 0.0f) { - runs block only when counter is 0
   case endHopCheck  // } - closes the hop check conditional
 
-  // Threadgroup position (for GEMM 2D dispatch)
+  // Threadgroup position (for GEMM 2D/3D dispatch)
   case threadgroupPositionX  // gid.x — column tile index
   case threadgroupPositionY  // gid.y — row tile index
+  case threadgroupPositionZ  // gid.z — frame index (for per-frame GEMM)
 
   // GEMM / simdgroup matrix operations (Metal tensor cores)
   case simdgroupMatrixZero  // declare simdgroup_float8x8, zero-initialized

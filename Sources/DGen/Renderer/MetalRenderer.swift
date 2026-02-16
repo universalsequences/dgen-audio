@@ -743,7 +743,7 @@ public class MetalRenderer: Renderer, UOpEmitter {
     }
 
     if isGemmKernel {
-      parameters.append("    uint2 gid [[threadgroup_position_in_grid]]")
+      parameters.append("    uint3 gid [[threadgroup_position_in_grid]]")
     } else {
       parameters.append("    uint id [[thread_position_in_grid]]")
     }
@@ -1139,6 +1139,8 @@ public class MetalRenderer: Renderer, UOpEmitter {
       return emitAssign(uop, "gid.x", ctx)
     case .threadgroupPositionY:
       return emitAssign(uop, "gid.y", ctx)
+    case .threadgroupPositionZ:
+      return emitAssign(uop, "gid.z", ctx)
 
     // GEMM simdgroup matrix operations
     case .simdgroupMatrixZero:

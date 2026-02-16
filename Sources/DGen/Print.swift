@@ -181,6 +181,8 @@ extension UOp {
             opStr = "\(ANSI.cyan)threadgroupPositionX\(ANSI.reset)"
         case .threadgroupPositionY:
             opStr = "\(ANSI.cyan)threadgroupPositionY\(ANSI.reset)"
+        case .threadgroupPositionZ:
+            opStr = "\(ANSI.cyan)threadgroupPositionZ\(ANSI.reset)"
         case .simdgroupMatrixZero:
             opStr = "\(ANSI.cyan)simdgroupMatrixZero\(ANSI.reset)"
         case let .simdgroupLoad(cellId, offset, stride):

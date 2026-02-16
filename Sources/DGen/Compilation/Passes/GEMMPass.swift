@@ -1,3 +1,5 @@
+import Foundation
+
 extension GraphPrepPasses {
   /// Walk backwards from a node through view-only ops (reshape, transpose, expandView, shrink, pad)
   /// to find the underlying compute/data node and the chain of view ops applied.
@@ -16,6 +18,7 @@ extension GraphPrepPasses {
   }
 
   static func gemmPass(graph: Graph) {
+    if ProcessInfo.processInfo.environment["DGEN_NO_GEMM"] != nil { return }
     for (nodeId, node) in graph.nodes {
       guard node.inputs.count == 1 else { continue }
       guard let mulNode = graph.nodes[node.inputs[0]] else { continue }

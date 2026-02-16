@@ -189,6 +189,11 @@ extension IRBuilder {
     return emitIntOp(.threadgroupPositionY)
   }
 
+  /// The threadgroup's Z position in the dispatch grid (frame index for per-frame GEMM).
+  public func threadgroupPositionZ() -> Expr {
+    return emitIntOp(.threadgroupPositionZ)
+  }
+
   // MARK: - SIMD Group Matrix Ops
 
   /// Declare a zero-initialized simdgroup_float8x8 matrix variable.

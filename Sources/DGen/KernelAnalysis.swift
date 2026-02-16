@@ -73,7 +73,7 @@ private func classify(_ op: Op) -> OpClass {
        .reshape, .transpose, .shrink, .pad, .expandView, .repeatView,
        .broadcastAccess, .sumAxisMarker, .maxAxisMarker, .meanAxisMarker,
        .expandAxisMarker, .beginHopCheck, .endHopCheck,
-       .beginReverseLoop, .threadgroupPositionX, .threadgroupPositionY:
+       .beginReverseLoop, .threadgroupPositionX, .threadgroupPositionY, .threadgroupPositionZ:
     return .control
 
   // GEMM simdgroup ops — multiply-accumulate is the core compute
