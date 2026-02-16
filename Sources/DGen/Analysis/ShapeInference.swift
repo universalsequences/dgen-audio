@@ -272,8 +272,19 @@ public func inferShape(op: LazyOp, inputs: [ValueShape], graph: Graph) throws ->
     // GEMM produces an [M, N] output matrix
     return .tensor([M, N])
 
-  // everything else is a scalar
-  default: return .scalar
+  // Scalar ops — stateful, I/O, side-effect, or inherently scalar.
+  // Listed explicitly so the compiler catches missing cases when new ops are added.
+  case .mse,
+    .spectralLossFFT, .spectralLossFFTGradSpec, .spectralLossFFTGradIFFT,
+    .spectralLossFFTGradInline, .spectralLossFFTGradRead, .spectralLossFFTGradRead2,
+    .selectRowGradWrite, .selectRowGradReduce,
+    .peekRowGradWrite, .peekRowGradReduce,
+    .selector,
+    .memoryRead, .memoryWrite, .memoryAccumulate, .memoryCellSum,
+    .historyReadWrite,
+    .param, .click, .noise,
+    .constant, .output, .input:
+    return .scalar
   }
 }
 
