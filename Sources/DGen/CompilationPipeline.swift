@@ -467,7 +467,7 @@ private func printUOpBlocks(_ uopBlocks: [BlockUOps], blocks: [Block]) {
     let tensorIndex = String(describing: block?.tensorIndex)
     let nodes = block?.nodes ?? []
     print(
-      "block #\(i+1) frameOrder=\(uopBlock.frameOrder) vectorWidth=\(uopBlock.vectorWidth) threadCountScale=\(String(describing: uopBlock.threadCountScale)) shape=\(shape) tensorIndex=\(tensorIndex) nodes=\(nodes)"
+      "block #\(i+1) frameOrder=\(uopBlock.frameOrder) vectorWidth=\(uopBlock.vectorWidth) dispatchMode=\(uopBlock.dispatchMode) shape=\(shape) tensorIndex=\(tensorIndex) nodes=\(nodes)"
     )
     var indentLevel = 0
     for uop in uopBlock.ops {

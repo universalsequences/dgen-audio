@@ -313,31 +313,13 @@ public class MetalCompiledKernel: CompiledKernelRuntime {
         }
       }
 
-      let totalThreads: Int
-      if kernel.temporality == .static_ {
-        // Static blocks: dispatch threadCountScale threads (or override, or 1)
-        if let scale = kernel.threadCountScale {
-          totalThreads = max(1, scale)
-        } else if let override = kernel.threadCount {
-          totalThreads = max(1, override)
-        } else {
-          totalThreads = 1
-        }
-      } else if let scale = kernel.threadCountScale {
-        totalThreads = max(1, frameCount * scale)
-      } else if let overrideThreads = kernel.threadCount {
-        totalThreads = max(1, overrideThreads)
-      } else if kernel.frameOrder == .sequential {
-        totalThreads = 1
-      } else {
-        totalThreads = frameCount
-      }
+      let totalThreads = kernel.dispatchMode.threadCount(frameCount: frameCount)
       let maxThreadsPerGroup = pipelineState.maxTotalThreadsPerThreadgroup
 
       let threadGroupWidth =
         totalThreads == 1
         ? 1
-        : min(kernel.threadGroupSize ?? 64, maxThreadsPerGroup, totalThreads)
+        : min(kernel.dispatchMode.threadGroupSize ?? 64, maxThreadsPerGroup, totalThreads)
       let threads = MTLSize(width: totalThreads, height: 1, depth: 1)
       let threadsPerGroup = MTLSize(width: threadGroupWidth, height: 1, depth: 1)
       computeEncoder.dispatchThreads(threads, threadsPerThreadgroup: threadsPerGroup)

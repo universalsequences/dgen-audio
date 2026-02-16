@@ -11,7 +11,7 @@ import Foundation
 public struct KernelStats {
   public let name: String
   public let frameOrder: FrameOrder
-  public let threadCountScale: Int?
+  public let dispatchMode: DispatchMode
   public let temporality: Temporality
   public let work: Int
   public let span: Int
@@ -130,12 +130,20 @@ private func analyzeOneKernel(
   // Determine thread count from the beginRange in the schedule
   var threadCount = computeThreadCount(item, frameCount: frameCount)
 
-  // Static blocks with threadParallel policy have beginParallelRange(N) that
-  // gets split into separate kernels dispatching N threads by
+  // Static blocks dispatched as staticThreads(1) may contain beginParallelRange(N)
+  // that gets split into separate kernels dispatching N threads by
   // splitStaticParallelRanges (which runs after prepareSchedule in
   // lowerUOpBlocks). We model this by treating the parallelRange body as
   // thread-parallel: N multiplies work but NOT span.
-  let isStaticParallel = item.parallelPolicy == .threadParallel
+  let isStaticParallel: Bool
+  if case .staticThreads(1) = item.dispatchMode {
+    isStaticParallel = item.ops.contains {
+      if case .beginParallelRange = $0.op { return true }
+      return false
+    }
+  } else {
+    isStaticParallel = false
+  }
 
   // Walk UOps with a loop stack
   var loopStack: [LoopEntry] = []
@@ -204,7 +212,7 @@ private func analyzeOneKernel(
   return KernelStats(
     name: name,
     frameOrder: item.frameOrder,
-    threadCountScale: item.threadCountScale,
+    dispatchMode: item.dispatchMode,
     temporality: item.temporality,
     work: work,
     span: span,
@@ -222,29 +230,7 @@ private func analyzeOneKernel(
 private func computeThreadCount(
   _ item: ScheduleItem, frameCount: Int
 ) -> Int {
-  if let override = item.threadCountOverride {
-    return max(1, override)
-  }
-
-  // Static blocks run once — they don't multiply by frameCount.
-  // Static scalar blocks dispatch 1 thread (body loops internally or uses parallelRange).
-  // Static SIMD blocks with threadCountScale dispatch threadCountScale threads.
-  if item.temporality == .static_ {
-    if item.frameOrder == .sequential {
-      return 1
-    }
-    // Static parallel: dispatch threadCountScale threads (no frameCount multiplier)
-    return item.threadCountScale ?? 1
-  }
-
-  switch item.frameOrder {
-  case .parallel:
-    // Frame-based parallel: each thread handles one unit of work
-    return frameCount * (item.threadCountScale ?? 1)
-  case .sequential:
-    // Frame-based sequential: single thread, body loops internally
-    return 1
-  }
+  return item.dispatchMode.threadCount(frameCount: frameCount)
 }
 
 /// Resolve iteration count from a beginLoop op.

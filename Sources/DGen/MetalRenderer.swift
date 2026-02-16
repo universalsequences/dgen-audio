@@ -41,8 +41,16 @@ public class MetalRenderer: Renderer, UOpEmitter {
     }
 
     let expanded = scheduleItems.flatMap { item in
-      if item.parallelPolicy == .threadParallel {
-        return splitStaticParallelRanges(item, ctx: ctx)
+      // Static blocks dispatched as staticThreads(1) may contain beginParallelRange
+      // that needs to be split into separate thread-parallel kernels
+      if case .staticThreads(1) = item.dispatchMode {
+        let hasParallelRange = item.ops.contains {
+          if case .beginParallelRange = $0.op { return true }
+          return false
+        }
+        if hasParallelRange {
+          return splitStaticParallelRanges(item, ctx: ctx)
+        }
       }
       return [SplitScheduleItem(item: item, threadCount: nil)]
     }
@@ -52,7 +60,6 @@ public class MetalRenderer: Renderer, UOpEmitter {
     return fused.enumerated().map { (i, entry) in
       let scheduleItem = entry.item
       let parallelCount = entry.threadCount
-      let threadCountOverride = parallelCount ?? scheduleItem.threadCountOverride
 
       // Always use _0, _1 suffix to avoid 'kernel' being a reserved word in Metal
       let kernelName = "\(name)_\(i)"
@@ -105,8 +112,14 @@ public class MetalRenderer: Renderer, UOpEmitter {
         bufferNames.append("reducedGradsSum")
       }
 
-      let threadGroupSize: Int? =
-        (scheduleItem.frameOrder == .sequential && threadCountOverride == nil) ? 1 : nil
+      // Compute final dispatch mode: if splitStaticParallelRanges produced a
+      // parallelCount, update to staticThreads(N); otherwise use schedule's mode.
+      let finalDispatchMode: DispatchMode
+      if let count = parallelCount {
+        finalDispatchMode = .staticThreads(count)
+      } else {
+        finalDispatchMode = scheduleItem.dispatchMode
+      }
 
       return CompiledKernel(
         name: kernelName,
@@ -114,9 +127,7 @@ public class MetalRenderer: Renderer, UOpEmitter {
         frameOrder: scheduleItem.frameOrder,
         temporality: scheduleItem.temporality,
         buffers: bufferNames,
-        threadGroupSize: threadGroupSize,
-        threadCount: threadCountOverride,
-        threadCountScale: scheduleItem.threadCountScale,
+        dispatchMode: finalDispatchMode,
         needsReducedGradsSum: useReduced,
         memorySize: max(totalMemorySlots, 1024)  // Match memory size calculation from render method
       )
@@ -308,9 +319,7 @@ public class MetalRenderer: Renderer, UOpEmitter {
     for segment in segments {
       if segment.ops.isEmpty { continue }
       let item = ScheduleItem(frameOrder: scheduleItem.frameOrder, vectorWidth: scheduleItem.vectorWidth, temporality: scheduleItem.temporality)
-      item.parallelPolicy = scheduleItem.parallelPolicy
-      item.threadCountScale = scheduleItem.threadCountScale
-      item.threadCountOverride = scheduleItem.threadCountOverride
+      item.dispatchMode = scheduleItem.dispatchMode
       item.ops.append(contentsOf: prefixOps)
       if segment.parallelCount == nil {
         item.ops.append(beginRangeOp)
@@ -490,7 +499,7 @@ public class MetalRenderer: Renderer, UOpEmitter {
     guard let countA = a.threadCount, let countB = b.threadCount, countA == countB else {
       return false
     }
-    if a.item.threadCountScale != b.item.threadCountScale { return false }
+    if a.item.dispatchMode != b.item.dispatchMode { return false }
     guard a.item.temporality == .static_, b.item.temporality == .static_ else { return false }
     guard a.item.frameOrder == .sequential, b.item.frameOrder == .sequential else { return false }
 
@@ -567,9 +576,7 @@ public class MetalRenderer: Renderer, UOpEmitter {
       closeCurrentKernel()
 
       let scheduleItem = ScheduleItem(frameOrder: block.frameOrder, vectorWidth: block.vectorWidth, temporality: block.temporality)
-      scheduleItem.parallelPolicy = block.parallelPolicy
-      scheduleItem.threadCountScale = block.threadCountScale
-      scheduleItem.threadCountOverride = block.threadCountOverride
+      scheduleItem.dispatchMode = block.dispatchMode
       scheduleItem.ops.append(UOp(op: .frameCount, value: .empty))
 
       for uop in block.ops {
@@ -578,71 +585,91 @@ public class MetalRenderer: Renderer, UOpEmitter {
         }
       }
 
-      let isStatic = block.temporality == .static_
-      let isScalar = block.frameOrder == .sequential
-
-      if block.hasOwnFrameLoop || isStatic {
-        // Static blocks: dispatch threadCountScale threads (or 1) with no frame loop.
-        let rangeEnd: Lazy
-        if block.frameOrder != .sequential, let scale = block.threadCountScale {
-          rangeEnd = .constant(0, Float(scale))
-        } else {
-          rangeEnd = .constant(0, 1)
-        }
-        let beginRange = UOp(op: .beginRange(.constant(0, 0), rangeEnd), value: .empty)
+      switch block.dispatchMode {
+      case .selfManaged:
+        // Block contains its own frame loops (BPTT) — dispatch 1 thread, no wrapping.
+        let beginRange = UOp(op: .beginRange(.constant(0, 0), .constant(0, 1)), value: .empty)
         scheduleItem.ops.append(beginRange)
         hasFrameLoop = false
-      } else if isScalar {
-        if block.parallelPolicy == .tensorElementParallel,
-          let tensorThreads = block.threadCountOverride
-        {
-          // Scalar frame loop, but one GPU thread per tensor element.
-          let beginRange = UOp(
-            op: .beginRange(.constant(0, 0), .constant(0, Float(tensorThreads))),
-            value: .empty
-          )
-          scheduleItem.ops.append(beginRange)
 
-          let beginLoop = UOp(op: .beginLoop(frameCountUOp, 1), value: .empty)
-          scheduleItem.ops.append(beginLoop)
-          hasFrameLoop = true
+      case .staticThreads(let n):
+        // Static blocks: dispatch N threads with no frame loop.
+        let beginRange = UOp(op: .beginRange(.constant(0, 0), .constant(0, Float(n))), value: .empty)
+        scheduleItem.ops.append(beginRange)
+        hasFrameLoop = false
 
-          if case .hopBased(_, let counterNodeId) = block.temporality {
-            guard let counterLazy = ctx.values[counterNodeId] else {
-              fatalError("Hop counter node \(counterNodeId) not found in ctx.values")
-            }
-            let hopCheck = UOp(op: .beginHopCheck(counterLazy), value: .empty)
-            scheduleItem.ops.append(hopCheck)
-            hopCheckOpen = true
+      case .fixedWithFrameLoop(let tensorThreads):
+        // Scalar frame loop, but one GPU thread per tensor element.
+        let beginRange = UOp(
+          op: .beginRange(.constant(0, 0), .constant(0, Float(tensorThreads))),
+          value: .empty
+        )
+        scheduleItem.ops.append(beginRange)
+
+        let beginLoop = UOp(op: .beginLoop(frameCountUOp, 1), value: .empty)
+        scheduleItem.ops.append(beginLoop)
+        hasFrameLoop = true
+
+        if case .hopBased(_, let counterNodeId) = block.temporality {
+          guard let counterLazy = ctx.values[counterNodeId] else {
+            fatalError("Hop counter node \(counterNodeId) not found in ctx.values")
           }
-        } else {
-          // Scalar kernels: thread 0 loops through frameCount
-          let beginRange = UOp(op: .beginRange(.constant(0, 0), .constant(0, 1)), value: .empty)
-          scheduleItem.ops.append(beginRange)
-
-          let loopCount = scaledFrameCount(block.threadCountScale, scheduleItem)
-          let beginLoop = UOp(op: .beginLoop(loopCount, 1), value: .empty)
-          scheduleItem.ops.append(beginLoop)
-          hasFrameLoop = true
-
-          // Hop-based scalar: wrap body in hop check conditional
-          if case .hopBased(_, let counterNodeId) = block.temporality {
-            guard let counterLazy = ctx.values[counterNodeId] else {
-              fatalError("Hop counter node \(counterNodeId) not found in ctx.values")
-            }
-            let hopCheck = UOp(op: .beginHopCheck(counterLazy), value: .empty)
-            scheduleItem.ops.append(hopCheck)
-            hopCheckOpen = true
-          }
+          let hopCheck = UOp(op: .beginHopCheck(counterLazy), value: .empty)
+          scheduleItem.ops.append(hopCheck)
+          hopCheckOpen = true
         }
-      } else {
+
+      case .singleThreaded:
+        // Scalar kernels: thread 0 loops through frameCount
+        let beginRange = UOp(op: .beginRange(.constant(0, 0), .constant(0, 1)), value: .empty)
+        scheduleItem.ops.append(beginRange)
+
+        let beginLoop = UOp(op: .beginLoop(frameCountUOp, 1), value: .empty)
+        scheduleItem.ops.append(beginLoop)
+        hasFrameLoop = true
+
+        if case .hopBased(_, let counterNodeId) = block.temporality {
+          guard let counterLazy = ctx.values[counterNodeId] else {
+            fatalError("Hop counter node \(counterNodeId) not found in ctx.values")
+          }
+          let hopCheck = UOp(op: .beginHopCheck(counterLazy), value: .empty)
+          scheduleItem.ops.append(hopCheck)
+          hopCheckOpen = true
+        }
+
+      case .perFrame:
         // SIMD kernels: each thread processes one frame
-        let rangeEnd = scaledFrameCount(block.threadCountScale, scheduleItem)
-        let beginRange = UOp(op: .beginRange(.constant(0, 0), rangeEnd), value: .empty)
+        let beginRange = UOp(op: .beginRange(.constant(0, 0), frameCountUOp), value: .empty)
         scheduleItem.ops.append(beginRange)
         hasFrameLoop = true
 
-        // Hop-based SIMD: wrap body in hop check conditional
+        if case .hopBased(_, let counterNodeId) = block.temporality {
+          guard let counterLazy = ctx.values[counterNodeId] else {
+            fatalError("Hop counter node \(counterNodeId) not found in ctx.values")
+          }
+          let hopCheck = UOp(op: .beginHopCheck(counterLazy), value: .empty)
+          scheduleItem.ops.append(hopCheck)
+          hopCheckOpen = true
+        }
+
+      case .perFrameScaled(let n):
+        if block.frameOrder == .sequential {
+          // Sequential with scale: 1 thread loops over frameCount*scale iterations
+          let beginRange = UOp(op: .beginRange(.constant(0, 0), .constant(0, 1)), value: .empty)
+          scheduleItem.ops.append(beginRange)
+
+          let loopCount = scaledFrameCount(n, scheduleItem)
+          let beginLoop = UOp(op: .beginLoop(loopCount, 1), value: .empty)
+          scheduleItem.ops.append(beginLoop)
+          hasFrameLoop = true
+        } else {
+          // SIMD kernels: frameCount * N threads
+          let rangeEnd = scaledFrameCount(n, scheduleItem)
+          let beginRange = UOp(op: .beginRange(.constant(0, 0), rangeEnd), value: .empty)
+          scheduleItem.ops.append(beginRange)
+          hasFrameLoop = true
+        }
+
         if case .hopBased(_, let counterNodeId) = block.temporality {
           guard let counterLazy = ctx.values[counterNodeId] else {
             fatalError("Hop counter node \(counterNodeId) not found in ctx.values")
@@ -674,8 +701,11 @@ public class MetalRenderer: Renderer, UOpEmitter {
     parallelRangeVars.removeAll()  // Reset parallel range tracking for new kernel
     varScalarTypes.removeAll()  // Reset type tracking for new kernel
     frameIndexOverride = nil
-    currentThreadCountScale = scheduleItem.threadCountScale
-    currentThreadCountOverride = scheduleItem.threadCountOverride
+    currentThreadCountScale = scheduleItem.dispatchMode.threadCountScale
+    switch scheduleItem.dispatchMode {
+    case .fixedWithFrameLoop(let n): currentThreadCountOverride = n
+    default: currentThreadCountOverride = nil
+    }
     currentTemporality = scheduleItem.temporality  // Set temporality for gradient indexing
     currentFrameOrder = scheduleItem.frameOrder
     let (inputs, outputs) = analyzeDependencies(scheduleItem: scheduleItem, ctx: ctx)

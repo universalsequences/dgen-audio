@@ -6,9 +6,7 @@ public func writeKernelsToDisk(_ result: CompilationResult, _ filename: String) 
     """
     // KERNEL \($0.offset)
     // FrameOrder: \($0.element.frameOrder)
-    // ThreadCountScale \($0.element.threadCountScale)
-    // ThreadGroupSize \($0.element.threadGroupSize)
-    // ThreadCount \($0.element.threadCount)
+    // DispatchMode: \($0.element.dispatchMode)
     \($0.element.source)
     """
   }.joined(separator: "\n\n")

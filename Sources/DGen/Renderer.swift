@@ -5,47 +5,79 @@ public struct BlockUOps {
   public let frameOrder: FrameOrder
   public let vectorWidth: Int
   public let temporality: Temporality
-  public var parallelPolicy: ParallelPolicy
-  /// When true, this block starts a new kernel (prevents fusion with previous block)
-  public var forceNewKernel: Bool
-  /// Optional: dispatch threads = frameCount * scale for this block
-  public var threadCountScale: Int?
-  /// Optional: dispatch a fixed number of threads for this block.
-  /// Used for scalar frame loops that parallelize over tensor elements (id < tensorSize).
-  public var threadCountOverride: Int?
-  /// When true, the block contains its own frame loops (e.g., BPTT forward+reverse loops).
-  /// prepareSchedule should dispatch 1 thread with no additional frame loop wrapping.
-  public var hasOwnFrameLoop: Bool
+  public var dispatchMode: DispatchMode
 
   public init(
     ops: [UOp],
     frameOrder: FrameOrder,
     vectorWidth: Int = 1,
     temporality: Temporality = .static_,
-    parallelPolicy: ParallelPolicy = .serial,
-    forceNewKernel: Bool = false,
-    threadCountScale: Int? = nil,
-    threadCountOverride: Int? = nil,
-    hasOwnFrameLoop: Bool = false
+    dispatchMode: DispatchMode = .singleThreaded
   ) {
     self.ops = ops
     self.frameOrder = frameOrder
     self.vectorWidth = vectorWidth
     self.temporality = temporality
-    self.parallelPolicy = parallelPolicy
-    self.forceNewKernel = forceNewKernel
-    self.threadCountScale = threadCountScale
-    self.threadCountOverride = threadCountOverride
-    self.hasOwnFrameLoop = hasOwnFrameLoop
+    self.dispatchMode = dispatchMode
   }
 }
 
-public enum ParallelPolicy {
-  case serial
-  case threadParallel
-  /// Scalar frame loop with fixed thread dispatch over tensor elements.
-  /// Kernel pattern: `if (id < tensorSize) { for (i < frameCount) { ... } }`
-  case tensorElementParallel
+/// How a kernel distributes work across GPU threads.
+public enum DispatchMode: Equatable {
+  /// 1 thread, renderer wraps body in frame loop (sequential blocks)
+  case singleThreaded
+
+  /// frameCount threads, one frame per thread (parallel blocks)
+  case perFrame
+
+  /// frameCount × N threads (parallel blocks with tensor elements)
+  case perFrameScaled(Int)
+
+  /// N fixed threads, each loops over all frames (tensor element parallel)
+  case fixedWithFrameLoop(Int)
+
+  /// N threads, no frame loop (static blocks)
+  case staticThreads(Int)
+
+  /// 1 thread, no frame loop — block has its own loops (BPTT)
+  case selfManaged
+}
+
+extension DispatchMode {
+  /// Total GPU threads to dispatch
+  func threadCount(frameCount: Int) -> Int {
+    switch self {
+    case .singleThreaded, .selfManaged: return 1
+    case .perFrame: return frameCount
+    case .perFrameScaled(let n): return frameCount * max(1, n)
+    case .fixedWithFrameLoop(let n), .staticThreads(let n): return max(1, n)
+    }
+  }
+
+  /// Whether the renderer should wrap the body in a frame loop
+  var hasRendererFrameLoop: Bool {
+    switch self {
+    case .singleThreaded, .fixedWithFrameLoop: return true
+    case .perFrame, .perFrameScaled, .staticThreads, .selfManaged: return false
+    }
+  }
+
+  /// Thread group size hint (1 for single-thread kernels, nil for runtime-determined)
+  var threadGroupSize: Int? {
+    switch self {
+    case .singleThreaded, .selfManaged: return 1
+    default: return nil
+    }
+  }
+
+  /// The thread count scale factor, if any (for perFrameScaled or staticThreads > 1)
+  var threadCountScale: Int? {
+    switch self {
+    case .perFrameScaled(let n): return n
+    case .staticThreads(let n) where n > 1: return n
+    default: return nil
+    }
+  }
 }
 
 public enum Device {
@@ -59,9 +91,7 @@ public struct CompiledKernel {
   public let frameOrder: FrameOrder
   public let temporality: Temporality
   public let buffers: [String]  // names of inputs/outputs
-  public let threadGroupSize: Int?  // for Metal: nil means runtime-determined, 1 for scalar
-  public let threadCount: Int?  // for Metal: override total threads (non-frame dispatch)
-  public let threadCountScale: Int?  // for Metal: total threads = frameCount * scale
+  public let dispatchMode: DispatchMode
   public let needsReducedGradsSum: Bool
   public let memorySize: Int  // Required memory allocation size in floats
 }
@@ -71,9 +101,7 @@ public class ScheduleItem {
   public let frameOrder: FrameOrder
   public let vectorWidth: Int
   public var temporality: Temporality = .frameBased
-  public var parallelPolicy: ParallelPolicy = .serial
-  public var threadCountScale: Int? = nil
-  public var threadCountOverride: Int? = nil
+  public var dispatchMode: DispatchMode = .perFrame
 
   init(frameOrder: FrameOrder, vectorWidth: Int = 1, temporality: Temporality = .frameBased) {
     self.frameOrder = frameOrder
@@ -213,9 +241,7 @@ public class CRenderer: Renderer {
         frameOrder: scheduleItem.frameOrder,
         temporality: scheduleItem.temporality,
         buffers: buffers,
-        threadGroupSize: 1,  // C execution is scalar for now
-        threadCount: nil,
-        threadCountScale: nil,
+        dispatchMode: .singleThreaded,  // C execution is scalar for now
         needsReducedGradsSum: false,
         memorySize: computedMem  // Ensure at least enough for voiceCellId
       )
@@ -248,7 +274,7 @@ public class CRenderer: Renderer {
     // Merge adjacent blocks of the same frameOrder into a single loop to reduce passes
     var currentFrameOrder: FrameOrder? = nil
     var currentTemporality: Temporality? = nil
-    var currentThreadCountScale: Int? = nil
+    var currentDispatchMode: DispatchMode? = nil
     var hopCheckOpen = false  // Track if we have an open hop check conditional
     var loopOpen = false
 
@@ -264,7 +290,7 @@ public class CRenderer: Renderer {
       let needsNewLoop =
         currentFrameOrder != block.frameOrder
         || currentTemporality != block.temporality
-        || currentThreadCountScale != block.threadCountScale
+        || currentDispatchMode != block.dispatchMode
 
       if needsNewLoop {
         // Close previous hop check if open
@@ -280,66 +306,111 @@ public class CRenderer: Renderer {
         }
 
         // Emit setThreadCountScale UOp when scale changes so emit() can track it
-        if block.threadCountScale != currentThreadCountScale {
-          if let scale = block.threadCountScale {
+        let newScale = block.dispatchMode.threadCountScale
+        let oldScale = currentDispatchMode?.threadCountScale
+        if newScale != oldScale {
+          if let scale = newScale {
             scheduleItem.ops.append(UOp(op: .setThreadCountScale(scale), value: .empty))
           } else {
             scheduleItem.ops.append(UOp(op: .setThreadCountScale(0), value: .empty))  // 0 means nil
           }
         }
 
-        // Open new loop based on temporality
-        if block.hasOwnFrameLoop {
+        // Open new loop based on dispatch mode
+        switch block.dispatchMode {
+        case .selfManaged:
           // Block contains its own forward/backward frame loops (BPTT)
           loopOpen = false
-        } else {
-        switch block.temporality {
-        case .frameBased:
-          // Frame-based: standard frame loop
-          let loopCount = scaledFrameCount(block.threadCountScale)
-          scheduleItem.ops.append(
-            UOp(
-              op: .beginLoop(loopCount, block.vectorWidth),
-              value: .empty)
-          )
-          loopOpen = true
 
-        case .hopBased(_, let counterNodeId):
-          // Hop-based: frame loop with conditional check inside
-          // The block only executes when counter == 0
-          // Look up the counter node's Lazy value from ctx.values (set during block emission)
-          guard let counterLazy = ctx.values[counterNodeId] else {
-            fatalError("Hop counter node \(counterNodeId) not found in ctx.values")
+        case .staticThreads, .perFrame, .perFrameScaled:
+          // Static/SIMD: no frame loop from C renderer perspective
+          switch block.temporality {
+          case .frameBased:
+            let loopCount = scaledFrameCount(block.dispatchMode.threadCountScale)
+            scheduleItem.ops.append(
+              UOp(
+                op: .beginLoop(loopCount, block.vectorWidth),
+                value: .empty)
+            )
+            loopOpen = true
+
+          case .hopBased(_, let counterNodeId):
+            guard let counterLazy = ctx.values[counterNodeId] else {
+              fatalError("Hop counter node \(counterNodeId) not found in ctx.values")
+            }
+            scheduleItem.ops.append(
+              UOp(
+                op: .beginLoop(frameCountUOp, block.vectorWidth),
+                value: .empty)
+            )
+            if case .variable(let vid, _) = counterLazy {
+              for uop in block.ops {
+                if case .loadGlobal(let id) = uop.op, id == vid {
+                  scheduleItem.ops.append(uop)
+                  break
+                }
+              }
+            }
+            scheduleItem.ops.append(
+              UOp(op: .beginHopCheck(counterLazy), value: .empty)
+            )
+            hopCheckOpen = true
+            loopOpen = true
+
+          case .static_:
+            loopOpen = false
           }
+
+        case .singleThreaded:
+          switch block.temporality {
+          case .frameBased:
+            scheduleItem.ops.append(
+              UOp(
+                op: .beginLoop(frameCountUOp, block.vectorWidth),
+                value: .empty)
+            )
+            loopOpen = true
+
+          case .hopBased(_, let counterNodeId):
+            guard let counterLazy = ctx.values[counterNodeId] else {
+              fatalError("Hop counter node \(counterNodeId) not found in ctx.values")
+            }
+            scheduleItem.ops.append(
+              UOp(
+                op: .beginLoop(frameCountUOp, block.vectorWidth),
+                value: .empty)
+            )
+            if case .variable(let vid, _) = counterLazy {
+              for uop in block.ops {
+                if case .loadGlobal(let id) = uop.op, id == vid {
+                  scheduleItem.ops.append(uop)
+                  break
+                }
+              }
+            }
+            scheduleItem.ops.append(
+              UOp(op: .beginHopCheck(counterLazy), value: .empty)
+            )
+            hopCheckOpen = true
+            loopOpen = true
+
+          case .static_:
+            loopOpen = false
+          }
+
+        case .fixedWithFrameLoop:
+          // Not used by C renderer, but handle gracefully
           scheduleItem.ops.append(
             UOp(
               op: .beginLoop(frameCountUOp, block.vectorWidth),
               value: .empty)
           )
-          // Hoist the counter's loadGlobal before beginHopCheck so the variable is declared
-          if case .variable(let vid, _) = counterLazy {
-            for uop in block.ops {
-              if case .loadGlobal(let id) = uop.op, id == vid {
-                scheduleItem.ops.append(uop)
-                break
-              }
-            }
-          }
-          scheduleItem.ops.append(
-            UOp(op: .beginHopCheck(counterLazy), value: .empty)
-          )
-          hopCheckOpen = true
           loopOpen = true
-
-        case .static_:
-          // Static: no frame loop
-          loopOpen = false
         }
-        }  // end else (not hasOwnFrameLoop)
 
         currentFrameOrder = block.frameOrder
         currentTemporality = block.temporality
-        currentThreadCountScale = block.threadCountScale
+        currentDispatchMode = block.dispatchMode
       }
 
       for uop in block.ops {
@@ -364,7 +435,7 @@ public class CRenderer: Renderer {
     totalMemorySlots: Int
   ) -> String {
     frameIndexOverride = nil
-    currentThreadCountScale = scheduleItem.threadCountScale
+    currentThreadCountScale = scheduleItem.dispatchMode.threadCountScale
     parallelRangeVarStack = []  // Reset parallel range tracking for new kernel
     inScaledFrameLoop = false  // Reset scaled frame loop tracking
     var code: [String] = []

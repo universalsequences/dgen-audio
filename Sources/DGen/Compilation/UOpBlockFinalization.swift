@@ -40,26 +40,21 @@ extension UOpBlockFinalization {
       upgradeElementLoopsToSIMD(&finalOps)
     }
 
-    let parallelPolicy = inferParallelPolicy(
+    let dispatchMode = computeDispatchMode(
+      block: block,
+      threadCountScale: threadCountScale,
+      statefulTensorDecision: statefulTensorDecision,
+      hasOwnFrameLoop: hasOwnFrameLoop,
       frameOrder: effectiveFrameOrder,
-      temporality: block.temporality,
-      ops: finalOps,
-      statefulTensorDecision: statefulTensorDecision
+      ops: finalOps
     )
-    let threadCountOverride = statefulTensorDecision.enabled ? statefulTensorDecision.tensorSize : nil
-
-    let forceNewKernel = threadCountScale != nil || threadCountOverride != nil || hasOwnFrameLoop
 
     return BlockUOps(
       ops: finalOps,
       frameOrder: effectiveFrameOrder,
       vectorWidth: effectiveVectorWidth,
       temporality: block.temporality,
-      parallelPolicy: parallelPolicy,
-      forceNewKernel: forceNewKernel,
-      threadCountScale: threadCountScale,
-      threadCountOverride: threadCountOverride,
-      hasOwnFrameLoop: hasOwnFrameLoop
+      dispatchMode: dispatchMode
     )
   }
 
@@ -101,24 +96,37 @@ extension UOpBlockFinalization {
     return (blockFrameOrder, bodyVectorWidth)
   }
 
-  /// Infers whether finalized scalar static blocks can launch with thread-level parallel policy.
-  private static func inferParallelPolicy(
+  /// Computes the dispatch mode for a finalized block.
+  private static func computeDispatchMode(
+    block: Block,
+    threadCountScale: Int?,
+    statefulTensorDecision: StatefulTensorParallelPolicy.Decision,
+    hasOwnFrameLoop: Bool,
     frameOrder: FrameOrder,
-    temporality: Temporality,
-    ops: [UOp],
-    statefulTensorDecision: StatefulTensorParallelPolicy.Decision
-  ) -> ParallelPolicy {
+    ops: [UOp]
+  ) -> DispatchMode {
+    if hasOwnFrameLoop { return .selfManaged }
+
+    if block.temporality == .static_ {
+      if block.frameOrder.isParallel, let scale = threadCountScale {
+        return .staticThreads(scale)
+      }
+      let hasParallelRange = ops.contains {
+        if case .beginParallelRange = $0.op { return true }
+        return false
+      }
+      if hasParallelRange { return .staticThreads(1) }  // split will adjust
+      return .staticThreads(1)
+    }
+
     if statefulTensorDecision.enabled {
-      return .tensorElementParallel
+      return .fixedWithFrameLoop(statefulTensorDecision.tensorSize)
     }
 
-    guard temporality == .static_, frameOrder == .sequential else { return .serial }
-
-    let hasParallelRange = ops.contains {
-      if case .beginParallelRange = $0.op { return true }
-      return false
+    if let scale = threadCountScale {
+      return .perFrameScaled(scale)
     }
 
-    return hasParallelRange ? .threadParallel : .serial
+    return frameOrder.isSequential ? .singleThreaded : .perFrame
   }
 }
