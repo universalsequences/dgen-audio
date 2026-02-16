@@ -40,6 +40,175 @@ final class MatmulKernelTests: XCTestCase {
     print("Kernel written to /tmp/matmul_2x2.metal")
   }
 
+  /// CPU reference matmul for verification: A[M,K] @ B[K,N] → C[M,N]
+  private func cpuMatmul(_ a: [Float], _ b: [Float], M: Int, K: Int, N: Int) -> [Float] {
+    var c = [Float](repeating: 0, count: M * N)
+    for i in 0..<M {
+      for j in 0..<N {
+        var sum: Float = 0
+        for p in 0..<K {
+          sum += a[i * K + p] * b[p * N + j]
+        }
+        c[i * N + j] = sum
+      }
+    }
+    return c
+  }
+
+  /// 8x8 matmul — smallest GEMM-eligible size (M,N,K all divisible by 8).
+  /// Exercises the simdgroup_float8x8 path with exactly 1 tile per dimension.
+  func testMatmul8x8Kernel() throws {
+    DGenConfig.kernelOutputPath = "/tmp/matmul_8x8.metal"
+    defer { DGenConfig.kernelOutputPath = nil }
+
+    let M = 8
+    let K = 8
+    let N = 8
+    // Deterministic small values to avoid float precision issues
+    let dataA = (0..<M * K).map { Float($0 + 1) * 0.01 }
+    let dataB = (0..<K * N).map { Float($0 + 1) * 0.01 }
+    let expected = cpuMatmul(dataA, dataB, M: M, K: K, N: N)
+
+    let A = Tensor(dataA).reshape([M, K])
+    let B = Tensor(dataB).reshape([K, N])
+    let C = A.matmul(B)
+    let result = try C.realize()
+
+    XCTAssertEqual(result.count, M * N)
+    for i in 0..<result.count {
+      XCTAssertEqual(
+        result[i], expected[i], accuracy: 1e-3,
+        "Mismatch at index \(i): got \(result[i]), expected \(expected[i])")
+    }
+    print("matmul 8x8 GEMM result verified against CPU reference")
+  }
+
+  /// 64x64 matmul — exercises multi-tile GEMM (8 tiles per dimension).
+  func testMatmul64x64Kernel() throws {
+    DGenConfig.kernelOutputPath = "/tmp/matmul_64x64.metal"
+    defer { DGenConfig.kernelOutputPath = nil }
+
+    let M = 64
+    let K = 64
+    let N = 64
+    // Use small values scaled down to keep products in reasonable float range
+    let dataA = (0..<M * K).map { Float($0 % 17) * 0.1 - 0.8 }
+    let dataB = (0..<K * N).map { Float($0 % 13) * 0.1 - 0.6 }
+    let expected = cpuMatmul(dataA, dataB, M: M, K: K, N: N)
+
+    let A = Tensor(dataA).reshape([M, K])
+    let B = Tensor(dataB).reshape([K, N])
+    let C = A.matmul(B)
+    let result = try C.realize()
+
+    XCTAssertEqual(result.count, M * N)
+    var maxErr: Float = 0
+    for i in 0..<result.count {
+      let err = abs(result[i] - expected[i])
+      maxErr = max(maxErr, err)
+      XCTAssertEqual(
+        result[i], expected[i], accuracy: 1e-2,
+        "Mismatch at [\(i/N),\(i%N)]: got \(result[i]), expected \(expected[i])")
+    }
+    print("matmul 64x64 GEMM result verified, max error: \(maxErr)")
+  }
+
+  /// 8x8 matmul backward — verify gradients are numerically correct.
+  /// For loss = sum(A @ B), dL/dA[i,k] = sum_j B[k,j] (sum of row k of B).
+  /// Both forward and backward matmul patterns are GEMM-eligible (8-divisible).
+  func testMatmulGemmBackward() throws {
+    DGenConfig.kernelOutputPath = "/tmp/matmul_gemm_backward.metal"
+    defer { DGenConfig.kernelOutputPath = nil }
+
+    let M = 8
+    let K = 8
+    let N = 8
+    let dataA = (0..<M * K).map { Float($0 + 1) * 0.01 }
+    let dataB = (0..<K * N).map { Float($0 + 1) * 0.01 }
+
+    let A = Tensor.param([M, K], data: dataA)
+    let B = Tensor(dataB).reshape([K, N])
+
+    let C = A.matmul(B)
+    let loss = C.sum()
+    let _ = try loss.backward(frameCount: 1)
+
+    // Verify gradients: dL/dA[i,k] = sum_j B[k,j]
+    guard let gradA = A.grad else {
+      XCTFail("A.grad is nil after backward")
+      return
+    }
+
+    var expectedGradA = [Float](repeating: 0, count: M * K)
+    for i in 0..<M {
+      for k in 0..<K {
+        var rowSum: Float = 0
+        for j in 0..<N { rowSum += dataB[k * N + j] }
+        expectedGradA[i * K + k] = rowSum
+      }
+    }
+
+    for i in 0..<expectedGradA.count {
+      XCTAssertEqual(
+        gradA.getData()![i], expectedGradA[i], accuracy: 1e-2,
+        "Gradient mismatch at A[\(i/K),\(i%K)]: got \(gradA.getData()![i]), expected \(expectedGradA[i])"
+      )
+    }
+    print("GEMM backward gradients verified against analytical reference")
+  }
+
+  /// 8x8 backward with both A and B as params — verify both gradients.
+  /// dL/dA[i,k] = sum_j B[k,j], dL/dB[k,j] = sum_i A[i,k]
+  func testMatmulGemmBackwardBothParams() throws {
+    let M = 8
+    let K = 8
+    let N = 8
+    let dataA = (0..<M * K).map { Float($0 + 1) * 0.01 }
+    let dataB = (0..<K * N).map { Float(65 - $0) * 0.01 }
+
+    let A = Tensor.param([M, K], data: dataA)
+    let B = Tensor.param([K, N], data: dataB)
+
+    let C = A.matmul(B)
+    let loss = (C - 0).sum()
+    let lossValue = try loss.backward(frameCount: 1)
+    print(dataA)
+    print(dataB)
+    print(lossValue)
+    print("loss value = \(lossValue.reduce(0, +))")
+
+    // dL/dA[i,k] = sum_j B[k,j]
+    guard let gradA = A.grad else {
+      XCTFail("A.grad nil")
+      return
+    }
+    for i in 0..<M {
+      for k in 0..<K {
+        var rowSum: Float = 0
+        for j in 0..<N { rowSum += dataB[k * N + j] }
+        XCTAssertEqual(
+          gradA.getData()![i * K + k], rowSum, accuracy: 1e-2,
+          "dA[\(i),\(k)] mismatch")
+      }
+    }
+
+    // dL/dB[k,j] = sum_i A[i,k]
+    guard let gradB = B.grad else {
+      XCTFail("B.grad nil")
+      return
+    }
+    for k in 0..<K {
+      for j in 0..<N {
+        var colSum: Float = 0
+        for i in 0..<M { colSum += dataA[i * K + k] }
+        XCTAssertEqual(
+          gradB.getData()![k * N + j], colSum, accuracy: 1e-2,
+          "dB[\(k),\(j)] mismatch")
+      }
+    }
+    print("GEMM backward both-param gradients verified")
+  }
+
   /// Matmul [2,2] @ [2,2] → [2,2] with backward pass.
   /// Verifies that the static matmul kernel parallelizes over output elements (4 threads, no element loop).
   func testMatmul2x2KernelBackward() throws {

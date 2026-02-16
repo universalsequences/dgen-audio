@@ -177,6 +177,18 @@ extension UOp {
             opStr = "\(ANSI.magenta)beginHopCheck\(ANSI.reset)(\(cond))"
         case .endHopCheck:
             opStr = "\(ANSI.magenta)endHopCheck\(ANSI.reset)"
+        case .threadgroupPositionX:
+            opStr = "\(ANSI.cyan)threadgroupPositionX\(ANSI.reset)"
+        case .threadgroupPositionY:
+            opStr = "\(ANSI.cyan)threadgroupPositionY\(ANSI.reset)"
+        case .simdgroupMatrixZero:
+            opStr = "\(ANSI.cyan)simdgroupMatrixZero\(ANSI.reset)"
+        case let .simdgroupLoad(cellId, offset, stride):
+            opStr = "\(ANSI.cyan)simdgroupLoad\(ANSI.reset)(cell=\(cellId), offset=\(offset), stride=\(stride))"
+        case let .simdgroupStore(src, cellId, offset, stride):
+            opStr = "\(ANSI.cyan)simdgroupStore\(ANSI.reset)(src=\(src), cell=\(cellId), offset=\(offset), stride=\(stride))"
+        case let .simdgroupMultiplyAccumulate(a, b, acc):
+            opStr = "\(ANSI.cyan)simdgroupMAD\(ANSI.reset)(\(a), \(b), acc=\(acc))"
         }
 
         return "\(ANSI.bold)UOp\(ANSI.reset)(op: \(opStr), value: \(value))"

@@ -259,6 +259,9 @@ extension LazyOp {
       .bufferViewGradStore, .bufferViewGradRead:
       try emitFFT(b: b, ctx: ctx, g: g, node: node, inputs: inputs, nodeId: nodeId)
 
+    case .gemm:
+      try emitGemm(b: b, ctx: ctx, g: g, node: node, nodeId: nodeId, ops: &ops)
+
     case .conv1d, .conv2d, .sum, .sumAxis, .maxAxis, .meanAxis, .reshape, .asStrided, .transpose, .shrink,
       .pad, .expandView, .repeatView, .peek, .expand, .expandAxis, .gradPhasor:
       try emitTensorOp(b: b, ctx: ctx, g: g, node: node, inputs: inputs, nodeId: nodeId, ops: &ops)

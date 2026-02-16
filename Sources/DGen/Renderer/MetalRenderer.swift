@@ -15,6 +15,7 @@ public class MetalRenderer: Renderer, UOpEmitter {
   private var staticGlobalVars: Set<VarID> = []
   private var currentThreadCountScale: Int? = nil
   private var currentThreadCountOverride: Int? = nil
+  private var isGemmKernel: Bool = false
   /// Track scalarType of emitted UOps by their VarID for offset type lookups
   private var varScalarTypes: [VarID: CastType] = [:]
 
@@ -113,7 +114,8 @@ public class MetalRenderer: Renderer, UOpEmitter {
       }
 
       // If splitStaticParallelRanges produced a thread count, override to staticThreads(N).
-      let finalDispatchMode = parallelCount.map { DispatchMode.staticThreads($0) }
+      let finalDispatchMode =
+        parallelCount.map { DispatchMode.staticThreads($0) }
         ?? scheduleItem.dispatchMode
 
       return CompiledKernel(
@@ -261,12 +263,12 @@ public class MetalRenderer: Renderer, UOpEmitter {
           if !current.isEmpty {
             segments.append((ops: current, parallelCount: nil))
             current.removeAll(keepingCapacity: true)
+          }
+          currentParallelCount = count
         }
-        currentParallelCount = count
-      }
-      parallelDepth += 1
-      if parallelDepth > maxParallelDepth { maxParallelDepth = parallelDepth }
-      current.append(op)
+        parallelDepth += 1
+        if parallelDepth > maxParallelDepth { maxParallelDepth = parallelDepth }
+        current.append(op)
       case .endParallelRange:
         current.append(op)
         parallelDepth -= 1
@@ -313,7 +315,9 @@ public class MetalRenderer: Renderer, UOpEmitter {
     var splitItems: [SplitScheduleItem] = []
     for segment in segments {
       if segment.ops.isEmpty { continue }
-      let item = ScheduleItem(frameOrder: scheduleItem.frameOrder, vectorWidth: scheduleItem.vectorWidth, temporality: scheduleItem.temporality)
+      let item = ScheduleItem(
+        frameOrder: scheduleItem.frameOrder, vectorWidth: scheduleItem.vectorWidth,
+        temporality: scheduleItem.temporality)
       item.dispatchMode = scheduleItem.dispatchMode
       item.ops.append(contentsOf: prefixOps)
       if segment.parallelCount == nil {
@@ -362,11 +366,17 @@ public class MetalRenderer: Renderer, UOpEmitter {
       .or(let a, let b), .xor(let a, let b), .beginRange(let a, let b), .beginForLoop(let a, let b):
       return variableIdsUsed(in: a).union(variableIdsUsed(in: b))
 
-    case .memoryRead(_, let a), .beginLoop(let a, _):
+    case .memoryRead(_, let a), .beginLoop(let a, _), .simdgroupLoad(_, let a, _):
       return variableIdsUsed(in: a)
 
     case .memoryWrite(_, let a, let b), .memoryAccumulate(_, let a, let b):
       return variableIdsUsed(in: a).union(variableIdsUsed(in: b))
+
+    case .simdgroupStore(let src, _, let off, _):
+      return variableIdsUsed(in: src).union(variableIdsUsed(in: off))
+
+    case .simdgroupMultiplyAccumulate(let a, let b, let acc):
+      return variableIdsUsed(in: a).union(variableIdsUsed(in: b)).union(variableIdsUsed(in: acc))
 
     case .latch(let a, let b):
       return variableIdsUsed(in: a).union(variableIdsUsed(in: b))
@@ -519,7 +529,9 @@ public class MetalRenderer: Renderer, UOpEmitter {
 
     for next in items.dropFirst() {
       if canFuseStaticThreadParallel(current, next) {
-        let merged = ScheduleItem(frameOrder: current.item.frameOrder, vectorWidth: current.item.vectorWidth, temporality: current.item.temporality)
+        let merged = ScheduleItem(
+          frameOrder: current.item.frameOrder, vectorWidth: current.item.vectorWidth,
+          temporality: current.item.temporality)
         merged.ops.append(contentsOf: current.item.ops)
         merged.ops.append(contentsOf: next.item.ops)
         current = SplitScheduleItem(item: merged, threadCount: current.threadCount)
@@ -570,7 +582,9 @@ public class MetalRenderer: Renderer, UOpEmitter {
     for block in uopBlocks {
       closeCurrentKernel()
 
-      let scheduleItem = ScheduleItem(frameOrder: block.frameOrder, vectorWidth: block.vectorWidth, temporality: block.temporality)
+      let scheduleItem = ScheduleItem(
+        frameOrder: block.frameOrder, vectorWidth: block.vectorWidth, temporality: block.temporality
+      )
       scheduleItem.dispatchMode = block.dispatchMode
       scheduleItem.ops.append(UOp(op: .frameCount, value: .empty))
 
@@ -589,7 +603,8 @@ public class MetalRenderer: Renderer, UOpEmitter {
 
       case .staticThreads(let n):
         // Static blocks: dispatch N threads with no frame loop.
-        let beginRange = UOp(op: .beginRange(.constant(0, 0), .constant(0, Float(n))), value: .empty)
+        let beginRange = UOp(
+          op: .beginRange(.constant(0, 0), .constant(0, Float(n))), value: .empty)
         scheduleItem.ops.append(beginRange)
         hasFrameLoop = false
 
@@ -633,6 +648,15 @@ public class MetalRenderer: Renderer, UOpEmitter {
           scheduleItem.ops.append(beginRange)
         }
         hasFrameLoop = true
+
+      case .gemm(let tilesM, let tilesN):
+        // GEMM: dispatch tilesM × tilesN threadgroups of 32 threads each.
+        // No frame wrapping — GEMM is a static-like operation.
+        let totalThreads = tilesM * tilesN * 32
+        let beginRange = UOp(
+          op: .beginRange(.constant(0, 0), .constant(0, Float(totalThreads))), value: .empty)
+        scheduleItem.ops.append(beginRange)
+        hasFrameLoop = false
       }
 
       // Hop-based temporality: wrap body in hop check conditional.
@@ -670,6 +694,10 @@ public class MetalRenderer: Renderer, UOpEmitter {
     currentThreadCountOverride = scheduleItem.dispatchMode.fixedThreadCount
     currentTemporality = scheduleItem.temporality  // Set temporality for gradient indexing
     currentFrameOrder = scheduleItem.frameOrder
+    isGemmKernel = {
+      if case .gemm = scheduleItem.dispatchMode { return true }
+      return false
+    }()
     let (inputs, outputs) = analyzeDependencies(scheduleItem: scheduleItem, ctx: ctx)
 
     let allBuffers = Set(inputs + outputs)
@@ -714,8 +742,15 @@ public class MetalRenderer: Renderer, UOpEmitter {
       bufferIndex += 1
     }
 
-    parameters.append("    uint id [[thread_position_in_grid]]")
+    if isGemmKernel {
+      parameters.append("    uint2 gid [[threadgroup_position_in_grid]]")
+    } else {
+      parameters.append("    uint id [[thread_position_in_grid]]")
+    }
 
+    if isGemmKernel {
+      kernels += "#include <metal_simdgroup_matrix>\n"
+    }
     kernels += "kernel void \(name)(\n"
     kernels += parameters.joined(separator: ",\n")
     kernels += "\n) {\n"
@@ -734,7 +769,8 @@ public class MetalRenderer: Renderer, UOpEmitter {
     for uop in scheduleItem.ops {
       var diff = 0
       switch uop.op {
-      case .beginIf, .beginLoop, .beginReverseLoop, .beginRange, .beginForLoop, .beginParallelRange, .beginHopCheck:
+      case .beginIf, .beginLoop, .beginReverseLoop, .beginRange, .beginForLoop, .beginParallelRange,
+        .beginHopCheck:
         diff = 1
       case .endIf, .endLoop, .endRange, .endParallelRange, .endHopCheck:
         indent -= 1
@@ -789,7 +825,8 @@ public class MetalRenderer: Renderer, UOpEmitter {
         inputs.insert(varId)
       case .loadTape(let val, _):
         checkLazyForGlobal(val)
-      case .load, .store, .delay1, .memoryRead, .memoryWrite, .memoryAccumulate, .noise:
+      case .load, .store, .delay1, .memoryRead, .memoryWrite, .memoryAccumulate, .noise,
+        .simdgroupLoad, .simdgroupStore:
         needsMemory = true
       default:
         break
@@ -998,7 +1035,8 @@ public class MetalRenderer: Renderer, UOpEmitter {
         countStr = "(uint)\(g(count))"
       }
       return "for (uint t\(varId) = 0; t\(varId) < \(countStr); t\(varId)++) {"
-    case .endLoop: return "} atomic_thread_fence(metal::mem_flags::mem_device, metal::memory_order_seq_cst);"
+    case .endLoop:
+      return "} atomic_thread_fence(metal::mem_flags::mem_device, metal::memory_order_seq_cst);"
 
     case .threadIndex:
       // In Metal, threadIndex maps to 'id' (thread_position_in_grid)
@@ -1020,6 +1058,9 @@ public class MetalRenderer: Renderer, UOpEmitter {
       return emitAssign(uop, g(value), ctx)
 
     case .beginRange(let start, let end):
+      // GEMM kernels use 2D threadgroup dispatch — no linear id range guard needed
+      if isGemmKernel { return "{" }
+
       let startExpr: String
       if case .constant(_, let val) = start {
         startExpr = "\(Int(val))"
@@ -1092,6 +1133,28 @@ public class MetalRenderer: Renderer, UOpEmitter {
       return "if (\(g(cond)) == 0.0) {"
     case .endHopCheck:
       return "}"
+
+    // GEMM threadgroup position
+    case .threadgroupPositionX:
+      return emitAssign(uop, "gid.x", ctx)
+    case .threadgroupPositionY:
+      return emitAssign(uop, "gid.y", ctx)
+
+    // GEMM simdgroup matrix operations
+    case .simdgroupMatrixZero:
+      let lhs = emitLazy(uop.value, ctx: ctx, isOut: true)
+      return "metal::simdgroup_float8x8 \(lhs) = metal::simdgroup_float8x8(0);"
+    case .simdgroupLoad(let cellId, let offset, let stride):
+      let lhs = emitLazy(uop.value, ctx: ctx, isOut: true)
+      let cast = intCastPrefix(for: offset)
+      return
+        "metal::simdgroup_float8x8 \(lhs) = metal::simdgroup_float8x8(0); metal::simdgroup_load(\(lhs), &memory[\(cellId) + \(cast)\(g(offset))], \(stride));"
+    case .simdgroupStore(let src, let cellId, let offset, let stride):
+      let cast = intCastPrefix(for: offset)
+      return
+        "metal::simdgroup_store(\(g(src)), &memory[\(cellId) + \(cast)\(g(offset))], \(stride));"
+    case .simdgroupMultiplyAccumulate(let a, let b, let acc):
+      return "metal::simdgroup_multiply_accumulate(\(g(acc)), \(g(a)), \(g(b)), \(g(acc)));"
 
     default:
       return "/* \(uop.prettyDescription()) */"

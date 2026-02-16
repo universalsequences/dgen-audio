@@ -1111,7 +1111,7 @@ extension LazyOp {
 
     // MARK: Gradient-specific ops (should not appear in forward graph)
 
-    case .gradPhasor(_), .gradDeterministicPhasor:
+    case .gradPhasor(_), .gradDeterministicPhasor, .gemm(_, _, _):
       // These are gradient ops, shouldn't need their own gradients
       return node.inputs.map { _ in nil }
     }

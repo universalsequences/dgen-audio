@@ -313,16 +313,23 @@ public class MetalCompiledKernel: CompiledKernelRuntime {
         }
       }
 
-      let totalThreads = kernel.dispatchMode.threadCount(frameCount: frameCount)
-      let maxThreadsPerGroup = pipelineState.maxTotalThreadsPerThreadgroup
+      if case .gemm(let tilesM, let tilesN) = kernel.dispatchMode {
+        // GEMM: 2D threadgroup grid, 32 threads per group (one SIMD group)
+        let threadgroups = MTLSize(width: tilesN, height: tilesM, depth: 1)
+        let threadsPerGroup = MTLSize(width: 32, height: 1, depth: 1)
+        computeEncoder.dispatchThreadgroups(threadgroups, threadsPerThreadgroup: threadsPerGroup)
+      } else {
+        let totalThreads = kernel.dispatchMode.threadCount(frameCount: frameCount)
+        let maxThreadsPerGroup = pipelineState.maxTotalThreadsPerThreadgroup
 
-      let threadGroupWidth =
-        totalThreads == 1
-        ? 1
-        : min(kernel.dispatchMode.threadGroupSize ?? 64, maxThreadsPerGroup, totalThreads)
-      let threads = MTLSize(width: totalThreads, height: 1, depth: 1)
-      let threadsPerGroup = MTLSize(width: threadGroupWidth, height: 1, depth: 1)
-      computeEncoder.dispatchThreads(threads, threadsPerThreadgroup: threadsPerGroup)
+        let threadGroupWidth =
+          totalThreads == 1
+          ? 1
+          : min(kernel.dispatchMode.threadGroupSize ?? 64, maxThreadsPerGroup, totalThreads)
+        let threads = MTLSize(width: totalThreads, height: 1, depth: 1)
+        let threadsPerGroup = MTLSize(width: threadGroupWidth, height: 1, depth: 1)
+        computeEncoder.dispatchThreads(threads, threadsPerThreadgroup: threadsPerGroup)
+      }
       if sharedEncoder == nil { computeEncoder.endEncoding() }
       if debugGradients {
         // Execute this kernel now so shared-memory buffers are visible for debug

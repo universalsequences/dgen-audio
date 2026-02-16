@@ -198,7 +198,8 @@ public struct CompilationPipeline {
     }
 
     let renderer = createRenderer(for: backend)
-    VoiceStateCompilation.configureRenderer(renderer, plan: voiceState, cellAllocations: cellAllocations)
+    VoiceStateCompilation.configureRenderer(
+      renderer, plan: voiceState, cellAllocations: cellAllocations)
 
     let kernels = try timings.measure("lowerUOpBlocks") {
       try lowerUOpBlocks(
@@ -261,6 +262,10 @@ public struct CompilationPipeline {
       options.forceScalar
         ? Set(graph.nodes.keys)
         : findSequentialNodes(graph, feedbackClusters: feedbackClusters, backend: backend)
+    }
+
+    timings.measure("gemmPass") {
+      GraphPrepPasses.gemmPass(graph: graph)
     }
 
     let sortedNodes = timings.measure("topologicalSort") {
@@ -353,7 +358,8 @@ public struct CompilationPipeline {
   private static func applyBackendBlockSafetySplitsIfNeeded(
     graph: Graph, backend: Backend, blocks: inout [Block]
   ) {
-    blocks = BackendBlockSafetySplitPass.applyIfNeeded(graph: graph, blocks: blocks, backend: backend)
+    blocks = BackendBlockSafetySplitPass.applyIfNeeded(
+      graph: graph, blocks: blocks, backend: backend)
   }
 
   /// Materializes lazy tensor cells after temporality and backend block layout are finalized.

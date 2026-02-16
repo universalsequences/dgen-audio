@@ -96,6 +96,16 @@ public enum Op {
   case beginHopCheck(Lazy)  // if (counter == 0.0f) { - runs block only when counter is 0
   case endHopCheck  // } - closes the hop check conditional
 
+  // Threadgroup position (for GEMM 2D dispatch)
+  case threadgroupPositionX  // gid.x — column tile index
+  case threadgroupPositionY  // gid.y — row tile index
+
+  // GEMM / simdgroup matrix operations (Metal tensor cores)
+  case simdgroupMatrixZero  // declare simdgroup_float8x8, zero-initialized
+  case simdgroupLoad(CellID, Lazy, Int)  // simdgroup_load(dest, memory[cell] + offset, stride)
+  case simdgroupStore(Lazy, CellID, Lazy, Int)  // simdgroup_store(src, memory[cell] + offset, stride)
+  case simdgroupMultiplyAccumulate(Lazy, Lazy, Lazy)  // acc = a * b + acc
+
   public var isDefineGlobal: Bool {
     if case .defineGlobal = self { return true }
     return false
@@ -106,7 +116,8 @@ public enum Op {
     switch self {
     case .load(let cellId), .store(let cellId, _), .delay1(let cellId, _),
       .memoryRead(let cellId, _), .memoryWrite(let cellId, _, _),
-      .memoryAccumulate(let cellId, _, _):
+      .memoryAccumulate(let cellId, _, _),
+      .simdgroupLoad(let cellId, _, _), .simdgroupStore(_, let cellId, _, _):
       return cellId
     default:
       return nil
@@ -171,6 +182,10 @@ public enum Op {
     case .loadTape(let v, let o): return .loadTape(r(v), r(o))
     case .beginIf(let c): return .beginIf(r(c))
     case .beginHopCheck(let c): return .beginHopCheck(r(c))
+    case .simdgroupLoad(let c, let o, let s): return .simdgroupLoad(c, r(o), s)
+    case .simdgroupStore(let src, let c, let o, let s): return .simdgroupStore(r(src), c, r(o), s)
+    case .simdgroupMultiplyAccumulate(let a, let b, let acc):
+      return .simdgroupMultiplyAccumulate(r(a), r(b), r(acc))
     default: return self  // ops without Lazy inputs (load, endLoop, frameIndex, etc.)
     }
   }
@@ -188,6 +203,10 @@ public enum Op {
     case .memoryWrite(_, let offset, let value): return .memoryWrite(newCellId, offset, value)
     case .memoryAccumulate(_, let offset, let value):
       return .memoryAccumulate(newCellId, offset, value)
+    case .simdgroupLoad(_, let offset, let stride):
+      return .simdgroupLoad(newCellId, offset, stride)
+    case .simdgroupStore(let src, _, let offset, let stride):
+      return .simdgroupStore(src, newCellId, offset, stride)
     default: return nil
     }
   }

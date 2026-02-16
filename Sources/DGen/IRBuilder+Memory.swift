@@ -176,4 +176,49 @@ extension IRBuilder {
 
     fatalError("no tape")
   }
+
+  // MARK: - Threadgroup Position
+
+  /// The threadgroup's X position in the dispatch grid (column tile index).
+  public func threadgroupPositionX() -> Expr {
+    return emitIntOp(.threadgroupPositionX)
+  }
+
+  /// The threadgroup's Y position in the dispatch grid (row tile index).
+  public func threadgroupPositionY() -> Expr {
+    return emitIntOp(.threadgroupPositionY)
+  }
+
+  // MARK: - SIMD Group Matrix Ops
+
+  /// Declare a zero-initialized simdgroup_float8x8 matrix variable.
+  public func simdgroupMatrixZero() -> Expr {
+    let dest = ctx.useVariable(src: nodeId)
+    ops.append(UOp(op: .simdgroupMatrixZero, value: dest))
+    return value(dest)
+  }
+
+  /// Cooperatively load an 8x8 tile from memory[cellId + offset] with the given stride.
+  public func simdgroupLoad(_ cellId: CellID, offset: Expr, stride: Int) -> Expr {
+    let dest = ctx.useVariable(src: nodeId)
+    ops.append(UOp(op: .simdgroupLoad(cellId, offset.lazy, stride), value: dest))
+    return value(dest)
+  }
+
+  /// Cooperatively store an 8x8 tile to memory[cellId + offset] with the given stride.
+  @discardableResult
+  public func simdgroupStore(_ src: Expr, cellId: CellID, offset: Expr, stride: Int) -> Expr {
+    let dest = ctx.useVariable(src: nodeId)
+    ops.append(UOp(op: .simdgroupStore(src.lazy, cellId, offset.lazy, stride), value: dest))
+    return value(dest)
+  }
+
+  /// Multiply-accumulate: acc = a * b + acc. In-place on the accumulator.
+  /// Uses acc's variable as the result — the renderer emits
+  /// `simdgroup_multiply_accumulate(acc, a, b, acc)` which modifies acc in place.
+  @discardableResult
+  public func simdgroupMultiplyAccumulate(_ a: Expr, _ b: Expr, _ acc: Expr) -> Expr {
+    ops.append(UOp(op: .simdgroupMultiplyAccumulate(a.lazy, b.lazy, acc.lazy), value: acc.lazy))
+    return acc
+  }
 }

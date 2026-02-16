@@ -530,6 +530,17 @@ private func groupRegularTensorBlock(
       }
       currentShape = nil
 
+    } else if case .gemm = node.op {
+      // GEMM manages its own dispatch — isolate into its own block
+      appendCurrentGroupingBlockIfNeeded(&currentBlock, grouped: &grouped)
+      var gemmBlock = makeTensorGroupingBlock(from: block)
+      gemmBlock.nodes.append(nodeId)
+      gemmBlock.shape = nil  // GEMM has its own dispatch, no shape-based threading
+      grouped.append(gemmBlock)
+      currentBlock = makeTensorGroupingBlock(from: block)
+      currentShape = nil
+      continue
+
     } else if case .constant = node.op {
       // Constants do not affect grouping state.
     } else if case .overlapAdd = node.op {
