@@ -127,8 +127,7 @@ private struct LoopEntry {
 private func analyzeOneKernel(
   _ item: ScheduleItem, name: String, frameCount: Int
 ) -> KernelStats {
-  // Determine thread count from the beginRange in the schedule
-  var threadCount = computeThreadCount(item, frameCount: frameCount)
+  var threadCount = item.dispatchMode.threadCount(frameCount: frameCount)
 
   // Static blocks dispatched as staticThreads(1) may contain beginParallelRange(N)
   // that gets split into separate kernels dispatching N threads by
@@ -223,15 +222,6 @@ private func analyzeOneKernel(
 }
 
 // MARK: - Helpers
-
-/// Compute the number of threads dispatched for this kernel.
-/// Note: for static threadParallel blocks, the thread count from
-/// beginParallelRange is applied in analyzeOneKernel instead.
-private func computeThreadCount(
-  _ item: ScheduleItem, frameCount: Int
-) -> Int {
-  return item.dispatchMode.threadCount(frameCount: frameCount)
-}
 
 /// Resolve iteration count from a beginLoop op.
 private func resolveLoopCount(

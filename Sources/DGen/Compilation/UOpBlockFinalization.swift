@@ -111,11 +111,6 @@ extension UOpBlockFinalization {
       if block.frameOrder.isParallel, let scale = threadCountScale {
         return .staticThreads(scale)
       }
-      let hasParallelRange = ops.contains {
-        if case .beginParallelRange = $0.op { return true }
-        return false
-      }
-      if hasParallelRange { return .staticThreads(1) }  // split will adjust
       return .staticThreads(1)
     }
 

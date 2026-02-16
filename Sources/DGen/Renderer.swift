@@ -78,6 +78,12 @@ extension DispatchMode {
     default: return nil
     }
   }
+
+  /// Fixed thread count for modes that dispatch a constant number of threads with a frame loop.
+  var fixedThreadCount: Int? {
+    if case .fixedWithFrameLoop(let n) = self { return n }
+    return nil
+  }
 }
 
 public enum Device {
@@ -316,94 +322,36 @@ public class CRenderer: Renderer {
           }
         }
 
-        // Open new loop based on dispatch mode
-        switch block.dispatchMode {
-        case .selfManaged:
-          // Block contains its own forward/backward frame loops (BPTT)
+        // Open new loop based on dispatch mode and temporality.
+        // C is single-threaded, so all frame-based dispatch modes become loops.
+        if block.dispatchMode == .selfManaged {
           loopOpen = false
-
-        case .staticThreads, .perFrame, .perFrameScaled:
-          // Static/SIMD: no frame loop from C renderer perspective
-          switch block.temporality {
-          case .frameBased:
-            let loopCount = scaledFrameCount(block.dispatchMode.threadCountScale)
-            scheduleItem.ops.append(
-              UOp(
-                op: .beginLoop(loopCount, block.vectorWidth),
-                value: .empty)
-            )
-            loopOpen = true
-
-          case .hopBased(_, let counterNodeId):
-            guard let counterLazy = ctx.values[counterNodeId] else {
-              fatalError("Hop counter node \(counterNodeId) not found in ctx.values")
-            }
-            scheduleItem.ops.append(
-              UOp(
-                op: .beginLoop(frameCountUOp, block.vectorWidth),
-                value: .empty)
-            )
-            if case .variable(let vid, _) = counterLazy {
-              for uop in block.ops {
-                if case .loadGlobal(let id) = uop.op, id == vid {
-                  scheduleItem.ops.append(uop)
-                  break
-                }
-              }
-            }
-            scheduleItem.ops.append(
-              UOp(op: .beginHopCheck(counterLazy), value: .empty)
-            )
-            hopCheckOpen = true
-            loopOpen = true
-
-          case .static_:
-            loopOpen = false
+        } else if block.temporality == .static_ {
+          loopOpen = false
+        } else if case .hopBased(_, let counterNodeId) = block.temporality {
+          guard let counterLazy = ctx.values[counterNodeId] else {
+            fatalError("Hop counter node \(counterNodeId) not found in ctx.values")
           }
-
-        case .singleThreaded:
-          switch block.temporality {
-          case .frameBased:
-            scheduleItem.ops.append(
-              UOp(
-                op: .beginLoop(frameCountUOp, block.vectorWidth),
-                value: .empty)
-            )
-            loopOpen = true
-
-          case .hopBased(_, let counterNodeId):
-            guard let counterLazy = ctx.values[counterNodeId] else {
-              fatalError("Hop counter node \(counterNodeId) not found in ctx.values")
-            }
-            scheduleItem.ops.append(
-              UOp(
-                op: .beginLoop(frameCountUOp, block.vectorWidth),
-                value: .empty)
-            )
-            if case .variable(let vid, _) = counterLazy {
-              for uop in block.ops {
-                if case .loadGlobal(let id) = uop.op, id == vid {
-                  scheduleItem.ops.append(uop)
-                  break
-                }
-              }
-            }
-            scheduleItem.ops.append(
-              UOp(op: .beginHopCheck(counterLazy), value: .empty)
-            )
-            hopCheckOpen = true
-            loopOpen = true
-
-          case .static_:
-            loopOpen = false
-          }
-
-        case .fixedWithFrameLoop:
-          // Not used by C renderer, but handle gracefully
           scheduleItem.ops.append(
-            UOp(
-              op: .beginLoop(frameCountUOp, block.vectorWidth),
-              value: .empty)
+            UOp(op: .beginLoop(frameCountUOp, block.vectorWidth), value: .empty)
+          )
+          // Hoist the counter's loadGlobal before beginHopCheck so the variable is declared
+          if case .variable(let vid, _) = counterLazy {
+            for uop in block.ops {
+              if case .loadGlobal(let id) = uop.op, id == vid {
+                scheduleItem.ops.append(uop)
+                break
+              }
+            }
+          }
+          scheduleItem.ops.append(UOp(op: .beginHopCheck(counterLazy), value: .empty))
+          hopCheckOpen = true
+          loopOpen = true
+        } else {
+          // frameBased: emit a loop, optionally scaled by threadCountScale
+          let loopCount = scaledFrameCount(block.dispatchMode.threadCountScale)
+          scheduleItem.ops.append(
+            UOp(op: .beginLoop(loopCount, block.vectorWidth), value: .empty)
           )
           loopOpen = true
         }
