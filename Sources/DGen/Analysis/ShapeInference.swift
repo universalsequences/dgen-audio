@@ -9,7 +9,6 @@ import Foundation
 /// Returns nil if the shapes are not broadcastable.
 /// Example: [2, 1, 3] + [1, 2, 3] -> [2, 2, 3]
 public func broadcastShapes(_ s1: [Int], _ s2: [Int]) -> [Int]? {
-  // Pad shorter shape with 1s on the left
   let maxLen = max(s1.count, s2.count)
   let padded1 = Array(repeating: 1, count: maxLen - s1.count) + s1
   let padded2 = Array(repeating: 1, count: maxLen - s2.count) + s2
@@ -25,11 +24,29 @@ public func broadcastShapes(_ s1: [Int], _ s2: [Int]) -> [Int]? {
     } else if d2 == 1 {
       result.append(d1)
     } else {
-      // Incompatible dimensions
       return nil
     }
   }
   return result
+}
+
+/// Reduces one dimension from a tensor shape along the given axis.
+/// Returns `.scalar` if the resulting shape is empty (1D tensor reduced to nothing).
+private func inferAxisReduceShape(
+  opName: String, axis: Int, inputs: [ValueShape]
+) throws -> ValueShape {
+  guard let firstInput = inputs.first, case .tensor(let shape) = firstInput else {
+    throw DGenError.shapeInferenceFailed(op: opName, reason: "requires tensor input")
+  }
+  let ndim = shape.count
+  let normalizedAxis = axis < 0 ? ndim + axis : axis
+  guard normalizedAxis >= 0 && normalizedAxis < ndim else {
+    throw DGenError.shapeInferenceFailed(
+      op: opName, reason: "axis \(axis) out of range for \(ndim)D tensor")
+  }
+  var outputShape = shape
+  outputShape.remove(at: normalizedAxis)
+  return outputShape.isEmpty ? .scalar : .tensor(outputShape)
 }
 
 public func inferShape(op: LazyOp, inputs: [ValueShape], graph: Graph) throws -> ValueShape {
@@ -40,103 +57,50 @@ public func inferShape(op: LazyOp, inputs: [ValueShape], graph: Graph) throws ->
     }
     return .tensor(tensor.shape)
 
-  // History read - returns scalar or tensor shape depending on cell
   case .historyRead(let cellId):
-    // O(1) lookup using cellToTensor mapping
     if let tensorId = graph.cellToTensor[cellId], let tensor = graph.tensors[tensorId] {
       return .tensor(tensor.shape)
     }
-    // Scalar cell
     return .scalar
 
-  // History write - output shape same as input (passthrough)
   case .historyWrite(_):
     guard let firstInput = inputs.first else {
       throw DGenError.shapeInferenceFailed(op: "historyWrite", reason: "missing input")
     }
     return firstInput
 
-  // Conv1d - output shape matches input shape (same padding)
+  // Conv output shape matches input shape (same padding)
   case .conv1d(_):
     guard let firstInput = inputs.first else {
       throw DGenError.shapeInferenceFailed(op: "conv1d", reason: "missing input tensor")
     }
     return firstInput
 
-  // Conv2d - output shape matches input shape (same padding)
   case .conv2d(_):
     guard let firstInput = inputs.first else {
       throw DGenError.shapeInferenceFailed(op: "conv2d", reason: "missing input tensor")
     }
     return firstInput
 
-  // Sum reduce - always outputs scalar
   case .sum:
     return .scalar
 
-  // Sum along axis - reduces one dimension
+  // Axis reductions all share the same shape logic: remove the reduced dimension
   case .sumAxis(let axis):
-    guard let firstInput = inputs.first, case .tensor(let shape) = firstInput else {
-      throw DGenError.shapeInferenceFailed(op: "sumAxis", reason: "requires tensor input")
-    }
-    let ndim = shape.count
-    let normalizedAxis = axis < 0 ? ndim + axis : axis
-    guard normalizedAxis >= 0 && normalizedAxis < ndim else {
-      throw DGenError.shapeInferenceFailed(
-        op: "sumAxis", reason: "axis \(axis) out of range for \(ndim)D tensor")
-    }
-    var outputShape = shape
-    outputShape.remove(at: normalizedAxis)
-    if outputShape.isEmpty {
-      return .scalar
-    }
-    return .tensor(outputShape)
+    return try inferAxisReduceShape(opName: "sumAxis", axis: axis, inputs: inputs)
 
-  // Max along axis - reduces one dimension (same shape logic as sumAxis)
   case .maxAxis(let axis):
-    guard let firstInput = inputs.first, case .tensor(let shape) = firstInput else {
-      throw DGenError.shapeInferenceFailed(op: "maxAxis", reason: "requires tensor input")
-    }
-    let ndim = shape.count
-    let normalizedAxis = axis < 0 ? ndim + axis : axis
-    guard normalizedAxis >= 0 && normalizedAxis < ndim else {
-      throw DGenError.shapeInferenceFailed(
-        op: "maxAxis", reason: "axis \(axis) out of range for \(ndim)D tensor")
-    }
-    var outputShape = shape
-    outputShape.remove(at: normalizedAxis)
-    if outputShape.isEmpty {
-      return .scalar
-    }
-    return .tensor(outputShape)
+    return try inferAxisReduceShape(opName: "maxAxis", axis: axis, inputs: inputs)
 
-  // Mean along axis - reduces one dimension (same shape logic as sumAxis)
   case .meanAxis(let axis):
-    guard let firstInput = inputs.first, case .tensor(let shape) = firstInput else {
-      throw DGenError.shapeInferenceFailed(op: "meanAxis", reason: "requires tensor input")
-    }
-    let ndim = shape.count
-    let normalizedAxis = axis < 0 ? ndim + axis : axis
-    guard normalizedAxis >= 0 && normalizedAxis < ndim else {
-      throw DGenError.shapeInferenceFailed(
-        op: "meanAxis", reason: "axis \(axis) out of range for \(ndim)D tensor")
-    }
-    var outputShape = shape
-    outputShape.remove(at: normalizedAxis)
-    if outputShape.isEmpty {
-      return .scalar
-    }
-    return .tensor(outputShape)
+    return try inferAxisReduceShape(opName: "meanAxis", axis: axis, inputs: inputs)
 
-  // Reshape - changes shape, preserves total size
   case .reshape(let newShape):
     return .tensor(newShape)
 
-  // AsStrided - view with custom strides (for pool/im2col)
   case .asStrided(let newShape, _):
     return .tensor(newShape)
 
-  // Transpose - permutes axes
   case .transpose(let axes):
     guard let firstInput = inputs.first, case .tensor(let shape) = firstInput else {
       throw DGenError.shapeInferenceFailed(op: "transpose", reason: "requires tensor input")
@@ -148,7 +112,6 @@ public func inferShape(op: LazyOp, inputs: [ValueShape], graph: Graph) throws ->
     }
     return .tensor(newShape)
 
-  // Shrink - slices tensor along each axis
   case .shrink(let ranges):
     guard let firstInput = inputs.first, case .tensor(let shape) = firstInput else {
       throw DGenError.shapeInferenceFailed(op: "shrink", reason: "requires tensor input")
@@ -163,7 +126,6 @@ public func inferShape(op: LazyOp, inputs: [ValueShape], graph: Graph) throws ->
     }
     return .tensor(newShape)
 
-  // Pad - expands tensor with zeros along each axis
   case .pad(let padding):
     guard let firstInput = inputs.first, case .tensor(let shape) = firstInput else {
       throw DGenError.shapeInferenceFailed(op: "pad", reason: "requires tensor input")
@@ -174,23 +136,18 @@ public func inferShape(op: LazyOp, inputs: [ValueShape], graph: Graph) throws ->
     return .tensor(newShape)
 
   case .expandView(let targetShape):
-    // expandView broadcasts size-1 dims to target shape (stride=0 view)
     return .tensor(targetShape)
 
   case .repeatView(let repeats):
-    // repeatView tiles tensor - output shape is input shape * repeats
     guard let firstInput = inputs.first, case .tensor(let shape) = firstInput else {
       throw DGenError.shapeInferenceFailed(op: "repeatView", reason: "requires tensor input")
     }
     let newShape = zip(shape, repeats).map { $0 * $1 }
     return .tensor(newShape)
 
-  // Peek - reads a scalar from a 2D tensor at (index, channel)
   case .peek:
-    // Peek always outputs scalar - it reads one value from the tensor
     return .scalar
 
-  // selectRow - extracts a single row from a 2D tensor using dynamic index
   case .selectRow:
     guard let firstInput = inputs.first,
       case .tensor(let shape) = firstInput,
@@ -198,31 +155,24 @@ public func inferShape(op: LazyOp, inputs: [ValueShape], graph: Graph) throws ->
     else {
       throw DGenError.shapeInferenceFailed(op: "selectRow", reason: "requires 2D tensor input")
     }
-    return .tensor([shape[1]])  // Output is [numCols]
+    return .tensor([shape[1]])
 
-  // peekRowInline - interpolated row extraction with frame-indexed storage
-  case .peekRowInline(_, let numRows, let numCols):
-    return .tensor([numCols])  // Output is [numCols]
+  case .peekRowInline(_, _, let numCols):
+    return .tensor([numCols])
 
-  // FFT - outputs [numBins, 2] tensor where numBins = windowSize/2 + 1
-  // overlapAdd - outputs scalar (one sample per frame via ring buffer)
   case .overlapAdd(_, _, _, _, _):
     return .scalar
 
-  // overlapAdd gradient ops - side-effect only, output scalar
   case .overlapAddGradStore(_), .overlapAddGradGather(_, _, _, _):
     return .scalar
 
-  // bufferView gradient ops - side-effect only, output scalar
   case .bufferViewGradStore(_, _), .bufferViewGradRead(_, _):
     return .scalar
 
-  // peek gradient ops - side-effect only, output scalar
   case .peekGradWrite(_, _, _, _, _, _, _), .peekGradReduce(_, _, _, _, _, _, _):
     return .scalar
 
-  // Inherited (elementwise) - includes all binary and unary math ops
-  // Also includes stateful ops (phasor, accum, latch) that can operate element-wise on tensors
+  // Elementwise ops: broadcast tensor shapes, or inherit the single tensor shape, or scalar
   case .add, .sub, .mul, .div, .sin, .cos, .exp, .sqrt, .tanh,
     .tan, .log, .log10, .abs, .sign, .floor, .ceil, .round,
     .pow, .mod, .min, .max, .atan2, .gt, .gte, .lt, .lte, .eq,
@@ -234,7 +184,6 @@ public func inferShape(op: LazyOp, inputs: [ValueShape], graph: Graph) throws ->
     }
     if tensors.count == 2 {
       if case .tensor(let s1) = tensors[0], case .tensor(let s2) = tensors[1] {
-        // Try NumPy-style broadcasting
         if let broadcastShape = broadcastShapes(s1, s2) {
           return .tensor(broadcastShape)
         } else {
@@ -243,37 +192,29 @@ public func inferShape(op: LazyOp, inputs: [ValueShape], graph: Graph) throws ->
       }
     }
     if tensors.count > 0 {
-      return tensors[0]  // return the tensor as the shape
+      return tensors[0]
     }
     return .scalar
 
-  // Seq returns the shape of the last input (the value that's returned)
   case .seq:
     return inputs.last ?? .scalar
 
-  // tensorAccumulate is a side-effect op (output is empty)
   case .tensorAccumulate(_):
     return .scalar
 
-  // Gradient-specific operations
   case .neg:
-    // Negation preserves shape
     return inputs.first ?? .scalar
 
   case .expand(let targetShape):
-    // Expand broadcasts scalar to tensor
     return .tensor(targetShape)
 
   case .expandAxis(let targetShape, _):
-    // ExpandAxis broadcasts along an axis
     return .tensor(targetShape)
 
   case .gemm(let M, let N, _):
-    // GEMM produces an [M, N] output matrix
     return .tensor([M, N])
 
-  // Scalar ops — stateful, I/O, side-effect, or inherently scalar.
-  // Listed explicitly so the compiler catches missing cases when new ops are added.
+  // Scalar ops -- listed explicitly so the compiler catches missing cases when new ops are added.
   case .mse,
     .spectralLossFFT, .spectralLossFFTGradSpec, .spectralLossFFTGradIFFT,
     .spectralLossFFTGradInline, .spectralLossFFTGradRead, .spectralLossFFTGradRead2,

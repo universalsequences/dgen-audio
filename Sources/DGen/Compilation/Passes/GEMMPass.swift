@@ -1,57 +1,53 @@
 import Foundation
 
 extension GraphPrepPasses {
-  /// Walk backwards from a node through view-only ops (reshape, transpose, expandView, shrink, pad)
-  /// to find the underlying compute/data node and the chain of view ops applied.
-  /// Returns (sourceNodeID, [viewOps from source→target order])
+  /// Walks backwards from a node through view-only ops to find the underlying
+  /// compute/data node. Returns the source node ID and the IDs of intermediate view nodes.
   private static func traceViewChain(
     from nodeId: NodeID, graph: Graph
-  ) -> (source: NodeID, viewOps: [(NodeID, LazyOp)]) {
-    var viewOps: [(NodeID, LazyOp)] = []
+  ) -> (source: NodeID, viewNodeIds: [NodeID]) {
+    var viewNodeIds: [NodeID] = []
     var currentId = nodeId
     while let node = graph.nodes[currentId], node.op.isViewOnly {
-      viewOps.append((currentId, node.op))
+      viewNodeIds.append(currentId)
       guard let nextInput = node.inputs.first else { break }
       currentId = nextInput
     }
-    return (currentId, viewOps)
+    return (currentId, viewNodeIds)
   }
 
+  /// Detects `sumAxis(mul(a, b))` patterns that represent matrix multiplication and
+  /// rewrites them as `.gemm` nodes, removing orphaned intermediate nodes.
   static func gemmPass(graph: Graph) {
     if ProcessInfo.processInfo.environment["DGEN_NO_GEMM"] != nil { return }
-    for (nodeId, node) in graph.nodes {
-      guard node.inputs.count == 1 else { continue }
-      guard let mulNode = graph.nodes[node.inputs[0]] else { continue }
 
-      // Pattern: sumAxis(mul(a, b))
+    for (nodeId, node) in graph.nodes {
+      guard node.inputs.count == 1,
+        let mulNode = graph.nodes[node.inputs[0]]
+      else { continue }
+
       guard case .sumAxis(let axis) = node.op,
         case .mul = mulNode.op,
         mulNode.inputs.count == 2
       else { continue }
 
-      // Get the mul's shape — this is [M, N, K] (or some permutation)
       guard case .tensor(let mulShape) = mulNode.shape, mulShape.count == 3 else { continue }
 
-      // The reduce axis tells us which dimension is K
       let K = mulShape[axis]
       let nonReduceAxes = (0..<3).filter { $0 != axis }
+      let axisM = nonReduceAxes[0]
+      let axisN = nonReduceAxes[1]
+      let M = mulShape[axisM]
+      let N = mulShape[axisN]
 
-      // Get shapes of the mul's direct inputs (the broadcast shapes before multiply)
       guard let input0Node = graph.nodes[mulNode.inputs[0]],
         let input1Node = graph.nodes[mulNode.inputs[1]],
         case .tensor(let input0Shape) = input0Node.shape,
         case .tensor(let input1Shape) = input1Node.shape
       else { continue }
 
-      // Determine which input owns M (rows) vs N (cols) by finding broadcast dims.
-      // Each input should have size-1 at exactly one non-reduce axis (the broadcast axis).
-      let axisM = nonReduceAxes[0]
-      let axisN = nonReduceAxes[1]
-      let M = mulShape[axisM]
-      let N = mulShape[axisN]
-
-      // The input with size-1 at axisM is broadcast there → it owns N (right matrix).
-      // The input with size-1 at axisN is broadcast there → it owns M (left matrix).
+      // Identify left (M-owning) vs right (N-owning) input by broadcast pattern:
+      // the input with size-1 at axisN owns rows (left), size-1 at axisM owns cols (right).
       let leftInputIdx: Int
       let rightInputIdx: Int
       if input0Shape[axisN] == 1 && input1Shape[axisM] == 1 {
@@ -61,27 +57,24 @@ extension GraphPrepPasses {
         leftInputIdx = 1
         rightInputIdx = 0
       } else {
-        continue  // not a matmul broadcast pattern
+        continue
       }
 
-      // Validate WMMA compatibility
       guard M % 8 == 0, N % 8 == 0, K % 8 == 0 else { continue }
 
-      // Trace each input back through view ops to find source tensors
-      let (leftSource, leftViews) = traceViewChain(from: mulNode.inputs[leftInputIdx], graph: graph)
-      let (rightSource, rightViews) = traceViewChain(
+      let (leftSource, leftViewIds) = traceViewChain(
+        from: mulNode.inputs[leftInputIdx], graph: graph)
+      let (rightSource, rightViewIds) = traceViewChain(
         from: mulNode.inputs[rightInputIdx], graph: graph)
 
-      // Rewrite: replace the sumAxis node with a gemm node pointing directly
-      // to source tensors. Same nodeId so downstream consumers are unaffected.
+      // Replace sumAxis with gemm, preserving the nodeId so downstream consumers are unaffected
       graph.nodes[nodeId] = Node(
         id: nodeId, op: .gemm(M, N, K), inputs: [leftSource, rightSource])
       graph.nodes[nodeId]?.shape = .tensor([M, N])
 
-      // Remove orphaned intermediate nodes (mul + view chains),
-      // but only if no other node in the graph consumes them.
+      // Remove orphaned intermediate nodes (mul + view chains)
       let mulNodeId = node.inputs[0]
-      let orphanCandidates = [mulNodeId] + leftViews.map(\.0) + rightViews.map(\.0)
+      let orphanCandidates = [mulNodeId] + leftViewIds + rightViewIds
       for candidateId in orphanCandidates {
         let hasOtherConsumer = graph.nodes.values.contains {
           $0.id != nodeId && $0.inputs.contains(candidateId)
