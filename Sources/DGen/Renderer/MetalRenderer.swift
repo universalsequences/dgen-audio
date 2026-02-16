@@ -366,7 +366,7 @@ public class MetalRenderer: Renderer, UOpEmitter {
       .or(let a, let b), .xor(let a, let b), .beginRange(let a, let b), .beginForLoop(let a, let b):
       return variableIdsUsed(in: a).union(variableIdsUsed(in: b))
 
-    case .memoryRead(_, let a), .beginLoop(let a, _), .simdgroupLoad(_, let a, _):
+    case .memoryRead(_, let a), .beginLoop(let a, _), .simdgroupLoad(_, let a, _, _):
       return variableIdsUsed(in: a)
 
     case .memoryWrite(_, let a, let b), .memoryAccumulate(_, let a, let b):
@@ -1146,9 +1146,13 @@ public class MetalRenderer: Renderer, UOpEmitter {
     case .simdgroupMatrixZero:
       let lhs = emitLazy(uop.value, ctx: ctx, isOut: true)
       return "metal::simdgroup_float8x8 \(lhs) = metal::simdgroup_float8x8(0);"
-    case .simdgroupLoad(let cellId, let offset, let stride):
+    case .simdgroupLoad(let cellId, let offset, let stride, let transpose):
       let lhs = emitLazy(uop.value, ctx: ctx, isOut: true)
       let cast = intCastPrefix(for: offset)
+      if transpose {
+        return
+          "metal::simdgroup_float8x8 \(lhs) = metal::simdgroup_float8x8(0); metal::simdgroup_load(\(lhs), &memory[\(cellId) + \(cast)\(g(offset))], \(stride), ulong2(0, 0), true);"
+      }
       return
         "metal::simdgroup_float8x8 \(lhs) = metal::simdgroup_float8x8(0); metal::simdgroup_load(\(lhs), &memory[\(cellId) + \(cast)\(g(offset))], \(stride));"
     case .simdgroupStore(let src, let cellId, let offset, let stride):

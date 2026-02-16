@@ -185,8 +185,8 @@ extension UOp {
             opStr = "\(ANSI.cyan)threadgroupPositionZ\(ANSI.reset)"
         case .simdgroupMatrixZero:
             opStr = "\(ANSI.cyan)simdgroupMatrixZero\(ANSI.reset)"
-        case let .simdgroupLoad(cellId, offset, stride):
-            opStr = "\(ANSI.cyan)simdgroupLoad\(ANSI.reset)(cell=\(cellId), offset=\(offset), stride=\(stride))"
+        case let .simdgroupLoad(cellId, offset, stride, transpose):
+            opStr = "\(ANSI.cyan)simdgroupLoad\(ANSI.reset)(cell=\(cellId), offset=\(offset), stride=\(stride)\(transpose ? ", T" : ""))"
         case let .simdgroupStore(src, cellId, offset, stride):
             opStr = "\(ANSI.cyan)simdgroupStore\(ANSI.reset)(src=\(src), cell=\(cellId), offset=\(offset), stride=\(stride))"
         case let .simdgroupMultiplyAccumulate(a, b, acc):

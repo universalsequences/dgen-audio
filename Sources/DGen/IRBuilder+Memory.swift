@@ -204,9 +204,10 @@ extension IRBuilder {
   }
 
   /// Cooperatively load an 8x8 tile from memory[cellId + offset] with the given stride.
-  public func simdgroupLoad(_ cellId: CellID, offset: Expr, stride: Int) -> Expr {
+  /// When `transpose` is true, the tile is loaded transposed (column-major → row-major).
+  public func simdgroupLoad(_ cellId: CellID, offset: Expr, stride: Int, transpose: Bool = false) -> Expr {
     let dest = ctx.useVariable(src: nodeId)
-    ops.append(UOp(op: .simdgroupLoad(cellId, offset.lazy, stride), value: dest))
+    ops.append(UOp(op: .simdgroupLoad(cellId, offset.lazy, stride, transpose), value: dest))
     return value(dest)
   }
 

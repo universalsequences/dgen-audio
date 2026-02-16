@@ -2,25 +2,62 @@ import Foundation
 
 extension GraphPrepPasses {
   /// Walks backwards from a node through view-only ops to find the underlying
-  /// compute/data node. Returns the source node ID and the IDs of intermediate view nodes.
+  /// compute/data node. Returns the source node ID, the IDs of intermediate view nodes,
+  /// and whether any transpose ops were encountered (for determining GEMM transpose flags).
   private static func traceViewChain(
     from nodeId: NodeID, graph: Graph
-  ) -> (source: NodeID, viewNodeIds: [NodeID]) {
+  ) -> (source: NodeID, viewNodeIds: [NodeID], hasTranspose: Bool, last2DShape: [Int]?) {
     var viewNodeIds: [NodeID] = []
     var currentId = nodeId
+    var hasTranspose = false
+    var last2DShape: [Int]? = nil
+
     while let node = graph.nodes[currentId], node.op.isViewOnly {
+      if case .tensor(let shape) = node.shape, shape.count == 2 {
+        last2DShape = shape
+      }
+      if case .transpose = node.op {
+        hasTranspose = !hasTranspose
+      }
       viewNodeIds.append(currentId)
       guard let nextInput = node.inputs.first else { break }
       currentId = nextInput
     }
-    return (currentId, viewNodeIds)
+
+    // Also check the final source node for 2D shape
+    if let sourceNode = graph.nodes[currentId],
+      case .tensor(let shape) = sourceNode.shape, shape.count == 2
+    {
+      last2DShape = shape
+    }
+
+    return (currentId, viewNodeIds, hasTranspose, last2DShape)
+  }
+
+  /// Determine if a GEMM input needs a transposed load by comparing source shape
+  /// against expected layout, using view chain transpose info to disambiguate square matrices.
+  private static func needsTranspose(
+    sourceShape: [Int], expected: [Int], viewChainHasTranspose: Bool
+  ) -> Bool? {
+    if sourceShape == expected {
+      // Shapes match directly. For non-square matrices this means no transpose.
+      // For square matrices (ambiguous), the view chain tells us if the physical
+      // layout was transposed relative to what the 3D mul position implies.
+      return viewChainHasTranspose
+    }
+    if sourceShape == [expected[1], expected[0]] {
+      // Shapes are reversed — transpose detected by shape alone.
+      // View chain transpose would cancel it out (double-transpose = no transpose).
+      return !viewChainHasTranspose
+    }
+    return nil
   }
 
   /// Detects `sumAxis(mul(a, b))` patterns that represent matrix multiplication and
   /// rewrites them as `.gemm` nodes, removing orphaned intermediate nodes.
+  /// Handles both forward patterns (broadcast size-1 dims) and backward patterns
+  /// (expandAxis from sumAxis backward).
   static func gemmPass(graph: Graph) {
-    //if ProcessInfo.processInfo.environment["DGEN_NO_GEMM"] != nil { return }
-
     for (nodeId, node) in graph.nodes {
       guard node.inputs.count == 1,
         let mulNode = graph.nodes[node.inputs[0]]
@@ -46,42 +83,191 @@ extension GraphPrepPasses {
         case .tensor(let input1Shape) = input1Node.shape
       else { continue }
 
-      // Identify left (M-owning) vs right (N-owning) input by broadcast pattern:
-      // the input with size-1 at axisN owns rows (left), size-1 at axisM owns cols (right).
-      let leftInputIdx: Int
-      let rightInputIdx: Int
-      if input0Shape[axisN] == 1 && input1Shape[axisM] == 1 {
-        leftInputIdx = 0
-        rightInputIdx = 1
-      } else if input0Shape[axisM] == 1 && input1Shape[axisN] == 1 {
-        leftInputIdx = 1
-        rightInputIdx = 0
-      } else {
+      guard M % 8 == 0, N % 8 == 0, K % 8 == 0 else { continue }
+
+      // --- Forward pattern: identify left/right by broadcast size-1 dims ---
+      if input0Shape[axisN] == 1 && input1Shape[axisM] == 1
+        || input0Shape[axisM] == 1 && input1Shape[axisN] == 1
+      {
+        let leftInputIdx: Int
+        let rightInputIdx: Int
+        if input0Shape[axisN] == 1 && input1Shape[axisM] == 1 {
+          leftInputIdx = 0
+          rightInputIdx = 1
+        } else {
+          leftInputIdx = 1
+          rightInputIdx = 0
+        }
+
+        let (leftSource, leftViewIds, _, _) = traceViewChain(
+          from: mulNode.inputs[leftInputIdx], graph: graph)
+        let (rightSource, rightViewIds, _, _) = traceViewChain(
+          from: mulNode.inputs[rightInputIdx], graph: graph)
+
+        graph.nodes[nodeId] = Node(
+          id: nodeId, op: .gemm(M, N, K, false, false), inputs: [leftSource, rightSource])
+        graph.nodes[nodeId]?.shape = .tensor([M, N])
+
+        let mulNodeId = node.inputs[0]
+        let orphanCandidates = [mulNodeId] + leftViewIds + rightViewIds
+        removeOrphans(orphanCandidates, excludingConsumer: nodeId, graph: graph)
         continue
       }
 
-      guard M % 8 == 0, N % 8 == 0, K % 8 == 0 else { continue }
+      // --- Backward pattern: one input is expandAxis (from sumAxis backward) ---
+      guard let match = matchBackwardGemm(
+        mulNode: mulNode,
+        input0Node: input0Node,
+        input1Node: input1Node,
+        axis: axis,
+        axisM: axisM,
+        axisN: axisN,
+        M: M,
+        N: N,
+        K: K,
+        graph: graph
+      ) else { continue }
 
-      let (leftSource, leftViewIds) = traceViewChain(
-        from: mulNode.inputs[leftInputIdx], graph: graph)
-      let (rightSource, rightViewIds) = traceViewChain(
-        from: mulNode.inputs[rightInputIdx], graph: graph)
-
-      // Replace sumAxis with gemm, preserving the nodeId so downstream consumers are unaffected
       graph.nodes[nodeId] = Node(
-        id: nodeId, op: .gemm(M, N, K), inputs: [leftSource, rightSource])
+        id: nodeId,
+        op: .gemm(M, N, K, match.transA, match.transB),
+        inputs: [match.leftSource, match.rightSource])
       graph.nodes[nodeId]?.shape = .tensor([M, N])
 
-      // Remove orphaned intermediate nodes (mul + view chains)
       let mulNodeId = node.inputs[0]
-      let orphanCandidates = [mulNodeId] + leftViewIds + rightViewIds
-      for candidateId in orphanCandidates {
-        let hasOtherConsumer = graph.nodes.values.contains {
-          $0.id != nodeId && $0.inputs.contains(candidateId)
-        }
-        if !hasOtherConsumer {
-          graph.nodes.removeValue(forKey: candidateId)
-        }
+      let orphanCandidates = [mulNodeId, match.expandNodeId] + match.viewIds
+      removeOrphans(orphanCandidates, excludingConsumer: nodeId, graph: graph)
+    }
+  }
+
+  /// Attempts to match the backward matmul pattern where one mul input is an
+  /// `expandAxis` node (from sumAxis backward) and the other is a broadcast
+  /// view chain from the forward pass.
+  private static func matchBackwardGemm(
+    mulNode: Node,
+    input0Node: Node,
+    input1Node: Node,
+    axis: Int,
+    axisM: Int,
+    axisN: Int,
+    M: Int,
+    N: Int,
+    K: Int,
+    graph: Graph
+  ) -> (leftSource: NodeID, rightSource: NodeID, transA: Bool, transB: Bool,
+    expandNodeId: NodeID, viewIds: [NodeID])?
+  {
+    // Find which mul input is an expandAxis node
+    var expandIdx: Int? = nil
+    for i in 0...1 {
+      let inputNode = (i == 0) ? input0Node : input1Node
+      if case .expandAxis = inputNode.op {
+        expandIdx = i
+        break
+      }
+    }
+
+    guard let expandIdx = expandIdx,
+      let expandNode = graph.nodes[mulNode.inputs[expandIdx]],
+      case .expandAxis(_, let expandAxisPos) = expandNode.op,
+      expandNode.inputs.count == 1
+    else { return nil }
+
+    let expandSource = expandNode.inputs[0]
+    guard let expandSourceNode = graph.nodes[expandSource],
+      case .tensor(let expandSrcShape) = expandSourceNode.shape,
+      expandSrcShape.count == 2
+    else { return nil }
+
+    // The expand axis must not be the reduce axis (they'd cancel out)
+    let remaining = [0, 1, 2].filter { $0 != expandAxisPos }
+    guard remaining.contains(axis) else { return nil }
+
+    // Trace the non-expandAxis input through view chain to its 2D source.
+    // The source might be 1D (e.g., Tensor(data).reshape([K,N]) has a 1D tensorRef),
+    // so we also track the last 2D shape seen in the chain for shape comparison.
+    let otherIdx = 1 - expandIdx
+    let (otherSource, otherViewIds, otherHasTranspose, otherLast2D) = traceViewChain(
+      from: mulNode.inputs[otherIdx], graph: graph)
+
+    // Use the traced source's shape if 2D, otherwise fall back to the nearest 2D shape in the chain
+    let otherSrcShape: [Int]
+    if let node = graph.nodes[otherSource],
+      case .tensor(let shape) = node.shape, shape.count == 2
+    {
+      otherSrcShape = shape
+    } else if let last2D = otherLast2D {
+      otherSrcShape = last2D
+    } else {
+      return nil
+    }
+
+    // Determine if expandAxis source is LEFT (owns M_out) or RIGHT (owns N_out).
+    // The expandAxis inserts a dim at expandAxisPos. The two remaining 3D positions
+    // map to the 2D source's dims. We check which remaining position corresponds to
+    // the GEMM's M axis to decide if the expand source is left or right.
+    let expandOtherAxis = remaining.first { $0 != axis }!
+    let expandIsLeft = (expandOtherAxis == axisM)
+
+    let leftSource: NodeID
+    let rightSource: NodeID
+    var viewIds: [NodeID] = []
+
+    // Determine transposes using axis mapping (works for all matrix sizes including square).
+    //
+    // The expandAxis source maps its 2D dims to 3D positions `remaining[0]` and `remaining[1]`.
+    // The GEMM left expects [M_gemm, K_gemm] → dim0=axisM, dim1=axis.
+    // The GEMM right expects [K_gemm, N_gemm] → dim0=axis, dim1=axisN.
+    //
+    // If the expand source is LEFT, check if remaining[0]==axisM (no transpose) or ==axis (transpose).
+    // For the OTHER input, use shape comparison + view chain transpose info.
+    let expandTranspose: Bool
+    if expandIsLeft {
+      // Left expected: [M_gemm, K_gemm]. expand dim 0 → remaining[0], dim 1 → remaining[1]
+      expandTranspose = (remaining[0] != axisM)
+    } else {
+      // Right expected: [K_gemm, N_gemm]. expand dim 0 → remaining[0], dim 1 → remaining[1]
+      expandTranspose = (remaining[0] != axis)
+    }
+
+    let transA: Bool
+    let transB: Bool
+
+    if expandIsLeft {
+      leftSource = expandSource
+      rightSource = otherSource
+      viewIds = otherViewIds
+      transA = expandTranspose
+      guard let tb = needsTranspose(
+        sourceShape: otherSrcShape, expected: [K, N],
+        viewChainHasTranspose: otherHasTranspose)
+      else { return nil }
+      transB = tb
+    } else {
+      leftSource = otherSource
+      rightSource = expandSource
+      viewIds = otherViewIds
+      transB = expandTranspose
+      guard let ta = needsTranspose(
+        sourceShape: otherSrcShape, expected: [M, K],
+        viewChainHasTranspose: otherHasTranspose)
+      else { return nil }
+      transA = ta
+    }
+
+    return (leftSource, rightSource, transA, transB, mulNode.inputs[expandIdx], viewIds)
+  }
+
+  /// Remove orphaned nodes that have no consumers besides the excluded node.
+  private static func removeOrphans(
+    _ candidates: [NodeID], excludingConsumer: NodeID, graph: Graph
+  ) {
+    for candidateId in candidates {
+      let hasOtherConsumer = graph.nodes.values.contains {
+        $0.id != excludingConsumer && $0.inputs.contains(candidateId)
+      }
+      if !hasOtherConsumer {
+        graph.nodes.removeValue(forKey: candidateId)
       }
     }
   }

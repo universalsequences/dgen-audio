@@ -118,7 +118,11 @@ final class MatmulKernelTests: XCTestCase {
   /// Both forward and backward matmul patterns are GEMM-eligible (8-divisible).
   func testMatmulGemmBackward() throws {
     DGenConfig.kernelOutputPath = "/tmp/matmul_gemm_backward.metal"
-    defer { DGenConfig.kernelOutputPath = nil }
+    DGenConfig.debug = true
+    defer {
+      DGenConfig.debug = false
+      DGenConfig.kernelOutputPath = nil
+    }
 
     let M = 8
     let K = 8

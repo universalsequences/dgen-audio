@@ -211,7 +211,7 @@ public func inferShape(op: LazyOp, inputs: [ValueShape], graph: Graph) throws ->
   case .expandAxis(let targetShape, _):
     return .tensor(targetShape)
 
-  case .gemm(let M, let N, _):
+  case .gemm(let M, let N, _, _, _):
     return .tensor([M, N])
 
   // Scalar ops -- listed explicitly so the compiler catches missing cases when new ops are added.

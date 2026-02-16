@@ -112,7 +112,7 @@ extension UOpBlockFinalization {
     // GEMM blocks use 2D threadgroup dispatch with 32 threads per group
     if let gemmNode = block.nodes.lazy.compactMap({ graph.nodes[$0] }).first(where: {
       if case .gemm = $0.op { return true }; return false
-    }), case .gemm(let M, let N, _) = gemmNode.op {
+    }), case .gemm(let M, let N, _, _, _) = gemmNode.op {
       return .gemm(tilesM: M / 8, tilesN: N / 8)
     }
 
