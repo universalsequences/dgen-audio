@@ -436,7 +436,7 @@ public class MetalRenderer: Renderer, UOpEmitter {
   private func kernelHasSideEffects(_ scheduleItem: ScheduleItem, ctx: IRContext) -> Bool {
     for uop in scheduleItem.ops {
       switch uop.op {
-      case .memoryWrite, .memoryAccumulate, .store, .delay1, .output:
+      case .memoryWrite, .memoryAccumulate, .store, .delay1, .output, .simdgroupStore:
         return true
       case .beginRange, .endRange, .beginLoop, .beginReverseLoop, .endLoop,
         .beginForLoop, .beginParallelRange, .endParallelRange,

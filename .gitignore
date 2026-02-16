@@ -29,3 +29,7 @@ runs
 testtrain.sh
 docs/SPECTRAL_HOP_GRADIENT_ISSUE.md
 /.ddsp_cache_overfit1
+test_kernel_yes_gemm.metal
+test_kernel_revert.metal
+test_kernel_no_gemm.metal
+test_kernel_revert.metal

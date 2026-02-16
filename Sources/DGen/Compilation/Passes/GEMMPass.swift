@@ -19,7 +19,7 @@ extension GraphPrepPasses {
   /// Detects `sumAxis(mul(a, b))` patterns that represent matrix multiplication and
   /// rewrites them as `.gemm` nodes, removing orphaned intermediate nodes.
   static func gemmPass(graph: Graph) {
-    if ProcessInfo.processInfo.environment["DGEN_NO_GEMM"] != nil { return }
+    //if ProcessInfo.processInfo.environment["DGEN_NO_GEMM"] != nil { return }
 
     for (nodeId, node) in graph.nodes {
       guard node.inputs.count == 1,
