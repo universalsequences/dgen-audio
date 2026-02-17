@@ -264,8 +264,10 @@ public struct CompilationPipeline {
         : findSequentialNodes(graph, feedbackClusters: feedbackClusters, backend: backend)
     }
 
-    timings.measure("gemmPass") {
-      GraphPrepPasses.gemmPass(graph: graph)
+    if backend == .metal {
+      timings.measure("gemmPass") {
+        GraphPrepPasses.gemmPass(graph: graph)
+      }
     }
 
     let sortedNodes = timings.measure("topologicalSort") {

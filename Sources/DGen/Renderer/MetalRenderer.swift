@@ -1149,12 +1149,9 @@ public class MetalRenderer: Renderer, UOpEmitter {
     case .simdgroupLoad(let cellId, let offset, let stride, let transpose):
       let lhs = emitLazy(uop.value, ctx: ctx, isOut: true)
       let cast = intCastPrefix(for: offset)
-      if transpose {
-        return
-          "metal::simdgroup_float8x8 \(lhs) = metal::simdgroup_float8x8(0); metal::simdgroup_load(\(lhs), &memory[\(cellId) + \(cast)\(g(offset))], \(stride), ulong2(0, 0), true);"
-      }
+      let transposeArgs = transpose ? ", ulong2(0, 0), true" : ""
       return
-        "metal::simdgroup_float8x8 \(lhs) = metal::simdgroup_float8x8(0); metal::simdgroup_load(\(lhs), &memory[\(cellId) + \(cast)\(g(offset))], \(stride));"
+        "metal::simdgroup_float8x8 \(lhs) = metal::simdgroup_float8x8(0); metal::simdgroup_load(\(lhs), &memory[\(cellId) + \(cast)\(g(offset))], \(stride)\(transposeArgs));"
     case .simdgroupStore(let src, let cellId, let offset, let stride):
       let cast = intCastPrefix(for: offset)
       return

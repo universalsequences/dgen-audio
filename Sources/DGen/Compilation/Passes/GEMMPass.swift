@@ -3,18 +3,19 @@ import Foundation
 extension GraphPrepPasses {
   /// Walks backwards from a node through view-only ops to find the underlying
   /// compute/data node. Returns the source node ID, the IDs of intermediate view nodes,
-  /// and whether any transpose ops were encountered (for determining GEMM transpose flags).
+  /// whether any transpose ops were encountered, and the nearest 2D shape found in the chain
+  /// (used when the source itself is 1D, e.g., a tensorRef before reshape).
   private static func traceViewChain(
     from nodeId: NodeID, graph: Graph
-  ) -> (source: NodeID, viewNodeIds: [NodeID], hasTranspose: Bool, last2DShape: [Int]?) {
+  ) -> (source: NodeID, viewNodeIds: [NodeID], hasTranspose: Bool, nearest2DShape: [Int]?) {
     var viewNodeIds: [NodeID] = []
     var currentId = nodeId
     var hasTranspose = false
-    var last2DShape: [Int]? = nil
+    var nearest2DShape: [Int]? = nil
 
     while let node = graph.nodes[currentId], node.op.isViewOnly {
       if case .tensor(let shape) = node.shape, shape.count == 2 {
-        last2DShape = shape
+        nearest2DShape = shape
       }
       if case .transpose = node.op {
         hasTranspose = !hasTranspose
@@ -24,14 +25,13 @@ extension GraphPrepPasses {
       currentId = nextInput
     }
 
-    // Also check the final source node for 2D shape
     if let sourceNode = graph.nodes[currentId],
       case .tensor(let shape) = sourceNode.shape, shape.count == 2
     {
-      last2DShape = shape
+      nearest2DShape = shape
     }
 
-    return (currentId, viewNodeIds, hasTranspose, last2DShape)
+    return (currentId, viewNodeIds, hasTranspose, nearest2DShape)
   }
 
   /// Determine if a GEMM input needs a transposed load by comparing source shape
@@ -86,18 +86,14 @@ extension GraphPrepPasses {
       guard M % 8 == 0, N % 8 == 0, K % 8 == 0 else { continue }
 
       // --- Forward pattern: identify left/right by broadcast size-1 dims ---
-      if input0Shape[axisN] == 1 && input1Shape[axisM] == 1
-        || input0Shape[axisM] == 1 && input1Shape[axisN] == 1
-      {
-        let leftInputIdx: Int
-        let rightInputIdx: Int
-        if input0Shape[axisN] == 1 && input1Shape[axisM] == 1 {
-          leftInputIdx = 0
-          rightInputIdx = 1
-        } else {
-          leftInputIdx = 1
-          rightInputIdx = 0
-        }
+      //
+      // Left (A) has size 1 along axisN, right (B) has size 1 along axisM.
+      // If the roles are swapped, flip the input indices.
+      let input0IsLeft = input0Shape[axisN] == 1 && input1Shape[axisM] == 1
+      let input0IsRight = input0Shape[axisM] == 1 && input1Shape[axisN] == 1
+      if input0IsLeft || input0IsRight {
+        let leftInputIdx = input0IsLeft ? 0 : 1
+        let rightInputIdx = 1 - leftInputIdx
 
         let (leftSource, leftViewIds, _, _) = traceViewChain(
           from: mulNode.inputs[leftInputIdx], graph: graph)
@@ -157,18 +153,12 @@ extension GraphPrepPasses {
   ) -> (leftSource: NodeID, rightSource: NodeID, transA: Bool, transB: Bool,
     expandNodeId: NodeID, viewIds: [NodeID])?
   {
-    // Find which mul input is an expandAxis node
-    var expandIdx: Int? = nil
-    for i in 0...1 {
-      let inputNode = (i == 0) ? input0Node : input1Node
-      if case .expandAxis = inputNode.op {
-        expandIdx = i
-        break
-      }
-    }
+    let inputNodes = [input0Node, input1Node]
+    guard let expandIdx = inputNodes.firstIndex(where: {
+      if case .expandAxis = $0.op { return true }; return false
+    }) else { return nil }
 
-    guard let expandIdx = expandIdx,
-      let expandNode = graph.nodes[mulNode.inputs[expandIdx]],
+    guard let expandNode = graph.nodes[mulNode.inputs[expandIdx]],
       case .expandAxis(_, let expandAxisPos) = expandNode.op,
       expandNode.inputs.count == 1
     else { return nil }
@@ -185,9 +175,9 @@ extension GraphPrepPasses {
 
     // Trace the non-expandAxis input through view chain to its 2D source.
     // The source might be 1D (e.g., Tensor(data).reshape([K,N]) has a 1D tensorRef),
-    // so we also track the last 2D shape seen in the chain for shape comparison.
+    // so we track the nearest 2D shape seen in the chain for shape comparison.
     let otherIdx = 1 - expandIdx
-    let (otherSource, otherViewIds, otherHasTranspose, otherLast2D) = traceViewChain(
+    let (otherSource, otherViewIds, otherHasTranspose, otherNearest2D) = traceViewChain(
       from: mulNode.inputs[otherIdx], graph: graph)
 
     // Use the traced source's shape if 2D, otherwise fall back to the nearest 2D shape in the chain
@@ -196,8 +186,8 @@ extension GraphPrepPasses {
       case .tensor(let shape) = node.shape, shape.count == 2
     {
       otherSrcShape = shape
-    } else if let last2D = otherLast2D {
-      otherSrcShape = last2D
+    } else if let nearest = otherNearest2D {
+      otherSrcShape = nearest
     } else {
       return nil
     }
@@ -209,34 +199,29 @@ extension GraphPrepPasses {
     let expandOtherAxis = remaining.first { $0 != axis }!
     let expandIsLeft = (expandOtherAxis == axisM)
 
-    let leftSource: NodeID
-    let rightSource: NodeID
-    var viewIds: [NodeID] = []
-
     // Determine transposes using axis mapping (works for all matrix sizes including square).
     //
     // The expandAxis source maps its 2D dims to 3D positions `remaining[0]` and `remaining[1]`.
-    // The GEMM left expects [M_gemm, K_gemm] → dim0=axisM, dim1=axis.
-    // The GEMM right expects [K_gemm, N_gemm] → dim0=axis, dim1=axisN.
+    // GEMM left expects [M, K] -> dim0=axisM, dim1=axis.
+    // GEMM right expects [K, N] -> dim0=axis, dim1=axisN.
     //
     // If the expand source is LEFT, check if remaining[0]==axisM (no transpose) or ==axis (transpose).
     // For the OTHER input, use shape comparison + view chain transpose info.
     let expandTranspose: Bool
     if expandIsLeft {
-      // Left expected: [M_gemm, K_gemm]. expand dim 0 → remaining[0], dim 1 → remaining[1]
       expandTranspose = (remaining[0] != axisM)
     } else {
-      // Right expected: [K_gemm, N_gemm]. expand dim 0 → remaining[0], dim 1 → remaining[1]
       expandTranspose = (remaining[0] != axis)
     }
 
     let transA: Bool
     let transB: Bool
+    let leftSource: NodeID
+    let rightSource: NodeID
 
     if expandIsLeft {
       leftSource = expandSource
       rightSource = otherSource
-      viewIds = otherViewIds
       transA = expandTranspose
       guard let tb = needsTranspose(
         sourceShape: otherSrcShape, expected: [K, N],
@@ -246,7 +231,6 @@ extension GraphPrepPasses {
     } else {
       leftSource = otherSource
       rightSource = expandSource
-      viewIds = otherViewIds
       transB = expandTranspose
       guard let ta = needsTranspose(
         sourceShape: otherSrcShape, expected: [M, K],
@@ -255,7 +239,7 @@ extension GraphPrepPasses {
       transA = ta
     }
 
-    return (leftSource, rightSource, transA, transB, mulNode.inputs[expandIdx], viewIds)
+    return (leftSource, rightSource, transA, transB, mulNode.inputs[expandIdx], otherViewIds)
   }
 
   /// Remove orphaned nodes that have no consumers besides the excluded node.

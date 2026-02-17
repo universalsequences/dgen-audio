@@ -30,13 +30,13 @@ extension LazyOp {
     let tileCol = b.threadgroupPositionX()
     let frameIndex = b.threadgroupPositionZ()
 
-    /// Returns the per-frame memory offset for a cell, or zero for static (non-frame-aware) cells.
+    // Per-frame memory offset for a cell, or zero for static (non-frame-aware) cells.
+    // M*K == K*M and K*N == N*K, so the size is the same regardless of transpose.
     func frameBase(cell: CellID, tensorSize: Int) -> Expr {
       ctx.frameAwareTensorCells.contains(cell)
         ? frameIndex * b.intConstant(tensorSize) : b.intConstant(0)
     }
 
-    // M*K == K*M and K*N == N*K, so frame base size is the same regardless of transpose
     let leftFrameBase = frameBase(cell: leftCell, tensorSize: M * K)
     let rightFrameBase = frameBase(cell: rightCell, tensorSize: K * N)
     let outFrameBase = frameBase(cell: outCell, tensorSize: M * N)
