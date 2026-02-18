@@ -109,6 +109,17 @@ extension LazyGraph {
             return ExecutionContext(compilationResult: cached, runtime: runtime, frameCount: frameCount)
         }
 
+        // Fast path: check full compilation cache using a lightweight graph fingerprint.
+        // Graph is a class (reference type) — the cached CompilationResult.graph points to
+        // the same live Graph object, so injectTensorData reads current tensor data.
+        let fingerprint = "\(graph.nodes.count)|\(graph.tensors.count)|\(frameCount)"
+        if let cached = fullCompilationCache, cached.fingerprint == fingerprint {
+            compilationCache = cached.result
+            runtimeCache = cached.runtime
+            isDirty = false
+            return ExecutionContext(compilationResult: cached.result, runtime: cached.runtime, frameCount: frameCount)
+        }
+
         // Compile the graph
         let result = try CompilationPipeline.compile(
             graph: graph,
@@ -121,24 +132,41 @@ extension LazyGraph {
             writeKernelsToDisk(result, outputPath)
         }
 
-        // Create runtime based on backend
-        let runtime: LazyRuntime
-        switch DGenConfig.backend {
-        case .metal:
-            runtime = try MetalCompiledKernel(
-                kernels: result.kernels,
-                cellAllocations: result.cellAllocations,
-                context: result.context,
-                frameCount: frameCount
-            )
-        case .c:
-            runtime = try CLazyRuntime(
-                kernels: result.kernels,
-                cellAllocations: result.cellAllocations,
-                memorySize: result.totalMemorySlots,
-                frameCount: frameCount
-            )
+        // Check if we have a cached runtime with matching kernel structure.
+        // The graph topology is identical each epoch (same model + loss), so the
+        // generated MSL is the same. We can reuse the MTLLibrary + pipeline states.
+        var hasher = Hasher()
+        for kernel in result.kernels {
+            hasher.combine(kernel.source)
         }
+        let structureKey = String(hasher.finalize())
+
+        let runtime: LazyRuntime
+        if let cachedRuntime = runtimeCacheByStructure[structureKey] {
+            runtime = cachedRuntime
+        } else {
+            // Create runtime based on backend
+            switch DGenConfig.backend {
+            case .metal:
+                runtime = try MetalCompiledKernel(
+                    kernels: result.kernels,
+                    cellAllocations: result.cellAllocations,
+                    context: result.context,
+                    frameCount: frameCount
+                )
+            case .c:
+                runtime = try CLazyRuntime(
+                    kernels: result.kernels,
+                    cellAllocations: result.cellAllocations,
+                    memorySize: result.totalMemorySlots,
+                    frameCount: frameCount
+                )
+            }
+            runtimeCacheByStructure[structureKey] = runtime
+        }
+
+        // Store in full compilation cache for subsequent epochs
+        fullCompilationCache = (fingerprint: fingerprint, result: result, runtime: runtime)
 
         // Cache for reuse
         compilationCache = result

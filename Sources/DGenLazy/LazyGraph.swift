@@ -37,8 +37,13 @@ public class LazyGraph {
   /// Initial values for stateful cells (e.g., click cells start at 1.0)
   internal var cellInitialValues: [CellID: Float] = [:]
 
-  /// Cache compiled kernels by graph structure hash (persists across graph clears)
-  internal var compilationCacheByStructure: [String: (CompilationResult, LazyRuntime)] = [:]
+  /// Cache Metal runtime (MTLLibrary + pipeline states) by kernel source hash.
+  /// Persists across graph clears since the graph topology is identical each epoch.
+  internal var runtimeCacheByStructure: [String: LazyRuntime] = [:]
+
+  /// Full compilation cache (DGen + MTL) keyed by graph fingerprint.
+  /// Reusable when graph topology is identical (same model, same loss, counters reset).
+  internal var fullCompilationCache: (fingerprint: String, result: CompilationResult, runtime: LazyRuntime)?
 
   internal var tensors: [WeakRef<Tensor>] = []
   internal var signals: [WeakRef<Signal>] = []
