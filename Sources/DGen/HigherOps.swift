@@ -1,3 +1,5 @@
+import Foundation
+
 extension Graph {
   /// Smart phasor that chooses between deterministic (parallelizable) and stateful versions.
   /// If freq is constant and reset is constant 0, uses deterministicPhasor for parallel execution.
@@ -56,9 +58,42 @@ extension Graph {
     precondition(hop >= 1, "hop must be >= 1")
 
     let numBins = windowSize / 2 + 1
+    let numStages = Int(log2(Double(windowSize)))
 
-    // Allocate window coefficients (shared between all frames - same Hann window)
-    let windowCell = alloc(vectorWidth: windowSize)
+    // Precompute Hann window (or all-1.0 if !useHann) as a static tensor
+    var hannData = [Float](repeating: 1.0, count: windowSize)
+    if useHannWindow {
+      for i in 0..<windowSize {
+        hannData[i] = Float(0.5 * (1.0 - cos(2.0 * .pi * Double(i) / Double(windowSize - 1))))
+      }
+    }
+    let hannNode = self.tensor(hannData)
+    let windowCell = self.tensors[self.nodeToTensor[hannNode]!]!.cellId
+
+    // Precompute twiddle factors (positive/IFFT convention)
+    // Layout: stage s → offset 2^s - 1, count 2^s. Total: N-1 entries.
+    var twReData = [Float](repeating: 0, count: windowSize - 1)
+    var twImData = [Float](repeating: 0, count: windowSize - 1)
+    for s in 0..<numStages {
+      let half = 1 << s
+      let offset = half - 1
+      for k in 0..<half {
+        let angle = 2.0 * .pi * Double(k) / Double(2 * half)
+        twReData[offset + k] = Float(cos(angle))
+        twImData[offset + k] = Float(sin(angle))
+      }
+    }
+    let twReNode = self.tensor(twReData)
+    let twImNode = self.tensor(twImData)
+
+    // Precompute bit-reversal permutation
+    var bitRevData = [Float](repeating: 0, count: windowSize)
+    for i in 0..<windowSize {
+      var rev = 0, bits = i
+      for _ in 0..<numStages { rev = rev * 2 + (bits & 1); bits >>= 1 }
+      bitRevData[i] = Float(rev)
+    }
+    let bitRevNode = self.tensor(bitRevData)
 
     // Allocate FFT scratch cells for storing complex spectrum - PER FRAME
     // Layout per frame: real[0..<windowSize], imag[windowSize..<windowSize*2]
@@ -76,7 +111,8 @@ extension Graph {
 
     // Optional hop counter: when hop > 1, spectral kernels only execute on frames where counter == 0.
     // We pass the counter value as an extra input so both forward and backward can gate work.
-    var inputs = [sig1, sig2]
+    // Inputs: [sig1, sig2, hannNode, twReNode, twImNode, bitRevNode, ?hopCounter]
+    var inputs = [sig1, sig2, hannNode, twReNode, twImNode, bitRevNode]
     if hop > 1 {
       let counterCell = alloc(vectorWidth: 1)
       let one = n(.constant(1), [])

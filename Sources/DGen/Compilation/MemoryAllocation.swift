@@ -5,6 +5,8 @@ public struct CellAllocations {
   public let cellVectorWidths: [CellID: Int]
   public let cellMappings: [CellID: CellID]
   public let totalMemorySlots: Int
+  /// Precomputed tensor data: (physicalOffset, values) pairs to inject before kernel run
+  public var tensorInitData: [(Int, [Float])] = []
 
   public init(totalMemorySlots: Int, cellMappings: [CellID: CellID], cellVectorWidths: [CellID: Int]) {
     self.cellVectorWidths = cellVectorWidths

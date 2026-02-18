@@ -9,8 +9,6 @@ final class SpectralLossGradientTests: XCTestCase {
   /// Test that FFT-based spectralLoss computes the forward pass correctly
   /// Note: spectralLossFFT only supports Metal backend
   func testSpectralLossFFTForwardPass() throws {
-    print("\n🧪 Test: SpectralLossFFT Forward Pass")
-
     let g = Graph()
 
     // Two constant frequencies
@@ -29,16 +27,12 @@ final class SpectralLossGradientTests: XCTestCase {
     // Output the loss
     _ = g.n(.output(0), loss)
 
-    print("   Frequency 1: 100 Hz")
-    print("   Frequency 2: 440 Hz")
-    print("   Window size: \(windowSize) samples")
-
     // MARK: - Compile (Metal backend only)
     let frameCount = 128
     let result = try CompilationPipeline.compile(
       graph: g,
       backend: .metal,
-      options: .init(frameCount: frameCount, debug: true)
+      options: .init(frameCount: frameCount, debug: false)
     )
 
     let runtime = try MetalCompiledKernel(
@@ -46,8 +40,6 @@ final class SpectralLossGradientTests: XCTestCase {
       cellAllocations: result.cellAllocations,
       context: result.context
     )
-
-    print("   ✅ Compiled successfully")
 
     // MARK: - Run
     let memory = runtime.allocateNodeMemory()!
@@ -68,31 +60,16 @@ final class SpectralLossGradientTests: XCTestCase {
 
     runtime.deallocateNodeMemory(memory)
 
-    // MARK: - Verification
-    print("   First few loss values:")
-    for i in 0..<min(10, frameCount) {
-      print("      Frame \(i): loss = \(String(format: "%.6f", outputBuffer[i]))")
-    }
-
-    print("   Last few loss values (after window filled):")
-    for i in (frameCount - 5)..<frameCount {
-      print("      Frame \(i): loss = \(String(format: "%.6f", outputBuffer[i]))")
-    }
-
     // After window fills, loss should be non-zero and stable for different frequencies
     let stableLoss = outputBuffer[frameCount - 1]
     XCTAssertGreaterThan(
       stableLoss, 0.0,
       "Spectral loss should be positive when comparing different frequencies")
-
-    print("   ✅ Test passed: spectral loss computed = \(String(format: "%.6f", stableLoss))")
   }
 
   /// Test that identical signals produce near-zero loss
   /// Note: spectralLossFFT only supports Metal backend
   func testSpectralLossFFTSameSignal() throws {
-    print("\n🧪 Test: SpectralLossFFT Same Signal")
-
     let g = Graph()
 
     let freq = g.n(.constant(440.0))
@@ -138,22 +115,18 @@ final class SpectralLossGradientTests: XCTestCase {
     runtime.deallocateNodeMemory(memory)
 
     let finalLoss = outputBuffer[frameCount - 1]
-    print("   Final loss: \(String(format: "%.8f", finalLoss))")
-
     // Two independent phasors at the same frequency will have different phase offsets,
     // but their spectral magnitudes should be similar. The loss won't be zero but should
     // be much lower than signals at different frequencies (which can be 300+ in this setup).
     XCTAssertLessThan(
       finalLoss, 50.0,
       "Same frequency signals should have lower spectral loss than different frequencies")
-    print("   ✅ Test passed: same signal loss = \(String(format: "%.6f", finalLoss))")
   }
 
   // MARK: - Hann Window Tests
 
   /// Test that Hann window coefficients are computed correctly
   func testHannWindowCoefficients() throws {
-    print("\n🧪 Test: Hann Window Coefficients")
 
     // Expected Hann window for N=8: w[n] = 0.5 * (1 - cos(2*pi*n/(N-1)))
     let windowSize = 8
@@ -164,9 +137,7 @@ final class SpectralLossGradientTests: XCTestCase {
       expectedWindow.append(w)
     }
 
-    print("   Expected Hann window (N=8):")
     for (i, w) in expectedWindow.enumerated() {
-      print("      w[\(i)] = \(String(format: "%.6f", w))")
     }
 
     // Verify key properties
@@ -181,13 +152,11 @@ final class SpectralLossGradientTests: XCTestCase {
     XCTAssertGreaterThan(
       expectedWindow[windowSize / 2 - 1], 0.9, "Hann window should be near max at center")
 
-    print("   ✅ Hann window coefficients verified")
   }
 
   /// Test spectral loss with and without Hann window
   /// Note: spectralLossFFT only supports Metal backend
   func testSpectralLossWithAndWithoutHannWindow() throws {
-    print("\n🧪 Test: SpectralLossFFT With/Without Hann Window")
 
     for useHann in [true, false] {
       let g = Graph()
@@ -236,22 +205,17 @@ final class SpectralLossGradientTests: XCTestCase {
       runtime.deallocateNodeMemory(memory)
 
       let finalLoss = outputBuffer[frameCount - 1]
-      print(
-        "   \(useHann ? "With" : "Without") Hann window: loss = \(String(format: "%.6f", finalLoss))"
-      )
 
       XCTAssertGreaterThan(
         finalLoss, 0.0, "Loss should be positive for different frequencies")
     }
 
-    print("   ✅ Both windowing modes work correctly")
   }
 
   // MARK: - Gradient Tests
 
   /// Test that gradient nodes are created for spectralLossFFT
   func testSpectralLossFFTGradientNodesCreated() throws {
-    print("\n🧪 Test: SpectralLossFFT Gradient Nodes Created")
 
     let g = Graph()
 
@@ -269,18 +233,13 @@ final class SpectralLossGradientTests: XCTestCase {
     // Compute gradients
     let grads = g.computeGradients(loss: loss, targets: Set([freqParam]))
 
-    print("   Gradient nodes created: \(grads.count)")
-    print("   Gradient side effects: \(g.gradientSideEffects.count)")
-
     // Should have created gradient ops
     XCTAssertFalse(g.gradientSideEffects.isEmpty, "Should create gradient side effects")
-    print("   ✅ Gradient nodes created successfully")
   }
 
   /// Test numerical gradient verification - verifies gradient direction is correct
   /// This test uses the actual training context to verify gradients point in the right direction
   func testSpectralLossGradientNumerical() throws {
-    print("\n🧪 Test: SpectralLossFFT Numerical Gradient Check")
 
     // Test that gradient direction is correct by checking a step in the gradient direction
     // reduces loss
@@ -290,7 +249,6 @@ final class SpectralLossGradientTests: XCTestCase {
 
     for (startFreq, targetFreq) in [(Float(100.0), Float(200.0)), (Float(300.0), Float(200.0))] {
       let direction = startFreq < targetFreq ? "up" : "down"
-      print("   Testing \(direction): \(startFreq) Hz → \(targetFreq) Hz")
 
       // Create graph and get gradient
       let g = Graph(sampleRate: sampleRate)
@@ -323,10 +281,6 @@ final class SpectralLossGradientTests: XCTestCase {
       // Take a step in the gradient direction
       let lossAfterStep = ctx.trainStep()
 
-      print("      Initial loss: \(String(format: "%.4f", initialLoss))")
-      print("      Gradient: \(String(format: "%.6f", grad))")
-      print("      Loss after step: \(String(format: "%.4f", lossAfterStep))")
-
       // Verify gradient has correct sign
       let expectedGradSign: Float = startFreq > targetFreq ? 1.0 : -1.0
       let actualGradSign: Float = grad > 0 ? 1.0 : -1.0
@@ -335,15 +289,12 @@ final class SpectralLossGradientTests: XCTestCase {
         "Gradient should be \(expectedGradSign > 0 ? "positive" : "negative") when starting \(direction) of target"
       )
 
-      print("      ✅ Gradient direction correct (\(grad > 0 ? "positive" : "negative"))")
     }
 
-    print("   ✅ Gradient direction verified")
   }
 
   /// Test that analytical gradient direction matches numerical gradient
   func testSpectralLossGradientDirectionNumerical() throws {
-    print("\n🧪 Test: Spectral Loss Analytical vs Numerical Gradient Direction")
 
     let frameCount = 128
     let windowSize = 64
@@ -355,7 +306,6 @@ final class SpectralLossGradientTests: XCTestCase {
 
     // Test both directions: starting below and above target
     for (label, startFreq) in [("below", Float(100.0)), ("above", Float(300.0))] {
-      print("\n   Testing starting \(label) target (\(startFreq) Hz → \(targetFreq) Hz)")
 
       // Compute loss at startFreq
       let lossAtStart = try computeLossAtFrequencySine(
@@ -380,29 +330,14 @@ final class SpectralLossGradientTests: XCTestCase {
         startFreq, target: targetFreq, windowSize: windowSize,
         frameCount: frameCount, sampleRate: sampleRate)
 
-      print("      Loss at freq: \(String(format: "%.4f", lossAtStart))")
-      print("      Loss at freq+ε: \(String(format: "%.4f", lossAtPlus))")
-      print("      Loss at freq-ε: \(String(format: "%.4f", lossAtMinus))")
-      print("      Numerical gradient: \(String(format: "%.6f", numericalGrad))")
-      print("      Analytical gradient: \(String(format: "%.6f", analyticalGrad))")
-
       // Check if the direction is correct
       let expectedDirection: Float = startFreq > targetFreq ? 1.0 : -1.0  // positive grad if above target
       let numericalDirection = numericalGrad > 0 ? 1.0 : -1.0
       let analyticalDirection = analyticalGrad > 0 ? 1.0 : -1.0
 
-      print(
-        "      Expected direction: \(expectedDirection > 0 ? "positive" : "negative") (need to decrease freq)"
-      )
-      print("      Numerical direction: \(numericalDirection > 0 ? "positive" : "negative")")
-      print(
-        "      Analytical direction: \(analyticalDirection > 0 ? "positive" : "negative")")
-
       // Verify directions match
       if numericalDirection == analyticalDirection {
-        print("      ✅ Analytical gradient direction matches numerical")
       } else {
-        print("      ⚠️ Analytical gradient direction differs from numerical!")
       }
     }
   }
@@ -553,7 +488,6 @@ final class SpectralLossGradientTests: XCTestCase {
   /// Test that spectralLossFFT compiles for Metal backend
   /// Note: spectralLossFFT only supports Metal backend (not C)
   func testSpectralLossFFTCompilesBothBackends() throws {
-    print("\n🧪 Test: SpectralLossFFT Compiles for Metal Backend")
 
     let g = Graph()
 
@@ -574,16 +508,11 @@ final class SpectralLossGradientTests: XCTestCase {
     )
 
     XCTAssertFalse(result.kernels.isEmpty, "Metal backend should produce kernels")
-    print("   metal: ✅ compiled (\(result.kernels.first?.source.count ?? 0) chars)")
-
-    print("   ✅ Metal backend compiles successfully")
   }
 
   /// Test that gradient ops compile correctly
   /// Note: spectralLossFFT only supports Metal backend
   func testSpectralLossFFTGradientOpsCompile() throws {
-    print("\n🧪 Test: SpectralLossFFT Gradient Ops Compile")
-
     let g = Graph()
 
     let freqParam = g.n(.param(g.alloc()))
@@ -610,7 +539,6 @@ final class SpectralLossGradientTests: XCTestCase {
     )
 
     XCTAssertFalse(result.kernels.isEmpty, "Should compile with gradient ops")
-    print("   ✅ Gradient ops compile successfully")
   }
 
   // MARK: - Edge Cases
@@ -618,8 +546,6 @@ final class SpectralLossGradientTests: XCTestCase {
   /// Test with various window sizes
   /// Note: spectralLossFFT only supports Metal backend
   func testSpectralLossFFTVariousWindowSizes() throws {
-    print("\n🧪 Test: SpectralLossFFT Various Window Sizes")
-
     let windowSizes = [8, 16, 32, 64, 128]
 
     for windowSize in windowSizes {
@@ -643,10 +569,8 @@ final class SpectralLossGradientTests: XCTestCase {
       )
 
       XCTAssertFalse(result.kernels.isEmpty, "Window size \(windowSize) should compile")
-      print("   Window size \(windowSize): ✅")
     }
 
-    print("   ✅ All window sizes work correctly")
   }
 
   // MARK: - Performance Comparison Tests
@@ -774,14 +698,6 @@ final class SpectralLossGradientTests: XCTestCase {
     let loss = g.spectralLossFFT(studentOut, teacherOut, windowSize: windowSize)
     _ = g.n(.output(0), [loss])
 
-    print("\n=== MLP -> peekRow -> Harmonic Synth (Spectral Loss) ===")
-    print("frameCount: \(frameCount), controlFrames: \(controlFrames)")
-    print("numHarmonics: \(numHarmonics), hiddenSize: \(hiddenSize)")
-    print("windowSize: \(windowSize)")
-    print(
-      "Total learnable params: \(hiddenSize + hiddenSize + hiddenSize*numHarmonics + numHarmonics)"
-    )
-
     // Use GraphTrainingContext with graph-based gradients
     let compileStart = CFAbsoluteTimeGetCurrent()
     let ctx = try GraphTrainingContext(
@@ -794,14 +710,12 @@ final class SpectralLossGradientTests: XCTestCase {
       kernelDebugOutput: "/tmp/mlp_peekrow_harmonic_spectral.metal"
     )
     let compileTime = (CFAbsoluteTimeGetCurrent() - compileStart) * 1000
-    print("Compile time: \(String(format: "%.2f", compileTime))ms")
 
     // Warmup
     _ = ctx.trainStep()
     _ = ctx.trainStep()
 
     let initialLoss = ctx.trainStep()
-    print("Initial loss: \(initialLoss)")
 
     // Training loop with timing
     let epochs = 100
@@ -817,13 +731,6 @@ final class SpectralLossGradientTests: XCTestCase {
     let trainTime = (CFAbsoluteTimeGetCurrent() - trainStart) * 1000
     let timePerEpoch = trainTime / Double(epochs)
 
-    print("\nFinal loss: \(String(format: "%.6f", finalLoss))")
-    print("Loss reduction: \(String(format: "%.2f", initialLoss / finalLoss))x")
-    print("\n--- Performance (Spectral Loss) ---")
-    print("Total train time (\(epochs) epochs): \(String(format: "%.2f", trainTime))ms")
-    print("Time per epoch: \(String(format: "%.3f", timePerEpoch))ms")
-    print("Epochs per second: \(String(format: "%.1f", 1000.0 / timePerEpoch))")
-
     // Spectral loss may not converge as easily as MSE for this task
     // Just verify it runs and produces reasonable values
     XCTAssertGreaterThan(initialLoss, 0.0, "Initial loss should be positive")
@@ -835,8 +742,6 @@ final class SpectralLossGradientTests: XCTestCase {
   /// The simplest possible test: one learnable sine wave frequency learning to match a target.
   /// This is the definitive proof that spectral loss gradients work.
   func testSimpleSineWaveFrequencyLearning() throws {
-    print("\n🧪 Test: Simple Sine Wave Frequency Learning with Spectral Loss")
-
     let frameCount = 128
     let windowSize = 64
     // Use lower sample rate for better frequency resolution
@@ -873,21 +778,12 @@ final class SpectralLossGradientTests: XCTestCase {
     _ = g.n(.output(0), loss)
 
     // Debug: check gradients before training
-    print("   DEBUG: Computing gradients...")
     let grads = g.computeGradients(loss: loss, targets: Set([freqParam.nodeId]))
-    print("   DEBUG: Gradients computed: \(grads.count) nodes")
     if let gradNode = grads[freqParam.nodeId] {
-      print("   DEBUG: Gradient node for freqParam: \(gradNode)")
       if let gradNodeInfo = g.nodes[gradNode] {
-        print("   DEBUG: Gradient op: \(gradNodeInfo.op)")
       }
     } else {
-      print("   DEBUG: No gradient found for freqParam!")
     }
-
-    print("   Target frequency: \(targetFreqValue) Hz")
-    print("   Starting frequency: \(startFreqValue) Hz")
-    print("   Window size: \(windowSize)")
 
     // Create training context (like onepole tests)
     // Note: Learning rate adjusted for frequency scale and gradient magnitude
@@ -908,16 +804,13 @@ final class SpectralLossGradientTests: XCTestCase {
 
     let initialLoss = ctx.trainStep()
     let initialFreq = freqParam.value
-    print(
-      "   Initial: freq = \(String(format: "%.1f", initialFreq)) Hz, loss = \(String(format: "%.4f", initialLoss))"
-    )
 
     // Train
     let epochs = 2000
     var lastLoss = initialLoss
     for i in 0..<epochs {
       lastLoss = ctx.trainStep()
-      if i % 20 == 0 || i == epochs - 1 {
+      if i % 200 == 0 || i == epochs - 1 {
         print(
           "   Epoch \(i): freq = \(String(format: "%.1f", freqParam.value)) Hz, loss = \(String(format: "%.4f", lastLoss)), grad = \(freqParam.grad)"
         )
@@ -930,19 +823,9 @@ final class SpectralLossGradientTests: XCTestCase {
     let finalFreq = freqParam.value
     let finalLoss = lastLoss
 
-    print(
-      "\n   Final: freq = \(String(format: "%.1f", finalFreq)) Hz, loss = \(String(format: "%.4f", finalLoss))"
-    )
-    print(
-      "   Frequency moved from \(String(format: "%.1f", startFreqValue)) toward \(String(format: "%.1f", targetFreqValue))"
-    )
-
     // Verify that frequency moved toward target
     let initialDistance = abs(startFreqValue - targetFreqValue)
     let finalDistance = abs(finalFreq - targetFreqValue)
-
-    print("   Initial distance from target: \(String(format: "%.1f", initialDistance)) Hz")
-    print("   Final distance from target: \(String(format: "%.1f", finalDistance)) Hz")
 
     XCTAssertLessThan(
       finalDistance, initialDistance,
@@ -958,7 +841,6 @@ final class SpectralLossGradientTests: XCTestCase {
       freqChange, 10.0,
       "Frequency should change by at least 10 Hz (changed by \(freqChange) Hz)")
 
-    print("   ✅ Frequency successfully learned toward target using spectral loss!")
   }
 
   // MARK: - Directional Frequency Learning Tests
@@ -1037,9 +919,6 @@ final class SpectralLossGradientTests: XCTestCase {
     file: StaticString = #file,
     line: UInt = #line
   ) throws {
-    print("\n🧪 Test: Frequency Learning - \(name)")
-    print("   Start: \(startFreq) Hz → Target: \(targetFreq) Hz")
-
     let frameCount = 128
     let windowSize = 64
     // Resolution = 2000/64 = 31.25 Hz per bin
@@ -1076,9 +955,6 @@ final class SpectralLossGradientTests: XCTestCase {
 
     let initialLoss = ctx.trainStep()
     let initialFreq = freqParam.value
-    print(
-      "   Initial: freq = \(String(format: "%.1f", initialFreq)) Hz, loss = \(String(format: "%.2f", initialLoss))"
-    )
 
     // Train
     var lastLoss = initialLoss
@@ -1086,7 +962,7 @@ final class SpectralLossGradientTests: XCTestCase {
     for i in 0..<maxEpochs {
       lastLoss = ctx.trainStep()
       epochsRun = i + 1
-      if i % 50 == 0 {
+      if i % 100 == 0 {
         print(
           "   Epoch \(i): freq = \(String(format: "%.1f", freqParam.value)) Hz, loss = \(String(format: "%.2f", lastLoss))"
         )
@@ -1101,13 +977,6 @@ final class SpectralLossGradientTests: XCTestCase {
     let finalLoss = lastLoss
     let initialDistance = abs(startFreq - targetFreq)
     let finalDistance = abs(finalFreq - targetFreq)
-
-    print(
-      "   Final: freq = \(String(format: "%.1f", finalFreq)) Hz, loss = \(String(format: "%.2f", finalLoss)) (after \(epochsRun) epochs)"
-    )
-    print(
-      "   Distance: \(String(format: "%.1f", initialDistance)) Hz → \(String(format: "%.1f", finalDistance)) Hz"
-    )
 
     // Verify direction
     let actualDirection = finalFreq > startFreq ? "up" : "down"
@@ -1139,6 +1008,5 @@ final class SpectralLossGradientTests: XCTestCase {
       file: file, line: line
     )
 
-    print("   ✅ Passed: frequency correctly moved \(actualDirection) toward target")
   }
 }

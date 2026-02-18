@@ -531,6 +531,13 @@ public class MetalCompiledKernel: CompiledKernelRuntime {
     let byteSize = getMemorySize() * MemoryLayout<Float>.size
     guard let ptr = malloc(byteSize) else { return nil }
     memset(ptr, 0, byteSize)
+    // Inject precomputed tensor data (e.g. FFT twiddle factors, Hann window)
+    let floatPtr = ptr.assumingMemoryBound(to: Float.self)
+    for (offset, data) in cellAllocations.tensorInitData {
+      for (i, value) in data.enumerated() {
+        floatPtr[offset + i] = value
+      }
+    }
     return ptr
   }
 

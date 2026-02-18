@@ -4,17 +4,19 @@ extension LazyOp {
   func emitSpectralLoss(b: IRBuilder, ctx: IRContext, g: Graph, node: Node, inputs: [Lazy]) throws {
     switch self {
     case .spectralLossFFT(
-      let windowSize, let useHann, let windowCell,
+      let windowSize, _, _,
       let fft1Cell, let fft2Cell, let mag1Cell, let mag2Cell, let scratchCell):
       // FFT-based spectral loss: forward pass (SIMD-parallel across frames)
-      // Each frame gets its own scratch space to avoid race conditions
-      // 1. Apply optional Hann window (shared across frames)
-      // 2. Compute FFT of both signals via Cooley-Tukey (per-frame scratch)
-      // 3. Compute magnitudes (per-frame storage)
-      // 4. Sum squared differences as loss
-      guard inputs.count >= 2 else {
+      // Precomputed tables (Hann, twiddle, bit-reversal) are passed as tensor inputs.
+      guard inputs.count >= 6 else {
         throw DGenError.insufficientInputs(
-          operator: "spectralLossFFT", expected: 2, actual: inputs.count)
+          operator: "spectralLossFFT", expected: 6, actual: inputs.count)
+      }
+
+      // Helper to resolve tensor input NodeID → cell ID
+      func tensorCellId(_ nodeId: NodeID) -> CellID {
+        let tensorId = g.nodeToTensor[nodeId]!
+        return g.tensors[tensorId]!.cellId
       }
 
       let numBins = windowSize / 2 + 1
@@ -24,7 +26,12 @@ extension LazyOp {
 
       let sig1 = b.value(inputs[0])
       let sig2 = b.value(inputs[1])
-      let hopCounter: Expr? = inputs.count > 2 ? b.value(inputs[2]) : nil
+      // inputs[2..5] are precomputed tensor refs (hann, twRe, twIm, bitRev)
+      let hannCellId = tensorCellId(node.inputs[2])
+      let twReCellId = tensorCellId(node.inputs[3])
+      let twImCellId = tensorCellId(node.inputs[4])
+      let bitRevCellId = tensorCellId(node.inputs[5])
+      let hopCounter: Expr? = inputs.count > 6 ? b.value(inputs[6]) : nil
       let winSizeFloat = b.constant(Float(windowSize))
       let zero = b.constant(0.0)
       let one = b.constant(1.0)
@@ -35,27 +42,17 @@ extension LazyOp {
       let fftBaseOffset = frameIdx * b.intConstant(fftSize)
       let magBaseOffset = frameIdx * b.intConstant(numBins)
 
-      // Helper to compute Hann coefficient inline (avoids shared memory race)
-      func hannCoeff(_ nFloat: Expr) -> Expr {
-        if useHann {
-          let angle = b.constant(2.0) * b.pi * nFloat / b.constant(Float(windowSize - 1))
-          return b.constant(0.5) * (one - b.cos(angle))
-        } else {
-          return one
-        }
-      }
-
       // Optional hop gating: when a hop counter input is present, execute only on counter==0 frames.
       // Keep computation in a single if-block to preserve scalar-mode lowering in nested loops.
       let shouldRun = hopCounter.map { $0 == zero } ?? (one > zero)
       let loss = b.float(0.0)
       b.if_(shouldRun) {
         // 1. Load windowed samples into per-frame FFT scratch cells
-        // Compute Hann coefficient inline to avoid shared memory race
+        // Read Hann coefficients from precomputed tensor
         b.parallelRange(windowSize) { n in
           let nInt = n
           let nFloat = b.cast(nInt, to: .float)
-          let w = hannCoeff(nFloat)
+          let w = b.memoryRead(hannCellId, nInt)
 
           // Load from tape: samples at position frameIdx - windowSize + 1 + n
           let j = b.cast(frameIdx, to: .float) - (winSizeFloat - one) + nFloat
@@ -69,28 +66,18 @@ extension LazyOp {
           _ = b.memoryWrite(fft1Cell, fftBaseOffset + nInt + imagOff, zero)
           _ = b.memoryWrite(fft2Cell, fftBaseOffset + nInt, s2 * w)
           _ = b.memoryWrite(fft2Cell, fftBaseOffset + nInt + imagOff, zero)
-
-          // Store window coefficients for backward pass (GradIFFT reads these)
-          // All frames write the same values — benign race
-          _ = b.memoryWrite(windowCell, nInt, w)
         }
 
         // 3. In-place FFT via Cooley-Tukey (per-frame scratch)
         func emitFFTInPlace(_ fftCell: CellID, _ baseOffset: Expr) {
           let imagOff = b.intConstant(imagOffset)
 
-          // Bit-reversal permutation
+          // Bit-reversal permutation using precomputed table
           b.loop(windowSize) { i in
-            var rev = b.constant(0.0)
-            var bits = b.cast(i, to: .float)
-            for _ in 0..<numStages {
-              rev = rev * b.constant(2.0) + (bits % b.constant(2.0))
-              bits = b.floor(bits / b.constant(2.0))
-            }
-
+            let iInt = b.cast(i, to: .int)
+            let rev = b.memoryRead(bitRevCellId, iInt)
             let iFloat = b.cast(i, to: .float)
             let shouldSwap = iFloat < rev
-            let iInt = b.cast(i, to: .int)
             let revInt = b.cast(rev, to: .int)
 
             let tempRealI = b.memoryRead(fftCell, baseOffset + iInt)
@@ -109,7 +96,7 @@ extension LazyOp {
             _ = b.memoryWrite(fftCell, baseOffset + revInt + imagOff, newImagRev)
           }
 
-          // Butterfly stages
+          // Butterfly stages using precomputed twiddle factors
           for stage in 0..<numStages {
             let butterflySize = 1 << (stage + 1)
             let halfSize = butterflySize / 2
@@ -127,9 +114,12 @@ extension LazyOp {
               let i = group * butterflySizeFloat + k
               let j = i + halfSizeFloat
 
-              let angle = b.constant(-2.0) * b.pi * k / butterflySizeFloat
-              let wr = b.cos(angle)
-              let wi = b.sin(angle)
+              // Read precomputed twiddle: offset = halfSize - 1, index = offset + k
+              let twiddleOffset = b.intConstant(halfSize - 1)
+              let kInt = b.cast(k, to: .int)
+              let twiddleIdx = twiddleOffset + kInt
+              let wr = b.memoryRead(twReCellId, twiddleIdx)
+              let wi = zero - b.memoryRead(twImCellId, twiddleIdx)  // negate for forward FFT
 
               let iInt = b.cast(i, to: .int)
               let jInt = b.cast(j, to: .int)
@@ -270,10 +260,21 @@ extension LazyOp {
       let gradTime1Cell, let gradTime2Cell, let windowCell):
       // IFFT to scatter frequency-domain gradients back to time domain (frame-aware)
       // Then multiply by window coefficients for Hann backprop
-      guard inputs.count >= 1 else {
+      // Inputs: [gradSpec, twReNode, twImNode, bitRevNode, ?hopCounter]
+      guard inputs.count >= 4 else {
         throw DGenError.insufficientInputs(
-          operator: "spectralLossFFTGradIFFT", expected: 1, actual: inputs.count)
+          operator: "spectralLossFFTGradIFFT", expected: 4, actual: inputs.count)
       }
+
+      // Helper to resolve tensor input NodeID → cell ID
+      func tensorCellId(_ nodeId: NodeID) -> CellID {
+        let tensorId = g.nodeToTensor[nodeId]!
+        return g.tensors[tensorId]!.cellId
+      }
+
+      let twReCellId = tensorCellId(node.inputs[1])
+      let twImCellId = tensorCellId(node.inputs[2])
+      let bitRevCellId = tensorCellId(node.inputs[3])
 
       let fftSize = windowSize * 2
       let numStages = Int(log2(Double(windowSize)))
@@ -283,7 +284,7 @@ extension LazyOp {
       let invNBins = b.constant(1.0 / Float(windowSize * numBins))
       let zero = b.constant(0.0)
       let one = b.constant(1.0)
-      let hopCounter: Expr? = inputs.count > 1 ? b.value(inputs[1]) : nil
+      let hopCounter: Expr? = inputs.count > 4 ? b.value(inputs[4]) : nil
       let frameIdx = b.frameIndex()
 
       // Per-frame base offsets (integer arithmetic for precision)
@@ -297,18 +298,12 @@ extension LazyOp {
 
         // Helper function to emit IFFT for a single gradient spectrum cell
         func emitIFFTInPlace(_ gradSpecCell: CellID, _ gradTimeCell: CellID) {
-          // Bit-reversal permutation (has data dependencies - keep sequential)
+          // Bit-reversal permutation using precomputed table
           b.loop(windowSize) { i in
-            var rev = b.constant(0.0)
-            var n = b.cast(i, to: .float)
-            for _ in 0..<numStages {
-              rev = rev * b.constant(2.0) + (n % b.constant(2.0))
-              n = b.floor(n / b.constant(2.0))
-            }
-
+            let iInt = b.cast(i, to: .int)
+            let rev = b.memoryRead(bitRevCellId, iInt)
             let iFloat = b.cast(i, to: .float)
             let shouldSwap = iFloat < rev
-            let iInt = b.cast(i, to: .int)
             let revInt = b.cast(rev, to: .int)
 
             let tempR = b.memoryRead(gradSpecCell, gradSpecBase + iInt)
@@ -327,7 +322,7 @@ extension LazyOp {
             _ = b.memoryWrite(gradSpecCell, gradSpecBase + revInt + imagOff, newRevI)
           }
 
-          // Butterfly stages with POSITIVE twiddle angles (IFFT)
+          // Butterfly stages with POSITIVE twiddle (IFFT) from precomputed table
           var butterflySize = 2
           for _ in 0..<numStages {
             let halfSize = butterflySize / 2
@@ -345,10 +340,12 @@ extension LazyOp {
               let i = group * butterflySizeFloat + k
               let j = i + halfSizeFloat
 
-              // IFFT twiddle: W = e^(+2πi*k/butterflySize) - POSITIVE angle
-              let angle = b.constant(2.0) * b.pi * k / butterflySizeFloat
-              let wr = b.cos(angle)
-              let wi = b.sin(angle)
+              // Read precomputed twiddle: positive convention (no negation for IFFT)
+              let twiddleOffset = b.intConstant(halfSize - 1)
+              let kInt = b.cast(k, to: .int)
+              let twiddleIdx = twiddleOffset + kInt
+              let wr = b.memoryRead(twReCellId, twiddleIdx)
+              let wi = b.memoryRead(twImCellId, twiddleIdx)
 
               let iInt = b.cast(i, to: .int)
               let jInt = b.cast(j, to: .int)

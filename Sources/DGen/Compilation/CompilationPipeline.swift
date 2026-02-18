@@ -188,7 +188,7 @@ public struct CompilationPipeline {
     }
 
     let voiceState = VoiceStateCompilation.buildPlan(graph: graph, options: options)
-    let cellAllocations = timings.measure("remapMemorySlots") {
+    var cellAllocations = timings.measure("remapMemorySlots") {
       remapVectorMemorySlots(
         &uopBlocks,
         cellSizes: graph.cellAllocationSizes,
@@ -196,6 +196,9 @@ public struct CompilationPipeline {
         graph: graph,
         enableBufferReuse: options.enableBufferReuse)
     }
+    // Collect precomputed tensor data (e.g. FFT twiddle factors, Hann window) for injection
+    cellAllocations.tensorInitData = collectTensorInitData(
+      graph: graph, cellAllocations: cellAllocations)
 
     let renderer = createRenderer(for: backend)
     VoiceStateCompilation.configureRenderer(

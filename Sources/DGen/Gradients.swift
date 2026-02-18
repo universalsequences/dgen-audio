@@ -740,7 +740,11 @@ extension LazyOp {
       // avoiding the O(N²) DFT recomputation of GradInline.
       let sig1 = node.inputs[0]
       let sig2 = node.inputs[1]
-      let hopCounter = node.inputs.count > 2 ? node.inputs[2] : nil
+      // inputs[2..5] are precomputed tensor refs: hann, twRe, twIm, bitRev
+      let twReNode = node.inputs[3]
+      let twImNode = node.inputs[4]
+      let bitRevNode = node.inputs[5]
+      let hopCounter = node.inputs.count > 6 ? node.inputs[6] : nil
       let fftSize = windowSize * 2
 
       // Allocate per-frame gradient spectrum cells (complex: real + imag)
@@ -770,7 +774,8 @@ extension LazyOp {
       g.addGradientSideEffect(gradSpec)
 
       // Step 2: IFFT gradient spectrum → time-domain gradients
-      var gradIFFTInputs: [NodeID] = [gradSpec]
+      // Pass precomputed twiddle/bitrev tensors for table-lookup IFFT
+      var gradIFFTInputs: [NodeID] = [gradSpec, twReNode, twImNode, bitRevNode]
       if let hopCounter { gradIFFTInputs.append(hopCounter) }
       let gradIFFT = g.n(
         .spectralLossFFTGradIFFT(
@@ -800,7 +805,11 @@ extension LazyOp {
           gradTime2Cell: gradTime2Cell
         ), gradReadInputs)
 
-      return [gradPassResult, grad2Node]
+      // Gradients: sig1, sig2 get time-domain gradients; tensor refs (hann, twRe, twIm, bitRev) and
+      // hop counter are non-differentiable
+      var result: [NodeID?] = [gradPassResult, grad2Node]
+      for _ in 2..<node.inputs.count { result.append(nil) }
+      return result
 
     case .spectralLossFFTGradSpec(_, _, _, _, _, _, _):
       // Gradient ops don't need their own gradients
