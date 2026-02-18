@@ -50,40 +50,20 @@ extension LazyOp {
       if ctx.frameAwareTensorCells.contains(tensor.cellId),
         let (tensorSize, frameCount) = ctx.g.frameAwareCells[tensor.cellId]
       {
-        // Fast frame-aware reduction:
-        // 1) zero destination cell in parallel
-        // 2) reduce frame axis in chunks and atomically accumulate chunk partials
-        //
-        // This shortens the inner loop from frameCount to chunkSize and increases
-        // parallelism for large-frame training workloads.
-        let reductionChunkSize = 256
-        let chunkCount = Swift.max(1, (frameCount + reductionChunkSize - 1) / reductionChunkSize)
+        // Frame-aware: sum across all frames (each at frameIdx * tensorSize + elemIdx).
+        // Each parallel lane owns one elemIdx, so reduce locally first, then do a single
+        // accumulate to avoid frameCount atomics per element.
         let tensorSizeInt = b.intConstant(tensorSize)
-        let sizeInt = b.intConstant(size)
-        let frameCountInt = b.intConstant(frameCount)
-        let zero = b.constant(0.0)
-
         b.parallelRange(size) { elemIdx in
           let elemIdxInt = b.cast(elemIdx, to: .int)
-          _ = b.memoryWrite(cellId, elemIdxInt, zero)
-        }
-
-        b.parallelRange(size * chunkCount) { laneIdx in
-          let laneIdxInt = b.cast(laneIdx, to: .int)
-          let elemIdxInt = laneIdxInt % sizeInt
-          let chunkIdxInt = laneIdxInt / sizeInt
-          let frameStart = chunkIdxInt * b.intConstant(reductionChunkSize)
           let localSum = b.float(0.0)
-
-          b.loop(reductionChunkSize) { chunkOffset in
-            let frameIdxInt = frameStart + chunkOffset
-            let inBounds = frameIdxInt < frameCountInt
+          b.loop(frameCount) { frameIdx in
+            let frameIdxInt = b.cast(frameIdx, to: .int)
             let readPos = frameIdxInt * tensorSizeInt + elemIdxInt
-            let val = b.gswitch(inBounds, b.memoryRead(tensor.cellId, readPos), zero)
+            let val = b.memoryRead(tensor.cellId, readPos)
             localSum.accumulate(val)
           }
-
-          _ = b.memoryAccumulate(cellId, elemIdxInt, localSum.value)
+          _ = b.memoryWrite(cellId, elemIdxInt, localSum.value)
         }
       } else if !tensor.transforms.isEmpty {
         // Use tensorRead to walk the transform chain
