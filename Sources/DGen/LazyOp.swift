@@ -174,6 +174,7 @@ public enum LazyOp {
   case conv2d(Shape)  // 2D convolution, Shape is kernel shape [kH, kW]
   case sum  // Reduce tensor to scalar by summing all elements
   case sumAxis(Int)  // Reduce along a specific axis
+  case sumMulAxis0  // Fused reduction: sum over axis 0 of elementwise mul for 2D tensors
   case gemm(Int, Int, Int, Bool, Bool)  // Matrix multiply via tensor cores: gemm(M, N, K, transA, transB)
   case maxAxis(Int)  // Reduce along axis keeping maximum
   case meanAxis(Int)  // Reduce along axis computing mean

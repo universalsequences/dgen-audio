@@ -89,6 +89,18 @@ public func inferShape(op: LazyOp, inputs: [ValueShape], graph: Graph) throws ->
   case .sumAxis(let axis):
     return try inferAxisReduceShape(opName: "sumAxis", axis: axis, inputs: inputs)
 
+  case .sumMulAxis0:
+    guard inputs.count == 2,
+      case .tensor(let leftShape) = inputs[0],
+      case .tensor(let rightShape) = inputs[1],
+      leftShape.count == 2,
+      rightShape == leftShape
+    else {
+      throw DGenError.shapeInferenceFailed(
+        op: "sumMulAxis0", reason: "requires two matching 2D tensor inputs")
+    }
+    return .tensor([leftShape[1]])
+
   case .maxAxis(let axis):
     return try inferAxisReduceShape(opName: "maxAxis", axis: axis, inputs: inputs)
 

@@ -68,7 +68,56 @@ extension GraphPrepPasses {
         mulNode.inputs.count == 2
       else { continue }
 
-      guard case .tensor(let mulShape) = mulNode.shape, mulShape.count == 3 else { continue }
+      guard let input0Node = graph.nodes[mulNode.inputs[0]],
+        let input1Node = graph.nodes[mulNode.inputs[1]],
+        case .tensor(let input0Shape) = input0Node.shape,
+        case .tensor(let input1Shape) = input1Node.shape
+      else { continue }
+
+      guard case .tensor(let mulShape) = mulNode.shape else { continue }
+
+      // Fused reduction pattern: sumAxis0(mul(A, B)) where A and B are 2D tensors [M, N].
+      // This emits a dedicated reduction op that maps naturally to perFrameScaled(N)
+      // and avoids the generic axis-reduce shape-region fallback.
+      if mulShape.count == 2 {
+        guard axis == 0,
+          mulShape == input0Shape,
+          mulShape == input1Shape,
+          mulShape.count == 2
+        else { continue }
+
+        let (leftSource, leftViewIds, _, leftNearest2D) = traceViewChain(
+          from: mulNode.inputs[0], graph: graph)
+        let (rightSource, rightViewIds, _, rightNearest2D) = traceViewChain(
+          from: mulNode.inputs[1], graph: graph)
+
+        func sourceMatchesMulShape(_ sourceId: NodeID, _ nearest2D: [Int]?) -> Bool {
+          if let node = graph.nodes[sourceId],
+            case .tensor(let sourceShape) = node.shape, sourceShape.count == 2
+          {
+            return sourceShape == mulShape
+          }
+          return nearest2D == mulShape
+        }
+
+        guard sourceMatchesMulShape(leftSource, leftNearest2D),
+          sourceMatchesMulShape(rightSource, rightNearest2D)
+        else { continue }
+
+        graph.nodes[nodeId] = Node(
+          id: nodeId,
+          op: .sumMulAxis0,
+          inputs: [leftSource, rightSource]
+        )
+        graph.nodes[nodeId]?.shape = .tensor([mulShape[1]])
+
+        let mulNodeId = node.inputs[0]
+        let orphanCandidates = [mulNodeId] + leftViewIds + rightViewIds
+        removeOrphans(orphanCandidates, excludingConsumer: nodeId, graph: graph)
+        continue
+      }
+
+      guard mulShape.count == 3 else { continue }
 
       let K = mulShape[axis]
       let nonReduceAxes = (0..<3).filter { $0 != axis }
@@ -76,12 +125,6 @@ extension GraphPrepPasses {
       let axisN = nonReduceAxes[1]
       let M = mulShape[axisM]
       let N = mulShape[axisN]
-
-      guard let input0Node = graph.nodes[mulNode.inputs[0]],
-        let input1Node = graph.nodes[mulNode.inputs[1]],
-        case .tensor(let input0Shape) = input0Node.shape,
-        case .tensor(let input1Shape) = input1Node.shape
-      else { continue }
 
       guard M % 8 == 0, N % 8 == 0, K % 8 == 0 else { continue }
 

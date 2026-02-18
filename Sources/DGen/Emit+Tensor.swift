@@ -273,6 +273,69 @@ extension LazyOp {
         _ = b.memoryWrite(outCell, b.cast(outIdx, to: .int), sumAcc.value)
       }
 
+    case .sumMulAxis0:
+      guard node.inputs.count == 2,
+        case .tensor(let leftShape) = g.nodes[node.inputs[0]]?.shape,
+        case .tensor(let rightShape) = g.nodes[node.inputs[1]]?.shape,
+        leftShape.count == 2,
+        rightShape == leftShape,
+        case .tensor(let outShape) = node.shape,
+        outShape == [leftShape[1]],
+        let leftTensor = g.nodeToTensor[node.inputs[0]].flatMap({ g.tensors[$0] }),
+        let rightTensor = g.nodeToTensor[node.inputs[1]].flatMap({ g.tensors[$0] }),
+        let outCell = g.nodeToTensor[node.id].flatMap({ g.tensors[$0] })?.cellId,
+        let loopIdx = b.ctx.tensorIndices[node.id]
+      else {
+        throw DGenError.tensorError(op: "sumMulAxis0", reason: "invalid input")
+      }
+
+      let rows = leftShape[0]
+      let cols = leftShape[1]
+      let colIdx = b.value(loopIdx, scalarType: .int)
+      let sumAcc = b.float(0.0)
+
+      let leftIsFrameAware = ctx.frameAwareTensorCells.contains(leftTensor.cellId)
+      let rightIsFrameAware = ctx.frameAwareTensorCells.contains(rightTensor.cellId)
+      let outIsFrameAware = ctx.frameAwareTensorCells.contains(outCell)
+      let leftTensorSize = leftShape.reduce(1, *)
+      let rightTensorSize = rightShape.reduce(1, *)
+      let outTensorSize = outShape.reduce(1, *)
+
+      func readFusedInput(_ tensor: Tensor, row: Expr, col: Expr, frameAware: Bool, tensorSize: Int)
+        -> Expr
+      {
+        if tensor.padding != nil || !tensor.transforms.isEmpty {
+          return b.tensorRead(tensor, indices: [row, col])
+        }
+
+        let flatIdx = row * b.intConstant(cols) + col
+        if frameAware {
+          return b.frameAwareTensorRead(
+            cellId: tensor.cellId,
+            tensorSize: tensorSize,
+            elemIdx: flatIdx
+          )
+        }
+        return b.memoryRead(tensor.cellId, flatIdx)
+      }
+
+      b.loop(rows) { row in
+        let leftVal = readFusedInput(
+          leftTensor, row: row, col: colIdx, frameAware: leftIsFrameAware,
+          tensorSize: leftTensorSize)
+        let rightVal = readFusedInput(
+          rightTensor, row: row, col: colIdx, frameAware: rightIsFrameAware,
+          tensorSize: rightTensorSize)
+        sumAcc.accumulate(leftVal * rightVal)
+      }
+
+      if outIsFrameAware {
+        _ = b.frameAwareTensorWrite(
+          cellId: outCell, tensorSize: outTensorSize, elemIdx: colIdx, value: sumAcc.value)
+      } else {
+        _ = b.memoryWrite(outCell, colIdx, sumAcc.value)
+      }
+
     case .maxAxis(let axis):
       guard case .tensor(let inShape) = g.nodes[node.inputs[0]]?.shape,
         case .tensor(let outShape) = node.shape,
