@@ -153,6 +153,9 @@ public enum LazyOp {
   case memoryAccumulate(CellID)  // Atomic add to memory cell
   case memoryCellSum(CellID, Int)  // Sum all elements in a memory cell (cell, size)
   case tensorAccumulate(CellID)  // Atomic add tensor elements to memory region
+  // Deterministic fused cross-frame reduction for gemm outputs:
+  // computes sum_f(gemm_f) directly into target cell (no atomic accumulation order variance).
+  case gemmReduceToCell(Int, Int, Int, Bool, Bool, CellID)  // (M, N, K, transA, transB, targetCell)
   case historyWrite(CellID)
   case historyReadWrite(CellID)
   case param(CellID)

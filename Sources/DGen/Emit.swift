@@ -266,7 +266,7 @@ extension LazyOp {
       .pad, .expandView, .repeatView, .peek, .expand, .expandAxis, .gradPhasor:
       try emitTensorOp(b: b, ctx: ctx, g: g, node: node, inputs: inputs, nodeId: nodeId, ops: &ops)
 
-    case .memoryRead, .memoryWrite, .memoryAccumulate, .memoryCellSum, .tensorAccumulate,
+    case .memoryRead, .memoryWrite, .memoryAccumulate, .memoryCellSum, .tensorAccumulate, .gemmReduceToCell,
       .historyWrite, .historyReadWrite, .historyRead, .param, .latch, .click, .noise,
       .phasor, .deterministicPhasor, .gradDeterministicPhasor, .accum,
       .output, .input, .seq:

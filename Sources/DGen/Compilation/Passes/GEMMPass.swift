@@ -177,6 +177,8 @@ extension GraphPrepPasses {
       let orphanCandidates = [mulNodeId, match.expandNodeId] + match.viewIds
       removeOrphans(orphanCandidates, excludingConsumer: nodeId, graph: graph)
     }
+
+    fuseCrossFrameTensorAccumulateGemm(graph: graph)
   }
 
   /// Attempts to match the backward matmul pattern where one mul input is an
@@ -296,6 +298,34 @@ extension GraphPrepPasses {
       if !hasOtherConsumer {
         graph.nodes.removeValue(forKey: candidateId)
       }
+    }
+  }
+
+  /// Rewrites `tensorAccumulate(cell, gemm(...))` into a deterministic fused GEMM reduction
+  /// that writes directly to `cell`, avoiding per-frame GEMM output materialization followed
+  /// by large static reduction kernels.
+  private static func fuseCrossFrameTensorAccumulateGemm(graph: Graph) {
+    for (nodeId, node) in graph.nodes {
+      guard case .tensorAccumulate(let targetCell) = node.op,
+        node.inputs.count == 1,
+        let gemmNode = graph.nodes[node.inputs[0]],
+        case .gemm(let M, let N, let K, let transA, let transB) = gemmNode.op,
+        gemmNode.inputs.count == 2
+      else { continue }
+
+      let hasOtherConsumer = graph.nodes.values.contains {
+        $0.id != nodeId && $0.inputs.contains(gemmNode.id)
+      }
+      guard !hasOtherConsumer else { continue }
+
+      graph.nodes[nodeId] = Node(
+        id: nodeId,
+        op: .gemmReduceToCell(M, N, K, transA, transB, targetCell),
+        inputs: gemmNode.inputs
+      )
+      graph.nodes[nodeId]?.shape = .scalar
+
+      removeOrphans([gemmNode.id], excludingConsumer: nodeId, graph: graph)
     }
   }
 }

@@ -541,6 +541,16 @@ private func groupRegularTensorBlock(
       currentBlock = makeTensorGroupingBlock(from: block)
       currentShape = nil
       continue
+    } else if case .gemmReduceToCell = node.op {
+      // Cross-frame GEMM reduction also manages its own tiled dispatch.
+      appendCurrentGroupingBlockIfNeeded(&currentBlock, grouped: &grouped)
+      var gemmBlock = makeTensorGroupingBlock(from: block)
+      gemmBlock.nodes.append(nodeId)
+      gemmBlock.shape = nil  // GEMM has its own dispatch, no shape-based threading
+      grouped.append(gemmBlock)
+      currentBlock = makeTensorGroupingBlock(from: block)
+      currentShape = nil
+      continue
 
     } else if case .constant = node.op {
       // Constants do not affect grouping state.

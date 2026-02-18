@@ -115,6 +115,11 @@ extension UOpBlockFinalization {
     }), case .gemm(let M, let N, _, _, _) = gemmNode.op {
       return .gemm(tilesM: M / 8, tilesN: N / 8)
     }
+    if let reduceGemmNode = block.nodes.lazy.compactMap({ graph.nodes[$0] }).first(where: {
+      if case .gemmReduceToCell = $0.op { return true }; return false
+    }), case .gemmReduceToCell(let M, let N, _, _, _, _) = reduceGemmNode.op {
+      return .gemm(tilesM: M / 8, tilesN: N / 8)
+    }
 
     if block.temporality == .static_ {
       if block.frameOrder.isParallel, let scale = threadCountScale {

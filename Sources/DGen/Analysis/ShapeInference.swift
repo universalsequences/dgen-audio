@@ -214,6 +214,9 @@ public func inferShape(op: LazyOp, inputs: [ValueShape], graph: Graph) throws ->
   case .tensorAccumulate(_):
     return .scalar
 
+  case .gemmReduceToCell:
+    return .scalar
+
   case .neg:
     return inputs.first ?? .scalar
 

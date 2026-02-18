@@ -249,6 +249,9 @@ public func findSequentialNodes(_ g: Graph, feedbackClusters: [[NodeID]], backen
     case .tensorAccumulate(_):
       // tensorAccumulate uses atomics internally - safe for SIMD execution
       simdSafe.insert($0.id)
+    case .gemmReduceToCell(_, _, _, _, _, _):
+      // Fused GEMM frame-reduction is explicitly parallel and should not be scalarized.
+      simdSafe.insert($0.id)
     default: break
     }
   }
