@@ -301,14 +301,23 @@ extension GraphPrepPasses {
     }
   }
 
-  /// Rewrites `tensorAccumulate(cell, gemm(...))` into a deterministic two-pass reduction:
-  /// 1) chunked GEMM partials [chunkCount, M, N]
-  /// 2) fixed-order reduction of chunk partials into target `cell`.
+  /// Rewrites `tensorAccumulate(cell, gemm(...))` into a deterministic two-pass reduction.
   ///
-  /// This preserves simdgroup GEMM for heavy math while avoiding one massive frame loop
-  /// inside a single GEMM kernel.
+  /// **Problem**: Backward parameter gradients for matmul sum per-frame GEMM results across
+  /// all frames into a single gradient tensor. `tensorAccumulate` uses atomic adds, whose
+  /// ordering varies between runs, producing non-deterministic floating-point results.
   ///
-  /// Match conditions:
+  /// **Solution**: Two-pass chunked reduction with fixed summation order:
+  /// 1. `gemmChunkPartials` — groups frames into chunks of 64. Each chunk accumulates its
+  ///    frames' GEMM tiles into one partial `[chunkCount, M, N]` tensor. Dispatched as
+  ///    `tilesM × tilesN × chunkCount` threadgroups (one chunk per z-index).
+  /// 2. `chunkPartialsReduceToCell` — one thread per output element sums partials across
+  ///    chunks in fixed order `[0..chunkCount)`, then writes to the target cell. No atomics.
+  ///
+  /// Chunking (vs. a single kernel looping all frames) preserves GPU occupancy: multiple
+  /// threadgroups work on different frame ranges in parallel.
+  ///
+  /// **Match conditions**:
   /// - node is `tensorAccumulate(targetCell)` with one input
   /// - that input traces through view-only ops to a `.gemm(...)` source
   /// - the traced gemm output has no other non-view consumers

@@ -45,13 +45,10 @@ public enum DispatchMode: Equatable {
   /// frameCount threads, threadGroupSize=1 (for kernels using threadgroup scratch memory)
   case perFrameThreadgroup1
 
-  /// GEMM: 2D threadgroup grid, 32 threads per group (one SIMD group).
-  /// tilesM × tilesN threadgroups, each handling one 8×8 output tile.
-  case gemm(tilesM: Int, tilesN: Int)
-
-  /// GEMM with explicit dispatch depth (for chunked-frame reductions).
-  /// tilesM × tilesN × depth threadgroups, 32 threads per group.
-  case gemmFixedDepth(tilesM: Int, tilesN: Int, depth: Int)
+  /// GEMM: 2D/3D threadgroup grid, 32 threads per group (one SIMD group).
+  /// tilesM × tilesN × depth threadgroups, each handling one 8×8 output tile.
+  /// When depth is nil, runtime frameCount is used (1 for static blocks).
+  case gemm(tilesM: Int, tilesN: Int, depth: Int? = nil)
 }
 
 extension DispatchMode {
@@ -62,9 +59,9 @@ extension DispatchMode {
     case .perFrame, .perFrameThreadgroup1: return frameCount
     case .perFrameScaled(let n): return frameCount * max(1, n)
     case .fixedWithFrameLoop(let n), .staticThreads(let n): return max(1, n)
-    case .gemm(let tilesM, let tilesN): return tilesM * tilesN * 32
-    case .gemmFixedDepth(let tilesM, let tilesN, let depth):
-      return max(1, tilesM) * max(1, tilesN) * max(1, depth) * 32
+    case .gemm(let tilesM, let tilesN, let depth):
+      let d = depth ?? 1
+      return max(1, tilesM) * max(1, tilesN) * max(1, d) * 32
     }
   }
 
@@ -72,8 +69,7 @@ extension DispatchMode {
   var hasRendererFrameLoop: Bool {
     switch self {
     case .singleThreaded, .fixedWithFrameLoop: return true
-    case .perFrame, .perFrameThreadgroup1, .perFrameScaled, .staticThreads, .selfManaged, .gemm,
-      .gemmFixedDepth:
+    case .perFrame, .perFrameThreadgroup1, .perFrameScaled, .staticThreads, .selfManaged, .gemm:
       return false
     }
   }
@@ -82,7 +78,7 @@ extension DispatchMode {
   var threadGroupSize: Int? {
     switch self {
     case .singleThreaded, .selfManaged, .perFrameThreadgroup1: return 1
-    case .gemm, .gemmFixedDepth: return 32
+    case .gemm: return 32
     default: return nil
     }
   }

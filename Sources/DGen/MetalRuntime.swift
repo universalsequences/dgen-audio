@@ -313,15 +313,10 @@ public class MetalCompiledKernel: CompiledKernelRuntime {
         }
       }
 
-      if case .gemm(let tilesM, let tilesN) = kernel.dispatchMode {
+      if case .gemm(let tilesM, let tilesN, let fixedDepth) = kernel.dispatchMode {
         // GEMM: 2D/3D threadgroup grid, 32 threads per group (one SIMD group).
-        // depth = frameCount for frame-based blocks (per-frame matmul via gid.z),
-        // depth = 1 for static blocks (single matmul, gid.z = 0).
-        let depth = kernel.temporality == .static_ ? 1 : frameCount
-        let threadgroups = MTLSize(width: tilesN, height: tilesM, depth: depth)
-        let threadsPerGroup = MTLSize(width: 32, height: 1, depth: 1)
-        computeEncoder.dispatchThreadgroups(threadgroups, threadsPerThreadgroup: threadsPerGroup)
-      } else if case .gemmFixedDepth(let tilesM, let tilesN, let depth) = kernel.dispatchMode {
+        // fixedDepth is set for chunked reductions; otherwise derive from temporality.
+        let depth = fixedDepth ?? (kernel.temporality == .static_ ? 1 : frameCount)
         let threadgroups = MTLSize(width: tilesN, height: tilesM, depth: max(1, depth))
         let threadsPerGroup = MTLSize(width: 32, height: 1, depth: 1)
         computeEncoder.dispatchThreadgroups(threadgroups, threadsPerThreadgroup: threadsPerGroup)

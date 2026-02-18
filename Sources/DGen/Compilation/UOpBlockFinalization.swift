@@ -110,23 +110,15 @@ extension UOpBlockFinalization {
     if hasOwnFrameLoop { return .selfManaged }
 
     // GEMM blocks use 2D threadgroup dispatch with 32 threads per group
-    if let gemmNode = block.nodes.lazy.compactMap({ graph.nodes[$0] }).first(where: {
-      if case .gemm = $0.op { return true }; return false
-    }), case .gemm(let M, let N, _, _, _) = gemmNode.op {
-      return .gemm(tilesM: M / 8, tilesN: N / 8)
-    }
-    if let reduceGemmNode = block.nodes.lazy.compactMap({ graph.nodes[$0] }).first(where: {
-      if case .gemmReduceToCell = $0.op { return true }; return false
-    }), case .gemmReduceToCell(let M, let N, _, _, _, _) = reduceGemmNode.op {
-      return .gemm(tilesM: M / 8, tilesN: N / 8)
-    }
-    if let chunkedGemmNode = block.nodes.lazy.compactMap({ graph.nodes[$0] }).first(where: {
-      if case .gemmChunkPartials = $0.op { return true }; return false
-    }),
-      case .gemmChunkPartials(let M, let N, _, _, _, _, let chunkCount) = chunkedGemmNode.op
-    {
-      // gid.z indexes chunk id for pass-1 chunked GEMM partials.
-      return .gemmFixedDepth(tilesM: M / 8, tilesN: N / 8, depth: chunkCount)
+    for nodeId in block.nodes {
+      guard let node = graph.nodes[nodeId] else { continue }
+      switch node.op {
+      case .gemm(let M, let N, _, _, _):
+        return .gemm(tilesM: M / 8, tilesN: N / 8)
+      case .gemmChunkPartials(let M, let N, _, _, _, _, let chunkCount):
+        return .gemm(tilesM: M / 8, tilesN: N / 8, depth: chunkCount)
+      default: continue
+      }
     }
 
     if block.temporality == .static_ {
