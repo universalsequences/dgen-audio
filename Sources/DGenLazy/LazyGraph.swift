@@ -37,12 +37,12 @@ public class LazyGraph {
   /// Initial values for stateful cells (e.g., click cells start at 1.0)
   internal var cellInitialValues: [CellID: Float] = [:]
 
-  /// Cache Metal runtime (MTLLibrary + pipeline states) by kernel source hash.
-  /// Persists across graph clears since the graph topology is identical each epoch.
-  internal var runtimeCacheByStructure: [String: LazyRuntime] = [:]
+  /// Metal runtime (MTLLibrary + pipeline states) cached by kernel source hash.
+  /// Persists across graph clears since identical topology produces identical kernels.
+  internal var runtimeCacheByKernelHash: [Int: LazyRuntime] = [:]
 
-  /// Full compilation cache (DGen + MTL) keyed by graph fingerprint.
-  /// Reusable when graph topology is identical (same model, same loss, counters reset).
+  /// Full compilation cache keyed by graph fingerprint (node count, tensor count, frame count).
+  /// Skips both DGen compilation and runtime creation when topology is unchanged across epochs.
   internal var fullCompilationCache: (fingerprint: String, result: CompilationResult, runtime: LazyRuntime)?
 
   internal var tensors: [WeakRef<Tensor>] = []
@@ -100,52 +100,6 @@ public class LazyGraph {
 
   public func registerSignal(_ signal: Signal) {
     signals.append(WeakRef(signal))
-  }
-
-  // MARK: - Graph Structure Hashing
-
-  /// Compute hash of current graph structure (ops and connections, not values)
-  /// Used to cache compiled kernels across graph rebuilds
-  /// Note: This hashes the logical structure, not specific node IDs
-  internal func graphStructureHash() -> String {
-    var hasher = Hasher()
-
-    // Build a topological representation independent of node IDs
-    // We hash: (operation type, number of inputs, relative input positions)
-    var nodeIndex: [NodeID: Int] = [:]
-    var index = 0
-    for (id, _) in graph.nodes.sorted(by: { $0.key < $1.key }) {
-      nodeIndex[id] = index
-      index += 1
-    }
-
-    // Now hash each node's op and its inputs (as relative indices)
-    for (_, node) in graph.nodes.sorted(by: { $0.key < $1.key }) {
-      hasher.combine(String(describing: node.op))
-      // Hash input count and their relative positions
-      hasher.combine(node.inputs.count)
-      for inputId in node.inputs {
-        // Use relative position in sorted order, or -1 if not found
-        hasher.combine(nodeIndex[inputId] ?? -1)
-      }
-    }
-
-    // Include tensor shapes (keyed by their sorted position, not ID)
-    var tensorIndex = 0
-    for (_, tensor) in graph.tensors.sorted(by: { $0.key < $1.key }) {
-      hasher.combine(tensorIndex)
-      hasher.combine(tensor.shape)
-      tensorIndex += 1
-    }
-
-    // Include parameter count and shapes
-    hasher.combine(parameterRegistry.tensors.count)
-    for tensor in parameterRegistry.tensors {
-      hasher.combine(tensor.shape)
-    }
-    hasher.combine(parameterRegistry.signals.count)
-
-    return String(hasher.finalize())
   }
 
   // MARK: - Graph Clearing

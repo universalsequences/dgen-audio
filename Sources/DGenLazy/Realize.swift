@@ -109,9 +109,8 @@ extension LazyGraph {
             return ExecutionContext(compilationResult: cached, runtime: runtime, frameCount: frameCount)
         }
 
-        // Fast path: check full compilation cache using a lightweight graph fingerprint.
-        // Graph is a class (reference type) — the cached CompilationResult.graph points to
-        // the same live Graph object, so injectTensorData reads current tensor data.
+        // Fast path: reuse full compilation cache when graph topology is unchanged.
+        // CompilationResult.graph is a reference type, so cached results see current tensor data.
         let fingerprint = "\(graph.nodes.count)|\(graph.tensors.count)|\(frameCount)"
         if let cached = fullCompilationCache, cached.fingerprint == fingerprint {
             compilationCache = cached.result
@@ -127,53 +126,56 @@ extension LazyGraph {
             options: .init(frameCount: frameCount, debug: DGenConfig.debug, enableBufferReuse: DGenConfig.enableBufferReuse)
         )
 
-        // Write kernels to disk if path is configured
         if let outputPath = DGenConfig.kernelOutputPath {
             writeKernelsToDisk(result, outputPath)
         }
 
-        // Check if we have a cached runtime with matching kernel structure.
-        // The graph topology is identical each epoch (same model + loss), so the
-        // generated MSL is the same. We can reuse the MTLLibrary + pipeline states.
-        var hasher = Hasher()
-        for kernel in result.kernels {
-            hasher.combine(kernel.source)
-        }
-        let structureKey = String(hasher.finalize())
-
+        // Reuse cached runtime if kernel sources are identical, otherwise create a new one.
+        // Identical topology produces identical MSL each epoch, so we skip MTLLibrary compilation.
+        let kernelHash = kernelSourceHash(result.kernels)
         let runtime: LazyRuntime
-        if let cachedRuntime = runtimeCacheByStructure[structureKey] {
-            runtime = cachedRuntime
+        if let cached = runtimeCacheByKernelHash[kernelHash] {
+            runtime = cached
         } else {
-            // Create runtime based on backend
-            switch DGenConfig.backend {
-            case .metal:
-                runtime = try MetalCompiledKernel(
-                    kernels: result.kernels,
-                    cellAllocations: result.cellAllocations,
-                    context: result.context,
-                    frameCount: frameCount
-                )
-            case .c:
-                runtime = try CLazyRuntime(
-                    kernels: result.kernels,
-                    cellAllocations: result.cellAllocations,
-                    memorySize: result.totalMemorySlots,
-                    frameCount: frameCount
-                )
-            }
-            runtimeCacheByStructure[structureKey] = runtime
+            runtime = try createRuntime(from: result, frameCount: frameCount)
+            runtimeCacheByKernelHash[kernelHash] = runtime
         }
 
-        // Store in full compilation cache for subsequent epochs
         fullCompilationCache = (fingerprint: fingerprint, result: result, runtime: runtime)
-
-        // Cache for reuse
         compilationCache = result
         runtimeCache = runtime
         isDirty = false
 
         return ExecutionContext(compilationResult: result, runtime: runtime, frameCount: frameCount)
+    }
+
+    /// Hash all kernel sources to produce a cache key for runtime reuse
+    private func kernelSourceHash(_ kernels: [CompiledKernel]) -> Int {
+        var hasher = Hasher()
+        for kernel in kernels {
+            hasher.combine(kernel.source)
+        }
+        return hasher.finalize()
+    }
+
+    /// Create a backend-appropriate runtime from compilation output
+    private func createRuntime(from result: CompilationResult, frameCount: Int) throws -> LazyRuntime {
+        switch DGenConfig.backend {
+        case .metal:
+            return try MetalCompiledKernel(
+                kernels: result.kernels,
+                cellAllocations: result.cellAllocations,
+                context: result.context,
+                frameCount: frameCount
+            )
+        case .c:
+            return try CLazyRuntime(
+                kernels: result.kernels,
+                cellAllocations: result.cellAllocations,
+                memorySize: result.totalMemorySlots,
+                frameCount: frameCount
+            )
+        }
     }
 
     /// Inject tensor data into memory buffer
