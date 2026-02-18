@@ -21,6 +21,14 @@ public class MetalRenderer: Renderer, UOpEmitter {
   /// Track scalarType of emitted UOps by their VarID for offset type lookups
   private var varScalarTypes: [VarID: CastType] = [:]
 
+  /// Whether the schedule item contains threadgroup array declarations
+  private static func hasThreadgroupScratch(_ scheduleItem: ScheduleItem) -> Bool {
+    scheduleItem.ops.contains {
+      if case .threadgroupArrayDecl = $0.op { return true }
+      return false
+    }
+  }
+
   public override init() {
   }
 
@@ -122,11 +130,7 @@ public class MetalRenderer: Renderer, UOpEmitter {
 
       // FFT kernels using threadgroup scratch need threadGroupSize=1 so each thread
       // gets its own on-chip scratch arrays (no sharing between threads).
-      let usesThreadgroupScratch = scheduleItem.ops.contains {
-        if case .threadgroupArrayDecl = $0.op { return true }
-        return false
-      }
-      if usesThreadgroupScratch {
+      if Self.hasThreadgroupScratch(scheduleItem) {
         finalDispatchMode = .perFrameThreadgroup1
       }
 
@@ -378,10 +382,12 @@ public class MetalRenderer: Renderer, UOpEmitter {
       .or(let a, let b), .xor(let a, let b), .beginRange(let a, let b), .beginForLoop(let a, let b):
       return variableIdsUsed(in: a).union(variableIdsUsed(in: b))
 
-    case .memoryRead(_, let a), .beginLoop(let a, _), .simdgroupLoad(_, let a, _, _):
+    case .memoryRead(_, let a), .beginLoop(let a, _), .simdgroupLoad(_, let a, _, _),
+      .threadgroupRead(_, let a):
       return variableIdsUsed(in: a)
 
-    case .memoryWrite(_, let a, let b), .memoryAccumulate(_, let a, let b):
+    case .memoryWrite(_, let a, let b), .memoryAccumulate(_, let a, let b),
+      .threadgroupWrite(_, let a, let b):
       return variableIdsUsed(in: a).union(variableIdsUsed(in: b))
 
     case .simdgroupStore(let src, _, let off, _):
@@ -710,10 +716,7 @@ public class MetalRenderer: Renderer, UOpEmitter {
       if case .gemm = scheduleItem.dispatchMode { return true }
       return false
     }()
-    usesThreadgroupScratch = scheduleItem.ops.contains {
-      if case .threadgroupArrayDecl = $0.op { return true }
-      return false
-    }
+    usesThreadgroupScratch = Self.hasThreadgroupScratch(scheduleItem)
     let (inputs, outputs) = analyzeDependencies(scheduleItem: scheduleItem, ctx: ctx)
 
     let allBuffers = Set(inputs + outputs)
