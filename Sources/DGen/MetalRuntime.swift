@@ -321,6 +321,10 @@ public class MetalCompiledKernel: CompiledKernelRuntime {
         let threadgroups = MTLSize(width: tilesN, height: tilesM, depth: depth)
         let threadsPerGroup = MTLSize(width: 32, height: 1, depth: 1)
         computeEncoder.dispatchThreadgroups(threadgroups, threadsPerThreadgroup: threadsPerGroup)
+      } else if case .gemmFixedDepth(let tilesM, let tilesN, let depth) = kernel.dispatchMode {
+        let threadgroups = MTLSize(width: tilesN, height: tilesM, depth: max(1, depth))
+        let threadsPerGroup = MTLSize(width: 32, height: 1, depth: 1)
+        computeEncoder.dispatchThreadgroups(threadgroups, threadsPerThreadgroup: threadsPerGroup)
       } else {
         let totalThreads = kernel.dispatchMode.threadCount(frameCount: frameCount)
         let maxThreadsPerGroup = pipelineState.maxTotalThreadsPerThreadgroup

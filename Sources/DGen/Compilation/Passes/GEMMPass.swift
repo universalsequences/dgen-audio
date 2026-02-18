@@ -301,31 +301,99 @@ extension GraphPrepPasses {
     }
   }
 
-  /// Rewrites `tensorAccumulate(cell, gemm(...))` into a deterministic fused GEMM reduction
-  /// that writes directly to `cell`, avoiding per-frame GEMM output materialization followed
-  /// by large static reduction kernels.
+  /// Rewrites `tensorAccumulate(cell, gemm(...))` into a deterministic two-pass reduction:
+  /// 1) chunked GEMM partials [chunkCount, M, N]
+  /// 2) fixed-order reduction of chunk partials into target `cell`.
+  ///
+  /// This preserves simdgroup GEMM for heavy math while avoiding one massive frame loop
+  /// inside a single GEMM kernel.
+  ///
+  /// Match conditions:
+  /// - node is `tensorAccumulate(targetCell)` with one input
+  /// - that input traces through view-only ops to a `.gemm(...)` source
+  /// - the traced gemm output has no other non-view consumers
+  ///
+  /// Typical trigger site is frame-based backward parameter gradients:
+  /// per-frame gemm output reduced across frames into a single gradient tensor.
   private static func fuseCrossFrameTensorAccumulateGemm(graph: Graph) {
-    for (nodeId, node) in graph.nodes {
+    struct Match {
+      let nodeId: NodeID
+      let targetCell: CellID
+      let sourceNodeId: NodeID
+      let viewNodeIds: [NodeID]
+      let outputHasTranspose: Bool
+      let gemmInputs: [NodeID]
+      let M: Int
+      let N: Int
+      let K: Int
+      let transA: Bool
+      let transB: Bool
+    }
+
+    var matches: [Match] = []
+    for nodeId in graph.nodes.keys.sorted() {
+      guard let node = graph.nodes[nodeId] else { continue }
       guard case .tensorAccumulate(let targetCell) = node.op,
-        node.inputs.count == 1,
-        let gemmNode = graph.nodes[node.inputs[0]],
+        node.inputs.count == 1
+      else { continue }
+
+      let (sourceNodeId, viewNodeIds, outputHasTranspose, _) = traceViewChain(
+        from: node.inputs[0], graph: graph)
+      guard let gemmNode = graph.nodes[sourceNodeId],
         case .gemm(let M, let N, let K, let transA, let transB) = gemmNode.op,
         gemmNode.inputs.count == 2
       else { continue }
 
       let hasOtherConsumer = graph.nodes.values.contains {
-        $0.id != nodeId && $0.inputs.contains(gemmNode.id)
+        $0.id != nodeId && !viewNodeIds.contains($0.id) && $0.inputs.contains(sourceNodeId)
       }
+      // Keep semantics simple: only rewrite when this accumulate is the sole compute consumer.
+      // If gemm has another real consumer, it must remain materialized as a normal tensor.
       guard !hasOtherConsumer else { continue }
 
-      graph.nodes[nodeId] = Node(
-        id: nodeId,
-        op: .gemmReduceToCell(M, N, K, transA, transB, targetCell),
-        inputs: gemmNode.inputs
-      )
-      graph.nodes[nodeId]?.shape = .scalar
+      matches.append(
+        Match(
+          nodeId: nodeId,
+          targetCell: targetCell,
+          sourceNodeId: sourceNodeId,
+          viewNodeIds: viewNodeIds,
+          outputHasTranspose: outputHasTranspose,
+          gemmInputs: gemmNode.inputs,
+          M: M,
+          N: N,
+          K: K,
+          transA: transA,
+          transB: transB
+        ))
+    }
 
-      removeOrphans([gemmNode.id], excludingConsumer: nodeId, graph: graph)
+    // Fixed chunk size for now. We can tune or gate this later with a cost model.
+    let chunkSize = 64
+    let chunkCount = max(1, (graph.maxFrameCount + chunkSize - 1) / chunkSize)
+
+    for match in matches {
+      // Skip if rewritten by an earlier transform.
+      guard let node = graph.nodes[match.nodeId],
+        case .tensorAccumulate = node.op
+      else { continue }
+
+      let partialNodeId = graph.n(
+        .gemmChunkPartials(
+          match.M, match.N, match.K, match.transA, match.transB, chunkSize, chunkCount),
+        match.gemmInputs,
+        shape: .tensor([chunkCount, match.M, match.N])
+      )
+
+      graph.nodes[match.nodeId] = Node(
+        id: match.nodeId,
+        op: .chunkPartialsReduceToCell(
+          match.targetCell, match.M, match.N, chunkCount, match.outputHasTranspose),
+        inputs: [partialNodeId]
+      )
+      graph.nodes[match.nodeId]?.shape = .scalar
+
+      removeOrphans(
+        [match.sourceNodeId] + match.viewNodeIds, excludingConsumer: match.nodeId, graph: graph)
     }
   }
 }

@@ -675,6 +675,12 @@ public class MetalRenderer: Renderer, UOpEmitter {
           op: .beginRange(.constant(0, 0), .constant(0, Float(totalThreads))), value: .empty)
         scheduleItem.ops.append(beginRange)
         hasFrameLoop = false
+      case .gemmFixedDepth(let tilesM, let tilesN, let depth):
+        let totalThreads = tilesM * tilesN * depth * 32
+        let beginRange = UOp(
+          op: .beginRange(.constant(0, 0), .constant(0, Float(totalThreads))), value: .empty)
+        scheduleItem.ops.append(beginRange)
+        hasFrameLoop = false
       }
 
       // Hop-based temporality: wrap body in hop check conditional.
@@ -714,6 +720,7 @@ public class MetalRenderer: Renderer, UOpEmitter {
     currentFrameOrder = scheduleItem.frameOrder
     isGemmKernel = {
       if case .gemm = scheduleItem.dispatchMode { return true }
+      if case .gemmFixedDepth = scheduleItem.dispatchMode { return true }
       return false
     }()
     usesThreadgroupScratch = Self.hasThreadgroupScratch(scheduleItem)

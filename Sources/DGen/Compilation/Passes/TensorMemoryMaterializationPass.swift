@@ -244,7 +244,15 @@ extension TensorMemoryMaterializationPass {
     intraBlockFrameAwareCells: Set<CellID>
   ) -> TensorAllocationDecision {
     let isOutbound = outboundCells.contains(lazyCellId)
-    let isFrameBased = nodeId.map { frameBasedNodes.contains($0) || hopBasedNodes[$0] != nil } ?? false
+    let isFrameBasedByTemporality =
+      nodeId.map { frameBasedNodes.contains($0) || hopBasedNodes[$0] != nil } ?? false
+    let isChunkedGemmPartial = nodeId.flatMap { graph.nodes[$0] }.map {
+      if case .gemmChunkPartials = $0.op { return true }
+      return false
+    } ?? false
+    // Chunked GEMM partial outputs already encode chunk dimension in their tensor shape.
+    // They are not per-frame tensors and must not be multiplied by frameCount again.
+    let isFrameBased = isFrameBasedByTemporality && !isChunkedGemmPartial
 
     let isInFeedbackLoop = backend == .c && nodeId.map { feedbackClusterNodes.contains($0) } ?? false
 

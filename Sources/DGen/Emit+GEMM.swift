@@ -10,7 +10,15 @@ extension LazyOp {
   func emitGemm(
     b: IRBuilder, ctx: IRContext, g: Graph, node: Node, nodeId: NodeID, ops: inout [UOp]
   ) throws {
-    guard case .gemm(let M, let N, let K, let transA, let transB) = self else { return }
+    let params: (M: Int, N: Int, K: Int, transA: Bool, transB: Bool, chunkSize: Int?, opName: String)
+    switch self {
+    case .gemm(let M, let N, let K, let transA, let transB):
+      params = (M, N, K, transA, transB, nil, "gemm")
+    case .gemmChunkPartials(let M, let N, let K, let transA, let transB, let chunkSize, _):
+      params = (M, N, K, transA, transB, chunkSize, "gemmChunkPartials")
+    default:
+      return
+    }
 
     guard node.inputs.count == 2,
       let leftTensorId = g.nodeToTensor[node.inputs[0]],
@@ -19,8 +27,15 @@ extension LazyOp {
       let rightTensor = g.tensors[rightTensorId],
       let outCell = g.nodeToTensor[nodeId].flatMap({ g.tensors[$0] })?.cellId
     else {
-      throw DGenError.tensorError(op: "gemm", reason: "could not resolve input/output tensors")
+      throw DGenError.tensorError(
+        op: params.opName, reason: "could not resolve input/output tensors")
     }
+
+    let M = params.M
+    let N = params.N
+    let K = params.K
+    let transA = params.transA
+    let transB = params.transB
 
     let leftCell = leftTensor.cellId
     let rightCell = rightTensor.cellId
@@ -28,61 +43,81 @@ extension LazyOp {
 
     let tileRow = b.threadgroupPositionY()
     let tileCol = b.threadgroupPositionX()
-    let frameIndex = b.threadgroupPositionZ()
-
-    // Per-frame memory offset for a cell, or zero for static (non-frame-aware) cells.
-    // M*K == K*M and K*N == N*K, so the size is the same regardless of transpose.
-    func frameBase(cell: CellID, tensorSize: Int) -> Expr {
-      ctx.frameAwareTensorCells.contains(cell)
-        ? frameIndex * b.intConstant(tensorSize) : b.intConstant(0)
-    }
-
-    let leftFrameBase = frameBase(cell: leftCell, tensorSize: M * K)
-    let rightFrameBase = frameBase(cell: rightCell, tensorSize: K * N)
-    let outFrameBase = frameBase(cell: outCell, tensorSize: M * N)
+    let zIndex = b.threadgroupPositionZ()
 
     // Zero-initialized accumulator
     let acc = b.simdgroupMatrixZero()
 
-    // K-loop: load A and B tiles, multiply-accumulate
-    b.loop(kSteps) { k in
-      // Left (A) tile load
-      let aOffset: Expr
-      let aStride: Int
-      if transA {
-        // Source is [K, M] row-major; transposed load reads as [M, K]
-        aOffset = leftFrameBase + k * b.intConstant(8 * M) + tileRow * b.intConstant(8)
-        aStride = M
-      } else {
-        // Source is [M, K] row-major
-        aOffset = leftFrameBase + tileRow * b.intConstant(8 * K) + k * b.intConstant(8)
-        aStride = K
-      }
-      let aTile = b.simdgroupLoad(leftCell, offset: aOffset, stride: aStride, transpose: transA)
+    // Shared tile MAC body (used by both per-frame GEMM and chunked partial GEMM).
+    func emitTileMac(leftFrameBase: Expr, rightFrameBase: Expr) {
+      b.loop(kSteps) { k in
+        let aOffset: Expr
+        let aStride: Int
+        if transA {
+          aOffset = leftFrameBase + k * b.intConstant(8 * M) + tileRow * b.intConstant(8)
+          aStride = M
+        } else {
+          aOffset = leftFrameBase + tileRow * b.intConstant(8 * K) + k * b.intConstant(8)
+          aStride = K
+        }
+        let aTile = b.simdgroupLoad(leftCell, offset: aOffset, stride: aStride, transpose: transA)
 
-      // Right (B) tile load
-      let bOffset: Expr
-      let bStride: Int
-      if transB {
-        // Source is [N, K] row-major; transposed load reads as [K, N]
-        bOffset = rightFrameBase + tileCol * b.intConstant(8 * K) + k * b.intConstant(8)
-        bStride = K
-      } else {
-        // Source is [K, N] row-major
-        bOffset = rightFrameBase + k * b.intConstant(8 * N) + tileCol * b.intConstant(8)
-        bStride = N
+        let bOffset: Expr
+        let bStride: Int
+        if transB {
+          bOffset = rightFrameBase + tileCol * b.intConstant(8 * K) + k * b.intConstant(8)
+          bStride = K
+        } else {
+          bOffset = rightFrameBase + k * b.intConstant(8 * N) + tileCol * b.intConstant(8)
+          bStride = N
+        }
+        let bTile = b.simdgroupLoad(rightCell, offset: bOffset, stride: bStride, transpose: transB)
+        b.simdgroupMultiplyAccumulate(aTile, bTile, acc)
       }
-      let bTile = b.simdgroupLoad(rightCell, offset: bOffset, stride: bStride, transpose: transB)
-
-      b.simdgroupMultiplyAccumulate(aTile, bTile, acc)
     }
 
-    // Store result tile at (tileRow*8, tileCol*8) in C[M,N]
-    let cOffset = outFrameBase + tileRow * b.intConstant(8 * N) + tileCol * b.intConstant(8)
-    b.simdgroupStore(acc, cellId: outCell, offset: cOffset, stride: N)
+    if let chunkSize = params.chunkSize {
+      // Pass 1 of split-frame reduction:
+      // - gid.z is CHUNK index (not frame index)
+      // - each chunk covers `chunkSize` frames
+      // - each (chunk, tileRow, tileCol) writes one partial tile into [chunk, M, N]
+      //
+      // Dispatch depth is chunkCount (set by scheduler), not frameCount.
+      let runtimeFrameCount = b.cast(b.frameCount(), to: .int)
+      let chunkBaseFrame = zIndex * b.intConstant(chunkSize)
+      b.loop(chunkSize) { localFrame in
+        let frameIdx = chunkBaseFrame + localFrame
+        // Final chunk may be partially full, so guard by runtime frameCount.
+        b.if_(frameIdx < runtimeFrameCount) {
+          let leftFrameBase =
+            ctx.frameAwareTensorCells.contains(leftCell)
+            ? frameIdx * b.intConstant(M * K) : b.intConstant(0)
+          let rightFrameBase =
+            ctx.frameAwareTensorCells.contains(rightCell)
+            ? frameIdx * b.intConstant(K * N) : b.intConstant(0)
+          emitTileMac(leftFrameBase: leftFrameBase, rightFrameBase: rightFrameBase)
+        }
+      }
 
-    // Mark output as memory-resident so downstream blocks read via tload
-    // instead of scalar global communication (defineGlobal/loadGlobal).
+      let chunkOffset = zIndex * b.intConstant(M * N)
+      let outOffset = chunkOffset + tileRow * b.intConstant(8 * N) + tileCol * b.intConstant(8)
+      b.simdgroupStore(acc, cellId: outCell, offset: outOffset, stride: N)
+    } else {
+      // Standard per-frame GEMM: z is frame index.
+      func frameBase(cell: CellID, tensorSize: Int) -> Expr {
+        ctx.frameAwareTensorCells.contains(cell)
+          ? zIndex * b.intConstant(tensorSize) : b.intConstant(0)
+      }
+      let leftFrameBase = frameBase(cell: leftCell, tensorSize: M * K)
+      let rightFrameBase = frameBase(cell: rightCell, tensorSize: K * N)
+      let outFrameBase = frameBase(cell: outCell, tensorSize: M * N)
+
+      emitTileMac(leftFrameBase: leftFrameBase, rightFrameBase: rightFrameBase)
+
+      let cOffset = outFrameBase + tileRow * b.intConstant(8 * N) + tileCol * b.intConstant(8)
+      b.simdgroupStore(acc, cellId: outCell, offset: cOffset, stride: N)
+    }
+
     ctx.values[nodeId] = .empty
   }
 }

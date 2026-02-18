@@ -162,7 +162,7 @@ public func isReductionOp(_ op: LazyOp) -> Bool {
   switch op {
   case .sum, .tensorAccumulate, .peekRowGradReduce,
     .selectRowGradReduce, .peekGradReduce, .overlapAddGradGather, .bufferViewGradRead,
-    .sumMulAxis0:
+    .sumMulAxis0, .chunkPartialsReduceToCell:
     return true
   default:
     return false
@@ -171,7 +171,8 @@ public func isReductionOp(_ op: LazyOp) -> Bool {
 
 public func isGlobalReductionOp(_ op: LazyOp) -> Bool {
   switch op {
-  case .peekRowGradReduce, .selectRowGradReduce, .peekGradReduce, .tensorAccumulate:
+  case .peekRowGradReduce, .selectRowGradReduce, .peekGradReduce, .tensorAccumulate,
+    .chunkPartialsReduceToCell:
     return true
   default:
     return false
@@ -537,6 +538,16 @@ private func groupRegularTensorBlock(
       var gemmBlock = makeTensorGroupingBlock(from: block)
       gemmBlock.nodes.append(nodeId)
       gemmBlock.shape = nil  // GEMM has its own dispatch, no shape-based threading
+      grouped.append(gemmBlock)
+      currentBlock = makeTensorGroupingBlock(from: block)
+      currentShape = nil
+      continue
+    } else if case .gemmChunkPartials = node.op {
+      // Chunked GEMM partials use explicit 3D tiled dispatch.
+      appendCurrentGroupingBlockIfNeeded(&currentBlock, grouped: &grouped)
+      var gemmBlock = makeTensorGroupingBlock(from: block)
+      gemmBlock.nodes.append(nodeId)
+      gemmBlock.shape = nil
       grouped.append(gemmBlock)
       currentBlock = makeTensorGroupingBlock(from: block)
       currentShape = nil

@@ -217,6 +217,9 @@ public func inferShape(op: LazyOp, inputs: [ValueShape], graph: Graph) throws ->
   case .gemmReduceToCell:
     return .scalar
 
+  case .chunkPartialsReduceToCell:
+    return .scalar
+
   case .neg:
     return inputs.first ?? .scalar
 
@@ -228,6 +231,9 @@ public func inferShape(op: LazyOp, inputs: [ValueShape], graph: Graph) throws ->
 
   case .gemm(let M, let N, _, _, _):
     return .tensor([M, N])
+
+  case .gemmChunkPartials(let M, let N, _, _, _, _, let chunkCount):
+    return .tensor([chunkCount, M, N])
 
   // Scalar ops -- listed explicitly so the compiler catches missing cases when new ops are added.
   case .mse,

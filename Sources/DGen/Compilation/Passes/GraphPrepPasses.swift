@@ -28,7 +28,8 @@ extension GraphPrepPasses {
     var simdSafe = Set<NodeID>()
     for (nodeId, node) in graph.nodes {
       switch node.op {
-      case .memoryAccumulate(_), .tensorAccumulate(_), .gemmReduceToCell(_, _, _, _, _, _):
+      case .memoryAccumulate(_), .tensorAccumulate(_), .gemmReduceToCell(_, _, _, _, _, _),
+        .chunkPartialsReduceToCell(_, _, _, _, _):
         simdSafe.insert(nodeId)
       default:
         break

@@ -120,6 +120,14 @@ extension UOpBlockFinalization {
     }), case .gemmReduceToCell(let M, let N, _, _, _, _) = reduceGemmNode.op {
       return .gemm(tilesM: M / 8, tilesN: N / 8)
     }
+    if let chunkedGemmNode = block.nodes.lazy.compactMap({ graph.nodes[$0] }).first(where: {
+      if case .gemmChunkPartials = $0.op { return true }; return false
+    }),
+      case .gemmChunkPartials(let M, let N, _, _, _, _, let chunkCount) = chunkedGemmNode.op
+    {
+      // gid.z indexes chunk id for pass-1 chunked GEMM partials.
+      return .gemmFixedDepth(tilesM: M / 8, tilesN: N / 8, depth: chunkCount)
+    }
 
     if block.temporality == .static_ {
       if block.frameOrder.isParallel, let scale = threadCountScale {

@@ -157,6 +157,39 @@ extension LazyOp {
       // Side-effect op: mark as materialized so downstream seq chaining remains valid.
       ctx.values[nodeId] = .empty
 
+    case .chunkPartialsReduceToCell(
+      let targetCell, let M, let N, let chunkCount, let outputTransposed):
+      guard node.inputs.count == 1,
+        let partialTensorId = g.nodeToTensor[node.inputs[0]],
+        let partialTensor = g.tensors[partialTensorId]
+      else {
+        throw DGenError.tensorError(
+          op: "chunkPartialsReduceToCell", reason: "could not resolve partial tensor")
+      }
+
+      let partialCell = partialTensor.cellId
+      let elementCount = M * N
+      b.parallelRange(elementCount) { elemIdx in
+        let sum = b.float(0.0)
+        // Pass 2 reduction order is fixed [0..chunkCount), so this path is deterministic.
+        // One thread owns one output element and writes exactly once (no atomics).
+        b.loop(chunkCount) { chunkIdx in
+          let readPos = chunkIdx * b.intConstant(elementCount) + elemIdx
+          let val = b.memoryRead(partialCell, readPos)
+          sum.accumulate(val)
+        }
+        if outputTransposed {
+          let row = elemIdx / b.intConstant(N)
+          let col = elemIdx % b.intConstant(N)
+          let targetIdx = col * b.intConstant(M) + row
+          _ = b.memoryWrite(targetCell, targetIdx, sum.value)
+        } else {
+          _ = b.memoryWrite(targetCell, elemIdx, sum.value)
+        }
+      }
+
+      ctx.values[nodeId] = .empty
+
     case .historyWrite(let cellId):
       // Unified history write - handles both scalar and tensor based on cellToTensor mapping
       // historyWrite is pass-through: stores value AND outputs it for downstream use.

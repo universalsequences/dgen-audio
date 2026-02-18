@@ -48,6 +48,10 @@ public enum DispatchMode: Equatable {
   /// GEMM: 2D threadgroup grid, 32 threads per group (one SIMD group).
   /// tilesM × tilesN threadgroups, each handling one 8×8 output tile.
   case gemm(tilesM: Int, tilesN: Int)
+
+  /// GEMM with explicit dispatch depth (for chunked-frame reductions).
+  /// tilesM × tilesN × depth threadgroups, 32 threads per group.
+  case gemmFixedDepth(tilesM: Int, tilesN: Int, depth: Int)
 }
 
 extension DispatchMode {
@@ -59,6 +63,8 @@ extension DispatchMode {
     case .perFrameScaled(let n): return frameCount * max(1, n)
     case .fixedWithFrameLoop(let n), .staticThreads(let n): return max(1, n)
     case .gemm(let tilesM, let tilesN): return tilesM * tilesN * 32
+    case .gemmFixedDepth(let tilesM, let tilesN, let depth):
+      return max(1, tilesM) * max(1, tilesN) * max(1, depth) * 32
     }
   }
 
@@ -66,7 +72,8 @@ extension DispatchMode {
   var hasRendererFrameLoop: Bool {
     switch self {
     case .singleThreaded, .fixedWithFrameLoop: return true
-    case .perFrame, .perFrameThreadgroup1, .perFrameScaled, .staticThreads, .selfManaged, .gemm:
+    case .perFrame, .perFrameThreadgroup1, .perFrameScaled, .staticThreads, .selfManaged, .gemm,
+      .gemmFixedDepth:
       return false
     }
   }
@@ -75,7 +82,7 @@ extension DispatchMode {
   var threadGroupSize: Int? {
     switch self {
     case .singleThreaded, .selfManaged, .perFrameThreadgroup1: return 1
-    case .gemm: return 32
+    case .gemm, .gemmFixedDepth: return 32
     default: return nil
     }
   }

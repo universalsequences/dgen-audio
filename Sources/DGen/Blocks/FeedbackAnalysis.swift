@@ -252,6 +252,9 @@ public func findSequentialNodes(_ g: Graph, feedbackClusters: [[NodeID]], backen
     case .gemmReduceToCell(_, _, _, _, _, _):
       // Fused GEMM frame-reduction is explicitly parallel and should not be scalarized.
       simdSafe.insert($0.id)
+    case .chunkPartialsReduceToCell(_, _, _, _, _):
+      // Deterministic chunk reduction maps one thread per output element.
+      simdSafe.insert($0.id)
     default: break
     }
   }

@@ -156,6 +156,12 @@ public enum LazyOp {
   // Deterministic fused cross-frame reduction for gemm outputs:
   // computes sum_f(gemm_f) directly into target cell (no atomic accumulation order variance).
   case gemmReduceToCell(Int, Int, Int, Bool, Bool, CellID)  // (M, N, K, transA, transB, targetCell)
+  // Two-pass deterministic cross-frame GEMM reduction:
+  // 1) chunked GEMM writes partial sums [chunkCount, M, N]
+  // 2) chunk reduction accumulates those partials into target cell.
+  // Triggered by GEMMPass when matching tensorAccumulate(view* -> gemm(...)).
+  case gemmChunkPartials(Int, Int, Int, Bool, Bool, Int, Int)  // (M, N, K, transA, transB, chunkSize, chunkCount)
+  case chunkPartialsReduceToCell(CellID, Int, Int, Int, Bool)  // (targetCell, M, N, chunkCount, outputTransposed)
   case historyWrite(CellID)
   case historyReadWrite(CellID)
   case param(CellID)
