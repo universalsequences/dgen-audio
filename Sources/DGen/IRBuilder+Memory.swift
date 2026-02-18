@@ -177,6 +177,34 @@ extension IRBuilder {
     fatalError("no tape")
   }
 
+  // MARK: - Threadgroup Scratch Memory
+
+  /// Declare a threadgroup scratch array of the given size. Returns a scratch ID
+  /// for use with `scratchRead` and `scratchWrite`.
+  public func threadgroupScratch(_ size: Int) -> Int {
+    let id = nextScratchId
+    nextScratchId += 1
+    ops.append(UOp(op: .threadgroupArrayDecl(scratchId: id, size: size), value: .empty))
+    return id
+  }
+
+  /// Read from a threadgroup scratch array at the given offset.
+  public func scratchRead(_ scratchId: Int, _ offset: Expr) -> Expr {
+    let dest = ctx.useVariable(src: nodeId)
+    let uop = UOp(op: .threadgroupRead(scratchId: scratchId, offset.lazy), value: dest)
+    ops.append(uop)
+    return value(dest)
+  }
+
+  /// Write a value to a threadgroup scratch array at the given offset.
+  @discardableResult
+  public func scratchWrite(_ scratchId: Int, _ offset: Expr, _ value: Expr) -> Expr {
+    let dest = ctx.useVariable(src: nodeId)
+    let uop = UOp(op: .threadgroupWrite(scratchId: scratchId, offset.lazy, value.lazy), value: dest)
+    ops.append(uop)
+    return self.value(dest)
+  }
+
   // MARK: - Threadgroup Position
 
   /// The threadgroup's X position in the dispatch grid (column tile index).

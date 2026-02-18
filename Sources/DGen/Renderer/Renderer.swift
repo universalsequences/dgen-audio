@@ -42,6 +42,9 @@ public enum DispatchMode: Equatable {
   /// 1 thread, no frame loop — block has its own loops (BPTT)
   case selfManaged
 
+  /// frameCount threads, threadGroupSize=1 (for kernels using threadgroup scratch memory)
+  case perFrameThreadgroup1
+
   /// GEMM: 2D threadgroup grid, 32 threads per group (one SIMD group).
   /// tilesM × tilesN threadgroups, each handling one 8×8 output tile.
   case gemm(tilesM: Int, tilesN: Int)
@@ -52,7 +55,7 @@ extension DispatchMode {
   func threadCount(frameCount: Int) -> Int {
     switch self {
     case .singleThreaded, .selfManaged: return 1
-    case .perFrame: return frameCount
+    case .perFrame, .perFrameThreadgroup1: return frameCount
     case .perFrameScaled(let n): return frameCount * max(1, n)
     case .fixedWithFrameLoop(let n), .staticThreads(let n): return max(1, n)
     case .gemm(let tilesM, let tilesN): return tilesM * tilesN * 32
@@ -63,14 +66,15 @@ extension DispatchMode {
   var hasRendererFrameLoop: Bool {
     switch self {
     case .singleThreaded, .fixedWithFrameLoop: return true
-    case .perFrame, .perFrameScaled, .staticThreads, .selfManaged, .gemm: return false
+    case .perFrame, .perFrameThreadgroup1, .perFrameScaled, .staticThreads, .selfManaged, .gemm:
+      return false
     }
   }
 
   /// Thread group size hint (1 for single-thread kernels, nil for runtime-determined)
   var threadGroupSize: Int? {
     switch self {
-    case .singleThreaded, .selfManaged: return 1
+    case .singleThreaded, .selfManaged, .perFrameThreadgroup1: return 1
     case .gemm: return 32
     default: return nil
     }

@@ -4,6 +4,7 @@ public final class IRBuilder {
   public let ctx: IRContext
   public let nodeId: NodeID
   public var ops: [UOp] = []
+  var nextScratchId: Int = 0
 
   public init(ctx: IRContext, nodeId: NodeID) {
     self.ctx = ctx

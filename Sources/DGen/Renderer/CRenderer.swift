@@ -992,6 +992,16 @@ public class CRenderer: Renderer {
     case .endHopCheck:
       return "}"
 
+    // Threadgroup shared memory (stack arrays on CPU)
+    case .threadgroupArrayDecl(let scratchId, let size):
+      return "float scratch_\(scratchId)[\(size)];"
+    case .threadgroupRead(let scratchId, let offset):
+      let cast = isIntTypedOffset(offset) ? "" : "(int)"
+      return emitAssign(uop, "scratch_\(scratchId)[\(cast)\(g(offset))]", ctx)
+    case .threadgroupWrite(let scratchId, let offset, let value):
+      let cast = isIntTypedOffset(offset) ? "" : "(int)"
+      return "scratch_\(scratchId)[\(cast)\(g(offset))] = \(g(value));"
+
     default:
       return "/* \(uop.prettyDescription()) */"
     }

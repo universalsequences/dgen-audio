@@ -5,8 +5,9 @@ extension LazyOp {
     switch self {
     case .spectralLossFFT(
       let windowSize, _, _,
-      let fft1Cell, let fft2Cell, let mag1Cell, let mag2Cell, let scratchCell):
+      let fft1Cell, let fft2Cell, let mag1Cell, let mag2Cell, _):
       // FFT-based spectral loss: forward pass (SIMD-parallel across frames)
+      // Uses threadgroup shared memory for butterfly stages (~25-50x faster than device).
       // Precomputed tables (Hann, twiddle, bit-reversal) are passed as tensor inputs.
       guard inputs.count >= 6 else {
         throw DGenError.insufficientInputs(
@@ -22,11 +23,10 @@ extension LazyOp {
       let numBins = windowSize / 2 + 1
       let numStages = Int(log2(Double(windowSize)))
       let fftSize = windowSize * 2  // real + imag
-      let imagOffset = windowSize  // Scratch layout: real[0..<N], imag[N..<2N]
+      let imagOffset = windowSize  // Device layout: real[0..<N], imag[N..<2N]
 
       let sig1 = b.value(inputs[0])
       let sig2 = b.value(inputs[1])
-      // inputs[2..5] are precomputed tensor refs (hann, twRe, twIm, bitRev)
       let hannCellId = tensorCellId(node.inputs[2])
       let twReCellId = tensorCellId(node.inputs[3])
       let twImCellId = tensorCellId(node.inputs[4])
@@ -35,44 +35,47 @@ extension LazyOp {
       let winSizeFloat = b.constant(Float(windowSize))
       let zero = b.constant(0.0)
       let one = b.constant(1.0)
-      // Use logical frame index (respects setFrameIndex in scaled-thread kernels).
       let frameIdx = b.frameIndex()
 
-      // Per-frame base offsets for thread-local scratch memory (integer to avoid float32 precision loss)
+      // Per-frame base offsets for device memory (integer to avoid float32 precision loss)
       let fftBaseOffset = frameIdx * b.intConstant(fftSize)
       let magBaseOffset = frameIdx * b.intConstant(numBins)
 
-      // Optional hop gating: when a hop counter input is present, execute only on counter==0 frames.
-      // Keep computation in a single if-block to preserve scalar-mode lowering in nested loops.
+      // Threadgroup scratch arrays for FFT butterflies (on-chip SRAM, ~2-4 cycle latency).
+      // Reused sequentially for both signals.
+      // Budget: scratchRe(N) + scratchIm(N) + twRe(N-1) + twIm(N-1) = 4N-2 floats.
+      // N=2048 → 32760 bytes < 32KB limit. Hann/bitrev stay in device (O(N) reads, negligible).
+      let scratchRe = b.threadgroupScratch(windowSize)
+      let scratchIm = b.threadgroupScratch(windowSize)
+      // Twiddle factors loaded from device once, then read from scratch during butterflies
+      let scratchTwRe = b.threadgroupScratch(windowSize - 1)
+      let scratchTwIm = b.threadgroupScratch(windowSize - 1)
+
       let shouldRun = hopCounter.map { $0 == zero } ?? (one > zero)
       let loss = b.float(0.0)
       b.if_(shouldRun) {
-        // 1. Load windowed samples into per-frame FFT scratch cells
-        // Read Hann coefficients from precomputed tensor
-        b.parallelRange(windowSize) { n in
-          let nInt = n
-          let nFloat = b.cast(nInt, to: .float)
-          let w = b.memoryRead(hannCellId, nInt)
-
-          // Load from tape: samples at position frameIdx - windowSize + 1 + n
-          let j = b.cast(frameIdx, to: .float) - (winSizeFloat - one) + nFloat
-
-          let s1 = b.tapeLoad(sig1, at: j)
-          let s2 = b.tapeLoad(sig2, at: j)
-
-          // Store in per-frame scratch: baseOffset + index (all int arithmetic)
-          let imagOff = b.intConstant(imagOffset)
-          _ = b.memoryWrite(fft1Cell, fftBaseOffset + nInt, s1 * w)
-          _ = b.memoryWrite(fft1Cell, fftBaseOffset + nInt + imagOff, zero)
-          _ = b.memoryWrite(fft2Cell, fftBaseOffset + nInt, s2 * w)
-          _ = b.memoryWrite(fft2Cell, fftBaseOffset + nInt + imagOff, zero)
+        // Load twiddle tables from device → scratch (once for both signals)
+        let twiddleSize = windowSize - 1
+        b.loop(twiddleSize) { n in
+          let nInt = b.cast(n, to: .int)
+          b.scratchWrite(scratchTwRe, nInt, b.memoryRead(twReCellId, nInt))
+          b.scratchWrite(scratchTwIm, nInt, b.memoryRead(twImCellId, nInt))
         }
 
-        // 3. In-place FFT via Cooley-Tukey (per-frame scratch)
-        func emitFFTInPlace(_ fftCell: CellID, _ baseOffset: Expr) {
-          let imagOff = b.intConstant(imagOffset)
+        // Helper: FFT one signal in scratch, copy result to device, compute magnitude
+        func emitFFTInScratch(signal: Expr, fftCell: CellID, magCell: CellID) {
+          // 1. Load windowed samples into scratch (Hann read from device — O(N), negligible)
+          b.loop(windowSize) { n in
+            let nInt = b.cast(n, to: .int)
+            let nFloat = b.cast(n, to: .float)
+            let w = b.memoryRead(hannCellId, nInt)
+            let j = b.cast(frameIdx, to: .float) - (winSizeFloat - one) + nFloat
+            let s = b.tapeLoad(signal, at: j)
+            b.scratchWrite(scratchRe, nInt, s * w)
+            b.scratchWrite(scratchIm, nInt, zero)
+          }
 
-          // Bit-reversal permutation using precomputed table
+          // 2. Bit-reversal permutation in scratch (bitrev indices from device — O(N), negligible)
           b.loop(windowSize) { i in
             let iInt = b.cast(i, to: .int)
             let rev = b.memoryRead(bitRevCellId, iInt)
@@ -80,30 +83,30 @@ extension LazyOp {
             let shouldSwap = iFloat < rev
             let revInt = b.cast(rev, to: .int)
 
-            let tempRealI = b.memoryRead(fftCell, baseOffset + iInt)
-            let tempImagI = b.memoryRead(fftCell, baseOffset + iInt + imagOff)
-            let tempRealRev = b.memoryRead(fftCell, baseOffset + revInt)
-            let tempImagRev = b.memoryRead(fftCell, baseOffset + revInt + imagOff)
+            let tempReI = b.scratchRead(scratchRe, iInt)
+            let tempImI = b.scratchRead(scratchIm, iInt)
+            let tempReRev = b.scratchRead(scratchRe, revInt)
+            let tempImRev = b.scratchRead(scratchIm, revInt)
 
-            let newRealI = b.gswitch(shouldSwap, tempRealRev, tempRealI)
-            let newImagI = b.gswitch(shouldSwap, tempImagRev, tempImagI)
-            let newRealRev = b.gswitch(shouldSwap, tempRealI, tempRealRev)
-            let newImagRev = b.gswitch(shouldSwap, tempImagI, tempImagRev)
+            let newReI = b.gswitch(shouldSwap, tempReRev, tempReI)
+            let newImI = b.gswitch(shouldSwap, tempImRev, tempImI)
+            let newReRev = b.gswitch(shouldSwap, tempReI, tempReRev)
+            let newImRev = b.gswitch(shouldSwap, tempImI, tempImRev)
 
-            _ = b.memoryWrite(fftCell, baseOffset + iInt, newRealI)
-            _ = b.memoryWrite(fftCell, baseOffset + iInt + imagOff, newImagI)
-            _ = b.memoryWrite(fftCell, baseOffset + revInt, newRealRev)
-            _ = b.memoryWrite(fftCell, baseOffset + revInt + imagOff, newImagRev)
+            b.scratchWrite(scratchRe, iInt, newReI)
+            b.scratchWrite(scratchIm, iInt, newImI)
+            b.scratchWrite(scratchRe, revInt, newReRev)
+            b.scratchWrite(scratchIm, revInt, newImRev)
           }
 
-          // Butterfly stages using precomputed twiddle factors
+          // 3. Butterfly stages entirely in scratch (all reads from threadgroup SRAM)
           for stage in 0..<numStages {
             let butterflySize = 1 << (stage + 1)
             let halfSize = butterflySize / 2
             let numGroups = windowSize / butterflySize
             let numButterflies = numGroups * halfSize
 
-            b.parallelRange(numButterflies) { flatIdx in
+            b.loop(numButterflies) { flatIdx in
               let flatFloat = b.cast(flatIdx, to: .float)
               let halfSizeFloat = b.constant(Float(halfSize))
               let butterflySizeFloat = b.constant(Float(butterflySize))
@@ -114,61 +117,59 @@ extension LazyOp {
               let i = group * butterflySizeFloat + k
               let j = i + halfSizeFloat
 
-              // Read precomputed twiddle: offset = halfSize - 1, index = offset + k
               let twiddleOffset = b.intConstant(halfSize - 1)
               let kInt = b.cast(k, to: .int)
               let twiddleIdx = twiddleOffset + kInt
-              let wr = b.memoryRead(twReCellId, twiddleIdx)
-              let wi = zero - b.memoryRead(twImCellId, twiddleIdx)  // negate for forward FFT
+              let wr = b.scratchRead(scratchTwRe, twiddleIdx)
+              let wi = zero - b.scratchRead(scratchTwIm, twiddleIdx)  // negate for forward FFT
 
               let iInt = b.cast(i, to: .int)
               let jInt = b.cast(j, to: .int)
 
-              let ar = b.memoryRead(fftCell, baseOffset + iInt)
-              let ai = b.memoryRead(fftCell, baseOffset + iInt + imagOff)
-              let br = b.memoryRead(fftCell, baseOffset + jInt)
-              let bi = b.memoryRead(fftCell, baseOffset + jInt + imagOff)
+              let ar = b.scratchRead(scratchRe, iInt)
+              let ai = b.scratchRead(scratchIm, iInt)
+              let br = b.scratchRead(scratchRe, jInt)
+              let bi = b.scratchRead(scratchIm, jInt)
 
               let tr = wr * br - wi * bi
               let ti = wr * bi + wi * br
 
-              _ = b.memoryWrite(fftCell, baseOffset + iInt, ar + tr)
-              _ = b.memoryWrite(fftCell, baseOffset + iInt + imagOff, ai + ti)
-              _ = b.memoryWrite(fftCell, baseOffset + jInt, ar - tr)
-              _ = b.memoryWrite(fftCell, baseOffset + jInt + imagOff, ai - ti)
+              b.scratchWrite(scratchRe, iInt, ar + tr)
+              b.scratchWrite(scratchIm, iInt, ai + ti)
+              b.scratchWrite(scratchRe, jInt, ar - tr)
+              b.scratchWrite(scratchIm, jInt, ai - ti)
             }
+          }
+
+          // 4. Copy FFT result to device (for downstream GradSpec) + compute magnitudes
+          let imagOff = b.intConstant(imagOffset)
+          b.loop(windowSize) { n in
+            let nInt = b.cast(n, to: .int)
+            let re = b.scratchRead(scratchRe, nInt)
+            let im = b.scratchRead(scratchIm, nInt)
+            _ = b.memoryWrite(fftCell, fftBaseOffset + nInt, re)
+            _ = b.memoryWrite(fftCell, fftBaseOffset + nInt + imagOff, im)
+          }
+          b.loop(numBins) { k in
+            let kInt = b.cast(k, to: .int)
+            let re = b.scratchRead(scratchRe, kInt)
+            let im = b.scratchRead(scratchIm, kInt)
+            let mag = b.sqrt(re * re + im * im)
+            _ = b.memoryWrite(magCell, magBaseOffset + kInt, mag)
           }
         }
 
-        // Apply FFT to both cells with per-frame offsets
-        emitFFTInPlace(fft1Cell, fftBaseOffset)
-        emitFFTInPlace(fft2Cell, fftBaseOffset)
+        // Process both signals sequentially (scratch arrays reused)
+        emitFFTInScratch(signal: sig1, fftCell: fft1Cell, magCell: mag1Cell)
+        emitFFTInScratch(signal: sig2, fftCell: fft2Cell, magCell: mag2Cell)
 
-        // 4. Compute magnitudes and store in per-frame storage
-        b.parallelRange(numBins) { k in
-          let kInt = b.cast(k, to: .int)
-          let imagOff = b.intConstant(imagOffset)
-
-          let real1 = b.memoryRead(fft1Cell, fftBaseOffset + kInt)
-          let imag1 = b.memoryRead(fft1Cell, fftBaseOffset + kInt + imagOff)
-          let mag1 = b.sqrt(real1 * real1 + imag1 * imag1)
-          _ = b.memoryWrite(mag1Cell, magBaseOffset + kInt, mag1)
-
-          let real2 = b.memoryRead(fft2Cell, fftBaseOffset + kInt)
-          let imag2 = b.memoryRead(fft2Cell, fftBaseOffset + kInt + imagOff)
-          let mag2 = b.sqrt(real2 * real2 + imag2 * imag2)
-          _ = b.memoryWrite(mag2Cell, magBaseOffset + kInt, mag2)
-
-          // Store squared difference in per-frame scratch
-          let diff = mag1 - mag2
-          _ = b.memoryWrite(scratchCell, magBaseOffset + kInt, diff * diff)
-        }
-
-        // 5. Sequential reduction of loss
+        // 5. Compute loss: sum of squared magnitude differences
         b.loop(numBins) { k in
           let kInt = b.cast(k, to: .int)
-          let diffSq = b.memoryRead(scratchCell, magBaseOffset + kInt)
-          loss.accumulate(diffSq)
+          let mag1 = b.memoryRead(mag1Cell, magBaseOffset + kInt)
+          let mag2 = b.memoryRead(mag2Cell, magBaseOffset + kInt)
+          let diff = mag1 - mag2
+          loss.accumulate(diff * diff)
         }
       }
 
@@ -259,6 +260,7 @@ extension LazyOp {
       let windowSize, let gradSpec1Cell, let gradSpec2Cell,
       let gradTime1Cell, let gradTime2Cell, let windowCell):
       // IFFT to scatter frequency-domain gradients back to time domain (frame-aware)
+      // Uses threadgroup shared memory for butterfly stages (~25-50x faster than device).
       // Then multiply by window coefficients for Hann backprop
       // Inputs: [gradSpec, twReNode, twImNode, bitRevNode, ?hopCounter]
       guard inputs.count >= 4 else {
@@ -279,7 +281,6 @@ extension LazyOp {
       let fftSize = windowSize * 2
       let numStages = Int(log2(Double(windowSize)))
       let imagOffset = windowSize
-      // Scale by 1/(N * numBins) to match GradInline normalization
       let numBins = windowSize / 2 + 1
       let invNBins = b.constant(1.0 / Float(windowSize * numBins))
       let zero = b.constant(0.0)
@@ -292,13 +293,37 @@ extension LazyOp {
       let gradTimeBase = frameIdx * b.intConstant(windowSize)
       let imagOff = b.intConstant(imagOffset)
 
-      // Force scalar mode (same pattern as forward FFT), with optional hop gating.
+      // Threadgroup scratch arrays for IFFT butterflies (reused for both signals)
+      // Budget: scratchRe(N) + scratchIm(N) + twRe(N-1) + twIm(N-1) = 4N-2 floats.
+      // N=2048 → 32760 bytes < 32KB limit. Bitrev/window stay in device (O(N) reads, negligible).
+      let scratchRe = b.threadgroupScratch(windowSize)
+      let scratchIm = b.threadgroupScratch(windowSize)
+      // Twiddle factors loaded from device once, then read from scratch during butterflies
+      let scratchTwRe = b.threadgroupScratch(windowSize - 1)
+      let scratchTwIm = b.threadgroupScratch(windowSize - 1)
+
       let shouldRun = hopCounter.map { $0 == zero } ?? (one > zero)
       b.if_(shouldRun) {
+        // Load twiddle tables from device → scratch (once for both signals)
+        let twiddleSize = windowSize - 1
+        b.loop(twiddleSize) { n in
+          let nInt = b.cast(n, to: .int)
+          b.scratchWrite(scratchTwRe, nInt, b.memoryRead(twReCellId, nInt))
+          b.scratchWrite(scratchTwIm, nInt, b.memoryRead(twImCellId, nInt))
+        }
 
-        // Helper function to emit IFFT for a single gradient spectrum cell
-        func emitIFFTInPlace(_ gradSpecCell: CellID, _ gradTimeCell: CellID) {
-          // Bit-reversal permutation using precomputed table
+        // Helper: IFFT one gradient spectrum in scratch, scale+window → device
+        func emitIFFTInScratch(_ gradSpecCell: CellID, _ gradTimeCell: CellID) {
+          // 1. Load gradient spectrum from device into scratch
+          b.loop(windowSize) { n in
+            let nInt = b.cast(n, to: .int)
+            let re = b.memoryRead(gradSpecCell, gradSpecBase + nInt)
+            let im = b.memoryRead(gradSpecCell, gradSpecBase + nInt + imagOff)
+            b.scratchWrite(scratchRe, nInt, re)
+            b.scratchWrite(scratchIm, nInt, im)
+          }
+
+          // 2. Bit-reversal permutation in scratch (bitrev indices from device — O(N), negligible)
           b.loop(windowSize) { i in
             let iInt = b.cast(i, to: .int)
             let rev = b.memoryRead(bitRevCellId, iInt)
@@ -306,30 +331,30 @@ extension LazyOp {
             let shouldSwap = iFloat < rev
             let revInt = b.cast(rev, to: .int)
 
-            let tempR = b.memoryRead(gradSpecCell, gradSpecBase + iInt)
-            let tempI = b.memoryRead(gradSpecCell, gradSpecBase + iInt + imagOff)
-            let revR = b.memoryRead(gradSpecCell, gradSpecBase + revInt)
-            let revI = b.memoryRead(gradSpecCell, gradSpecBase + revInt + imagOff)
+            let tempR = b.scratchRead(scratchRe, iInt)
+            let tempI = b.scratchRead(scratchIm, iInt)
+            let revR = b.scratchRead(scratchRe, revInt)
+            let revI = b.scratchRead(scratchIm, revInt)
 
             let newIR = b.gswitch(shouldSwap, revR, tempR)
             let newII = b.gswitch(shouldSwap, revI, tempI)
             let newRevR = b.gswitch(shouldSwap, tempR, revR)
             let newRevI = b.gswitch(shouldSwap, tempI, revI)
 
-            _ = b.memoryWrite(gradSpecCell, gradSpecBase + iInt, newIR)
-            _ = b.memoryWrite(gradSpecCell, gradSpecBase + iInt + imagOff, newII)
-            _ = b.memoryWrite(gradSpecCell, gradSpecBase + revInt, newRevR)
-            _ = b.memoryWrite(gradSpecCell, gradSpecBase + revInt + imagOff, newRevI)
+            b.scratchWrite(scratchRe, iInt, newIR)
+            b.scratchWrite(scratchIm, iInt, newII)
+            b.scratchWrite(scratchRe, revInt, newRevR)
+            b.scratchWrite(scratchIm, revInt, newRevI)
           }
 
-          // Butterfly stages with POSITIVE twiddle (IFFT) from precomputed table
+          // 3. Butterfly stages entirely in scratch with POSITIVE twiddle (IFFT)
           var butterflySize = 2
           for _ in 0..<numStages {
             let halfSize = butterflySize / 2
             let numGroups = windowSize / butterflySize
             let numButterflies = numGroups * halfSize
 
-            b.parallelRange(numButterflies) { flatIdx in
+            b.loop(numButterflies) { flatIdx in
               let flatFloat = b.cast(flatIdx, to: .float)
               let halfSizeFloat = b.constant(Float(halfSize))
               let butterflySizeFloat = b.constant(Float(butterflySize))
@@ -340,45 +365,43 @@ extension LazyOp {
               let i = group * butterflySizeFloat + k
               let j = i + halfSizeFloat
 
-              // Read precomputed twiddle: positive convention (no negation for IFFT)
               let twiddleOffset = b.intConstant(halfSize - 1)
               let kInt = b.cast(k, to: .int)
               let twiddleIdx = twiddleOffset + kInt
-              let wr = b.memoryRead(twReCellId, twiddleIdx)
-              let wi = b.memoryRead(twImCellId, twiddleIdx)
+              let wr = b.scratchRead(scratchTwRe, twiddleIdx)
+              let wi = b.scratchRead(scratchTwIm, twiddleIdx)  // positive for IFFT
 
               let iInt = b.cast(i, to: .int)
               let jInt = b.cast(j, to: .int)
 
-              let ar = b.memoryRead(gradSpecCell, gradSpecBase + iInt)
-              let ai = b.memoryRead(gradSpecCell, gradSpecBase + iInt + imagOff)
-              let br = b.memoryRead(gradSpecCell, gradSpecBase + jInt)
-              let bi = b.memoryRead(gradSpecCell, gradSpecBase + jInt + imagOff)
+              let ar = b.scratchRead(scratchRe, iInt)
+              let ai = b.scratchRead(scratchIm, iInt)
+              let br = b.scratchRead(scratchRe, jInt)
+              let bi = b.scratchRead(scratchIm, jInt)
 
-              // Complex multiply and butterfly
               let tr = wr * br - wi * bi
               let ti = wr * bi + wi * br
 
-              _ = b.memoryWrite(gradSpecCell, gradSpecBase + iInt, ar + tr)
-              _ = b.memoryWrite(gradSpecCell, gradSpecBase + iInt + imagOff, ai + ti)
-              _ = b.memoryWrite(gradSpecCell, gradSpecBase + jInt, ar - tr)
-              _ = b.memoryWrite(gradSpecCell, gradSpecBase + jInt + imagOff, ai - ti)
+              b.scratchWrite(scratchRe, iInt, ar + tr)
+              b.scratchWrite(scratchIm, iInt, ai + ti)
+              b.scratchWrite(scratchRe, jInt, ar - tr)
+              b.scratchWrite(scratchIm, jInt, ai - ti)
             }
             butterflySize *= 2
           }
 
-          // Scale by 1/(N*numBins) and multiply by window (Hann backprop)
-          b.parallelRange(windowSize) { n in
+          // 4. Scale by 1/(N*numBins), multiply by window → write to device
+          b.loop(windowSize) { n in
             let nInt = b.cast(n, to: .int)
-            let realVal = b.memoryRead(gradSpecCell, gradSpecBase + nInt) * invNBins
+            let realVal = b.scratchRead(scratchRe, nInt) * invNBins
             let w = b.memoryRead(windowCell, nInt)
             _ = b.memoryWrite(gradTimeCell, gradTimeBase + nInt, realVal * w)
           }
         }
 
-        // Apply IFFT to both gradient cells
-        emitIFFTInPlace(gradSpec1Cell, gradTime1Cell)
-        emitIFFTInPlace(gradSpec2Cell, gradTime2Cell)
+        // Apply IFFT to both gradient cells (scratch reused sequentially)
+        emitIFFTInScratch(gradSpec1Cell, gradTime1Cell)
+        emitIFFTInScratch(gradSpec2Cell, gradTime2Cell)
 
       }  // end b.if_(shouldRun)
 
@@ -386,7 +409,7 @@ extension LazyOp {
       // grad-read kernels don't see stale values from previous runs.
       if let hopCounter {
         b.if_(hopCounter > zero) {
-          b.parallelRange(windowSize) { n in
+          b.loop(windowSize) { n in
             let nInt = b.cast(n, to: .int)
             _ = b.memoryWrite(gradTime1Cell, gradTimeBase + nInt, zero)
             _ = b.memoryWrite(gradTime2Cell, gradTimeBase + nInt, zero)

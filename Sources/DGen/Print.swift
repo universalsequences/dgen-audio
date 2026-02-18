@@ -191,6 +191,12 @@ extension UOp {
             opStr = "\(ANSI.cyan)simdgroupStore\(ANSI.reset)(src=\(src), cell=\(cellId), offset=\(offset), stride=\(stride))"
         case let .simdgroupMultiplyAccumulate(a, b, acc):
             opStr = "\(ANSI.cyan)simdgroupMAD\(ANSI.reset)(\(a), \(b), acc=\(acc))"
+        case let .threadgroupArrayDecl(scratchId, size):
+            opStr = "\(ANSI.cyan)threadgroupArrayDecl\(ANSI.reset)(scratch=\(scratchId), size=\(size))"
+        case let .threadgroupRead(scratchId, offset):
+            opStr = "\(ANSI.cyan)threadgroupRead\(ANSI.reset)(scratch=\(scratchId), \(offset))"
+        case let .threadgroupWrite(scratchId, offset, value):
+            opStr = "\(ANSI.cyan)threadgroupWrite\(ANSI.reset)(scratch=\(scratchId), \(offset), \(value))"
         }
 
         return "\(ANSI.bold)UOp\(ANSI.reset)(op: \(opStr), value: \(value))"

@@ -107,6 +107,11 @@ public enum Op {
   case simdgroupStore(Lazy, CellID, Lazy, Int)  // simdgroup_store(src, memory[cell] + offset, stride)
   case simdgroupMultiplyAccumulate(Lazy, Lazy, Lazy)  // acc = a * b + acc
 
+  // Threadgroup shared memory (on-chip SRAM for FFT scratch)
+  case threadgroupArrayDecl(scratchId: Int, size: Int)  // declare threadgroup float scratch_N[size]
+  case threadgroupRead(scratchId: Int, Lazy)    // read scratch_N[offset]
+  case threadgroupWrite(scratchId: Int, Lazy, Lazy)   // scratch_N[offset] = value
+
   public var isDefineGlobal: Bool {
     if case .defineGlobal = self { return true }
     return false
@@ -187,6 +192,9 @@ public enum Op {
     case .simdgroupStore(let src, let c, let o, let s): return .simdgroupStore(r(src), c, r(o), s)
     case .simdgroupMultiplyAccumulate(let a, let b, let acc):
       return .simdgroupMultiplyAccumulate(r(a), r(b), r(acc))
+    case .threadgroupRead(let id, let offset): return .threadgroupRead(scratchId: id, r(offset))
+    case .threadgroupWrite(let id, let offset, let value):
+      return .threadgroupWrite(scratchId: id, r(offset), r(value))
     default: return self  // ops without Lazy inputs (load, endLoop, frameIndex, etc.)
     }
   }

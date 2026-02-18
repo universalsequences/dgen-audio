@@ -16,6 +16,8 @@ public class MetalRenderer: Renderer, UOpEmitter {
   private var currentThreadCountScale: Int? = nil
   private var currentThreadCountOverride: Int? = nil
   private var isGemmKernel: Bool = false
+  /// Kernel uses threadgroup scratch (threadGroupSize=1) — skip device memory fences
+  private var usesThreadgroupScratch: Bool = false
   /// Track scalarType of emitted UOps by their VarID for offset type lookups
   private var varScalarTypes: [VarID: CastType] = [:]
 
@@ -114,9 +116,19 @@ public class MetalRenderer: Renderer, UOpEmitter {
       }
 
       // If splitStaticParallelRanges produced a thread count, override to staticThreads(N).
-      let finalDispatchMode =
+      var finalDispatchMode =
         parallelCount.map { DispatchMode.staticThreads($0) }
         ?? scheduleItem.dispatchMode
+
+      // FFT kernels using threadgroup scratch need threadGroupSize=1 so each thread
+      // gets its own on-chip scratch arrays (no sharing between threads).
+      let usesThreadgroupScratch = scheduleItem.ops.contains {
+        if case .threadgroupArrayDecl = $0.op { return true }
+        return false
+      }
+      if usesThreadgroupScratch {
+        finalDispatchMode = .perFrameThreadgroup1
+      }
 
       return CompiledKernel(
         name: kernelName,
@@ -627,7 +639,7 @@ public class MetalRenderer: Renderer, UOpEmitter {
         scheduleItem.ops.append(beginLoop)
         hasFrameLoop = true
 
-      case .perFrame:
+      case .perFrame, .perFrameThreadgroup1:
         // SIMD kernels: each thread processes one frame
         let beginRange = UOp(op: .beginRange(.constant(0, 0), frameCountUOp), value: .empty)
         scheduleItem.ops.append(beginRange)
@@ -698,6 +710,10 @@ public class MetalRenderer: Renderer, UOpEmitter {
       if case .gemm = scheduleItem.dispatchMode { return true }
       return false
     }()
+    usesThreadgroupScratch = scheduleItem.ops.contains {
+      if case .threadgroupArrayDecl = $0.op { return true }
+      return false
+    }
     let (inputs, outputs) = analyzeDependencies(scheduleItem: scheduleItem, ctx: ctx)
 
     let allBuffers = Set(inputs + outputs)
@@ -1036,6 +1052,11 @@ public class MetalRenderer: Renderer, UOpEmitter {
       }
       return "for (uint t\(varId) = 0; t\(varId) < \(countStr); t\(varId)++) {"
     case .endLoop:
+      // Skip device memory fence for threadgroup scratch kernels (threadGroupSize=1,
+      // single thread per threadgroup — no cross-thread synchronization needed)
+      if usesThreadgroupScratch {
+        return "}"
+      }
       return "} atomic_thread_fence(metal::mem_flags::mem_device, metal::memory_order_seq_cst);"
 
     case .threadIndex:
@@ -1158,6 +1179,16 @@ public class MetalRenderer: Renderer, UOpEmitter {
         "metal::simdgroup_store(\(g(src)), &memory[\(cellId) + \(cast)\(g(offset))], \(stride));"
     case .simdgroupMultiplyAccumulate(let a, let b, let acc):
       return "metal::simdgroup_multiply_accumulate(\(g(acc)), \(g(a)), \(g(b)), \(g(acc)));"
+
+    // Threadgroup shared memory (on-chip SRAM for FFT scratch)
+    case .threadgroupArrayDecl(let scratchId, let size):
+      return "threadgroup float scratch_\(scratchId)[\(size)];"
+    case .threadgroupRead(let scratchId, let offset):
+      let cast = intCastPrefix(for: offset)
+      return emitAssign(uop, "scratch_\(scratchId)[\(cast)\(g(offset))]", ctx)
+    case .threadgroupWrite(let scratchId, let offset, let value):
+      let cast = intCastPrefix(for: offset)
+      return "scratch_\(scratchId)[\(cast)\(g(offset))] = \(g(value));"
 
     default:
       return "/* \(uop.prettyDescription()) */"
