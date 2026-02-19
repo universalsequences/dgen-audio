@@ -85,17 +85,33 @@ extension LazyOp {
       // Dispatch depth is chunkCount (set by scheduler), not frameCount.
       let runtimeFrameCount = b.cast(b.frameCount(), to: .int)
       let chunkBaseFrame = zIndex * b.intConstant(chunkSize)
-      b.loop(chunkSize) { localFrame in
-        let frameIdx = chunkBaseFrame + localFrame
-        // Final chunk may be partially full, so guard by runtime frameCount.
-        b.if_(frameIdx < runtimeFrameCount) {
-          let leftFrameBase =
-            ctx.frameAwareTensorCells.contains(leftCell)
-            ? frameIdx * b.intConstant(M * K) : b.intConstant(0)
-          let rightFrameBase =
-            ctx.frameAwareTensorCells.contains(rightCell)
-            ? frameIdx * b.intConstant(K * N) : b.intConstant(0)
-          emitTileMac(leftFrameBase: leftFrameBase, rightFrameBase: rightFrameBase)
+      let chunkEndFrame = chunkBaseFrame + b.intConstant(chunkSize)
+
+      func emitFrameMac(_ frameIdx: Expr) {
+        let leftFrameBase =
+          ctx.frameAwareTensorCells.contains(leftCell)
+          ? frameIdx * b.intConstant(M * K) : b.intConstant(0)
+        let rightFrameBase =
+          ctx.frameAwareTensorCells.contains(rightCell)
+          ? frameIdx * b.intConstant(K * N) : b.intConstant(0)
+        emitTileMac(leftFrameBase: leftFrameBase, rightFrameBase: rightFrameBase)
+      }
+
+      // Fast path: full chunk in bounds. Avoid per-frame branch in the hot loop.
+      b.if_(chunkEndFrame <= runtimeFrameCount) {
+        b.loop(chunkSize) { localFrame in
+          let frameIdx = chunkBaseFrame + localFrame
+          emitFrameMac(frameIdx)
+        }
+      }
+
+      // Tail path: only needed for the final partially-filled chunk.
+      b.if_(chunkEndFrame > runtimeFrameCount) {
+        b.loop(chunkSize) { localFrame in
+          let frameIdx = chunkBaseFrame + localFrame
+          b.if_(frameIdx < runtimeFrameCount) {
+            emitFrameMac(frameIdx)
+          }
         }
       }
 
