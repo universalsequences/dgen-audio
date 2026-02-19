@@ -34,7 +34,6 @@ extension Graph {
   public func computeGradients(loss: NodeID, targets: Set<NodeID>) -> [NodeID: NodeID] {
     var grads: [NodeID: NodeID] = [:]
     gradientSideEffects = []
-    accumulatedGradProxyCellByNode.removeAll()
 
     // Seed: gradient of loss w.r.t. itself = 1.0
     grads[loss] = n(.constant(1.0), [])
@@ -46,17 +45,14 @@ extension Graph {
         let node = nodes[nodeId]
       else { continue }
 
-      // Apply backward rule -> get gradient NodeIDs for inputs
-      // Also handles side effects like storing to gradient carry cells
       // For ops that store per-frame data in cells (like spectralLossFFT), the backward
       // pass needs to run AFTER the forward op. We sequence gradOutput with nodeId
       // to create this ordering dependency.
       let sequencedGrad: NodeID
-      if case .spectralLossFFT = node.op {
+      switch node.op {
+      case .spectralLossFFT, .spectralLossFFTBatched:
         sequencedGrad = n(.seq, [nodeId, upstreamGrad])
-      } else if case .spectralLossFFTBatched = node.op {
-        sequencedGrad = n(.seq, [nodeId, upstreamGrad])
-      } else {
+      default:
         sequencedGrad = upstreamGrad
       }
       let inputGrads = node.op.backward(graph: self, node: node, gradOutput: sequencedGrad)
@@ -66,20 +62,7 @@ extension Graph {
         guard let grad = grad else { continue }
 
         if let existing = grads[inputId] {
-          // Multiple paths contribute to this gradient.
-          // For accumulated grad proxies (same backing grad cell), chain with seq
-          // so we keep one read of the shared accumulated cell instead of adding
-          // two tensor reads (which double-counts and can explode kernel work).
-          if let existingCell = accumulatedGradProxyCellByNode[existing],
-            let newCell = accumulatedGradProxyCellByNode[grad],
-            existingCell == newCell
-          {
-            let merged = n(.seq, [existing, grad])
-            accumulatedGradProxyCellByNode[merged] = existingCell
-            grads[inputId] = merged
-          } else {
-            grads[inputId] = n(.add, [existing, grad])
-          }
+          grads[inputId] = n(.add, [existing, grad])
         } else {
           grads[inputId] = grad
         }

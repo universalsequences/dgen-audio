@@ -35,7 +35,6 @@ public enum DGenConfig {
 
     /// Enable buffer liveness analysis and reuse to reduce memory allocations
     public static var enableBufferReuse: Bool = true
-
 }
 
 // MARK: - Type Aliases for Convenience

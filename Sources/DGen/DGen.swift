@@ -63,11 +63,6 @@ open class Graph {
     /// These need to be chained with gradient outputs to ensure they execute.
     public var gradientSideEffects: [NodeID] = []
 
-    /// Tracks gradient proxy nodes that read from an accumulated gradient cell.
-    /// Used during backward graph construction to merge multiple contributions
-    /// from the same accumulation cell without emitting expensive tensor adds.
-    public var accumulatedGradProxyCellByNode: [NodeID: CellID] = [:]
-
     /// Last node ID before gradient nodes were added.
     /// Used to separate forward and gradient node ordering during compilation.
     public var lastForwardNodeId: NodeID?
