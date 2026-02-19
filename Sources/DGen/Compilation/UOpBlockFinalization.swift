@@ -117,6 +117,8 @@ extension UOpBlockFinalization {
         return .gemm(tilesM: M / 8, tilesN: N / 8)
       case .gemmChunkPartials(let M, let N, _, _, _, _, let chunkCount):
         return .gemm(tilesM: M / 8, tilesN: N / 8, depth: chunkCount)
+      case .gemmSmall(let M, let N, _, _, _):
+        return .perFrameScaled(M * N)
       default: continue
       }
     }

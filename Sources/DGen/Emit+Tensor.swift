@@ -336,6 +336,68 @@ extension LazyOp {
         _ = b.memoryWrite(outCell, colIdx, sumAcc.value)
       }
 
+    case .gemmSmall(let M, let N, let K, let transA, let transB):
+      guard node.inputs.count == 2,
+        let leftTensor = g.nodeToTensor[node.inputs[0]].flatMap({ g.tensors[$0] }),
+        let rightTensor = g.nodeToTensor[node.inputs[1]].flatMap({ g.tensors[$0] }),
+        let outCell = g.nodeToTensor[node.id].flatMap({ g.tensors[$0] })?.cellId,
+        let loopIdx = b.ctx.tensorIndices[node.id]
+      else {
+        throw DGenError.tensorError(op: "gemmSmall", reason: "invalid input")
+      }
+
+      let leftIsFrameAware = ctx.frameAwareTensorCells.contains(leftTensor.cellId)
+      let rightIsFrameAware = ctx.frameAwareTensorCells.contains(rightTensor.cellId)
+      let outIsFrameAware = ctx.frameAwareTensorCells.contains(outCell)
+      // Physical sizes: A is [M,K] or [K,M], B is [K,N] or [N,K]
+      let leftTensorSize = M * K
+      let rightTensorSize = K * N
+      let outTensorSize = M * N
+
+      // One thread per output element: elemIdx = m * N + n
+      let elemIdx = b.value(loopIdx, scalarType: .int)
+      let m = elemIdx / b.intConstant(N)
+      let n = elemIdx % b.intConstant(N)
+      let sumAcc = b.float(0.0)
+
+      func readGemmInput(_ tensor: Tensor, flatIdx: Expr, frameAware: Bool, tensorSize: Int) -> Expr
+      {
+        if tensor.padding != nil || !tensor.transforms.isEmpty {
+          // Fallback: use generic tensor read for complex views
+          return b.memoryRead(tensor.cellId, flatIdx)
+        }
+        if frameAware {
+          return b.frameAwareTensorRead(
+            cellId: tensor.cellId, tensorSize: tensorSize, elemIdx: flatIdx)
+        }
+        return b.memoryRead(tensor.cellId, flatIdx)
+      }
+
+      b.loop(K) { k in
+        // A[m,k]: stored as [M,K] (row-major) or transposed [K,M]
+        let aFlat: Expr = transA
+          ? k * b.intConstant(M) + m    // A stored as [K,M]
+          : m * b.intConstant(K) + k    // A stored as [M,K]
+        // B[k,n]: stored as [K,N] (row-major) or transposed [N,K]
+        let bFlat: Expr = transB
+          ? n * b.intConstant(K) + k    // B stored as [N,K]
+          : k * b.intConstant(N) + n    // B stored as [K,N]
+
+        let leftVal = readGemmInput(
+          leftTensor, flatIdx: aFlat, frameAware: leftIsFrameAware, tensorSize: leftTensorSize)
+        let rightVal = readGemmInput(
+          rightTensor, flatIdx: bFlat, frameAware: rightIsFrameAware, tensorSize: rightTensorSize)
+        sumAcc.accumulate(leftVal * rightVal)
+      }
+
+      let outFlat = m * b.intConstant(N) + n
+      if outIsFrameAware {
+        _ = b.frameAwareTensorWrite(
+          cellId: outCell, tensorSize: outTensorSize, elemIdx: outFlat, value: sumAcc.value)
+      } else {
+        _ = b.memoryWrite(outCell, outFlat, sumAcc.value)
+      }
+
     case .maxAxis(let axis):
       guard case .tensor(let inShape) = g.nodes[node.inputs[0]]?.shape,
         case .tensor(let outShape) = node.shape,

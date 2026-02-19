@@ -162,7 +162,7 @@ public func isReductionOp(_ op: LazyOp) -> Bool {
   switch op {
   case .sum, .tensorAccumulate, .peekRowGradReduce,
     .selectRowGradReduce, .peekGradReduce, .overlapAddGradGather, .bufferViewGradRead,
-    .sumMulAxis0, .chunkPartialsReduceToCell:
+    .sumMulAxis0, .gemmSmall, .chunkPartialsReduceToCell:
     return true
   default:
     return false
@@ -539,6 +539,17 @@ private func groupRegularTensorBlock(
       gemmBlock.nodes.append(nodeId)
       gemmBlock.shape = nil  // GEMM has its own dispatch, no shape-based threading
       grouped.append(gemmBlock)
+      currentBlock = makeTensorGroupingBlock(from: block)
+      currentShape = nil
+      continue
+    } else if case .gemmSmall(let M, let N, _, _, _) = node.op {
+      // gemmSmall uses perFrameScaled(M*N) dispatch — isolate into its own block
+      appendCurrentGroupingBlockIfNeeded(&currentBlock, grouped: &grouped)
+      var gemmSmallBlock = makeTensorGroupingBlock(from: block)
+      gemmSmallBlock.nodes.append(nodeId)
+      gemmSmallBlock.shape = [M, N]  // Shape drives tensorIndex assignment
+      gemmSmallBlock.tensorIndex = ctx.useVariable(src: nil)
+      grouped.append(gemmSmallBlock)
       currentBlock = makeTensorGroupingBlock(from: block)
       currentShape = nil
       continue

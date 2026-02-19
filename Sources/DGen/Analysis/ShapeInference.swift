@@ -229,6 +229,9 @@ public func inferShape(op: LazyOp, inputs: [ValueShape], graph: Graph) throws ->
   case .gemm(let M, let N, _, _, _):
     return .tensor([M, N])
 
+  case .gemmSmall(let M, let N, _, _, _):
+    return .tensor([M, N])
+
   case .gemmChunkPartials(let M, let N, _, _, _, _, let chunkCount):
     return .tensor([chunkCount, M, N])
 

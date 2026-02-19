@@ -160,14 +160,16 @@ public struct Expr {
       uop.value, ctx: lhs.ctx, nodeId: lhs.nodeId, builder: lhs.builder, scalarType: resultType)
   }
 
-  /// Emit a comparison UOp (always returns float, no type promotion)
+  /// Emit a comparison UOp. Preserves int type when both operands are int; otherwise float.
   private static func emitComparisonOp(
     _ lhs: Expr, _ rhs: Expr,
     thunk: (Lazy, Lazy) -> (IRContext, NodeID?) -> UOp
   ) -> Expr {
-    let uop = thunk(lhs.lazy, rhs.lazy)(lhs.ctx, nil)
+    var uop = thunk(lhs.lazy, rhs.lazy)(lhs.ctx, nil)
+    let resultType: CastType = (lhs.scalarType == .int && rhs.scalarType == .int) ? .int : .float
+    uop.scalarType = resultType
     lhs.builder.ops.append(uop)
-    return Expr(uop.value, ctx: lhs.ctx, nodeId: lhs.nodeId, builder: lhs.builder)
+    return Expr(uop.value, ctx: lhs.ctx, nodeId: lhs.nodeId, builder: lhs.builder, scalarType: resultType)
   }
 
   /// The constant value of this expression, or nil if not a compile-time constant.
@@ -193,14 +195,15 @@ public struct Expr {
   }
 
   /// Try constant folding for a comparison op; returns nil if either is not a constant.
-  /// Evaluates to 1.0 (true) or 0.0 (false) as a float-typed constant.
+  /// Evaluates to 1.0 (true) or 0.0 (false). Preserves int type when both operands are int.
   private static func foldComparison(
     _ lhs: Expr, _ rhs: Expr, op: (Float, Float) -> Bool
   ) -> Expr? {
     guard let lval = lhs.constantValue, let rval = rhs.constantValue else { return nil }
     let result: Float = op(lval, rval) ? 1.0 : 0.0
+    let resultType: CastType = (lhs.scalarType == .int && rhs.scalarType == .int) ? .int : .float
     let folded = lhs.ctx.useConstant(src: lhs.nodeId, value: result)
-    return Expr(folded, ctx: lhs.ctx, nodeId: lhs.nodeId, builder: lhs.builder)
+    return Expr(folded, ctx: lhs.ctx, nodeId: lhs.nodeId, builder: lhs.builder, scalarType: resultType)
   }
 
   /// Create a typed constant using the promoted type of two operands.

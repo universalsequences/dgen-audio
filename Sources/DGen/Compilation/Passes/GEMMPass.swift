@@ -46,9 +46,12 @@ extension GraphPrepPasses {
       return viewChainHasTranspose
     }
     if sourceShape == [expected[1], expected[0]] {
-      // Shapes are reversed — transpose detected by shape alone.
-      // View chain transpose would cancel it out (double-transpose = no transpose).
-      return !viewChainHasTranspose
+      // Shapes are reversed: physical is [N,K] while GEMM expects [K,N].
+      // GEMM reads directly from physical memory (bypassing the view chain), so it
+      // always needs transposed access to get the right element ordering, regardless
+      // of whether the view chain also had a transpose.
+      // Square matrices never reach here (they match Case 1 above).
+      return true
     }
     return nil
   }
@@ -126,25 +129,37 @@ extension GraphPrepPasses {
       let M = mulShape[axisM]
       let N = mulShape[axisN]
 
-      guard M % 8 == 0, N % 8 == 0, K % 8 == 0 else { continue }
+      let gemmAligned = M % 8 == 0 && N % 8 == 0 && K % 8 == 0
 
       // --- Forward pattern: identify left/right by broadcast size-1 dims ---
       //
       // Left (A) has size 1 along axisN, right (B) has size 1 along axisM.
       // If the roles are swapped, flip the input indices.
+      // Both inputs must be 3D for this matmul pattern to apply — a 1D or 2D
+      // input indicates plain broadcasting (e.g., [N] broadcast to [1,N,N]),
+      // not a matmul expand pattern, so skip those.
+      guard input0Shape.count == 3, input1Shape.count == 3 else { continue }
       let input0IsLeft = input0Shape[axisN] == 1 && input1Shape[axisM] == 1
       let input0IsRight = input0Shape[axisM] == 1 && input1Shape[axisN] == 1
       if input0IsLeft || input0IsRight {
         let leftInputIdx = input0IsLeft ? 0 : 1
         let rightInputIdx = 1 - leftInputIdx
 
-        let (leftSource, leftViewIds, _, _) = traceViewChain(
+        let (leftSource, leftViewIds, leftHasTranspose, _) = traceViewChain(
           from: mulNode.inputs[leftInputIdx], graph: graph)
-        let (rightSource, rightViewIds, _, _) = traceViewChain(
+        let (rightSource, rightViewIds, rightHasTranspose, _) = traceViewChain(
           from: mulNode.inputs[rightInputIdx], graph: graph)
 
-        graph.nodes[nodeId] = Node(
-          id: nodeId, op: .gemm(M, N, K, false, false), inputs: [leftSource, rightSource])
+        // DGen's matmul always transposes B once before reshaping: bTransposed = transpose(b).
+        // So if the view chain has an ODD number of transposes, B is physically [K,N] → transB=false.
+        // If EVEN (e.g., Q@K^T where K.transpose() is transposed again), B is [N,K] → transB=true.
+        // Similarly, transA = leftHasTranspose if A's view chain has a net transpose (A stored [K,M]).
+        let transA = leftHasTranspose
+        let transB = !rightHasTranspose
+        let op: LazyOp = gemmAligned
+          ? .gemm(M, N, K, transA, transB)
+          : .gemmSmall(M, N, K, transA, transB)
+        graph.nodes[nodeId] = Node(id: nodeId, op: op, inputs: [leftSource, rightSource])
         graph.nodes[nodeId]?.shape = .tensor([M, N])
 
         let mulNodeId = node.inputs[0]
@@ -167,9 +182,12 @@ extension GraphPrepPasses {
         graph: graph
       ) else { continue }
 
+      let op: LazyOp = gemmAligned
+        ? .gemm(M, N, K, match.transA, match.transB)
+        : .gemmSmall(M, N, K, match.transA, match.transB)
       graph.nodes[nodeId] = Node(
         id: nodeId,
-        op: .gemm(M, N, K, match.transA, match.transB),
+        op: op,
         inputs: [match.leftSource, match.rightSource])
       graph.nodes[nodeId]?.shape = .tensor([M, N])
 
