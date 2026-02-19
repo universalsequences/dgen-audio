@@ -328,7 +328,9 @@ public struct CompilationPipeline {
     graph.nodes.values.contains { node in
       switch node.op {
       case .spectralLossFFT, .spectralLossFFTGradInline, .spectralLossFFTGradSpec,
-        .spectralLossFFTGradIFFT, .spectralLossFFTGradRead, .spectralLossFFTGradRead2:
+        .spectralLossFFTGradIFFT, .spectralLossFFTGradRead, .spectralLossFFTGradRead2,
+        .spectralLossFFTBatched, .spectralLossFFTBatchedGradSpec, .spectralLossFFTBatchedGradIFFT,
+        .spectralLossFFTBatchedGradRead, .spectralLossFFTBatchedGradRead2:
         return true
       default:
         return false

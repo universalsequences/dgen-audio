@@ -124,6 +124,11 @@ public func isolateSpectralPasses(_ blocks: [Block], _ g: Graph) -> [Block] {
         if case .spectralLossFFTGradIFFT = node.op { return true }
         if case .spectralLossFFTGradRead = node.op { return true }
         if case .spectralLossFFTGradRead2 = node.op { return true }
+        if case .spectralLossFFTBatched = node.op { return true }
+        if case .spectralLossFFTBatchedGradSpec = node.op { return true }
+        if case .spectralLossFFTBatchedGradIFFT = node.op { return true }
+        if case .spectralLossFFTBatchedGradRead = node.op { return true }
+        if case .spectralLossFFTBatchedGradRead2 = node.op { return true }
         return false
       }()
 

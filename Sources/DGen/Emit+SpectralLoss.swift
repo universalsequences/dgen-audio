@@ -622,6 +622,518 @@ extension LazyOp {
       let normalizedGrad2 = gradSum.value / normFactor2
       b.use(val: normalizedGrad2)
 
+    // MARK: - Batched Spectral Loss
+
+    case .spectralLossFFTBatched(
+      let windowSize, let batchSize, _,
+      _, let fft1Cell, let fft2Cell, let mag1Cell, let mag2Cell, _):
+      guard inputs.count >= 6 else {
+        throw DGenError.insufficientInputs(
+          operator: "spectralLossFFTBatched", expected: 6, actual: inputs.count)
+      }
+
+      func tensorCellId(_ nodeId: NodeID) -> CellID {
+        let tensorId = g.nodeToTensor[nodeId]!
+        return g.tensors[tensorId]!.cellId
+      }
+
+      // Resolve input tensor cells for [B] SignalTensors
+      let sig1TensorId = g.nodeToTensor[node.inputs[0]]!
+      let sig1Cell = g.tensors[sig1TensorId]!.cellId
+      let sig2TensorId = g.nodeToTensor[node.inputs[1]]!
+      let sig2Cell = g.tensors[sig2TensorId]!.cellId
+
+      let numBins = windowSize / 2 + 1
+      let numStages = Int(log2(Double(windowSize)))
+      let fftSize = windowSize * 2
+      let imagOffset = windowSize
+
+      let hannCellId = tensorCellId(node.inputs[2])
+      let twReCellId = tensorCellId(node.inputs[3])
+      let twImCellId = tensorCellId(node.inputs[4])
+      let bitRevCellId = tensorCellId(node.inputs[5])
+      let hopCounter: Expr? = inputs.count > 6 ? b.value(inputs[6]) : nil
+      let winSizeFloat = b.constant(Float(windowSize))
+      let zero = b.constant(0.0)
+      let one = b.constant(1.0)
+      let frameIdx = b.frameIndex()
+      let frameCount = b.frameCount()
+      let batchSizeInt = b.intConstant(batchSize)
+
+      // Threadgroup scratch arrays (reused per batch element, sequentially)
+      let scratchRe = b.threadgroupScratch(windowSize)
+      let scratchIm = b.threadgroupScratch(windowSize)
+      let scratchTwRe = b.threadgroupScratch(windowSize - 1)
+      let scratchTwIm = b.threadgroupScratch(windowSize - 1)
+
+      let shouldRun = hopCounter.map { $0 == zero } ?? (one > zero)
+      let loss = b.float(0.0)
+      b.if_(shouldRun) {
+        // Load twiddle tables once
+        let twiddleSize = windowSize - 1
+        b.loop(twiddleSize) { n in
+          let nInt = b.cast(n, to: .int)
+          b.scratchWrite(scratchTwRe, nInt, b.memoryRead(twReCellId, nInt))
+          b.scratchWrite(scratchTwIm, nInt, b.memoryRead(twImCellId, nInt))
+        }
+
+        // Helper: FFT one signal for one batch element
+        func emitFFTInScratch(signalCell: CellID, batchIdx: Expr, fftCell: CellID, magCell: CellID) {
+          let batchIdx_int = b.cast(batchIdx, to: .int)
+          // Per-frame+batch base offsets: (frame * B + batchIdx) * stride
+          let frameBatch = frameIdx * batchSizeInt + batchIdx_int
+          let fftBaseOffset = frameBatch * b.intConstant(fftSize)
+          let magBaseOffset = frameBatch * b.intConstant(numBins)
+
+          // 1. Load windowed samples into scratch
+          b.loop(windowSize) { n in
+            let nInt = b.cast(n, to: .int)
+            let nFloat = b.cast(n, to: .float)
+            let w = b.memoryRead(hannCellId, nInt)
+            // Target frame for this window position
+            let targetFrameFloat = b.cast(frameIdx, to: .float) - (winSizeFloat - one) + nFloat
+            // Combine two conditions: multiply boolean results (1.0 * 1.0 = 1.0, else 0.0)
+            let cond1 = targetFrameFloat >= zero
+            let cond2 = targetFrameFloat < b.cast(frameCount, to: .float)
+            let inBounds = cond1 * cond2
+            let clampedFrame = b.max(zero, b.min(targetFrameFloat,
+              b.cast(frameCount, to: .float) - one))
+            let memIdx = b.cast(clampedFrame, to: .int) * batchSizeInt + batchIdx_int
+            let s = b.memoryRead(signalCell, memIdx)
+            let safeSample = b.gswitch(inBounds, s, zero)
+            b.scratchWrite(scratchRe, nInt, safeSample * w)
+            b.scratchWrite(scratchIm, nInt, zero)
+          }
+
+          // 2. Bit-reversal permutation
+          b.loop(windowSize) { i in
+            let iInt = b.cast(i, to: .int)
+            let rev = b.memoryRead(bitRevCellId, iInt)
+            let iFloat = b.cast(i, to: .float)
+            let shouldSwap = iFloat < rev
+            let revInt = b.cast(rev, to: .int)
+
+            let tempReI = b.scratchRead(scratchRe, iInt)
+            let tempImI = b.scratchRead(scratchIm, iInt)
+            let tempReRev = b.scratchRead(scratchRe, revInt)
+            let tempImRev = b.scratchRead(scratchIm, revInt)
+
+            let newReI = b.gswitch(shouldSwap, tempReRev, tempReI)
+            let newImI = b.gswitch(shouldSwap, tempImRev, tempImI)
+            let newReRev = b.gswitch(shouldSwap, tempReI, tempReRev)
+            let newImRev = b.gswitch(shouldSwap, tempImI, tempImRev)
+
+            b.scratchWrite(scratchRe, iInt, newReI)
+            b.scratchWrite(scratchIm, iInt, newImI)
+            b.scratchWrite(scratchRe, revInt, newReRev)
+            b.scratchWrite(scratchIm, revInt, newImRev)
+          }
+
+          // 3. Butterfly stages
+          for stage in 0..<numStages {
+            let butterflySize = 1 << (stage + 1)
+            let halfSize = butterflySize / 2
+            let numGroups = windowSize / butterflySize
+            let numButterflies = numGroups * halfSize
+
+            b.loop(numButterflies) { flatIdx in
+              let flatFloat = b.cast(flatIdx, to: .float)
+              let halfSizeFloat = b.constant(Float(halfSize))
+              let butterflySizeFloat = b.constant(Float(butterflySize))
+
+              let group = b.floor(flatFloat / halfSizeFloat)
+              let k = flatFloat - (group * halfSizeFloat)
+
+              let i = group * butterflySizeFloat + k
+              let j = i + halfSizeFloat
+
+              let twiddleOffset = b.intConstant(halfSize - 1)
+              let kInt = b.cast(k, to: .int)
+              let twiddleIdx = twiddleOffset + kInt
+              let wr = b.scratchRead(scratchTwRe, twiddleIdx)
+              let wi = zero - b.scratchRead(scratchTwIm, twiddleIdx)
+
+              let iInt = b.cast(i, to: .int)
+              let jInt = b.cast(j, to: .int)
+
+              let ar = b.scratchRead(scratchRe, iInt)
+              let ai = b.scratchRead(scratchIm, iInt)
+              let br = b.scratchRead(scratchRe, jInt)
+              let bi = b.scratchRead(scratchIm, jInt)
+
+              let tr = wr * br - wi * bi
+              let ti = wr * bi + wi * br
+
+              b.scratchWrite(scratchRe, iInt, ar + tr)
+              b.scratchWrite(scratchIm, iInt, ai + ti)
+              b.scratchWrite(scratchRe, jInt, ar - tr)
+              b.scratchWrite(scratchIm, jInt, ai - ti)
+            }
+          }
+
+          // 4. Copy FFT result to device + compute magnitudes
+          let imagOff = b.intConstant(imagOffset)
+          b.loop(windowSize) { n in
+            let nInt = b.cast(n, to: .int)
+            let re = b.scratchRead(scratchRe, nInt)
+            let im = b.scratchRead(scratchIm, nInt)
+            _ = b.memoryWrite(fftCell, fftBaseOffset + nInt, re)
+            _ = b.memoryWrite(fftCell, fftBaseOffset + nInt + imagOff, im)
+          }
+          b.loop(numBins) { k in
+            let kInt = b.cast(k, to: .int)
+            let re = b.scratchRead(scratchRe, kInt)
+            let im = b.scratchRead(scratchIm, kInt)
+            let mag = b.sqrt(re * re + im * im)
+            _ = b.memoryWrite(magCell, magBaseOffset + kInt, mag)
+          }
+        }
+
+        // Process each batch element sequentially (scratch reused)
+        b.loop(batchSize) { bIdx in
+          emitFFTInScratch(signalCell: sig1Cell, batchIdx: bIdx, fftCell: fft1Cell, magCell: mag1Cell)
+          emitFFTInScratch(signalCell: sig2Cell, batchIdx: bIdx, fftCell: fft2Cell, magCell: mag2Cell)
+
+          // Compute loss for this batch element
+          let batchIdx_int = b.cast(bIdx, to: .int)
+          let frameBatch = frameIdx * batchSizeInt + batchIdx_int
+          let magBaseOffset = frameBatch * b.intConstant(numBins)
+          b.loop(numBins) { k in
+            let kInt = b.cast(k, to: .int)
+            let mag1 = b.memoryRead(mag1Cell, magBaseOffset + kInt)
+            let mag2 = b.memoryRead(mag2Cell, magBaseOffset + kInt)
+            let diff = mag1 - mag2
+            loss.accumulate(diff * diff)
+          }
+        }
+      }
+
+      // Mean across batches
+      let batchSizeFloat = b.constant(Float(batchSize))
+      b.use(val: loss.value / batchSizeFloat)
+
+    case .spectralLossFFTBatchedGradSpec(
+      let windowSize, let batchSize,
+      let fft1Cell, let fft2Cell,
+      let mag1Cell, let mag2Cell, let gradSpec1Cell, let gradSpec2Cell):
+      guard inputs.count >= 1 else {
+        throw DGenError.insufficientInputs(
+          operator: "spectralLossFFTBatchedGradSpec", expected: 1, actual: inputs.count)
+      }
+
+      let fftSize = windowSize * 2
+      let numBins = windowSize / 2 + 1
+      let imagOffset = windowSize
+      let gradOutput = b.value(inputs[0])
+      let hopCounter: Expr? = inputs.count > 3 ? b.value(inputs[3]) : nil
+      let eps = b.constant(1e-8)
+      let frameIdx = b.frameIndex()
+      let zero = b.constant(0.0)
+      let batchSizeInt = b.intConstant(batchSize)
+      // Scale gradOutput by 1/B to match the mean in the forward pass
+      let scaledGradOutput = gradOutput / b.constant(Float(batchSize))
+
+      let imagOff = b.intConstant(imagOffset)
+
+      let shouldRun = hopCounter.map { $0 == zero } ?? (zero == zero)
+      b.if_(shouldRun) {
+        b.loop(batchSize) { bIdx in
+          let batchIdx_int = b.cast(bIdx, to: .int)
+          let frameBatch = frameIdx * batchSizeInt + batchIdx_int
+          let fftBase = frameBatch * b.intConstant(fftSize)
+          let magBase = frameBatch * b.intConstant(numBins)
+          let gradSpecBase = frameBatch * b.intConstant(fftSize)
+
+          b.parallelRange(numBins) { k in
+            let kInt = b.cast(k, to: .int)
+
+            let mag1 = b.memoryRead(mag1Cell, magBase + kInt)
+            let mag2 = b.memoryRead(mag2Cell, magBase + kInt)
+            let real1 = b.memoryRead(fft1Cell, fftBase + kInt)
+            let imag1 = b.memoryRead(fft1Cell, fftBase + kInt + imagOff)
+            let real2 = b.memoryRead(fft2Cell, fftBase + kInt)
+            let imag2 = b.memoryRead(fft2Cell, fftBase + kInt + imagOff)
+
+            let gradMag1 = b.constant(2.0) * (mag1 - mag2) * scaledGradOutput
+            let gradMag2 = b.constant(-2.0) * (mag1 - mag2) * scaledGradOutput
+
+            let safeMag1 = b.max(mag1, eps)
+            let safeMag2 = b.max(mag2, eps)
+
+            let gradReal1 = gradMag1 * real1 / safeMag1
+            let gradImag1 = gradMag1 * imag1 / safeMag1
+            let gradReal2 = gradMag2 * real2 / safeMag2
+            let gradImag2 = gradMag2 * imag2 / safeMag2
+
+            _ = b.memoryWrite(gradSpec1Cell, gradSpecBase + kInt, gradReal1)
+            _ = b.memoryWrite(gradSpec1Cell, gradSpecBase + kInt + imagOff, gradImag1)
+            _ = b.memoryWrite(gradSpec2Cell, gradSpecBase + kInt, gradReal2)
+            _ = b.memoryWrite(gradSpec2Cell, gradSpecBase + kInt + imagOff, gradImag2)
+          }
+
+          // Zero upper bins
+          if windowSize / 2 - 1 > 0 {
+            b.parallelRange(windowSize / 2 - 1) { k in
+              let kInt = b.cast(k, to: .int) + b.intConstant(numBins)
+              _ = b.memoryWrite(gradSpec1Cell, gradSpecBase + kInt, b.constant(0.0))
+              _ = b.memoryWrite(gradSpec1Cell, gradSpecBase + kInt + imagOff, b.constant(0.0))
+              _ = b.memoryWrite(gradSpec2Cell, gradSpecBase + kInt, b.constant(0.0))
+              _ = b.memoryWrite(gradSpec2Cell, gradSpecBase + kInt + imagOff, b.constant(0.0))
+            }
+          }
+        }
+      }
+
+      b.use(val: zero)
+
+    case .spectralLossFFTBatchedGradIFFT(
+      let windowSize, let batchSize,
+      let gradSpec1Cell, let gradSpec2Cell,
+      let gradTime1Cell, let gradTime2Cell, let windowCell):
+      guard inputs.count >= 4 else {
+        throw DGenError.insufficientInputs(
+          operator: "spectralLossFFTBatchedGradIFFT", expected: 4, actual: inputs.count)
+      }
+
+      func tensorCellId(_ nodeId: NodeID) -> CellID {
+        let tensorId = g.nodeToTensor[nodeId]!
+        return g.tensors[tensorId]!.cellId
+      }
+
+      let twReCellId = tensorCellId(node.inputs[1])
+      let twImCellId = tensorCellId(node.inputs[2])
+      let bitRevCellId = tensorCellId(node.inputs[3])
+
+      let fftSize = windowSize * 2
+      let numStages = Int(log2(Double(windowSize)))
+      let imagOffset = windowSize
+      let numBins = windowSize / 2 + 1
+      let invNBins = b.constant(1.0 / Float(windowSize * numBins))
+      let zero = b.constant(0.0)
+      let one = b.constant(1.0)
+      let hopCounter: Expr? = inputs.count > 4 ? b.value(inputs[4]) : nil
+      let frameIdx = b.frameIndex()
+      let batchSizeInt = b.intConstant(batchSize)
+
+      let imagOff = b.intConstant(imagOffset)
+
+      let scratchRe = b.threadgroupScratch(windowSize)
+      let scratchIm = b.threadgroupScratch(windowSize)
+      let scratchTwRe = b.threadgroupScratch(windowSize - 1)
+      let scratchTwIm = b.threadgroupScratch(windowSize - 1)
+
+      let shouldRun = hopCounter.map { $0 == zero } ?? (one > zero)
+      b.if_(shouldRun) {
+        // Load twiddle tables once
+        let twiddleSize = windowSize - 1
+        b.loop(twiddleSize) { n in
+          let nInt = b.cast(n, to: .int)
+          b.scratchWrite(scratchTwRe, nInt, b.memoryRead(twReCellId, nInt))
+          b.scratchWrite(scratchTwIm, nInt, b.memoryRead(twImCellId, nInt))
+        }
+
+        func emitIFFTInScratch(_ gradSpecCell: CellID, _ gradTimeCell: CellID, batchIdx: Expr) {
+          let batchIdx_int = b.cast(batchIdx, to: .int)
+          let frameBatch = frameIdx * batchSizeInt + batchIdx_int
+          let gradSpecBase = frameBatch * b.intConstant(fftSize)
+          let gradTimeBase = frameBatch * b.intConstant(windowSize)
+
+          // 1. Load gradient spectrum into scratch
+          b.loop(windowSize) { n in
+            let nInt = b.cast(n, to: .int)
+            let re = b.memoryRead(gradSpecCell, gradSpecBase + nInt)
+            let im = b.memoryRead(gradSpecCell, gradSpecBase + nInt + imagOff)
+            b.scratchWrite(scratchRe, nInt, re)
+            b.scratchWrite(scratchIm, nInt, im)
+          }
+
+          // 2. Bit-reversal permutation
+          b.loop(windowSize) { i in
+            let iInt = b.cast(i, to: .int)
+            let rev = b.memoryRead(bitRevCellId, iInt)
+            let iFloat = b.cast(i, to: .float)
+            let shouldSwap = iFloat < rev
+            let revInt = b.cast(rev, to: .int)
+
+            let tempR = b.scratchRead(scratchRe, iInt)
+            let tempI = b.scratchRead(scratchIm, iInt)
+            let revR = b.scratchRead(scratchRe, revInt)
+            let revI = b.scratchRead(scratchIm, revInt)
+
+            let newIR = b.gswitch(shouldSwap, revR, tempR)
+            let newII = b.gswitch(shouldSwap, revI, tempI)
+            let newRevR = b.gswitch(shouldSwap, tempR, revR)
+            let newRevI = b.gswitch(shouldSwap, tempI, revI)
+
+            b.scratchWrite(scratchRe, iInt, newIR)
+            b.scratchWrite(scratchIm, iInt, newII)
+            b.scratchWrite(scratchRe, revInt, newRevR)
+            b.scratchWrite(scratchIm, revInt, newRevI)
+          }
+
+          // 3. Butterfly stages with POSITIVE twiddle (IFFT)
+          var butterflySize = 2
+          for _ in 0..<numStages {
+            let halfSize = butterflySize / 2
+            let numGroups = windowSize / butterflySize
+            let numButterflies = numGroups * halfSize
+
+            b.loop(numButterflies) { flatIdx in
+              let flatFloat = b.cast(flatIdx, to: .float)
+              let halfSizeFloat = b.constant(Float(halfSize))
+              let butterflySizeFloat = b.constant(Float(butterflySize))
+
+              let group = b.floor(flatFloat / halfSizeFloat)
+              let k = flatFloat - (group * halfSizeFloat)
+
+              let i = group * butterflySizeFloat + k
+              let j = i + halfSizeFloat
+
+              let twiddleOffset = b.intConstant(halfSize - 1)
+              let kInt = b.cast(k, to: .int)
+              let twiddleIdx = twiddleOffset + kInt
+              let wr = b.scratchRead(scratchTwRe, twiddleIdx)
+              let wi = b.scratchRead(scratchTwIm, twiddleIdx)  // positive for IFFT
+
+              let iInt = b.cast(i, to: .int)
+              let jInt = b.cast(j, to: .int)
+
+              let ar = b.scratchRead(scratchRe, iInt)
+              let ai = b.scratchRead(scratchIm, iInt)
+              let br = b.scratchRead(scratchRe, jInt)
+              let bi = b.scratchRead(scratchIm, jInt)
+
+              let tr = wr * br - wi * bi
+              let ti = wr * bi + wi * br
+
+              b.scratchWrite(scratchRe, iInt, ar + tr)
+              b.scratchWrite(scratchIm, iInt, ai + ti)
+              b.scratchWrite(scratchRe, jInt, ar - tr)
+              b.scratchWrite(scratchIm, jInt, ai - ti)
+            }
+            butterflySize *= 2
+          }
+
+          // 4. Scale by 1/(N*numBins), multiply by window → write to device
+          b.loop(windowSize) { n in
+            let nInt = b.cast(n, to: .int)
+            let realVal = b.scratchRead(scratchRe, nInt) * invNBins
+            let w = b.memoryRead(windowCell, nInt)
+            _ = b.memoryWrite(gradTimeCell, gradTimeBase + nInt, realVal * w)
+          }
+        }
+
+        // Process each batch element sequentially (scratch reused)
+        b.loop(batchSize) { bIdx in
+          emitIFFTInScratch(gradSpec1Cell, gradTime1Cell, batchIdx: bIdx)
+          emitIFFTInScratch(gradSpec2Cell, gradTime2Cell, batchIdx: bIdx)
+        }
+      }
+
+      // On non-hop frames, clear this frame's gradient slices
+      if let hopCounter {
+        b.if_(hopCounter > zero) {
+          b.loop(batchSize) { bIdx in
+            let batchIdx_int = b.cast(bIdx, to: .int)
+            let frameBatch = frameIdx * batchSizeInt + batchIdx_int
+            let gradTimeBase = frameBatch * b.intConstant(windowSize)
+            b.loop(windowSize) { n in
+              let nInt = b.cast(n, to: .int)
+              _ = b.memoryWrite(gradTime1Cell, gradTimeBase + nInt, zero)
+              _ = b.memoryWrite(gradTime2Cell, gradTimeBase + nInt, zero)
+            }
+          }
+        }
+      }
+
+      b.use(val: zero)
+
+    case .spectralLossFFTBatchedGradRead(let windowSize, let batchSize,
+      let gradTime1Cell, _, let outputCell):
+      // Read [B] gradients for signal 1 from frame-indexed storage
+      // Each batch element sums contributions from all windows containing that sample
+      guard inputs.count >= 1 else {
+        throw DGenError.insufficientInputs(
+          operator: "spectralLossFFTBatchedGradRead", expected: 1, actual: inputs.count)
+      }
+      let _ = b.value(inputs[0])
+      if inputs.count > 1 { let _ = b.value(inputs[1]) }
+
+      let frameIdx = b.frameIndex()
+      let winSizeInt = b.intConstant(windowSize)
+      let winSizeFloat = b.constant(Float(windowSize))
+      let frameCount = b.frameCount()
+      let batchSizeInt = b.intConstant(batchSize)
+      let p = frameIdx
+
+      // Emit [B] gradient values
+      b.loop(batchSize) { bIdx in
+        let batchIdx_int = b.cast(bIdx, to: .int)
+        let gradSum = b.float(0.0)
+        b.loop(windowSize) { i in
+          let iInt = b.cast(i, to: .int)
+          let iFloat = b.cast(i, to: .float)
+          let pFloat = b.cast(p, to: .float)
+          let w = pFloat + iFloat
+          let offsetInt = winSizeInt - b.intConstant(1) - iInt
+          let clampedW = b.min(w, b.cast(frameCount, to: .float) - b.constant(1.0))
+          let frameBatch = b.cast(clampedW, to: .int) * batchSizeInt + batchIdx_int
+          let idx = frameBatch * winSizeInt + offsetInt
+          let contrib = b.memoryRead(gradTime1Cell, idx)
+          let inBounds = w < b.cast(frameCount, to: .float)
+          let safeContrib = b.gswitch(inBounds, contrib, b.constant(0.0))
+          gradSum.accumulate(safeContrib)
+        }
+        let numBinsFloat = b.constant(Float(windowSize / 2 + 1))
+        let normFactor = b.sqrt(numBinsFloat * winSizeFloat)
+        let normalizedGrad = gradSum.value / normFactor
+        // Write gradient to frame-aware output: memory[outputCell + frame * B + b]
+        let writeIdx = frameIdx * batchSizeInt + batchIdx_int
+        _ = b.memoryWrite(outputCell, writeIdx, normalizedGrad)
+      }
+      b.use(val: b.constant(0.0))
+
+    case .spectralLossFFTBatchedGradRead2(let windowSize, let batchSize,
+      let gradTime2Cell, let outputCell):
+      guard inputs.count >= 1 else {
+        throw DGenError.insufficientInputs(
+          operator: "spectralLossFFTBatchedGradRead2", expected: 1, actual: inputs.count)
+      }
+      let _ = b.value(inputs[0])
+      if inputs.count > 1 { let _ = b.value(inputs[1]) }
+
+      let frameIdx = b.frameIndex()
+      let winSizeInt = b.intConstant(windowSize)
+      let winSizeFloat = b.constant(Float(windowSize))
+      let frameCount = b.frameCount()
+      let batchSizeInt = b.intConstant(batchSize)
+      let p = frameIdx
+
+      b.loop(batchSize) { bIdx in
+        let batchIdx_int = b.cast(bIdx, to: .int)
+        let gradSum = b.float(0.0)
+        b.loop(windowSize) { i in
+          let iInt = b.cast(i, to: .int)
+          let iFloat = b.cast(i, to: .float)
+          let pFloat = b.cast(p, to: .float)
+          let w = pFloat + iFloat
+          let offsetInt = winSizeInt - b.intConstant(1) - iInt
+          let clampedW = b.min(w, b.cast(frameCount, to: .float) - b.constant(1.0))
+          let frameBatch = b.cast(clampedW, to: .int) * batchSizeInt + batchIdx_int
+          let idx = frameBatch * winSizeInt + offsetInt
+          let contrib = b.memoryRead(gradTime2Cell, idx)
+          let inBounds = w < b.cast(frameCount, to: .float)
+          let safeContrib = b.gswitch(inBounds, contrib, b.constant(0.0))
+          gradSum.accumulate(safeContrib)
+        }
+        let numBinsFloat2 = b.constant(Float(windowSize / 2 + 1))
+        let normFactor2 = b.sqrt(numBinsFloat2 * winSizeFloat)
+        let normalizedGrad2 = gradSum.value / normFactor2
+        let writeIdx = frameIdx * batchSizeInt + batchIdx_int
+        _ = b.memoryWrite(outputCell, writeIdx, normalizedGrad2)
+      }
+      b.use(val: b.constant(0.0))
+
     default: break
     }
   }

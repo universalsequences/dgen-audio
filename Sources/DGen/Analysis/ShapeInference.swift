@@ -238,10 +238,17 @@ public func inferShape(op: LazyOp, inputs: [ValueShape], graph: Graph) throws ->
   case .gemmChunkPartials(let M, let N, _, _, _, _, let chunkCount):
     return .tensor([chunkCount, M, N])
 
+  // Batched spectral loss: GradRead ops output [B] tensors
+  case .spectralLossFFTBatchedGradRead(_, let batchSize, _, _, _):
+    return .tensor([batchSize])
+  case .spectralLossFFTBatchedGradRead2(_, let batchSize, _, _):
+    return .tensor([batchSize])
+
   // Scalar ops -- listed explicitly so the compiler catches missing cases when new ops are added.
   case .mse,
     .spectralLossFFT, .spectralLossFFTGradSpec, .spectralLossFFTGradIFFT,
     .spectralLossFFTGradInline, .spectralLossFFTGradRead, .spectralLossFFTGradRead2,
+    .spectralLossFFTBatched, .spectralLossFFTBatchedGradSpec, .spectralLossFFTBatchedGradIFFT,
     .selectRowGradWrite, .selectRowGradReduce,
     .selector,
     .memoryRead, .memoryWrite, .memoryAccumulate, .memoryCellSum,

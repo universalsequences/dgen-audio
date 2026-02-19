@@ -54,6 +54,8 @@ extension Graph {
       let sequencedGrad: NodeID
       if case .spectralLossFFT = node.op {
         sequencedGrad = n(.seq, [nodeId, upstreamGrad])
+      } else if case .spectralLossFFTBatched = node.op {
+        sequencedGrad = n(.seq, [nodeId, upstreamGrad])
       } else {
         sequencedGrad = upstreamGrad
       }
@@ -826,6 +828,117 @@ extension LazyOp {
 
     case .spectralLossFFTGradRead2(_, _):
       // Gradient read ops don't need their own gradients
+      return node.inputs.map { _ in nil }
+
+    case .spectralLossFFTBatched(
+      let windowSize, let batchSize, _, let windowCell,
+      let fft1Cell, let fft2Cell, let mag1Cell, let mag2Cell, _):
+      // Batched FFT spectral loss backward - same 3-step chain as scalar version
+      let sig1 = node.inputs[0]
+      let sig2 = node.inputs[1]
+      let twReNode = node.inputs[3]
+      let twImNode = node.inputs[4]
+      let bitRevNode = node.inputs[5]
+      let hopCounter = node.inputs.count > 6 ? node.inputs[6] : nil
+      let fftSize = windowSize * 2
+
+      // Allocate per-frame gradient spectrum cells scaled by B
+      let gradSpec1Cell = g.alloc(vectorWidth: fftSize * batchSize * g.maxFrameCount)
+      let gradSpec2Cell = g.alloc(vectorWidth: fftSize * batchSize * g.maxFrameCount)
+
+      // Allocate per-frame time-domain gradient cells scaled by B
+      let gradTime1Cell = g.alloc(vectorWidth: windowSize * batchSize * g.maxFrameCount)
+      let gradTime2Cell = g.alloc(vectorWidth: windowSize * batchSize * g.maxFrameCount)
+
+      // Allocate output cells for [B] gradient tensors
+      let gradOutput1Cell = g.alloc(vectorWidth: batchSize * g.maxFrameCount)
+      let gradOutput2Cell = g.alloc(vectorWidth: batchSize * g.maxFrameCount)
+
+      // Step 1: Compute gradient w.r.t. complex spectrum
+      var gradSpecInputs: [NodeID] = [gradOutput, sig1, sig2]
+      if let hopCounter { gradSpecInputs.append(hopCounter) }
+      let gradSpec = g.n(
+        .spectralLossFFTBatchedGradSpec(
+          windowSize: windowSize,
+          batchSize: batchSize,
+          fft1Cell: fft1Cell,
+          fft2Cell: fft2Cell,
+          mag1Cell: mag1Cell,
+          mag2Cell: mag2Cell,
+          gradSpec1Cell: gradSpec1Cell,
+          gradSpec2Cell: gradSpec2Cell
+        ), gradSpecInputs)
+
+      g.addGradientSideEffect(gradSpec)
+
+      // Step 2: IFFT gradient spectrum → time-domain gradients
+      var gradIFFTInputs: [NodeID] = [gradSpec, twReNode, twImNode, bitRevNode]
+      if let hopCounter { gradIFFTInputs.append(hopCounter) }
+      let gradIFFT = g.n(
+        .spectralLossFFTBatchedGradIFFT(
+          windowSize: windowSize,
+          batchSize: batchSize,
+          gradSpec1Cell: gradSpec1Cell,
+          gradSpec2Cell: gradSpec2Cell,
+          gradTime1Cell: gradTime1Cell,
+          gradTime2Cell: gradTime2Cell,
+          windowCell: windowCell
+        ), gradIFFTInputs)
+
+      g.addGradientSideEffect(gradIFFT)
+
+      // Step 3: Read [B] gradients for each signal
+      var gradReadInputs: [NodeID] = [gradIFFT]
+      if let hopCounter { gradReadInputs.append(hopCounter) }
+      let gradPassResult = g.n(
+        .spectralLossFFTBatchedGradRead(
+          windowSize: windowSize,
+          batchSize: batchSize,
+          gradTime1Cell: gradTime1Cell,
+          gradTime2Cell: gradTime2Cell,
+          outputCell: gradOutput1Cell
+        ), gradReadInputs, shape: .tensor([batchSize]))
+
+      // Register outputCell as this node's tensor so downstream readInput finds it
+      do {
+        let tid = g.nextTensorId
+        g.nextTensorId += 1
+        g.tensors[tid] = Tensor(id: tid, shape: [batchSize], cellId: gradOutput1Cell)
+        g.nodeToTensor[gradPassResult] = tid
+        g.frameAwareCells[gradOutput1Cell] = (tensorSize: batchSize, frameCount: g.maxFrameCount)
+      }
+
+      let grad2Node = g.n(
+        .spectralLossFFTBatchedGradRead2(
+          windowSize: windowSize,
+          batchSize: batchSize,
+          gradTime2Cell: gradTime2Cell,
+          outputCell: gradOutput2Cell
+        ), gradReadInputs, shape: .tensor([batchSize]))
+
+      // Register outputCell as this node's tensor so downstream readInput finds it
+      do {
+        let tid = g.nextTensorId
+        g.nextTensorId += 1
+        g.tensors[tid] = Tensor(id: tid, shape: [batchSize], cellId: gradOutput2Cell)
+        g.nodeToTensor[grad2Node] = tid
+        g.frameAwareCells[gradOutput2Cell] = (tensorSize: batchSize, frameCount: g.maxFrameCount)
+      }
+
+      var result: [NodeID?] = [gradPassResult, grad2Node]
+      for _ in 2..<node.inputs.count { result.append(nil) }
+      return result
+
+    case .spectralLossFFTBatchedGradSpec(_, _, _, _, _, _, _, _):
+      return node.inputs.map { _ in nil }
+
+    case .spectralLossFFTBatchedGradIFFT(_, _, _, _, _, _, _):
+      return node.inputs.map { _ in nil }
+
+    case .spectralLossFFTBatchedGradRead(_, _, _, _, _):
+      return node.inputs.map { _ in nil }
+
+    case .spectralLossFFTBatchedGradRead2(_, _, _, _):
       return node.inputs.map { _ in nil }
 
     case .selectRow:

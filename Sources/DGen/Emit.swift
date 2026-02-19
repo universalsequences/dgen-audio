@@ -248,7 +248,9 @@ extension LazyOp {
     // MARK: - Dispatched categories
 
     case .spectralLossFFT, .spectralLossFFTGradSpec, .spectralLossFFTGradIFFT,
-      .spectralLossFFTGradInline, .spectralLossFFTGradRead, .spectralLossFFTGradRead2:
+      .spectralLossFFTGradInline, .spectralLossFFTGradRead, .spectralLossFFTGradRead2,
+      .spectralLossFFTBatched, .spectralLossFFTBatchedGradSpec, .spectralLossFFTBatchedGradIFFT,
+      .spectralLossFFTBatchedGradRead, .spectralLossFFTBatchedGradRead2:
       try emitSpectralLoss(b: b, ctx: ctx, g: g, node: node, inputs: inputs)
 
     case .selectRow, .selectRowGradWrite, .selectRowGradReduce,

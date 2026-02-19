@@ -109,6 +109,52 @@ public enum LazyOp {
     windowSize: Int,
     gradTime2Cell: CellID
   )
+
+  // Batched FFT-based spectral loss: processes [B] SignalTensors independently per batch element
+  case spectralLossFFTBatched(
+    windowSize: Int,
+    batchSize: Int,
+    useHann: Bool,
+    windowCell: CellID,
+    fft1Cell: CellID,
+    fft2Cell: CellID,
+    mag1Cell: CellID,
+    mag2Cell: CellID,
+    scratchCell: CellID
+  )
+  case spectralLossFFTBatchedGradSpec(
+    windowSize: Int,
+    batchSize: Int,
+    fft1Cell: CellID,
+    fft2Cell: CellID,
+    mag1Cell: CellID,
+    mag2Cell: CellID,
+    gradSpec1Cell: CellID,
+    gradSpec2Cell: CellID
+  )
+  case spectralLossFFTBatchedGradIFFT(
+    windowSize: Int,
+    batchSize: Int,
+    gradSpec1Cell: CellID,
+    gradSpec2Cell: CellID,
+    gradTime1Cell: CellID,
+    gradTime2Cell: CellID,
+    windowCell: CellID
+  )
+  case spectralLossFFTBatchedGradRead(
+    windowSize: Int,
+    batchSize: Int,
+    gradTime1Cell: CellID,
+    gradTime2Cell: CellID,
+    outputCell: CellID
+  )
+  case spectralLossFFTBatchedGradRead2(
+    windowSize: Int,
+    batchSize: Int,
+    gradTime2Cell: CellID,
+    outputCell: CellID
+  )
+
   // selectRow: extract a single row from a 2D tensor using dynamic index
   // Input: [tensor2D, rowIndex] where rowIndex is floored to int
   // Output: 1D tensor [numCols]

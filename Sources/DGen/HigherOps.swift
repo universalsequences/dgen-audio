@@ -136,6 +136,102 @@ extension Graph {
       ), inputs)
   }
 
+  /// Batched FFT-based spectral loss for [B]-shaped SignalTensors.
+  ///
+  /// Computes spectral loss independently per batch element, returns scalar (mean across batches).
+  /// Backward produces [B]-shaped gradients.
+  ///
+  /// - Parameters:
+  ///   - sig1: First input tensor node (shape [B])
+  ///   - sig2: Second input tensor node (shape [B])
+  ///   - batchSize: Number of batch elements (B)
+  ///   - windowSize: FFT window size (must be power of 2)
+  ///   - useHannWindow: Whether to apply Hann window before FFT
+  ///   - hop: Compute spectral terms every `hop` frames
+  /// - Returns: Scalar loss node (mean across batches)
+  public func spectralLossFFTBatched(
+    _ sig1: NodeID,
+    _ sig2: NodeID,
+    batchSize: Int,
+    windowSize: Int,
+    useHannWindow: Bool = true,
+    hop: Int = 1
+  ) -> NodeID {
+    precondition(
+      windowSize > 0 && (windowSize & (windowSize - 1)) == 0,
+      "windowSize must be a power of 2")
+    precondition(hop >= 1, "hop must be >= 1")
+    precondition(batchSize >= 1, "batchSize must be >= 1")
+
+    let numBins = windowSize / 2 + 1
+    let numStages = Int(log2(Double(windowSize)))
+
+    // Precompute Hann window (same as scalar version)
+    var hannData = [Float](repeating: 1.0, count: windowSize)
+    if useHannWindow {
+      for i in 0..<windowSize {
+        hannData[i] = Float(0.5 * (1.0 - cos(2.0 * .pi * Double(i) / Double(windowSize - 1))))
+      }
+    }
+    let hannNode = self.tensor(hannData)
+    let windowCell = self.tensors[self.nodeToTensor[hannNode]!]!.cellId
+
+    // Precompute twiddle factors
+    var twReData = [Float](repeating: 0, count: windowSize - 1)
+    var twImData = [Float](repeating: 0, count: windowSize - 1)
+    for s in 0..<numStages {
+      let half = 1 << s
+      let offset = half - 1
+      for k in 0..<half {
+        let angle = 2.0 * .pi * Double(k) / Double(2 * half)
+        twReData[offset + k] = Float(cos(angle))
+        twImData[offset + k] = Float(sin(angle))
+      }
+    }
+    let twReNode = self.tensor(twReData)
+    let twImNode = self.tensor(twImData)
+
+    // Precompute bit-reversal permutation
+    var bitRevData = [Float](repeating: 0, count: windowSize)
+    for i in 0..<windowSize {
+      var rev = 0, bits = i
+      for _ in 0..<numStages { rev = rev * 2 + (bits & 1); bits >>= 1 }
+      bitRevData[i] = Float(rev)
+    }
+    let bitRevNode = self.tensor(bitRevData)
+
+    // Allocate cells scaled by B (batch size)
+    let fftSize = windowSize * 2
+    let fft1Cell = alloc(vectorWidth: fftSize * batchSize * maxFrameCount)
+    let fft2Cell = alloc(vectorWidth: fftSize * batchSize * maxFrameCount)
+    let mag1Cell = alloc(vectorWidth: numBins * batchSize * maxFrameCount)
+    let mag2Cell = alloc(vectorWidth: numBins * batchSize * maxFrameCount)
+    let scratchCell = alloc(vectorWidth: numBins * batchSize * maxFrameCount)
+
+    var inputs = [sig1, sig2, hannNode, twReNode, twImNode, bitRevNode]
+    if hop > 1 {
+      let counterCell = alloc(vectorWidth: 1)
+      let one = n(.constant(1), [])
+      let zero = n(.constant(0), [])
+      let hopConst = n(.constant(Float(hop)), [])
+      let counterAccum = n(.accum(counterCell), one, zero, zero, hopConst)
+      inputs.append(counterAccum)
+    }
+
+    return n(
+      .spectralLossFFTBatched(
+        windowSize: windowSize,
+        batchSize: batchSize,
+        useHann: useHannWindow,
+        windowCell: windowCell,
+        fft1Cell: fft1Cell,
+        fft2Cell: fft2Cell,
+        mag1Cell: mag1Cell,
+        mag2Cell: mag2Cell,
+        scratchCell: scratchCell
+      ), inputs)
+  }
+
   /// Delta: returns the difference between current and previous input value
   /// delta(input) = input - history(input)
   public func delta(_ input: NodeID) -> NodeID {

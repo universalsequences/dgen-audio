@@ -659,6 +659,47 @@ public func spectralLossFFT(
   return loss
 }
 
+/// Batched spectral loss for [B]-shaped SignalTensors.
+///
+/// Computes spectral loss independently per batch element, returns scalar (mean across batches).
+/// Backward produces [B]-shaped gradients.
+///
+/// - Parameters:
+///   - sig1: First [B] SignalTensor (typically student/predicted)
+///   - sig2: Second [B] SignalTensor (typically teacher/target)
+///   - windowSize: FFT window size (must be power of 2)
+///   - useHannWindow: Whether to apply Hann window before FFT (default: true)
+///   - hop: Compute spectral terms every `hop` frames (default: 1)
+///   - normalize: Divide loss by frame count (default: false)
+/// - Returns: Scalar loss signal (mean across batches)
+public func spectralLossFFT(
+  _ sig1: SignalTensor,
+  _ sig2: SignalTensor,
+  windowSize: Int,
+  useHannWindow: Bool = true,
+  hop: Int = 1,
+  normalize: Bool = false
+) -> Signal {
+  precondition(sig1.shape == sig2.shape, "Batched spectral loss requires matching shapes")
+  precondition(sig1.shape.count == 1, "Batched spectral loss requires 1D [B] shape")
+  let batchSize = sig1.shape[0]
+  let nodeId = sig1.graph.graph.spectralLossFFTBatched(
+    sig1.nodeId,
+    sig2.nodeId,
+    batchSize: batchSize,
+    windowSize: windowSize,
+    useHannWindow: useHannWindow,
+    hop: hop
+  )
+  let loss = Signal(
+    nodeId: nodeId, graph: sig1.graph, requiresGrad: sig1.requiresGrad || sig2.requiresGrad)
+  if normalize {
+    let n = Float(sig1.graph.graph.maxFrameCount)
+    return loss / Signal.constant(n)
+  }
+  return loss
+}
+
 /// Read a row from a 2D tensor with linear interpolation (frame-based)
 ///
 /// Reads a row from a tensor where the row index can change per frame.
