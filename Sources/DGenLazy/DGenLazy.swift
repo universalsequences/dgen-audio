@@ -36,18 +36,6 @@ public enum DGenConfig {
     /// Enable buffer liveness analysis and reuse to reduce memory allocations
     public static var enableBufferReuse: Bool = true
 
-    /// Toggle `peek` backward strategy.
-    /// `true`: deterministic write+reduce.
-    /// `false`: atomic scatter (usually faster).
-    public static var useDeterministicPeekGradients: Bool = false {
-        didSet { DGenGradientConfig.useDeterministicPeekGradients = useDeterministicPeekGradients }
-    }
-
-    /// Debug toggle for legacy `peek` backward behavior:
-    /// when enabled, `peek` does not propagate tensor-input gradients upstream.
-    public static var dropPeekTensorInputGradient: Bool = false {
-        didSet { DGenGradientConfig.dropPeekTensorInputGradient = dropPeekTensorInputGradient }
-    }
 }
 
 // MARK: - Type Aliases for Convenience

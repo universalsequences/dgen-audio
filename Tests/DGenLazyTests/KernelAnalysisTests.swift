@@ -155,99 +155,76 @@ final class KernelAnalysisTests: XCTestCase {
   }
 
   func testPeekBackwardABAnalytics() throws {
-    struct Metrics {
-      let analysis: KernelAnalysis
-      let gradL2: Float
-      let gradNZ: Int
-    }
+    DGenConfig.sampleRate = 4000.0
+    DGenConfig.maxFrameCount = 512
+    DGenConfig.kernelOutputPath = "/tmp/peek_ab_fixed_upstream.metal"
 
-    func runMode(label: String, dropPeekTensorInputGradient: Bool) throws -> Metrics {
-      DGenConfig.sampleRate = 4000.0
-      DGenConfig.maxFrameCount = 512
-      DGenConfig.useDeterministicPeekGradients = false
-      DGenConfig.dropPeekTensorInputGradient = dropPeekTensorInputGradient
-      DGenConfig.kernelOutputPath = "/tmp/peek_ab_\(label).metal"
+    let frames = 256
+    let controlFrames = 32
+    let harmonics = 16
 
-      let frames = 256
-      let controlFrames = 32
-      let harmonics = 16
-
-      // ---------- Compile-only analysis pass ----------
-      LazyGraphContext.reset()
-      let timeRows = (0..<controlFrames).map { [Float($0) / Float(max(1, controlFrames - 1))] }
-      let timeTensor = Tensor(timeRows)
-      let wA = Tensor.param(
-        [1, harmonics],
-        data: (0..<harmonics).map { i in
-          let x = Float(i) / Float(max(1, harmonics - 1))
-          return 0.1 * Foundation.sin(x * 3.0 * Float.pi)
-        }
-      )
-      let bA = Tensor.param([1, harmonics], data: [Float](repeating: 0.0, count: harmonics))
-      let ampsA = sigmoid(timeTensor.matmul(wA) + bA)
-      let playheadA = Signal.phasor(DGenConfig.sampleRate / Float(frames)) * Float(controlFrames - 1)
-      var predA = Signal.constant(0.0)
-      for h in 0..<harmonics {
-        let amp = ampsA.peek(playheadA, channel: Signal.constant(Float(h)))
-        let osc = sin(Signal.phasor(Float(80 + h * 20)) * 2.0 * Float.pi)
-        predA = predA + amp * osc
+    // ---------- Compile-only analysis pass ----------
+    LazyGraphContext.reset()
+    let timeRows = (0..<controlFrames).map { [Float($0) / Float(max(1, controlFrames - 1))] }
+    let timeTensor = Tensor(timeRows)
+    let wA = Tensor.param(
+      [1, harmonics],
+      data: (0..<harmonics).map { i in
+        let x = Float(i) / Float(max(1, harmonics - 1))
+        return 0.1 * Foundation.sin(x * 3.0 * Float.pi)
       }
-      let lossA = mse(predA, Signal.constant(0.0))
-      let analysis = try lossA.analyze(backward: true, frames: frames)
-
-      // ---------- Runtime backward pass for gradient magnitude ----------
-      LazyGraphContext.reset()
-      let timeTensorB = Tensor(timeRows)
-      let wB = Tensor.param(
-        [1, harmonics],
-        data: (0..<harmonics).map { i in
-          let x = Float(i) / Float(max(1, harmonics - 1))
-          return 0.1 * Foundation.sin(x * 3.0 * Float.pi)
-        }
-      )
-      let bB = Tensor.param([1, harmonics], data: [Float](repeating: 0.0, count: harmonics))
-      let ampsB = sigmoid(timeTensorB.matmul(wB) + bB)
-      let playheadB = Signal.phasor(DGenConfig.sampleRate / Float(frames)) * Float(controlFrames - 1)
-      var predB = Signal.constant(0.0)
-      for h in 0..<harmonics {
-        let amp = ampsB.peek(playheadB, channel: Signal.constant(Float(h)))
-        let osc = sin(Signal.phasor(Float(80 + h * 20)) * 2.0 * Float.pi)
-        predB = predB + amp * osc
-      }
-      let lossB = mse(predB, Signal.constant(0.0))
-      _ = try lossB.backward(frames: frames)
-
-      let gradData = wB.grad?.getData() ?? []
-      let gradL2 = Foundation.sqrt(gradData.reduce(0.0) { $0 + $1 * $1 })
-      let gradNZ = gradData.filter { $0 != 0 && $0.isFinite }.count
-
-      return Metrics(analysis: analysis, gradL2: gradL2, gradNZ: gradNZ)
+    )
+    let bA = Tensor.param([1, harmonics], data: [Float](repeating: 0.0, count: harmonics))
+    let ampsA = sigmoid(timeTensor.matmul(wA) + bA)
+    let playheadA = Signal.phasor(DGenConfig.sampleRate / Float(frames)) * Float(controlFrames - 1)
+    var predA = Signal.constant(0.0)
+    for h in 0..<harmonics {
+      let amp = ampsA.peek(playheadA, channel: Signal.constant(Float(h)))
+      let osc = sin(Signal.phasor(Float(80 + h * 20)) * 2.0 * Float.pi)
+      predA = predA + amp * osc
     }
+    let lossA = mse(predA, Signal.constant(0.0))
+    let analysis = try lossA.analyze(backward: true, frames: frames)
 
-    let legacy = try runMode(label: "legacy_drop", dropPeekTensorInputGradient: true)
-    let fixed = try runMode(label: "fixed_upstream", dropPeekTensorInputGradient: false)
-
-    let legacyScalar = legacy.analysis.kernels.filter { $0.frameOrder == .sequential }
-    let fixedScalar = fixed.analysis.kernels.filter { $0.frameOrder == .sequential }
-    let legacyScalarWork = legacyScalar.reduce(0) { $0 + $1.work }
-    let fixedScalarWork = fixedScalar.reduce(0) { $0 + $1.work }
-
-    print("=== Peek Backward A/B Analytics ===")
-    print(
-      "legacy(drop=true): kernels=\(legacy.analysis.kernelCount) work=\(legacy.analysis.work) span=\(legacy.analysis.span) "
-        + "scalarKernels=\(legacyScalar.count) scalarWork=\(legacyScalarWork) "
-        + "gradL2=\(legacy.gradL2) gradNZ=\(legacy.gradNZ)"
+    // ---------- Runtime backward pass for gradient magnitude ----------
+    LazyGraphContext.reset()
+    let timeTensorB = Tensor(timeRows)
+    let wB = Tensor.param(
+      [1, harmonics],
+      data: (0..<harmonics).map { i in
+        let x = Float(i) / Float(max(1, harmonics - 1))
+        return 0.1 * Foundation.sin(x * 3.0 * Float.pi)
+      }
     )
-    print(
-      "fixed(drop=false): kernels=\(fixed.analysis.kernelCount) work=\(fixed.analysis.work) span=\(fixed.analysis.span) "
-        + "scalarKernels=\(fixedScalar.count) scalarWork=\(fixedScalarWork) "
-        + "gradL2=\(fixed.gradL2) gradNZ=\(fixed.gradNZ)"
-    )
-    print("legacy kernels: /tmp/peek_ab_legacy_drop.metal")
-    print("fixed kernels: /tmp/peek_ab_fixed_upstream.metal")
+    let bB = Tensor.param([1, harmonics], data: [Float](repeating: 0.0, count: harmonics))
+    let ampsB = sigmoid(timeTensorB.matmul(wB) + bB)
+    let playheadB = Signal.phasor(DGenConfig.sampleRate / Float(frames)) * Float(controlFrames - 1)
+    var predB = Signal.constant(0.0)
+    for h in 0..<harmonics {
+      let amp = ampsB.peek(playheadB, channel: Signal.constant(Float(h)))
+      let osc = sin(Signal.phasor(Float(80 + h * 20)) * 2.0 * Float.pi)
+      predB = predB + amp * osc
+    }
+    let lossB = mse(predB, Signal.constant(0.0))
+    _ = try lossB.backward(frames: frames)
 
-    XCTAssertGreaterThan(legacy.analysis.kernelCount, 0)
-    XCTAssertGreaterThan(fixed.analysis.kernelCount, 0)
+    let gradData = wB.grad?.getData() ?? []
+    let gradL2 = Foundation.sqrt(gradData.reduce(0.0) { $0 + $1 * $1 })
+    let gradNZ = gradData.filter { $0 != 0 && $0.isFinite }.count
+
+    let scalarKernels = analysis.kernels.filter { $0.frameOrder == .sequential }
+    let scalarWork = scalarKernels.reduce(0) { $0 + $1.work }
+
+    print("=== Peek Backward Analytics ===")
+    print(
+      "kernels=\(analysis.kernelCount) work=\(analysis.work) span=\(analysis.span) "
+        + "scalarKernels=\(scalarKernels.count) scalarWork=\(scalarWork) "
+        + "gradL2=\(gradL2) gradNZ=\(gradNZ)"
+    )
+    print("kernels: /tmp/peek_ab_fixed_upstream.metal")
+
+    XCTAssertGreaterThan(analysis.kernelCount, 0)
+    XCTAssertGreaterThan(gradNZ, 0, "Expected non-zero gradients")
   }
 
   func testPeekRowTensorPhasorKernelAnalytics() throws {
@@ -296,8 +273,6 @@ final class KernelAnalysisTests: XCTestCase {
 
       DGenConfig.sampleRate = 4000.0
       DGenConfig.maxFrameCount = 512
-      DGenConfig.useDeterministicPeekGradients = false
-      DGenConfig.dropPeekTensorInputGradient = false
 
       let kernelPath = "/tmp/peek_tensor_phasor_\(label).metal"
       DGenConfig.kernelOutputPath = kernelPath

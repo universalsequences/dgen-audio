@@ -63,7 +63,13 @@ extension TemporalityPass {
       }
 
       let hasFrameBasedInput = node.inputs.contains { inputId in
-        frameBasedNodes.contains(inputId) && !hopProducingNodes.keys.contains(inputId)
+        // Global reduction ops (sampleGradReduce, peekGradReduce, etc.)
+        // aggregate across ALL frames internally. Their output is static,
+        // so they should not propagate frame-based temporality downstream.
+        if let inputNode = graph.nodes[inputId], isGlobalReductionOp(inputNode.op) {
+          return false
+        }
+        return frameBasedNodes.contains(inputId) && !hopProducingNodes.keys.contains(inputId)
       }
       if hasFrameBasedInput {
         frameBasedNodes.insert(nodeId)

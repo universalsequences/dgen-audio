@@ -1120,107 +1120,48 @@ extension LazyOp {
       let gradCell = getOrCreateGradCell(g, tensorInput: tensorInput, totalSize: totalSize)
       let zero = g.n(.constant(0.0), [])
 
-      if false {  //DGenGradientConfig.useDeterministicPeekGradients {
-        // Deterministic two-phase write+reduce:
-        // 1) write per-frame grad + interpolation metadata
-        // 2) reduce over frames to build tensor gradient
-        let gradWriteCell = g.alloc(vectorWidth: g.maxFrameCount)
-        let floorPosCell = g.alloc(vectorWidth: g.maxFrameCount)
-        let nextPosCell = g.alloc(vectorWidth: g.maxFrameCount)
-        let fracCell = g.alloc(vectorWidth: g.maxFrameCount)
+      // Two-phase write+reduce:
+      // 1) write per-frame grad + interpolation metadata
+      // 2) reduce over frames to build tensor gradient
+      let gradWriteCell = g.alloc(vectorWidth: g.maxFrameCount)
+      let floorPosCell = g.alloc(vectorWidth: g.maxFrameCount)
+      let nextPosCell = g.alloc(vectorWidth: g.maxFrameCount)
+      let fracCell = g.alloc(vectorWidth: g.maxFrameCount)
 
-        let writeOp = g.n(
-          .peekGradWrite(
-            gradWriteCell: gradWriteCell,
-            floorPosCell: floorPosCell,
-            nextPosCell: nextPosCell,
-            fracCell: fracCell,
-            channelSize: channelSize,
-            numChannels: numChannels,
-            maxFrameCount: g.maxFrameCount
-          ),
-          [gradOutput, node.inputs[1], node.inputs[2]]
-        )
-        g.addGradientSideEffect(writeOp)
+      let writeOp = g.n(
+        .peekGradWrite(
+          gradWriteCell: gradWriteCell,
+          floorPosCell: floorPosCell,
+          nextPosCell: nextPosCell,
+          fracCell: fracCell,
+          channelSize: channelSize,
+          numChannels: numChannels,
+          maxFrameCount: g.maxFrameCount
+        ),
+        [gradOutput, node.inputs[1], node.inputs[2]]
+      )
+      g.addGradientSideEffect(writeOp)
 
-        let reduceOp = g.n(
-          .peekGradReduce(
-            gradWriteCell: gradWriteCell,
-            floorPosCell: floorPosCell,
-            nextPosCell: nextPosCell,
-            fracCell: fracCell,
-            gradCell: gradCell,
-            totalSize: totalSize,
-            maxFrameCount: g.maxFrameCount
-          ),
-          [writeOp]
-        )
-        g.addGradientSideEffect(reduceOp)
-
-        let sequencedGrad = createSequencedGradTensor(
-          g,
+      let reduceOp = g.n(
+        .peekGradReduce(
+          gradWriteCell: gradWriteCell,
+          floorPosCell: floorPosCell,
+          nextPosCell: nextPosCell,
+          fracCell: fracCell,
           gradCell: gradCell,
-          shape: originalShape,
-          afterOp: reduceOp
-        )
-        return [sequencedGrad, zero, zero]
-      }
+          totalSize: totalSize,
+          maxFrameCount: g.maxFrameCount
+        ),
+        [writeOp]
+      )
+      g.addGradientSideEffect(reduceOp)
 
-      // Legacy fast scatter path:
-      // dL/d(tensor[pos1]) += gradOut * (1-frac)
-      // dL/d(tensor[pos2]) += gradOut * frac
-      let index = node.inputs[1]
-      let channel = node.inputs[2]
-      let one = g.n(.constant(1.0), [])
-      let channelSizeFloat = g.n(.constant(Float(channelSize)), [])
-
-      let wrappedIndex = g.n(.mod, [index, channelSizeFloat])
-      let isNegative = g.n(.lt, [wrappedIndex, zero])
-      let positiveIndex = g.n(
-        .gswitch, [isNegative, g.n(.add, [wrappedIndex, channelSizeFloat]), wrappedIndex])
-
-      let numChannelsMinusOne = g.n(.constant(Float(numChannels - 1)), [])
-      let clampedChannel = g.n(
-        .floor, [g.n(.max, [zero, g.n(.min, [channel, numChannelsMinusOne])])])
-      let channelOffset = g.n(.mul, [channelSizeFloat, clampedChannel])
-
-      let finalReadPos = g.n(.add, [channelOffset, positiveIndex])
-      let flooredPos = g.n(.floor, [finalReadPos])
-      let frac = g.n(.sub, [finalReadPos, flooredPos])
-
-      let nextPos = g.n(.add, [flooredPos, one])
-      let nextChannelOffset = g.n(.add, [channelOffset, channelSizeFloat])
-      let nextPosWrapped = g.n(
-        .gswitch, [g.n(.gte, [nextPos, nextChannelOffset]), channelOffset, nextPos])
-
-      let oneMinusFrac = g.n(.sub, [one, frac])
-      let grad1 = g.n(.mul, [gradOutput, oneMinusFrac])
-      let grad2 = g.n(.mul, [gradOutput, frac])
-
-      let scatter1 = g.n(.memoryAccumulate(gradCell), [flooredPos, grad1])
-      let scatter2 = g.n(.memoryAccumulate(gradCell), [nextPosWrapped, grad2])
-      g.addGradientSideEffect(scatter1)
-      g.addGradientSideEffect(scatter2)
-
-      if DGenGradientConfig.dropPeekTensorInputGradient {
-        // Legacy behavior (fast but wrong for upstream learning): accumulate into grad cell
-        // for direct tensor params, but do not return a tensor-input gradient node.
-        return [nil, zero, zero]
-      }
-
-      // Keep the fast scatter accumulation path, but also return a proper tensor gradient
-      // for upstream backpropagation. Without this, peek() acts as a gradient sink and
-      // decoder weights upstream of tensor-producing ops (e.g., matmul -> sigmoid -> peek)
-      // receive no gradients.
-      let scatterDone = g.n(.seq, [scatter1, scatter2])
       let sequencedGrad = createSequencedGradTensor(
         g,
         gradCell: gradCell,
         shape: originalShape,
-        afterOp: scatterDone
+        afterOp: reduceOp
       )
-      g.accumulatedGradProxyCellByNode[sequencedGrad] = gradCell
-
       return [sequencedGrad, zero, zero]
 
     // MARK: Logical ops (non-differentiable)
