@@ -252,7 +252,8 @@ extension LazyOp {
       try emitSpectralLoss(b: b, ctx: ctx, g: g, node: node, inputs: inputs)
 
     case .selectRow, .peekRowInline, .selectRowGradWrite, .selectRowGradReduce,
-      .peekRowGradWrite, .peekRowGradReduce, .peekGradWrite, .peekGradReduce:
+      .peekRowGradWrite, .peekRowGradReduce, .peekGradWrite, .peekGradReduce,
+      .sampleInline, .sampleGradWrite, .sampleGradReduce:
       try emitRowSelection(b: b, ctx: ctx, g: g, node: node, inputs: inputs, nodeId: nodeId)
 
     case .overlapAdd, .overlapAddGradStore, .overlapAddGradGather,

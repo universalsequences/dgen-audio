@@ -719,6 +719,35 @@ extension SignalTensor {
   }
 }
 
+/// Sample along axis 0 with interpolation. Reduces rank by 1.
+/// Index is in raw [0, D0) space. Integer = exact row, fractional = lerp.
+extension Tensor {
+  public func sample(_ index: Signal) -> SignalTensor {
+    guard shape.count >= 2 else {
+      fatalError("sample requires at least 2D tensor, got shape \(shape)")
+    }
+    let remainingShape = Array(shape.dropFirst())
+    let nodeId = try! graph.graph.sample(tensor: self.nodeId, index: index.nodeId)
+    return SignalTensor(
+      nodeId: nodeId, graph: graph, shape: remainingShape,
+      requiresGrad: requiresGrad || index.requiresGrad)
+  }
+}
+
+/// Sample along axis 0 with interpolation on SignalTensor. Reduces rank by 1.
+extension SignalTensor {
+  public func sample(_ index: Signal) -> SignalTensor {
+    guard shape.count >= 2 else {
+      fatalError("sample requires at least 2D tensor, got shape \(shape)")
+    }
+    let remainingShape = Array(shape.dropFirst())
+    let nodeId = try! graph.graph.sample(tensor: self.nodeId, index: index.nodeId)
+    return SignalTensor(
+      nodeId: nodeId, graph: graph, shape: remainingShape,
+      requiresGrad: requiresGrad || index.requiresGrad)
+  }
+}
+
 // MARK: - Audio Effects (Signal)
 
 extension Signal {

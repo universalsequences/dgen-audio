@@ -378,6 +378,232 @@ extension LazyOp {
 
       b.use(val: zero)
 
+    case .sampleInline(let scratchCell, let numRows, let remainingShape):
+      // Interpolated sampling along axis 0 for any-rank tensor.
+      // Inputs: [tensorND, index], Output: tensor with remainingShape
+      guard node.inputs.count == 2 else {
+        throw DGenError.insufficientInputs(
+          operator: "sampleInline", expected: 2, actual: node.inputs.count)
+      }
+
+      let tensorInput = node.inputs[0]
+      guard let inTensorId = g.nodeToTensor[tensorInput],
+        let inTensor = g.tensors[inTensorId],
+        let outTensorId = g.nodeToTensor[node.id],
+        let outTensor = g.tensors[outTensorId],
+        let loopIdx = ctx.tensorIndices[nodeId]
+      else {
+        throw DGenError.tensorError(op: "sampleInline", reason: "missing tensor")
+      }
+
+      let remainingSize = remainingShape.reduce(1, *)
+      let rowIndex = try b.readInput(node, inputs, at: 1)
+      let numRowsFloat = b.constant(Float(numRows))
+      let remainingSizeFloat = b.constant(Float(remainingSize))
+      let zero = b.constant(0.0)
+      let one = b.constant(1.0)
+
+      // Wrap rowIndex with modulo and ensure positive
+      let wrappedIndex = b.mod(rowIndex, numRowsFloat)
+      let isNegative = wrappedIndex < zero
+      let positiveIndex = b.gswitch(isNegative, wrappedIndex + numRowsFloat, wrappedIndex)
+
+      // Compute floor/ceil indices for interpolation
+      let floorIndex = b.floor(positiveIndex)
+      let ceilIndex = floorIndex + one
+      let ceilWrapped = b.gswitch(ceilIndex >= numRowsFloat, zero, ceilIndex)
+      let frac = positiveIndex - floorIndex
+      let oneMinusFrac = one - frac
+
+      // Use currentFrameIndex for correct frame index in frame-aware tensor blocks
+      let frameIdx = b.currentFrameIndex()
+      let frameBase = frameIdx * remainingSizeFloat
+
+      // Use block's tensor index - each thread handles ONE element of remainingShape
+      let elemIdx = b.value(loopIdx, scalarType: .int)
+      // Decompose flat elem index to multi-dim indices for tensorRead
+      let remainingIndices = b.flatToMultiIndex(elemIdx, remainingShape)
+      let remainingIndicesFloat = remainingIndices.map { b.cast($0, to: .float) }
+
+      // tensorRead with [rowIndex] + remaining dims
+      let floorValue = b.tensorRead(inTensor, indices: [floorIndex] + remainingIndicesFloat)
+      let ceilValue = b.tensorRead(inTensor, indices: [ceilWrapped] + remainingIndicesFloat)
+
+      // Interpolate: (1 - frac) * floor + frac * ceil
+      let interpolated = oneMinusFrac * floorValue + frac * ceilValue
+      let elemIdxFloat = b.cast(elemIdx, to: .float)
+      let writePos = frameBase + elemIdxFloat
+      _ = b.memoryWrite(scratchCell, b.cast(writePos, to: .int), interpolated)
+
+      // Write to output tensor with appropriate addressing
+      if ctx.frameAwareTensorCells.contains(outTensor.cellId) {
+        _ = b.memoryWrite(outTensor.cellId, b.cast(writePos, to: .int), interpolated)
+      } else {
+        _ = b.memoryWrite(outTensor.cellId, b.cast(elemIdx, to: .int), interpolated)
+      }
+
+      ctx.values[nodeId] = .empty
+
+    case .sampleGradWrite(
+      let floorGradCell, let ceilGradCell, let rowIdxCell, let fracCell,
+      let numRows, let remainingShape, let maxFrameCount):
+      // Write gradients for both floor and ceil rows to frame-indexed storage
+      // Inputs: [gradOutput (tensor or scalar), index]
+      guard node.inputs.count == 2 else {
+        throw DGenError.insufficientInputs(
+          operator: "sampleGradWrite", expected: 2, actual: node.inputs.count)
+      }
+
+      let remainingSize = remainingShape.reduce(1, *)
+      let gradTensorInput = node.inputs[0]
+
+      // Check if gradient input is a tensor or scalar
+      let gradCellId: CellID?
+      if let gradTensorId = g.nodeToTensor[gradTensorInput],
+        let gradTensor = g.tensors[gradTensorId]
+      {
+        gradCellId = gradTensor.cellId
+      } else {
+        gradCellId = nil
+      }
+
+      let scalarGrad = b.value(inputs[0])
+
+      // Read index and compute interpolation params
+      let rowIndex = try b.readInput(node, inputs, at: 1)
+      let numRowsFloat = b.constant(Float(numRows))
+      let remainingSizeFloat = b.constant(Float(remainingSize))
+      let zero = b.constant(0.0)
+      let one = b.constant(1.0)
+
+      let wrappedIndex = b.mod(rowIndex, numRowsFloat)
+      let isNegative = wrappedIndex < zero
+      let positiveIndex = b.gswitch(isNegative, wrappedIndex + numRowsFloat, wrappedIndex)
+
+      let floorIndex = b.floor(positiveIndex)
+      let ceilIndex = floorIndex + one
+      let ceilWrapped = b.gswitch(ceilIndex >= numRowsFloat, zero, ceilIndex)
+      let frac = positiveIndex - floorIndex
+
+      let frameIdx = b.frameIndex()
+
+      // Write row indices and frac for this frame
+      _ = b.memoryWrite(rowIdxCell, b.cast(frameIdx, to: .int), floorIndex)
+      _ = b.memoryWrite(fracCell, b.cast(frameIdx, to: .int), frac)
+      let ceilSlot = frameIdx + b.constant(Float(maxFrameCount))
+      _ = b.memoryWrite(rowIdxCell, b.cast(ceilSlot, to: .int), ceilWrapped)
+
+      // Write weighted gradients for floor and ceil
+      let oneMinusFrac = one - frac
+      let frameBase = frameIdx * remainingSizeFloat
+
+      b.parallelRange(remainingSize) { elemIdx in
+        let elemIdxFloat = b.cast(elemIdx, to: .float)
+        let gradValue: Expr
+        if let cellId = gradCellId {
+          let readPos = frameBase + elemIdxFloat
+          gradValue = b.memoryRead(cellId, b.cast(readPos, to: .int))
+        } else {
+          gradValue = scalarGrad
+        }
+        let writePos = frameBase + elemIdxFloat
+        let floorGrad = gradValue * oneMinusFrac
+        _ = b.memoryWrite(floorGradCell, b.cast(writePos, to: .int), floorGrad)
+        let ceilGrad = gradValue * frac
+        _ = b.memoryWrite(ceilGradCell, b.cast(writePos, to: .int), ceilGrad)
+      }
+
+      b.use(val: zero)
+
+    case .sampleGradReduce(
+      let floorGradCell, let ceilGradCell, let rowIdxCell, _,
+      let gradCell, let numRows, let remainingShape, let maxFrameCount):
+      // Sum gradient contributions from all frames for each tensor position
+      guard node.inputs.count == 1 else {
+        throw DGenError.insufficientInputs(
+          operator: "sampleGradReduce", expected: 1, actual: node.inputs.count)
+      }
+
+      _ = b.value(inputs[0])  // Force dependency on write pass
+
+      let remainingSize = remainingShape.reduce(1, *)
+      let remainingSizeInt = b.intConstant(remainingSize)
+      let remainingSizeFloat = b.constant(Float(remainingSize))
+      let zero = b.constant(0.0)
+      let maxFrameCountFloat = b.constant(Float(maxFrameCount))
+      let frameCount = b.frameCount()
+
+      if DGenGradientConfig.useFastPeekRowGradReduce {
+        // Fast scatter-add path: parallelize over (frame, elem)
+        let maxRow = b.constant(Float(Swift.max(0, numRows - 1)))
+        let totalElems = maxFrameCount * remainingSize
+        b.parallelRange(totalElems) { flatIdx in
+          let frameIdx = flatIdx / remainingSizeInt
+          let elemIdx = flatIdx - frameIdx * remainingSizeInt
+          let frameFloat = b.cast(frameIdx, to: .float)
+          let elemFloat = b.cast(elemIdx, to: .float)
+          let inBounds = frameFloat < frameCount
+          let readPos = frameFloat * remainingSizeFloat + elemFloat
+
+          // Floor contribution
+          let floorRowRaw = b.memoryRead(rowIdxCell, b.cast(frameIdx, to: .int))
+          let floorRowRounded = b.floor(floorRowRaw + b.constant(0.5))
+          let floorRow = b.min(b.max(floorRowRounded, zero), maxRow)
+          let floorGrad = b.memoryRead(floorGradCell, b.cast(readPos, to: .int))
+          let floorContrib = b.gswitch(inBounds > zero, floorGrad, zero)
+          let floorDest = floorRow * remainingSizeFloat + elemFloat
+          _ = b.memoryAccumulate(gradCell, b.cast(floorDest, to: .int), floorContrib)
+
+          // Ceil contribution
+          let ceilSlot = frameFloat + maxFrameCountFloat
+          let ceilRowRaw = b.memoryRead(rowIdxCell, b.cast(ceilSlot, to: .int))
+          let ceilRowRounded = b.floor(ceilRowRaw + b.constant(0.5))
+          let ceilRow = b.min(b.max(ceilRowRounded, zero), maxRow)
+          let ceilGrad = b.memoryRead(ceilGradCell, b.cast(readPos, to: .int))
+          let ceilContrib = b.gswitch(inBounds > zero, ceilGrad, zero)
+          let ceilDest = ceilRow * remainingSizeFloat + elemFloat
+          _ = b.memoryAccumulate(gradCell, b.cast(ceilDest, to: .int), ceilContrib)
+        }
+      } else {
+        // Legacy row-bin scan path
+        let totalElems = numRows * remainingSize
+        b.parallelRange(totalElems) { flatIdx in
+          let rowIdx = flatIdx / remainingSizeInt
+          let elemIdx = flatIdx - rowIdx * remainingSizeInt
+          let rowFloat = b.cast(rowIdx, to: .float)
+          let elemFloat = b.cast(elemIdx, to: .float)
+          let gradSum = b.float(0.0)
+
+          b.loop(maxFrameCount) { frameIdx in
+            let frameFloat = b.cast(frameIdx, to: .float)
+            let inBounds = frameFloat < frameCount
+            let readPos = frameFloat * remainingSizeFloat + elemFloat
+
+            // Floor row contribution
+            let floorRow = b.memoryRead(rowIdxCell, b.cast(frameIdx, to: .int))
+            let isFloorMatch = b.abs(floorRow - rowFloat) < b.constant(0.5)
+            let floorGrad = b.memoryRead(floorGradCell, b.cast(readPos, to: .int))
+            let floorValid = inBounds * isFloorMatch
+            let floorContrib = b.gswitch(floorValid > zero, floorGrad, zero)
+            gradSum.accumulate(floorContrib)
+
+            // Ceil row contribution
+            let ceilSlot = frameFloat + maxFrameCountFloat
+            let ceilRow = b.memoryRead(rowIdxCell, b.cast(ceilSlot, to: .int))
+            let isCeilMatch = b.abs(ceilRow - rowFloat) < b.constant(0.5)
+            let ceilGrad = b.memoryRead(ceilGradCell, b.cast(readPos, to: .int))
+            let ceilValid = inBounds * isCeilMatch
+            let ceilContrib = b.gswitch(ceilValid > zero, ceilGrad, zero)
+            gradSum.accumulate(ceilContrib)
+          }
+
+          let destPos = rowFloat * remainingSizeFloat + elemFloat
+          _ = b.memoryAccumulate(gradCell, b.cast(destPos, to: .int), gradSum.value)
+        }
+      }
+
+      b.use(val: zero)
+
     case .peekGradWrite(
       let gradWriteCell, let floorPosCell, let nextPosCell, let fracCell,
       let channelSize, let numChannels, _):

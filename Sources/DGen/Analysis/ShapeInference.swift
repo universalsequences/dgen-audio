@@ -172,6 +172,9 @@ public func inferShape(op: LazyOp, inputs: [ValueShape], graph: Graph) throws ->
   case .peekRowInline(_, _, let numCols):
     return .tensor([numCols])
 
+  case .sampleInline(_, _, let remainingShape):
+    return .tensor(remainingShape)
+
   case .overlapAdd(_, _, _, _, _):
     return .scalar
 
@@ -182,6 +185,9 @@ public func inferShape(op: LazyOp, inputs: [ValueShape], graph: Graph) throws ->
     return .scalar
 
   case .peekGradWrite(_, _, _, _, _, _, _), .peekGradReduce(_, _, _, _, _, _, _):
+    return .scalar
+
+  case .sampleGradWrite(_, _, _, _, _, _, _), .sampleGradReduce(_, _, _, _, _, _, _, _):
     return .scalar
 
   // Elementwise ops: broadcast tensor shapes, or inherit the single tensor shape, or scalar

@@ -140,6 +140,18 @@ public enum LazyOp {
   // selectRowGradWrite: write gradient to frame-indexed storage (deterministic, no atomics)
   // Input: [gradOutput (1D tensor), rowIndex]
   // Writes to gradWriteCell[frame * numCols + col] and rowIdxCell[frame]
+  // sampleInline: interpolated sampling along axis 0 for any-rank tensor (N >= 2)
+  // Input: [tensorND, index] where index is in [0, D0)
+  // Output: tensor with shape.dropFirst() — uses frame-indexed storage for SIMD safety
+  case sampleInline(scratchCell: CellID, numRows: Int, remainingShape: [Int])
+  // sampleGradWrite: write interpolation-weighted gradients to frame-indexed storage
+  case sampleGradWrite(
+    floorGradCell: CellID, ceilGradCell: CellID, rowIdxCell: CellID, fracCell: CellID,
+    numRows: Int, remainingShape: [Int], maxFrameCount: Int)
+  // sampleGradReduce: sum gradient contributions from all frames for each tensor position
+  case sampleGradReduce(
+    floorGradCell: CellID, ceilGradCell: CellID, rowIdxCell: CellID, fracCell: CellID,
+    gradCell: CellID, numRows: Int, remainingShape: [Int], maxFrameCount: Int)
   case selectRowGradWrite(gradWriteCell: CellID, rowIdxCell: CellID, numRows: Int, numCols: Int)
   // selectRowGradReduce: sum contributions from all frames for each tensor position
   // Input: [gradWritePass] (for ordering)

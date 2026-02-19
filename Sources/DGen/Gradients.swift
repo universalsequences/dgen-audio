@@ -563,7 +563,7 @@ extension LazyOp {
       result = g.n(.reshape(inputShape), [result])
       return [result]
 
-    case .repeatView(let repeats):
+    case .repeatView(_):
       // repeatView backward: sum over the repeated tiles to get gradient for original
       // For now, return the gradient (TODO: implement proper reduction for repeated dims)
       return [gradOutput]
@@ -572,9 +572,6 @@ extension LazyOp {
 
     case .phasor(_):
       // d(phase)/d(freq) = frameIndex / sampleRate
-      // Note: This requires frame index, which is tricky in graph form
-      // For now, we use a special gradPhasor op that handles this
-      let freq = node.inputs[0]
       let sampleRate = g.n(.constant(g.sampleRate), [])
       return [g.n(.gradPhasor(node.id), [gradOutput, sampleRate])]
 
@@ -948,7 +945,68 @@ extension LazyOp {
       let zero = g.n(.constant(0.0), [])
       return [sequencedGrad, zero]
 
-    case .peekRowGradWrite(_, _, _, _, _, _, _), .peekRowGradReduce(_, _, _, _, _, _, _, _),
+    case .sampleInline(_, let numRows, let remainingShape):
+      // sampleInline(tensorND, index) -> tensor with remainingShape
+      // Gradient scatters to both floor and ceil rows with interpolation weights
+      guard node.inputs.count == 2 else {
+        return [nil, nil]
+      }
+
+      let tensorInput = node.inputs[0]
+      guard let inputNode = g.nodes[tensorInput],
+        case .tensor(let shape) = inputNode.shape,
+        shape.count >= 2
+      else {
+        let zero = g.n(.constant(0.0), [])
+        return [nil, zero]
+      }
+
+      let remainingSize = remainingShape.reduce(1, *)
+      let totalSize = numRows * remainingSize
+
+      let gradCell = getOrCreateGradCell(g, tensorInput: tensorInput, totalSize: totalSize)
+
+      // Allocate frame-indexed storage
+      let floorGradCell = g.alloc(vectorWidth: g.maxFrameCount * remainingSize)
+      let ceilGradCell = g.alloc(vectorWidth: g.maxFrameCount * remainingSize)
+      let rowIdxCell = g.alloc(vectorWidth: g.maxFrameCount * 2)
+      let fracCell = g.alloc(vectorWidth: g.maxFrameCount)
+
+      // Phase 1: Write weighted gradients to frame-indexed storage
+      let rowIndex = node.inputs[1]
+      let writeOp = g.n(
+        .sampleGradWrite(
+          floorGradCell: floorGradCell,
+          ceilGradCell: ceilGradCell,
+          rowIdxCell: rowIdxCell,
+          fracCell: fracCell,
+          numRows: numRows,
+          remainingShape: remainingShape,
+          maxFrameCount: g.maxFrameCount
+        ), [gradOutput, rowIndex])
+      g.addGradientSideEffect(writeOp)
+
+      // Phase 2: Reduce across frames
+      let reduceOp = g.n(
+        .sampleGradReduce(
+          floorGradCell: floorGradCell,
+          ceilGradCell: ceilGradCell,
+          rowIdxCell: rowIdxCell,
+          fracCell: fracCell,
+          gradCell: gradCell,
+          numRows: numRows,
+          remainingShape: remainingShape,
+          maxFrameCount: g.maxFrameCount
+        ), [writeOp])
+      g.addGradientSideEffect(reduceOp)
+
+      let sequencedGrad = createSequencedGradTensor(
+        g, gradCell: gradCell, shape: shape, afterOp: reduceOp)
+      let zero = g.n(.constant(0.0), [])
+      return [sequencedGrad, zero]
+
+    case .sampleGradWrite(_, _, _, _, _, _, _), .sampleGradReduce(_, _, _, _, _, _, _, _),
+      .peekRowGradWrite(_, _, _, _, _, _, _), .peekRowGradReduce(_, _, _, _, _, _, _, _),
       .peekGradWrite(_, _, _, _, _, _, _), .peekGradReduce(_, _, _, _, _, _, _),
       .overlapAddGradStore(_), .overlapAddGradGather(_, _, _, _),
       .bufferViewGradStore(_, _), .bufferViewGradRead(_, _):
@@ -1118,12 +1176,11 @@ extension LazyOp {
       let zero = g.n(.constant(0.0), [])
       return [zero, zero]
 
-    // MARK: Gradient-specific ops (should not appear in forward graph)
+    // MARK: Non-differentiable compute ops
 
     case .gradPhasor(_), .gradDeterministicPhasor, .gemm(_, _, _, _, _), .sumMulAxis0,
       .gemmSmall(_, _, _, _, _),
       .gemmChunkPartials(_, _, _, _, _, _, _), .chunkPartialsReduceToCell(_, _, _, _, _):
-      // These are gradient ops, shouldn't need their own gradients
       return node.inputs.map { _ in nil }
     }
   }

@@ -700,4 +700,23 @@ extension Graph {
       [tensor, rowIndex], shape: .tensor([numCols]))
   }
 
+  /// Generalized sampling along axis 0 with interpolation for any-rank tensor (N >= 2).
+  /// Input index is in raw [0, D0) space. Integer = exact row, fractional = lerp.
+  public func sample(tensor: NodeID, index: NodeID) throws -> NodeID {
+    guard let tensorNode = nodes[tensor],
+      case .tensor(let shape) = tensorNode.shape,
+      shape.count >= 2
+    else {
+      throw DGenError.tensorError(op: "sample", reason: "requires at least 2D tensor input")
+    }
+    let numRows = shape[0]
+    let remainingShape = Array(shape.dropFirst())
+    let remainingSize = remainingShape.reduce(1, *)
+    let scratchCell = alloc(vectorWidth: maxFrameCount * remainingSize)
+
+    return n(
+      .sampleInline(scratchCell: scratchCell, numRows: numRows, remainingShape: remainingShape),
+      [tensor, index], shape: .tensor(remainingShape))
+  }
+
 }
