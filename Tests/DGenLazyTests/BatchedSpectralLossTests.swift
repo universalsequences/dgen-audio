@@ -113,7 +113,8 @@ final class BatchedSpectralLossTests: XCTestCase {
       for i in 0..<grad.count {
         XCTAssertFalse(grad[i].isNaN, "Gradient[\(i)] should not be NaN")
         XCTAssertFalse(grad[i].isInfinite, "Gradient[\(i)] should not be infinite")
-        XCTAssertNotEqual(grad[i], 0.0, accuracy: 1e-10,
+        XCTAssertNotEqual(
+          grad[i], 0.0, accuracy: 1e-10,
           "Gradient[\(i)] should be non-zero, got \(grad[i])")
       }
     }
@@ -136,7 +137,8 @@ final class BatchedSpectralLossTests: XCTestCase {
     let values = try loss.backward(frames: frameCount)
     let avg = values.reduce(0, +) / Float(values.count)
 
-    XCTAssertEqual(Double(avg), 0.0, accuracy: 0.01,
+    XCTAssertEqual(
+      Double(avg), 0.0, accuracy: 0.01,
       "Identical batched signals should give near-zero loss, got \(avg)")
   }
 
@@ -153,7 +155,8 @@ final class BatchedSpectralLossTests: XCTestCase {
     let values = try loss.backward(frames: frameCount)
     let avg = values.reduce(0, +) / Float(values.count)
 
-    XCTAssertGreaterThan(avg, 0.1,
+    XCTAssertGreaterThan(
+      avg, 0.1,
       "Different batched signals should give non-zero loss, got \(avg)")
   }
 
@@ -239,7 +242,8 @@ final class BatchedSpectralLossTests: XCTestCase {
       optimizer.zeroGrad()
     }
 
-    XCTAssertGreaterThan(losses.first!, losses.last!,
+    XCTAssertGreaterThan(
+      losses.first!, losses.last!,
       "Scalar loss should decrease: first=\(losses.first!), last=\(losses.last!)")
   }
 
@@ -288,11 +292,131 @@ final class BatchedSpectralLossTests: XCTestCase {
     }
 
     // Loss should decrease from first to last epoch
-    XCTAssertGreaterThan(losses.first!, losses.last!,
+    XCTAssertGreaterThan(
+      losses.first!, losses.last!,
       "Loss should decrease: first=\(losses.first!), last=\(losses.last!), all=\(losses)")
     // At least 30% reduction over 20 epochs
-    XCTAssertLessThan(losses.last!, losses.first! * 0.7,
+    XCTAssertLessThan(
+      losses.last!, losses.first! * 0.7,
       "Loss should decrease by at least 30%: first=\(losses.first!), last=\(losses.last!)")
+  }
+
+  // MARK: - Batched harmonic synth → batched spectral loss
+
+  /// Core batch-synth pipeline: [B, K] frequencies → statefulPhasor → sin → sumAxis → [B] signal
+  /// → batched spectral loss. This is the critical path for batched DDSP training.
+  func testBatchedHarmonicSynthProducesCorrectShapes() throws {
+    let frameCount = 256
+    let windowSize = 64
+    let twoPi = Float.pi * 2.0
+    let B = 2
+    let K = 3
+
+    configure(frames: frameCount)
+
+    // [B, K] frequencies: batch 0 = harmonics of 100Hz, batch 1 = harmonics of 150Hz
+    let freqs = Tensor([
+      [100.0, 200.0, 300.0],
+      [150.0, 300.0, 450.0],
+    ])  // [B=2, K=3]
+
+    // Build student with learnable [B, K] amplitudes
+    let ampParam = Tensor.param(
+      [B, K],
+      data: [
+        0.5, 0.3, 0.2,
+        0.4, 0.6, 0.1,
+      ])
+
+    let phases = SignalTensor.phasor(freqs)  // [B, K]
+    let sines = sin(phases * twoPi)  // [B, K]
+    let weighted = sines * ampParam  // [B, K]
+    let student = weighted.sum(axis: 1)  // [B] — sum harmonics
+
+    // Teacher: same freqs, different amps
+    let teacherAmps = Tensor([
+      [1.0, 0.5, 0.25],
+      [0.8, 0.4, 0.2],
+    ])  // [B=2, K=3]
+    let teacherSines = sin(SignalTensor.phasor(freqs) * twoPi) * teacherAmps
+    let teacher = teacherSines.sum(axis: 1)  // [B]
+
+    let loss = spectralLossFFT(student, teacher, windowSize: windowSize)
+    let values = try loss.backward(frames: frameCount)
+    let avg = values.reduce(0, +) / Float(values.count)
+
+    XCTAssertGreaterThan(avg, 0.0, "Loss should be positive, got \(avg)")
+    XCTAssertFalse(avg.isNaN, "Loss should not be NaN")
+
+    let grad = ampParam.grad?.getData()
+    XCTAssertNotNil(grad, "Should have gradients")
+    if let grad = grad {
+      XCTAssertEqual(grad.count, B * K, "Should have B*K=\(B*K) gradient values, got \(grad.count)")
+      for i in 0..<grad.count {
+        XCTAssertFalse(grad[i].isNaN, "Gradient[\(i)] should not be NaN")
+        XCTAssertFalse(grad[i].isInfinite, "Gradient[\(i)] should not be infinite")
+      }
+    }
+  }
+
+  /// Train [B, K] amplitude parameters via batched harmonic synth + spectral loss.
+  func testBatchedHarmonicSynthTrainingReducesLoss() throws {
+    let frameCount = 256
+    let windowSize = 64
+    let twoPi = Float.pi * 2.0
+
+    configure(frames: frameCount)
+
+    // Create 2D tensors directly (not via reshape) so they survive graph clear
+    let freqs = Tensor([
+      [100.0, 200.0, 300.0],
+      [150.0, 300.0, 450.0],
+    ])  // [B=2, K=3]
+
+    // Learnable amps start at 0.5 uniform, target is non-uniform
+    let ampParam = Tensor.param(
+      [2, 3],
+      data: [
+        0.5, 0.5, 0.5,
+        0.5, 0.5, 0.5,
+      ])
+    ampParam.minBound = 0.01
+    ampParam.maxBound = 2.0
+
+    let teacherAmps = Tensor([
+      [1.0, 0.5, 0.25],
+      [0.8, 0.4, 0.2],
+    ])  // [B=2, K=3]
+
+    let optimizer = Adam(params: [ampParam], lr: 0.005)
+
+    // Warmup
+    do {
+      let student = sin(SignalTensor.phasor(freqs) * twoPi) * ampParam
+      let teacher = sin(SignalTensor.phasor(freqs) * twoPi) * teacherAmps
+      let loss = spectralLossFFT(
+        student.sum(axis: 1), teacher.sum(axis: 1), windowSize: windowSize)
+      _ = try loss.backward(frames: frameCount)
+      optimizer.zeroGrad()
+    }
+
+    var losses: [Float] = []
+    for _ in 0..<20 {
+      let student = sin(SignalTensor.phasor(freqs) * twoPi) * ampParam
+      let teacher = sin(SignalTensor.phasor(freqs) * twoPi) * teacherAmps
+
+      // batched spectral loss
+      let loss = spectralLossFFT(
+        student.sum(axis: 1), teacher.sum(axis: 1), windowSize: windowSize)
+      let values = try loss.backward(frames: frameCount)
+      losses.append(values.reduce(0, +) / Float(values.count))
+      optimizer.step()
+      optimizer.zeroGrad()
+    }
+
+    XCTAssertGreaterThan(
+      losses.first!, losses.last!,
+      "Loss should decrease: first=\(losses.first!), last=\(losses.last!)")
   }
 
   // MARK: - Hop support
