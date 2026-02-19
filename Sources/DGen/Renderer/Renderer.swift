@@ -45,6 +45,9 @@ public enum DispatchMode: Equatable {
   /// frameCount threads, threadGroupSize=1 (for kernels using threadgroup scratch memory)
   case perFrameThreadgroup1
 
+  /// frameCount × N threads, threadGroupSize=1 (for scaled kernels using threadgroup scratch)
+  case perFrameScaledThreadgroup1(Int)
+
   /// GEMM: 2D/3D threadgroup grid, 32 threads per group (one SIMD group).
   /// tilesM × tilesN × depth threadgroups, each handling one 8×8 output tile.
   /// When depth is nil, runtime frameCount is used (1 for static blocks).
@@ -58,6 +61,7 @@ extension DispatchMode {
     case .singleThreaded, .selfManaged: return 1
     case .perFrame, .perFrameThreadgroup1: return frameCount
     case .perFrameScaled(let n): return frameCount * max(1, n)
+    case .perFrameScaledThreadgroup1(let n): return frameCount * max(1, n)
     case .fixedWithFrameLoop(let n), .staticThreads(let n): return max(1, n)
     case .gemm(let tilesM, let tilesN, let depth):
       let d = depth ?? 1
@@ -69,7 +73,7 @@ extension DispatchMode {
   var hasRendererFrameLoop: Bool {
     switch self {
     case .singleThreaded, .fixedWithFrameLoop: return true
-    case .perFrame, .perFrameThreadgroup1, .perFrameScaled, .staticThreads, .selfManaged, .gemm:
+    case .perFrame, .perFrameThreadgroup1, .perFrameScaled, .perFrameScaledThreadgroup1, .staticThreads, .selfManaged, .gemm:
       return false
     }
   }
@@ -77,7 +81,8 @@ extension DispatchMode {
   /// Thread group size hint (1 for single-thread kernels, nil for runtime-determined)
   var threadGroupSize: Int? {
     switch self {
-    case .singleThreaded, .selfManaged, .perFrameThreadgroup1: return 1
+    case .singleThreaded, .selfManaged, .perFrameThreadgroup1, .perFrameScaledThreadgroup1:
+      return 1
     case .gemm: return 32
     default: return nil
     }
@@ -87,6 +92,7 @@ extension DispatchMode {
   var threadCountScale: Int? {
     switch self {
     case .perFrameScaled(let n): return n
+    case .perFrameScaledThreadgroup1(let n): return n
     case .staticThreads(let n) where n > 1: return n
     default: return nil
     }

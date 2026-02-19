@@ -209,7 +209,8 @@ extension Graph {
     let fft2Cell = alloc(vectorWidth: fftSize * batchSize * numHopWindows)
     let mag1Cell = alloc(vectorWidth: numBins * batchSize * numHopWindows)
     let mag2Cell = alloc(vectorWidth: numBins * batchSize * numHopWindows)
-    let scratchCell = alloc(vectorWidth: numBins * batchSize * numHopWindows)
+    // Stores one scalar loss per (hopWindow, batch element)
+    let scratchCell = alloc(vectorWidth: batchSize * numHopWindows)
 
     var inputs = [sig1, sig2, hannNode, twReNode, twImNode, bitRevNode]
     if hop > 1 {
@@ -221,7 +222,7 @@ extension Graph {
       inputs.append(counterAccum)
     }
 
-    return n(
+    let forward = n(
       .spectralLossFFTBatched(
         windowSize: windowSize,
         batchSize: batchSize,
@@ -234,6 +235,16 @@ extension Graph {
         mag2Cell: mag2Cell,
         scratchCell: scratchCell
       ), inputs)
+
+    // Reduce per-batch losses to scalar mean for this frame.
+    return n(
+      .spectralLossFFTBatchedReduce(
+        windowSize: windowSize,
+        batchSize: batchSize,
+        hop: hop,
+        scratchCell: scratchCell
+      ), [forward]
+    )
   }
 
   /// Delta: returns the difference between current and previous input value

@@ -128,10 +128,17 @@ public class MetalRenderer: Renderer, UOpEmitter {
         parallelCount.map { DispatchMode.staticThreads($0) }
         ?? scheduleItem.dispatchMode
 
-      // FFT kernels using threadgroup scratch need threadGroupSize=1 so each thread
+      // Kernels using threadgroup scratch need threadGroupSize=1 so each thread
       // gets its own on-chip scratch arrays (no sharing between threads).
       if Self.hasThreadgroupScratch(scheduleItem) {
-        finalDispatchMode = .perFrameThreadgroup1
+        switch finalDispatchMode {
+        case .perFrameScaled(let n):
+          finalDispatchMode = .perFrameScaledThreadgroup1(n)
+        case .perFrame:
+          finalDispatchMode = .perFrameThreadgroup1
+        default:
+          break
+        }
       }
 
       return CompiledKernel(
@@ -651,7 +658,7 @@ public class MetalRenderer: Renderer, UOpEmitter {
         scheduleItem.ops.append(beginRange)
         hasFrameLoop = true
 
-      case .perFrameScaled(let n):
+      case .perFrameScaled(let n), .perFrameScaledThreadgroup1(let n):
         if block.frameOrder == .sequential {
           // Sequential with scale: 1 thread loops over frameCount*scale iterations
           let beginRange = UOp(op: .beginRange(.constant(0, 0), .constant(0, 1)), value: .empty)

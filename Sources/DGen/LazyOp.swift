@@ -129,6 +129,13 @@ public enum LazyOp {
     mag2Cell: CellID,
     scratchCell: CellID
   )
+  // Reduce per-batch spectral losses written by spectralLossFFTBatched into scalar mean.
+  case spectralLossFFTBatchedReduce(
+    windowSize: Int,
+    batchSize: Int,
+    hop: Int,
+    scratchCell: CellID
+  )
   case spectralLossFFTBatchedGradSpec(
     windowSize: Int,
     batchSize: Int,

@@ -329,7 +329,8 @@ public struct CompilationPipeline {
       switch node.op {
       case .spectralLossFFT, .spectralLossFFTGradInline, .spectralLossFFTGradSpec,
         .spectralLossFFTGradIFFT, .spectralLossFFTGradRead, .spectralLossFFTGradRead2,
-        .spectralLossFFTBatched, .spectralLossFFTBatchedGradSpec, .spectralLossFFTBatchedGradIFFT,
+        .spectralLossFFTBatched, .spectralLossFFTBatchedReduce,
+        .spectralLossFFTBatchedGradSpec, .spectralLossFFTBatchedGradIFFT,
         .spectralLossFFTBatchedGradRead, .spectralLossFFTBatchedGradRead2:
         return true
       default:

@@ -690,7 +690,7 @@ extension LazyOp {
 
     case .spectralLossFFTBatched(
       let windowSize, let batchSize, let hop, _,
-      _, let fft1Cell, let fft2Cell, let mag1Cell, let mag2Cell, _):
+      _, let fft1Cell, let fft2Cell, let mag1Cell, let mag2Cell, let scratchCell):
       guard inputs.count >= 6 else {
         throw DGenError.insufficientInputs(
           operator: "spectralLossFFTBatched", expected: 6, actual: inputs.count)
@@ -720,7 +720,8 @@ extension LazyOp {
       let winSizeFloat = b.constant(Float(windowSize))
       let zero = b.constant(0.0)
       let one = b.constant(1.0)
-      let frameIdx = b.frameIndex()
+      let (frameIdx, batchIdx) = b.setupFlatThreading(tensorSize: batchSize)
+      let batchIdx_int = b.cast(batchIdx, to: .int)
       let frameCount = b.frameCount()
       let batchSizeInt = b.intConstant(batchSize)
 
@@ -731,7 +732,6 @@ extension LazyOp {
       let scratchTwIm = b.threadgroupScratch(windowSize - 1)
 
       let shouldRun = hopCounter.map { $0 == zero } ?? (one > zero)
-      let loss = b.float(0.0)
       b.if_(shouldRun) {
         // Load twiddle tables once
         let twiddleSize = windowSize - 1
@@ -854,27 +854,50 @@ extension LazyOp {
           }
         }
 
-        // Process each batch element sequentially (scratch reused)
-        b.loop(batchSize) { bIdx in
-          emitFFTInScratch(signalCell: sig1Cell, batchIdx: bIdx, fftCell: fft1Cell, magCell: mag1Cell)
-          emitFFTInScratch(signalCell: sig2Cell, batchIdx: bIdx, fftCell: fft2Cell, magCell: mag2Cell)
+        emitFFTInScratch(signalCell: sig1Cell, batchIdx: batchIdx, fftCell: fft1Cell, magCell: mag1Cell)
+        emitFFTInScratch(signalCell: sig2Cell, batchIdx: batchIdx, fftCell: fft2Cell, magCell: mag2Cell)
 
-          // Compute loss for this batch element (using hop-compressed mag offsets)
-          let batchIdx_int = b.cast(bIdx, to: .int)
-          let hopWindowIdx2 = hop > 1 ? frameIdx / b.intConstant(hop) : frameIdx
-          let frameBatch = hopWindowIdx2 * batchSizeInt + batchIdx_int
-          let magBaseOffset = frameBatch * b.intConstant(numBins)
-          b.loop(numBins) { k in
-            let kInt = b.cast(k, to: .int)
-            let mag1 = b.memoryRead(mag1Cell, magBaseOffset + kInt)
-            let mag2 = b.memoryRead(mag2Cell, magBaseOffset + kInt)
-            let diff = mag1 - mag2
-            loss.accumulate(diff * diff)
-          }
+        // Compute one loss value for this batch lane, then store for reduce-pass.
+        let hopWindowIdx2 = hop > 1 ? frameIdx / b.intConstant(hop) : frameIdx
+        let frameBatch = hopWindowIdx2 * batchSizeInt + batchIdx_int
+        let magBaseOffset = frameBatch * b.intConstant(numBins)
+        let batchLoss = b.float(0.0)
+        b.loop(numBins) { k in
+          let kInt = b.cast(k, to: .int)
+          let mag1 = b.memoryRead(mag1Cell, magBaseOffset + kInt)
+          let mag2 = b.memoryRead(mag2Cell, magBaseOffset + kInt)
+          let diff = mag1 - mag2
+          batchLoss.accumulate(diff * diff)
+        }
+        _ = b.memoryWrite(scratchCell, frameBatch, batchLoss.value)
+      }
+
+      // Side-effect only; scalar output is produced by spectralLossFFTBatchedReduce.
+      b.use(val: zero)
+
+    case .spectralLossFFTBatchedReduce(_, let batchSize, let hop, let scratchCell):
+      guard !inputs.isEmpty else {
+        throw DGenError.insufficientInputs(
+          operator: "spectralLossFFTBatchedReduce", expected: 1, actual: inputs.count)
+      }
+      let _ = b.value(inputs[0])  // sequencing dependency on write pass
+
+      let frameIdx = b.frameIndex()
+      let hopWindowIdx = hop > 1 ? frameIdx / b.intConstant(hop) : frameIdx
+      let batchSizeInt = b.intConstant(batchSize)
+      let hopInt = b.intConstant(hop)
+      let shouldRun = hop > 1 ? ((frameIdx % hopInt) == b.intConstant(0)) : (b.constant(1.0) > b.constant(0.0))
+      let loss = b.float(0.0)
+
+      b.if_(shouldRun) {
+        b.loop(batchSize) { bIdx in
+          let bIdxInt = b.cast(bIdx, to: .int)
+          let idx = hopWindowIdx * batchSizeInt + bIdxInt
+          let partial = b.memoryRead(scratchCell, idx)
+          loss.accumulate(partial)
         }
       }
 
-      // Mean across batches
       let batchSizeFloat = b.constant(Float(batchSize))
       b.use(val: loss.value / batchSizeFloat)
 
@@ -893,7 +916,8 @@ extension LazyOp {
       let gradOutput = b.value(inputs[0])
       let hopCounter: Expr? = inputs.count > 3 ? b.value(inputs[3]) : nil
       let eps = b.constant(1e-8)
-      let frameIdx = b.frameIndex()
+      let (frameIdx, batchIdx) = b.setupFlatThreading(tensorSize: batchSize)
+      let batchIdx_int = b.cast(batchIdx, to: .int)
       let zero = b.constant(0.0)
       let batchSizeInt = b.intConstant(batchSize)
       // Scale gradOutput by 1/B to match the mean in the forward pass
@@ -905,49 +929,46 @@ extension LazyOp {
       b.if_(shouldRun) {
         // Hop-compressed index for spectral cell offsets
         let hopWindowIdx = hop > 1 ? frameIdx / b.intConstant(hop) : frameIdx
-        b.loop(batchSize) { bIdx in
-          let batchIdx_int = b.cast(bIdx, to: .int)
-          let frameBatch = hopWindowIdx * batchSizeInt + batchIdx_int
-          let fftBase = frameBatch * b.intConstant(fftSize)
-          let magBase = frameBatch * b.intConstant(numBins)
-          let gradSpecBase = frameBatch * b.intConstant(fftSize)
+        let frameBatch = hopWindowIdx * batchSizeInt + batchIdx_int
+        let fftBase = frameBatch * b.intConstant(fftSize)
+        let magBase = frameBatch * b.intConstant(numBins)
+        let gradSpecBase = frameBatch * b.intConstant(fftSize)
 
-          b.parallelRange(numBins) { k in
-            let kInt = b.cast(k, to: .int)
+        b.parallelRange(numBins) { k in
+          let kInt = b.cast(k, to: .int)
 
-            let mag1 = b.memoryRead(mag1Cell, magBase + kInt)
-            let mag2 = b.memoryRead(mag2Cell, magBase + kInt)
-            let real1 = b.memoryRead(fft1Cell, fftBase + kInt)
-            let imag1 = b.memoryRead(fft1Cell, fftBase + kInt + imagOff)
-            let real2 = b.memoryRead(fft2Cell, fftBase + kInt)
-            let imag2 = b.memoryRead(fft2Cell, fftBase + kInt + imagOff)
+          let mag1 = b.memoryRead(mag1Cell, magBase + kInt)
+          let mag2 = b.memoryRead(mag2Cell, magBase + kInt)
+          let real1 = b.memoryRead(fft1Cell, fftBase + kInt)
+          let imag1 = b.memoryRead(fft1Cell, fftBase + kInt + imagOff)
+          let real2 = b.memoryRead(fft2Cell, fftBase + kInt)
+          let imag2 = b.memoryRead(fft2Cell, fftBase + kInt + imagOff)
 
-            let gradMag1 = b.constant(2.0) * (mag1 - mag2) * scaledGradOutput
-            let gradMag2 = b.constant(-2.0) * (mag1 - mag2) * scaledGradOutput
+          let gradMag1 = b.constant(2.0) * (mag1 - mag2) * scaledGradOutput
+          let gradMag2 = b.constant(-2.0) * (mag1 - mag2) * scaledGradOutput
 
-            let safeMag1 = b.max(mag1, eps)
-            let safeMag2 = b.max(mag2, eps)
+          let safeMag1 = b.max(mag1, eps)
+          let safeMag2 = b.max(mag2, eps)
 
-            let gradReal1 = gradMag1 * real1 / safeMag1
-            let gradImag1 = gradMag1 * imag1 / safeMag1
-            let gradReal2 = gradMag2 * real2 / safeMag2
-            let gradImag2 = gradMag2 * imag2 / safeMag2
+          let gradReal1 = gradMag1 * real1 / safeMag1
+          let gradImag1 = gradMag1 * imag1 / safeMag1
+          let gradReal2 = gradMag2 * real2 / safeMag2
+          let gradImag2 = gradMag2 * imag2 / safeMag2
 
-            _ = b.memoryWrite(gradSpec1Cell, gradSpecBase + kInt, gradReal1)
-            _ = b.memoryWrite(gradSpec1Cell, gradSpecBase + kInt + imagOff, gradImag1)
-            _ = b.memoryWrite(gradSpec2Cell, gradSpecBase + kInt, gradReal2)
-            _ = b.memoryWrite(gradSpec2Cell, gradSpecBase + kInt + imagOff, gradImag2)
-          }
+          _ = b.memoryWrite(gradSpec1Cell, gradSpecBase + kInt, gradReal1)
+          _ = b.memoryWrite(gradSpec1Cell, gradSpecBase + kInt + imagOff, gradImag1)
+          _ = b.memoryWrite(gradSpec2Cell, gradSpecBase + kInt, gradReal2)
+          _ = b.memoryWrite(gradSpec2Cell, gradSpecBase + kInt + imagOff, gradImag2)
+        }
 
-          // Zero upper bins
-          if windowSize / 2 - 1 > 0 {
-            b.parallelRange(windowSize / 2 - 1) { k in
-              let kInt = b.cast(k, to: .int) + b.intConstant(numBins)
-              _ = b.memoryWrite(gradSpec1Cell, gradSpecBase + kInt, b.constant(0.0))
-              _ = b.memoryWrite(gradSpec1Cell, gradSpecBase + kInt + imagOff, b.constant(0.0))
-              _ = b.memoryWrite(gradSpec2Cell, gradSpecBase + kInt, b.constant(0.0))
-              _ = b.memoryWrite(gradSpec2Cell, gradSpecBase + kInt + imagOff, b.constant(0.0))
-            }
+        // Zero upper bins
+        if windowSize / 2 - 1 > 0 {
+          b.parallelRange(windowSize / 2 - 1) { k in
+            let kInt = b.cast(k, to: .int) + b.intConstant(numBins)
+            _ = b.memoryWrite(gradSpec1Cell, gradSpecBase + kInt, b.constant(0.0))
+            _ = b.memoryWrite(gradSpec1Cell, gradSpecBase + kInt + imagOff, b.constant(0.0))
+            _ = b.memoryWrite(gradSpec2Cell, gradSpecBase + kInt, b.constant(0.0))
+            _ = b.memoryWrite(gradSpec2Cell, gradSpecBase + kInt + imagOff, b.constant(0.0))
           }
         }
       }
@@ -980,7 +1001,7 @@ extension LazyOp {
       let zero = b.constant(0.0)
       let one = b.constant(1.0)
       let hopCounter: Expr? = inputs.count > 4 ? b.value(inputs[4]) : nil
-      let frameIdx = b.frameIndex()
+      let (frameIdx, batchIdx) = b.setupFlatThreading(tensorSize: batchSize)
       let batchSizeInt = b.intConstant(batchSize)
 
       let imagOff = b.intConstant(imagOffset)
@@ -1093,11 +1114,8 @@ extension LazyOp {
           }
         }
 
-        // Process each batch element sequentially (scratch reused)
-        b.loop(batchSize) { bIdx in
-          emitIFFTInScratch(gradSpec1Cell, gradTime1Cell, batchIdx: bIdx)
-          emitIFFTInScratch(gradSpec2Cell, gradTime2Cell, batchIdx: bIdx)
-        }
+        emitIFFTInScratch(gradSpec1Cell, gradTime1Cell, batchIdx: batchIdx)
+        emitIFFTInScratch(gradSpec2Cell, gradTime2Cell, batchIdx: batchIdx)
       }
 
       // With hop-compressed allocation, non-hop frames have no storage slots.
@@ -1116,73 +1134,70 @@ extension LazyOp {
       let _ = b.value(inputs[0])
       if inputs.count > 1 { let _ = b.value(inputs[1]) }
 
-      let frameIdx = b.frameIndex()
+      let (frameIdx, batchIdx) = b.setupFlatThreading(tensorSize: batchSize)
       let winSizeInt = b.intConstant(windowSize)
       let winSizeFloat = b.constant(Float(windowSize))
       let batchSizeInt = b.intConstant(batchSize)
       let p = frameIdx
+      let batchIdx_int = b.cast(batchIdx, to: .int)
 
-      // Emit [B] gradient values
-      b.loop(batchSize) { bIdx in
-        let batchIdx_int = b.cast(bIdx, to: .int)
-        let gradSum = b.float(0.0)
+      let gradSum = b.float(0.0)
 
-        if hop <= 1 {
-          let frameCount = b.frameCount()
-          b.loop(windowSize) { i in
-            let iInt = b.cast(i, to: .int)
-            let iFloat = b.cast(i, to: .float)
-            let pFloat = b.cast(p, to: .float)
-            let w = pFloat + iFloat
-            let offsetInt = winSizeInt - b.intConstant(1) - iInt
-            let clampedW = b.min(w, b.cast(frameCount, to: .float) - b.constant(1.0))
-            let frameBatch = b.cast(clampedW, to: .int) * batchSizeInt + batchIdx_int
-            let idx = frameBatch * winSizeInt + offsetInt
-            let contrib = b.memoryRead(gradTime1Cell, idx)
-            let inBounds = w < b.cast(frameCount, to: .float)
-            let safeContrib = b.gswitch(inBounds, contrib, b.constant(0.0))
-            gradSum.accumulate(safeContrib)
-          }
-        } else {
-          let maxIter = windowSize / hop + 1
-          let hopInt = b.intConstant(hop)
-          let frameCountInt = b.cast(b.frameCount(), to: .int)
-          let totalHopWindows = (frameCountInt + hopInt - b.intConstant(1)) / hopInt
-          let maxHopIdx = totalHopWindows - b.intConstant(1)
-          let rawLastHopIdx = (p + winSizeInt - b.intConstant(1)) / hopInt
-          let lastHopIdx = b.min(rawLastHopIdx, maxHopIdx)
-          let maxIdx = totalHopWindows * batchSizeInt * winSizeInt - b.intConstant(1)
-
-          b.loop(maxIter) { j in
-            let jInt = b.cast(j, to: .int)
-            let hopIdx = lastHopIdx - jInt
-            let w = hopIdx * hopInt
-
-            let inBounds1 = b.cast(hopIdx, to: .float) >= b.constant(0.0)
-            let inBounds2 = b.cast(w, to: .float) >= b.cast(p, to: .float)
-            let inBounds3 = b.cast(hopIdx, to: .float) < b.cast(totalHopWindows, to: .float)
-            let inBounds = inBounds1 * inBounds2 * inBounds3
-
-            let offsetInWindow = p - w + winSizeInt - b.intConstant(1)
-            let frameBatch = hopIdx * batchSizeInt + batchIdx_int
-            let idx = frameBatch * winSizeInt + offsetInWindow
-            let safeIdx = b.max(
-              b.constant(0.0),
-              b.min(b.cast(idx, to: .float), b.cast(maxIdx, to: .float))
-            )
-            let contrib = b.memoryRead(gradTime1Cell, b.cast(safeIdx, to: .int))
-            let safeContrib = b.gswitch(inBounds, contrib, b.constant(0.0))
-            gradSum.accumulate(safeContrib)
-          }
+      if hop <= 1 {
+        let frameCount = b.frameCount()
+        b.loop(windowSize) { i in
+          let iInt = b.cast(i, to: .int)
+          let iFloat = b.cast(i, to: .float)
+          let pFloat = b.cast(p, to: .float)
+          let w = pFloat + iFloat
+          let offsetInt = winSizeInt - b.intConstant(1) - iInt
+          let clampedW = b.min(w, b.cast(frameCount, to: .float) - b.constant(1.0))
+          let frameBatch = b.cast(clampedW, to: .int) * batchSizeInt + batchIdx_int
+          let idx = frameBatch * winSizeInt + offsetInt
+          let contrib = b.memoryRead(gradTime1Cell, idx)
+          let inBounds = w < b.cast(frameCount, to: .float)
+          let safeContrib = b.gswitch(inBounds, contrib, b.constant(0.0))
+          gradSum.accumulate(safeContrib)
         }
+      } else {
+        let maxIter = windowSize / hop + 1
+        let hopInt = b.intConstant(hop)
+        let frameCountInt = b.cast(b.frameCount(), to: .int)
+        let totalHopWindows = (frameCountInt + hopInt - b.intConstant(1)) / hopInt
+        let maxHopIdx = totalHopWindows - b.intConstant(1)
+        let rawLastHopIdx = (p + winSizeInt - b.intConstant(1)) / hopInt
+        let lastHopIdx = b.min(rawLastHopIdx, maxHopIdx)
+        let maxIdx = totalHopWindows * batchSizeInt * winSizeInt - b.intConstant(1)
 
-        let numBinsFloat = b.constant(Float(windowSize / 2 + 1))
-        let normFactor = b.sqrt(numBinsFloat * winSizeFloat)
-        let normalizedGrad = gradSum.value / normFactor
-        // Write gradient to frame-aware output: memory[outputCell + frame * B + b]
-        let writeIdx = frameIdx * batchSizeInt + batchIdx_int
-        _ = b.memoryWrite(outputCell, writeIdx, normalizedGrad)
+        b.loop(maxIter) { j in
+          let jInt = b.cast(j, to: .int)
+          let hopIdx = lastHopIdx - jInt
+          let w = hopIdx * hopInt
+
+          let inBounds1 = b.cast(hopIdx, to: .float) >= b.constant(0.0)
+          let inBounds2 = b.cast(w, to: .float) >= b.cast(p, to: .float)
+          let inBounds3 = b.cast(hopIdx, to: .float) < b.cast(totalHopWindows, to: .float)
+          let inBounds = inBounds1 * inBounds2 * inBounds3
+
+          let offsetInWindow = p - w + winSizeInt - b.intConstant(1)
+          let frameBatch = hopIdx * batchSizeInt + batchIdx_int
+          let idx = frameBatch * winSizeInt + offsetInWindow
+          let safeIdx = b.max(
+            b.constant(0.0),
+            b.min(b.cast(idx, to: .float), b.cast(maxIdx, to: .float))
+          )
+          let contrib = b.memoryRead(gradTime1Cell, b.cast(safeIdx, to: .int))
+          let safeContrib = b.gswitch(inBounds, contrib, b.constant(0.0))
+          gradSum.accumulate(safeContrib)
+        }
       }
+
+      let numBinsFloat = b.constant(Float(windowSize / 2 + 1))
+      let normFactor = b.sqrt(numBinsFloat * winSizeFloat)
+      let normalizedGrad = gradSum.value / normFactor
+      // Write gradient to frame-aware output: memory[outputCell + frame * B + b]
+      let writeIdx = frameIdx * batchSizeInt + batchIdx_int
+      _ = b.memoryWrite(outputCell, writeIdx, normalizedGrad)
       b.use(val: b.constant(0.0))
 
     case .spectralLossFFTBatchedGradRead2(let windowSize, let batchSize, let hop,
@@ -1194,71 +1209,69 @@ extension LazyOp {
       let _ = b.value(inputs[0])
       if inputs.count > 1 { let _ = b.value(inputs[1]) }
 
-      let frameIdx = b.frameIndex()
+      let (frameIdx, batchIdx) = b.setupFlatThreading(tensorSize: batchSize)
       let winSizeInt = b.intConstant(windowSize)
       let winSizeFloat = b.constant(Float(windowSize))
       let batchSizeInt = b.intConstant(batchSize)
       let p = frameIdx
+      let batchIdx_int = b.cast(batchIdx, to: .int)
 
-      b.loop(batchSize) { bIdx in
-        let batchIdx_int = b.cast(bIdx, to: .int)
-        let gradSum = b.float(0.0)
+      let gradSum = b.float(0.0)
 
-        if hop <= 1 {
-          let frameCount = b.frameCount()
-          b.loop(windowSize) { i in
-            let iInt = b.cast(i, to: .int)
-            let iFloat = b.cast(i, to: .float)
-            let pFloat = b.cast(p, to: .float)
-            let w = pFloat + iFloat
-            let offsetInt = winSizeInt - b.intConstant(1) - iInt
-            let clampedW = b.min(w, b.cast(frameCount, to: .float) - b.constant(1.0))
-            let frameBatch = b.cast(clampedW, to: .int) * batchSizeInt + batchIdx_int
-            let idx = frameBatch * winSizeInt + offsetInt
-            let contrib = b.memoryRead(gradTime2Cell, idx)
-            let inBounds = w < b.cast(frameCount, to: .float)
-            let safeContrib = b.gswitch(inBounds, contrib, b.constant(0.0))
-            gradSum.accumulate(safeContrib)
-          }
-        } else {
-          let maxIter = windowSize / hop + 1
-          let hopInt = b.intConstant(hop)
-          let frameCountInt = b.cast(b.frameCount(), to: .int)
-          let totalHopWindows = (frameCountInt + hopInt - b.intConstant(1)) / hopInt
-          let maxHopIdx = totalHopWindows - b.intConstant(1)
-          let rawLastHopIdx = (p + winSizeInt - b.intConstant(1)) / hopInt
-          let lastHopIdx = b.min(rawLastHopIdx, maxHopIdx)
-          let maxIdx = totalHopWindows * batchSizeInt * winSizeInt - b.intConstant(1)
-
-          b.loop(maxIter) { j in
-            let jInt = b.cast(j, to: .int)
-            let hopIdx = lastHopIdx - jInt
-            let w = hopIdx * hopInt
-
-            let inBounds1 = b.cast(hopIdx, to: .float) >= b.constant(0.0)
-            let inBounds2 = b.cast(w, to: .float) >= b.cast(p, to: .float)
-            let inBounds3 = b.cast(hopIdx, to: .float) < b.cast(totalHopWindows, to: .float)
-            let inBounds = inBounds1 * inBounds2 * inBounds3
-
-            let offsetInWindow = p - w + winSizeInt - b.intConstant(1)
-            let frameBatch = hopIdx * batchSizeInt + batchIdx_int
-            let idx = frameBatch * winSizeInt + offsetInWindow
-            let safeIdx = b.max(
-              b.constant(0.0),
-              b.min(b.cast(idx, to: .float), b.cast(maxIdx, to: .float))
-            )
-            let contrib = b.memoryRead(gradTime2Cell, b.cast(safeIdx, to: .int))
-            let safeContrib = b.gswitch(inBounds, contrib, b.constant(0.0))
-            gradSum.accumulate(safeContrib)
-          }
+      if hop <= 1 {
+        let frameCount = b.frameCount()
+        b.loop(windowSize) { i in
+          let iInt = b.cast(i, to: .int)
+          let iFloat = b.cast(i, to: .float)
+          let pFloat = b.cast(p, to: .float)
+          let w = pFloat + iFloat
+          let offsetInt = winSizeInt - b.intConstant(1) - iInt
+          let clampedW = b.min(w, b.cast(frameCount, to: .float) - b.constant(1.0))
+          let frameBatch = b.cast(clampedW, to: .int) * batchSizeInt + batchIdx_int
+          let idx = frameBatch * winSizeInt + offsetInt
+          let contrib = b.memoryRead(gradTime2Cell, idx)
+          let inBounds = w < b.cast(frameCount, to: .float)
+          let safeContrib = b.gswitch(inBounds, contrib, b.constant(0.0))
+          gradSum.accumulate(safeContrib)
         }
+      } else {
+        let maxIter = windowSize / hop + 1
+        let hopInt = b.intConstant(hop)
+        let frameCountInt = b.cast(b.frameCount(), to: .int)
+        let totalHopWindows = (frameCountInt + hopInt - b.intConstant(1)) / hopInt
+        let maxHopIdx = totalHopWindows - b.intConstant(1)
+        let rawLastHopIdx = (p + winSizeInt - b.intConstant(1)) / hopInt
+        let lastHopIdx = b.min(rawLastHopIdx, maxHopIdx)
+        let maxIdx = totalHopWindows * batchSizeInt * winSizeInt - b.intConstant(1)
 
-        let numBinsFloat2 = b.constant(Float(windowSize / 2 + 1))
-        let normFactor2 = b.sqrt(numBinsFloat2 * winSizeFloat)
-        let normalizedGrad2 = gradSum.value / normFactor2
-        let writeIdx = frameIdx * batchSizeInt + batchIdx_int
-        _ = b.memoryWrite(outputCell, writeIdx, normalizedGrad2)
+        b.loop(maxIter) { j in
+          let jInt = b.cast(j, to: .int)
+          let hopIdx = lastHopIdx - jInt
+          let w = hopIdx * hopInt
+
+          let inBounds1 = b.cast(hopIdx, to: .float) >= b.constant(0.0)
+          let inBounds2 = b.cast(w, to: .float) >= b.cast(p, to: .float)
+          let inBounds3 = b.cast(hopIdx, to: .float) < b.cast(totalHopWindows, to: .float)
+          let inBounds = inBounds1 * inBounds2 * inBounds3
+
+          let offsetInWindow = p - w + winSizeInt - b.intConstant(1)
+          let frameBatch = hopIdx * batchSizeInt + batchIdx_int
+          let idx = frameBatch * winSizeInt + offsetInWindow
+          let safeIdx = b.max(
+            b.constant(0.0),
+            b.min(b.cast(idx, to: .float), b.cast(maxIdx, to: .float))
+          )
+          let contrib = b.memoryRead(gradTime2Cell, b.cast(safeIdx, to: .int))
+          let safeContrib = b.gswitch(inBounds, contrib, b.constant(0.0))
+          gradSum.accumulate(safeContrib)
+        }
       }
+
+      let numBinsFloat2 = b.constant(Float(windowSize / 2 + 1))
+      let normFactor2 = b.sqrt(numBinsFloat2 * winSizeFloat)
+      let normalizedGrad2 = gradSum.value / normFactor2
+      let writeIdx = frameIdx * batchSizeInt + batchIdx_int
+      _ = b.memoryWrite(outputCell, writeIdx, normalizedGrad2)
       b.use(val: b.constant(0.0))
 
     default: break

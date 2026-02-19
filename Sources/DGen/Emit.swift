@@ -249,7 +249,8 @@ extension LazyOp {
 
     case .spectralLossFFT, .spectralLossFFTGradSpec, .spectralLossFFTGradIFFT,
       .spectralLossFFTGradInline, .spectralLossFFTGradRead, .spectralLossFFTGradRead2,
-      .spectralLossFFTBatched, .spectralLossFFTBatchedGradSpec, .spectralLossFFTBatchedGradIFFT,
+      .spectralLossFFTBatched, .spectralLossFFTBatchedReduce,
+      .spectralLossFFTBatchedGradSpec, .spectralLossFFTBatchedGradIFFT,
       .spectralLossFFTBatchedGradRead, .spectralLossFFTBatchedGradRead2:
       try emitSpectralLoss(b: b, ctx: ctx, g: g, node: node, inputs: inputs)
 

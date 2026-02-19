@@ -818,6 +818,10 @@ extension LazyOp {
       // Gradient read ops don't need their own gradients
       return node.inputs.map { _ in nil }
 
+    case .spectralLossFFTBatchedReduce:
+      // Forward reduce is an identity link for gradients: d(meanReduce)/d(writePass) = 1.
+      return [gradOutput]
+
     case .spectralLossFFTBatched(
       let windowSize, let batchSize, let hop, _, let windowCell,
       let fft1Cell, let fft2Cell, let mag1Cell, let mag2Cell, _):

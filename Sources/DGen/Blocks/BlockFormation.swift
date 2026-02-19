@@ -93,9 +93,10 @@ public func fuseBlocks(_ blocks: [Block]) -> [Block] {
   return fused
 }
 
-/// Isolate spectralloss ops into their own blocks
-/// to ensure they execute as separate kernels without any fused operations.
-/// Also isolates FFT-based spectral loss gradient operations to avoid race conditions.
+/// Isolate special passes into their own blocks to prevent unsafe fusion.
+/// Includes:
+/// - FFT-based spectral ops (shared scratch / race-avoidance)
+/// - scalar side-effect grad-write ops that must not inherit tensor ThreadCountScale
 /// Preserves ordering of other nodes.
 public func isolateSpectralPasses(_ blocks: [Block], _ g: Graph) -> [Block] {
   var result: [Block] = []
@@ -114,7 +115,7 @@ public func isolateSpectralPasses(_ blocks: [Block], _ g: Graph) -> [Block] {
     var currentNodes: [NodeID] = []
 
     for nodeId in block.nodes {
-      let isSpectralPass = { () -> Bool in
+      let isIsolatedPass = { () -> Bool in
         guard let node = g.nodes[nodeId] else { return false }
         // FFT-based spectral loss ops need isolation because they use shared scratch
         // memory for FFT computation that can't be safely accessed by multiple SIMD threads
@@ -125,24 +126,28 @@ public func isolateSpectralPasses(_ blocks: [Block], _ g: Graph) -> [Block] {
         if case .spectralLossFFTGradRead = node.op { return true }
         if case .spectralLossFFTGradRead2 = node.op { return true }
         if case .spectralLossFFTBatched = node.op { return true }
+        if case .spectralLossFFTBatchedReduce = node.op { return true }
         if case .spectralLossFFTBatchedGradSpec = node.op { return true }
         if case .spectralLossFFTBatchedGradIFFT = node.op { return true }
         if case .spectralLossFFTBatchedGradRead = node.op { return true }
         if case .spectralLossFFTBatchedGradRead2 = node.op { return true }
+        // Scalar side-effect write passes must not inherit tensor ThreadCountScale.
+        // If fused into a tensor-shaped region they can be massively over-dispatched.
+        if case .sampleGradWrite = node.op { return true }
+        if case .selectRowGradWrite = node.op { return true }
+        if case .peekGradWrite = node.op { return true }
         return false
       }()
 
-      if isSpectralPass {
+      if isIsolatedPass {
         // Flush any accumulated nodes before the spectral pass
         if !currentNodes.isEmpty {
           result.append(makeBlock(from: block, nodes: currentNodes))
           currentNodes = []
         }
 
-        // Add spectral pass in its own SIMD block — spectral ops are always
-        // parallel across frames, even when their inputs come from scalar blocks.
-        // Clear shape/tensorIndex: FFT butterflies are single-threaded per frame
-        // and must NOT inherit the parent block's ThreadCountScale (e.g. from matmul).
+        // Add isolated pass in its own SIMD block.
+        // Clear shape/tensorIndex so it never inherits parent ThreadCountScale.
         var spectralBlock = makeBlock(from: block, nodes: [nodeId])
         spectralBlock.frameOrder = .parallel
         spectralBlock.shape = nil

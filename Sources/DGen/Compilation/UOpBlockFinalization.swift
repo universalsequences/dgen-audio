@@ -25,7 +25,12 @@ extension UOpBlockFinalization {
       graph: graph,
       backend: backend
     )
-    let (threadCountScale, strippedOps) = extractThreadCountScale(from: emittedOps)
+    let (rawThreadCountScale, strippedOps) = extractThreadCountScale(from: emittedOps)
+    // Keep scaled dispatch only when the finalized block still references flat-thread primitives.
+    // This avoids pathological over-dispatch when a stale setThreadCountScale survives after
+    // fusion/simplification but no op uses thread-index decomposition anymore.
+    let threadCountScale =
+      requiresScaledDispatch(ops: strippedOps) ? rawThreadCountScale : nil
     var finalOps = strippedOps
     let (effectiveFrameOrder, effectiveVectorWidth) = resolveVectorWidth(
       backend: backend,
@@ -74,6 +79,22 @@ extension UOpBlockFinalization {
     }
 
     return (scale, filtered)
+  }
+
+  /// Returns true when ops require frameCount*scale dispatch semantics.
+  /// We conservatively key off explicit flat-thread primitives:
+  /// - threadIndex: reads the flat dispatched thread id.
+  /// - setFrameIndex: remaps frame index from flat-thread decomposition.
+  private static func requiresScaledDispatch(ops: [UOp]) -> Bool {
+    for op in ops {
+      switch op.op {
+      case .threadIndex, .setFrameIndex:
+        return true
+      default:
+        continue
+      }
+    }
+    return false
   }
 
   /// Resolves final frame order and vector width after backend-specific scalar constraints.
