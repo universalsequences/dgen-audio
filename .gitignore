@@ -33,3 +33,7 @@ test_kernel_yes_gemm.metal
 test_kernel_revert.metal
 test_kernel_no_gemm.metal
 test_kernel_revert.metal
+/.ddsp_cache_flute
+/.ddsp_cache_flute2
+train3.sh
+train_flute.sh

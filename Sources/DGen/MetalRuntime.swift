@@ -304,34 +304,9 @@ public class MetalCompiledKernel: CompiledKernelRuntime {
       }
 
       guard index < pipelineStates.count else { continue }
-      let pipelineState = pipelineStates[index]
-      computeEncoder.setComputePipelineState(pipelineState)
+      _ = encodeKernel(
+        kernel, pipelineState: pipelineStates[index], encoder: computeEncoder, frameCount: frameCount)
 
-      for (bufferIndex, bufferName) in kernel.buffers.enumerated() {
-        if let buffer = bufferPool[bufferName] {
-          computeEncoder.setBuffer(buffer, offset: 0, index: bufferIndex)
-        }
-      }
-
-      if case .gemm(let tilesM, let tilesN, let fixedDepth) = kernel.dispatchMode {
-        // GEMM: 2D/3D threadgroup grid, 32 threads per group (one SIMD group).
-        // fixedDepth is set for chunked reductions; otherwise derive from temporality.
-        let depth = fixedDepth ?? (kernel.temporality == .static_ ? 1 : frameCount)
-        let threadgroups = MTLSize(width: tilesN, height: tilesM, depth: max(1, depth))
-        let threadsPerGroup = MTLSize(width: 32, height: 1, depth: 1)
-        computeEncoder.dispatchThreadgroups(threadgroups, threadsPerThreadgroup: threadsPerGroup)
-      } else {
-        let totalThreads = kernel.dispatchMode.threadCount(frameCount: frameCount)
-        let maxThreadsPerGroup = pipelineState.maxTotalThreadsPerThreadgroup
-
-        let threadGroupWidth =
-          totalThreads == 1
-          ? 1
-          : min(kernel.dispatchMode.threadGroupSize ?? 64, maxThreadsPerGroup, totalThreads)
-        let threads = MTLSize(width: totalThreads, height: 1, depth: 1)
-        let threadsPerGroup = MTLSize(width: threadGroupWidth, height: 1, depth: 1)
-        computeEncoder.dispatchThreads(threads, threadsPerThreadgroup: threadsPerGroup)
-      }
       if sharedEncoder == nil { computeEncoder.endEncoding() }
       if debugGradients {
         // Execute this kernel now so shared-memory buffers are visible for debug
@@ -356,6 +331,43 @@ public class MetalCompiledKernel: CompiledKernelRuntime {
     copyResultsToOutputs(outputs: outputs, frameCount: frameCount, volumeScale: volumeScale)
   }
 
+  /// Bind buffer arguments and dispatch a single kernel on the given encoder.
+  /// Returns a short description of the dispatch geometry for profiling.
+  private func encodeKernel(
+    _ kernel: CompiledKernel,
+    pipelineState: MTLComputePipelineState,
+    encoder: MTLComputeCommandEncoder,
+    frameCount: Int
+  ) -> String {
+    encoder.setComputePipelineState(pipelineState)
+    for (bufferIndex, bufferName) in kernel.buffers.enumerated() {
+      if let buffer = bufferPool[bufferName] {
+        encoder.setBuffer(buffer, offset: 0, index: bufferIndex)
+      }
+    }
+
+    if case .gemm(let tilesM, let tilesN, let fixedDepth) = kernel.dispatchMode {
+      let depth = fixedDepth ?? (kernel.temporality == .static_ ? 1 : frameCount)
+      encoder.dispatchThreadgroups(
+        MTLSize(width: tilesN, height: tilesM, depth: max(1, depth)),
+        threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1)
+      )
+      return "gemm(\(tilesM)x\(tilesN)x\(depth))"
+    }
+
+    let totalThreads = kernel.dispatchMode.threadCount(frameCount: frameCount)
+    let maxThreadsPerGroup = pipelineState.maxTotalThreadsPerThreadgroup
+    let threadGroupWidth =
+      totalThreads == 1
+      ? 1
+      : min(kernel.dispatchMode.threadGroupSize ?? 64, maxThreadsPerGroup, totalThreads)
+    encoder.dispatchThreads(
+      MTLSize(width: totalThreads, height: 1, depth: 1),
+      threadsPerThreadgroup: MTLSize(width: threadGroupWidth, height: 1, depth: 1)
+    )
+    return "\(kernel.dispatchMode)".components(separatedBy: "(").first ?? "?"
+  }
+
   /// Run each kernel in isolation and record GPU timestamps.
   /// Returns per-kernel results sorted by index (not timed order).
   /// Note: kernels run on whatever data is currently in the buffers,
@@ -373,32 +385,8 @@ public class MetalCompiledKernel: CompiledKernelRuntime {
             let computeEncoder = commandBuffer.makeComputeCommandEncoder()
       else { continue }
 
-      let pipelineState = pipelineStates[index]
-      computeEncoder.setComputePipelineState(pipelineState)
-      for (bufferIndex, bufferName) in kernel.buffers.enumerated() {
-        if let buffer = bufferPool[bufferName] {
-          computeEncoder.setBuffer(buffer, offset: 0, index: bufferIndex)
-        }
-      }
-
-      let dispatchInfo: String
-      if case .gemm(let tilesM, let tilesN, let fixedDepth) = kernel.dispatchMode {
-        let depth = fixedDepth ?? (kernel.temporality == .static_ ? 1 : frameCount)
-        computeEncoder.dispatchThreadgroups(
-          MTLSize(width: tilesN, height: tilesM, depth: max(1, depth)),
-          threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1)
-        )
-        dispatchInfo = "gemm(\(tilesM)x\(tilesN)x\(depth))"
-      } else {
-        let totalThreads = kernel.dispatchMode.threadCount(frameCount: frameCount)
-        let maxTTG = pipelineState.maxTotalThreadsPerThreadgroup
-        let groupWidth = totalThreads == 1 ? 1 : min(kernel.dispatchMode.threadGroupSize ?? 64, maxTTG, totalThreads)
-        computeEncoder.dispatchThreads(
-          MTLSize(width: totalThreads, height: 1, depth: 1),
-          threadsPerThreadgroup: MTLSize(width: groupWidth, height: 1, depth: 1)
-        )
-        dispatchInfo = "\(kernel.dispatchMode)".components(separatedBy: "(").first ?? "?"
-      }
+      let dispatchInfo = encodeKernel(
+        kernel, pipelineState: pipelineStates[index], encoder: computeEncoder, frameCount: frameCount)
 
       computeEncoder.endEncoding()
       commandBuffer.commit()

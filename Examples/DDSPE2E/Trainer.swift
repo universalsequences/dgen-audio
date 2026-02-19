@@ -44,6 +44,8 @@ struct TrainerOptions {
   var kernelDumpPath: String?
   var initCheckpointPath: String?
   var profileKernelsStep: Int = -1  // step at which to profile GPU kernels (-1 = disabled)
+  var renderEvery: Int = 0          // render audio snapshot every N steps (0 = disabled)
+  var renderWavPath: String? = nil  // path to write rendered WAV (overwritten each time)
 }
 
 enum DDSPE2ETrainer {
@@ -233,6 +235,14 @@ enum DDSPE2ETrainer {
     logger("Run directory: \(runDirs.root.path)")
     logger("Starting M2 decoder-only training")
 
+    if config.batchSize > 1 {
+      try runBatchedDecoderTraining(
+        dataset: dataset, config: config, runDirs: runDirs, options: options,
+        splitEntries: splitEntries, model: model, optimizer: optimizer, logger: logger
+      )
+      return
+    }
+
     // Pre-allocate data tensors ONCE before the training loop.
     // This matches the test pattern: define tensors ahead of time,
     // then use updateDataLazily to inject new chunk data each iteration.
@@ -251,9 +261,7 @@ enum DDSPE2ETrainer {
     let targetTensor = Tensor([Float](repeating: 0, count: frameCount))
     let synthTensors = DDSPSynth.PreallocatedTensors(
       featureFrames: paddedFeatureFrames,
-      numHarmonics: config.numHarmonics,
-      enableFIRNoise: config.enableStaticFIRNoise,
-      firKernelSize: config.noiseFIRKernelSize
+      numHarmonics: config.numHarmonics
     )
 
     var order = Array(splitEntries.indices)
@@ -281,6 +289,9 @@ enum DDSPE2ETrainer {
     var logLines = [String]()
     logLines.append("step,loss,chunk_id,step_ms,load_ms,graph_ms,backward_ms,opt_ms")
 
+    let gradAccum = max(1, config.gradAccumSteps)
+    var chunkOffset = 0
+
     for step in 0..<steps {
       let tStepStart = CFAbsoluteTimeGetCurrent()
 
@@ -296,90 +307,120 @@ enum DDSPE2ETrainer {
       )
       optimizer.lr = currentLR
 
-      if step > 0, step % order.count == 0, config.shuffleChunks {
-        order.shuffle(using: &rng)
-      }
-
-      let entry = splitEntries[order[step % order.count]]
-      let chunk = try dataset.loadChunk(entry)
-      let tAfterLoad = CFAbsoluteTimeGetCurrent()
-
-      // Inject new chunk data into pre-allocated tensors (padded to GEMM-aligned size)
-      var conditioningData = makeConditioningData(
-        f0Hz: chunk.f0Hz,
-        loudnessDB: chunk.loudnessDB,
-        uvMask: chunk.uvMask
-      )
-      let paddingRows = paddedFeatureFrames * 3 - conditioningData.count
-      if paddingRows > 0 {
-        conditioningData.append(contentsOf: [Float](repeating: 0, count: paddingRows))
-      }
-      featuresTensor.updateDataLazily(conditioningData)
-      targetTensor.updateDataLazily(chunk.audio)
-
-      var paddedF0 = chunk.f0Hz
-      var paddedUV = chunk.uvMask
-      let framePadding = paddedFeatureFrames - paddedF0.count
-      if framePadding > 0 {
-        paddedF0.append(contentsOf: [Float](repeating: 0, count: framePadding))
-        paddedUV.append(contentsOf: [Float](repeating: 0, count: framePadding))
-      }
-      synthTensors.updateChunkData(f0Frames: paddedF0, uvFrames: paddedUV)
-
-      // Build graph using pre-allocated tensors
-      let controls = model.forward(features: featuresTensor)
-      let prediction = DDSPSynth.renderSignal(
-        controls: controls,
-        tensors: synthTensors,
-        featureFrames: chunk.f0Hz.count,
-        frameCount: frameCount,
-        numHarmonics: config.numHarmonics,
-        enableStaticFIRNoise: config.enableStaticFIRNoise,
-        noiseFIRKernelSize: config.noiseFIRKernelSize
-      )
-
-      let target = targetTensor.toSignal(maxFrames: frameCount)
+      // --- Gradient accumulation inner loop ---
+      // Run gradAccum backward passes, sum gradients, then do one optimizer step.
+      var accumGrads: [Int: [Float]] = [:]
+      var totalAccumLoss: Float = 0
+      var anyUnstable = false
+      var lastEntry = splitEntries[order[0]]
+      var lastChunkFeatureFrames = lastEntry.featureFrames
+      var stepLoadMs: Double = 0
+      var stepGraphMs: Double = 0
+      var stepBackwardMs: Double = 0
       let spectralWeight = spectralWeightForStep(
         step: step,
         targetWeight: config.spectralWeight,
         warmupSteps: config.spectralWarmupSteps,
         rampSteps: config.spectralRampSteps
       )
-      let loss = DDSPTrainingLosses.fullLoss(
-        prediction: prediction,
-        target: target,
-        spectralWindowSizes: config.spectralWindowSizes,
-        spectralHopDivisor: config.spectralHopDivisor,
-        frameCount: frameCount,
-        mseWeight: config.mseLossWeight,
-        spectralWeight: spectralWeight
-      )
-      let tAfterGraph = CFAbsoluteTimeGetCurrent()
 
-      let lossValues = try loss.backward(frames: frameCount)
-      let tAfterBackward = CFAbsoluteTimeGetCurrent()
-      if step == options.profileKernelsStep {
-        LazyGraphContext.current.profileGPU(frames: frameCount)
+      for _ in 0..<gradAccum {
+        if chunkOffset > 0, chunkOffset % order.count == 0, config.shuffleChunks {
+          order.shuffle(using: &rng)
+        }
+        lastEntry = splitEntries[order[chunkOffset % order.count]]
+        chunkOffset += 1
+
+        let chunk = try dataset.loadChunk(lastEntry)
+        lastChunkFeatureFrames = chunk.f0Hz.count
+        let tAfterLoad = CFAbsoluteTimeGetCurrent()
+
+        var conditioningData = makeConditioningData(
+          f0Hz: chunk.f0Hz,
+          loudnessDB: chunk.loudnessDB,
+          uvMask: chunk.uvMask
+        )
+        let paddingRows = paddedFeatureFrames * 3 - conditioningData.count
+        if paddingRows > 0 {
+          conditioningData.append(contentsOf: [Float](repeating: 0, count: paddingRows))
+        }
+        featuresTensor.updateDataLazily(conditioningData)
+        targetTensor.updateDataLazily(chunk.audio)
+
+        var paddedF0 = chunk.f0Hz
+        var paddedUV = chunk.uvMask
+        let framePadding = paddedFeatureFrames - paddedF0.count
+        if framePadding > 0 {
+          paddedF0.append(contentsOf: [Float](repeating: 0, count: framePadding))
+          paddedUV.append(contentsOf: [Float](repeating: 0, count: framePadding))
+        }
+        synthTensors.updateChunkData(f0Frames: paddedF0, uvFrames: paddedUV)
+
+        let controls = model.forward(features: featuresTensor)
+        let prediction = DDSPSynth.renderSignal(
+          controls: controls,
+          tensors: synthTensors,
+          featureFrames: chunk.f0Hz.count,
+          frameCount: frameCount,
+          numHarmonics: config.numHarmonics
+        )
+        let target = targetTensor.toSignal(maxFrames: frameCount)
+        let loss = DDSPTrainingLosses.fullLoss(
+          prediction: prediction,
+          target: target,
+          spectralWindowSizes: config.spectralWindowSizes,
+          spectralHopDivisor: config.spectralHopDivisor,
+          frameCount: frameCount,
+          mseWeight: config.mseLossWeight,
+          spectralWeight: spectralWeight
+        )
+        let tAfterGraph = CFAbsoluteTimeGetCurrent()
+
+        let lossValues = try loss.backward(frames: frameCount)
+        let tAfterBackward = CFAbsoluteTimeGetCurrent()
+
+        stepLoadMs += (tAfterLoad - tStepStart) * 1000.0
+        stepGraphMs += (tAfterGraph - tAfterLoad) * 1000.0
+        stepBackwardMs += (tAfterBackward - tAfterGraph) * 1000.0
+
+        let accumLoss = lossValues.reduce(0, +) / Float(max(1, lossValues.count))
+        if !accumLoss.isFinite || accumLoss > 1e6 {
+          anyUnstable = true
+          break
+        }
+        totalAccumLoss += accumLoss
+
+        // Sum gradients from this pass
+        for (i, param) in model.parameters.enumerated() {
+          if let tensor = param as? Tensor,
+            let gradData = tensor.grad?.getData()
+          {
+            if accumGrads[i] == nil {
+              accumGrads[i] = gradData
+            } else {
+              for j in 0..<min(gradData.count, accumGrads[i]!.count) {
+                accumGrads[i]![j] += gradData[j]
+              }
+            }
+          }
+        }
       }
-      let stepLoss = lossValues.reduce(0, +) / Float(max(1, lossValues.count))
 
+      let loadMs = stepLoadMs
+      let graphMs = stepGraphMs
+      let backwardMs = stepBackwardMs
+      let stepLoss = anyUnstable ? Float.nan : totalAccumLoss / Float(gradAccum)
       let shouldLog = step == 0 || step == steps - 1 || step % config.logEvery == 0
-      let loadMs = (tAfterLoad - tStepStart) * 1000.0
-      let graphMs = (tAfterGraph - tAfterLoad) * 1000.0
-      let backwardMs = (tAfterBackward - tAfterGraph) * 1000.0
 
-      if !stepLoss.isFinite || stepLoss > 1e6 {
+      if anyUnstable || !stepLoss.isFinite || stepLoss > 1e6 {
         let stepMs = (CFAbsoluteTimeGetCurrent() - tStepStart) * 1000.0
         totalStepMs += stepMs
         totalLoadMs += loadMs
         totalGraphMs += graphMs
         totalBackwardMs += backwardMs
-        if stepMs > maxStepMs {
-          maxStepMs = stepMs
-          maxStep = step
-        }
+        if stepMs > maxStepMs { maxStepMs = stepMs; maxStep = step }
         emaStepMs = step == 0 ? stepMs : (emaStepMs * (1.0 - emaAlpha) + stepMs * emaAlpha)
-        logLines.append("\(step),\(stepLoss),\(entry.id),\(stepMs),\(loadMs),\(graphMs),\(backwardMs),0")
+        logLines.append("\(step),\(stepLoss),\(lastEntry.id),\(stepMs),\(loadMs),\(graphMs),\(backwardMs),0")
         logger(
           "step=\(step) unstable loss=\(stepLoss); skipping update "
             + "tStepMs=\(format(Double(stepMs))) tLoadMs=\(format(Double(loadMs))) "
@@ -390,9 +431,21 @@ enum DDSPE2ETrainer {
 
       if firstLoss == nil { firstLoss = stepLoss }
       lastFiniteLoss = stepLoss
-      if stepLoss < minLoss {
-        minLoss = stepLoss
-        minStep = step
+      if stepLoss < minLoss { minLoss = stepLoss; minStep = step }
+
+      // Average accumulated gradients and write back via the last backward's .grad tensors
+      let invAccum = 1.0 / Float(gradAccum)
+      for (i, param) in model.parameters.enumerated() {
+        if let tensor = param as? Tensor, let gradTensor = tensor.grad,
+          var averaged = accumGrads[i]
+        {
+          for j in 0..<averaged.count { averaged[j] *= invAccum }
+          gradTensor.updateDataLazily(averaged)
+        }
+      }
+
+      if step == options.profileKernelsStep {
+        LazyGraphContext.current.profileGPU(frames: frameCount)
       }
 
       let tOptStart = CFAbsoluteTimeGetCurrent()
@@ -407,6 +460,35 @@ enum DDSPE2ETrainer {
       let postClipGradStats = shouldLog ? summarizeGradients(params: model.parameters) : nil
       optimizer.step()
       optimizer.zeroGrad()
+
+      // Render audio snapshot after the optimizer update so we hear the current model state.
+      // backward() already cleared the graph, so we rebuild a fresh forward-only pass,
+      // realize it, then clear again so the next training iteration starts clean.
+      if let wavPath = options.renderWavPath, options.renderEvery > 0,
+        step % options.renderEvery == 0
+      {
+        do {
+          let renderControls = model.forward(features: featuresTensor)
+          let renderPrediction = DDSPSynth.renderSignal(
+            controls: renderControls,
+            tensors: synthTensors,
+            featureFrames: lastChunkFeatureFrames,
+            frameCount: frameCount,
+            numHarmonics: config.numHarmonics
+          )
+          let samples = try renderPrediction.realize(frames: frameCount)
+          LazyGraphContext.current.clearComputationGraph()
+          try AudioFile.save(
+            url: URL(fileURLWithPath: wavPath),
+            samples: samples,
+            sampleRate: config.sampleRate)
+          logger("step=\(step) rendered audio → \(wavPath)")
+        } catch {
+          LazyGraphContext.current.clearComputationGraph()
+          logger("step=\(step) render warning: \(error)")
+        }
+      }
+
       let tAfterOpt = CFAbsoluteTimeGetCurrent()
       let optMs = (tAfterOpt - tOptStart) * 1000.0
       let stepMs = (tAfterOpt - tStepStart) * 1000.0
@@ -415,12 +497,9 @@ enum DDSPE2ETrainer {
       totalGraphMs += graphMs
       totalBackwardMs += backwardMs
       totalOptMs += optMs
-      if stepMs > maxStepMs {
-        maxStepMs = stepMs
-        maxStep = step
-      }
+      if stepMs > maxStepMs { maxStepMs = stepMs; maxStep = step }
       emaStepMs = step == 0 ? stepMs : (emaStepMs * (1.0 - emaAlpha) + stepMs * emaAlpha)
-      logLines.append("\(step),\(stepLoss),\(entry.id),\(stepMs),\(loadMs),\(graphMs),\(backwardMs),\(optMs)")
+      logLines.append("\(step),\(stepLoss),\(lastEntry.id),\(stepMs),\(loadMs),\(graphMs),\(backwardMs),\(optMs)")
       validUpdates += 1
 
       if shouldLog {
@@ -442,7 +521,7 @@ enum DDSPE2ETrainer {
         }
         logger(
           "step=\(step) loss=\(formatLoss(stepLoss)) lr=\(formatLR(currentLR)) specW=\(format(spectralWeight)) "
-            + "chunk=\(entry.id)\(gradInfo) "
+            + "chunk=\(lastEntry.id) accum=\(gradAccum)\(gradInfo) "
             + "tStepMs=\(format(Double(stepMs))) tEMAms=\(format(Double(emaStepMs))) "
             + "tLoadMs=\(format(Double(loadMs))) tGraphMs=\(format(Double(graphMs))) "
             + "tBackwardMs=\(format(Double(backwardMs))) tOptMs=\(format(Double(optMs)))")
@@ -496,6 +575,367 @@ enum DDSPE2ETrainer {
         + "validUpdates=\(validUpdates) avgStepMs=\(format(totalStepMs / denomSteps)) "
         + "avgBackwardMs=\(format(totalBackwardMs / denomSteps)) maxStepMs=\(format(maxStepMs))@\(maxStep)"
     )
+  }
+
+  // MARK: - Batched Training Path
+
+  private static func runBatchedDecoderTraining(
+    dataset: CachedDataset,
+    config: DDSPE2EConfig,
+    runDirs: RunDirectories,
+    options: TrainerOptions,
+    splitEntries: [CachedChunkEntry],
+    model: DDSPDecoderModel,
+    optimizer: Adam,
+    logger: (String) -> Void
+  ) throws {
+    let B = config.batchSize
+    let frameCount = max(config.chunkSize, 1)
+    let firstChunkFeatureFrames = splitEntries[0].featureFrames
+    let paddedFeatureFrames = ((firstChunkFeatureFrames + 7) / 8) * 8
+
+    logger("Batched training: batchSize=\(B) featureFrames=\(firstChunkFeatureFrames) → padded=\(paddedFeatureFrames)")
+
+    // Pre-allocate batched tensors
+    let featuresTensor = Tensor(
+      [[Float]](repeating: [Float](repeating: 0, count: 3), count: paddedFeatureFrames * B)
+    )
+    let synthTensors = DDSPSynth.PreallocatedTensors(
+      featureFrames: paddedFeatureFrames,
+      numHarmonics: config.numHarmonics,
+      batchSize: B,
+      frameCount: frameCount
+    )
+
+    var order = Array(splitEntries.indices)
+    var rng = SeededGenerator(seed: config.seed)
+    if config.shuffleChunks {
+      order.shuffle(using: &rng)
+    }
+
+    let steps = max(1, options.steps)
+    var firstLoss: Float?
+    var lastFiniteLoss: Float = 0
+    var minLoss = Float.greatestFiniteMagnitude
+    var minStep = 0
+    var validUpdates = 0
+    var totalStepMs: Double = 0
+    var totalLoadMs: Double = 0
+    var totalGraphMs: Double = 0
+    var totalBackwardMs: Double = 0
+    var totalOptMs: Double = 0
+    var maxStepMs: Double = 0
+    var maxStep = 0
+    var emaStepMs: Double = 0
+    let emaAlpha: Double = 0.1
+
+    var logLines = [String]()
+    logLines.append("step,loss,chunk_ids,step_ms,load_ms,graph_ms,backward_ms,opt_ms")
+
+    var chunkOffset = 0
+    let F = paddedFeatureFrames
+    let K = config.numHarmonics
+
+    for step in 0..<steps {
+      let tStepStart = CFAbsoluteTimeGetCurrent()
+
+      let currentLR = computeLR(
+        step: step,
+        totalSteps: steps,
+        maxLR: config.learningRate,
+        minLR: config.lrMin,
+        schedule: config.lrSchedule,
+        warmupSteps: config.lrWarmupSteps,
+        halfLife: config.lrHalfLife
+      )
+      optimizer.lr = currentLR
+
+      let spectralWeight = spectralWeightForStep(
+        step: step,
+        targetWeight: config.spectralWeight,
+        warmupSteps: config.spectralWarmupSteps,
+        rampSteps: config.spectralRampSteps
+      )
+
+      // Load B chunks
+      var chunks = [CachedChunk]()
+      chunks.reserveCapacity(B)
+      var chunkIds = [String]()
+      for _ in 0..<B {
+        if chunkOffset > 0, chunkOffset % order.count == 0, config.shuffleChunks {
+          order.shuffle(using: &rng)
+        }
+        let entry = splitEntries[order[chunkOffset % order.count]]
+        chunkOffset += 1
+        chunks.append(try dataset.loadChunk(entry))
+        chunkIds.append(entry.id)
+      }
+      let tAfterLoad = CFAbsoluteTimeGetCurrent()
+
+      // Stack features as [B*F, 3] (batch-major: all frames of chunk0, then chunk1, etc.)
+      var conditioningData = [Float]()
+      conditioningData.reserveCapacity(B * F * 3)
+      for chunk in chunks {
+        var chunkCond = makeConditioningData(
+          f0Hz: chunk.f0Hz,
+          loudnessDB: chunk.loudnessDB,
+          uvMask: chunk.uvMask
+        )
+        let paddingRows = F * 3 - chunkCond.count
+        if paddingRows > 0 {
+          chunkCond.append(contentsOf: [Float](repeating: 0, count: paddingRows))
+        }
+        conditioningData.append(contentsOf: chunkCond)
+      }
+      featuresTensor.updateDataLazily(conditioningData)
+
+      // Stack f0/uv as [F, B] (time-major interleaved)
+      var f0Interleaved = [Float](repeating: 0, count: F * B)
+      var uvInterleaved = [Float](repeating: 0, count: F * B)
+      for frame in 0..<F {
+        for b in 0..<B {
+          let srcFrame = min(frame, chunks[b].f0Hz.count - 1)
+          f0Interleaved[frame * B + b] = srcFrame >= 0 ? chunks[b].f0Hz[srcFrame] : 0
+          uvInterleaved[frame * B + b] = srcFrame >= 0 ? chunks[b].uvMask[srcFrame] : 0
+        }
+      }
+
+      // Stack audio as [frameCount, B] (time-major interleaved)
+      var audioInterleaved = [Float](repeating: 0, count: frameCount * B)
+      for t in 0..<frameCount {
+        for b in 0..<B {
+          if t < chunks[b].audio.count {
+            audioInterleaved[t * B + b] = chunks[b].audio[t]
+          }
+        }
+      }
+
+      synthTensors.updateBatchedData(
+        f0Interleaved: f0Interleaved,
+        uvInterleaved: uvInterleaved,
+        audioInterleaved: audioInterleaved
+      )
+
+      // Forward pass
+      let controls = model.forward(features: featuresTensor)
+      let prediction = DDSPSynth.renderBatchedSignal(
+        controls: controls,
+        tensors: synthTensors,
+        batchSize: B,
+        featureFrames: F,
+        frameCount: frameCount,
+        numHarmonics: K
+      )
+
+      // Target playhead: steps 0, 1, 2, ..., frameCount-1 (one audio sample per frame)
+      let targetPlayhead = Signal.accum(
+        Signal.constant(1.0),
+        reset: 0.0,
+        min: 0.0,
+        max: Float(frameCount)
+      )
+      let targetBatched = synthTensors.target!.sample(targetPlayhead)  // [B]
+
+      let loss = DDSPTrainingLosses.fullBatchedLoss(
+        prediction: prediction,
+        target: targetBatched,
+        batchSize: B,
+        spectralWindowSizes: config.spectralWindowSizes,
+        spectralHopDivisor: config.spectralHopDivisor,
+        frameCount: frameCount,
+        mseWeight: config.mseLossWeight,
+        spectralWeight: spectralWeight
+      )
+      let tAfterGraph = CFAbsoluteTimeGetCurrent()
+
+      let lossValues = try loss.backward(frames: frameCount)
+      let tAfterBackward = CFAbsoluteTimeGetCurrent()
+
+      let loadMs = (tAfterLoad - tStepStart) * 1000.0
+      let graphMs = (tAfterGraph - tAfterLoad) * 1000.0
+      let backwardMs = (tAfterBackward - tAfterGraph) * 1000.0
+
+      let stepLoss = lossValues.reduce(0, +) / Float(max(1, lossValues.count))
+      let shouldLog = step == 0 || step == steps - 1 || step % config.logEvery == 0
+
+      if !stepLoss.isFinite || stepLoss > 1e6 {
+        let stepMs = (CFAbsoluteTimeGetCurrent() - tStepStart) * 1000.0
+        totalStepMs += stepMs
+        totalLoadMs += loadMs
+        totalGraphMs += graphMs
+        totalBackwardMs += backwardMs
+        if stepMs > maxStepMs { maxStepMs = stepMs; maxStep = step }
+        emaStepMs = step == 0 ? stepMs : (emaStepMs * (1.0 - emaAlpha) + stepMs * emaAlpha)
+        logLines.append("\(step),\(stepLoss),\(chunkIds.joined(separator: "+")),\(stepMs),\(loadMs),\(graphMs),\(backwardMs),0")
+        logger(
+          "step=\(step) unstable loss=\(stepLoss); skipping update "
+            + "tStepMs=\(format(Double(stepMs)))")
+        continue
+      }
+
+      if firstLoss == nil { firstLoss = stepLoss }
+      lastFiniteLoss = stepLoss
+      if stepLoss < minLoss { minLoss = stepLoss; minStep = step }
+
+      if step == options.profileKernelsStep {
+        LazyGraphContext.current.profileGPU(frames: frameCount)
+      }
+
+      let tOptStart = CFAbsoluteTimeGetCurrent()
+      let preClipGradStats = shouldLog ? summarizeGradients(params: model.parameters) : nil
+      let gradScale = config.normalizeGradByFrames ? (1.0 / Float(max(1, frameCount))) : 1.0
+      let clipStats = sanitizeAndClipGradients(
+        params: model.parameters,
+        clip: config.gradClip,
+        mode: config.gradClipMode,
+        gradScale: gradScale
+      )
+      let postClipGradStats = shouldLog ? summarizeGradients(params: model.parameters) : nil
+      optimizer.step()
+      optimizer.zeroGrad()
+
+      // Render audio snapshot
+      if let wavPath = options.renderWavPath, options.renderEvery > 0,
+        step % options.renderEvery == 0
+      {
+        do {
+          // For rendering, use the first chunk's signal (non-batched path)
+          let renderSynthTensors = DDSPSynth.PreallocatedTensors(
+            featureFrames: F,
+            numHarmonics: K
+          )
+          var paddedF0 = chunks[0].f0Hz
+          var paddedUV = chunks[0].uvMask
+          let framePadding = F - paddedF0.count
+          if framePadding > 0 {
+            paddedF0.append(contentsOf: [Float](repeating: 0, count: framePadding))
+            paddedUV.append(contentsOf: [Float](repeating: 0, count: framePadding))
+          }
+          renderSynthTensors.updateChunkData(f0Frames: paddedF0, uvFrames: paddedUV)
+
+          // Use only first chunk's features for render: extract [F, 3] from [B*F, 3]
+          let renderFeatures = Tensor(
+            [[Float]](repeating: [Float](repeating: 0, count: 3), count: F)
+          )
+          let firstChunkCond = makeConditioningData(
+            f0Hz: chunks[0].f0Hz,
+            loudnessDB: chunks[0].loudnessDB,
+            uvMask: chunks[0].uvMask
+          )
+          var paddedCond = firstChunkCond
+          let condPadding = F * 3 - paddedCond.count
+          if condPadding > 0 {
+            paddedCond.append(contentsOf: [Float](repeating: 0, count: condPadding))
+          }
+          renderFeatures.updateDataLazily(paddedCond)
+
+          let singleControls = model.forward(features: renderFeatures)
+          let renderPrediction = DDSPSynth.renderSignal(
+            controls: singleControls,
+            tensors: renderSynthTensors,
+            featureFrames: chunks[0].f0Hz.count,
+            frameCount: frameCount,
+            numHarmonics: K
+          )
+          let samples = try renderPrediction.realize(frames: frameCount)
+          LazyGraphContext.current.clearComputationGraph()
+          try AudioFile.save(
+            url: URL(fileURLWithPath: wavPath),
+            samples: samples,
+            sampleRate: config.sampleRate)
+          logger("step=\(step) rendered audio → \(wavPath)")
+        } catch {
+          LazyGraphContext.current.clearComputationGraph()
+          logger("step=\(step) render warning: \(error)")
+        }
+      }
+
+      let tAfterOpt = CFAbsoluteTimeGetCurrent()
+      let optMs = (tAfterOpt - tOptStart) * 1000.0
+      let stepMs = (tAfterOpt - tStepStart) * 1000.0
+      totalStepMs += stepMs
+      totalLoadMs += loadMs
+      totalGraphMs += graphMs
+      totalBackwardMs += backwardMs
+      totalOptMs += optMs
+      if stepMs > maxStepMs { maxStepMs = stepMs; maxStep = step }
+      emaStepMs = step == 0 ? stepMs : (emaStepMs * (1.0 - emaAlpha) + stepMs * emaAlpha)
+      logLines.append("\(step),\(stepLoss),\(chunkIds.joined(separator: "+")),\(stepMs),\(loadMs),\(graphMs),\(backwardMs),\(optMs)")
+      validUpdates += 1
+
+      if shouldLog {
+        let gradInfo: String
+        if let pre = preClipGradStats, let post = postClipGradStats {
+          let clipPct = clipStats.clippedFraction * 100.0
+          gradInfo =
+            " gL2=\(format(pre.l2Norm)) gMax=\(format(pre.maxAbs)) "
+            + "gNZ=\(pre.nonZeroCount)/\(pre.finiteCount) "
+            + "gFinite=\(pre.finiteCount)/\(pre.totalCount) "
+            + "gParams=\(pre.paramsWithGrad)/\(pre.paramCount) "
+            + "gMaxPostClip=\(format(post.maxAbs)) "
+            + "gScale=\(format(gradScale)) "
+            + "gClipMode=\(config.gradClipMode.rawValue) "
+            + "gClip=\(clipStats.clippedCount)/\(clipStats.finiteCount) (\(format(clipPct))%) "
+            + "gNonFinite=\(clipStats.nonFiniteCount)"
+        } else {
+          gradInfo = ""
+        }
+        logger(
+          "step=\(step) loss=\(formatLoss(stepLoss)) lr=\(formatLR(currentLR)) specW=\(format(spectralWeight)) "
+            + "batch=\(B)\(gradInfo) "
+            + "tStepMs=\(format(Double(stepMs))) tEMAms=\(format(Double(emaStepMs))) "
+            + "tLoadMs=\(format(Double(loadMs))) tGraphMs=\(format(Double(graphMs))) "
+            + "tBackwardMs=\(format(Double(backwardMs))) tOptMs=\(format(Double(optMs)))")
+      }
+
+      if step > 0, step % config.checkpointEvery == 0 {
+        try CheckpointStore.writeModelState(
+          checkpointsDir: runDirs.checkpoints,
+          step: step,
+          params: model.snapshots()
+        )
+      }
+    }
+
+    if validUpdates == 0 {
+      throw DatasetError.invalid("No valid training updates were performed (all steps unstable)")
+    }
+
+    let first = firstLoss ?? lastFiniteLoss
+    let denomSteps = Double(max(1, steps))
+    let summary: [String: String] = [
+      "steps": "\(steps)",
+      "validUpdates": "\(validUpdates)",
+      "batchSize": "\(B)",
+      "firstLoss": "\(first)",
+      "finalLoss": "\(lastFiniteLoss)",
+      "minLoss": "\(minLoss)",
+      "minStep": "\(minStep)",
+      "reduction": "\(first / max(lastFiniteLoss, 1e-12))",
+      "avgStepMs": "\(totalStepMs / denomSteps)",
+      "avgLoadMs": "\(totalLoadMs / denomSteps)",
+      "avgGraphMs": "\(totalGraphMs / denomSteps)",
+      "avgBackwardMs": "\(totalBackwardMs / denomSteps)",
+      "avgOptMs": "\(totalOptMs / denomSteps)",
+      "maxStepMs": "\(maxStepMs)",
+      "maxStep": "\(maxStep)",
+    ]
+
+    try CheckpointStore.writeModelState(
+      checkpointsDir: runDirs.checkpoints,
+      step: steps,
+      params: model.snapshots()
+    )
+    try writeJSON(summary, to: runDirs.logs.appendingPathComponent("train_summary.json"))
+
+    let csv = logLines.joined(separator: "\n") + "\n"
+    try csv.write(to: runDirs.logs.appendingPathComponent("train_log.csv"), atomically: true, encoding: .utf8)
+
+    logger("M2 batched training complete")
+    logger(
+      "firstLoss=\(formatLoss(first)) finalLoss=\(formatLoss(lastFiniteLoss)) reduction=\(format(first / max(lastFiniteLoss, 1e-12))) "
+        + "validUpdates=\(validUpdates) batchSize=\(B) avgStepMs=\(format(totalStepMs / denomSteps)) "
+        + "avgBackwardMs=\(format(totalBackwardMs / denomSteps)) maxStepMs=\(format(maxStepMs))@\(maxStep)")
   }
 
   private static func sanitizeAndClipGradients(

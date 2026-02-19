@@ -165,8 +165,8 @@ public struct Expr {
     _ lhs: Expr, _ rhs: Expr,
     thunk: (Lazy, Lazy) -> (IRContext, NodeID?) -> UOp
   ) -> Expr {
+    let resultType = promotedType(lhs, rhs)
     var uop = thunk(lhs.lazy, rhs.lazy)(lhs.ctx, nil)
-    let resultType: CastType = (lhs.scalarType == .int && rhs.scalarType == .int) ? .int : .float
     uop.scalarType = resultType
     lhs.builder.ops.append(uop)
     return Expr(uop.value, ctx: lhs.ctx, nodeId: lhs.nodeId, builder: lhs.builder, scalarType: resultType)
@@ -201,7 +201,7 @@ public struct Expr {
   ) -> Expr? {
     guard let lval = lhs.constantValue, let rval = rhs.constantValue else { return nil }
     let result: Float = op(lval, rval) ? 1.0 : 0.0
-    let resultType: CastType = (lhs.scalarType == .int && rhs.scalarType == .int) ? .int : .float
+    let resultType = promotedType(lhs, rhs)
     let folded = lhs.ctx.useConstant(src: lhs.nodeId, value: result)
     return Expr(folded, ctx: lhs.ctx, nodeId: lhs.nodeId, builder: lhs.builder, scalarType: resultType)
   }

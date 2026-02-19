@@ -208,8 +208,7 @@ extension LazyOp {
       }
 
       b.loop(inShape[axis]) { reduceIdx in
-        let rIdx = reduceIdx
-        let inFlatIdx = inBaseFlatIdx + rIdx * axisStride
+        let inFlatIdx = inBaseFlatIdx + reduceIdx * axisStride
 
         // Read from input tensor — or compute inline if fused with skipped producers.
         let val: Expr
@@ -219,7 +218,7 @@ extension LazyOp {
           case .mul(let aTensor, let bTensor) = source
         {
           var inIndices = inStaticIndices
-          inIndices[axis] = rIdx
+          inIndices[axis] = reduceIdx
           // Fused path: compute A * B inline instead of reading from memory.
           // The mul's input tensors have view transforms (reshape, expand) that
           // handle broadcasting — tensorRead walks the transform chain to map
@@ -235,7 +234,7 @@ extension LazyOp {
           case .expandAxis(let sourceTensor, let expandedAxis) = source
         {
           var inIndices = inStaticIndices
-          inIndices[axis] = rIdx
+          inIndices[axis] = reduceIdx
 
           var sourceIndices: [Expr] = []
           sourceIndices.reserveCapacity(Swift.max(0, inIndices.count - 1))
@@ -245,8 +244,7 @@ extension LazyOp {
           val = readInlineReduceTensor(sourceTensor, indices: sourceIndices)
         } else if inTensor.padding != nil {
           var inIndices = inStaticIndices
-          inIndices[axis] = rIdx
-          // Padded tensor: must use tensorRead for padding bounds checking
+          inIndices[axis] = reduceIdx
           val = b.tensorRead(inTensor, indices: inIndices)
         } else if inIsFrameAware {
           // Non-padded frame-aware tensor: use direct frame-aware read
@@ -257,8 +255,7 @@ extension LazyOp {
           val = b.memoryRead(inTensor.cellId, inFlatIdx)
         } else {
           var inIndices = inStaticIndices
-          inIndices[axis] = rIdx
-          // Non-padded, non-frame-aware: use tensorRead
+          inIndices[axis] = reduceIdx
           val = b.tensorRead(inTensor, indices: inIndices)
         }
 
@@ -362,10 +359,6 @@ extension LazyOp {
 
       func readGemmInput(_ tensor: Tensor, flatIdx: Expr, frameAware: Bool, tensorSize: Int) -> Expr
       {
-        if tensor.padding != nil || !tensor.transforms.isEmpty {
-          // Fallback: use generic tensor read for complex views
-          return b.memoryRead(tensor.cellId, flatIdx)
-        }
         if frameAware {
           return b.frameAwareTensorRead(
             cellId: tensor.cellId, tensorSize: tensorSize, elemIdx: flatIdx)
@@ -432,8 +425,6 @@ extension LazyOp {
       }
 
       b.loop(inShape[axis]) { reduceIdx in
-        let rIdx = reduceIdx
-
         var outIndices = [Expr]()
         var remaining = b.cast(outIdxMax, to: .int)
         for i in 0..<outShape.count {
@@ -447,7 +438,7 @@ extension LazyOp {
         var outDim = 0
         for i in 0..<inShape.count {
           if i == axis {
-            inIndices.append(rIdx)
+            inIndices.append(reduceIdx)
           } else {
             inIndices.append(outIndices[outDim])
             outDim += 1
@@ -514,8 +505,6 @@ extension LazyOp {
       }
 
       b.loop(inShape[axis]) { reduceIdx in
-        let rIdx = reduceIdx
-
         var outIndices = [Expr]()
         var remaining = b.cast(outIdxMean, to: .int)
         for i in 0..<outShape.count {
@@ -529,7 +518,7 @@ extension LazyOp {
         var outDim = 0
         for i in 0..<inShape.count {
           if i == axis {
-            inIndices.append(rIdx)
+            inIndices.append(reduceIdx)
           } else {
             inIndices.append(outIndices[outDim])
             outDim += 1

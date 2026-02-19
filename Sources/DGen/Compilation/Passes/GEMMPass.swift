@@ -56,6 +56,16 @@ extension GraphPrepPasses {
     return nil
   }
 
+  /// Choose between SIMD-group GEMM (8-aligned) and element-parallel fallback.
+  private static func gemmOp(
+    M: Int, N: Int, K: Int, transA: Bool, transB: Bool
+  ) -> LazyOp {
+    let aligned = M % 8 == 0 && N % 8 == 0 && K % 8 == 0
+    return aligned
+      ? .gemm(M, N, K, transA, transB)
+      : .gemmSmall(M, N, K, transA, transB)
+  }
+
   /// Detects `sumAxis(mul(a, b))` patterns that represent matrix multiplication and
   /// rewrites them as `.gemm` nodes, removing orphaned intermediate nodes.
   /// Handles both forward patterns (broadcast size-1 dims) and backward patterns
@@ -129,8 +139,6 @@ extension GraphPrepPasses {
       let M = mulShape[axisM]
       let N = mulShape[axisN]
 
-      let gemmAligned = M % 8 == 0 && N % 8 == 0 && K % 8 == 0
-
       // --- Forward pattern: identify left/right by broadcast size-1 dims ---
       //
       // Left (A) has size 1 along axisN, right (B) has size 1 along axisM.
@@ -156,10 +164,10 @@ extension GraphPrepPasses {
         // Similarly, transA = leftHasTranspose if A's view chain has a net transpose (A stored [K,M]).
         let transA = leftHasTranspose
         let transB = !rightHasTranspose
-        let op: LazyOp = gemmAligned
-          ? .gemm(M, N, K, transA, transB)
-          : .gemmSmall(M, N, K, transA, transB)
-        graph.nodes[nodeId] = Node(id: nodeId, op: op, inputs: [leftSource, rightSource])
+        graph.nodes[nodeId] = Node(
+          id: nodeId,
+          op: gemmOp(M: M, N: N, K: K, transA: transA, transB: transB),
+          inputs: [leftSource, rightSource])
         graph.nodes[nodeId]?.shape = .tensor([M, N])
 
         let mulNodeId = node.inputs[0]
@@ -182,12 +190,9 @@ extension GraphPrepPasses {
         graph: graph
       ) else { continue }
 
-      let op: LazyOp = gemmAligned
-        ? .gemm(M, N, K, match.transA, match.transB)
-        : .gemmSmall(M, N, K, match.transA, match.transB)
       graph.nodes[nodeId] = Node(
         id: nodeId,
-        op: op,
+        op: gemmOp(M: M, N: N, K: K, transA: match.transA, transB: match.transB),
         inputs: [match.leftSource, match.rightSource])
       graph.nodes[nodeId]?.shape = .tensor([M, N])
 

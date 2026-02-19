@@ -109,7 +109,8 @@ extension UOpBlockFinalization {
   ) -> DispatchMode {
     if hasOwnFrameLoop { return .selfManaged }
 
-    // GEMM blocks use 2D threadgroup dispatch with 32 threads per group
+    // GEMM ops override dispatch: gemm/gemmChunkPartials use 2D threadgroup grids,
+    // gemmSmall uses per-frame element-parallel dispatch.
     for nodeId in block.nodes {
       guard let node = graph.nodes[nodeId] else { continue }
       switch node.op {

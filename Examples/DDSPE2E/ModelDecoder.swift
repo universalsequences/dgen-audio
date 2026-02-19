@@ -5,6 +5,7 @@ struct DecoderControls {
   var harmonicAmps: Tensor      // [frames, numHarmonics]
   var harmonicGain: Tensor      // [frames, 1]
   var noiseGain: Tensor         // [frames, 1]
+  var noiseFilter: Tensor?      // [frames, noiseFilterSize] — nil when noise filter disabled
 }
 
 struct NamedTensorSnapshot: Codable {
@@ -18,6 +19,8 @@ final class DDSPDecoderModel {
   let hiddenSize: Int
   let numLayers: Int
   let numHarmonics: Int
+  let enableNoiseFilter: Bool
+  let noiseFilterSize: Int
 
   // Trunk layers: [(W, b), ...]
   let trunkWeights: [Tensor]
@@ -33,10 +36,16 @@ final class DDSPDecoderModel {
   let W_noise: Tensor
   let b_noise: Tensor
 
+  // Learned FIR filter head (nil when enableFIRNoise is false)
+  let W_filter: Tensor?
+  let b_filter: Tensor?
+
   init(config: DDSPE2EConfig) {
     self.hiddenSize = config.modelHiddenSize
     self.numLayers = max(1, config.modelNumLayers)
     self.numHarmonics = config.numHarmonics
+    self.enableNoiseFilter = config.enableNoiseFilter
+    self.noiseFilterSize = max(2, config.noiseFilterSize)
 
     var rng = SeededGenerator(seed: config.seed)
 
@@ -67,6 +76,18 @@ final class DDSPDecoderModel {
     // Keep non-negative controls after updates
     self.b_hgain.minBound = -8.0
     self.b_noise.minBound = -8.0
+
+    // Learned FIR filter: [hiddenSize → noiseFilterSize], sigmoid → positive taps in (0,1)
+    if config.enableNoiseFilter {
+      let K = max(2, config.noiseFilterSize)
+      self.W_filter = Tensor.param(
+        [hiddenSize, K],
+        data: Self.randomArray(count: hiddenSize * K, scale: 0.05, rng: &rng))
+      self.b_filter = Tensor.param([1, K], data: [Float](repeating: 0.0, count: K))
+    } else {
+      self.W_filter = nil
+      self.b_filter = nil
+    }
   }
 
   var parameters: [any LazyValue] {
@@ -76,6 +97,9 @@ final class DDSPDecoderModel {
       params.append(trunkBiases[i])
     }
     params.append(contentsOf: [W_harm, b_harm, W_hgain, b_hgain, W_noise, b_noise])
+    if let wf = W_filter, let bf = b_filter {
+      params.append(contentsOf: [wf, bf])
+    }
     return params
   }
 
@@ -98,10 +122,18 @@ final class DDSPDecoderModel {
     let nGainLogits = hidden.matmul(W_noise) + b_noise
     let noiseGain = sigmoid(nGainLogits)
 
+    // learned FIR filter taps [F,K] — sigmoid keeps taps positive in (0,1)
+    var noiseFilter: Tensor? = nil
+    if enableNoiseFilter, let wf = W_filter, let bf = b_filter {
+      let filterLogits = hidden.matmul(wf) + bf
+      noiseFilter = sigmoid(filterLogits)
+    }
+
     return DecoderControls(
       harmonicAmps: harmonicAmps,
       harmonicGain: harmonicGain,
-      noiseGain: noiseGain
+      noiseGain: noiseGain,
+      noiseFilter: noiseFilter
     )
   }
 
@@ -119,6 +151,9 @@ final class DDSPDecoderModel {
       snapshot("W_noise", W_noise),
       snapshot("b_noise", b_noise),
     ])
+    if let wf = W_filter, let bf = b_filter {
+      snaps.append(contentsOf: [snapshot("W_filter", wf), snapshot("b_filter", bf)])
+    }
     return snaps
   }
 
@@ -134,6 +169,10 @@ final class DDSPDecoderModel {
     loadTensor(b_hgain, from: byName["b_hgain"])
     loadTensor(W_noise, from: byName["W_noise"])
     loadTensor(b_noise, from: byName["b_noise"])
+    if let wf = W_filter, let bf = b_filter {
+      loadTensor(wf, from: byName["W_filter"])
+      loadTensor(bf, from: byName["b_filter"])
+    }
   }
 
   private func snapshot(_ name: String, _ tensor: Tensor) -> NamedTensorSnapshot {

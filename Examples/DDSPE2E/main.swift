@@ -117,6 +117,8 @@ struct DDSPE2EMain {
     let split = parseSplit(options["split"]) ?? .train
     let mode = TrainMode(rawValue: (options["mode"] ?? "m2").lowercased()) ?? .m2
     let profileStep = Int(options["profile-step"] ?? "-1") ?? -1
+    let renderEvery = Int(options["render-every"] ?? "0") ?? 0
+    let renderWavPath = options["render-wav"]
 
     try DDSPE2ETrainer.run(
       dataset: dataset,
@@ -128,7 +130,9 @@ struct DDSPE2EMain {
         mode: mode,
         kernelDumpPath: kernelDumpPath,
         initCheckpointPath: initCheckpointPath,
-        profileKernelsStep: profileStep
+        profileKernelsStep: profileStep,
+        renderEvery: renderEvery,
+        renderWavPath: renderWavPath
       ),
       logger: log
     )
@@ -206,9 +210,11 @@ struct DDSPE2EMain {
       --shuffle <true|false>
       --model-hidden <int>
       --harmonics <int>
-      --static-fir-noise <true|false>
-      --noise-fir-size <int>
+      --noise-filter <true|false>
+      --noise-filter-size <int>
       --lr <float>
+      --batch-size <int>
+      --grad-accum-steps <int>
       --grad-clip <float>
       --clip-mode <element|global>
       --normalize-grad-by-frames <true|false>
@@ -222,6 +228,8 @@ struct DDSPE2EMain {
       --checkpoint-every <int>
       --kernel-dump [path]
       --init-checkpoint <model-checkpoint-json>
+      --render-every <int>
+      --render-wav <path>
 
     Examples:
       swift run DDSPE2E dump-config --output ddsp_config.json

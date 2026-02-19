@@ -37,13 +37,15 @@ struct DDSPE2EConfig: Codable {
   var modelHiddenSize: Int = 32
   var modelNumLayers: Int = 1
   var numHarmonics: Int = 16
-  var enableStaticFIRNoise: Bool = false
-  var noiseFIRKernelSize: Int = 15
+  var enableNoiseFilter: Bool = false
+  var noiseFilterSize: Int = 15
   var learningRate: Float = 0.001
   var lrSchedule: LRSchedule = .cosine
   var lrMin: Float = 1e-5
   var lrHalfLife: Int = 50
   var lrWarmupSteps: Int = 0
+  var batchSize: Int = 1
+  var gradAccumSteps: Int = 1
   var gradClip: Float = 1.0
   var gradClipMode: GradientClipMode = .element
   var normalizeGradByFrames: Bool = true
@@ -77,13 +79,15 @@ struct DDSPE2EConfig: Codable {
     case modelHiddenSize
     case modelNumLayers
     case numHarmonics
-    case enableStaticFIRNoise
-    case noiseFIRKernelSize
+    case enableNoiseFilter
+    case noiseFilterSize
     case learningRate
     case lrSchedule
     case lrMin
     case lrHalfLife
     case lrWarmupSteps
+    case batchSize
+    case gradAccumSteps
     case gradClip
     case gradClipMode
     case normalizeGradByFrames
@@ -121,15 +125,17 @@ struct DDSPE2EConfig: Codable {
     modelHiddenSize = try c.decodeIfPresent(Int.self, forKey: .modelHiddenSize) ?? d.modelHiddenSize
     modelNumLayers = try c.decodeIfPresent(Int.self, forKey: .modelNumLayers) ?? d.modelNumLayers
     numHarmonics = try c.decodeIfPresent(Int.self, forKey: .numHarmonics) ?? d.numHarmonics
-    enableStaticFIRNoise =
-      try c.decodeIfPresent(Bool.self, forKey: .enableStaticFIRNoise) ?? d.enableStaticFIRNoise
-    noiseFIRKernelSize =
-      try c.decodeIfPresent(Int.self, forKey: .noiseFIRKernelSize) ?? d.noiseFIRKernelSize
+    enableNoiseFilter =
+      try c.decodeIfPresent(Bool.self, forKey: .enableNoiseFilter) ?? d.enableNoiseFilter
+    noiseFilterSize =
+      try c.decodeIfPresent(Int.self, forKey: .noiseFilterSize) ?? d.noiseFilterSize
     learningRate = try c.decodeIfPresent(Float.self, forKey: .learningRate) ?? d.learningRate
     lrSchedule = try c.decodeIfPresent(LRSchedule.self, forKey: .lrSchedule) ?? d.lrSchedule
     lrMin = try c.decodeIfPresent(Float.self, forKey: .lrMin) ?? d.lrMin
     lrHalfLife = try c.decodeIfPresent(Int.self, forKey: .lrHalfLife) ?? d.lrHalfLife
     lrWarmupSteps = try c.decodeIfPresent(Int.self, forKey: .lrWarmupSteps) ?? d.lrWarmupSteps
+    batchSize = try c.decodeIfPresent(Int.self, forKey: .batchSize) ?? d.batchSize
+    gradAccumSteps = try c.decodeIfPresent(Int.self, forKey: .gradAccumSteps) ?? d.gradAccumSteps
     gradClip = try c.decodeIfPresent(Float.self, forKey: .gradClip) ?? d.gradClip
     gradClipMode = try c.decodeIfPresent(GradientClipMode.self, forKey: .gradClipMode) ?? d.gradClipMode
     normalizeGradByFrames =
@@ -174,11 +180,11 @@ struct DDSPE2EConfig: Codable {
     if let value = options["harmonics"] {
       numHarmonics = try parseInt(value, key: "harmonics")
     }
-    if let value = options["static-fir-noise"] {
-      enableStaticFIRNoise = parseBool(value)
+    if let value = options["noise-filter"] {
+      enableNoiseFilter = parseBool(value)
     }
-    if let value = options["noise-fir-size"] {
-      noiseFIRKernelSize = try parseInt(value, key: "noise-fir-size")
+    if let value = options["noise-filter-size"] {
+      noiseFilterSize = try parseInt(value, key: "noise-filter-size")
     }
     if let value = options["lr"] {
       learningRate = try parseFloat(value, key: "lr")
@@ -197,6 +203,12 @@ struct DDSPE2EConfig: Codable {
     }
     if let value = options["lr-warmup-steps"] {
       lrWarmupSteps = try parseInt(value, key: "lr-warmup-steps")
+    }
+    if let value = options["batch-size"] {
+      batchSize = try parseInt(value, key: "batch-size")
+    }
+    if let value = options["grad-accum-steps"] {
+      gradAccumSteps = try parseInt(value, key: "grad-accum-steps")
     }
     if let value = options["grad-clip"] {
       gradClip = try parseFloat(value, key: "grad-clip")
@@ -294,8 +306,8 @@ struct DDSPE2EConfig: Codable {
     guard numHarmonics > 0 else {
       throw ConfigError.invalid("numHarmonics must be > 0")
     }
-    guard noiseFIRKernelSize > 1 else {
-      throw ConfigError.invalid("noiseFIRKernelSize must be > 1")
+    guard noiseFilterSize > 1 else {
+      throw ConfigError.invalid("noiseFilterSize must be > 1")
     }
     guard learningRate > 0 else {
       throw ConfigError.invalid("learningRate must be > 0")
@@ -308,6 +320,12 @@ struct DDSPE2EConfig: Codable {
     }
     guard lrWarmupSteps >= 0 else {
       throw ConfigError.invalid("lrWarmupSteps must be >= 0")
+    }
+    guard batchSize >= 1 else {
+      throw ConfigError.invalid("batchSize must be >= 1")
+    }
+    guard gradAccumSteps >= 1 else {
+      throw ConfigError.invalid("gradAccumSteps must be >= 1")
     }
     guard gradClip > 0 else {
       throw ConfigError.invalid("gradClip must be > 0")
