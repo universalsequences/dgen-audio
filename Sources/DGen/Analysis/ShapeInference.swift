@@ -169,9 +169,6 @@ public func inferShape(op: LazyOp, inputs: [ValueShape], graph: Graph) throws ->
     }
     return .tensor([shape[1]])
 
-  case .peekRowInline(_, _, let numCols):
-    return .tensor([numCols])
-
   case .sampleInline(_, _, let remainingShape):
     return .tensor(remainingShape)
 
@@ -246,7 +243,6 @@ public func inferShape(op: LazyOp, inputs: [ValueShape], graph: Graph) throws ->
     .spectralLossFFT, .spectralLossFFTGradSpec, .spectralLossFFTGradIFFT,
     .spectralLossFFTGradInline, .spectralLossFFTGradRead, .spectralLossFFTGradRead2,
     .selectRowGradWrite, .selectRowGradReduce,
-    .peekRowGradWrite, .peekRowGradReduce,
     .selector,
     .memoryRead, .memoryWrite, .memoryAccumulate, .memoryCellSum,
     .historyReadWrite,

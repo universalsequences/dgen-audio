@@ -676,28 +676,13 @@ extension Graph {
   }
 
   /// Read a row from a 2D tensor with linear interpolation between adjacent rows.
-  /// Uses peekRowInline for SIMD-safe parallel execution with frame-indexed storage.
+  /// Delegates to the generalized `sample` op internally.
   /// - Parameters:
   ///   - tensor: 2D tensor [numRows, numCols]
   ///   - rowIndex: Scalar row index (fractional values interpolate between rows)
   /// - Returns: 1D tensor [numCols] containing the interpolated row
   public func peekRow(tensor: NodeID, rowIndex: NodeID) throws -> NodeID {
-    guard let tensorNode = nodes[tensor],
-      case .tensor(let shape) = tensorNode.shape,
-      shape.count == 2
-    else {
-      throw DGenError.tensorError(op: "peekRow", reason: "requires 2D tensor input")
-    }
-    let numRows = shape[0]
-    let numCols = shape[1]
-
-    // Allocate frame-indexed scratch cell for SIMD safety
-    // Size: maxFrameCount * numCols
-    let scratchCell = alloc(vectorWidth: maxFrameCount * numCols)
-
-    return n(
-      .peekRowInline(scratchCell: scratchCell, numRows: numRows, numCols: numCols),
-      [tensor, rowIndex], shape: .tensor([numCols]))
+    return try sample(tensor: tensor, index: rowIndex)
   }
 
   /// Generalized sampling along axis 0 with interpolation for any-rank tensor (N >= 2).

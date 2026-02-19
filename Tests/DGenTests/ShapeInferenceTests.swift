@@ -442,10 +442,10 @@ final class ShapeInferenceTests: XCTestCase {
         }
     }
 
-    func testPeekRowInlineInfersNumCols() throws {
+    func testSampleInlineInfersRemainingShape() throws {
         let g = Graph()
         let shape = try inferShape(
-            op: .peekRowInline(scratchCell: 99, numRows: 8, numCols: 16),
+            op: .sampleInline(scratchCell: 99, numRows: 8, remainingShape: [16]),
             inputs: [.tensor([8, 16]), .scalar],
             graph: g
         )

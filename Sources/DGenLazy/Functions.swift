@@ -676,14 +676,7 @@ public func spectralLossFFT(
 /// - Returns: SignalTensor [numCols] containing the interpolated row per frame
 extension Tensor {
   public func peekRow(_ rowIndex: Signal) -> SignalTensor {
-    guard shape.count == 2 else {
-      fatalError("peekRow requires 2D tensor, got shape \(shape)")
-    }
-    let numCols = shape[1]
-    let nodeId = try! graph.graph.peekRow(tensor: self.nodeId, rowIndex: rowIndex.nodeId)
-    return SignalTensor(
-      nodeId: nodeId, graph: graph, shape: [numCols],
-      requiresGrad: requiresGrad || rowIndex.requiresGrad)
+    return self.sample(rowIndex)
   }
 }
 
@@ -708,14 +701,7 @@ extension Tensor {
 /// Read a row from a 2D SignalTensor with linear interpolation
 extension SignalTensor {
   public func peekRow(_ rowIndex: Signal) -> SignalTensor {
-    guard shape.count == 2 else {
-      fatalError("peekRow requires 2D tensor, got shape \(shape)")
-    }
-    let numCols = shape[1]
-    let nodeId = try! graph.graph.peekRow(tensor: self.nodeId, rowIndex: rowIndex.nodeId)
-    return SignalTensor(
-      nodeId: nodeId, graph: graph, shape: [numCols],
-      requiresGrad: requiresGrad || rowIndex.requiresGrad)
+    return self.sample(rowIndex)
   }
 }
 

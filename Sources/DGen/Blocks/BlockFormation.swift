@@ -160,7 +160,7 @@ public func isolateSpectralPasses(_ blocks: [Block], _ g: Graph) -> [Block] {
 
 public func isReductionOp(_ op: LazyOp) -> Bool {
   switch op {
-  case .sum, .tensorAccumulate, .peekRowGradReduce, .sampleGradReduce,
+  case .sum, .tensorAccumulate, .sampleGradReduce,
     .selectRowGradReduce, .peekGradReduce, .overlapAddGradGather, .bufferViewGradRead,
     .sumMulAxis0, .gemmSmall, .chunkPartialsReduceToCell:
     return true
@@ -171,7 +171,7 @@ public func isReductionOp(_ op: LazyOp) -> Bool {
 
 public func isGlobalReductionOp(_ op: LazyOp) -> Bool {
   switch op {
-  case .peekRowGradReduce, .sampleGradReduce, .selectRowGradReduce, .peekGradReduce,
+  case .sampleGradReduce, .selectRowGradReduce, .peekGradReduce,
     .tensorAccumulate, .chunkPartialsReduceToCell:
     return true
   default:
@@ -329,7 +329,7 @@ public func splitReduceBlocks(g: Graph, blocks: [Block]) -> [Block] {
 
     // Reduction block
     // Global reduces run once total, not per-frame:
-    // - peekRowGradReduce/selectRowGradReduce/peekGradReduce: reduction ops with internal frame loops
+    // - sampleGradReduce/selectRowGradReduce/peekGradReduce: reduction ops with internal frame loops
     // - tensorAccumulate: atomic gradient accumulation, loops over frames internally
     let reductionNode = g.nodes[block.nodes[reductionOpIndex]]
     let isGlobalReduce = reductionNode.map { isGlobalReductionOp($0.op) } ?? false

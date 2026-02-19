@@ -886,65 +886,6 @@ extension LazyOp {
       // Gradient ops don't need their own gradients
       return node.inputs.map { _ in nil }
 
-    case .peekRowInline(_, let numRows, let numCols):
-      // peekRowInline(tensor2D, rowIndex) -> 1D tensor [numCols]
-      // Gradient scatters to both floor and ceil rows with interpolation weights
-      guard node.inputs.count == 2 else {
-        return [nil, nil]
-      }
-
-      let tensorInput = node.inputs[0]
-      guard let inputNode = g.nodes[tensorInput],
-        case .tensor(let shape) = inputNode.shape,
-        shape.count == 2
-      else {
-        let zero = g.n(.constant(0.0), [])
-        return [nil, zero]
-      }
-
-      let totalSize = numRows * numCols
-
-      let gradCell = getOrCreateGradCell(g, tensorInput: tensorInput, totalSize: totalSize)
-
-      // Allocate frame-indexed storage
-      let floorGradCell = g.alloc(vectorWidth: g.maxFrameCount * numCols)
-      let ceilGradCell = g.alloc(vectorWidth: g.maxFrameCount * numCols)
-      let rowIdxCell = g.alloc(vectorWidth: g.maxFrameCount * 2)  // floor and ceil indices
-      let fracCell = g.alloc(vectorWidth: g.maxFrameCount)
-
-      // Phase 1: Write weighted gradients to frame-indexed storage
-      let rowIndex = node.inputs[1]
-      let writeOp = g.n(
-        .peekRowGradWrite(
-          floorGradCell: floorGradCell,
-          ceilGradCell: ceilGradCell,
-          rowIdxCell: rowIdxCell,
-          fracCell: fracCell,
-          numRows: numRows,
-          numCols: numCols,
-          maxFrameCount: g.maxFrameCount
-        ), [gradOutput, rowIndex])
-      g.addGradientSideEffect(writeOp)
-
-      // Phase 2: Reduce across frames
-      let reduceOp = g.n(
-        .peekRowGradReduce(
-          floorGradCell: floorGradCell,
-          ceilGradCell: ceilGradCell,
-          rowIdxCell: rowIdxCell,
-          fracCell: fracCell,
-          gradCell: gradCell,
-          numRows: numRows,
-          numCols: numCols,
-          maxFrameCount: g.maxFrameCount
-        ), [writeOp])
-      g.addGradientSideEffect(reduceOp)
-
-      let sequencedGrad = createSequencedGradTensor(
-        g, gradCell: gradCell, shape: shape, afterOp: reduceOp)
-      let zero = g.n(.constant(0.0), [])
-      return [sequencedGrad, zero]
-
     case .sampleInline(_, let numRows, let remainingShape):
       // sampleInline(tensorND, index) -> tensor with remainingShape
       // Gradient scatters to both floor and ceil rows with interpolation weights
@@ -1006,7 +947,6 @@ extension LazyOp {
       return [sequencedGrad, zero]
 
     case .sampleGradWrite(_, _, _, _, _, _, _), .sampleGradReduce(_, _, _, _, _, _, _, _),
-      .peekRowGradWrite(_, _, _, _, _, _, _), .peekRowGradReduce(_, _, _, _, _, _, _, _),
       .peekGradWrite(_, _, _, _, _, _, _), .peekGradReduce(_, _, _, _, _, _, _),
       .overlapAddGradStore(_), .overlapAddGradGather(_, _, _, _),
       .bufferViewGradStore(_, _), .bufferViewGradRead(_, _):

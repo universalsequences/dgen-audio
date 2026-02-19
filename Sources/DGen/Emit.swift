@@ -251,8 +251,8 @@ extension LazyOp {
       .spectralLossFFTGradInline, .spectralLossFFTGradRead, .spectralLossFFTGradRead2:
       try emitSpectralLoss(b: b, ctx: ctx, g: g, node: node, inputs: inputs)
 
-    case .selectRow, .peekRowInline, .selectRowGradWrite, .selectRowGradReduce,
-      .peekRowGradWrite, .peekRowGradReduce, .peekGradWrite, .peekGradReduce,
+    case .selectRow, .selectRowGradWrite, .selectRowGradReduce,
+      .peekGradWrite, .peekGradReduce,
       .sampleInline, .sampleGradWrite, .sampleGradReduce:
       try emitRowSelection(b: b, ctx: ctx, g: g, node: node, inputs: inputs, nodeId: nodeId)
 

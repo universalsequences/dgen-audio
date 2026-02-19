@@ -113,20 +113,6 @@ public enum LazyOp {
   // Input: [tensor2D, rowIndex] where rowIndex is floored to int
   // Output: 1D tensor [numCols]
   case selectRow
-  // peekRowInline: interpolated row extraction with frame-local computation
-  // Input: [tensor2D, rowIndex] where rowIndex is interpolated between floor and ceil
-  // Output: 1D tensor [numCols] - uses frame-indexed storage for SIMD safety
-  // scratchCell stores frame-indexed outputs: frame * numCols + col
-  case peekRowInline(scratchCell: CellID, numRows: Int, numCols: Int)
-  // peekRowGradWrite: write gradients for both floor and ceil rows to frame-indexed storage
-  // Input: [gradOutput (1D tensor), rowIndex]
-  case peekRowGradWrite(
-    floorGradCell: CellID, ceilGradCell: CellID, rowIdxCell: CellID, fracCell: CellID,
-    numRows: Int, numCols: Int, maxFrameCount: Int)
-  // peekRowGradReduce: sum gradient contributions from all frames for each tensor position
-  case peekRowGradReduce(
-    floorGradCell: CellID, ceilGradCell: CellID, rowIdxCell: CellID, fracCell: CellID,
-    gradCell: CellID, numRows: Int, numCols: Int, maxFrameCount: Int)
   // peekGradWrite: write per-frame scalar gradient and interpolation metadata for peek backward
   // Input: [gradOutput (scalar), index, channel]
   case peekGradWrite(
