@@ -279,15 +279,9 @@ final class TransformerOpsTests: XCTestCase {
       let lossValue = try loss.backward(frameCount: 1).first ?? 0
       losses.append(lossValue)
 
-      if epoch % 10 == 0 {
-        print("Attention epoch \(epoch): loss=\(lossValue)")
-      }
-
       optimizer.step()
       optimizer.zeroGrad()
     }
-
-    print("Attention training: initial=\(losses[0]) final=\(losses.last!)")
 
     // Loss should decrease significantly
     XCTAssertGreaterThan(losses[0], losses.last!, "Loss should decrease")
@@ -330,15 +324,10 @@ final class TransformerOpsTests: XCTestCase {
       let lossValue = try loss.backward(frameCount: 1).first ?? 0
       losses.append(lossValue)
 
-      if epoch % 40 == 0 {
-        print("KV retrieval epoch \(epoch): loss=\(lossValue)")
-      }
-
       optimizer.step()
       optimizer.zeroGrad()
     }
 
-    print("KV retrieval: initial=\(losses[0]) final=\(losses.last!)")
     XCTAssertLessThan(losses.last!, losses[0] * 0.1, "Loss should decrease 10x")
 
     // Verify the student actually performs key-value retrieval
@@ -425,15 +414,10 @@ final class TransformerOpsTests: XCTestCase {
       let lossValue = try loss.backward(frameCount: 1).first ?? 0
       losses.append(lossValue)
 
-      if epoch % 40 == 0 {
-        print("Next-token epoch \(epoch): loss=\(lossValue)")
-      }
-
       optimizer.step()
       optimizer.zeroGrad()
     }
 
-    print("Next-token: initial=\(losses[0]) final=\(losses.last!)")
     XCTAssertLessThan(losses.last!, losses[0] * 0.1, "Loss should decrease 10x")
 
     // Verify: for each position, the highest logit should be the correct next token
@@ -446,9 +430,6 @@ final class TransformerOpsTests: XCTestCase {
     for pos in 0..<4 {
       let row = (0..<4).map { output[pos * 4 + $0] }
       let predicted = row.enumerated().max(by: { $0.element < $1.element })!.offset
-      print(
-        "Position \(pos): logits=\(row.map { String(format: "%.2f", $0) }) predicted=\(predicted) expected=\(expectedArgmax[pos])"
-      )
       XCTAssertEqual(
         predicted, expectedArgmax[pos],
         "Position \(pos) should predict token \(expectedArgmax[pos])")
@@ -585,24 +566,13 @@ final class TransformerOpsTests: XCTestCase {
       let diff = predictions - target
       let loss = (diff * diff).sum()
 
-      if epoch == 0 {
-        DGenConfig.kernelOutputPath = "/tmp/attention_transcription.metal"
-        DGenConfig.debug = true
-      }
       let lossValue = try loss.backward(frameCount: 1).first ?? 0
-      DGenConfig.kernelOutputPath = nil
-      DGenConfig.debug = false
       losses.append(lossValue)
-
-      if epoch % 10 == 0 {
-        print("Rhythm epoch \(epoch): loss=\(lossValue)")
-      }
 
       optimizer.step()
       optimizer.zeroGrad()
     }
 
-    print("Rhythm onset: initial=\(losses[0]) final=\(losses.last!)")
     XCTAssertLessThan(losses.last!, losses[0] * 0.5, "Loss should decrease 2x")
 
     let spectrogram = Tensor(spectrogramData).reshape([numWindows, numBins])
@@ -611,12 +581,6 @@ final class TransformerOpsTests: XCTestCase {
     let (finalAttn, _) = Self.attention(spectrogram, WQ, WK, WV)
     let finalPred = finalAttn.matmul(WO)
     let predValues = try finalPred.realize()
-
-    print("Rhythm predictions vs pattern:")
-    for w in 0..<numWindows {
-      let label = pattern[w] > 0.5 ? "HIT" : "rest"
-      print("  Window \(w) [\(label)]: \(String(format: "%.3f", predValues[w]))")
-    }
 
     // Hit predictions should be higher than rest predictions
     let hitPreds = (0..<numWindows).filter { pattern[$0] > 0.5 }.map { predValues[$0] }

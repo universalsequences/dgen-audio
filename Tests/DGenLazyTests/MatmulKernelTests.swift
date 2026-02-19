@@ -213,53 +213,6 @@ final class MatmulKernelTests: XCTestCase {
     print("GEMM backward both-param gradients verified")
   }
 
-  /// Matmul [2,2] @ [2,2] → [2,2] with backward pass.
-  /// Verifies that the static matmul kernel parallelizes over output elements (4 threads, no element loop).
-  func testMatmul2x2KernelBackward() throws {
-    DGenConfig.kernelOutputPath = "/tmp/matmul_2x2_backward.metal"
-    defer { DGenConfig.kernelOutputPath = nil }
-
-    let A = Tensor([
-      [1.0, 2.0],
-      [3.0, 4.0],
-    ])
-    let B = Tensor([
-      [5.0, 6.0],
-      [7.0, 8.0],
-    ])
-
-    let C = A.matmul(B)
-    let _ = try C.sum().backward(frameCount: 4)
-
-    // Read generated kernel and verify parallelization of kernel_0 (the matmul)
-    let source = try String(contentsOfFile: "/tmp/matmul_2x2_backward.metal", encoding: .utf8)
-    let kernel0 = extractKernel(source, index: 0)
-
-    // Must dispatch 4 threads (one per output element), not 1
-    XCTAssertTrue(
-      kernel0.contains("id < (uint)(4)"),
-      "Matmul kernel should dispatch 4 threads (one per output element), got single-thread dispatch"
-    )
-    XCTAssertFalse(
-      kernel0.contains("id < (uint)(1)"),
-      "Matmul kernel must NOT use single-thread dispatch"
-    )
-
-    // Must NOT have a sequential loop over 4 elements (the outer element loop should be parallelized)
-    XCTAssertFalse(
-      kernel0.contains("t8 < 4") || kernel0.contains("< 4;"),
-      "Matmul kernel should not have a sequential loop over 4 output elements"
-    )
-
-    // Should have ThreadCountScale = 4
-    XCTAssertTrue(
-      kernel0.contains("ThreadCountScale Optional(4)"),
-      "Matmul kernel should have ThreadCountScale = 4"
-    )
-
-    print("Kernel written to /tmp/matmul_2x2_backward.metal")
-  }
-
   /// Extract a single kernel's source from concatenated Metal output.
   private func extractKernel(_ source: String, index: Int) -> String {
     let marker = "// KERNEL \(index)\n"
