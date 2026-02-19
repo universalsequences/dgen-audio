@@ -15,6 +15,11 @@ public protocol LazyRuntime: AnyObject {
     func runNoCopy(frameCount: Int)
     func memoryPointer() -> UnsafeMutablePointer<Float>?
     func outputsPointer() -> UnsafeMutablePointer<Float>?
+    func profileKernels(frameCount: Int) -> [(index: Int, name: String, dispatchInfo: String, gpuMs: Double)]
+}
+
+extension CLazyRuntime {
+    public func profileKernels(frameCount: Int) -> [(index: Int, name: String, dispatchInfo: String, gpuMs: Double)] { [] }
 }
 
 extension MetalCompiledKernel: LazyRuntime {
@@ -522,6 +527,40 @@ extension SignalTensor {
 
         // Fallback - return the summed output
         return graph.readOutputs(context: context)
+    }
+}
+
+// MARK: - GPU Kernel Profiling
+
+extension LazyGraph {
+    /// Profile individual GPU kernel execution times.
+    /// Must be called after at least one backward pass so the full compilation cache is warm.
+    /// Prints a ranked table of kernels by GPU time to stdout.
+    public func profileGPU(frames: Int) {
+        guard let cached = fullCompilationCache else {
+            print("[profile] No compiled runtime — run backward() first")
+            return
+        }
+
+        print("[profile] Profiling \(cached.result.kernels.count) kernels (frameCount=\(frames))...")
+        let timings = cached.runtime.profileKernels(frameCount: frames)
+        guard !timings.isEmpty else {
+            print("[profile] No timings returned (C backend?)")
+            return
+        }
+
+        let total = timings.reduce(0.0) { $0 + $1.gpuMs }
+        let sorted = timings.sorted { $0.gpuMs > $1.gpuMs }
+
+        print(String(format: "[profile] Total GPU time: %.2fms across %d kernels", total, timings.count))
+        print("[profile] Top kernels by GPU time:")
+        print("  idx  name                                        dispatch                ms        %")
+        for r in sorted {
+            let pct = total > 0 ? r.gpuMs / total * 100 : 0
+            let name = r.name.padding(toLength: 42, withPad: " ", startingAt: 0)
+            let disp = r.dispatchInfo.padding(toLength: 22, withPad: " ", startingAt: 0)
+            print(String(format: "  %3d  \(name)  \(disp)  %7.3f  %5.1f%%", r.index, r.gpuMs, pct))
+        }
     }
 }
 

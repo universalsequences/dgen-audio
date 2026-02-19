@@ -356,6 +356,61 @@ public class MetalCompiledKernel: CompiledKernelRuntime {
     copyResultsToOutputs(outputs: outputs, frameCount: frameCount, volumeScale: volumeScale)
   }
 
+  /// Run each kernel in isolation and record GPU timestamps.
+  /// Returns per-kernel results sorted by index (not timed order).
+  /// Note: kernels run on whatever data is currently in the buffers,
+  /// so call this after a real backward pass to profile realistic workloads.
+  public func profileKernels(frameCount: Int) -> [(index: Int, name: String, dispatchInfo: String, gpuMs: Double)] {
+    if let frameCountBuffer = bufferPool["frameCount"] {
+      frameCountBuffer.contents().assumingMemoryBound(to: UInt32.self)[0] = UInt32(frameCount)
+    }
+
+    var results: [(index: Int, name: String, dispatchInfo: String, gpuMs: Double)] = []
+
+    for (index, kernel) in kernels.enumerated() {
+      guard index < pipelineStates.count,
+            let commandBuffer = commandQueue.makeCommandBuffer(),
+            let computeEncoder = commandBuffer.makeComputeCommandEncoder()
+      else { continue }
+
+      let pipelineState = pipelineStates[index]
+      computeEncoder.setComputePipelineState(pipelineState)
+      for (bufferIndex, bufferName) in kernel.buffers.enumerated() {
+        if let buffer = bufferPool[bufferName] {
+          computeEncoder.setBuffer(buffer, offset: 0, index: bufferIndex)
+        }
+      }
+
+      let dispatchInfo: String
+      if case .gemm(let tilesM, let tilesN, let fixedDepth) = kernel.dispatchMode {
+        let depth = fixedDepth ?? (kernel.temporality == .static_ ? 1 : frameCount)
+        computeEncoder.dispatchThreadgroups(
+          MTLSize(width: tilesN, height: tilesM, depth: max(1, depth)),
+          threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1)
+        )
+        dispatchInfo = "gemm(\(tilesM)x\(tilesN)x\(depth))"
+      } else {
+        let totalThreads = kernel.dispatchMode.threadCount(frameCount: frameCount)
+        let maxTTG = pipelineState.maxTotalThreadsPerThreadgroup
+        let groupWidth = totalThreads == 1 ? 1 : min(kernel.dispatchMode.threadGroupSize ?? 64, maxTTG, totalThreads)
+        computeEncoder.dispatchThreads(
+          MTLSize(width: totalThreads, height: 1, depth: 1),
+          threadsPerThreadgroup: MTLSize(width: groupWidth, height: 1, depth: 1)
+        )
+        dispatchInfo = "\(kernel.dispatchMode)".components(separatedBy: "(").first ?? "?"
+      }
+
+      computeEncoder.endEncoding()
+      commandBuffer.commit()
+      commandBuffer.waitUntilCompleted()
+
+      let gpuMs = (commandBuffer.gpuEndTime - commandBuffer.gpuStartTime) * 1000.0
+      results.append((index: index, name: kernel.name, dispatchInfo: dispatchInfo, gpuMs: gpuMs))
+    }
+
+    return results
+  }
+
   private func copyResultsToOutputs(
     outputs: UnsafeMutablePointer<Float>, frameCount: Int, volumeScale: Float
   ) {

@@ -116,6 +116,7 @@ struct DDSPE2EMain {
     let steps = Int(options["steps"] ?? "200") ?? 200
     let split = parseSplit(options["split"]) ?? .train
     let mode = TrainMode(rawValue: (options["mode"] ?? "m2").lowercased()) ?? .m2
+    let profileStep = Int(options["profile-step"] ?? "-1") ?? -1
 
     try DDSPE2ETrainer.run(
       dataset: dataset,
@@ -126,7 +127,8 @@ struct DDSPE2EMain {
         split: split,
         mode: mode,
         kernelDumpPath: kernelDumpPath,
-        initCheckpointPath: initCheckpointPath
+        initCheckpointPath: initCheckpointPath,
+        profileKernelsStep: profileStep
       ),
       logger: log
     )

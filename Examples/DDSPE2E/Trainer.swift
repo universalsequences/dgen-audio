@@ -43,6 +43,7 @@ struct TrainerOptions {
   var mode: TrainMode
   var kernelDumpPath: String?
   var initCheckpointPath: String?
+  var profileKernelsStep: Int = -1  // step at which to profile GPU kernels (-1 = disabled)
 }
 
 enum DDSPE2ETrainer {
@@ -357,6 +358,9 @@ enum DDSPE2ETrainer {
 
       let lossValues = try loss.backward(frames: frameCount)
       let tAfterBackward = CFAbsoluteTimeGetCurrent()
+      if step == options.profileKernelsStep {
+        LazyGraphContext.current.profileGPU(frames: frameCount)
+      }
       let stepLoss = lossValues.reduce(0, +) / Float(max(1, lossValues.count))
 
       let shouldLog = step == 0 || step == steps - 1 || step % config.logEvery == 0

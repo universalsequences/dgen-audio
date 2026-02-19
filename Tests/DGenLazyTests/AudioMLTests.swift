@@ -167,13 +167,13 @@ final class AudioMLTests: XCTestCase {
       return targetTensor.toSignal(maxFrames: numFrames)
     }
 
-    let windowSize = 2048
+    let windowSize = 256
     // --- Warmup (first compile) ---
     do {
       let s = buildSynth()
       let t = buildTarget()
       let loss =
-        spectralLossFFT(s, t, windowSize: windowSize, normalize: true)
+        spectralLossFFT(s, t, windowSize: windowSize, hop: windowSize / 4, normalize: true)
       let initialLoss = try loss.backward(frames: numFrames)
       print("INITIAL LOSS = \(initialLoss.reduce(0, +))")
 
