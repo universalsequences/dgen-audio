@@ -95,19 +95,20 @@ extension Graph {
     }
     let bitRevNode = self.tensor(bitRevData)
 
-    // Allocate FFT scratch cells for storing complex spectrum - PER FRAME
-    // Layout per frame: real[0..<windowSize], imag[windowSize..<windowSize*2]
-    // Total: (windowSize * 2) * maxFrameCount
+    // Allocate FFT scratch cells for storing complex spectrum - PER HOP WINDOW
+    // With hop > 1, only every hop'th frame computes an FFT, so we only need
+    // numHopWindows slots instead of maxFrameCount.
     let fftSize = windowSize * 2
-    let fft1Cell = alloc(vectorWidth: fftSize * maxFrameCount)
-    let fft2Cell = alloc(vectorWidth: fftSize * maxFrameCount)
+    let numHopWindows = hop > 1 ? (maxFrameCount + hop - 1) / hop : maxFrameCount
+    let fft1Cell = alloc(vectorWidth: fftSize * numHopWindows)
+    let fft2Cell = alloc(vectorWidth: fftSize * numHopWindows)
 
-    // Allocate magnitude cells (only positive frequencies: numBins) - PER FRAME
-    let mag1Cell = alloc(vectorWidth: numBins * maxFrameCount)
-    let mag2Cell = alloc(vectorWidth: numBins * maxFrameCount)
+    // Allocate magnitude cells (only positive frequencies: numBins) - PER HOP WINDOW
+    let mag1Cell = alloc(vectorWidth: numBins * numHopWindows)
+    let mag2Cell = alloc(vectorWidth: numBins * numHopWindows)
 
-    // Allocate scratch for per-frame squared differences
-    let scratchCell = alloc(vectorWidth: numBins * maxFrameCount)
+    // Allocate scratch for per-hop-window squared differences
+    let scratchCell = alloc(vectorWidth: numBins * numHopWindows)
 
     // Optional hop counter: when hop > 1, spectral kernels only execute on frames where counter == 0.
     // We pass the counter value as an extra input so both forward and backward can gate work.
@@ -126,6 +127,7 @@ extension Graph {
     return n(
       .spectralLossFFT(
         windowSize: windowSize,
+        hop: hop,
         useHann: useHannWindow,
         windowCell: windowCell,
         fft1Cell: fft1Cell,
@@ -200,13 +202,14 @@ extension Graph {
     }
     let bitRevNode = self.tensor(bitRevData)
 
-    // Allocate cells scaled by B (batch size)
+    // Allocate cells scaled by B (batch size) and hop-compressed
     let fftSize = windowSize * 2
-    let fft1Cell = alloc(vectorWidth: fftSize * batchSize * maxFrameCount)
-    let fft2Cell = alloc(vectorWidth: fftSize * batchSize * maxFrameCount)
-    let mag1Cell = alloc(vectorWidth: numBins * batchSize * maxFrameCount)
-    let mag2Cell = alloc(vectorWidth: numBins * batchSize * maxFrameCount)
-    let scratchCell = alloc(vectorWidth: numBins * batchSize * maxFrameCount)
+    let numHopWindows = hop > 1 ? (maxFrameCount + hop - 1) / hop : maxFrameCount
+    let fft1Cell = alloc(vectorWidth: fftSize * batchSize * numHopWindows)
+    let fft2Cell = alloc(vectorWidth: fftSize * batchSize * numHopWindows)
+    let mag1Cell = alloc(vectorWidth: numBins * batchSize * numHopWindows)
+    let mag2Cell = alloc(vectorWidth: numBins * batchSize * numHopWindows)
+    let scratchCell = alloc(vectorWidth: numBins * batchSize * numHopWindows)
 
     var inputs = [sig1, sig2, hannNode, twReNode, twImNode, bitRevNode]
     if hop > 1 {
@@ -222,6 +225,7 @@ extension Graph {
       .spectralLossFFTBatched(
         windowSize: windowSize,
         batchSize: batchSize,
+        hop: hop,
         useHann: useHannWindow,
         windowCell: windowCell,
         fft1Cell: fft1Cell,

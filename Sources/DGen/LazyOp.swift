@@ -65,6 +65,7 @@ public enum LazyOp {
   // FFT-based spectral loss with backprop support
   case spectralLossFFT(
     windowSize: Int,
+    hop: Int,
     useHann: Bool,
     windowCell: CellID,
     fft1Cell: CellID,
@@ -75,6 +76,7 @@ public enum LazyOp {
   )
   case spectralLossFFTGradSpec(
     windowSize: Int,
+    hop: Int,
     fft1Cell: CellID,
     fft2Cell: CellID,
     mag1Cell: CellID,
@@ -84,6 +86,7 @@ public enum LazyOp {
   )
   case spectralLossFFTGradIFFT(
     windowSize: Int,
+    hop: Int,
     gradSpec1Cell: CellID,
     gradSpec2Cell: CellID,
     gradTime1Cell: CellID,
@@ -93,6 +96,7 @@ public enum LazyOp {
   // Inline gradient computation for spectralLossFFT - recomputes DFT to avoid race conditions
   case spectralLossFFTGradInline(
     windowSize: Int,
+    hop: Int,
     useHann: Bool,
     windowCell: CellID,
     gradTime1Cell: CellID,
@@ -101,12 +105,14 @@ public enum LazyOp {
   // Read gradient from frame-indexed storage (returns grad1)
   case spectralLossFFTGradRead(
     windowSize: Int,
+    hop: Int,
     gradTime1Cell: CellID,
     gradTime2Cell: CellID
   )
   // Read second gradient from frame-indexed storage (returns grad2)
   case spectralLossFFTGradRead2(
     windowSize: Int,
+    hop: Int,
     gradTime2Cell: CellID
   )
 
@@ -114,6 +120,7 @@ public enum LazyOp {
   case spectralLossFFTBatched(
     windowSize: Int,
     batchSize: Int,
+    hop: Int,
     useHann: Bool,
     windowCell: CellID,
     fft1Cell: CellID,
@@ -125,6 +132,7 @@ public enum LazyOp {
   case spectralLossFFTBatchedGradSpec(
     windowSize: Int,
     batchSize: Int,
+    hop: Int,
     fft1Cell: CellID,
     fft2Cell: CellID,
     mag1Cell: CellID,
@@ -135,6 +143,7 @@ public enum LazyOp {
   case spectralLossFFTBatchedGradIFFT(
     windowSize: Int,
     batchSize: Int,
+    hop: Int,
     gradSpec1Cell: CellID,
     gradSpec2Cell: CellID,
     gradTime1Cell: CellID,
@@ -144,6 +153,7 @@ public enum LazyOp {
   case spectralLossFFTBatchedGradRead(
     windowSize: Int,
     batchSize: Int,
+    hop: Int,
     gradTime1Cell: CellID,
     gradTime2Cell: CellID,
     outputCell: CellID
@@ -151,6 +161,7 @@ public enum LazyOp {
   case spectralLossFFTBatchedGradRead2(
     windowSize: Int,
     batchSize: Int,
+    hop: Int,
     gradTime2Cell: CellID,
     outputCell: CellID
   )

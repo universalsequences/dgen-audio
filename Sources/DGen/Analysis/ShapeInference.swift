@@ -239,9 +239,9 @@ public func inferShape(op: LazyOp, inputs: [ValueShape], graph: Graph) throws ->
     return .tensor([chunkCount, M, N])
 
   // Batched spectral loss: GradRead ops output [B] tensors
-  case .spectralLossFFTBatchedGradRead(_, let batchSize, _, _, _):
+  case .spectralLossFFTBatchedGradRead(_, let batchSize, _, _, _, _):
     return .tensor([batchSize])
-  case .spectralLossFFTBatchedGradRead2(_, let batchSize, _, _):
+  case .spectralLossFFTBatchedGradRead2(_, let batchSize, _, _, _):
     return .tensor([batchSize])
 
   // Scalar ops -- listed explicitly so the compiler catches missing cases when new ops are added.

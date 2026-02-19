@@ -715,7 +715,7 @@ extension LazyOp {
       return node.inputs.map { _ in nil }
 
     case .spectralLossFFT(
-      let windowSize, _, let windowCell,
+      let windowSize, let hop, _, let windowCell,
       let fft1Cell, let fft2Cell, let mag1Cell, let mag2Cell, _):
       // FFT-based spectral loss backward pass using O(N log N) IFFT
       // Reads the forward pass's per-frame FFT/magnitude cells directly,
@@ -728,14 +728,15 @@ extension LazyOp {
       let bitRevNode = node.inputs[5]
       let hopCounter = node.inputs.count > 6 ? node.inputs[6] : nil
       let fftSize = windowSize * 2
+      let numHopWindows = hop > 1 ? (g.maxFrameCount + hop - 1) / hop : g.maxFrameCount
 
-      // Allocate per-frame gradient spectrum cells (complex: real + imag)
-      let gradSpec1Cell = g.alloc(vectorWidth: fftSize * g.maxFrameCount)
-      let gradSpec2Cell = g.alloc(vectorWidth: fftSize * g.maxFrameCount)
+      // Allocate per-hop-window gradient spectrum cells (complex: real + imag)
+      let gradSpec1Cell = g.alloc(vectorWidth: fftSize * numHopWindows)
+      let gradSpec2Cell = g.alloc(vectorWidth: fftSize * numHopWindows)
 
-      // Allocate per-frame time-domain gradient cells
-      let gradTime1Cell = g.alloc(vectorWidth: g.maxFrameCount * windowSize)
-      let gradTime2Cell = g.alloc(vectorWidth: g.maxFrameCount * windowSize)
+      // Allocate per-hop-window time-domain gradient cells
+      let gradTime1Cell = g.alloc(vectorWidth: numHopWindows * windowSize)
+      let gradTime2Cell = g.alloc(vectorWidth: numHopWindows * windowSize)
 
       // Step 1: Compute gradient w.r.t. complex spectrum from forward's stored data
       // sig1/sig2 are ordering-only inputs — they ensure GradSpec runs after the
@@ -745,6 +746,7 @@ extension LazyOp {
       let gradSpec = g.n(
         .spectralLossFFTGradSpec(
           windowSize: windowSize,
+          hop: hop,
           fft1Cell: fft1Cell,
           fft2Cell: fft2Cell,
           mag1Cell: mag1Cell,
@@ -762,6 +764,7 @@ extension LazyOp {
       let gradIFFT = g.n(
         .spectralLossFFTGradIFFT(
           windowSize: windowSize,
+          hop: hop,
           gradSpec1Cell: gradSpec1Cell,
           gradSpec2Cell: gradSpec2Cell,
           gradTime1Cell: gradTime1Cell,
@@ -777,6 +780,7 @@ extension LazyOp {
       let gradPassResult = g.n(
         .spectralLossFFTGradRead(
           windowSize: windowSize,
+          hop: hop,
           gradTime1Cell: gradTime1Cell,
           gradTime2Cell: gradTime2Cell
         ), gradReadInputs)
@@ -784,6 +788,7 @@ extension LazyOp {
       let grad2Node = g.n(
         .spectralLossFFTGradRead2(
           windowSize: windowSize,
+          hop: hop,
           gradTime2Cell: gradTime2Cell
         ), gradReadInputs)
 
@@ -793,28 +798,28 @@ extension LazyOp {
       for _ in 2..<node.inputs.count { result.append(nil) }
       return result
 
-    case .spectralLossFFTGradSpec(_, _, _, _, _, _, _):
+    case .spectralLossFFTGradSpec(_, _, _, _, _, _, _, _):
       // Gradient ops don't need their own gradients
       return node.inputs.map { _ in nil }
 
-    case .spectralLossFFTGradIFFT(_, _, _, _, _, _):
+    case .spectralLossFFTGradIFFT(_, _, _, _, _, _, _):
       // Gradient ops don't need their own gradients
       return node.inputs.map { _ in nil }
 
-    case .spectralLossFFTGradInline(_, _, _, _, _):
+    case .spectralLossFFTGradInline(_, _, _, _, _, _):
       // Gradient ops don't need their own gradients
       return node.inputs.map { _ in nil }
 
-    case .spectralLossFFTGradRead(_, _, _):
+    case .spectralLossFFTGradRead(_, _, _, _):
       // Gradient read ops don't need their own gradients
       return node.inputs.map { _ in nil }
 
-    case .spectralLossFFTGradRead2(_, _):
+    case .spectralLossFFTGradRead2(_, _, _):
       // Gradient read ops don't need their own gradients
       return node.inputs.map { _ in nil }
 
     case .spectralLossFFTBatched(
-      let windowSize, let batchSize, _, let windowCell,
+      let windowSize, let batchSize, let hop, _, let windowCell,
       let fft1Cell, let fft2Cell, let mag1Cell, let mag2Cell, _):
       // Batched FFT spectral loss backward - same 3-step chain as scalar version
       let sig1 = node.inputs[0]
@@ -824,16 +829,17 @@ extension LazyOp {
       let bitRevNode = node.inputs[5]
       let hopCounter = node.inputs.count > 6 ? node.inputs[6] : nil
       let fftSize = windowSize * 2
+      let numHopWindows = hop > 1 ? (g.maxFrameCount + hop - 1) / hop : g.maxFrameCount
 
-      // Allocate per-frame gradient spectrum cells scaled by B
-      let gradSpec1Cell = g.alloc(vectorWidth: fftSize * batchSize * g.maxFrameCount)
-      let gradSpec2Cell = g.alloc(vectorWidth: fftSize * batchSize * g.maxFrameCount)
+      // Allocate per-hop-window gradient spectrum cells scaled by B
+      let gradSpec1Cell = g.alloc(vectorWidth: fftSize * batchSize * numHopWindows)
+      let gradSpec2Cell = g.alloc(vectorWidth: fftSize * batchSize * numHopWindows)
 
-      // Allocate per-frame time-domain gradient cells scaled by B
-      let gradTime1Cell = g.alloc(vectorWidth: windowSize * batchSize * g.maxFrameCount)
-      let gradTime2Cell = g.alloc(vectorWidth: windowSize * batchSize * g.maxFrameCount)
+      // Allocate per-hop-window time-domain gradient cells scaled by B
+      let gradTime1Cell = g.alloc(vectorWidth: windowSize * batchSize * numHopWindows)
+      let gradTime2Cell = g.alloc(vectorWidth: windowSize * batchSize * numHopWindows)
 
-      // Allocate output cells for [B] gradient tensors
+      // Allocate output cells for [B] gradient tensors (per-frame, NOT hop-compressed)
       let gradOutput1Cell = g.alloc(vectorWidth: batchSize * g.maxFrameCount)
       let gradOutput2Cell = g.alloc(vectorWidth: batchSize * g.maxFrameCount)
 
@@ -844,6 +850,7 @@ extension LazyOp {
         .spectralLossFFTBatchedGradSpec(
           windowSize: windowSize,
           batchSize: batchSize,
+          hop: hop,
           fft1Cell: fft1Cell,
           fft2Cell: fft2Cell,
           mag1Cell: mag1Cell,
@@ -861,6 +868,7 @@ extension LazyOp {
         .spectralLossFFTBatchedGradIFFT(
           windowSize: windowSize,
           batchSize: batchSize,
+          hop: hop,
           gradSpec1Cell: gradSpec1Cell,
           gradSpec2Cell: gradSpec2Cell,
           gradTime1Cell: gradTime1Cell,
@@ -877,6 +885,7 @@ extension LazyOp {
         .spectralLossFFTBatchedGradRead(
           windowSize: windowSize,
           batchSize: batchSize,
+          hop: hop,
           gradTime1Cell: gradTime1Cell,
           gradTime2Cell: gradTime2Cell,
           outputCell: gradOutput1Cell
@@ -895,6 +904,7 @@ extension LazyOp {
         .spectralLossFFTBatchedGradRead2(
           windowSize: windowSize,
           batchSize: batchSize,
+          hop: hop,
           gradTime2Cell: gradTime2Cell,
           outputCell: gradOutput2Cell
         ), gradReadInputs, shape: .tensor([batchSize]))
@@ -912,16 +922,16 @@ extension LazyOp {
       for _ in 2..<node.inputs.count { result.append(nil) }
       return result
 
-    case .spectralLossFFTBatchedGradSpec(_, _, _, _, _, _, _, _):
+    case .spectralLossFFTBatchedGradSpec(_, _, _, _, _, _, _, _, _):
       return node.inputs.map { _ in nil }
 
-    case .spectralLossFFTBatchedGradIFFT(_, _, _, _, _, _, _):
+    case .spectralLossFFTBatchedGradIFFT(_, _, _, _, _, _, _, _):
       return node.inputs.map { _ in nil }
 
-    case .spectralLossFFTBatchedGradRead(_, _, _, _, _):
+    case .spectralLossFFTBatchedGradRead(_, _, _, _, _, _):
       return node.inputs.map { _ in nil }
 
-    case .spectralLossFFTBatchedGradRead2(_, _, _, _):
+    case .spectralLossFFTBatchedGradRead2(_, _, _, _, _):
       return node.inputs.map { _ in nil }
 
     case .selectRow:

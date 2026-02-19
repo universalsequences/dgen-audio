@@ -37,3 +37,7 @@ test_kernel_revert.metal
 /.ddsp_cache_flute2
 train3.sh
 train_flute.sh
+test_kernel_yes_gemm_small_hidden.metal
+test_kernel_no_batch.metal
+test_kernel_batch.metal
+KERNEL_OPTIMIZATIONS.md
