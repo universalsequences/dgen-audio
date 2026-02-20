@@ -123,6 +123,7 @@ public enum Op {
     case .load(let cellId), .store(let cellId, _), .delay1(let cellId, _),
       .memoryRead(let cellId, _), .memoryWrite(let cellId, _, _),
       .memoryAccumulate(let cellId, _, _),
+      .noise(let cellId),
       .simdgroupLoad(let cellId, _, _, _), .simdgroupStore(_, let cellId, _, _):
       return cellId
     default:
@@ -208,6 +209,7 @@ public enum Op {
     case .load: return .load(newCellId)
     case .store(_, let val): return .store(newCellId, val)
     case .delay1(_, let a): return .delay1(newCellId, a)
+    case .noise: return .noise(newCellId)
     case .memoryRead(_, let offset): return .memoryRead(newCellId, offset)
     case .memoryWrite(_, let offset, let value): return .memoryWrite(newCellId, offset, value)
     case .memoryAccumulate(_, let offset, let value):

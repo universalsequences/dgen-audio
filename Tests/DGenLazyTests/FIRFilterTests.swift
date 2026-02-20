@@ -202,4 +202,112 @@ final class FIRFilterTests: XCTestCase {
     XCTAssertGreaterThan(lastTap, 0.1, "Last kernel tap (newest sample) should dominate")
     XCTAssertLessThan(lastLoss, firstLoss * 0.1, "Loss should decrease by 10x")
   }
+
+  /// Batched FIR with shared noise: one noise buffer, B different learned filter kernels.
+  ///
+  /// Validates the approach for batched DDSP noise synthesis:
+  /// all batch elements share the same white noise ring buffer but each
+  /// applies its own learned FIR taps to produce different filtered outputs.
+  ///
+  /// Teacher: noise.buffer(K).expand([B,K]) * knownTaps[b] → sum(axis:1) → [B]
+  /// Student: noise.buffer(K).expand([B,K]) * learnedTaps[b] → sum(axis:1) → [B]
+  func testBatchedFIRSharedNoise() throws {
+    let B = 2
+    let K = 16
+    let frameCount = 256
+
+    // Target filter taps: different exponential decay per batch element
+    // h[k] = (1-α) * α^(K-1-k)  (oldest → newest, largest weight on most recent sample)
+    let alphas: [Float] = [0.3, 0.7]
+    var targetData = [Float]()
+    for alpha in alphas {
+      for k in 0..<K {
+        targetData.append((1 - alpha) * pow(alpha, Float(K - 1 - k)))
+      }
+    }
+    let targetTaps = Tensor(targetData).reshape([B, K])
+
+    // Learned taps: initialize to uniform
+    let learnedTaps = Tensor.param(
+      [B, K], data: [Float](repeating: 1.0 / Float(K), count: B * K))
+
+    func buildLoss() -> Signal {
+      let noise = Signal.noise()
+      let noiseBuffer = noise.buffer(size: K)  // [1, K]
+      let noiseBatch = noiseBuffer.expand([B, K])  // [B, K]
+
+      // Teacher: known filter taps
+      let teacherOut = (noiseBatch * targetTaps).sum(axis: 1)  // [B]
+
+      // Student: learned filter taps
+      let studentOut = (noiseBatch * learnedTaps).sum(axis: 1)  // [B]
+
+      // MSE between student and teacher
+      let diff = studentOut - teacherOut  // [B]
+      return (diff * diff).mean()  // scalar
+    }
+
+    let optimizer = Adam(params: [learnedTaps], lr: 0.01)
+
+    // Warmup
+    DGenConfig.kernelOutputPath = "/tmp/batched_fir_shared_noise.c"
+    _ = try buildLoss().backward(frames: frameCount)
+    DGenConfig.kernelOutputPath = nil
+    optimizer.zeroGrad()
+
+    print("\n=== Batched FIR Shared Noise (B=\(B), K=\(K)) ===")
+    var firstLoss: Float = 0
+    var lastLoss: Float = 0
+    for epoch in 0..<200 {
+      let loss = buildLoss()
+      let lossValues = try loss.backward(frames: frameCount)
+      let avgLoss = lossValues.reduce(0, +) / Float(frameCount)
+
+      if epoch == 0 { firstLoss = avgLoss }
+      lastLoss = avgLoss
+
+      if epoch % 50 == 0 || epoch == 199 {
+        let k = learnedTaps.getData() ?? []
+        let k0 = Array(k[0..<K])
+        let k1 = Array(k[K..<2 * K])
+        print(
+          "Epoch \(epoch): loss=\(String(format: "%.4e", avgLoss))")
+        print(
+          "  batch0 last4: \(k0.suffix(4).map { String(format: "%.4f", $0) })")
+        print(
+          "  batch1 last4: \(k1.suffix(4).map { String(format: "%.4f", $0) })")
+      }
+
+      optimizer.step()
+      optimizer.zeroGrad()
+    }
+
+    // Verify loss decreased significantly
+    XCTAssertLessThan(lastLoss, firstLoss, "Loss should decrease")
+    XCTAssertLessThan(lastLoss, firstLoss * 0.1, "Loss should decrease by at least 10x")
+
+    // Verify learned taps converge differently per batch element
+    let learned = learnedTaps.getData() ?? []
+    for b in 0..<B {
+      let learnedSlice = Array(learned[b * K..<(b + 1) * K])
+      let targetSlice = Array(targetData[b * K..<(b + 1) * K])
+
+      // Newest tap (last element) should be close to target
+      let learnedLast = learnedSlice.last ?? 0
+      let targetLast = targetSlice.last ?? 0
+      XCTAssertEqual(
+        learnedLast, targetLast, accuracy: 0.15,
+        "Batch \(b): newest tap should match target (α=\(alphas[b]))")
+    }
+
+    // Batch 0 (α=0.3, fast decay) should have a larger last tap than batch 1 (α=0.7, slow decay)
+    let learned0Last = learned[K - 1]
+    let learned1Last = learned[2 * K - 1]
+    XCTAssertGreaterThan(
+      learned0Last, learned1Last,
+      "Fast-decay filter (α=0.3) should weight newest sample more than slow-decay (α=0.7)")
+
+    print("Target batch0 last4: \(targetData[(K-4)..<K].map { String(format: "%.4f", $0) })")
+    print("Target batch1 last4: \(targetData[(2*K-4)..<(2*K)].map { String(format: "%.4f", $0) })")
+  }
 }

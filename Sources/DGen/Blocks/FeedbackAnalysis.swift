@@ -267,6 +267,8 @@ public func findSequentialNodes(_ g: Graph, feedbackClusters: [[NodeID]], backen
       scalar.insert($0.id)  // Phasor operations need to be scalar (stateful)
     case .click(_):
       scalar.insert($0.id)  // Click reads/writes cell — needs sequential frame execution
+    case .noise(_):
+      scalar.insert($0.id)  // Noise PRNG reads/writes state cell — needs sequential frame execution
     default: break
     }
   }

@@ -15,7 +15,7 @@ extension TemporalityPass {
     switch op {
     case .phasor(_), .deterministicPhasor, .output(_), .accum(_), .input(_),
       .historyRead(_), .historyWrite(_), .historyReadWrite(_), .latch(_), .click(_),
-      .overlapAdd(_, _, _, _, _):
+      .noise(_), .overlapAdd(_, _, _, _, _):
       return true
     default:
       return false

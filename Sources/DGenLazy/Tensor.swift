@@ -266,6 +266,26 @@ public class Tensor: LazyValue {
   }
 }
 
+// MARK: - View Operations (data-propagating overrides)
+
+// Overrides TensorOps.reshape to propagate _data through the view.
+// Without this, reshaped tensors lose their source data and can't
+// refresh after graph clears, causing stale nodeIds that silently
+// alias wrong nodes in rebuilt graphs.
+//
+// Only reshape is safe to propagate because it doesn't change data layout.
+// transpose/expand/shrink change data order or size, so they must NOT
+// propagate _data (the default TensorOps implementations are correct).
+
+extension Tensor {
+
+  /// Reshape with data propagation for refresh support.
+  public func reshape(_ newShape: Shape) -> Tensor {
+    let nodeId = try! graph.graph.reshape(self.nodeId, to: newShape)
+    return Tensor(nodeId: nodeId, graph: graph, shape: newShape, requiresGrad: requiresGrad, data: _data)
+  }
+}
+
 // MARK: - Tensor Properties
 
 extension Tensor {
