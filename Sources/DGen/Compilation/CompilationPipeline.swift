@@ -460,16 +460,6 @@ extension CompilationResult {
   public var source: String {
     kernels.map { $0.source }.joined(separator: "\n\n")
   }
-
-  /// Get the first kernel's source (useful for single-kernel results)
-  public var firstKernelSource: String? {
-    kernels.first?.source
-  }
-
-  /// Check if compilation produced any kernels
-  public var hasKernels: Bool {
-    !kernels.isEmpty
-  }
 }
 
 // MARK: - Debug Helpers
