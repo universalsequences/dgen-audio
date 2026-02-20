@@ -56,6 +56,25 @@ enum CheckpointStore {
     try data.write(to: url)
   }
 
+  static func writeBestModelState(
+    checkpointsDir: URL,
+    step: Int,
+    params: [NamedTensorSnapshot]
+  ) throws {
+    let checkpoint = ModelCheckpoint(
+      step: step,
+      createdAtUTC: ISO8601DateFormatter().string(from: Date()),
+      params: params
+    )
+
+    let encoder = JSONEncoder()
+    encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+    let data = try encoder.encode(checkpoint)
+
+    let url = checkpointsDir.appendingPathComponent("model_best.json")
+    try data.write(to: url)
+  }
+
   static func readModelState(from url: URL) throws -> ModelCheckpoint {
     let data = try Data(contentsOf: url)
     let decoder = JSONDecoder()

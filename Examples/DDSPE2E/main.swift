@@ -119,6 +119,7 @@ struct DDSPE2EMain {
     let profileStep = Int(options["profile-step"] ?? "-1") ?? -1
     let renderEvery = Int(options["render-every"] ?? "0") ?? 0
     let renderWavPath = options["render-wav"]
+    let dumpControlsEvery = Int(options["dump-controls-every"] ?? "0") ?? 0
 
     try DDSPE2ETrainer.run(
       dataset: dataset,
@@ -132,7 +133,8 @@ struct DDSPE2EMain {
         initCheckpointPath: initCheckpointPath,
         profileKernelsStep: profileStep,
         renderEvery: renderEvery,
-        renderWavPath: renderWavPath
+        renderWavPath: renderWavPath,
+        dumpControlsEvery: dumpControlsEvery
       ),
       logger: log
     )
@@ -208,8 +210,26 @@ struct DDSPE2EMain {
       --max-files <int>
       --max-chunks-per-file <int>
       --shuffle <true|false>
+      --fixed-batch <true|false>
       --model-hidden <int>
       --harmonics <int>
+      --harmonic-head-mode <legacy|normalized|softmax-db|exp-sigmoid>
+      --normalized-harmonic-head <true|false>
+      --softmax-temp <float>
+      --softmax-temp-end <float>
+      --softmax-temp-warmup-steps <int>
+      --softmax-temp-ramp-steps <int>
+      --softmax-amp-floor <float>
+      --softmax-gain-min-db <float>
+      --softmax-gain-max-db <float>
+      --harmonic-entropy-weight <float>
+      --harmonic-entropy-weight-end <float>
+      --harmonic-entropy-warmup-steps <int>
+      --harmonic-entropy-ramp-steps <int>
+      --harmonic-concentration-weight <float>
+      --harmonic-concentration-weight-end <float>
+      --harmonic-concentration-warmup-steps <int>
+      --harmonic-concentration-ramp-steps <int>
       --noise-filter <true|false>
       --noise-filter-size <int>
       --lr <float>
@@ -218,8 +238,11 @@ struct DDSPE2EMain {
       --grad-clip <float>
       --clip-mode <element|global>
       --normalize-grad-by-frames <true|false>
+      --early-stop-patience <int>
+      --early-stop-min-delta <float>
       --spectral-windows <csv-int-list>
       --spectral-weight <float>
+      --spectral-logmag-weight <float>
       --spectral-hop-divisor <int>
       --spectral-warmup-steps <int>
       --spectral-ramp-steps <int>
@@ -230,6 +253,7 @@ struct DDSPE2EMain {
       --init-checkpoint <model-checkpoint-json>
       --render-every <int>
       --render-wav <path>
+      --dump-controls-every <int>
 
     Examples:
       swift run DDSPE2E dump-config --output ddsp_config.json

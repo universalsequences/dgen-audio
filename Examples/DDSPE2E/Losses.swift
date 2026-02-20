@@ -9,7 +9,8 @@ enum DDSPTrainingLosses {
     spectralHopDivisor: Int,
     frameCount: Int,
     mseWeight: Float,
-    spectralWeight: Float
+    spectralWeight: Float,
+    spectralLogmagWeight: Float
   ) -> Signal {
     let usableWindows = spectralWindowSizes.filter { $0 > 1 && $0 <= frameCount }
     var total = Signal.constant(0.0)
@@ -31,6 +32,20 @@ enum DDSPTrainingLosses {
       hasTerm = true
     }
 
+    if spectralLogmagWeight > 0, !usableWindows.isEmpty {
+      var specLog = Signal.constant(0.0)
+      for w in usableWindows {
+        let hop = max(1, w / max(1, spectralHopDivisor))
+        specLog =
+          specLog
+          + spectralLossFFT(
+            prediction, target, windowSize: w, useLogMagnitude: true, hop: hop, normalize: true)
+      }
+      specLog = specLog * (1.0 / Float(usableWindows.count))
+      total = total + specLog * spectralLogmagWeight
+      hasTerm = true
+    }
+
     // Preserve a valid scalar loss signal without forcing extra loss terms into the graph.
     return hasTerm ? total : Signal.constant(0.0)
   }
@@ -44,7 +59,8 @@ enum DDSPTrainingLosses {
     spectralHopDivisor: Int,
     frameCount: Int,
     mseWeight: Float,
-    spectralWeight: Float
+    spectralWeight: Float,
+    spectralLogmagWeight: Float
   ) -> Signal {
     let usableWindows = spectralWindowSizes.filter { $0 > 1 && $0 <= frameCount }
     var total = Signal.constant(0.0)
@@ -65,6 +81,20 @@ enum DDSPTrainingLosses {
       }
       spec = spec * (1.0 / Float(usableWindows.count))
       total = total + spec * spectralWeight
+      hasTerm = true
+    }
+
+    if spectralLogmagWeight > 0, !usableWindows.isEmpty {
+      var specLog = Signal.constant(0.0)
+      for w in usableWindows {
+        let hop = max(1, w / max(1, spectralHopDivisor))
+        specLog =
+          specLog
+          + spectralLossFFT(
+            prediction, target, windowSize: w, useLogMagnitude: true, hop: hop, normalize: true)
+      }
+      specLog = specLog * (1.0 / Float(usableWindows.count))
+      total = total + specLog * spectralLogmagWeight
       hasTerm = true
     }
 

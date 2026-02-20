@@ -46,6 +46,7 @@ struct TrainerOptions {
   var profileKernelsStep: Int = -1  // step at which to profile GPU kernels (-1 = disabled)
   var renderEvery: Int = 0          // render audio snapshot every N steps (0 = disabled)
   var renderWavPath: String? = nil  // path to write rendered WAV (overwritten each time)
+  var dumpControlsEvery: Int = 0    // dump decoder controls every N steps (0 = disabled)
 }
 
 enum DDSPE2ETrainer {
@@ -216,7 +217,26 @@ enum DDSPE2ETrainer {
       "manifestChunks": "\(dataset.manifest.chunkCount)",
       "requestedSteps": "\(options.steps)",
       "numHarmonics": "\(config.numHarmonics)",
+      "harmonicHeadMode": config.harmonicHeadMode.rawValue,
+      "normalizedHarmonicHead": "\(config.normalizedHarmonicHead)",
+      "softmaxTemperature": "\(config.softmaxTemperature)",
+      "softmaxTemperatureEnd": "\(config.softmaxTemperatureEnd ?? config.softmaxTemperature)",
+      "softmaxTemperatureWarmupSteps": "\(config.softmaxTemperatureWarmupSteps)",
+      "softmaxTemperatureRampSteps": "\(config.softmaxTemperatureRampSteps)",
+      "softmaxAmpFloor": "\(config.softmaxAmpFloor)",
+      "softmaxGainMinDB": "\(config.softmaxGainMinDB)",
+      "softmaxGainMaxDB": "\(config.softmaxGainMaxDB)",
+      "harmonicEntropyWeight": "\(config.harmonicEntropyWeight)",
+      "harmonicEntropyWeightEnd": "\(config.harmonicEntropyWeightEnd ?? config.harmonicEntropyWeight)",
+      "harmonicEntropyWarmupSteps": "\(config.harmonicEntropyWarmupSteps)",
+      "harmonicEntropyRampSteps": "\(config.harmonicEntropyRampSteps)",
+      "harmonicConcentrationWeight": "\(config.harmonicConcentrationWeight)",
+      "harmonicConcentrationWeightEnd":
+        "\(config.harmonicConcentrationWeightEnd ?? config.harmonicConcentrationWeight)",
+      "harmonicConcentrationWarmupSteps": "\(config.harmonicConcentrationWarmupSteps)",
+      "harmonicConcentrationRampSteps": "\(config.harmonicConcentrationRampSteps)",
       "hiddenSize": "\(config.modelHiddenSize)",
+      "fixedBatch": "\(config.fixedBatch)",
       "lr": "\(config.learningRate)",
       "lrSchedule": config.lrSchedule.rawValue,
       "lrMin": "\(config.lrMin)",
@@ -225,10 +245,14 @@ enum DDSPE2ETrainer {
       "gradClipMode": config.gradClipMode.rawValue,
       "gradClip": "\(config.gradClip)",
       "normalizeGradByFrames": "\(config.normalizeGradByFrames)",
+      "earlyStopPatience": "\(config.earlyStopPatience)",
+      "earlyStopMinDelta": "\(config.earlyStopMinDelta)",
       "spectralWeightTarget": "\(config.spectralWeight)",
+      "spectralLogmagWeight": "\(config.spectralLogmagWeight)",
       "spectralHopDivisor": "\(config.spectralHopDivisor)",
       "spectralWarmupSteps": "\(config.spectralWarmupSteps)",
       "spectralRampSteps": "\(config.spectralRampSteps)",
+      "dumpControlsEvery": "\(options.dumpControlsEvery)",
     ]
     try writeJSON(runMeta, to: runDirs.root.appendingPathComponent("run_meta.json"))
 
@@ -270,11 +294,30 @@ enum DDSPE2ETrainer {
       order.shuffle(using: &rng)
     }
 
+    let gradAccum = max(1, config.gradAccumSteps)
+    let fixedGradAccumEntries: [CachedChunkEntry]
+    if config.fixedBatch {
+      fixedGradAccumEntries =
+        (0..<gradAccum).map { splitEntries[order[$0 % order.count]] }
+      logger(
+        "Fixed batch enabled (single path): reusing chunk(s) every step: "
+          + fixedGradAccumEntries.map(\.id).joined(separator: "+")
+      )
+    } else {
+      fixedGradAccumEntries = []
+    }
+
     let steps = max(1, options.steps)
     var firstLoss: Float?
     var lastFiniteLoss: Float = 0
     var minLoss = Float.greatestFiniteMagnitude
     var minStep = 0
+    var bestModelSnapshots: [NamedTensorSnapshot]?
+    var bestModelStep = 0
+    var noImproveSteps = 0
+    var completedSteps = 0
+    let earlyStopPatience = config.earlyStopPatience
+    let earlyStopMinDelta = config.earlyStopMinDelta
     var validUpdates = 0
     var totalStepMs: Double = 0
     var totalLoadMs: Double = 0
@@ -289,7 +332,6 @@ enum DDSPE2ETrainer {
     var logLines = [String]()
     logLines.append("step,loss,chunk_id,step_ms,load_ms,graph_ms,backward_ms,opt_ms")
 
-    let gradAccum = max(1, config.gradAccumSteps)
     var chunkOffset = 0
 
     for step in 0..<steps {
@@ -323,13 +365,39 @@ enum DDSPE2ETrainer {
         warmupSteps: config.spectralWarmupSteps,
         rampSteps: config.spectralRampSteps
       )
+      let harmonicEntropyWeight = harmonicEntropyWeightForStep(
+        step: step,
+        startWeight: config.harmonicEntropyWeight,
+        endWeight: config.harmonicEntropyWeightEnd ?? config.harmonicEntropyWeight,
+        warmupSteps: config.harmonicEntropyWarmupSteps,
+        rampSteps: config.harmonicEntropyRampSteps
+      )
+      let harmonicConcentrationWeight = harmonicConcentrationWeightForStep(
+        step: step,
+        startWeight: config.harmonicConcentrationWeight,
+        endWeight: config.harmonicConcentrationWeightEnd ?? config.harmonicConcentrationWeight,
+        warmupSteps: config.harmonicConcentrationWarmupSteps,
+        rampSteps: config.harmonicConcentrationRampSteps
+      )
+      let softmaxTemperature = softmaxTemperatureForStep(
+        step: step,
+        startTemperature: config.softmaxTemperature,
+        endTemperature: config.softmaxTemperatureEnd ?? config.softmaxTemperature,
+        warmupSteps: config.softmaxTemperatureWarmupSteps,
+        rampSteps: config.softmaxTemperatureRampSteps
+      )
+      model.softmaxTemperature = softmaxTemperature
 
-      for _ in 0..<gradAccum {
-        if chunkOffset > 0, chunkOffset % order.count == 0, config.shuffleChunks {
-          order.shuffle(using: &rng)
+      for accumIdx in 0..<gradAccum {
+        if config.fixedBatch {
+          lastEntry = fixedGradAccumEntries[accumIdx % fixedGradAccumEntries.count]
+        } else {
+          if chunkOffset > 0, chunkOffset % order.count == 0, config.shuffleChunks {
+            order.shuffle(using: &rng)
+          }
+          lastEntry = splitEntries[order[chunkOffset % order.count]]
+          chunkOffset += 1
         }
-        lastEntry = splitEntries[order[chunkOffset % order.count]]
-        chunkOffset += 1
 
         let chunk = try dataset.loadChunk(lastEntry)
         lastChunkFeatureFrames = chunk.f0Hz.count
@@ -357,6 +425,17 @@ enum DDSPE2ETrainer {
         synthTensors.updateChunkData(f0Frames: paddedF0, uvFrames: paddedUV)
 
         let controls = model.forward(features: featuresTensor)
+        if shouldDumpControls(step: step, every: options.dumpControlsEvery) {
+          try dumpDecoderControls(
+            step: step,
+            model: model,
+            conditioningData: conditioningData,
+            featureFrames: paddedFeatureFrames,
+            batchSize: 1,
+            runDirs: runDirs,
+            logger: logger
+          )
+        }
         let prediction = DDSPSynth.renderSignal(
           controls: controls,
           tensors: synthTensors,
@@ -365,14 +444,27 @@ enum DDSPE2ETrainer {
           numHarmonics: config.numHarmonics
         )
         let target = targetTensor.toSignal(maxFrames: frameCount)
-        let loss = DDSPTrainingLosses.fullLoss(
+        var loss = DDSPTrainingLosses.fullLoss(
           prediction: prediction,
           target: target,
           spectralWindowSizes: config.spectralWindowSizes,
           spectralHopDivisor: config.spectralHopDivisor,
           frameCount: frameCount,
           mseWeight: config.mseLossWeight,
-          spectralWeight: spectralWeight
+          spectralWeight: spectralWeight,
+          spectralLogmagWeight: config.spectralLogmagWeight
+        )
+        loss = addHarmonicEntropyRegularization(
+          baseLoss: loss,
+          controls: controls,
+          numHarmonics: config.numHarmonics,
+          weight: harmonicEntropyWeight
+        )
+        loss = addHarmonicConcentrationRegularization(
+          baseLoss: loss,
+          controls: controls,
+          numHarmonics: config.numHarmonics,
+          weight: harmonicConcentrationWeight
         )
         let tAfterGraph = CFAbsoluteTimeGetCurrent()
 
@@ -426,12 +518,29 @@ enum DDSPE2ETrainer {
             + "tStepMs=\(format(Double(stepMs))) tLoadMs=\(format(Double(loadMs))) "
             + "tGraphMs=\(format(Double(graphMs))) tBackwardMs=\(format(Double(backwardMs)))"
         )
+        completedSteps = step + 1
+        if earlyStopPatience > 0 {
+          noImproveSteps += 1
+          if noImproveSteps >= earlyStopPatience {
+            logger(
+              "early-stop triggered after \(completedSteps) steps (patience=\(earlyStopPatience), minDelta=\(earlyStopMinDelta))"
+            )
+            break
+          }
+        }
         continue
       }
 
       if firstLoss == nil { firstLoss = stepLoss }
       lastFiniteLoss = stepLoss
-      if stepLoss < minLoss { minLoss = stepLoss; minStep = step }
+      let improved = stepLoss < (minLoss - earlyStopMinDelta)
+      if improved {
+        minLoss = stepLoss
+        minStep = step
+        noImproveSteps = 0
+      } else {
+        noImproveSteps += 1
+      }
 
       // Average accumulated gradients and write back via the last backward's .grad tensors
       let invAccum = 1.0 / Float(gradAccum)
@@ -460,6 +569,10 @@ enum DDSPE2ETrainer {
       let postClipGradStats = shouldLog ? summarizeGradients(params: model.parameters) : nil
       optimizer.step()
       optimizer.zeroGrad()
+      if improved {
+        bestModelSnapshots = model.snapshots()
+        bestModelStep = step
+      }
 
       // Render audio snapshot after the optimizer update so we hear the current model state.
       // backward() already cleared the graph, so we rebuild a fresh forward-only pass,
@@ -501,6 +614,7 @@ enum DDSPE2ETrainer {
       emaStepMs = step == 0 ? stepMs : (emaStepMs * (1.0 - emaAlpha) + stepMs * emaAlpha)
       logLines.append("\(step),\(stepLoss),\(lastEntry.id),\(stepMs),\(loadMs),\(graphMs),\(backwardMs),\(optMs)")
       validUpdates += 1
+      completedSteps = step + 1
 
       if shouldLog {
         let gradInfo: String
@@ -520,7 +634,7 @@ enum DDSPE2ETrainer {
           gradInfo = ""
         }
         logger(
-          "step=\(step) loss=\(formatLoss(stepLoss)) lr=\(formatLR(currentLR)) specW=\(format(spectralWeight)) "
+          "step=\(step) loss=\(formatLoss(stepLoss)) lr=\(formatLR(currentLR)) specW=\(format(spectralWeight)) specLogW=\(format(config.spectralLogmagWeight)) entW=\(format(harmonicEntropyWeight)) concW=\(format(harmonicConcentrationWeight)) temp=\(format(softmaxTemperature)) "
             + "chunk=\(lastEntry.id) accum=\(gradAccum)\(gradInfo) "
             + "tStepMs=\(format(Double(stepMs))) tEMAms=\(format(Double(emaStepMs))) "
             + "tLoadMs=\(format(Double(loadMs))) tGraphMs=\(format(Double(graphMs))) "
@@ -534,6 +648,12 @@ enum DDSPE2ETrainer {
           params: model.snapshots()
         )
       }
+      if earlyStopPatience > 0 && noImproveSteps >= earlyStopPatience {
+        logger(
+          "early-stop triggered after \(completedSteps) steps (bestStep=\(minStep), patience=\(earlyStopPatience), minDelta=\(earlyStopMinDelta))"
+        )
+        break
+      }
     }
 
     if validUpdates == 0 {
@@ -541,9 +661,13 @@ enum DDSPE2ETrainer {
     }
 
     let first = firstLoss ?? lastFiniteLoss
-    let denomSteps = Double(max(1, steps))
+    let executedSteps = max(1, completedSteps)
+    let denomSteps = Double(executedSteps)
     let summary: [String: String] = [
-      "steps": "\(steps)",
+      "steps": "\(executedSteps)",
+      "requestedSteps": "\(steps)",
+      "earlyStopPatience": "\(earlyStopPatience)",
+      "earlyStopMinDelta": "\(earlyStopMinDelta)",
       "validUpdates": "\(validUpdates)",
       "firstLoss": "\(first)",
       "finalLoss": "\(lastFiniteLoss)",
@@ -561,8 +685,13 @@ enum DDSPE2ETrainer {
 
     try CheckpointStore.writeModelState(
       checkpointsDir: runDirs.checkpoints,
-      step: steps,
+      step: executedSteps,
       params: model.snapshots()
+    )
+    try CheckpointStore.writeBestModelState(
+      checkpointsDir: runDirs.checkpoints,
+      step: bestModelStep,
+      params: bestModelSnapshots ?? model.snapshots()
     )
     try writeJSON(summary, to: runDirs.logs.appendingPathComponent("train_summary.json"))
 
@@ -612,12 +741,29 @@ enum DDSPE2ETrainer {
     if config.shuffleChunks {
       order.shuffle(using: &rng)
     }
+    let fixedBatchEntries: [CachedChunkEntry]
+    if config.fixedBatch {
+      fixedBatchEntries =
+        (0..<B).map { splitEntries[order[$0 % order.count]] }
+      logger(
+        "Fixed batch enabled (batched path): reusing chunk(s) every step: "
+          + fixedBatchEntries.map(\.id).joined(separator: "+")
+      )
+    } else {
+      fixedBatchEntries = []
+    }
 
     let steps = max(1, options.steps)
     var firstLoss: Float?
     var lastFiniteLoss: Float = 0
     var minLoss = Float.greatestFiniteMagnitude
     var minStep = 0
+    var bestModelSnapshots: [NamedTensorSnapshot]?
+    var bestModelStep = 0
+    var noImproveSteps = 0
+    var completedSteps = 0
+    let earlyStopPatience = config.earlyStopPatience
+    let earlyStopMinDelta = config.earlyStopMinDelta
     var validUpdates = 0
     var totalStepMs: Double = 0
     var totalLoadMs: Double = 0
@@ -656,17 +802,44 @@ enum DDSPE2ETrainer {
         warmupSteps: config.spectralWarmupSteps,
         rampSteps: config.spectralRampSteps
       )
+      let harmonicEntropyWeight = harmonicEntropyWeightForStep(
+        step: step,
+        startWeight: config.harmonicEntropyWeight,
+        endWeight: config.harmonicEntropyWeightEnd ?? config.harmonicEntropyWeight,
+        warmupSteps: config.harmonicEntropyWarmupSteps,
+        rampSteps: config.harmonicEntropyRampSteps
+      )
+      let harmonicConcentrationWeight = harmonicConcentrationWeightForStep(
+        step: step,
+        startWeight: config.harmonicConcentrationWeight,
+        endWeight: config.harmonicConcentrationWeightEnd ?? config.harmonicConcentrationWeight,
+        warmupSteps: config.harmonicConcentrationWarmupSteps,
+        rampSteps: config.harmonicConcentrationRampSteps
+      )
+      let softmaxTemperature = softmaxTemperatureForStep(
+        step: step,
+        startTemperature: config.softmaxTemperature,
+        endTemperature: config.softmaxTemperatureEnd ?? config.softmaxTemperature,
+        warmupSteps: config.softmaxTemperatureWarmupSteps,
+        rampSteps: config.softmaxTemperatureRampSteps
+      )
+      model.softmaxTemperature = softmaxTemperature
 
       // Load B chunks
       var chunks = [CachedChunk]()
       chunks.reserveCapacity(B)
       var chunkIds = [String]()
-      for _ in 0..<B {
-        if chunkOffset > 0, chunkOffset % order.count == 0, config.shuffleChunks {
-          order.shuffle(using: &rng)
+      for batchIdx in 0..<B {
+        let entry: CachedChunkEntry
+        if config.fixedBatch {
+          entry = fixedBatchEntries[batchIdx % fixedBatchEntries.count]
+        } else {
+          if chunkOffset > 0, chunkOffset % order.count == 0, config.shuffleChunks {
+            order.shuffle(using: &rng)
+          }
+          entry = splitEntries[order[chunkOffset % order.count]]
+          chunkOffset += 1
         }
-        let entry = splitEntries[order[chunkOffset % order.count]]
-        chunkOffset += 1
         chunks.append(try dataset.loadChunk(entry))
         chunkIds.append(entry.id)
       }
@@ -718,6 +891,17 @@ enum DDSPE2ETrainer {
 
       // Forward pass
       let controls = model.forward(features: featuresTensor)
+      if shouldDumpControls(step: step, every: options.dumpControlsEvery) {
+        try dumpDecoderControls(
+          step: step,
+          model: model,
+          conditioningData: conditioningData,
+          featureFrames: F,
+          batchSize: B,
+          runDirs: runDirs,
+          logger: logger
+        )
+      }
       let prediction = DDSPSynth.renderBatchedSignal(
         controls: controls,
         tensors: synthTensors,
@@ -736,7 +920,7 @@ enum DDSPE2ETrainer {
       )
       let targetBatched = synthTensors.target!.sample(targetPlayhead)  // [B]
 
-      let loss = DDSPTrainingLosses.fullBatchedLoss(
+      var loss = DDSPTrainingLosses.fullBatchedLoss(
         prediction: prediction,
         target: targetBatched,
         batchSize: B,
@@ -744,7 +928,20 @@ enum DDSPE2ETrainer {
         spectralHopDivisor: config.spectralHopDivisor,
         frameCount: frameCount,
         mseWeight: config.mseLossWeight,
-        spectralWeight: spectralWeight
+        spectralWeight: spectralWeight,
+        spectralLogmagWeight: config.spectralLogmagWeight
+      )
+      loss = addHarmonicEntropyRegularization(
+        baseLoss: loss,
+        controls: controls,
+        numHarmonics: config.numHarmonics,
+        weight: harmonicEntropyWeight
+      )
+      loss = addHarmonicConcentrationRegularization(
+        baseLoss: loss,
+        controls: controls,
+        numHarmonics: config.numHarmonics,
+        weight: harmonicConcentrationWeight
       )
       let tAfterGraph = CFAbsoluteTimeGetCurrent()
 
@@ -770,12 +967,29 @@ enum DDSPE2ETrainer {
         logger(
           "step=\(step) unstable loss=\(stepLoss); skipping update "
             + "tStepMs=\(format(Double(stepMs)))")
+        completedSteps = step + 1
+        if earlyStopPatience > 0 {
+          noImproveSteps += 1
+          if noImproveSteps >= earlyStopPatience {
+            logger(
+              "early-stop triggered after \(completedSteps) steps (patience=\(earlyStopPatience), minDelta=\(earlyStopMinDelta))"
+            )
+            break
+          }
+        }
         continue
       }
 
       if firstLoss == nil { firstLoss = stepLoss }
       lastFiniteLoss = stepLoss
-      if stepLoss < minLoss { minLoss = stepLoss; minStep = step }
+      let improved = stepLoss < (minLoss - earlyStopMinDelta)
+      if improved {
+        minLoss = stepLoss
+        minStep = step
+        noImproveSteps = 0
+      } else {
+        noImproveSteps += 1
+      }
 
       if step == options.profileKernelsStep {
         LazyGraphContext.current.profileGPU(frames: frameCount)
@@ -793,6 +1007,10 @@ enum DDSPE2ETrainer {
       let postClipGradStats = shouldLog ? summarizeGradients(params: model.parameters) : nil
       optimizer.step()
       optimizer.zeroGrad()
+      if improved {
+        bestModelSnapshots = model.snapshots()
+        bestModelStep = step
+      }
 
       // Render audio snapshot
       if let wavPath = options.renderWavPath, options.renderEvery > 0,
@@ -862,6 +1080,7 @@ enum DDSPE2ETrainer {
       emaStepMs = step == 0 ? stepMs : (emaStepMs * (1.0 - emaAlpha) + stepMs * emaAlpha)
       logLines.append("\(step),\(stepLoss),\(chunkIds.joined(separator: "+")),\(stepMs),\(loadMs),\(graphMs),\(backwardMs),\(optMs)")
       validUpdates += 1
+      completedSteps = step + 1
 
       if shouldLog {
         let gradInfo: String
@@ -881,7 +1100,7 @@ enum DDSPE2ETrainer {
           gradInfo = ""
         }
         logger(
-          "step=\(step) loss=\(formatLoss(stepLoss)) lr=\(formatLR(currentLR)) specW=\(format(spectralWeight)) "
+          "step=\(step) loss=\(formatLoss(stepLoss)) lr=\(formatLR(currentLR)) specW=\(format(spectralWeight)) specLogW=\(format(config.spectralLogmagWeight)) entW=\(format(harmonicEntropyWeight)) concW=\(format(harmonicConcentrationWeight)) temp=\(format(softmaxTemperature)) "
             + "batch=\(B)\(gradInfo) "
             + "tStepMs=\(format(Double(stepMs))) tEMAms=\(format(Double(emaStepMs))) "
             + "tLoadMs=\(format(Double(loadMs))) tGraphMs=\(format(Double(graphMs))) "
@@ -895,6 +1114,12 @@ enum DDSPE2ETrainer {
           params: model.snapshots()
         )
       }
+      if earlyStopPatience > 0 && noImproveSteps >= earlyStopPatience {
+        logger(
+          "early-stop triggered after \(completedSteps) steps (bestStep=\(minStep), patience=\(earlyStopPatience), minDelta=\(earlyStopMinDelta))"
+        )
+        break
+      }
     }
 
     if validUpdates == 0 {
@@ -902,9 +1127,13 @@ enum DDSPE2ETrainer {
     }
 
     let first = firstLoss ?? lastFiniteLoss
-    let denomSteps = Double(max(1, steps))
+    let executedSteps = max(1, completedSteps)
+    let denomSteps = Double(executedSteps)
     let summary: [String: String] = [
-      "steps": "\(steps)",
+      "steps": "\(executedSteps)",
+      "requestedSteps": "\(steps)",
+      "earlyStopPatience": "\(earlyStopPatience)",
+      "earlyStopMinDelta": "\(earlyStopMinDelta)",
       "validUpdates": "\(validUpdates)",
       "batchSize": "\(B)",
       "firstLoss": "\(first)",
@@ -923,8 +1152,13 @@ enum DDSPE2ETrainer {
 
     try CheckpointStore.writeModelState(
       checkpointsDir: runDirs.checkpoints,
-      step: steps,
+      step: executedSteps,
       params: model.snapshots()
+    )
+    try CheckpointStore.writeBestModelState(
+      checkpointsDir: runDirs.checkpoints,
+      step: bestModelStep,
+      params: bestModelSnapshots ?? model.snapshots()
     )
     try writeJSON(summary, to: runDirs.logs.appendingPathComponent("train_summary.json"))
 
@@ -1117,6 +1351,452 @@ enum DDSPE2ETrainer {
     let rampProgress = Float(step - warmupSteps) / Float(rampSteps)
     let alpha = min(1.0, max(0.0, rampProgress))
     return targetWeight * alpha
+  }
+
+  private static func harmonicEntropyWeightForStep(
+    step: Int,
+    startWeight: Float,
+    endWeight: Float,
+    warmupSteps: Int,
+    rampSteps: Int
+  ) -> Float {
+    let start = max(0, startWeight)
+    let end = max(0, endWeight)
+    if step < warmupSteps {
+      return start
+    }
+    if rampSteps <= 0 {
+      return end
+    }
+    let rampProgress = Float(step - warmupSteps) / Float(rampSteps)
+    let alpha = min(1.0, max(0.0, rampProgress))
+    return start + (end - start) * alpha
+  }
+
+  private static func harmonicConcentrationWeightForStep(
+    step: Int,
+    startWeight: Float,
+    endWeight: Float,
+    warmupSteps: Int,
+    rampSteps: Int
+  ) -> Float {
+    let start = max(0, startWeight)
+    let end = max(0, endWeight)
+    if step < warmupSteps {
+      return start
+    }
+    if rampSteps <= 0 {
+      return end
+    }
+    let rampProgress = Float(step - warmupSteps) / Float(rampSteps)
+    let alpha = min(1.0, max(0.0, rampProgress))
+    return start + (end - start) * alpha
+  }
+
+  private static func softmaxTemperatureForStep(
+    step: Int,
+    startTemperature: Float,
+    endTemperature: Float,
+    warmupSteps: Int,
+    rampSteps: Int
+  ) -> Float {
+    let start = max(1e-4, startTemperature)
+    let end = max(1e-4, endTemperature)
+    if step < warmupSteps {
+      return start
+    }
+    if rampSteps <= 0 {
+      return end
+    }
+    let rampProgress = Float(step - warmupSteps) / Float(rampSteps)
+    let alpha = min(1.0, max(0.0, rampProgress))
+    return start + (end - start) * alpha
+  }
+
+  /// Entropy regularizer for softmax harmonic distributions.
+  /// Adds weight * (log(K) - mean_entropy) so minimizing loss encourages broader spectra.
+  private static func addHarmonicEntropyRegularization(
+    baseLoss: Signal,
+    controls: DecoderControls,
+    numHarmonics: Int,
+    weight: Float
+  ) -> Signal {
+    guard weight > 0, controls.harmonicHeadMode == .softmaxDB else {
+      return baseLoss
+    }
+    let eps: Float = 1e-8
+    let amps = controls.harmonicAmps
+    let entropyPerRow = -((amps * (amps + eps).log()).sum(axis: 1))  // [rows]
+    let entropyMean = entropyPerRow.mean()  // [1]
+    let maxEntropy = Float(Foundation.log(Double(max(1, numHarmonics))))
+    let entropyGap = Tensor([maxEntropy]) - entropyMean  // [1], >= 0 when entropy below max
+    let entropyPenalty = entropyGap.peek(Signal.constant(0.0))
+    return baseLoss + entropyPenalty * weight
+  }
+
+  /// Concentration regularizer for softmax harmonic distributions.
+  /// Adds weight * max(mean(sum(p^2)) - 1/K, 0) so minimizing loss discourages one-bin collapse.
+  private static func addHarmonicConcentrationRegularization(
+    baseLoss: Signal,
+    controls: DecoderControls,
+    numHarmonics: Int,
+    weight: Float
+  ) -> Signal {
+    guard weight > 0, controls.harmonicHeadMode == .softmaxDB else {
+      return baseLoss
+    }
+    let amps = controls.harmonicAmps
+    let concentrationPerRow = (amps * amps).sum(axis: 1)  // [rows]
+    let concentrationMean = concentrationPerRow.mean()  // [1]
+    let minConcentration = 1.0 / Float(max(1, numHarmonics))
+    let concentrationGap = max(concentrationMean - Tensor([minConcentration]), 0.0)
+    let concentrationPenalty = concentrationGap.peek(Signal.constant(0.0))
+    return baseLoss + concentrationPenalty * weight
+  }
+
+  private struct ControlSnapshot {
+    var rows: Int
+    var harmonics: Int
+    var noiseFilterSize: Int
+    var harmonicHeadMode: HarmonicHeadMode
+    var harmonicAmps: [Float]
+    var harmonicGain: [Float]
+    var noiseGain: [Float]
+    var noiseFilter: [Float]?
+  }
+
+  private static func shouldDumpControls(step: Int, every: Int) -> Bool {
+    return every > 0 && step % every == 0
+  }
+
+  private static func dumpDecoderControls(
+    step: Int,
+    model: DDSPDecoderModel,
+    conditioningData: [Float],
+    featureFrames: Int,
+    batchSize: Int,
+    runDirs: RunDirectories,
+    logger: (String) -> Void
+  ) throws {
+    let rows = featureFrames * batchSize
+    guard rows > 0, conditioningData.count == rows * 3 else { return }
+    guard let snapshot = computeDecoderControlsCPU(model: model, conditioningData: conditioningData, rows: rows)
+    else {
+      logger("step=\(step) control dump skipped (unable to read model parameter data)")
+      return
+    }
+
+    let controlsDir = runDirs.logs.appendingPathComponent("controls", isDirectory: true)
+    try FileManager.default.createDirectory(at: controlsDir, withIntermediateDirectories: true)
+    let tag = String(format: "step_%06d", step)
+
+    // 1) Per-frame control summary.
+    var summary = "batch,frame,f0_norm,loudness_norm,uv,harmonic_gain,noise_gain,amp_sum,amp_max,amp_argmax\n"
+    summary.reserveCapacity(rows * 96)
+    for row in 0..<rows {
+      let batch = row / featureFrames
+      let frame = row % featureFrames
+      let base = row * 3
+      let f0Norm = conditioningData[base]
+      let loudNorm = conditioningData[base + 1]
+      let uv = conditioningData[base + 2]
+
+      var ampSum: Float = 0
+      var ampMax: Float = -Float.greatestFiniteMagnitude
+      var ampArgmax = 0
+      let harmBase = row * snapshot.harmonics
+      for h in 0..<snapshot.harmonics {
+        let a = snapshot.harmonicAmps[harmBase + h]
+        ampSum += a
+        if a > ampMax {
+          ampMax = a
+          ampArgmax = h + 1
+        }
+      }
+
+      summary += "\(batch),\(frame),\(f0Norm),\(loudNorm),\(uv),\(snapshot.harmonicGain[row]),\(snapshot.noiseGain[row]),\(ampSum),\(ampMax),\(ampArgmax)\n"
+    }
+    try summary.write(
+      to: controlsDir.appendingPathComponent("\(tag)_control_summary.csv"),
+      atomically: true,
+      encoding: .utf8
+    )
+
+    // 2) Harmonic amplitudes for batch 0 at start/mid/end frame.
+    let selectedFrames = uniqueSortedIndices([0, max(0, featureFrames / 2), max(0, featureFrames - 1)])
+    for frame in selectedFrames {
+      let row = frame  // batch 0 only
+      let harmBase = row * snapshot.harmonics
+      var harmCSV = "harmonic,amp\n"
+      for h in 0..<snapshot.harmonics {
+        harmCSV += "\(h + 1),\(snapshot.harmonicAmps[harmBase + h])\n"
+      }
+      try harmCSV.write(
+        to: controlsDir.appendingPathComponent("\(tag)_b0_f\(frame)_harmonics.csv"),
+        atomically: true,
+        encoding: .utf8
+      )
+
+      // 3) Wavetable synthesized from harmonic amplitudes (one cycle, zero-phase sine basis).
+      let tableSize = 512
+      let gain = snapshot.harmonicGain[row]
+      let harmonicScale: Float =
+        snapshot.harmonicHeadMode == .legacy ? (1.0 / Float(max(1, snapshot.harmonics))) : 1.0
+      var waveCSV = "sample,value\n"
+      waveCSV.reserveCapacity(tableSize * 20)
+      for n in 0..<tableSize {
+        let phase = 2.0 * Float.pi * Float(n) / Float(tableSize)
+        var value: Float = 0
+        for h in 0..<snapshot.harmonics {
+          let amp = snapshot.harmonicAmps[harmBase + h]
+          value += amp * sin(Float(h + 1) * phase)
+        }
+        value = value * harmonicScale * gain
+        waveCSV += "\(n),\(value)\n"
+      }
+      try waveCSV.write(
+        to: controlsDir.appendingPathComponent("\(tag)_b0_f\(frame)_wavetable.csv"),
+        atomically: true,
+        encoding: .utf8
+      )
+
+      if let filter = snapshot.noiseFilter, snapshot.noiseFilterSize > 0 {
+        let filterBase = row * snapshot.noiseFilterSize
+        var filterCSV = "tap,value\n"
+        for i in 0..<snapshot.noiseFilterSize {
+          filterCSV += "\(i),\(filter[filterBase + i])\n"
+        }
+        try filterCSV.write(
+          to: controlsDir.appendingPathComponent("\(tag)_b0_f\(frame)_noise_filter.csv"),
+          atomically: true,
+          encoding: .utf8
+        )
+      }
+    }
+
+    logger("step=\(step) dumped decoder controls → \(controlsDir.path)")
+  }
+
+  private static func computeDecoderControlsCPU(
+    model: DDSPDecoderModel,
+    conditioningData: [Float],
+    rows: Int
+  ) -> ControlSnapshot? {
+    guard rows > 0 else { return nil }
+
+    var hidden = conditioningData  // [rows, 3]
+    var inSize = model.inputSize
+
+    for i in 0..<model.numLayers {
+      guard let w = model.trunkWeights[i].getData(),
+        let b = model.trunkBiases[i].getData(),
+        b.count == model.hiddenSize
+      else {
+        return nil
+      }
+      let mm = matmul(
+        lhs: hidden,
+        lhsRows: rows,
+        lhsCols: inSize,
+        rhs: w,
+        rhsCols: model.hiddenSize
+      )
+      var next = [Float](repeating: 0, count: rows * model.hiddenSize)
+      for r in 0..<rows {
+        let rowBase = r * model.hiddenSize
+        for c in 0..<model.hiddenSize {
+          next[rowBase + c] = tanh(mm[rowBase + c] + b[c])
+        }
+      }
+      hidden = next
+      inSize = model.hiddenSize
+    }
+
+    guard
+      let wHarm = model.W_harm.getData(),
+      let bHarm = model.b_harm.getData(),
+      bHarm.count == model.numHarmonics,
+      let wHGain = model.W_hgain.getData(),
+      let bHGain = model.b_hgain.getData(),
+      bHGain.count == 1,
+      let wNoise = model.W_noise.getData(),
+      let bNoise = model.b_noise.getData(),
+      bNoise.count == 1
+    else {
+      return nil
+    }
+
+    let harmLogits = addRowBias(
+      matmul(lhs: hidden, lhsRows: rows, lhsCols: model.hiddenSize, rhs: wHarm, rhsCols: model.numHarmonics),
+      rows: rows,
+      cols: model.numHarmonics,
+      bias: bHarm
+    )
+    let hGainLogits = addRowBias(
+      matmul(lhs: hidden, lhsRows: rows, lhsCols: model.hiddenSize, rhs: wHGain, rhsCols: 1),
+      rows: rows,
+      cols: 1,
+      bias: bHGain
+    )
+    let noiseLogits = addRowBias(
+      matmul(lhs: hidden, lhsRows: rows, lhsCols: model.hiddenSize, rhs: wNoise, rhsCols: 1),
+      rows: rows,
+      cols: 1,
+      bias: bNoise
+    )
+
+    let harm: [Float]
+    let hGain: [Float]
+    switch model.harmonicHeadMode {
+    case .legacy:
+      harm = harmLogits.map(sigmoidCPU)
+      hGain = hGainLogits.map(sigmoidCPU)
+    case .normalized:
+      let harmPositive = harmLogits.map(softplusCPU)
+      var normalized = [Float](repeating: 0, count: rows * model.numHarmonics)
+      for r in 0..<rows {
+        let rowBase = r * model.numHarmonics
+        var sum: Float = 0
+        for c in 0..<model.numHarmonics {
+          sum += harmPositive[rowBase + c]
+        }
+        let denom = sum + 1e-6
+        for c in 0..<model.numHarmonics {
+          normalized[rowBase + c] = harmPositive[rowBase + c] / denom
+        }
+      }
+      harm = normalized
+      hGain = hGainLogits.map(softplusCPU)
+    case .softmaxDB:
+      let temperature = max(1e-4, model.softmaxTemperature)
+      let scaledLogits = harmLogits.map { $0 / temperature }
+      let softmaxDist = softmaxRowsCPU(scaledLogits, rows: rows, cols: model.numHarmonics)
+      if model.softmaxAmpFloor > 0 {
+        let floorMix = min(max(model.softmaxAmpFloor, 0), 1)
+        let uniform = floorMix / Float(max(1, model.numHarmonics))
+        harm = softmaxDist.map { $0 * (1.0 - floorMix) + uniform }
+      } else {
+        harm = softmaxDist
+      }
+      let ln10Over20: Float = 0.11512925464970229
+      let gainDB = hGainLogits.map {
+        model.softmaxGainMinDB + sigmoidCPU($0) * (model.softmaxGainMaxDB - model.softmaxGainMinDB)
+      }
+      hGain = gainDB.map { Foundation.exp($0 * ln10Over20) }
+    case .expSigmoid:
+      harm = harmLogits.map { expSigmoidCPU($0) }
+      hGain = hGainLogits.map { expSigmoidCPU($0) }
+    }
+    let nGain = model.harmonicHeadMode == .expSigmoid ? noiseLogits.map { expSigmoidCPU($0) } : noiseLogits.map(sigmoidCPU)
+
+    var filterOut: [Float]? = nil
+    var filterSize = 0
+    if model.enableNoiseFilter,
+      let wf = model.W_filter?.getData(),
+      let bf = model.b_filter?.getData()
+    {
+      filterSize = model.noiseFilterSize
+      guard bf.count == filterSize else { return nil }
+      let filterLogits = addRowBias(
+        matmul(lhs: hidden, lhsRows: rows, lhsCols: model.hiddenSize, rhs: wf, rhsCols: filterSize),
+        rows: rows,
+        cols: filterSize,
+        bias: bf
+      )
+      filterOut = filterLogits.map(sigmoidCPU)
+    }
+
+    return ControlSnapshot(
+      rows: rows,
+      harmonics: model.numHarmonics,
+      noiseFilterSize: filterSize,
+      harmonicHeadMode: model.harmonicHeadMode,
+      harmonicAmps: harm,
+      harmonicGain: hGain,
+      noiseGain: nGain,
+      noiseFilter: filterOut
+    )
+  }
+
+  private static func matmul(
+    lhs: [Float],
+    lhsRows: Int,
+    lhsCols: Int,
+    rhs: [Float],
+    rhsCols: Int
+  ) -> [Float] {
+    var out = [Float](repeating: 0, count: lhsRows * rhsCols)
+    for r in 0..<lhsRows {
+      let lhsRow = r * lhsCols
+      let outRow = r * rhsCols
+      for c in 0..<rhsCols {
+        var sum: Float = 0
+        for k in 0..<lhsCols {
+          sum += lhs[lhsRow + k] * rhs[k * rhsCols + c]
+        }
+        out[outRow + c] = sum
+      }
+    }
+    return out
+  }
+
+  private static func addRowBias(_ x: [Float], rows: Int, cols: Int, bias: [Float]) -> [Float] {
+    var out = x
+    for r in 0..<rows {
+      let rowBase = r * cols
+      for c in 0..<cols {
+        out[rowBase + c] += bias[c]
+      }
+    }
+    return out
+  }
+
+  private static func sigmoidCPU(_ x: Float) -> Float {
+    1.0 / (1.0 + Foundation.exp(-x))
+  }
+
+  private static func softplusCPU(_ x: Float) -> Float {
+    let positive: Float = max(0, x)
+    let correction = Foundation.log(1.0 + Foundation.exp(-Double(abs(x))))
+    return positive + Float(correction)
+  }
+
+  private static func softmaxRowsCPU(_ x: [Float], rows: Int, cols: Int) -> [Float] {
+    guard rows > 0, cols > 0 else { return x }
+    var out = [Float](repeating: 0, count: x.count)
+    for r in 0..<rows {
+      let base = r * cols
+      var rowMax = -Float.greatestFiniteMagnitude
+      for c in 0..<cols {
+        rowMax = max(rowMax, x[base + c])
+      }
+      var sumExp: Float = 0
+      for c in 0..<cols {
+        let e = Float(Foundation.exp(Double(x[base + c] - rowMax)))
+        out[base + c] = e
+        sumExp += e
+      }
+      let denom = max(sumExp, 1e-12)
+      for c in 0..<cols {
+        out[base + c] /= denom
+      }
+    }
+    return out
+  }
+
+  private static func expSigmoidCPU(
+    _ x: Float,
+    exponent: Float = 10.0,
+    maxValue: Float = 2.0,
+    threshold: Float = 1e-7
+  ) -> Float {
+    let sig = sigmoidCPU(x)
+    let shaped = pow(sig, Float(Foundation.log(Double(exponent))))
+    return maxValue * shaped + threshold
+  }
+
+  private static func uniqueSortedIndices(_ values: [Int]) -> [Int] {
+    Array(Set(values)).sorted()
   }
 
   /// Compute conditioning features as flat [Float] data (row-major [N, 3]).

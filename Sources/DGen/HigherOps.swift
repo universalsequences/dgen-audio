@@ -50,6 +50,7 @@ extension Graph {
     _ sig2: NodeID,
     windowSize: Int,
     useHannWindow: Bool = true,
+    useLogMagnitude: Bool = false,
     hop: Int = 1
   ) -> NodeID {
     precondition(
@@ -129,6 +130,7 @@ extension Graph {
         windowSize: windowSize,
         hop: hop,
         useHann: useHannWindow,
+        useLogMagnitude: useLogMagnitude,
         windowCell: windowCell,
         fft1Cell: fft1Cell,
         fft2Cell: fft2Cell,
@@ -157,6 +159,7 @@ extension Graph {
     batchSize: Int,
     windowSize: Int,
     useHannWindow: Bool = true,
+    useLogMagnitude: Bool = false,
     hop: Int = 1
   ) -> NodeID {
     precondition(
@@ -228,6 +231,7 @@ extension Graph {
         batchSize: batchSize,
         hop: hop,
         useHann: useHannWindow,
+        useLogMagnitude: useLogMagnitude,
         windowCell: windowCell,
         fft1Cell: fft1Cell,
         fft2Cell: fft2Cell,

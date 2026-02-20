@@ -345,6 +345,64 @@ public prefix func - (x: SignalTensor) -> SignalTensor {
     return SignalTensor(nodeId: nodeId, graph: x.graph, shape: x.shape, requiresGrad: x.requiresGrad)
 }
 
+// MARK: - Comparison Operators (SignalTensor)
+
+/// SignalTensor > SignalTensor
+public func > (lhs: SignalTensor, rhs: SignalTensor) -> SignalTensor {
+    let nodeId = lhs.graph.node(.gt, [lhs.nodeId, rhs.nodeId])
+    let outShape = broadcastShape(lhs.shape, rhs.shape)
+    return SignalTensor(nodeId: nodeId, graph: lhs.graph, shape: outShape, requiresGrad: false)
+}
+
+/// SignalTensor >= SignalTensor
+public func >= (lhs: SignalTensor, rhs: SignalTensor) -> SignalTensor {
+    let nodeId = lhs.graph.node(.gte, [lhs.nodeId, rhs.nodeId])
+    let outShape = broadcastShape(lhs.shape, rhs.shape)
+    return SignalTensor(nodeId: nodeId, graph: lhs.graph, shape: outShape, requiresGrad: false)
+}
+
+/// SignalTensor < SignalTensor
+public func < (lhs: SignalTensor, rhs: SignalTensor) -> SignalTensor {
+    let nodeId = lhs.graph.node(.lt, [lhs.nodeId, rhs.nodeId])
+    let outShape = broadcastShape(lhs.shape, rhs.shape)
+    return SignalTensor(nodeId: nodeId, graph: lhs.graph, shape: outShape, requiresGrad: false)
+}
+
+/// SignalTensor <= SignalTensor
+public func <= (lhs: SignalTensor, rhs: SignalTensor) -> SignalTensor {
+    let nodeId = lhs.graph.node(.lte, [lhs.nodeId, rhs.nodeId])
+    let outShape = broadcastShape(lhs.shape, rhs.shape)
+    return SignalTensor(nodeId: nodeId, graph: lhs.graph, shape: outShape, requiresGrad: false)
+}
+
+/// SignalTensor > Double
+public func > (lhs: SignalTensor, rhs: Double) -> SignalTensor {
+    let rhsNode = lhs.graph.node(.constant(Float(rhs)))
+    let nodeId = lhs.graph.node(.gt, [lhs.nodeId, rhsNode])
+    return SignalTensor(nodeId: nodeId, graph: lhs.graph, shape: lhs.shape, requiresGrad: false)
+}
+
+/// SignalTensor >= Double
+public func >= (lhs: SignalTensor, rhs: Double) -> SignalTensor {
+    let rhsNode = lhs.graph.node(.constant(Float(rhs)))
+    let nodeId = lhs.graph.node(.gte, [lhs.nodeId, rhsNode])
+    return SignalTensor(nodeId: nodeId, graph: lhs.graph, shape: lhs.shape, requiresGrad: false)
+}
+
+/// SignalTensor < Double
+public func < (lhs: SignalTensor, rhs: Double) -> SignalTensor {
+    let rhsNode = lhs.graph.node(.constant(Float(rhs)))
+    let nodeId = lhs.graph.node(.lt, [lhs.nodeId, rhsNode])
+    return SignalTensor(nodeId: nodeId, graph: lhs.graph, shape: lhs.shape, requiresGrad: false)
+}
+
+/// SignalTensor <= Double
+public func <= (lhs: SignalTensor, rhs: Double) -> SignalTensor {
+    let rhsNode = lhs.graph.node(.constant(Float(rhs)))
+    let nodeId = lhs.graph.node(.lte, [lhs.nodeId, rhsNode])
+    return SignalTensor(nodeId: nodeId, graph: lhs.graph, shape: lhs.shape, requiresGrad: false)
+}
+
 // MARK: - Comparison Operators (Signal)
 // Returns 1.0 if true, 0.0 if false
 

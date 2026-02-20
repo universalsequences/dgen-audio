@@ -11,6 +11,13 @@ enum LRSchedule: String, Codable {
   case exp
 }
 
+enum HarmonicHeadMode: String, Codable {
+  case legacy
+  case normalized
+  case softmaxDB = "softmax-db"
+  case expSigmoid = "exp-sigmoid"
+}
+
 struct DDSPE2EConfig: Codable {
   var sampleRate: Float = 16_000.0
   var chunkSize: Int = 16_384
@@ -28,6 +35,7 @@ struct DDSPE2EConfig: Codable {
 
   var trainSplit: Float = 0.9
   var shuffleChunks: Bool = true
+  var fixedBatch: Bool = false
 
   var seed: UInt64 = 1337
   var maxFiles: Int?
@@ -37,6 +45,24 @@ struct DDSPE2EConfig: Codable {
   var modelHiddenSize: Int = 32
   var modelNumLayers: Int = 1
   var numHarmonics: Int = 16
+  var harmonicHeadMode: HarmonicHeadMode = .legacy
+  // Backward-compatible alias. This is kept so older configs/CLI still decode.
+  var normalizedHarmonicHead: Bool = false
+  var softmaxTemperature: Float = 1.0
+  var softmaxTemperatureEnd: Float?
+  var softmaxTemperatureWarmupSteps: Int = 0
+  var softmaxTemperatureRampSteps: Int = 0
+  var softmaxAmpFloor: Float = 0.0
+  var softmaxGainMinDB: Float = -50.0
+  var softmaxGainMaxDB: Float = 6.0
+  var harmonicEntropyWeight: Float = 0.0
+  var harmonicEntropyWeightEnd: Float?
+  var harmonicEntropyWarmupSteps: Int = 0
+  var harmonicEntropyRampSteps: Int = 0
+  var harmonicConcentrationWeight: Float = 0.0
+  var harmonicConcentrationWeightEnd: Float?
+  var harmonicConcentrationWarmupSteps: Int = 0
+  var harmonicConcentrationRampSteps: Int = 0
   var enableNoiseFilter: Bool = false
   var noiseFilterSize: Int = 15
   var learningRate: Float = 0.001
@@ -49,8 +75,11 @@ struct DDSPE2EConfig: Codable {
   var gradClip: Float = 1.0
   var gradClipMode: GradientClipMode = .element
   var normalizeGradByFrames: Bool = true
+  var earlyStopPatience: Int = 0
+  var earlyStopMinDelta: Float = 0.0
   var spectralWindowSizes: [Int] = []
   var spectralWeight: Float = 0.0
+  var spectralLogmagWeight: Float = 0.0
   var spectralHopDivisor: Int = 4
   var spectralWarmupSteps: Int = 100
   var spectralRampSteps: Int = 200
@@ -73,12 +102,30 @@ struct DDSPE2EConfig: Codable {
     case peakNormalizeTo
     case trainSplit
     case shuffleChunks
+    case fixedBatch
     case seed
     case maxFiles
     case maxChunksPerFile
     case modelHiddenSize
     case modelNumLayers
     case numHarmonics
+    case harmonicHeadMode
+    case normalizedHarmonicHead
+    case softmaxTemperature
+    case softmaxTemperatureEnd
+    case softmaxTemperatureWarmupSteps
+    case softmaxTemperatureRampSteps
+    case softmaxAmpFloor
+    case softmaxGainMinDB
+    case softmaxGainMaxDB
+    case harmonicEntropyWeight
+    case harmonicEntropyWeightEnd
+    case harmonicEntropyWarmupSteps
+    case harmonicEntropyRampSteps
+    case harmonicConcentrationWeight
+    case harmonicConcentrationWeightEnd
+    case harmonicConcentrationWarmupSteps
+    case harmonicConcentrationRampSteps
     case enableNoiseFilter
     case noiseFilterSize
     case learningRate
@@ -91,8 +138,11 @@ struct DDSPE2EConfig: Codable {
     case gradClip
     case gradClipMode
     case normalizeGradByFrames
+    case earlyStopPatience
+    case earlyStopMinDelta
     case spectralWindowSizes
     case spectralWeight
+    case spectralLogmagWeight
     case spectralHopDivisor
     case spectralWarmupSteps
     case spectralRampSteps
@@ -119,12 +169,50 @@ struct DDSPE2EConfig: Codable {
     peakNormalizeTo = try c.decodeIfPresent(Float.self, forKey: .peakNormalizeTo) ?? d.peakNormalizeTo
     trainSplit = try c.decodeIfPresent(Float.self, forKey: .trainSplit) ?? d.trainSplit
     shuffleChunks = try c.decodeIfPresent(Bool.self, forKey: .shuffleChunks) ?? d.shuffleChunks
+    fixedBatch = try c.decodeIfPresent(Bool.self, forKey: .fixedBatch) ?? d.fixedBatch
     seed = try c.decodeIfPresent(UInt64.self, forKey: .seed) ?? d.seed
     maxFiles = try c.decodeIfPresent(Int.self, forKey: .maxFiles)
     maxChunksPerFile = try c.decodeIfPresent(Int.self, forKey: .maxChunksPerFile)
     modelHiddenSize = try c.decodeIfPresent(Int.self, forKey: .modelHiddenSize) ?? d.modelHiddenSize
     modelNumLayers = try c.decodeIfPresent(Int.self, forKey: .modelNumLayers) ?? d.modelNumLayers
     numHarmonics = try c.decodeIfPresent(Int.self, forKey: .numHarmonics) ?? d.numHarmonics
+    harmonicHeadMode = try c.decodeIfPresent(HarmonicHeadMode.self, forKey: .harmonicHeadMode)
+      ?? d.harmonicHeadMode
+    normalizedHarmonicHead =
+      try c.decodeIfPresent(Bool.self, forKey: .normalizedHarmonicHead) ?? d.normalizedHarmonicHead
+    if !c.contains(.harmonicHeadMode) {
+      harmonicHeadMode = normalizedHarmonicHead ? .normalized : .legacy
+    }
+    normalizedHarmonicHead = harmonicHeadMode == .normalized
+    softmaxTemperature =
+      try c.decodeIfPresent(Float.self, forKey: .softmaxTemperature) ?? d.softmaxTemperature
+    softmaxTemperatureEnd = try c.decodeIfPresent(Float.self, forKey: .softmaxTemperatureEnd)
+    softmaxTemperatureWarmupSteps =
+      try c.decodeIfPresent(Int.self, forKey: .softmaxTemperatureWarmupSteps)
+      ?? d.softmaxTemperatureWarmupSteps
+    softmaxTemperatureRampSteps =
+      try c.decodeIfPresent(Int.self, forKey: .softmaxTemperatureRampSteps)
+      ?? d.softmaxTemperatureRampSteps
+    softmaxAmpFloor = try c.decodeIfPresent(Float.self, forKey: .softmaxAmpFloor) ?? d.softmaxAmpFloor
+    softmaxGainMinDB = try c.decodeIfPresent(Float.self, forKey: .softmaxGainMinDB) ?? d.softmaxGainMinDB
+    softmaxGainMaxDB = try c.decodeIfPresent(Float.self, forKey: .softmaxGainMaxDB) ?? d.softmaxGainMaxDB
+    harmonicEntropyWeight =
+      try c.decodeIfPresent(Float.self, forKey: .harmonicEntropyWeight) ?? d.harmonicEntropyWeight
+    harmonicEntropyWeightEnd = try c.decodeIfPresent(Float.self, forKey: .harmonicEntropyWeightEnd)
+    harmonicEntropyWarmupSteps =
+      try c.decodeIfPresent(Int.self, forKey: .harmonicEntropyWarmupSteps) ?? d.harmonicEntropyWarmupSteps
+    harmonicEntropyRampSteps =
+      try c.decodeIfPresent(Int.self, forKey: .harmonicEntropyRampSteps) ?? d.harmonicEntropyRampSteps
+    harmonicConcentrationWeight =
+      try c.decodeIfPresent(Float.self, forKey: .harmonicConcentrationWeight) ?? d.harmonicConcentrationWeight
+    harmonicConcentrationWeightEnd =
+      try c.decodeIfPresent(Float.self, forKey: .harmonicConcentrationWeightEnd)
+    harmonicConcentrationWarmupSteps =
+      try c.decodeIfPresent(Int.self, forKey: .harmonicConcentrationWarmupSteps)
+      ?? d.harmonicConcentrationWarmupSteps
+    harmonicConcentrationRampSteps =
+      try c.decodeIfPresent(Int.self, forKey: .harmonicConcentrationRampSteps)
+      ?? d.harmonicConcentrationRampSteps
     enableNoiseFilter =
       try c.decodeIfPresent(Bool.self, forKey: .enableNoiseFilter) ?? d.enableNoiseFilter
     noiseFilterSize =
@@ -140,8 +228,12 @@ struct DDSPE2EConfig: Codable {
     gradClipMode = try c.decodeIfPresent(GradientClipMode.self, forKey: .gradClipMode) ?? d.gradClipMode
     normalizeGradByFrames =
       try c.decodeIfPresent(Bool.self, forKey: .normalizeGradByFrames) ?? d.normalizeGradByFrames
+    earlyStopPatience = try c.decodeIfPresent(Int.self, forKey: .earlyStopPatience) ?? d.earlyStopPatience
+    earlyStopMinDelta = try c.decodeIfPresent(Float.self, forKey: .earlyStopMinDelta) ?? d.earlyStopMinDelta
     spectralWindowSizes = try c.decodeIfPresent([Int].self, forKey: .spectralWindowSizes) ?? d.spectralWindowSizes
     spectralWeight = try c.decodeIfPresent(Float.self, forKey: .spectralWeight) ?? d.spectralWeight
+    spectralLogmagWeight =
+      try c.decodeIfPresent(Float.self, forKey: .spectralLogmagWeight) ?? d.spectralLogmagWeight
     spectralHopDivisor = try c.decodeIfPresent(Int.self, forKey: .spectralHopDivisor) ?? d.spectralHopDivisor
     spectralWarmupSteps = try c.decodeIfPresent(Int.self, forKey: .spectralWarmupSteps) ?? d.spectralWarmupSteps
     spectralRampSteps = try c.decodeIfPresent(Int.self, forKey: .spectralRampSteps) ?? d.spectralRampSteps
@@ -180,6 +272,65 @@ struct DDSPE2EConfig: Codable {
     if let value = options["harmonics"] {
       numHarmonics = try parseInt(value, key: "harmonics")
     }
+    if let value = options["normalized-harmonic-head"] {
+      normalizedHarmonicHead = parseBool(value)
+      harmonicHeadMode = normalizedHarmonicHead ? .normalized : .legacy
+    }
+    if let value = options["harmonic-head-mode"] {
+      guard let mode = HarmonicHeadMode(rawValue: value.lowercased()) else {
+        throw ConfigError.invalid(
+          "Invalid harmonic head mode for --harmonic-head-mode: \(value) (expected legacy|normalized|softmax-db|exp-sigmoid)"
+        )
+      }
+      harmonicHeadMode = mode
+    }
+    if let value = options["softmax-temp"] {
+      softmaxTemperature = try parseFloat(value, key: "softmax-temp")
+    }
+    if let value = options["softmax-temp-end"] {
+      softmaxTemperatureEnd = try parseFloat(value, key: "softmax-temp-end")
+    }
+    if let value = options["softmax-temp-warmup-steps"] {
+      softmaxTemperatureWarmupSteps = try parseInt(value, key: "softmax-temp-warmup-steps")
+    }
+    if let value = options["softmax-temp-ramp-steps"] {
+      softmaxTemperatureRampSteps = try parseInt(value, key: "softmax-temp-ramp-steps")
+    }
+    if let value = options["softmax-amp-floor"] {
+      softmaxAmpFloor = try parseFloat(value, key: "softmax-amp-floor")
+    }
+    if let value = options["softmax-gain-min-db"] {
+      softmaxGainMinDB = try parseFloat(value, key: "softmax-gain-min-db")
+    }
+    if let value = options["softmax-gain-max-db"] {
+      softmaxGainMaxDB = try parseFloat(value, key: "softmax-gain-max-db")
+    }
+    if let value = options["harmonic-entropy-weight"] {
+      harmonicEntropyWeight = try parseFloat(value, key: "harmonic-entropy-weight")
+    }
+    if let value = options["harmonic-entropy-weight-end"] {
+      harmonicEntropyWeightEnd = try parseFloat(value, key: "harmonic-entropy-weight-end")
+    }
+    if let value = options["harmonic-entropy-warmup-steps"] {
+      harmonicEntropyWarmupSteps = try parseInt(value, key: "harmonic-entropy-warmup-steps")
+    }
+    if let value = options["harmonic-entropy-ramp-steps"] {
+      harmonicEntropyRampSteps = try parseInt(value, key: "harmonic-entropy-ramp-steps")
+    }
+    if let value = options["harmonic-concentration-weight"] {
+      harmonicConcentrationWeight = try parseFloat(value, key: "harmonic-concentration-weight")
+    }
+    if let value = options["harmonic-concentration-weight-end"] {
+      harmonicConcentrationWeightEnd = try parseFloat(value, key: "harmonic-concentration-weight-end")
+    }
+    if let value = options["harmonic-concentration-warmup-steps"] {
+      harmonicConcentrationWarmupSteps =
+        try parseInt(value, key: "harmonic-concentration-warmup-steps")
+    }
+    if let value = options["harmonic-concentration-ramp-steps"] {
+      harmonicConcentrationRampSteps =
+        try parseInt(value, key: "harmonic-concentration-ramp-steps")
+    }
     if let value = options["noise-filter"] {
       enableNoiseFilter = parseBool(value)
     }
@@ -191,7 +342,7 @@ struct DDSPE2EConfig: Codable {
     }
     if let value = options["lr-schedule"] {
       guard let schedule = LRSchedule(rawValue: value.lowercased()) else {
-        throw ConfigError.invalid("Invalid LR schedule for --lr-schedule: \(value) (expected none|cosine)")
+        throw ConfigError.invalid("Invalid LR schedule for --lr-schedule: \(value) (expected none|cosine|exp)")
       }
       lrSchedule = schedule
     }
@@ -222,11 +373,20 @@ struct DDSPE2EConfig: Codable {
     if let value = options["normalize-grad-by-frames"] {
       normalizeGradByFrames = parseBool(value)
     }
+    if let value = options["early-stop-patience"] {
+      earlyStopPatience = try parseInt(value, key: "early-stop-patience")
+    }
+    if let value = options["early-stop-min-delta"] {
+      earlyStopMinDelta = try parseFloat(value, key: "early-stop-min-delta")
+    }
     if let value = options["spectral-windows"] {
       spectralWindowSizes = try parseIntList(value, key: "spectral-windows")
     }
     if let value = options["spectral-weight"] {
       spectralWeight = try parseFloat(value, key: "spectral-weight")
+    }
+    if let value = options["spectral-logmag-weight"] {
+      spectralLogmagWeight = try parseFloat(value, key: "spectral-logmag-weight")
     }
     if let value = options["spectral-hop-divisor"] {
       spectralHopDivisor = try parseInt(value, key: "spectral-hop-divisor")
@@ -249,7 +409,11 @@ struct DDSPE2EConfig: Codable {
     if let value = options["shuffle"] {
       shuffleChunks = parseBool(value)
     }
+    if let value = options["fixed-batch"] {
+      fixedBatch = parseBool(value)
+    }
 
+    normalizedHarmonicHead = harmonicHeadMode == .normalized
     try validate()
   }
 
@@ -306,6 +470,54 @@ struct DDSPE2EConfig: Codable {
     guard numHarmonics > 0 else {
       throw ConfigError.invalid("numHarmonics must be > 0")
     }
+    guard softmaxTemperature > 0 else {
+      throw ConfigError.invalid("softmaxTemperature must be > 0")
+    }
+    if let softmaxTemperatureEnd {
+      guard softmaxTemperatureEnd > 0 else {
+        throw ConfigError.invalid("softmaxTemperatureEnd must be > 0")
+      }
+    }
+    guard softmaxTemperatureWarmupSteps >= 0 else {
+      throw ConfigError.invalid("softmaxTemperatureWarmupSteps must be >= 0")
+    }
+    guard softmaxTemperatureRampSteps >= 0 else {
+      throw ConfigError.invalid("softmaxTemperatureRampSteps must be >= 0")
+    }
+    guard softmaxAmpFloor >= 0, softmaxAmpFloor <= 1 else {
+      throw ConfigError.invalid("softmaxAmpFloor must be in [0, 1]")
+    }
+    guard softmaxGainMaxDB > softmaxGainMinDB else {
+      throw ConfigError.invalid("softmaxGainMaxDB must be > softmaxGainMinDB")
+    }
+    guard harmonicEntropyWeight >= 0 else {
+      throw ConfigError.invalid("harmonicEntropyWeight must be >= 0")
+    }
+    if let harmonicEntropyWeightEnd {
+      guard harmonicEntropyWeightEnd >= 0 else {
+        throw ConfigError.invalid("harmonicEntropyWeightEnd must be >= 0")
+      }
+    }
+    guard harmonicEntropyWarmupSteps >= 0 else {
+      throw ConfigError.invalid("harmonicEntropyWarmupSteps must be >= 0")
+    }
+    guard harmonicEntropyRampSteps >= 0 else {
+      throw ConfigError.invalid("harmonicEntropyRampSteps must be >= 0")
+    }
+    guard harmonicConcentrationWeight >= 0 else {
+      throw ConfigError.invalid("harmonicConcentrationWeight must be >= 0")
+    }
+    if let harmonicConcentrationWeightEnd {
+      guard harmonicConcentrationWeightEnd >= 0 else {
+        throw ConfigError.invalid("harmonicConcentrationWeightEnd must be >= 0")
+      }
+    }
+    guard harmonicConcentrationWarmupSteps >= 0 else {
+      throw ConfigError.invalid("harmonicConcentrationWarmupSteps must be >= 0")
+    }
+    guard harmonicConcentrationRampSteps >= 0 else {
+      throw ConfigError.invalid("harmonicConcentrationRampSteps must be >= 0")
+    }
     guard noiseFilterSize > 1 else {
       throw ConfigError.invalid("noiseFilterSize must be > 1")
     }
@@ -330,6 +542,12 @@ struct DDSPE2EConfig: Codable {
     guard gradClip > 0 else {
       throw ConfigError.invalid("gradClip must be > 0")
     }
+    guard earlyStopPatience >= 0 else {
+      throw ConfigError.invalid("earlyStopPatience must be >= 0")
+    }
+    guard earlyStopMinDelta >= 0 else {
+      throw ConfigError.invalid("earlyStopMinDelta must be >= 0")
+    }
     for w in spectralWindowSizes {
       guard w > 1 else {
         throw ConfigError.invalid("spectral window size must be > 1")
@@ -337,6 +555,9 @@ struct DDSPE2EConfig: Codable {
     }
     guard spectralWeight >= 0 else {
       throw ConfigError.invalid("spectralWeight must be >= 0")
+    }
+    guard spectralLogmagWeight >= 0 else {
+      throw ConfigError.invalid("spectralLogmagWeight must be >= 0")
     }
     guard spectralHopDivisor > 0 else {
       throw ConfigError.invalid("spectralHopDivisor must be > 0")

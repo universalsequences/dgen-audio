@@ -6,6 +6,7 @@ struct DecoderControls {
   var harmonicGain: Tensor      // [frames, 1]
   var noiseGain: Tensor         // [frames, 1]
   var noiseFilter: Tensor?      // [frames, noiseFilterSize] — nil when noise filter disabled
+  var harmonicHeadMode: HarmonicHeadMode
 }
 
 struct NamedTensorSnapshot: Codable {
@@ -19,6 +20,11 @@ final class DDSPDecoderModel {
   let hiddenSize: Int
   let numLayers: Int
   let numHarmonics: Int
+  let harmonicHeadMode: HarmonicHeadMode
+  var softmaxTemperature: Float
+  let softmaxAmpFloor: Float
+  let softmaxGainMinDB: Float
+  let softmaxGainMaxDB: Float
   let enableNoiseFilter: Bool
   let noiseFilterSize: Int
 
@@ -40,10 +46,17 @@ final class DDSPDecoderModel {
   let W_filter: Tensor?
   let b_filter: Tensor?
 
+  private static let ln10Over20: Float = 0.11512925464970229  // ln(10)/20
+
   init(config: DDSPE2EConfig) {
     self.hiddenSize = config.modelHiddenSize
     self.numLayers = max(1, config.modelNumLayers)
     self.numHarmonics = config.numHarmonics
+    self.harmonicHeadMode = config.harmonicHeadMode
+    self.softmaxTemperature = config.softmaxTemperature
+    self.softmaxAmpFloor = config.softmaxAmpFloor
+    self.softmaxGainMinDB = config.softmaxGainMinDB
+    self.softmaxGainMaxDB = config.softmaxGainMaxDB
     self.enableNoiseFilter = config.enableNoiseFilter
     self.noiseFilterSize = max(2, config.noiseFilterSize)
 
@@ -110,17 +123,48 @@ final class DDSPDecoderModel {
       hidden = tanh(hidden.matmul(trunkWeights[i]) + trunkBiases[i])
     }
 
-    // harmonic amplitudes [F,K]
+    // Harmonic head:
+    // - legacy: sigmoid amplitudes + sigmoid gain
+    // - normalized: softplus amplitudes normalized per frame + softplus gain
+    // - softmax-db: softmax amplitudes + bounded dB gain mapped back to linear
+    // - exp-sigmoid: DDSP-like positive controls; synth path handles Nyquist-aware renorm
     let harmLogits = hidden.matmul(W_harm) + b_harm
-    let harmonicAmps = sigmoid(harmLogits)
-
-    // global harmonic gain [F,1]
     let hGainLogits = hidden.matmul(W_hgain) + b_hgain
-    let harmonicGain = sigmoid(hGainLogits)
+    let harmonicAmps: Tensor
+    let harmonicGain: Tensor
+    switch harmonicHeadMode {
+    case .legacy:
+      harmonicAmps = sigmoid(harmLogits)
+      harmonicGain = sigmoid(hGainLogits)
+    case .normalized:
+      let harmonicPositive = Self.softplus(harmLogits)
+      let rows = hidden.shape[0]
+      let harmonicDenom =
+        harmonicPositive.sum(axis: 1).reshape([rows, 1]).expand([rows, numHarmonics]) + 1e-6
+      harmonicAmps = harmonicPositive / harmonicDenom
+      harmonicGain = Self.softplus(hGainLogits)
+    case .softmaxDB:
+      let temperature = max(1e-4, softmaxTemperature)
+      let softmaxDist = (harmLogits / temperature).softmax(axis: 1)
+      if softmaxAmpFloor > 0 {
+        let floorMix = min(max(softmaxAmpFloor, 0), 1)
+        let uniform = floorMix / Float(max(1, numHarmonics))
+        harmonicAmps = softmaxDist * (1.0 - floorMix) + uniform
+      } else {
+        harmonicAmps = softmaxDist
+      }
+      let gainUnit = sigmoid(hGainLogits)
+      let gainDb =
+        softmaxGainMinDB + gainUnit * (softmaxGainMaxDB - softmaxGainMinDB)
+      harmonicGain = (gainDb * Self.ln10Over20).exp()
+    case .expSigmoid:
+      harmonicAmps = Self.expSigmoid(harmLogits)
+      harmonicGain = Self.expSigmoid(hGainLogits)
+    }
 
     // broadband noise gain [F,1]
     let nGainLogits = hidden.matmul(W_noise) + b_noise
-    let noiseGain = sigmoid(nGainLogits)
+    let noiseGain = harmonicHeadMode == .expSigmoid ? Self.expSigmoid(nGainLogits) : sigmoid(nGainLogits)
 
     // learned FIR filter taps [F,K] — sigmoid keeps taps positive in (0,1)
     var noiseFilter: Tensor? = nil
@@ -133,7 +177,8 @@ final class DDSPDecoderModel {
       harmonicAmps: harmonicAmps,
       harmonicGain: harmonicGain,
       noiseGain: noiseGain,
-      noiseFilter: noiseFilter
+      noiseFilter: noiseFilter,
+      harmonicHeadMode: harmonicHeadMode
     )
   }
 
@@ -201,5 +246,24 @@ final class DDSPDecoderModel {
       data[i] = (r * 2.0 - 1.0) * scale
     }
     return data
+  }
+
+  /// Numerically stable softplus: log(1 + exp(x)).
+  /// Implemented as max(x, 0) + log(1 + exp(-abs(x))) to avoid overflow.
+  private static func softplus(_ x: Tensor) -> Tensor {
+    let positive = max(x, 0.0)
+    let correction = (1.0 + (-abs(x)).exp()).log()
+    return positive + correction
+  }
+
+  /// DDSP exp_sigmoid: maxValue * sigmoid(x)^log(exponent) + threshold
+  private static func expSigmoid(
+    _ x: Tensor,
+    exponent: Float = 10.0,
+    maxValue: Float = 2.0,
+    threshold: Float = 1e-7
+  ) -> Tensor {
+    let shaped = sigmoid(x).pow(Float(Foundation.log(Double(exponent))))
+    return maxValue * shaped + threshold
   }
 }

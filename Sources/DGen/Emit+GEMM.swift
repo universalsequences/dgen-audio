@@ -40,6 +40,8 @@ extension LazyOp {
     let leftCell = leftTensor.cellId
     let rightCell = rightTensor.cellId
     let kSteps = K / 8
+    let leftIsFrameAware = ctx.frameAwareTensorCells.contains(leftCell)
+    let rightIsFrameAware = ctx.frameAwareTensorCells.contains(rightCell)
 
     let tileRow = b.threadgroupPositionY()
     let tileCol = b.threadgroupPositionX()
@@ -89,29 +91,38 @@ extension LazyOp {
 
       func emitFrameMac(_ frameIdx: Expr) {
         let leftFrameBase =
-          ctx.frameAwareTensorCells.contains(leftCell)
+          leftIsFrameAware
           ? frameIdx * b.intConstant(M * K) : b.intConstant(0)
         let rightFrameBase =
-          ctx.frameAwareTensorCells.contains(rightCell)
+          rightIsFrameAware
           ? frameIdx * b.intConstant(K * N) : b.intConstant(0)
         emitTileMac(leftFrameBase: leftFrameBase, rightFrameBase: rightFrameBase)
       }
 
-      // Fast path: full chunk in bounds. Avoid per-frame branch in the hot loop.
-      b.if_(chunkEndFrame <= runtimeFrameCount) {
-        b.loop(chunkSize) { localFrame in
-          let frameIdx = chunkBaseFrame + localFrame
-          emitFrameMac(frameIdx)
-        }
-      }
-
-      // Tail path: only needed for the final partially-filled chunk.
-      b.if_(chunkEndFrame > runtimeFrameCount) {
-        b.loop(chunkSize) { localFrame in
-          let frameIdx = chunkBaseFrame + localFrame
-          b.if_(frameIdx < runtimeFrameCount) {
+      if leftIsFrameAware || rightIsFrameAware {
+        // At least one GEMM input varies per frame, so we must reduce over frames.
+        // Fast path: full chunk in bounds. Avoid per-frame branch in the hot loop.
+        b.if_(chunkEndFrame <= runtimeFrameCount) {
+          b.loop(chunkSize) { localFrame in
+            let frameIdx = chunkBaseFrame + localFrame
             emitFrameMac(frameIdx)
           }
+        }
+
+        // Tail path: only needed for the final partially-filled chunk.
+        b.if_(chunkEndFrame > runtimeFrameCount) {
+          b.loop(chunkSize) { localFrame in
+            let frameIdx = chunkBaseFrame + localFrame
+            b.if_(frameIdx < runtimeFrameCount) {
+              emitFrameMac(frameIdx)
+            }
+          }
+        }
+      } else {
+        // Both inputs are frame-invariant. Preserve tensorAccumulate semantics by computing
+        // the static GEMM exactly once and placing it in chunk 0; other chunks remain zero.
+        b.if_(zIndex == b.intConstant(0)) {
+          emitTileMac(leftFrameBase: b.intConstant(0), rightFrameBase: b.intConstant(0))
         }
       }
 

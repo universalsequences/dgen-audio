@@ -4,7 +4,7 @@ extension LazyOp {
   func emitSpectralLoss(b: IRBuilder, ctx: IRContext, g: Graph, node: Node, inputs: [Lazy]) throws {
     switch self {
     case .spectralLossFFT(
-      let windowSize, let hop, _, _,
+      let windowSize, let hop, _, let useLogMagnitude, _,
       let fft1Cell, let fft2Cell, let mag1Cell, let mag2Cell, _):
       // FFT-based spectral loss: forward pass (SIMD-parallel across frames)
       // Uses threadgroup shared memory for butterfly stages (~25-50x faster than device).
@@ -35,6 +35,7 @@ extension LazyOp {
       let winSizeFloat = b.constant(Float(windowSize))
       let zero = b.constant(0.0)
       let one = b.constant(1.0)
+      let eps = b.constant(1e-8)
       let frameIdx = b.frameIndex()
 
       // Hop-compressed index: with hop > 1, spectral cells are indexed by hop window, not frame
@@ -166,12 +167,15 @@ extension LazyOp {
         emitFFTInScratch(signal: sig1, fftCell: fft1Cell, magCell: mag1Cell)
         emitFFTInScratch(signal: sig2, fftCell: fft2Cell, magCell: mag2Cell)
 
-        // 5. Compute loss: sum of squared magnitude differences
+        // 5. Compute loss in magnitude or log-magnitude space.
         b.loop(numBins) { k in
           let kInt = b.cast(k, to: .int)
           let mag1 = b.memoryRead(mag1Cell, magBaseOffset + kInt)
           let mag2 = b.memoryRead(mag2Cell, magBaseOffset + kInt)
-          let diff = mag1 - mag2
+          let diff =
+            useLogMagnitude
+            ? (b.log(mag1 + eps) - b.log(mag2 + eps))
+            : (mag1 - mag2)
           loss.accumulate(diff * diff)
         }
       }
@@ -179,7 +183,7 @@ extension LazyOp {
       b.use(val: loss.value)
 
     case .spectralLossFFTGradSpec(
-      let windowSize, let hop, let fft1Cell, let fft2Cell,
+      let windowSize, let hop, let useLogMagnitude, let fft1Cell, let fft2Cell,
       let mag1Cell, let mag2Cell, let gradSpec1Cell, let gradSpec2Cell):
       // Compute gradient w.r.t. complex spectrum (hop-window-aware)
       // Reads from forward pass's per-hop-window FFT/magnitude cells
@@ -223,9 +227,19 @@ extension LazyOp {
           let real2 = b.memoryRead(fft2Cell, fftBase + kInt)
           let imag2 = b.memoryRead(fft2Cell, fftBase + kInt + imagOff)
 
-          // ∂L/∂mag = 2 * (mag1 - mag2) * gradOutput
-          let gradMag1 = b.constant(2.0) * (mag1 - mag2) * gradOutput
-          let gradMag2 = b.constant(-2.0) * (mag1 - mag2) * gradOutput
+          let gradMag1: Expr
+          let gradMag2: Expr
+          if useLogMagnitude {
+            let logDiff = b.log(mag1 + eps) - b.log(mag2 + eps)
+            let invLogDenom1 = b.constant(1.0) / (mag1 + eps)
+            let invLogDenom2 = b.constant(1.0) / (mag2 + eps)
+            gradMag1 = b.constant(2.0) * logDiff * invLogDenom1 * gradOutput
+            gradMag2 = b.constant(-2.0) * logDiff * invLogDenom2 * gradOutput
+          } else {
+            // ∂L/∂mag = 2 * (mag1 - mag2) * gradOutput
+            gradMag1 = b.constant(2.0) * (mag1 - mag2) * gradOutput
+            gradMag2 = b.constant(-2.0) * (mag1 - mag2) * gradOutput
+          }
 
           // Handle division by zero with epsilon
           let safeMag1 = b.max(mag1, eps)
@@ -689,7 +703,7 @@ extension LazyOp {
     // MARK: - Batched Spectral Loss
 
     case .spectralLossFFTBatched(
-      let windowSize, let batchSize, let hop, _,
+      let windowSize, let batchSize, let hop, _, let useLogMagnitude,
       _, let fft1Cell, let fft2Cell, let mag1Cell, let mag2Cell, let scratchCell):
       guard inputs.count >= 6 else {
         throw DGenError.insufficientInputs(
@@ -720,6 +734,7 @@ extension LazyOp {
       let winSizeFloat = b.constant(Float(windowSize))
       let zero = b.constant(0.0)
       let one = b.constant(1.0)
+      let eps = b.constant(1e-8)
       let (frameIdx, batchIdx) = b.setupFlatThreading(tensorSize: batchSize)
       let batchIdx_int = b.cast(batchIdx, to: .int)
       let frameCount = b.frameCount()
@@ -866,7 +881,10 @@ extension LazyOp {
           let kInt = b.cast(k, to: .int)
           let mag1 = b.memoryRead(mag1Cell, magBaseOffset + kInt)
           let mag2 = b.memoryRead(mag2Cell, magBaseOffset + kInt)
-          let diff = mag1 - mag2
+          let diff =
+            useLogMagnitude
+            ? (b.log(mag1 + eps) - b.log(mag2 + eps))
+            : (mag1 - mag2)
           batchLoss.accumulate(diff * diff)
         }
         _ = b.memoryWrite(scratchCell, frameBatch, batchLoss.value)
@@ -902,7 +920,7 @@ extension LazyOp {
       b.use(val: loss.value / batchSizeFloat)
 
     case .spectralLossFFTBatchedGradSpec(
-      let windowSize, let batchSize, let hop,
+      let windowSize, let batchSize, let hop, let useLogMagnitude,
       let fft1Cell, let fft2Cell,
       let mag1Cell, let mag2Cell, let gradSpec1Cell, let gradSpec2Cell):
       guard inputs.count >= 1 else {
@@ -944,8 +962,18 @@ extension LazyOp {
           let real2 = b.memoryRead(fft2Cell, fftBase + kInt)
           let imag2 = b.memoryRead(fft2Cell, fftBase + kInt + imagOff)
 
-          let gradMag1 = b.constant(2.0) * (mag1 - mag2) * scaledGradOutput
-          let gradMag2 = b.constant(-2.0) * (mag1 - mag2) * scaledGradOutput
+          let gradMag1: Expr
+          let gradMag2: Expr
+          if useLogMagnitude {
+            let logDiff = b.log(mag1 + eps) - b.log(mag2 + eps)
+            let invLogDenom1 = b.constant(1.0) / (mag1 + eps)
+            let invLogDenom2 = b.constant(1.0) / (mag2 + eps)
+            gradMag1 = b.constant(2.0) * logDiff * invLogDenom1 * scaledGradOutput
+            gradMag2 = b.constant(-2.0) * logDiff * invLogDenom2 * scaledGradOutput
+          } else {
+            gradMag1 = b.constant(2.0) * (mag1 - mag2) * scaledGradOutput
+            gradMag2 = b.constant(-2.0) * (mag1 - mag2) * scaledGradOutput
+          }
 
           let safeMag1 = b.max(mag1, eps)
           let safeMag2 = b.max(mag2, eps)

@@ -84,7 +84,7 @@ enum DDSPSynth {
     let gain2D = controls.harmonicGain.reshape([B, F]).transpose([1, 0])
 
     // Sample at playhead position: [F, B, K].sample(playhead) → [B, K]
-    let ampsAtTime = amps3D.sample(playhead)
+    let ampsAtTimeRaw = amps3D.sample(playhead)
     // [F, B].sample(playhead) → [B]
     let gainAtTime = gain2D.sample(playhead)
 
@@ -96,15 +96,23 @@ enum DDSPSynth {
     // Harmonic frequencies: harmonicIndices [B, K] * f0 [B] → [B, K]
     let f0Expanded = f0AtTime.reshape([B, 1]).expand([B, K])
     let harmonicFreqs = tensors.harmonicIndices * f0Expanded
+    let ampsAtTime = nyquistNormalizedHarmonicsBatched(
+      amps: ampsAtTimeRaw,
+      harmonicFreqs: harmonicFreqs,
+      batchSize: B,
+      harmonicHeadMode: controls.harmonicHeadMode
+    )
 
     // Synthesize: phasor → sin → weighted sum
     let twoPi = Float.pi * 2.0
     let harmonicPhases = Signal.statefulPhasor(harmonicFreqs)
     let harmonicSines = sin(harmonicPhases * twoPi)
-    let harmonic = (harmonicSines * ampsAtTime).sum(axis: 1)  // [B, K] → [B]
+    let harmonicScale: Float =
+      controls.harmonicHeadMode == .legacy ? (1.0 / Float(max(1, K))) : 1.0
+    let harmonic = (harmonicSines * ampsAtTime).sum(axis: 1) * harmonicScale  // [B, K] → [B]
 
     // Apply gain and UV mask
-    var harmonicOut = harmonic * uvAtTime * gainAtTime * (1.0 / Float(max(1, K)))
+    var harmonicOut = harmonic * uvAtTime * gainAtTime
 
     // --- Filtered Noise ---
     let noiseGain2D = controls.noiseGain.reshape([B, F]).transpose([1, 0])
@@ -155,14 +163,21 @@ enum DDSPSynth {
     let uv = tensors.uv.peek(playhead).clip(0.0, 1.0)
 
     let twoPi = Float.pi * 2.0
-    let ampsAtTime = controls.harmonicAmps.peekRow(playhead)
+    let ampsAtTimeRaw = controls.harmonicAmps.peekRow(playhead)
     let harmonicFreqs = tensors.harmonicIndices * f0
+    let ampsAtTime = nyquistNormalizedHarmonics(
+      amps: ampsAtTimeRaw,
+      harmonicFreqs: harmonicFreqs,
+      harmonicHeadMode: controls.harmonicHeadMode
+    )
     let harmonicPhases = Signal.statefulPhasor(harmonicFreqs)
     let harmonicSines = sin(harmonicPhases * twoPi)
-    let harmonic = (harmonicSines * ampsAtTime).sum() * uv
+    let harmonicScale: Float =
+      controls.harmonicHeadMode == .legacy ? (1.0 / Float(max(1, numHarmonics))) : 1.0
+    let harmonic = (harmonicSines * ampsAtTime).sum() * harmonicScale * uv
 
     let harmonicGain = controls.harmonicGain.peek(playhead, channel: Signal.constant(0.0))
-    let harmonicOut = harmonic * harmonicGain * (1.0 / Float(max(1, numHarmonics)))
+    let harmonicOut = harmonic * harmonicGain
 
     guard let noiseFilter = controls.noiseFilter else {
       _ = controls.noiseGain.peek(playhead, channel: Signal.constant(0.0))
@@ -177,5 +192,39 @@ enum DDSPSynth {
     let filteredNoise = (noiseBuffer * filterTaps).sum()
     let noiseOut = filteredNoise * noiseGain * (1.0 - uv)
     return harmonicOut + noiseOut
+  }
+
+  /// Applies Nyquist masking and (for distribution-like heads) renormalization.
+  /// This mirrors DDSP's harmonic normalization behavior where above-Nyquist bins
+  /// are removed before distribution renormalization.
+  private static func nyquistNormalizedHarmonics(
+    amps: SignalTensor,
+    harmonicFreqs: SignalTensor,
+    harmonicHeadMode: HarmonicHeadMode
+  ) -> SignalTensor {
+    let nyquistHz = Double(DGenConfig.sampleRate * 0.5)
+    let nyquistMask = harmonicFreqs < nyquistHz
+    let masked = amps * nyquistMask
+    guard harmonicHeadMode != .legacy else {
+      return masked
+    }
+    let denom = masked.sum(axis: 0) + 1e-8
+    return masked / denom
+  }
+
+  private static func nyquistNormalizedHarmonicsBatched(
+    amps: SignalTensor,
+    harmonicFreqs: SignalTensor,
+    batchSize: Int,
+    harmonicHeadMode: HarmonicHeadMode
+  ) -> SignalTensor {
+    let nyquistHz = Double(DGenConfig.sampleRate * 0.5)
+    let nyquistMask = harmonicFreqs < nyquistHz
+    let masked = amps * nyquistMask
+    guard harmonicHeadMode != .legacy else {
+      return masked
+    }
+    let denom = masked.sum(axis: 1).reshape([batchSize, 1]) + 1e-8
+    return masked / denom
   }
 }

@@ -142,6 +142,21 @@ public func sqrt(_ x: SignalTensor) -> SignalTensor {
   return SignalTensor(nodeId: nodeId, graph: x.graph, shape: x.shape, requiresGrad: x.requiresGrad)
 }
 
+public func abs(_ x: SignalTensor) -> SignalTensor {
+  let nodeId = x.graph.node(.abs, [x.nodeId])
+  return SignalTensor(nodeId: nodeId, graph: x.graph, shape: x.shape, requiresGrad: x.requiresGrad)
+}
+
+public func sign(_ x: SignalTensor) -> SignalTensor {
+  let nodeId = x.graph.node(.sign, [x.nodeId])
+  return SignalTensor(nodeId: nodeId, graph: x.graph, shape: x.shape, requiresGrad: false)
+}
+
+public func log(_ x: SignalTensor) -> SignalTensor {
+  let nodeId = x.graph.node(.log, [x.nodeId])
+  return SignalTensor(nodeId: nodeId, graph: x.graph, shape: x.shape, requiresGrad: x.requiresGrad)
+}
+
 // MARK: - Binary Math Functions
 
 public func pow(_ x: Tensor, _ y: Tensor) -> Tensor {
@@ -552,6 +567,9 @@ extension Signal {
 }
 
 extension SignalTensor {
+  public func abs() -> SignalTensor { DGenLazy.abs(self) }
+  public func sign() -> SignalTensor { DGenLazy.sign(self) }
+  public func log() -> SignalTensor { DGenLazy.log(self) }
   public func sin() -> SignalTensor { DGenLazy.sin(self) }
   public func cos() -> SignalTensor { DGenLazy.cos(self) }
   public func exp() -> SignalTensor { DGenLazy.exp(self) }
@@ -633,6 +651,7 @@ extension SignalTensor {
 ///   - sig2: Second signal (typically the teacher/target signal)
 ///   - windowSize: FFT window size (must be power of 2)
 ///   - useHannWindow: Whether to apply Hann window before FFT (default: true)
+///   - useLogMagnitude: Compare log-magnitudes `log(|X|+eps)` instead of magnitudes (default: false)
 ///   - hop: Compute spectral terms every `hop` frames (default: 1)
 /// - Returns: Scalar loss signal (per frame)
 public func spectralLossFFT(
@@ -640,6 +659,7 @@ public func spectralLossFFT(
   _ sig2: Signal,
   windowSize: Int,
   useHannWindow: Bool = true,
+  useLogMagnitude: Bool = false,
   hop: Int = 1,
   normalize: Bool = false
 ) -> Signal {
@@ -648,6 +668,7 @@ public func spectralLossFFT(
     sig2.nodeId,
     windowSize: windowSize,
     useHannWindow: useHannWindow,
+    useLogMagnitude: useLogMagnitude,
     hop: hop
   )
   let loss = Signal(
@@ -669,6 +690,7 @@ public func spectralLossFFT(
 ///   - sig2: Second [B] SignalTensor (typically teacher/target)
 ///   - windowSize: FFT window size (must be power of 2)
 ///   - useHannWindow: Whether to apply Hann window before FFT (default: true)
+///   - useLogMagnitude: Compare log-magnitudes `log(|X|+eps)` instead of magnitudes (default: false)
 ///   - hop: Compute spectral terms every `hop` frames (default: 1)
 ///   - normalize: Divide loss by frame count (default: false)
 /// - Returns: Scalar loss signal (mean across batches)
@@ -677,6 +699,7 @@ public func spectralLossFFT(
   _ sig2: SignalTensor,
   windowSize: Int,
   useHannWindow: Bool = true,
+  useLogMagnitude: Bool = false,
   hop: Int = 1,
   normalize: Bool = false
 ) -> Signal {
@@ -689,6 +712,7 @@ public func spectralLossFFT(
     batchSize: batchSize,
     windowSize: windowSize,
     useHannWindow: useHannWindow,
+    useLogMagnitude: useLogMagnitude,
     hop: hop
   )
   let loss = Signal(
