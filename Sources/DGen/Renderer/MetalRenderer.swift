@@ -1063,7 +1063,9 @@ public class MetalRenderer: Renderer, UOpEmitter {
     case .endLoop:
       // Skip device memory fence for threadgroup scratch kernels (threadGroupSize=1,
       // single thread per threadgroup — no cross-thread synchronization needed)
-      if usesThreadgroupScratch {
+      // GEMM loops are register-local; device fences in their inner loops are unnecessary
+      // and can dominate runtime at large K.
+      if usesThreadgroupScratch || isGemmKernel {
         return "}"
       }
       return "} atomic_thread_fence(metal::mem_flags::mem_device, metal::memory_order_seq_cst);"
@@ -1153,7 +1155,7 @@ public class MetalRenderer: Renderer, UOpEmitter {
       //
       // The fence ensures writes complete and are visible before the next frame's reads.
       // This matches how the C backend behaves (sequential consistency on CPU).
-      if parallelRangeMode == .thread {
+      if parallelRangeMode == .thread || isGemmKernel {
         return "}"
       }
       return "} atomic_thread_fence(metal::mem_flags::mem_device, metal::memory_order_seq_cst);"
