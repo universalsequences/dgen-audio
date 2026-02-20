@@ -104,11 +104,29 @@ enum DDSPSynth {
     let harmonic = (harmonicSines * ampsAtTime).sum(axis: 1)  // [B, K] → [B]
 
     // Apply gain and UV mask
-    let harmonicOut = harmonic * uvAtTime * gainAtTime * (1.0 / Float(max(1, K)))
+    var harmonicOut = harmonic * uvAtTime * gainAtTime * (1.0 / Float(max(1, K)))
 
-    // Consume noiseGain to keep its matmul in the graph (matches unbatched path)
+    // --- Filtered Noise ---
     let noiseGain2D = controls.noiseGain.reshape([B, F]).transpose([1, 0])
-    _ = noiseGain2D.sample(playhead)
+    let noiseGainAtTime = noiseGain2D.sample(playhead)  // [B]
+
+    if let noiseFilter = controls.noiseFilter {
+      let firK = noiseFilter.shape[1]  // noiseFilterSize
+
+      // Reshape filter taps: [B*F, firK] → [B, F, firK] → [F, B, firK]
+      let filter3D = noiseFilter.reshape([B, F, firK]).transpose([1, 0, 2])
+      let filterTapsAtTime = filter3D.sample(playhead)  // [B, firK]
+
+      // Shared noise → buffer → broadcast → per-batch FIR
+      let noise = Signal.noise()
+      let noiseBuffer = noise.buffer(size: firK)          // [1, firK]
+      let noiseBatch = noiseBuffer.expand([B, firK])      // [B, firK]
+      let filteredNoise = (noiseBatch * filterTapsAtTime).sum(axis: 1)  // [B]
+
+      // UV masking + gain
+      let noiseOut = filteredNoise * noiseGainAtTime * (Tensor([1.0]) - uvAtTime)
+      harmonicOut = harmonicOut + noiseOut
+    }
 
     return harmonicOut
   }

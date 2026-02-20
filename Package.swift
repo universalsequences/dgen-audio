@@ -7,7 +7,6 @@ let package = Package(
         .macOS(.v10_15)
     ],
     products: [
-        .executable(name: "dgen", targets: ["DGenApp"]),
         .executable(name: "DDSPE2E", targets: ["DDSPE2E"]),
         .library(name: "DGen", targets: ["DGen"]),
         .library(name: "DGenLazy", targets: ["DGenLazy"]),
@@ -21,11 +20,6 @@ let package = Package(
                 .linkedFramework("MetalKit"),
                 .linkedFramework("QuartzCore")
             ]
-        ),
-        .executableTarget(
-            name: "DGenApp",
-            dependencies: ["DGen"],
-            path: "Sources/DGenApp"
         ),
         .executableTarget(
             name: "DDSPE2E",
