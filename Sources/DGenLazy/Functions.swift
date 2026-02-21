@@ -637,7 +637,7 @@ extension SignalTensor {
 
 /// Spectral loss using FFT - compares frequency content of two signals
 ///
-/// Computes the sum of squared magnitude differences in the frequency domain.
+/// Computes frequency-domain loss in magnitude or log-magnitude space.
 /// Uses Cooley-Tukey FFT for efficient computation and IFFT for gradient backpropagation.
 ///
 /// ```swift
@@ -652,6 +652,7 @@ extension SignalTensor {
 ///   - windowSize: FFT window size (must be power of 2)
 ///   - useHannWindow: Whether to apply Hann window before FFT (default: true)
 ///   - useLogMagnitude: Compare log-magnitudes `log(|X|+eps)` instead of magnitudes (default: false)
+///   - lossMode: `l2` for squared difference, `l1` for absolute difference
 ///   - hop: Compute spectral terms every `hop` frames (default: 1)
 /// - Returns: Scalar loss signal (per frame)
 public func spectralLossFFT(
@@ -660,6 +661,7 @@ public func spectralLossFFT(
   windowSize: Int,
   useHannWindow: Bool = true,
   useLogMagnitude: Bool = false,
+  lossMode: SpectralLossMode = .l2,
   hop: Int = 1,
   normalize: Bool = false
 ) -> Signal {
@@ -669,6 +671,7 @@ public func spectralLossFFT(
     windowSize: windowSize,
     useHannWindow: useHannWindow,
     useLogMagnitude: useLogMagnitude,
+    lossMode: lossMode,
     hop: hop
   )
   let loss = Signal(
@@ -691,6 +694,7 @@ public func spectralLossFFT(
 ///   - windowSize: FFT window size (must be power of 2)
 ///   - useHannWindow: Whether to apply Hann window before FFT (default: true)
 ///   - useLogMagnitude: Compare log-magnitudes `log(|X|+eps)` instead of magnitudes (default: false)
+///   - lossMode: `l2` for squared difference, `l1` for absolute difference
 ///   - hop: Compute spectral terms every `hop` frames (default: 1)
 ///   - normalize: Divide loss by frame count (default: false)
 /// - Returns: Scalar loss signal (mean across batches)
@@ -700,6 +704,7 @@ public func spectralLossFFT(
   windowSize: Int,
   useHannWindow: Bool = true,
   useLogMagnitude: Bool = false,
+  lossMode: SpectralLossMode = .l2,
   hop: Int = 1,
   normalize: Bool = false
 ) -> Signal {
@@ -713,6 +718,7 @@ public func spectralLossFFT(
     windowSize: windowSize,
     useHannWindow: useHannWindow,
     useLogMagnitude: useLogMagnitude,
+    lossMode: lossMode,
     hop: hop
   )
   let loss = Signal(

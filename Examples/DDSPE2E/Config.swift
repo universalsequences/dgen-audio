@@ -18,6 +18,16 @@ enum HarmonicHeadMode: String, Codable {
   case expSigmoid = "exp-sigmoid"
 }
 
+enum ControlSmoothingMode: String, Codable {
+  case fir
+  case off
+}
+
+enum SpectralLossModeOption: String, Codable {
+  case l2
+  case l1
+}
+
 struct DDSPE2EConfig: Codable {
   var sampleRate: Float = 16_000.0
   var chunkSize: Int = 16_384
@@ -46,6 +56,7 @@ struct DDSPE2EConfig: Codable {
   var modelNumLayers: Int = 1
   var numHarmonics: Int = 16
   var harmonicHeadMode: HarmonicHeadMode = .legacy
+  var controlSmoothingMode: ControlSmoothingMode = .fir
   // Backward-compatible alias. This is kept so older configs/CLI still decode.
   var normalizedHarmonicHead: Bool = false
   var softmaxTemperature: Float = 1.0
@@ -80,6 +91,7 @@ struct DDSPE2EConfig: Codable {
   var spectralWindowSizes: [Int] = []
   var spectralWeight: Float = 0.0
   var spectralLogmagWeight: Float = 0.0
+  var spectralLossMode: SpectralLossModeOption = .l2
   var spectralHopDivisor: Int = 4
   var spectralWarmupSteps: Int = 100
   var spectralRampSteps: Int = 200
@@ -110,6 +122,7 @@ struct DDSPE2EConfig: Codable {
     case modelNumLayers
     case numHarmonics
     case harmonicHeadMode
+    case controlSmoothingMode
     case normalizedHarmonicHead
     case softmaxTemperature
     case softmaxTemperatureEnd
@@ -143,6 +156,7 @@ struct DDSPE2EConfig: Codable {
     case spectralWindowSizes
     case spectralWeight
     case spectralLogmagWeight
+    case spectralLossMode
     case spectralHopDivisor
     case spectralWarmupSteps
     case spectralRampSteps
@@ -178,6 +192,9 @@ struct DDSPE2EConfig: Codable {
     numHarmonics = try c.decodeIfPresent(Int.self, forKey: .numHarmonics) ?? d.numHarmonics
     harmonicHeadMode = try c.decodeIfPresent(HarmonicHeadMode.self, forKey: .harmonicHeadMode)
       ?? d.harmonicHeadMode
+    controlSmoothingMode =
+      try c.decodeIfPresent(ControlSmoothingMode.self, forKey: .controlSmoothingMode)
+      ?? d.controlSmoothingMode
     normalizedHarmonicHead =
       try c.decodeIfPresent(Bool.self, forKey: .normalizedHarmonicHead) ?? d.normalizedHarmonicHead
     if !c.contains(.harmonicHeadMode) {
@@ -234,6 +251,8 @@ struct DDSPE2EConfig: Codable {
     spectralWeight = try c.decodeIfPresent(Float.self, forKey: .spectralWeight) ?? d.spectralWeight
     spectralLogmagWeight =
       try c.decodeIfPresent(Float.self, forKey: .spectralLogmagWeight) ?? d.spectralLogmagWeight
+    spectralLossMode = try c.decodeIfPresent(SpectralLossModeOption.self, forKey: .spectralLossMode)
+      ?? d.spectralLossMode
     spectralHopDivisor = try c.decodeIfPresent(Int.self, forKey: .spectralHopDivisor) ?? d.spectralHopDivisor
     spectralWarmupSteps = try c.decodeIfPresent(Int.self, forKey: .spectralWarmupSteps) ?? d.spectralWarmupSteps
     spectralRampSteps = try c.decodeIfPresent(Int.self, forKey: .spectralRampSteps) ?? d.spectralRampSteps
@@ -283,6 +302,14 @@ struct DDSPE2EConfig: Codable {
         )
       }
       harmonicHeadMode = mode
+    }
+    if let value = options["control-smoothing"] {
+      guard let mode = ControlSmoothingMode(rawValue: value.lowercased()) else {
+        throw ConfigError.invalid(
+          "Invalid control smoothing mode for --control-smoothing: \(value) (expected fir|off)"
+        )
+      }
+      controlSmoothingMode = mode
     }
     if let value = options["softmax-temp"] {
       softmaxTemperature = try parseFloat(value, key: "softmax-temp")
@@ -387,6 +414,14 @@ struct DDSPE2EConfig: Codable {
     }
     if let value = options["spectral-logmag-weight"] {
       spectralLogmagWeight = try parseFloat(value, key: "spectral-logmag-weight")
+    }
+    if let value = options["spectral-loss-mode"] {
+      guard let mode = SpectralLossModeOption(rawValue: value.lowercased()) else {
+        throw ConfigError.invalid(
+          "Invalid spectral loss mode for --spectral-loss-mode: \(value) (expected l2|l1)"
+        )
+      }
+      spectralLossMode = mode
     }
     if let value = options["spectral-hop-divisor"] {
       spectralHopDivisor = try parseInt(value, key: "spectral-hop-divisor")

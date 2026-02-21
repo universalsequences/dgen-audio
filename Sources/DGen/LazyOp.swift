@@ -7,6 +7,14 @@ public typealias CellID = Int
 public typealias GradID = Int
 public typealias ChannelNumber = Int
 
+/// Distance mode used by FFT spectral loss in magnitude (or log-magnitude) space.
+public enum SpectralLossMode: String, Codable, Sendable {
+  /// Squared difference `(a - b)^2` (default).
+  case l2
+  /// Absolute difference `|a - b|`.
+  case l1
+}
+
 // MARK: - Tensor Emit Helpers
 
 /// Emit a binary op for scalars or tensors.
@@ -68,6 +76,7 @@ public enum LazyOp {
     hop: Int,
     useHann: Bool,
     useLogMagnitude: Bool,
+    lossMode: SpectralLossMode,
     windowCell: CellID,
     fft1Cell: CellID,
     fft2Cell: CellID,
@@ -79,6 +88,7 @@ public enum LazyOp {
     windowSize: Int,
     hop: Int,
     useLogMagnitude: Bool,
+    lossMode: SpectralLossMode,
     fft1Cell: CellID,
     fft2Cell: CellID,
     mag1Cell: CellID,
@@ -125,6 +135,7 @@ public enum LazyOp {
     hop: Int,
     useHann: Bool,
     useLogMagnitude: Bool,
+    lossMode: SpectralLossMode,
     windowCell: CellID,
     fft1Cell: CellID,
     fft2Cell: CellID,
@@ -144,6 +155,7 @@ public enum LazyOp {
     batchSize: Int,
     hop: Int,
     useLogMagnitude: Bool,
+    lossMode: SpectralLossMode,
     fft1Cell: CellID,
     fft2Cell: CellID,
     mag1Cell: CellID,

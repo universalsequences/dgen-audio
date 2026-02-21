@@ -31,6 +31,8 @@ struct DDSPE2EMain {
       try handleInspectCache(options)
     case "train":
       try handleTrain(options)
+    case "probe-smoothing":
+      try handleProbeSmoothing(options)
     default:
       throw CLIError.invalid("Unknown command: \(command)")
     }
@@ -140,6 +142,10 @@ struct DDSPE2EMain {
     )
   }
 
+  private static func handleProbeSmoothing(_ options: [String: String]) throws {
+    try DDSPE2ESmoothingProbe.run(options: options, logger: log)
+  }
+
   private static func resolveKernelDumpPath(rawValue: String?, runDir: URL) -> String? {
     guard let rawValue else { return nil }
     if rawValue == "true" {
@@ -193,6 +199,7 @@ struct DDSPE2EMain {
       preprocess --input <wav-dir> --cache <cache-dir> [--config <json>] [overrides]
       inspect-cache --cache <cache-dir> [--split train|val] [--limit N]
       train --cache <cache-dir> [--runs-dir <dir>] [--run-name <name>] [--steps N] [--split train|val] [--mode dry|m2] [--config <json>] [overrides]
+      probe-smoothing --cache <cache-dir> [--split train|val] [--index N] [--output <dir>] [--config <json>] [--init-checkpoint <path>] [overrides]
 
     Common overrides:
       --sample-rate <float>
@@ -214,6 +221,7 @@ struct DDSPE2EMain {
       --model-hidden <int>
       --harmonics <int>
       --harmonic-head-mode <legacy|normalized|softmax-db|exp-sigmoid>
+      --control-smoothing <fir|off>
       --normalized-harmonic-head <true|false>
       --softmax-temp <float>
       --softmax-temp-end <float>
@@ -243,6 +251,7 @@ struct DDSPE2EMain {
       --spectral-windows <csv-int-list>
       --spectral-weight <float>
       --spectral-logmag-weight <float>
+      --spectral-loss-mode <l2|l1>
       --spectral-hop-divisor <int>
       --spectral-warmup-steps <int>
       --spectral-ramp-steps <int>
@@ -261,6 +270,7 @@ struct DDSPE2EMain {
       swift run DDSPE2E inspect-cache --cache .ddsp_cache --limit 3
       swift run DDSPE2E train --cache .ddsp_cache --steps 50 --mode m2
       swift run DDSPE2E train --cache .ddsp_cache --steps 1 --kernel-dump
+      swift run DDSPE2E probe-smoothing --cache .ddsp_cache --split train --index 0 --output /tmp/ddsp_smoothing_probe
     """
     print(text)
   }

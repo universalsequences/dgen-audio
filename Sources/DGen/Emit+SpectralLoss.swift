@@ -4,7 +4,7 @@ extension LazyOp {
   func emitSpectralLoss(b: IRBuilder, ctx: IRContext, g: Graph, node: Node, inputs: [Lazy]) throws {
     switch self {
     case .spectralLossFFT(
-      let windowSize, let hop, _, let useLogMagnitude, _,
+      let windowSize, let hop, _, let useLogMagnitude, let lossMode, _,
       let fft1Cell, let fft2Cell, let mag1Cell, let mag2Cell, _):
       // FFT-based spectral loss: forward pass (SIMD-parallel across frames)
       // Uses threadgroup shared memory for butterfly stages (~25-50x faster than device).
@@ -176,14 +176,18 @@ extension LazyOp {
             useLogMagnitude
             ? (b.log(mag1 + eps) - b.log(mag2 + eps))
             : (mag1 - mag2)
-          loss.accumulate(diff * diff)
+          if lossMode == .l1 {
+            loss.accumulate(b.abs(diff))
+          } else {
+            loss.accumulate(diff * diff)
+          }
         }
       }
 
       b.use(val: loss.value)
 
     case .spectralLossFFTGradSpec(
-      let windowSize, let hop, let useLogMagnitude, let fft1Cell, let fft2Cell,
+      let windowSize, let hop, let useLogMagnitude, let lossMode, let fft1Cell, let fft2Cell,
       let mag1Cell, let mag2Cell, let gradSpec1Cell, let gradSpec2Cell):
       // Compute gradient w.r.t. complex spectrum (hop-window-aware)
       // Reads from forward pass's per-hop-window FFT/magnitude cells
@@ -233,12 +237,20 @@ extension LazyOp {
             let logDiff = b.log(mag1 + eps) - b.log(mag2 + eps)
             let invLogDenom1 = b.constant(1.0) / (mag1 + eps)
             let invLogDenom2 = b.constant(1.0) / (mag2 + eps)
-            gradMag1 = b.constant(2.0) * logDiff * invLogDenom1 * gradOutput
-            gradMag2 = b.constant(-2.0) * logDiff * invLogDenom2 * gradOutput
+            let logScale =
+              lossMode == .l1
+              ? b.sign(logDiff)
+              : (b.constant(2.0) * logDiff)
+            gradMag1 = logScale * invLogDenom1 * gradOutput
+            gradMag2 = (b.constant(0.0) - logScale) * invLogDenom2 * gradOutput
           } else {
-            // ∂L/∂mag = 2 * (mag1 - mag2) * gradOutput
-            gradMag1 = b.constant(2.0) * (mag1 - mag2) * gradOutput
-            gradMag2 = b.constant(-2.0) * (mag1 - mag2) * gradOutput
+            let magDiff = mag1 - mag2
+            let magScale =
+              lossMode == .l1
+              ? b.sign(magDiff)
+              : (b.constant(2.0) * magDiff)
+            gradMag1 = magScale * gradOutput
+            gradMag2 = (b.constant(0.0) - magScale) * gradOutput
           }
 
           // Handle division by zero with epsilon
@@ -703,7 +715,7 @@ extension LazyOp {
     // MARK: - Batched Spectral Loss
 
     case .spectralLossFFTBatched(
-      let windowSize, let batchSize, let hop, _, let useLogMagnitude,
+      let windowSize, let batchSize, let hop, _, let useLogMagnitude, let lossMode,
       _, let fft1Cell, let fft2Cell, let mag1Cell, let mag2Cell, let scratchCell):
       guard inputs.count >= 6 else {
         throw DGenError.insufficientInputs(
@@ -885,7 +897,11 @@ extension LazyOp {
             useLogMagnitude
             ? (b.log(mag1 + eps) - b.log(mag2 + eps))
             : (mag1 - mag2)
-          batchLoss.accumulate(diff * diff)
+          if lossMode == .l1 {
+            batchLoss.accumulate(b.abs(diff))
+          } else {
+            batchLoss.accumulate(diff * diff)
+          }
         }
         _ = b.memoryWrite(scratchCell, frameBatch, batchLoss.value)
       }
@@ -920,7 +936,7 @@ extension LazyOp {
       b.use(val: loss.value / batchSizeFloat)
 
     case .spectralLossFFTBatchedGradSpec(
-      let windowSize, let batchSize, let hop, let useLogMagnitude,
+      let windowSize, let batchSize, let hop, let useLogMagnitude, let lossMode,
       let fft1Cell, let fft2Cell,
       let mag1Cell, let mag2Cell, let gradSpec1Cell, let gradSpec2Cell):
       guard inputs.count >= 1 else {
@@ -968,11 +984,20 @@ extension LazyOp {
             let logDiff = b.log(mag1 + eps) - b.log(mag2 + eps)
             let invLogDenom1 = b.constant(1.0) / (mag1 + eps)
             let invLogDenom2 = b.constant(1.0) / (mag2 + eps)
-            gradMag1 = b.constant(2.0) * logDiff * invLogDenom1 * scaledGradOutput
-            gradMag2 = b.constant(-2.0) * logDiff * invLogDenom2 * scaledGradOutput
+            let logScale =
+              lossMode == .l1
+              ? b.sign(logDiff)
+              : (b.constant(2.0) * logDiff)
+            gradMag1 = logScale * invLogDenom1 * scaledGradOutput
+            gradMag2 = (b.constant(0.0) - logScale) * invLogDenom2 * scaledGradOutput
           } else {
-            gradMag1 = b.constant(2.0) * (mag1 - mag2) * scaledGradOutput
-            gradMag2 = b.constant(-2.0) * (mag1 - mag2) * scaledGradOutput
+            let magDiff = mag1 - mag2
+            let magScale =
+              lossMode == .l1
+              ? b.sign(magDiff)
+              : (b.constant(2.0) * magDiff)
+            gradMag1 = magScale * scaledGradOutput
+            gradMag2 = (b.constant(0.0) - magScale) * scaledGradOutput
           }
 
           let safeMag1 = b.max(mag1, eps)

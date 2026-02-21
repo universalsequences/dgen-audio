@@ -36,7 +36,7 @@ extension Graph {
   /// gradients back to time domain - fully parallelizable via butterfly stages.
   ///
   /// Mathematical formulation:
-  /// - Forward: Apply optional Hann window, compute FFT, compute magnitudes, sum squared differences
+  /// - Forward: Apply optional Hann window, compute FFT, compute magnitudes, accumulate L1/L2 distance
   /// - Backward: Chain rule through magnitude, scale by unit vector, IFFT to time domain, multiply by window
   ///
   /// - Parameters:
@@ -44,6 +44,7 @@ extension Graph {
   ///   - sig2: Second input signal (reference/target)
   ///   - windowSize: FFT window size (must be power of 2)
   ///   - useHannWindow: Whether to apply Hann window before FFT (default: true)
+  ///   - lossMode: Distance mode in magnitude space (`.l2` or `.l1`)
   /// - Returns: Scalar loss value per frame
   public func spectralLossFFT(
     _ sig1: NodeID,
@@ -51,6 +52,7 @@ extension Graph {
     windowSize: Int,
     useHannWindow: Bool = true,
     useLogMagnitude: Bool = false,
+    lossMode: SpectralLossMode = .l2,
     hop: Int = 1
   ) -> NodeID {
     precondition(
@@ -108,7 +110,7 @@ extension Graph {
     let mag1Cell = alloc(vectorWidth: numBins * numHopWindows)
     let mag2Cell = alloc(vectorWidth: numBins * numHopWindows)
 
-    // Allocate scratch for per-hop-window squared differences
+    // Allocate scratch for per-hop-window spectral distances
     let scratchCell = alloc(vectorWidth: numBins * numHopWindows)
 
     // Optional hop counter: when hop > 1, spectral kernels only execute on frames where counter == 0.
@@ -131,6 +133,7 @@ extension Graph {
         hop: hop,
         useHann: useHannWindow,
         useLogMagnitude: useLogMagnitude,
+        lossMode: lossMode,
         windowCell: windowCell,
         fft1Cell: fft1Cell,
         fft2Cell: fft2Cell,
@@ -151,6 +154,7 @@ extension Graph {
   ///   - batchSize: Number of batch elements (B)
   ///   - windowSize: FFT window size (must be power of 2)
   ///   - useHannWindow: Whether to apply Hann window before FFT
+  ///   - lossMode: Distance mode in magnitude space (`.l2` or `.l1`)
   ///   - hop: Compute spectral terms every `hop` frames
   /// - Returns: Scalar loss node (mean across batches)
   public func spectralLossFFTBatched(
@@ -160,6 +164,7 @@ extension Graph {
     windowSize: Int,
     useHannWindow: Bool = true,
     useLogMagnitude: Bool = false,
+    lossMode: SpectralLossMode = .l2,
     hop: Int = 1
   ) -> NodeID {
     precondition(
@@ -232,6 +237,7 @@ extension Graph {
         hop: hop,
         useHann: useHannWindow,
         useLogMagnitude: useLogMagnitude,
+        lossMode: lossMode,
         windowCell: windowCell,
         fft1Cell: fft1Cell,
         fft2Cell: fft2Cell,

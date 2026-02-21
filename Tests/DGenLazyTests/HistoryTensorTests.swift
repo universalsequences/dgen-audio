@@ -101,6 +101,51 @@ final class HistoryTensorTests: XCTestCase {
     print("First 4 frames: \(Array(result.prefix(4)))")
   }
 
+  /// Minimal batched synth-like pattern:
+  ///   output = sin(phasor(freqs)) * onePole(gain)
+  /// This isolates tensor history smoothing in a [B]-shaped render path.
+  func testBatchedPhasorWithSmoothedGain() throws {
+    DGenConfig.kernelOutputPath = "/tmp/batched_smoothed_gain_kernel.metal"
+    DGenConfig.debug = true
+
+    let batchSize = 4
+    let frameCount = 32
+    let twoPi = Float.pi * 2.0
+    let alpha: Float = 0.9
+
+    let freqs = Tensor([220.0, 330.0, 440.0, 550.0])
+    let phases = Signal.statefulPhasor(freqs)  // [B]
+    let osc = sin(phases * twoPi)  // [B]
+
+    // Time-varying shared gain scalar, broadcast across batch.
+    let sharedGain = (Signal.phasor(0.5) * 0.25 + 0.75).clip(0.0, 1.0)
+    // Static per-batch scaling to avoid all lanes being identical.
+    let laneScale = Tensor([1.0, 0.8, 0.6, 0.4])
+    let gainRaw = laneScale * sharedGain  // [B]
+
+    // One-pole smoothing on [B]-shaped control.
+    let history = TensorHistory(shape: [batchSize])
+    let prevGain = history.read()
+    let smoothedGain = prevGain * alpha + gainRaw * (1.0 - alpha)
+    history.write(smoothedGain)
+
+    // Simple render proxy and scalar loss/output.
+    let output = (osc * smoothedGain).sum()
+    let result = try output.realize(frames: frameCount)
+
+    print("\n=== Batched Phasor + Smoothed Gain ===")
+    print("Frames: \(frameCount), Batch: \(batchSize), alpha: \(alpha)")
+    print("First 8 outputs: \(Array(result.prefix(8)))")
+    print("Kernel dump: /tmp/batched_smoothed_gain_kernel.metal")
+
+    XCTAssertEqual(result.count, frameCount)
+    XCTAssertTrue(result.allSatisfy { $0.isFinite }, "All outputs should be finite")
+    XCTAssertGreaterThan(result.reduce(0, { $0 + abs($1) }), 0.0, "Output should not be all zeros")
+
+    DGenConfig.kernelOutputPath = nil
+    DGenConfig.debug = false
+  }
+
   // MARK: - Conv2D in Feedback Loop
 
   /// Feedback loop using proper conv2d with kernel tensor

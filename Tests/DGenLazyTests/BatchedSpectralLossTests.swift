@@ -59,6 +59,54 @@ final class BatchedSpectralLossTests: XCTestCase {
       "Batched loss (\(batchedAvg)) should match mean of scalar losses (\(expectedMean))")
   }
 
+  func testSpectralLossL1ModeIsSelectableAndProducesDifferentValue() throws {
+    let frameCount = 256
+    let windowSize = 64
+    let twoPi = Float.pi * 2.0
+
+    func evaluate(_ mode: SpectralLossMode) throws -> Float {
+      configure(frames: frameCount)
+      let student = sin(SignalTensor.phasor(Tensor([110.0, 220.0])) * twoPi)
+      let teacher = sin(SignalTensor.phasor(Tensor([180.0, 260.0])) * twoPi)
+      let loss = spectralLossFFT(
+        student, teacher, windowSize: windowSize, lossMode: mode, normalize: true)
+      let values = try loss.backward(frames: frameCount)
+      return values.reduce(0, +) / Float(max(1, values.count))
+    }
+
+    let l2 = try evaluate(.l2)
+    let l1 = try evaluate(.l1)
+
+    XCTAssertGreaterThan(l2, 0.0, "L2 spectral loss should be positive, got \(l2)")
+    XCTAssertGreaterThan(l1, 0.0, "L1 spectral loss should be positive, got \(l1)")
+    XCTAssertNotEqual(
+      Double(l1), Double(l2), accuracy: 1e-8,
+      "L1 and L2 spectral modes should produce different values on this input")
+  }
+
+  func testSpectralLossL1ModeBackpropagatesToParams() throws {
+    let frameCount = 256
+    let windowSize = 64
+    let twoPi = Float.pi * 2.0
+
+    configure(frames: frameCount)
+    let ampParam = Tensor.param([2], data: [0.6, 0.4])
+    let freqs = Tensor([150.0, 310.0])
+    let student = sin(SignalTensor.phasor(freqs) * twoPi) * ampParam
+    let teacher = sin(SignalTensor.phasor(freqs) * twoPi)
+    let loss = spectralLossFFT(
+      student, teacher, windowSize: windowSize, lossMode: .l1, normalize: true)
+    _ = try loss.backward(frames: frameCount)
+
+    guard let grad = ampParam.grad?.getData() else {
+      XCTFail("Expected gradients for ampParam with L1 spectral loss")
+      return
+    }
+    XCTAssertEqual(grad.count, 2, "Expected two gradients for ampParam")
+    XCTAssertTrue(grad.allSatisfy { !$0.isNaN && !$0.isInfinite }, "Gradients must be finite")
+    XCTAssertTrue(grad.contains { abs($0) > 1e-9 }, "Expected at least one non-zero gradient")
+  }
+
   // MARK: - Determinism
 
   func testBatchedSpectralLossIsDeterministic() throws {

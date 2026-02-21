@@ -140,6 +140,23 @@ python3 Examples/DDSPE2E/scripts/plot_controls.py \
 
 This writes `runs/<run-name>/logs/controls/plots/steps_xxxxxx_xxxxxx_controls_compare.png`.
 
+9. Probe raw vs FIR-smoothed controls (realized tensors, no training):
+
+```bash
+swift run DDSPE2E probe-smoothing \
+  --cache .ddsp_cache_tinysol \
+  --split train \
+  --index 0 \
+  --output /tmp/ddsp_smoothing_probe
+```
+
+Analyze with Python:
+
+```bash
+python3 Examples/DDSPE2E/scripts/analyze_smoothing_probe.py \
+  --dir /tmp/ddsp_smoothing_probe
+```
+
 ## Spectral Hop Divisor
 
 For each spectral window `w`, the effective hop is:
@@ -155,9 +172,12 @@ Set `--spectral-hop-divisor 1` to effectively disable hop sparsification for tha
 
 Use `--spectral-logmag-weight <float>` to add an FFT-domain log-magnitude term:
 
-- per-bin term: `(log(|X_pred| + eps) - log(|X_tgt| + eps))^2`
+- per-bin term:
+  - `--spectral-loss-mode l2` (default): `(log(|X_pred| + eps) - log(|X_tgt| + eps))^2`
+  - `--spectral-loss-mode l1`: `|log(|X_pred| + eps) - log(|X_tgt| + eps)|`
 - computed in spectral space (not `log(abs(waveform))` in time domain)
 - combines with `--spectral-weight` (linear magnitude term) and `--mse-weight`
+- for DDSP paper parity, `--spectral-loss-mode l1` is typically the right choice
 
 ## Fixed Batch
 
@@ -183,6 +203,11 @@ By default, training uses the legacy harmonic head behavior.
 - `--harmonic-entropy-weight-end <float>`, `--harmonic-entropy-warmup-steps <int>`, `--harmonic-entropy-ramp-steps <int>` optionally schedule entropy weight from start to end during training (useful to avoid early collapse without constraining late optimization)
 - `--harmonic-concentration-weight <float>` adds a concentration regularizer in training for `softmax-db` mode (`weight * max(mean(sum(p^2)) - 1/K, 0)`)
 - `--harmonic-concentration-weight-end <float>`, `--harmonic-concentration-warmup-steps <int>`, `--harmonic-concentration-ramp-steps <int>` optionally schedule concentration penalty from start to end
+
+## Control Smoothing
+
+- `--control-smoothing fir` (default): frame-domain FIR smoothing (`pad + conv2d`) before sampling controls at audio rate
+- `--control-smoothing off`: no smoothing
 
 ## Commands
 
@@ -211,7 +236,8 @@ By default, training uses the legacy harmonic head behavior.
 - `--fixed-batch <true|false>` (default: `false`)
 - `--model-hidden <int>` (default: `32`)
 - `--harmonics <int>` (default: `16`)
-- `--harmonic-head-mode <legacy|normalized|softmax-db>` (default: `legacy`)
+- `--harmonic-head-mode <legacy|normalized|softmax-db|exp-sigmoid>` (default: `legacy`)
+- `--control-smoothing <fir|off>` (default: `fir`)
 - `--normalized-harmonic-head <true|false>` (default: `false`)
 - `--softmax-temp <float>` (default: `1.0`)
 - `--softmax-temp-end <float>` (default: unset; falls back to `--softmax-temp`)
@@ -235,6 +261,7 @@ By default, training uses the legacy harmonic head behavior.
 - `--spectral-windows <csv-int-list>` (default: empty)
 - `--spectral-weight <float>` (default: `0.0`)
 - `--spectral-logmag-weight <float>` (default: `0.0`)
+- `--spectral-loss-mode <l2|l1>` (default: `l2`)
 - `--spectral-hop-divisor <int>` (default: `4`)
 - `--spectral-warmup-steps <int>` (default: `100`)
 - `--spectral-ramp-steps <int>` (default: `200`)

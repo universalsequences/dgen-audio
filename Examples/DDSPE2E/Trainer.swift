@@ -50,6 +50,8 @@ struct TrainerOptions {
 }
 
 enum DDSPE2ETrainer {
+  private static let conditioningFeatureCount = 5
+
   private struct GradientStats {
     var paramCount: Int = 0
     var paramsWithGrad: Int = 0
@@ -218,6 +220,7 @@ enum DDSPE2ETrainer {
       "requestedSteps": "\(options.steps)",
       "numHarmonics": "\(config.numHarmonics)",
       "harmonicHeadMode": config.harmonicHeadMode.rawValue,
+      "controlSmoothingMode": config.controlSmoothingMode.rawValue,
       "normalizedHarmonicHead": "\(config.normalizedHarmonicHead)",
       "softmaxTemperature": "\(config.softmaxTemperature)",
       "softmaxTemperatureEnd": "\(config.softmaxTemperatureEnd ?? config.softmaxTemperature)",
@@ -249,6 +252,7 @@ enum DDSPE2ETrainer {
       "earlyStopMinDelta": "\(config.earlyStopMinDelta)",
       "spectralWeightTarget": "\(config.spectralWeight)",
       "spectralLogmagWeight": "\(config.spectralLogmagWeight)",
+      "spectralLossMode": config.spectralLossMode.rawValue,
       "spectralHopDivisor": "\(config.spectralHopDivisor)",
       "spectralWarmupSteps": "\(config.spectralWarmupSteps)",
       "spectralRampSteps": "\(config.spectralRampSteps)",
@@ -280,7 +284,10 @@ enum DDSPE2ETrainer {
     logger("Feature frames: \(firstChunkFeatureFrames) → padded: \(paddedFeatureFrames)")
 
     let featuresTensor = Tensor(
-      [[Float]](repeating: [Float](repeating: 0, count: 3), count: paddedFeatureFrames)
+      [[Float]](
+        repeating: [Float](repeating: 0, count: conditioningFeatureCount),
+        count: paddedFeatureFrames
+      )
     )
     let targetTensor = Tensor([Float](repeating: 0, count: frameCount))
     let synthTensors = DDSPSynth.PreallocatedTensors(
@@ -408,7 +415,7 @@ enum DDSPE2ETrainer {
           loudnessDB: chunk.loudnessDB,
           uvMask: chunk.uvMask
         )
-        let paddingRows = paddedFeatureFrames * 3 - conditioningData.count
+        let paddingRows = paddedFeatureFrames * conditioningFeatureCount - conditioningData.count
         if paddingRows > 0 {
           conditioningData.append(contentsOf: [Float](repeating: 0, count: paddingRows))
         }
@@ -441,7 +448,8 @@ enum DDSPE2ETrainer {
           tensors: synthTensors,
           featureFrames: chunk.f0Hz.count,
           frameCount: frameCount,
-          numHarmonics: config.numHarmonics
+          numHarmonics: config.numHarmonics,
+          controlSmoothingMode: config.controlSmoothingMode
         )
         let target = targetTensor.toSignal(maxFrames: frameCount)
         var loss = DDSPTrainingLosses.fullLoss(
@@ -452,7 +460,8 @@ enum DDSPE2ETrainer {
           frameCount: frameCount,
           mseWeight: config.mseLossWeight,
           spectralWeight: spectralWeight,
-          spectralLogmagWeight: config.spectralLogmagWeight
+          spectralLogmagWeight: config.spectralLogmagWeight,
+          spectralLossMode: config.spectralLossMode
         )
         loss = addHarmonicEntropyRegularization(
           baseLoss: loss,
@@ -587,7 +596,8 @@ enum DDSPE2ETrainer {
             tensors: synthTensors,
             featureFrames: lastChunkFeatureFrames,
             frameCount: frameCount,
-            numHarmonics: config.numHarmonics
+            numHarmonics: config.numHarmonics,
+            controlSmoothingMode: config.controlSmoothingMode
           )
           let samples = try renderPrediction.realize(frames: frameCount)
           LazyGraphContext.current.clearComputationGraph()
@@ -727,7 +737,10 @@ enum DDSPE2ETrainer {
 
     // Pre-allocate batched tensors
     let featuresTensor = Tensor(
-      [[Float]](repeating: [Float](repeating: 0, count: 3), count: paddedFeatureFrames * B)
+      [[Float]](
+        repeating: [Float](repeating: 0, count: conditioningFeatureCount),
+        count: paddedFeatureFrames * B
+      )
     )
     let synthTensors = DDSPSynth.PreallocatedTensors(
       featureFrames: paddedFeatureFrames,
@@ -845,16 +858,16 @@ enum DDSPE2ETrainer {
       }
       let tAfterLoad = CFAbsoluteTimeGetCurrent()
 
-      // Stack features as [B*F, 3] (batch-major: all frames of chunk0, then chunk1, etc.)
+      // Stack features as [B*F, 5] (batch-major: all frames of chunk0, then chunk1, etc.)
       var conditioningData = [Float]()
-      conditioningData.reserveCapacity(B * F * 3)
+      conditioningData.reserveCapacity(B * F * conditioningFeatureCount)
       for chunk in chunks {
         var chunkCond = makeConditioningData(
           f0Hz: chunk.f0Hz,
           loudnessDB: chunk.loudnessDB,
           uvMask: chunk.uvMask
         )
-        let paddingRows = F * 3 - chunkCond.count
+        let paddingRows = F * conditioningFeatureCount - chunkCond.count
         if paddingRows > 0 {
           chunkCond.append(contentsOf: [Float](repeating: 0, count: paddingRows))
         }
@@ -908,7 +921,8 @@ enum DDSPE2ETrainer {
         batchSize: B,
         featureFrames: F,
         frameCount: frameCount,
-        numHarmonics: K
+        numHarmonics: K,
+        controlSmoothingMode: config.controlSmoothingMode
       )
 
       // Target playhead: steps 0, 1, 2, ..., frameCount-1 (one audio sample per frame)
@@ -929,7 +943,8 @@ enum DDSPE2ETrainer {
         frameCount: frameCount,
         mseWeight: config.mseLossWeight,
         spectralWeight: spectralWeight,
-        spectralLogmagWeight: config.spectralLogmagWeight
+        spectralLogmagWeight: config.spectralLogmagWeight,
+        spectralLossMode: config.spectralLossMode
       )
       loss = addHarmonicEntropyRegularization(
         baseLoss: loss,
@@ -1031,9 +1046,9 @@ enum DDSPE2ETrainer {
           }
           renderSynthTensors.updateChunkData(f0Frames: paddedF0, uvFrames: paddedUV)
 
-          // Use only first chunk's features for render: extract [F, 3] from [B*F, 3]
+          // Use only first chunk's features for render: extract [F, 5] from [B*F, 5]
           let renderFeatures = Tensor(
-            [[Float]](repeating: [Float](repeating: 0, count: 3), count: F)
+            [[Float]](repeating: [Float](repeating: 0, count: conditioningFeatureCount), count: F)
           )
           let firstChunkCond = makeConditioningData(
             f0Hz: chunks[0].f0Hz,
@@ -1041,7 +1056,7 @@ enum DDSPE2ETrainer {
             uvMask: chunks[0].uvMask
           )
           var paddedCond = firstChunkCond
-          let condPadding = F * 3 - paddedCond.count
+          let condPadding = F * conditioningFeatureCount - paddedCond.count
           if condPadding > 0 {
             paddedCond.append(contentsOf: [Float](repeating: 0, count: condPadding))
           }
@@ -1053,7 +1068,8 @@ enum DDSPE2ETrainer {
             tensors: renderSynthTensors,
             featureFrames: chunks[0].f0Hz.count,
             frameCount: frameCount,
-            numHarmonics: K
+            numHarmonics: K,
+            controlSmoothingMode: config.controlSmoothingMode
           )
           let samples = try renderPrediction.realize(frames: frameCount)
           LazyGraphContext.current.clearComputationGraph()
@@ -1479,7 +1495,8 @@ enum DDSPE2ETrainer {
     logger: (String) -> Void
   ) throws {
     let rows = featureFrames * batchSize
-    guard rows > 0, conditioningData.count == rows * 3 else { return }
+    let featureCount = model.inputSize
+    guard rows > 0, conditioningData.count == rows * featureCount else { return }
     guard let snapshot = computeDecoderControlsCPU(model: model, conditioningData: conditioningData, rows: rows)
     else {
       logger("step=\(step) control dump skipped (unable to read model parameter data)")
@@ -1491,15 +1508,18 @@ enum DDSPE2ETrainer {
     let tag = String(format: "step_%06d", step)
 
     // 1) Per-frame control summary.
-    var summary = "batch,frame,f0_norm,loudness_norm,uv,harmonic_gain,noise_gain,amp_sum,amp_max,amp_argmax\n"
+    var summary =
+      "batch,frame,f0_norm,loudness_norm,uv,delta_f0,delta_loudness,harmonic_gain,noise_gain,amp_sum,amp_max,amp_argmax\n"
     summary.reserveCapacity(rows * 96)
     for row in 0..<rows {
       let batch = row / featureFrames
       let frame = row % featureFrames
-      let base = row * 3
+      let base = row * featureCount
       let f0Norm = conditioningData[base]
       let loudNorm = conditioningData[base + 1]
       let uv = conditioningData[base + 2]
+      let deltaF0 = featureCount > 3 ? conditioningData[base + 3] : 0
+      let deltaLoud = featureCount > 4 ? conditioningData[base + 4] : 0
 
       var ampSum: Float = 0
       var ampMax: Float = -Float.greatestFiniteMagnitude
@@ -1514,7 +1534,8 @@ enum DDSPE2ETrainer {
         }
       }
 
-      summary += "\(batch),\(frame),\(f0Norm),\(loudNorm),\(uv),\(snapshot.harmonicGain[row]),\(snapshot.noiseGain[row]),\(ampSum),\(ampMax),\(ampArgmax)\n"
+      summary +=
+        "\(batch),\(frame),\(f0Norm),\(loudNorm),\(uv),\(deltaF0),\(deltaLoud),\(snapshot.harmonicGain[row]),\(snapshot.noiseGain[row]),\(ampSum),\(ampMax),\(ampArgmax)\n"
     }
     try summary.write(
       to: controlsDir.appendingPathComponent("\(tag)_control_summary.csv"),
@@ -1584,7 +1605,7 @@ enum DDSPE2ETrainer {
   ) -> ControlSnapshot? {
     guard rows > 0 else { return nil }
 
-    var hidden = conditioningData  // [rows, 3]
+    var hidden = conditioningData  // [rows, inputSize]
     var inSize = model.inputSize
 
     for i in 0..<model.numLayers {
@@ -1799,7 +1820,7 @@ enum DDSPE2ETrainer {
     Array(Set(values)).sorted()
   }
 
-  /// Compute conditioning features as flat [Float] data (row-major [N, 3]).
+  /// Compute conditioning features as flat [Float] data (row-major [N, 5]).
   /// Used with pre-allocated tensor via updateDataLazily.
   private static func makeConditioningData(
     f0Hz: [Float],
@@ -1807,19 +1828,27 @@ enum DDSPE2ETrainer {
     uvMask: [Float]
   ) -> [Float] {
     let n = min(f0Hz.count, min(loudnessDB.count, uvMask.count))
-    if n == 0 { return [0.0, 0.0, 0.0] }
+    if n == 0 { return [Float](repeating: 0, count: conditioningFeatureCount) }
 
     var flat = [Float]()
-    flat.reserveCapacity(n * 3)
+    flat.reserveCapacity(n * conditioningFeatureCount)
+    var prevF0Norm: Float = 0
+    var prevLoudNorm: Float = 0
 
     for i in 0..<n {
       let uv = min(1.0, max(0.0, uvMask[i]))
       let safeF0 = max(1.0, f0Hz[i])
       let f0Norm = log2(safeF0 / 440.0)
       let loudNorm = min(1.0, max(0.0, (loudnessDB[i] + 80.0) / 80.0))
+      let deltaF0 = i == 0 ? 0 : (f0Norm - prevF0Norm)
+      let deltaLoud = i == 0 ? 0 : (loudNorm - prevLoudNorm)
       flat.append(f0Norm)
       flat.append(loudNorm)
       flat.append(uv)
+      flat.append(deltaF0)
+      flat.append(deltaLoud)
+      prevF0Norm = f0Norm
+      prevLoudNorm = loudNorm
     }
 
     return flat

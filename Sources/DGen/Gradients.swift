@@ -715,7 +715,7 @@ extension LazyOp {
       return node.inputs.map { _ in nil }
 
     case .spectralLossFFT(
-      let windowSize, let hop, _, let useLogMagnitude, let windowCell,
+      let windowSize, let hop, _, let useLogMagnitude, let lossMode, let windowCell,
       let fft1Cell, let fft2Cell, let mag1Cell, let mag2Cell, _):
       // FFT-based spectral loss backward pass using O(N log N) IFFT
       // Reads the forward pass's per-frame FFT/magnitude cells directly,
@@ -748,6 +748,7 @@ extension LazyOp {
           windowSize: windowSize,
           hop: hop,
           useLogMagnitude: useLogMagnitude,
+          lossMode: lossMode,
           fft1Cell: fft1Cell,
           fft2Cell: fft2Cell,
           mag1Cell: mag1Cell,
@@ -799,7 +800,7 @@ extension LazyOp {
       for _ in 2..<node.inputs.count { result.append(nil) }
       return result
 
-    case .spectralLossFFTGradSpec(_, _, _, _, _, _, _, _, _):
+    case .spectralLossFFTGradSpec(_, _, _, _, _, _, _, _, _, _):
       // Gradient ops don't need their own gradients
       return node.inputs.map { _ in nil }
 
@@ -824,7 +825,7 @@ extension LazyOp {
       return [gradOutput]
 
     case .spectralLossFFTBatched(
-      let windowSize, let batchSize, let hop, _, let useLogMagnitude, let windowCell,
+      let windowSize, let batchSize, let hop, _, let useLogMagnitude, let lossMode, let windowCell,
       let fft1Cell, let fft2Cell, let mag1Cell, let mag2Cell, _):
       // Batched FFT spectral loss backward - same 3-step chain as scalar version
       let sig1 = node.inputs[0]
@@ -857,6 +858,7 @@ extension LazyOp {
           batchSize: batchSize,
           hop: hop,
           useLogMagnitude: useLogMagnitude,
+          lossMode: lossMode,
           fft1Cell: fft1Cell,
           fft2Cell: fft2Cell,
           mag1Cell: mag1Cell,
@@ -928,7 +930,7 @@ extension LazyOp {
       for _ in 2..<node.inputs.count { result.append(nil) }
       return result
 
-    case .spectralLossFFTBatchedGradSpec(_, _, _, _, _, _, _, _, _, _):
+    case .spectralLossFFTBatchedGradSpec(_, _, _, _, _, _, _, _, _, _, _):
       return node.inputs.map { _ in nil }
 
     case .spectralLossFFTBatchedGradIFFT(_, _, _, _, _, _, _, _):

@@ -1,3 +1,4 @@
+import DGen
 import DGenLazy
 import Foundation
 
@@ -10,9 +11,11 @@ enum DDSPTrainingLosses {
     frameCount: Int,
     mseWeight: Float,
     spectralWeight: Float,
-    spectralLogmagWeight: Float
+    spectralLogmagWeight: Float,
+    spectralLossMode: SpectralLossModeOption
   ) -> Signal {
     let usableWindows = spectralWindowSizes.filter { $0 > 1 && $0 <= frameCount }
+    let lossMode: SpectralLossMode = spectralLossMode == .l1 ? .l1 : .l2
     var total = Signal.constant(0.0)
     var hasTerm = false
 
@@ -25,7 +28,10 @@ enum DDSPTrainingLosses {
       var spec = Signal.constant(0.0)
       for w in usableWindows {
         let hop = max(1, w / max(1, spectralHopDivisor))
-        spec = spec + spectralLossFFT(prediction, target, windowSize: w, hop: hop, normalize: true)
+        spec =
+          spec
+          + spectralLossFFT(
+            prediction, target, windowSize: w, lossMode: lossMode, hop: hop, normalize: true)
       }
       spec = spec * (1.0 / Float(usableWindows.count))
       total = total + spec * spectralWeight
@@ -39,7 +45,8 @@ enum DDSPTrainingLosses {
         specLog =
           specLog
           + spectralLossFFT(
-            prediction, target, windowSize: w, useLogMagnitude: true, hop: hop, normalize: true)
+            prediction, target, windowSize: w, useLogMagnitude: true, lossMode: lossMode,
+            hop: hop, normalize: true)
       }
       specLog = specLog * (1.0 / Float(usableWindows.count))
       total = total + specLog * spectralLogmagWeight
@@ -60,9 +67,11 @@ enum DDSPTrainingLosses {
     frameCount: Int,
     mseWeight: Float,
     spectralWeight: Float,
-    spectralLogmagWeight: Float
+    spectralLogmagWeight: Float,
+    spectralLossMode: SpectralLossModeOption
   ) -> Signal {
     let usableWindows = spectralWindowSizes.filter { $0 > 1 && $0 <= frameCount }
+    let lossMode: SpectralLossMode = spectralLossMode == .l1 ? .l1 : .l2
     var total = Signal.constant(0.0)
     var hasTerm = false
 
@@ -77,7 +86,10 @@ enum DDSPTrainingLosses {
       var spec = Signal.constant(0.0)
       for w in usableWindows {
         let hop = max(1, w / max(1, spectralHopDivisor))
-        spec = spec + spectralLossFFT(prediction, target, windowSize: w, hop: hop, normalize: true)
+        spec =
+          spec
+          + spectralLossFFT(
+            prediction, target, windowSize: w, lossMode: lossMode, hop: hop, normalize: true)
       }
       spec = spec * (1.0 / Float(usableWindows.count))
       total = total + spec * spectralWeight
@@ -91,7 +103,8 @@ enum DDSPTrainingLosses {
         specLog =
           specLog
           + spectralLossFFT(
-            prediction, target, windowSize: w, useLogMagnitude: true, hop: hop, normalize: true)
+            prediction, target, windowSize: w, useLogMagnitude: true, lossMode: lossMode,
+            hop: hop, normalize: true)
       }
       specLog = specLog * (1.0 / Float(usableWindows.count))
       total = total + specLog * spectralLogmagWeight

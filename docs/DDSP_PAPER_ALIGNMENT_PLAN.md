@@ -276,3 +276,102 @@ The most likely path to materially better results is not "add GRU immediately". 
 1. match DDSP control/loss mechanics,
 2. leverage DGEN state primitives for lightweight temporal smoothing,
 3. escalate to heavier recurrence only if evidence says it is necessary.
+
+## Transformer GRU-Replacement Actionable Checklist
+Goal: add a transformer temporal backbone where DDSP originally used GRU, while preserving current synth and control heads for clear A/B comparisons.
+
+### Phase 0 - Baseline lock (required before edits)
+- [ ] Save one reproducible baseline run with current MLP decoder.
+- [ ] Export control dumps (`--dump-controls-every 20`) and render snapshots for reference.
+- [ ] Record baseline metrics in a short run note:
+  - [ ] total loss floor
+  - [ ] spectral mag term
+  - [ ] spectral logmag term
+  - [ ] harmonic entropy/concentration trends
+
+Exit gate:
+- [ ] Baseline can be rerun with matching behavior before transformer code is introduced.
+
+### Phase 1 - Config and CLI plumbing
+- [ ] In `Examples/DDSPE2E/Config.swift`, add decoder backbone selection:
+  - [ ] `decoderBackbone: mlp|transformer`
+  - [ ] `transformerDModel`
+  - [ ] `transformerLayers`
+  - [ ] `transformerFFMultiplier`
+  - [ ] `transformerCausal`
+  - [ ] `transformerUsePositionalEncoding`
+- [ ] Add validation rules for all new transformer config values.
+- [ ] Add CLI override parsing for new fields in `Examples/DDSPE2E/Config.swift`.
+- [ ] Update CLI help text in `Examples/DDSPE2E/main.swift`.
+- [ ] Add new config values to run metadata logging in `Examples/DDSPE2E/Trainer.swift`.
+
+Exit gate:
+- [ ] `dump-config` includes transformer fields.
+- [ ] `train` accepts new flags and writes them to `resolved_config.json` + `run_meta.json`.
+
+### Phase 2 - Decoder transformer trunk
+- [ ] In `Examples/DDSPE2E/ModelDecoder.swift`, keep existing heads unchanged.
+- [ ] Add an input projection from `[F,5] -> [F,d_model]`.
+- [ ] Implement transformer block(s) with:
+  - [ ] pre-norm LayerNorm
+  - [ ] scaled dot-product attention
+  - [ ] residual connection
+  - [ ] feed-forward sublayer + residual
+- [ ] Implement optional causal attention mask tensor.
+- [ ] Implement optional positional encoding addition.
+- [ ] Route trunk output into existing harmonic/noise heads.
+- [ ] Keep `mlp` path functional for direct A/B runs.
+
+Exit gate:
+- [ ] Forward pass shape checks pass for both `mlp` and `transformer`.
+- [ ] No NaN/Inf in decoder outputs on a short dry run.
+
+### Phase 3 - Training integration and defaults
+- [ ] In transformer mode, default to `batchSize=1` and use `gradAccumSteps` to recover effective batch.
+- [ ] In transformer mode, default `controlSmoothingMode=off` to avoid confounding FIR and temporal modeling.
+- [ ] Preserve existing loss stack and synth behavior during first transformer experiments.
+- [ ] Add an explicit warning in logs if transformer mode runs with settings likely to cause OOM or quadratic blowup.
+
+Exit gate:
+- [ ] 100-step single-chunk run completes in transformer mode with stable loss and finite gradients.
+
+### Phase 4 - Tests
+- [ ] Extend `Tests/DGenLazyTests/TransformerOpsTests.swift` or add decoder-specific tests for:
+  - [ ] shape contract (`[F,5] -> controls`)
+  - [ ] gradient flow through transformer params
+  - [ ] causal property (future frames do not alter earlier outputs)
+  - [ ] numerical stability (no NaN/Inf over repeated optimization steps)
+- [ ] Add checkpoint compatibility coverage:
+  - [ ] old MLP checkpoints still load
+  - [ ] missing transformer params are handled safely
+
+Exit gate:
+- [ ] Transformer-related tests pass with `swift test`.
+
+### Phase 5 - Experiment matrix (decide if transformer replaces GRU role)
+- [ ] Run A: MLP + current smoothing policy.
+- [ ] Run B: MLP + smoothing off.
+- [ ] Run C: Transformer (causal) + smoothing off.
+- [ ] Run D: Transformer (causal) + minimal smoothing (optional).
+- [ ] For each run, collect:
+  - [ ] best loss
+  - [ ] final loss slope
+  - [ ] harmonic entropy/concentration traces
+  - [ ] render snapshots at fixed steps
+  - [ ] step time and backward time
+
+Exit gate:
+- [ ] Transformer shows clear temporal-control benefit (less collapse and/or better audio movement) relative to MLP baselines.
+
+### Phase 6 - Optional batched transformer path
+- [ ] If needed, add block-diagonal + causal masking for `batchSize > 1` to prevent cross-chunk attention leakage.
+- [ ] Add guardrails for sequence length (`B*F`) and memory costs.
+- [ ] Re-run experiment matrix in batched mode.
+
+Exit gate:
+- [ ] Batched transformer is correct (no cross-sample leakage) and performant enough to keep.
+
+### Final decision checklist
+- [ ] Keep transformer path as default temporal backbone if it consistently beats MLP across target datasets.
+- [ ] Keep MLP path available as fallback/debug baseline.
+- [ ] Document recommended transformer preset in `Examples/DDSPE2E/README.md` and training scripts.

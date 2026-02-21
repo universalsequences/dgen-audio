@@ -2,6 +2,11 @@ import DGenLazy
 import Foundation
 
 enum DDSPSynth {
+  // FIR mode applies a frame-domain kernel before time sampling.
+  private enum ControlSmoothing {
+    static let firTaps: [Float] = [0.1, 0.2, 0.4, 0.2, 0.1]
+  }
+
   /// Pre-allocated tensors for synth rendering. Created once before the training loop.
   struct PreallocatedTensors {
     let f0: Tensor
@@ -58,7 +63,8 @@ enum DDSPSynth {
     batchSize: Int,
     featureFrames: Int,
     frameCount: Int,
-    numHarmonics: Int
+    numHarmonics: Int,
+    controlSmoothingMode: ControlSmoothingMode
   ) -> SignalTensor {
     let B = batchSize
     let K = numHarmonics
@@ -79,14 +85,32 @@ enum DDSPSynth {
 
     // Reshape model outputs from [B*F, ...] to time-major for sampling
     // harmonicAmps: [B*F, K] → [B, F, K] → [F, B, K]
-    let amps3D = controls.harmonicAmps.reshape([B, F, K]).transpose([1, 0, 2])
+    let amps3DRaw = controls.harmonicAmps.reshape([B, F, K]).transpose([1, 0, 2])
     // harmonicGain: [B*F, 1] → [B, F] → [F, B]
-    let gain2D = controls.harmonicGain.reshape([B, F]).transpose([1, 0])
+    let gain2DRaw = controls.harmonicGain.reshape([B, F]).transpose([1, 0])
+    let noiseGain2DRaw = controls.noiseGain.reshape([B, F]).transpose([1, 0])
+
+    let amps3D: Tensor
+    let gain2D: Tensor
+    let noiseGain2D: Tensor
+    switch controlSmoothingMode {
+    case .fir:
+      amps3D = firSmoothFrames3D(amps3DRaw)
+      gain2D = firSmoothFrames2D(gain2DRaw)
+      noiseGain2D = firSmoothFrames2D(noiseGain2DRaw)
+    case .off:
+      amps3D = amps3DRaw
+      gain2D = gain2DRaw
+      noiseGain2D = noiseGain2DRaw
+    }
 
     // Sample at playhead position: [F, B, K].sample(playhead) → [B, K]
     let ampsAtTimeRaw = amps3D.sample(playhead)
     // [F, B].sample(playhead) → [B]
-    let gainAtTime = gain2D.sample(playhead)
+    let gainAtTimeRaw = gain2D.sample(playhead)
+
+    let smoothedAmps = ampsAtTimeRaw
+    let smoothedGain = gainAtTimeRaw
 
     // Sample f0/uv from pre-allocated [F, B] tensors
     // f0/uv are already sanitized on the CPU side during data loading
@@ -97,7 +121,7 @@ enum DDSPSynth {
     let f0Expanded = f0AtTime.reshape([B, 1]).expand([B, K])
     let harmonicFreqs = tensors.harmonicIndices * f0Expanded
     let ampsAtTime = nyquistNormalizedHarmonicsBatched(
-      amps: ampsAtTimeRaw,
+      amps: smoothedAmps,
       harmonicFreqs: harmonicFreqs,
       batchSize: B,
       harmonicHeadMode: controls.harmonicHeadMode
@@ -112,11 +136,11 @@ enum DDSPSynth {
     let harmonic = (harmonicSines * ampsAtTime).sum(axis: 1) * harmonicScale  // [B, K] → [B]
 
     // Apply gain and UV mask
-    var harmonicOut = harmonic * uvAtTime * gainAtTime
+    var harmonicOut = harmonic * uvAtTime * smoothedGain
 
     // --- Filtered Noise ---
-    let noiseGain2D = controls.noiseGain.reshape([B, F]).transpose([1, 0])
-    let noiseGainAtTime = noiseGain2D.sample(playhead)  // [B]
+    let noiseGainAtTimeRaw = noiseGain2D.sample(playhead)  // [B]
+    let smoothedNoiseGain = noiseGainAtTimeRaw
 
     if let noiseFilter = controls.noiseFilter {
       let firK = noiseFilter.shape[1]  // noiseFilterSize
@@ -132,7 +156,7 @@ enum DDSPSynth {
       let filteredNoise = (noiseBatch * filterTapsAtTime).sum(axis: 1)  // [B]
 
       // UV masking + gain
-      let noiseOut = filteredNoise * noiseGainAtTime * (Tensor([1.0]) - uvAtTime)
+      let noiseOut = filteredNoise * smoothedNoiseGain * (Tensor([1.0]) - uvAtTime)
       harmonicOut = harmonicOut + noiseOut
     }
 
@@ -144,7 +168,8 @@ enum DDSPSynth {
     tensors: PreallocatedTensors,
     featureFrames: Int,
     frameCount: Int,
-    numHarmonics: Int
+    numHarmonics: Int,
+    controlSmoothingMode: ControlSmoothingMode
   ) -> Signal {
     let featureMaxIndex = Float(max(0, featureFrames - 1))
     let frameDenom = Float(max(1, frameCount - 1))
@@ -162,11 +187,25 @@ enum DDSPSynth {
     let f0 = min(max(tensors.f0.peek(playhead), 20.0), 500.0)
     let uv = tensors.uv.peek(playhead).clip(0.0, 1.0)
 
+    let harmonicAmpsFrames: Tensor
+    let harmonicGainFrames: Tensor
+    let noiseGainFrames: Tensor
+    if controlSmoothingMode == .fir {
+      harmonicAmpsFrames = firSmoothFrames2D(controls.harmonicAmps)
+      harmonicGainFrames = firSmoothFrames2D(controls.harmonicGain)
+      noiseGainFrames = firSmoothFrames2D(controls.noiseGain)
+    } else {
+      harmonicAmpsFrames = controls.harmonicAmps
+      harmonicGainFrames = controls.harmonicGain
+      noiseGainFrames = controls.noiseGain
+    }
+
     let twoPi = Float.pi * 2.0
-    let ampsAtTimeRaw = controls.harmonicAmps.peekRow(playhead)
+    let ampsAtTimeRaw = harmonicAmpsFrames.peekRow(playhead)
+    let smoothedAmps = ampsAtTimeRaw
     let harmonicFreqs = tensors.harmonicIndices * f0
     let ampsAtTime = nyquistNormalizedHarmonics(
-      amps: ampsAtTimeRaw,
+      amps: smoothedAmps,
       harmonicFreqs: harmonicFreqs,
       harmonicHeadMode: controls.harmonicHeadMode
     )
@@ -176,16 +215,19 @@ enum DDSPSynth {
       controls.harmonicHeadMode == .legacy ? (1.0 / Float(max(1, numHarmonics))) : 1.0
     let harmonic = (harmonicSines * ampsAtTime).sum() * harmonicScale * uv
 
-    let harmonicGain = controls.harmonicGain.peek(playhead, channel: Signal.constant(0.0))
+    let harmonicGainRaw = harmonicGainFrames.peek(playhead, channel: Signal.constant(0.0))
+    let harmonicGain = harmonicGainRaw
     let harmonicOut = harmonic * harmonicGain
 
+    let noiseGainRaw = noiseGainFrames.peek(playhead, channel: Signal.constant(0.0))
+    let noiseGain = noiseGainRaw
+
     guard let noiseFilter = controls.noiseFilter else {
-      _ = controls.noiseGain.peek(playhead, channel: Signal.constant(0.0))
+      _ = noiseGain
       return harmonicOut
     }
 
     let firSize = noiseFilter.shape[1]
-    let noiseGain = controls.noiseGain.peek(playhead, channel: Signal.constant(0.0))
     let noiseExcitation = Signal.noise()
     let filterTaps = noiseFilter.peekRow(playhead)              // [firSize] learned per frame
     let noiseBuffer = noiseExcitation.buffer(size: firSize).reshape([firSize])
@@ -227,4 +269,51 @@ enum DDSPSynth {
     let denom = masked.sum(axis: 1).reshape([batchSize, 1]) + 1e-8
     return masked / denom
   }
+
+  private static func firSmoothFrames2D(_ x: Tensor) -> Tensor {
+    guard x.shape.count == 2 else { return x }
+    let kernel = Tensor(ControlSmoothing.firTaps).reshape([ControlSmoothing.firTaps.count, 1])
+    let k = kernel.shape[0]
+    guard k > 1 else { return x }
+
+    let left = (k - 1) / 2
+    let right = k - 1 - left
+    let padded = replicatePadRows2D(x, left: left, right: right)
+    return padded.conv2d(kernel)
+  }
+
+  private static func replicatePadRows2D(_ x: Tensor, left: Int, right: Int) -> Tensor {
+    let frames = x.shape[0]
+    let cols = x.shape[1]
+    var padded = x.pad([(left, right), (0, 0)])
+
+    if left > 0 {
+      let leftEdge = x
+        .shrink([(0, 1), nil])
+        .expand([left, cols])
+        .pad([(0, frames + right), (0, 0)])
+      padded = padded + leftEdge
+    }
+
+    if right > 0 {
+      let rightEdge = x
+        .shrink([(max(0, frames - 1), frames), nil])
+        .expand([right, cols])
+        .pad([(left + frames, 0), (0, 0)])
+      padded = padded + rightEdge
+    }
+
+    return padded
+  }
+
+  private static func firSmoothFrames3D(_ x: Tensor) -> Tensor {
+    guard x.shape.count == 3 else { return x }
+    let f = x.shape[0]
+    let b = x.shape[1]
+    let k = x.shape[2]
+    let flat = x.reshape([f, b * k])
+    let smoothed = firSmoothFrames2D(flat)
+    return smoothed.reshape([f, b, k])
+  }
+
 }

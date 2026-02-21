@@ -16,7 +16,7 @@ struct NamedTensorSnapshot: Codable {
 }
 
 final class DDSPDecoderModel {
-  let inputSize: Int = 3
+  let inputSize: Int = 5
   let hiddenSize: Int
   let numLayers: Int
   let numHarmonics: Int
@@ -117,7 +117,7 @@ final class DDSPDecoderModel {
   }
 
   func forward(features: Tensor) -> DecoderControls {
-    // trunk: [F,3] -> [F,H] -> ... -> [F,H]
+    // trunk: [F,5] -> [F,H] -> ... -> [F,H]
     var hidden = features
     for i in 0..<numLayers {
       hidden = tanh(hidden.matmul(trunkWeights[i]) + trunkBiases[i])

@@ -7,6 +7,7 @@ swift run  DDSPE2E train \
     --seed 1 \
     --lr 3e-4 \
     --harmonic-head-mode exp-sigmoid \
+    --control-smoothing fir \
     --lr-schedule exp \
     --lr-half-life 2000 \
     --lr-warmup-steps 0 \
@@ -17,6 +18,7 @@ swift run  DDSPE2E train \
     --mse-weight 0 \
     --spectral-weight 1.0 \
     --spectral-logmag-weight 1.0 \
+    --spectral-loss-mode l1 \
     --spectral-windows 64,128,256,512,1024 \
     --spectral-hop-divisor 4 \
     --spectral-warmup-steps 0 \
@@ -24,9 +26,9 @@ swift run  DDSPE2E train \
     --log-every 1 \
     --model-hidden 128 \
     --noise-filter true \
-    --render-every 20 \
+    --render-every 400 \
     --render-wav /Users/alecresende/Downloads/rendered.wav \
     --harmonics 64 \
-    --run-name train4_exp_sigmoid_logmag \
+    --run-name train4_exp_sigmoid_logmag_l1 \
     --model-layers 2 \
     --kernel-dump test_kernel_yes_gemm.metal
