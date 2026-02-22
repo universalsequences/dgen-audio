@@ -179,6 +179,183 @@ Use `--spectral-logmag-weight <float>` to add an FFT-domain log-magnitude term:
 - combines with `--spectral-weight` (linear magnitude term) and `--mse-weight`
 - for DDSP paper parity, `--spectral-loss-mode l1` is typically the right choice
 
+## Loudness Envelope Loss
+
+Use `--loudness-weight <float>` to add a frame-envelope reconstruction term that supervises decoder gains.
+
+- mode:
+  - `--loudness-loss-mode linear-l2` (default): L2 in linear-gain domain
+  - `--loudness-loss-mode db-l1`: L1 in normalized dB domain (more robust in current transformer regime)
+- optional schedule:
+  - `--loudness-weight-end <float>`
+  - `--loudness-warmup-steps <int>`
+  - `--loudness-ramp-steps <int>`
+
+Needle-moving preset (measured on February 21, 2026):
+- `--loudness-weight 0.2 --loudness-loss-mode db-l1`
+- overfit probe improved from `3.265924e-4` to `2.5940128e-4` (about `20.6%` lower)
+
+### Best Known Low-Loss Script (A/B/C Staging)
+
+The current best overfit probe was reached with a 3-stage sequence that combines:
+- `db-l1` loudness supervision
+- scheduled loudness warmup in Stage A
+- low-LR continuation in Stage B
+- spectral-only polish in Stage C
+
+Reference best probe (lower is better):
+- `0.00023486369` from `runs/probe_phasec_from_best_lr1e5/logs/train_summary.json`
+
+Ready-to-run script:
+
+```bash
+bash Examples/DDSPE2E/scripts/run_best_low_loss_abc.sh
+```
+
+The script supports env overrides (for example `CACHE=...`, `RUN_PREFIX=...`, `STEPS_A=...`) and can skip stages via `RUN_STAGE_A/B/C/PROBE`.
+
+### One-Command Auto A/B/C (Flag)
+
+You can run the same 3-stage chain directly via `train`:
+
+```bash
+swift run DDSPE2E train \
+  --cache .ddsp_cache_overfit1 \
+  --mode m2 \
+  --split train \
+  --auto-abc true \
+  --auto-abc-preset best-low-loss \
+  --steps 500 \
+  --auto-abc-steps-b 300 \
+  --auto-abc-steps-c 300 \
+  --run-name autoabc_trial
+```
+
+Behavior:
+- Stage A/B/C are launched sequentially, each stage initialized from previous stage `model_best.json`.
+- Stage-local best checkpoint detection uses early-stop patience + min-delta.
+- Writes aggregate summary to `runs/<run-prefix>_auto_abc_summary.json`.
+- `--init-checkpoint` (optional) is applied to Stage A start only.
+- `--auto-abc-preset best-low-loss` applies the full transformer/spectral/fixed-batch baseline used by the best-known A/B/C chain.
+
+What exactly happens for this command:
+1. Stage A runs with the preset baseline plus Stage A overrides.
+2. Stage A tracks its own best checkpoint (`model_best.json`) by minimum training loss.
+3. Stage B starts from `StageA/model_best.json` (not from Stage A final step).
+4. Stage B uses a different objective mix (`loudness-weight=0.02`) and lower LR; because the objective changed, the reported loss can jump higher than where Stage A ended.
+5. Stage B still tracks its own best checkpoint and stops early if it stops improving by `patience/min-delta`.
+6. Stage C starts from `StageB/model_best.json` (not from Stage B final step).
+7. Stage C returns to spectral-only polish (`loudness-weight=0.0`) at very low LR to refine parameters after the Stage B bridge step.
+8. Final summary (`runs/<run-prefix>_auto_abc_summary.json`) reports all stage minima and a recommended checkpoint (the lowest `minLoss` across A/B/C).
+
+Why this can break plateau behavior:
+- Stage A often finds a good basin quickly but can drift afterward.
+- Stage B changes gradient pressure (especially envelope supervision) to move parameters away from that local regime.
+- Stage C removes the bridge term and re-optimizes the main spectral target from B's best point.
+
+Run from repo root:
+
+```bash
+#!/usr/bin/env bash
+set -euo pipefail
+
+BIN="./.build/debug/DDSPE2E"
+CACHE=".ddsp_cache_overfit1"
+
+swift build -c debug
+
+# Stage A: main run (db-l1 loudness schedule 0 -> 0.05)
+$BIN train \
+  --cache "$CACHE" --mode m2 --split train \
+  --steps 500 --shuffle false --fixed-batch true --seed 1 \
+  --lr 3e-4 --lr-schedule exp --lr-half-life 2000 --lr-warmup-steps 0 --lr-min 1e-4 \
+  --batch-size 1 --grad-accum-steps 1 \
+  --grad-clip 1.0 --clip-mode element --normalize-grad-by-frames false \
+  --mse-weight 0 \
+  --spectral-weight 1.0 --spectral-logmag-weight 1.0 --spectral-loss-mode l1 \
+  --spectral-windows 64,128,256,512,1024 --spectral-hop-divisor 4 \
+  --spectral-warmup-steps 0 --spectral-ramp-steps 0 \
+  --model-hidden 128 --harmonics 64 --harmonic-head-mode exp-sigmoid \
+  --noise-filter true --model-layers 2 \
+  --decoder-backbone transformer --transformer-d-model 64 --transformer-layers 2 \
+  --transformer-ff-multiplier 2 --transformer-causal true --transformer-positional-encoding true \
+  --control-smoothing off \
+  --loudness-loss-mode db-l1 \
+  --loudness-weight 0.0 --loudness-weight-end 0.05 \
+  --loudness-warmup-steps 10 --loudness-ramp-steps 40 \
+  --run-name long_db1_sched005_s500
+
+# Stage B: continue from Stage A best checkpoint at lower LR and lighter loudness
+$BIN train \
+  --cache "$CACHE" --mode m2 --split train \
+  --steps 300 --shuffle false --fixed-batch true --seed 1 \
+  --lr 3e-5 --lr-schedule exp --lr-half-life 120 --lr-warmup-steps 0 --lr-min 3e-6 \
+  --batch-size 1 --grad-accum-steps 1 \
+  --grad-clip 1.0 --clip-mode element --normalize-grad-by-frames false \
+  --mse-weight 0 \
+  --spectral-weight 1.0 --spectral-logmag-weight 1.0 --spectral-loss-mode l1 \
+  --spectral-windows 64,128,256,512,1024 --spectral-hop-divisor 4 \
+  --spectral-warmup-steps 0 --spectral-ramp-steps 0 \
+  --model-hidden 128 --harmonics 64 --harmonic-head-mode exp-sigmoid \
+  --noise-filter true --model-layers 2 \
+  --decoder-backbone transformer --transformer-d-model 64 --transformer-layers 2 \
+  --transformer-ff-multiplier 2 --transformer-causal true --transformer-positional-encoding true \
+  --control-smoothing off \
+  --loudness-loss-mode db-l1 --loudness-weight 0.02 \
+  --init-checkpoint runs/long_db1_sched005_s500/checkpoints/model_best.json \
+  --run-name cont_from_best62_lr3e5_lw002
+
+# Stage C: spectral-only polish from Stage B best checkpoint
+$BIN train \
+  --cache "$CACHE" --mode m2 --split train \
+  --steps 300 --shuffle false --fixed-batch true --seed 1 \
+  --lr 1e-5 --lr-schedule exp --lr-half-life 80 --lr-warmup-steps 0 --lr-min 1e-6 \
+  --batch-size 1 --grad-accum-steps 1 \
+  --grad-clip 1.0 --clip-mode element --normalize-grad-by-frames false \
+  --mse-weight 0 \
+  --spectral-weight 1.0 --spectral-logmag-weight 1.0 --spectral-loss-mode l1 \
+  --spectral-windows 64,128,256,512,1024 --spectral-hop-divisor 4 \
+  --spectral-warmup-steps 0 --spectral-ramp-steps 0 \
+  --model-hidden 128 --harmonics 64 --harmonic-head-mode exp-sigmoid \
+  --noise-filter true --model-layers 2 \
+  --decoder-backbone transformer --transformer-d-model 64 --transformer-layers 2 \
+  --transformer-ff-multiplier 2 --transformer-causal true --transformer-positional-encoding true \
+  --control-smoothing off \
+  --loudness-loss-mode db-l1 --loudness-weight 0.0 \
+  --init-checkpoint runs/cont_from_best62_lr3e5_lw002/checkpoints/model_best.json \
+  --run-name phasec_from_best_lr1e5
+
+# Probe final checkpoint under spectral-only metric
+$BIN train \
+  --cache "$CACHE" --mode m2 --split train \
+  --steps 1 --shuffle false --fixed-batch true --seed 1 \
+  --lr 1e-9 --lr-schedule none \
+  --batch-size 1 --grad-accum-steps 1 \
+  --grad-clip 1.0 --clip-mode element --normalize-grad-by-frames false \
+  --mse-weight 0 \
+  --spectral-weight 1.0 --spectral-logmag-weight 1.0 --spectral-loss-mode l1 \
+  --spectral-windows 64,128,256,512,1024 --spectral-hop-divisor 4 \
+  --spectral-warmup-steps 0 --spectral-ramp-steps 0 \
+  --model-hidden 128 --harmonics 64 --harmonic-head-mode exp-sigmoid \
+  --noise-filter true --model-layers 2 \
+  --decoder-backbone transformer --transformer-d-model 64 --transformer-layers 2 \
+  --transformer-ff-multiplier 2 --transformer-causal true --transformer-positional-encoding true \
+  --control-smoothing off \
+  --loudness-weight 0.0 \
+  --init-checkpoint runs/phasec_from_best_lr1e5/checkpoints/model_best.json \
+  --run-name probe_phasec_from_best_lr1e5
+
+jq -r '.finalLoss' runs/probe_phasec_from_best_lr1e5/logs/train_summary.json
+```
+
+Method summary (what got us here):
+- Replaced hard noise UV-gating with continuous noise path.
+- Added loudness envelope reconstruction as an auxiliary loss.
+- Switched loudness reconstruction from `linear-l2` to `db-l1` (normalized dB-domain L1), which gave the largest single jump.
+- Found the best Stage A loudness schedule in this regime: `0 -> 0.05` with warmup/ramp.
+- Added Stage B low-LR continuation (`3e-5`, `loudness=0.02`) to keep improving after the early minimum.
+- Added Stage C spectral-only polish (`1e-5`, `loudness=0`) to avoid late mixed-objective drift.
+
 ## Fixed Batch
 
 Use `--fixed-batch true` to reuse the same sampled chunk set every training step.
@@ -265,12 +442,26 @@ By default, training uses the legacy harmonic head behavior.
 - `--spectral-hop-divisor <int>` (default: `4`)
 - `--spectral-warmup-steps <int>` (default: `100`)
 - `--spectral-ramp-steps <int>` (default: `200`)
+- `--loudness-weight <float>` (default: `0.0`)
+- `--loudness-loss-mode <linear-l2|db-l1>` (default: `linear-l2`)
+- `--loudness-weight-end <float>` (default: unset; falls back to `--loudness-weight`)
+- `--loudness-warmup-steps <int>` (default: `0`)
+- `--loudness-ramp-steps <int>` (default: `0`)
 - `--mse-weight <float>` (default: `1.0`)
 - `--log-every <int>` (default: `10`)
 - `--checkpoint-every <int>` (default: `100`)
 - `--kernel-dump [path]` (train only; use `true` to write to `<run-dir>/kernels.metal`)
 - `--init-checkpoint <model-checkpoint-json>` (train only; initializes model weights from a saved checkpoint)
 - `--dump-controls-every <int>` (train only; default: `0`, disabled)
+- `--auto-abc <true|false>` (train only; default: `false`, runs staged A->B->C orchestration in one command)
+- `--auto-abc-steps-a <int>` (train only; default: `--steps`)
+- `--auto-abc-steps-b <int>` (train only; default: `300`)
+- `--auto-abc-steps-c <int>` (train only; default: `300`)
+- `--auto-abc-patience-a <int>` (train only; default: `40`)
+- `--auto-abc-patience-b <int>` (train only; default: `40`)
+- `--auto-abc-patience-c <int>` (train only; default: `40`)
+- `--auto-abc-min-delta <float>` (train only; default: `max(1e-7, --early-stop-min-delta)`)
+- `--auto-abc-preset <baseline|best-low-loss>` (train only; default: `baseline`)
 
 ## Outputs
 

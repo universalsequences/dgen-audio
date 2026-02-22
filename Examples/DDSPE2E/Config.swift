@@ -23,9 +23,19 @@ enum ControlSmoothingMode: String, Codable {
   case off
 }
 
+enum DecoderBackbone: String, Codable {
+  case mlp
+  case transformer
+}
+
 enum SpectralLossModeOption: String, Codable {
   case l2
   case l1
+}
+
+enum LoudnessLossModeOption: String, Codable {
+  case linearL2 = "linear-l2"
+  case dbL1 = "db-l1"
 }
 
 struct DDSPE2EConfig: Codable {
@@ -54,6 +64,12 @@ struct DDSPE2EConfig: Codable {
   // M2 decoder-only model/training parameters
   var modelHiddenSize: Int = 32
   var modelNumLayers: Int = 1
+  var decoderBackbone: DecoderBackbone = .mlp
+  var transformerDModel: Int = 64
+  var transformerLayers: Int = 2
+  var transformerFFMultiplier: Int = 2
+  var transformerCausal: Bool = true
+  var transformerUsePositionalEncoding: Bool = true
   var numHarmonics: Int = 16
   var harmonicHeadMode: HarmonicHeadMode = .legacy
   var controlSmoothingMode: ControlSmoothingMode = .fir
@@ -95,6 +111,11 @@ struct DDSPE2EConfig: Codable {
   var spectralHopDivisor: Int = 4
   var spectralWarmupSteps: Int = 100
   var spectralRampSteps: Int = 200
+  var loudnessLossWeight: Float = 0.0
+  var loudnessLossMode: LoudnessLossModeOption = .linearL2
+  var loudnessLossWeightEnd: Float?
+  var loudnessLossWarmupSteps: Int = 0
+  var loudnessLossRampSteps: Int = 0
   var mseLossWeight: Float = 1.0
   var logEvery: Int = 10
   var checkpointEvery: Int = 100
@@ -120,6 +141,12 @@ struct DDSPE2EConfig: Codable {
     case maxChunksPerFile
     case modelHiddenSize
     case modelNumLayers
+    case decoderBackbone
+    case transformerDModel
+    case transformerLayers
+    case transformerFFMultiplier
+    case transformerCausal
+    case transformerUsePositionalEncoding
     case numHarmonics
     case harmonicHeadMode
     case controlSmoothingMode
@@ -160,6 +187,11 @@ struct DDSPE2EConfig: Codable {
     case spectralHopDivisor
     case spectralWarmupSteps
     case spectralRampSteps
+    case loudnessLossWeight
+    case loudnessLossMode
+    case loudnessLossWeightEnd
+    case loudnessLossWarmupSteps
+    case loudnessLossRampSteps
     case mseLossWeight
     case logEvery
     case checkpointEvery
@@ -189,6 +221,16 @@ struct DDSPE2EConfig: Codable {
     maxChunksPerFile = try c.decodeIfPresent(Int.self, forKey: .maxChunksPerFile)
     modelHiddenSize = try c.decodeIfPresent(Int.self, forKey: .modelHiddenSize) ?? d.modelHiddenSize
     modelNumLayers = try c.decodeIfPresent(Int.self, forKey: .modelNumLayers) ?? d.modelNumLayers
+    decoderBackbone = try c.decodeIfPresent(DecoderBackbone.self, forKey: .decoderBackbone)
+      ?? d.decoderBackbone
+    transformerDModel = try c.decodeIfPresent(Int.self, forKey: .transformerDModel) ?? d.transformerDModel
+    transformerLayers = try c.decodeIfPresent(Int.self, forKey: .transformerLayers) ?? d.transformerLayers
+    transformerFFMultiplier =
+      try c.decodeIfPresent(Int.self, forKey: .transformerFFMultiplier) ?? d.transformerFFMultiplier
+    transformerCausal = try c.decodeIfPresent(Bool.self, forKey: .transformerCausal) ?? d.transformerCausal
+    transformerUsePositionalEncoding =
+      try c.decodeIfPresent(Bool.self, forKey: .transformerUsePositionalEncoding)
+      ?? d.transformerUsePositionalEncoding
     numHarmonics = try c.decodeIfPresent(Int.self, forKey: .numHarmonics) ?? d.numHarmonics
     harmonicHeadMode = try c.decodeIfPresent(HarmonicHeadMode.self, forKey: .harmonicHeadMode)
       ?? d.harmonicHeadMode
@@ -256,6 +298,14 @@ struct DDSPE2EConfig: Codable {
     spectralHopDivisor = try c.decodeIfPresent(Int.self, forKey: .spectralHopDivisor) ?? d.spectralHopDivisor
     spectralWarmupSteps = try c.decodeIfPresent(Int.self, forKey: .spectralWarmupSteps) ?? d.spectralWarmupSteps
     spectralRampSteps = try c.decodeIfPresent(Int.self, forKey: .spectralRampSteps) ?? d.spectralRampSteps
+    loudnessLossWeight = try c.decodeIfPresent(Float.self, forKey: .loudnessLossWeight) ?? d.loudnessLossWeight
+    loudnessLossMode = try c.decodeIfPresent(LoudnessLossModeOption.self, forKey: .loudnessLossMode)
+      ?? d.loudnessLossMode
+    loudnessLossWeightEnd = try c.decodeIfPresent(Float.self, forKey: .loudnessLossWeightEnd)
+    loudnessLossWarmupSteps =
+      try c.decodeIfPresent(Int.self, forKey: .loudnessLossWarmupSteps) ?? d.loudnessLossWarmupSteps
+    loudnessLossRampSteps =
+      try c.decodeIfPresent(Int.self, forKey: .loudnessLossRampSteps) ?? d.loudnessLossRampSteps
     mseLossWeight = try c.decodeIfPresent(Float.self, forKey: .mseLossWeight) ?? d.mseLossWeight
     logEvery = try c.decodeIfPresent(Int.self, forKey: .logEvery) ?? d.logEvery
     checkpointEvery = try c.decodeIfPresent(Int.self, forKey: .checkpointEvery) ?? d.checkpointEvery
@@ -287,6 +337,29 @@ struct DDSPE2EConfig: Codable {
     }
     if let value = options["model-layers"] {
       modelNumLayers = try parseInt(value, key: "model-layers")
+    }
+    if let value = options["decoder-backbone"] {
+      guard let backbone = DecoderBackbone(rawValue: value.lowercased()) else {
+        throw ConfigError.invalid(
+          "Invalid decoder backbone for --decoder-backbone: \(value) (expected mlp|transformer)"
+        )
+      }
+      decoderBackbone = backbone
+    }
+    if let value = options["transformer-d-model"] {
+      transformerDModel = try parseInt(value, key: "transformer-d-model")
+    }
+    if let value = options["transformer-layers"] {
+      transformerLayers = try parseInt(value, key: "transformer-layers")
+    }
+    if let value = options["transformer-ff-multiplier"] {
+      transformerFFMultiplier = try parseInt(value, key: "transformer-ff-multiplier")
+    }
+    if let value = options["transformer-causal"] {
+      transformerCausal = parseBool(value)
+    }
+    if let value = options["transformer-positional-encoding"] {
+      transformerUsePositionalEncoding = parseBool(value)
     }
     if let value = options["harmonics"] {
       numHarmonics = try parseInt(value, key: "harmonics")
@@ -432,6 +505,26 @@ struct DDSPE2EConfig: Codable {
     if let value = options["spectral-ramp-steps"] {
       spectralRampSteps = try parseInt(value, key: "spectral-ramp-steps")
     }
+    if let value = options["loudness-weight"] {
+      loudnessLossWeight = try parseFloat(value, key: "loudness-weight")
+    }
+    if let value = options["loudness-loss-mode"] {
+      guard let mode = LoudnessLossModeOption(rawValue: value.lowercased()) else {
+        throw ConfigError.invalid(
+          "Invalid loudness loss mode for --loudness-loss-mode: \(value) (expected linear-l2|db-l1)"
+        )
+      }
+      loudnessLossMode = mode
+    }
+    if let value = options["loudness-weight-end"] {
+      loudnessLossWeightEnd = try parseFloat(value, key: "loudness-weight-end")
+    }
+    if let value = options["loudness-warmup-steps"] {
+      loudnessLossWarmupSteps = try parseInt(value, key: "loudness-warmup-steps")
+    }
+    if let value = options["loudness-ramp-steps"] {
+      loudnessLossRampSteps = try parseInt(value, key: "loudness-ramp-steps")
+    }
     if let value = options["mse-weight"] {
       mseLossWeight = try parseFloat(value, key: "mse-weight")
     }
@@ -501,6 +594,15 @@ struct DDSPE2EConfig: Codable {
     }
     guard modelNumLayers >= 1 else {
       throw ConfigError.invalid("modelNumLayers must be >= 1")
+    }
+    guard transformerDModel > 0 else {
+      throw ConfigError.invalid("transformerDModel must be > 0")
+    }
+    guard transformerLayers >= 1 else {
+      throw ConfigError.invalid("transformerLayers must be >= 1")
+    }
+    guard transformerFFMultiplier >= 1 else {
+      throw ConfigError.invalid("transformerFFMultiplier must be >= 1")
     }
     guard numHarmonics > 0 else {
       throw ConfigError.invalid("numHarmonics must be > 0")
@@ -602,6 +704,20 @@ struct DDSPE2EConfig: Codable {
     }
     guard spectralRampSteps >= 0 else {
       throw ConfigError.invalid("spectralRampSteps must be >= 0")
+    }
+    guard loudnessLossWeight >= 0 else {
+      throw ConfigError.invalid("loudnessLossWeight must be >= 0")
+    }
+    if let loudnessLossWeightEnd {
+      guard loudnessLossWeightEnd >= 0 else {
+        throw ConfigError.invalid("loudnessLossWeightEnd must be >= 0")
+      }
+    }
+    guard loudnessLossWarmupSteps >= 0 else {
+      throw ConfigError.invalid("loudnessLossWarmupSteps must be >= 0")
+    }
+    guard loudnessLossRampSteps >= 0 else {
+      throw ConfigError.invalid("loudnessLossRampSteps must be >= 0")
     }
     guard mseLossWeight >= 0 else {
       throw ConfigError.invalid("mseLossWeight must be >= 0")

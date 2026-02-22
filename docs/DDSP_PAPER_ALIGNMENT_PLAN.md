@@ -375,3 +375,135 @@ Exit gate:
 - [ ] Keep transformer path as default temporal backbone if it consistently beats MLP across target datasets.
 - [ ] Keep MLP path available as fallback/debug baseline.
 - [ ] Document recommended transformer preset in `Examples/DDSPE2E/README.md` and training scripts.
+
+## Needle-Moving Result Log (February 21, 2026)
+Goal: verify whether recent loudness-envelope changes materially improve the plateau regime.
+
+Setup (constant across runs):
+- Dataset/cache: `.ddsp_cache_overfit1`
+- Backbone: `transformer` (`dModel=64`, `layers=2`, `causal=true`, `positional=true`)
+- Head/synth path: `harmonic-head-mode=exp-sigmoid`, `control-smoothing=off`, `noise-filter=true`
+- Main run: `80` steps, spectral L1 + logmag (`--spectral-weight 1 --spectral-logmag-weight 1`)
+- Comparison metric: one-step spectral probe from best checkpoint with `--loudness-weight 0` and `--lr 1e-9`
+
+Measured probe results (lower is better):
+- Prior best before loudness-loss mode split:
+  - run: `transformer_probe_from_lw02`
+  - probe loss: `0.0003265924`
+- New A/B with explicit loudness-loss mode:
+  - `linear-l2`:
+    - train run: `transformer_regime_lw02_linear_l2_new`
+    - probe run: `transformer_probe_from_lw02_linear_l2_new`
+    - probe loss: `0.0005652444`
+  - `db-l1`:
+    - train run: `transformer_regime_lw02_db_l1_new`
+    - probe run: `transformer_probe_from_lw02_db_l1_new`
+    - probe loss: `0.00025940128`
+
+Conclusion:
+- `db-l1` loudness loss is the first tested variant that clearly moves the needle.
+- Relative improvement vs previous best (`0.0003265924` -> `0.00025940128`) is about `20.6%`.
+
+### Follow-up optimization sequence (same date)
+Goal: push beyond the first `db-l1` improvement and verify whether lower floors are sustainable.
+
+Methods tested after `db-l1`:
+- Loudness-weight sweep with fixed vs scheduled policies (`0.05, 0.1, 0.2, 0.3`).
+- Longer single-run training (`200` and `500` steps) for the best Stage A preset.
+- Two-stage continuation from best checkpoint with lower LR + reduced loudness weight.
+- Final spectral-only polish stage from the best continuation checkpoint.
+
+Best results from this sequence:
+- Stage A sweep winner:
+  - train: `sweep_db1_sched_w005`
+  - probe: `probe_sweep_db1_sched_w005`
+  - probe loss: `0.00024693029`
+- Stage A long run (`500` steps):
+  - train: `long_db1_sched005_s500`
+  - probe: `probe_long_db1_sched005_s500`
+  - probe loss: `0.00024431903`
+- Stage B continuation:
+  - train: `cont_from_best62_lr3e5_lw002`
+  - probe: `probe_cont_from_best62_lr3e5_lw002`
+  - probe loss: `0.0002380305`
+- Stage C spectral-only polish (current best):
+  - train: `phasec_from_best_lr1e5`
+  - probe: `probe_phasec_from_best_lr1e5`
+  - probe loss: `0.00023486369`
+
+Net impact vs pre-`db-l1` baseline:
+- `0.0003265924` -> `0.00023486369` (about `28.1%` lower).
+
+Important behavior note:
+- In long single-stage runs, loss can reach an early minimum and then rebound.
+- Best-checkpoint selection by probe metric is required; final-step checkpoints are often worse.
+
+Reproducibility:
+- The full command chain used to produce the current best is documented in `Examples/DDSPE2E/README.md` under:
+  - `Best Known Low-Loss Script (A/B/C Staging)`
+
+## Auto A/B/C Controller Checklist (Implemented Behind Flag)
+Goal: run Stage A -> Stage B -> Stage C in one command, using each stage's best checkpoint as the handoff point.
+
+### Checklist
+- [x] Add a single flag to enable staged orchestration:
+  - [x] `train --auto-abc true`
+- [x] Keep implementation layered on top of existing trainer:
+  - [x] reuse normal `train` flow and `model_best.json` outputs
+  - [x] avoid changing the core loss/optimizer loop behavior
+- [x] Stage A profile (auto-applied under flag):
+  - [x] exp LR schedule (`3e-4`, `lrMin=1e-4`, `halfLife=2000`)
+  - [x] loudness `db-l1` with schedule `0.0 -> 0.05` (`warmup=10`, `ramp=40`)
+  - [x] early-stop based checkpoint detection via `earlyStopPatience` + `earlyStopMinDelta`
+- [x] Stage B profile (auto-applied under flag):
+  - [x] continue from Stage A `model_best.json`
+  - [x] exp LR schedule (`3e-5`, `lrMin=3e-6`, `halfLife=120`)
+  - [x] light loudness (`db-l1`, `weight=0.02`)
+  - [x] early-stop based checkpoint detection
+- [x] Stage C profile (auto-applied under flag):
+  - [x] continue from Stage B `model_best.json`
+  - [x] exp LR schedule (`1e-5`, `lrMin=1e-6`, `halfLife=80`)
+  - [x] spectral-only polish (`loudness=0.0`)
+  - [x] early-stop based checkpoint detection
+- [x] Add stage control knobs:
+  - [x] `--auto-abc-steps-a`, `--auto-abc-steps-b`, `--auto-abc-steps-c`
+  - [x] `--auto-abc-patience-a`, `--auto-abc-patience-b`, `--auto-abc-patience-c`
+  - [x] `--auto-abc-min-delta`
+- [x] Write a single aggregate summary after all 3 stages:
+  - [x] `runs/<prefix>_auto_abc_summary.json`
+  - [x] includes run dirs, per-stage min/final losses, and final recommended checkpoint
+
+### Usage
+```bash
+swift run DDSPE2E train \
+  --cache .ddsp_cache_overfit1 \
+  --mode m2 \
+  --split train \
+  --auto-abc true \
+  --auto-abc-preset best-low-loss \
+  --steps 500 \
+  --auto-abc-steps-b 300 \
+  --auto-abc-steps-c 300 \
+  --run-name autoabc_trial
+```
+
+Notes:
+- `--steps` maps to Stage A by default when `--auto-abc` is enabled.
+- Stage B/C default to `300` steps unless explicitly overridden.
+- If `--init-checkpoint` is provided, Stage A starts from it; B and C still chain from each preceding stage best checkpoint.
+- `--auto-abc-preset best-low-loss` applies transformer + spectral + fixed-batch baseline settings for apples-to-apples runs with the documented best chain.
+
+### What this command does, exactly
+1. Stage A runs with the selected preset baseline plus Stage A overrides.
+2. Stage A tracks its own best checkpoint (`model_best.json`) by minimum training loss.
+3. Stage B starts from `StageA/model_best.json` (not Stage A final-step weights).
+4. Stage B uses a different objective mix (`loudness-weight=0.02`) and lower LR, so raw loss can jump versus Stage A's ending value because the objective changed.
+5. Stage B still tracks its own best checkpoint and may early-stop via `patience/min-delta`.
+6. Stage C starts from `StageB/model_best.json` (not Stage B final-step weights).
+7. Stage C returns to spectral-only polish (`loudness-weight=0.0`) at low LR, refining after the Stage B bridge move.
+8. The final aggregate summary (`runs/<run-prefix>_auto_abc_summary.json`) reports each stage min/final loss and a recommended checkpoint (lowest `minLoss` across A/B/C).
+
+### Why this can help with plateau
+- Stage A often finds a good basin quickly, but can drift after the early minimum.
+- Stage B changes gradient pressure (especially envelope supervision) to move parameters out of that local regime.
+- Stage C removes the bridge term and re-optimizes the main spectral objective from B's best point.

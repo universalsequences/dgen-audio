@@ -155,8 +155,8 @@ enum DDSPSynth {
       let noiseBatch = noiseBuffer.expand([B, firK])      // [B, firK]
       let filteredNoise = (noiseBatch * filterTapsAtTime).sum(axis: 1)  // [B]
 
-      // UV masking + gain
-      let noiseOut = filteredNoise * smoothedNoiseGain * (Tensor([1.0]) - uvAtTime)
+      // Keep noise path active for all frames (no hard UV gate).
+      let noiseOut = filteredNoise * smoothedNoiseGain
       harmonicOut = harmonicOut + noiseOut
     }
 
@@ -232,7 +232,8 @@ enum DDSPSynth {
     let filterTaps = noiseFilter.peekRow(playhead)              // [firSize] learned per frame
     let noiseBuffer = noiseExcitation.buffer(size: firSize).reshape([firSize])
     let filteredNoise = (noiseBuffer * filterTaps).sum()
-    let noiseOut = filteredNoise * noiseGain * (1.0 - uv)
+    // Keep noise path active for all frames (no hard UV gate).
+    let noiseOut = filteredNoise * noiseGain
     return harmonicOut + noiseOut
   }
 

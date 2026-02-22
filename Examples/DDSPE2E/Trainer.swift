@@ -238,13 +238,25 @@ enum DDSPE2ETrainer {
         "\(config.harmonicConcentrationWeightEnd ?? config.harmonicConcentrationWeight)",
       "harmonicConcentrationWarmupSteps": "\(config.harmonicConcentrationWarmupSteps)",
       "harmonicConcentrationRampSteps": "\(config.harmonicConcentrationRampSteps)",
-      "hiddenSize": "\(config.modelHiddenSize)",
+      "decoderBackbone": config.decoderBackbone.rawValue,
+      "hiddenSize": "\(model.hiddenSize)",
+      "modelNumLayers": "\(config.modelNumLayers)",
+      "transformerDModel": "\(config.transformerDModel)",
+      "transformerLayers": "\(config.transformerLayers)",
+      "transformerFFMultiplier": "\(config.transformerFFMultiplier)",
+      "transformerCausal": "\(config.transformerCausal)",
+      "transformerUsePositionalEncoding": "\(config.transformerUsePositionalEncoding)",
       "fixedBatch": "\(config.fixedBatch)",
       "lr": "\(config.learningRate)",
       "lrSchedule": config.lrSchedule.rawValue,
       "lrMin": "\(config.lrMin)",
       "lrWarmupSteps": "\(config.lrWarmupSteps)",
       "mseWeight": "\(config.mseLossWeight)",
+      "loudnessWeight": "\(config.loudnessLossWeight)",
+      "loudnessLossMode": config.loudnessLossMode.rawValue,
+      "loudnessWeightEnd": "\(config.loudnessLossWeightEnd ?? config.loudnessLossWeight)",
+      "loudnessWarmupSteps": "\(config.loudnessLossWarmupSteps)",
+      "loudnessRampSteps": "\(config.loudnessLossRampSteps)",
       "gradClipMode": config.gradClipMode.rawValue,
       "gradClip": "\(config.gradClip)",
       "normalizeGradByFrames": "\(config.normalizeGradByFrames)",
@@ -262,6 +274,25 @@ enum DDSPE2ETrainer {
 
     logger("Run directory: \(runDirs.root.path)")
     logger("Starting M2 decoder-only training")
+    if config.decoderBackbone == .transformer {
+      logger(
+        "Transformer backbone enabled: dModel=\(config.transformerDModel) "
+          + "layers=\(config.transformerLayers) ffMultiplier=\(config.transformerFFMultiplier) "
+          + "causal=\(config.transformerCausal) positionalEncoding=\(config.transformerUsePositionalEncoding)"
+      )
+      if config.batchSize > 1 {
+        logger(
+          "WARNING: transformer with batchSize=\(config.batchSize) uses quadratic attention on flattened sequence; "
+            + "prefer batchSize=1 + grad-accum-steps for stable memory use."
+        )
+      }
+      if config.controlSmoothingMode != .off {
+        logger(
+          "WARNING: control smoothing is \(config.controlSmoothingMode.rawValue); "
+            + "for clean temporal-backbone A/B use --control-smoothing off."
+        )
+      }
+    }
 
     if config.batchSize > 1 {
       try runBatchedDecoderTraining(
@@ -290,6 +321,8 @@ enum DDSPE2ETrainer {
       )
     )
     let targetTensor = Tensor([Float](repeating: 0, count: frameCount))
+    let loudnessTargetTensor = Tensor([[Float]](repeating: [0.0], count: paddedFeatureFrames))
+    let uvMaskTensor = Tensor([[Float]](repeating: [0.0], count: paddedFeatureFrames))
     let synthTensors = DDSPSynth.PreallocatedTensors(
       featureFrames: paddedFeatureFrames,
       numHarmonics: config.numHarmonics
@@ -372,6 +405,13 @@ enum DDSPE2ETrainer {
         warmupSteps: config.spectralWarmupSteps,
         rampSteps: config.spectralRampSteps
       )
+      let loudnessWeight = scheduledNonNegativeWeightForStep(
+        step: step,
+        startWeight: config.loudnessLossWeight,
+        endWeight: config.loudnessLossWeightEnd ?? config.loudnessLossWeight,
+        warmupSteps: config.loudnessLossWarmupSteps,
+        rampSteps: config.loudnessLossRampSteps
+      )
       let harmonicEntropyWeight = harmonicEntropyWeightForStep(
         step: step,
         startWeight: config.harmonicEntropyWeight,
@@ -421,6 +461,16 @@ enum DDSPE2ETrainer {
         }
         featuresTensor.updateDataLazily(conditioningData)
         targetTensor.updateDataLazily(chunk.audio)
+        let loudnessTargetData = makeLoudnessTargetData(
+          loudnessDB: chunk.loudnessDB,
+          paddedFrames: paddedFeatureFrames
+        )
+        let uvTargetData = makeUVTargetData(
+          uvMask: chunk.uvMask,
+          paddedFrames: paddedFeatureFrames
+        )
+        loudnessTargetTensor.updateDataLazily(loudnessTargetData)
+        uvMaskTensor.updateDataLazily(uvTargetData)
 
         var paddedF0 = chunk.f0Hz
         var paddedUV = chunk.uvMask
@@ -432,17 +482,6 @@ enum DDSPE2ETrainer {
         synthTensors.updateChunkData(f0Frames: paddedF0, uvFrames: paddedUV)
 
         let controls = model.forward(features: featuresTensor)
-        if shouldDumpControls(step: step, every: options.dumpControlsEvery) {
-          try dumpDecoderControls(
-            step: step,
-            model: model,
-            conditioningData: conditioningData,
-            featureFrames: paddedFeatureFrames,
-            batchSize: 1,
-            runDirs: runDirs,
-            logger: logger
-          )
-        }
         let prediction = DDSPSynth.renderSignal(
           controls: controls,
           tensors: synthTensors,
@@ -461,7 +500,13 @@ enum DDSPE2ETrainer {
           mseWeight: config.mseLossWeight,
           spectralWeight: spectralWeight,
           spectralLogmagWeight: config.spectralLogmagWeight,
-          spectralLossMode: config.spectralLossMode
+          spectralLossMode: config.spectralLossMode,
+          loudnessWeight: loudnessWeight,
+          loudnessLossMode: config.loudnessLossMode,
+          harmonicGain: controls.harmonicGain,
+          noiseGain: controls.noiseGain,
+          targetLoudnessNorm: loudnessTargetTensor,
+          uvMask: uvMaskTensor
         )
         loss = addHarmonicEntropyRegularization(
           baseLoss: loss,
@@ -479,6 +524,19 @@ enum DDSPE2ETrainer {
 
         let lossValues = try loss.backward(frames: frameCount)
         let tAfterBackward = CFAbsoluteTimeGetCurrent()
+
+        if shouldDumpControls(step: step, every: options.dumpControlsEvery), accumIdx == gradAccum - 1 {
+          try dumpDecoderControls(
+            step: step,
+            model: model,
+            controls: controls,
+            conditioningData: conditioningData,
+            featureFrames: paddedFeatureFrames,
+            batchSize: 1,
+            runDirs: runDirs,
+            logger: logger
+          )
+        }
 
         stepLoadMs += (tAfterLoad - tStepStart) * 1000.0
         stepGraphMs += (tAfterGraph - tAfterLoad) * 1000.0
@@ -644,7 +702,7 @@ enum DDSPE2ETrainer {
           gradInfo = ""
         }
         logger(
-          "step=\(step) loss=\(formatLoss(stepLoss)) lr=\(formatLR(currentLR)) specW=\(format(spectralWeight)) specLogW=\(format(config.spectralLogmagWeight)) entW=\(format(harmonicEntropyWeight)) concW=\(format(harmonicConcentrationWeight)) temp=\(format(softmaxTemperature)) "
+          "step=\(step) loss=\(formatLoss(stepLoss)) lr=\(formatLR(currentLR)) specW=\(format(spectralWeight)) specLogW=\(format(config.spectralLogmagWeight)) loudW=\(format(loudnessWeight)) entW=\(format(harmonicEntropyWeight)) concW=\(format(harmonicConcentrationWeight)) temp=\(format(softmaxTemperature)) "
             + "chunk=\(lastEntry.id) accum=\(gradAccum)\(gradInfo) "
             + "tStepMs=\(format(Double(stepMs))) tEMAms=\(format(Double(emaStepMs))) "
             + "tLoadMs=\(format(Double(loadMs))) tGraphMs=\(format(Double(graphMs))) "
@@ -742,6 +800,8 @@ enum DDSPE2ETrainer {
         count: paddedFeatureFrames * B
       )
     )
+    let loudnessTargetTensor = Tensor([[Float]](repeating: [0.0], count: paddedFeatureFrames * B))
+    let uvMaskTensor = Tensor([[Float]](repeating: [0.0], count: paddedFeatureFrames * B))
     let synthTensors = DDSPSynth.PreallocatedTensors(
       featureFrames: paddedFeatureFrames,
       numHarmonics: config.numHarmonics,
@@ -815,6 +875,13 @@ enum DDSPE2ETrainer {
         warmupSteps: config.spectralWarmupSteps,
         rampSteps: config.spectralRampSteps
       )
+      let loudnessWeight = scheduledNonNegativeWeightForStep(
+        step: step,
+        startWeight: config.loudnessLossWeight,
+        endWeight: config.loudnessLossWeightEnd ?? config.loudnessLossWeight,
+        warmupSteps: config.loudnessLossWarmupSteps,
+        rampSteps: config.loudnessLossRampSteps
+      )
       let harmonicEntropyWeight = harmonicEntropyWeightForStep(
         step: step,
         startWeight: config.harmonicEntropyWeight,
@@ -861,6 +928,10 @@ enum DDSPE2ETrainer {
       // Stack features as [B*F, 5] (batch-major: all frames of chunk0, then chunk1, etc.)
       var conditioningData = [Float]()
       conditioningData.reserveCapacity(B * F * conditioningFeatureCount)
+      var loudnessTargetData = [Float]()
+      loudnessTargetData.reserveCapacity(B * F)
+      var uvTargetData = [Float]()
+      uvTargetData.reserveCapacity(B * F)
       for chunk in chunks {
         var chunkCond = makeConditioningData(
           f0Hz: chunk.f0Hz,
@@ -872,8 +943,16 @@ enum DDSPE2ETrainer {
           chunkCond.append(contentsOf: [Float](repeating: 0, count: paddingRows))
         }
         conditioningData.append(contentsOf: chunkCond)
+        loudnessTargetData.append(
+          contentsOf: makeLoudnessTargetData(loudnessDB: chunk.loudnessDB, paddedFrames: F)
+        )
+        uvTargetData.append(
+          contentsOf: makeUVTargetData(uvMask: chunk.uvMask, paddedFrames: F)
+        )
       }
       featuresTensor.updateDataLazily(conditioningData)
+      loudnessTargetTensor.updateDataLazily(loudnessTargetData)
+      uvMaskTensor.updateDataLazily(uvTargetData)
 
       // Stack f0/uv as [F, B] (time-major interleaved)
       var f0Interleaved = [Float](repeating: 0, count: F * B)
@@ -903,18 +982,7 @@ enum DDSPE2ETrainer {
       )
 
       // Forward pass
-      let controls = model.forward(features: featuresTensor)
-      if shouldDumpControls(step: step, every: options.dumpControlsEvery) {
-        try dumpDecoderControls(
-          step: step,
-          model: model,
-          conditioningData: conditioningData,
-          featureFrames: F,
-          batchSize: B,
-          runDirs: runDirs,
-          logger: logger
-        )
-      }
+      let controls = model.forward(features: featuresTensor, batchSize: B, featureFrames: F)
       let prediction = DDSPSynth.renderBatchedSignal(
         controls: controls,
         tensors: synthTensors,
@@ -944,7 +1012,13 @@ enum DDSPE2ETrainer {
         mseWeight: config.mseLossWeight,
         spectralWeight: spectralWeight,
         spectralLogmagWeight: config.spectralLogmagWeight,
-        spectralLossMode: config.spectralLossMode
+        spectralLossMode: config.spectralLossMode,
+        loudnessWeight: loudnessWeight,
+        loudnessLossMode: config.loudnessLossMode,
+        harmonicGain: controls.harmonicGain,
+        noiseGain: controls.noiseGain,
+        targetLoudnessNorm: loudnessTargetTensor,
+        uvMask: uvMaskTensor
       )
       loss = addHarmonicEntropyRegularization(
         baseLoss: loss,
@@ -962,6 +1036,19 @@ enum DDSPE2ETrainer {
 
       let lossValues = try loss.backward(frames: frameCount)
       let tAfterBackward = CFAbsoluteTimeGetCurrent()
+
+      if shouldDumpControls(step: step, every: options.dumpControlsEvery) {
+        try dumpDecoderControls(
+          step: step,
+          model: model,
+          controls: controls,
+          conditioningData: conditioningData,
+          featureFrames: F,
+          batchSize: B,
+          runDirs: runDirs,
+          logger: logger
+        )
+      }
 
       let loadMs = (tAfterLoad - tStepStart) * 1000.0
       let graphMs = (tAfterGraph - tAfterLoad) * 1000.0
@@ -1116,7 +1203,7 @@ enum DDSPE2ETrainer {
           gradInfo = ""
         }
         logger(
-          "step=\(step) loss=\(formatLoss(stepLoss)) lr=\(formatLR(currentLR)) specW=\(format(spectralWeight)) specLogW=\(format(config.spectralLogmagWeight)) entW=\(format(harmonicEntropyWeight)) concW=\(format(harmonicConcentrationWeight)) temp=\(format(softmaxTemperature)) "
+          "step=\(step) loss=\(formatLoss(stepLoss)) lr=\(formatLR(currentLR)) specW=\(format(spectralWeight)) specLogW=\(format(config.spectralLogmagWeight)) loudW=\(format(loudnessWeight)) entW=\(format(harmonicEntropyWeight)) concW=\(format(harmonicConcentrationWeight)) temp=\(format(softmaxTemperature)) "
             + "batch=\(B)\(gradInfo) "
             + "tStepMs=\(format(Double(stepMs))) tEMAms=\(format(Double(emaStepMs))) "
             + "tLoadMs=\(format(Double(loadMs))) tGraphMs=\(format(Double(graphMs))) "
@@ -1369,6 +1456,26 @@ enum DDSPE2ETrainer {
     return targetWeight * alpha
   }
 
+  private static func scheduledNonNegativeWeightForStep(
+    step: Int,
+    startWeight: Float,
+    endWeight: Float,
+    warmupSteps: Int,
+    rampSteps: Int
+  ) -> Float {
+    let start = max(0, startWeight)
+    let end = max(0, endWeight)
+    if step < warmupSteps {
+      return start
+    }
+    if rampSteps <= 0 {
+      return end
+    }
+    let rampProgress = Float(step - warmupSteps) / Float(rampSteps)
+    let alpha = min(1.0, max(0.0, rampProgress))
+    return start + (end - start) * alpha
+  }
+
   private static func harmonicEntropyWeightForStep(
     step: Int,
     startWeight: Float,
@@ -1488,6 +1595,7 @@ enum DDSPE2ETrainer {
   private static func dumpDecoderControls(
     step: Int,
     model: DDSPDecoderModel,
+    controls: DecoderControls? = nil,
     conditioningData: [Float],
     featureFrames: Int,
     batchSize: Int,
@@ -1497,9 +1605,24 @@ enum DDSPE2ETrainer {
     let rows = featureFrames * batchSize
     let featureCount = model.inputSize
     guard rows > 0, conditioningData.count == rows * featureCount else { return }
-    guard let snapshot = computeDecoderControlsCPU(model: model, conditioningData: conditioningData, rows: rows)
+    let snapshotFromControls: ControlSnapshot?
+    if let controls {
+      snapshotFromControls = try? computeDecoderControlsFromTensors(controls: controls, expectedRows: rows)
+    } else {
+      snapshotFromControls = nil
+    }
+    guard
+      let snapshot =
+        (snapshotFromControls
+        ?? computeDecoderControlsCPU(
+          model: model,
+          conditioningData: conditioningData,
+          rows: rows,
+          featureFrames: featureFrames,
+          batchSize: batchSize
+        ))
     else {
-      logger("step=\(step) control dump skipped (unable to read model parameter data)")
+      logger("step=\(step) control dump skipped (unable to read control/model data)")
       return
     }
 
@@ -1598,39 +1721,215 @@ enum DDSPE2ETrainer {
     logger("step=\(step) dumped decoder controls → \(controlsDir.path)")
   }
 
+  private static func computeDecoderControlsFromTensors(
+    controls: DecoderControls,
+    expectedRows: Int
+  ) throws -> ControlSnapshot? {
+    guard controls.harmonicAmps.shape.count == 2 else { return nil }
+    let rows = controls.harmonicAmps.shape[0]
+    let harmonics = controls.harmonicAmps.shape[1]
+    guard rows == expectedRows, rows > 0, harmonics > 0 else { return nil }
+    let harmonicAmps = try controls.harmonicAmps.realize()
+    let harmonicGain = try controls.harmonicGain.realize()
+    let noiseGain = try controls.noiseGain.realize()
+    guard
+      harmonicAmps.count == rows * harmonics,
+      harmonicGain.count == rows,
+      noiseGain.count == rows
+    else { return nil }
+
+    var noiseFilterData: [Float]? = nil
+    var noiseFilterSize = 0
+    if let noiseFilter = controls.noiseFilter {
+      guard noiseFilter.shape.count == 2 else { return nil }
+      guard noiseFilter.shape[0] == rows else { return nil }
+      noiseFilterSize = noiseFilter.shape[1]
+      guard noiseFilterSize > 0 else { return nil }
+      let data = try noiseFilter.realize()
+      guard data.count == rows * noiseFilterSize else { return nil }
+      noiseFilterData = data
+    }
+
+    return ControlSnapshot(
+      rows: rows,
+      harmonics: harmonics,
+      noiseFilterSize: noiseFilterSize,
+      harmonicHeadMode: controls.harmonicHeadMode,
+      harmonicAmps: harmonicAmps,
+      harmonicGain: harmonicGain,
+      noiseGain: noiseGain,
+      noiseFilter: noiseFilterData
+    )
+  }
+
   private static func computeDecoderControlsCPU(
     model: DDSPDecoderModel,
     conditioningData: [Float],
-    rows: Int
+    rows: Int,
+    featureFrames: Int,
+    batchSize: Int
   ) -> ControlSnapshot? {
     guard rows > 0 else { return nil }
+    var hidden: [Float]
 
-    var hidden = conditioningData  // [rows, inputSize]
-    var inSize = model.inputSize
-
-    for i in 0..<model.numLayers {
-      guard let w = model.trunkWeights[i].getData(),
-        let b = model.trunkBiases[i].getData(),
-        b.count == model.hiddenSize
+    switch model.decoderBackbone {
+    case .mlp:
+      hidden = conditioningData  // [rows, inputSize]
+      var inSize = model.inputSize
+      for i in 0..<model.numLayers {
+        guard let w = model.trunkWeights[i].getData(),
+          let b = model.trunkBiases[i].getData(),
+          b.count == model.hiddenSize
+        else {
+          return nil
+        }
+        let mm = matmul(
+          lhs: hidden,
+          lhsRows: rows,
+          lhsCols: inSize,
+          rhs: w,
+          rhsCols: model.hiddenSize
+        )
+        var next = [Float](repeating: 0, count: rows * model.hiddenSize)
+        for r in 0..<rows {
+          let rowBase = r * model.hiddenSize
+          for c in 0..<model.hiddenSize {
+            next[rowBase + c] = tanh(mm[rowBase + c] + b[c])
+          }
+        }
+        hidden = next
+        inSize = model.hiddenSize
+      }
+    case .transformer:
+      let snapshotMap = Dictionary(uniqueKeysWithValues: model.snapshots().map { ($0.name, $0) })
+      guard
+        let wIn = snapshotMap["tr_in_W"]?.data,
+        let bIn = snapshotMap["tr_in_b"]?.data,
+        bIn.count == model.hiddenSize
       else {
         return nil
       }
-      let mm = matmul(
-        lhs: hidden,
-        lhsRows: rows,
-        lhsCols: inSize,
-        rhs: w,
-        rhsCols: model.hiddenSize
+
+      hidden = addRowBias(
+        matmul(
+          lhs: conditioningData,
+          lhsRows: rows,
+          lhsCols: model.inputSize,
+          rhs: wIn,
+          rhsCols: model.hiddenSize
+        ),
+        rows: rows,
+        cols: model.hiddenSize,
+        bias: bIn
       )
-      var next = [Float](repeating: 0, count: rows * model.hiddenSize)
-      for r in 0..<rows {
-        let rowBase = r * model.hiddenSize
-        for c in 0..<model.hiddenSize {
-          next[rowBase + c] = tanh(mm[rowBase + c] + b[c])
-        }
+
+      if model.transformerUsePositionalEncoding {
+        let pos = positionalEncodingCPU(
+          length: rows,
+          dim: model.hiddenSize,
+          batchSize: batchSize,
+          featureFrames: featureFrames
+        )
+        hidden = addElementwise(hidden, pos)
       }
-      hidden = next
-      inSize = model.hiddenSize
+
+      for i in 0..<model.numLayers {
+        let prefix = "tr_l\(i + 1)"
+        guard
+          let wQ = snapshotMap["\(prefix)_Wq"]?.data,
+          let wK = snapshotMap["\(prefix)_Wk"]?.data,
+          let wV = snapshotMap["\(prefix)_Wv"]?.data,
+          let wO = snapshotMap["\(prefix)_Wo"]?.data,
+          let wFF1 = snapshotMap["\(prefix)_Wff1"]?.data,
+          let bFF1 = snapshotMap["\(prefix)_bff1"]?.data,
+          let wFF2 = snapshotMap["\(prefix)_Wff2"]?.data,
+          let bFF2 = snapshotMap["\(prefix)_bff2"]?.data,
+          let ln1Gamma = snapshotMap["\(prefix)_ln1_g"]?.data,
+          let ln1Beta = snapshotMap["\(prefix)_ln1_b"]?.data,
+          let ln2Gamma = snapshotMap["\(prefix)_ln2_g"]?.data,
+          let ln2Beta = snapshotMap["\(prefix)_ln2_b"]?.data
+        else {
+          return nil
+        }
+
+        let attnInput = layerNormRowsCPU(
+          x: hidden,
+          rows: rows,
+          cols: model.hiddenSize,
+          gamma: ln1Gamma,
+          beta: ln1Beta
+        )
+        let q = matmul(
+          lhs: attnInput,
+          lhsRows: rows,
+          lhsCols: model.hiddenSize,
+          rhs: wQ,
+          rhsCols: model.hiddenSize
+        )
+        let k = matmul(
+          lhs: attnInput,
+          lhsRows: rows,
+          lhsCols: model.hiddenSize,
+          rhs: wK,
+          rhsCols: model.hiddenSize
+        )
+        let v = matmul(
+          lhs: attnInput,
+          lhsRows: rows,
+          lhsCols: model.hiddenSize,
+          rhs: wV,
+          rhsCols: model.hiddenSize
+        )
+        let kT = transpose(x: k, rows: rows, cols: model.hiddenSize)
+        var scores = matmul(lhs: q, lhsRows: rows, lhsCols: model.hiddenSize, rhs: kT, rhsCols: rows)
+        let scale = 1.0 / Foundation.sqrt(Float(max(1, model.hiddenSize)))
+        for i in 0..<scores.count { scores[i] *= scale }
+        if let mask = attentionMaskCPU(
+          length: rows,
+          batchSize: batchSize,
+          featureFrames: featureFrames,
+          causal: model.transformerCausal
+        ) {
+          scores = addElementwise(scores, mask)
+        }
+        let weights = softmaxRowsCPU(scores, rows: rows, cols: rows)
+        let context = matmul(lhs: weights, lhsRows: rows, lhsCols: rows, rhs: v, rhsCols: model.hiddenSize)
+        let attnOut = matmul(
+          lhs: context,
+          lhsRows: rows,
+          lhsCols: model.hiddenSize,
+          rhs: wO,
+          rhsCols: model.hiddenSize
+        )
+        let attnResidual = addElementwise(hidden, attnOut)
+
+        let ffInput = layerNormRowsCPU(
+          x: attnResidual,
+          rows: rows,
+          cols: model.hiddenSize,
+          gamma: ln2Gamma,
+          beta: ln2Beta
+        )
+        let ff1 = addRowBias(
+          matmul(
+            lhs: ffInput,
+            lhsRows: rows,
+            lhsCols: model.hiddenSize,
+            rhs: wFF1,
+            rhsCols: bFF1.count
+          ),
+          rows: rows,
+          cols: bFF1.count,
+          bias: bFF1
+        ).map { max(0, $0) }
+        let ff2 = addRowBias(
+          matmul(lhs: ff1, lhsRows: rows, lhsCols: bFF1.count, rhs: wFF2, rhsCols: model.hiddenSize),
+          rows: rows,
+          cols: model.hiddenSize,
+          bias: bFF2
+        )
+        hidden = addElementwise(attnResidual, ff2)
+      }
     }
 
     guard
@@ -1772,6 +2071,115 @@ enum DDSPE2ETrainer {
     return out
   }
 
+  private static func addElementwise(_ a: [Float], _ b: [Float]) -> [Float] {
+    guard a.count == b.count else { return a }
+    var out = a
+    for i in 0..<out.count {
+      out[i] += b[i]
+    }
+    return out
+  }
+
+  private static func transpose(x: [Float], rows: Int, cols: Int) -> [Float] {
+    var out = [Float](repeating: 0, count: rows * cols)
+    for r in 0..<rows {
+      for c in 0..<cols {
+        out[c * rows + r] = x[r * cols + c]
+      }
+    }
+    return out
+  }
+
+  private static func layerNormRowsCPU(
+    x: [Float],
+    rows: Int,
+    cols: Int,
+    gamma: [Float],
+    beta: [Float],
+    eps: Float = 1e-5
+  ) -> [Float] {
+    guard gamma.count == cols, beta.count == cols else { return x }
+    var out = [Float](repeating: 0, count: x.count)
+    for r in 0..<rows {
+      let base = r * cols
+      var mean: Float = 0
+      for c in 0..<cols { mean += x[base + c] }
+      mean /= Float(cols)
+      var variance: Float = 0
+      for c in 0..<cols {
+        let d = x[base + c] - mean
+        variance += d * d
+      }
+      variance /= Float(cols)
+      let invStd = 1.0 / Foundation.sqrt(variance + eps)
+      for c in 0..<cols {
+        let normalized = (x[base + c] - mean) * invStd
+        out[base + c] = normalized * gamma[c] + beta[c]
+      }
+    }
+    return out
+  }
+
+  private static func positionalEncodingCPU(
+    length: Int,
+    dim: Int,
+    batchSize: Int,
+    featureFrames: Int
+  ) -> [Float] {
+    guard length > 0, dim > 0 else { return [] }
+    let useChunkedPositions = batchSize > 1 && featureFrames > 0 && featureFrames * batchSize == length
+    let perChunkFrames = featureFrames > 0 ? featureFrames : length
+
+    var data = [Float](repeating: 0.0, count: length * dim)
+    for pos in 0..<length {
+      let positionIndex = useChunkedPositions ? (pos % perChunkFrames) : pos
+      for i in stride(from: 0, to: dim, by: 2) {
+        let exponent = Float(i) / Float(dim)
+        let denom = Foundation.pow(10_000.0, Double(exponent))
+        let angle = Float(positionIndex) / Float(denom)
+        data[pos * dim + i] = Foundation.sin(angle)
+        if i + 1 < dim {
+          data[pos * dim + i + 1] = Foundation.cos(angle)
+        }
+      }
+    }
+    return data
+  }
+
+  private static func attentionMaskCPU(
+    length: Int,
+    batchSize: Int,
+    featureFrames: Int,
+    causal: Bool
+  ) -> [Float]? {
+    guard length > 0 else { return nil }
+    if batchSize <= 1 {
+      if !causal { return nil }
+      var data = [Float](repeating: 0.0, count: length * length)
+      for row in 0..<length {
+        for col in (row + 1)..<length {
+          data[row * length + col] = -1e9
+        }
+      }
+      return data
+    }
+    guard featureFrames > 0, featureFrames * batchSize == length else {
+      return causal ? attentionMaskCPU(length: length, batchSize: 1, featureFrames: length, causal: true) : nil
+    }
+    var data = [Float](repeating: -1e9, count: length * length)
+    for batch in 0..<batchSize {
+      let start = batch * featureFrames
+      let end = start + featureFrames
+      for row in start..<end {
+        let colEnd = causal ? (row + 1) : end
+        for col in start..<colEnd {
+          data[row * length + col] = 0.0
+        }
+      }
+    }
+    return data
+  }
+
   private static func sigmoidCPU(_ x: Float) -> Float {
     1.0 / (1.0 + Foundation.exp(-x))
   }
@@ -1852,6 +2260,26 @@ enum DDSPE2ETrainer {
     }
 
     return flat
+  }
+
+  private static func makeLoudnessTargetData(loudnessDB: [Float], paddedFrames: Int) -> [Float] {
+    var out = [Float](repeating: 0.0, count: paddedFrames)
+    let n = min(paddedFrames, loudnessDB.count)
+    guard n > 0 else { return out }
+    for i in 0..<n {
+      out[i] = min(1.0, max(0.0, (loudnessDB[i] + 80.0) / 80.0))
+    }
+    return out
+  }
+
+  private static func makeUVTargetData(uvMask: [Float], paddedFrames: Int) -> [Float] {
+    var out = [Float](repeating: 0.0, count: paddedFrames)
+    let n = min(paddedFrames, uvMask.count)
+    guard n > 0 else { return out }
+    for i in 0..<n {
+      out[i] = min(1.0, max(0.0, uvMask[i]))
+    }
+    return out
   }
 
   private static func writeJSON<T: Encodable>(_ value: T, to url: URL) throws {

@@ -108,13 +108,6 @@ struct DDSPE2EMain {
 
     let runsBase = URL(fileURLWithPath: options["runs-dir"] ?? "runs")
     let runName = options["run-name"]
-    let runDirs = try RunDirectories.create(base: runsBase, runName: runName)
-    let kernelDumpPath = resolveKernelDumpPath(
-      rawValue: options["kernel-dump"],
-      runDir: runDirs.root
-    )
-    let initCheckpointPath = options["init-checkpoint"]
-
     let steps = Int(options["steps"] ?? "200") ?? 200
     let split = parseSplit(options["split"]) ?? .train
     let mode = TrainMode(rawValue: (options["mode"] ?? "m2").lowercased()) ?? .m2
@@ -122,6 +115,31 @@ struct DDSPE2EMain {
     let renderEvery = Int(options["render-every"] ?? "0") ?? 0
     let renderWavPath = options["render-wav"]
     let dumpControlsEvery = Int(options["dump-controls-every"] ?? "0") ?? 0
+    let initCheckpointPath = options["init-checkpoint"]
+    let rawKernelDump = options["kernel-dump"]
+
+    if parseBoolOption(options["auto-abc"], defaultValue: false) {
+      try runAutoABCTraining(
+        dataset: dataset,
+        baseConfig: config,
+        runsBase: runsBase,
+        runName: runName,
+        split: split,
+        mode: mode,
+        defaultSteps: steps,
+        profileStep: profileStep,
+        renderEvery: renderEvery,
+        renderWavPath: renderWavPath,
+        dumpControlsEvery: dumpControlsEvery,
+        rawKernelDumpValue: rawKernelDump,
+        initialCheckpointPath: initCheckpointPath,
+        options: options
+      )
+      return
+    }
+
+    let runDirs = try RunDirectories.create(base: runsBase, runName: runName)
+    let kernelDumpPath = resolveKernelDumpPath(rawValue: rawKernelDump, runDir: runDirs.root)
 
     try DDSPE2ETrainer.run(
       dataset: dataset,
@@ -140,6 +158,430 @@ struct DDSPE2EMain {
       ),
       logger: log
     )
+  }
+
+  private struct TrainSummaryValues {
+    let steps: Int
+    let minStep: Int
+    let minLoss: Float
+    let finalLoss: Float
+  }
+
+  private struct AutoABCStageResult: Codable {
+    let stage: String
+    let runName: String
+    let runDir: String
+    let bestCheckpoint: String
+    let steps: Int
+    let minStep: Int
+    let minLoss: Float
+    let finalLoss: Float
+  }
+
+  private struct AutoABCSummary: Codable {
+    let createdAtUTC: String
+    let runPrefix: String
+    let initialCheckpoint: String?
+    let split: String
+    let stages: [AutoABCStageResult]
+    let bestCheckpoint: String
+    let bestLoss: Float
+  }
+
+  private enum AutoABCPreset: String {
+    case baseline
+    case bestLowLoss = "best-low-loss"
+  }
+
+  private static func runAutoABCTraining(
+    dataset: CachedDataset,
+    baseConfig: DDSPE2EConfig,
+    runsBase: URL,
+    runName: String?,
+    split: DatasetSplit,
+    mode: TrainMode,
+    defaultSteps: Int,
+    profileStep: Int,
+    renderEvery: Int,
+    renderWavPath: String?,
+    dumpControlsEvery: Int,
+    rawKernelDumpValue: String?,
+    initialCheckpointPath: String?,
+    options: [String: String]
+  ) throws {
+    guard mode == .m2 else {
+      throw CLIError.invalid("--auto-abc currently supports only --mode m2")
+    }
+
+    let preset = try parseAutoABCPreset(options["auto-abc-preset"])
+    let presetBaseConfig = applyAutoABCPreset(preset, to: baseConfig)
+
+    let prefix = runName ?? "autoabc_\(timestampString())"
+    let stageARun = "\(prefix)_stageA"
+    let stageBRun = "\(prefix)_stageB"
+    let stageCRun = "\(prefix)_stageC"
+
+    let stepsA = try parsePositiveIntOption(
+      options["auto-abc-steps-a"],
+      key: "auto-abc-steps-a",
+      defaultValue: max(1, defaultSteps)
+    )
+    let stepsB = try parsePositiveIntOption(
+      options["auto-abc-steps-b"],
+      key: "auto-abc-steps-b",
+      defaultValue: 300
+    )
+    let stepsC = try parsePositiveIntOption(
+      options["auto-abc-steps-c"],
+      key: "auto-abc-steps-c",
+      defaultValue: 300
+    )
+    let patienceA = try parseNonNegativeIntOption(
+      options["auto-abc-patience-a"],
+      key: "auto-abc-patience-a",
+      defaultValue: 40
+    )
+    let patienceB = try parseNonNegativeIntOption(
+      options["auto-abc-patience-b"],
+      key: "auto-abc-patience-b",
+      defaultValue: 40
+    )
+    let patienceC = try parseNonNegativeIntOption(
+      options["auto-abc-patience-c"],
+      key: "auto-abc-patience-c",
+      defaultValue: 40
+    )
+    let minDelta = try parseNonNegativeFloatOption(
+      options["auto-abc-min-delta"],
+      key: "auto-abc-min-delta",
+      defaultValue: max(1e-7, presetBaseConfig.earlyStopMinDelta)
+    )
+
+    log(
+      "Auto A/B/C enabled: preset=\(preset.rawValue) steps=(\(stepsA),\(stepsB),\(stepsC)) "
+        + "patience=(\(patienceA),\(patienceB),\(patienceC)) minDelta=\(fmt(minDelta))"
+    )
+
+    var stageAConfig = presetBaseConfig
+    stageAConfig.lrSchedule = .exp
+    stageAConfig.learningRate = 3e-4
+    stageAConfig.lrMin = 1e-4
+    stageAConfig.lrHalfLife = 2000
+    stageAConfig.lrWarmupSteps = 0
+    stageAConfig.loudnessLossMode = .dbL1
+    stageAConfig.loudnessLossWeight = 0.0
+    stageAConfig.loudnessLossWeightEnd = 0.05
+    stageAConfig.loudnessLossWarmupSteps = 10
+    stageAConfig.loudnessLossRampSteps = 40
+    stageAConfig.earlyStopPatience = patienceA
+    stageAConfig.earlyStopMinDelta = minDelta
+    try stageAConfig.validate()
+
+    let stageARunDirs = try RunDirectories.create(base: runsBase, runName: stageARun)
+    let stageAKernelDumpPath = resolveKernelDumpPath(rawValue: rawKernelDumpValue, runDir: stageARunDirs.root)
+    try DDSPE2ETrainer.run(
+      dataset: dataset,
+      config: stageAConfig,
+      runDirs: stageARunDirs,
+      options: TrainerOptions(
+        steps: stepsA,
+        split: split,
+        mode: .m2,
+        kernelDumpPath: stageAKernelDumpPath,
+        initCheckpointPath: initialCheckpointPath,
+        profileKernelsStep: profileStep,
+        renderEvery: renderEvery,
+        renderWavPath: renderWavPath,
+        dumpControlsEvery: dumpControlsEvery
+      ),
+      logger: log
+    )
+    let stageASummary = try loadTrainSummary(
+      from: stageARunDirs.logs.appendingPathComponent("train_summary.json")
+    )
+    let stageABestCheckpoint = stageARunDirs.checkpoints.appendingPathComponent("model_best.json")
+    guard FileManager.default.fileExists(atPath: stageABestCheckpoint.path) else {
+      throw CLIError.invalid("Auto A/B/C Stage A did not produce model_best.json")
+    }
+    log(
+      "Auto A/B/C Stage A done: minLoss=\(fmt(stageASummary.minLoss)) "
+        + "minStep=\(stageASummary.minStep) best=\(stageABestCheckpoint.path)"
+    )
+
+    var stageBConfig = presetBaseConfig
+    stageBConfig.lrSchedule = .exp
+    stageBConfig.learningRate = 3e-5
+    stageBConfig.lrMin = 3e-6
+    stageBConfig.lrHalfLife = 120
+    stageBConfig.lrWarmupSteps = 0
+    stageBConfig.loudnessLossMode = .dbL1
+    stageBConfig.loudnessLossWeight = 0.02
+    stageBConfig.loudnessLossWeightEnd = nil
+    stageBConfig.loudnessLossWarmupSteps = 0
+    stageBConfig.loudnessLossRampSteps = 0
+    stageBConfig.earlyStopPatience = patienceB
+    stageBConfig.earlyStopMinDelta = minDelta
+    try stageBConfig.validate()
+
+    let stageBRunDirs = try RunDirectories.create(base: runsBase, runName: stageBRun)
+    let stageBKernelDumpPath = resolveKernelDumpPath(rawValue: rawKernelDumpValue, runDir: stageBRunDirs.root)
+    try DDSPE2ETrainer.run(
+      dataset: dataset,
+      config: stageBConfig,
+      runDirs: stageBRunDirs,
+      options: TrainerOptions(
+        steps: stepsB,
+        split: split,
+        mode: .m2,
+        kernelDumpPath: stageBKernelDumpPath,
+        initCheckpointPath: stageABestCheckpoint.path,
+        profileKernelsStep: profileStep,
+        renderEvery: renderEvery,
+        renderWavPath: renderWavPath,
+        dumpControlsEvery: dumpControlsEvery
+      ),
+      logger: log
+    )
+    let stageBSummary = try loadTrainSummary(
+      from: stageBRunDirs.logs.appendingPathComponent("train_summary.json")
+    )
+    let stageBBestCheckpoint = stageBRunDirs.checkpoints.appendingPathComponent("model_best.json")
+    guard FileManager.default.fileExists(atPath: stageBBestCheckpoint.path) else {
+      throw CLIError.invalid("Auto A/B/C Stage B did not produce model_best.json")
+    }
+    log(
+      "Auto A/B/C Stage B done: minLoss=\(fmt(stageBSummary.minLoss)) "
+        + "minStep=\(stageBSummary.minStep) best=\(stageBBestCheckpoint.path)"
+    )
+
+    var stageCConfig = presetBaseConfig
+    stageCConfig.lrSchedule = .exp
+    stageCConfig.learningRate = 1e-5
+    stageCConfig.lrMin = 1e-6
+    stageCConfig.lrHalfLife = 80
+    stageCConfig.lrWarmupSteps = 0
+    stageCConfig.loudnessLossMode = .dbL1
+    stageCConfig.loudnessLossWeight = 0.0
+    stageCConfig.loudnessLossWeightEnd = nil
+    stageCConfig.loudnessLossWarmupSteps = 0
+    stageCConfig.loudnessLossRampSteps = 0
+    stageCConfig.earlyStopPatience = patienceC
+    stageCConfig.earlyStopMinDelta = minDelta
+    try stageCConfig.validate()
+
+    let stageCRunDirs = try RunDirectories.create(base: runsBase, runName: stageCRun)
+    let stageCKernelDumpPath = resolveKernelDumpPath(rawValue: rawKernelDumpValue, runDir: stageCRunDirs.root)
+    try DDSPE2ETrainer.run(
+      dataset: dataset,
+      config: stageCConfig,
+      runDirs: stageCRunDirs,
+      options: TrainerOptions(
+        steps: stepsC,
+        split: split,
+        mode: .m2,
+        kernelDumpPath: stageCKernelDumpPath,
+        initCheckpointPath: stageBBestCheckpoint.path,
+        profileKernelsStep: profileStep,
+        renderEvery: renderEvery,
+        renderWavPath: renderWavPath,
+        dumpControlsEvery: dumpControlsEvery
+      ),
+      logger: log
+    )
+    let stageCSummary = try loadTrainSummary(
+      from: stageCRunDirs.logs.appendingPathComponent("train_summary.json")
+    )
+    let stageCBestCheckpoint = stageCRunDirs.checkpoints.appendingPathComponent("model_best.json")
+    guard FileManager.default.fileExists(atPath: stageCBestCheckpoint.path) else {
+      throw CLIError.invalid("Auto A/B/C Stage C did not produce model_best.json")
+    }
+    log(
+      "Auto A/B/C Stage C done: minLoss=\(fmt(stageCSummary.minLoss)) "
+        + "minStep=\(stageCSummary.minStep) best=\(stageCBestCheckpoint.path)"
+    )
+
+    let stageResults = [
+      AutoABCStageResult(
+        stage: "A",
+        runName: stageARun,
+        runDir: stageARunDirs.root.path,
+        bestCheckpoint: stageABestCheckpoint.path,
+        steps: stageASummary.steps,
+        minStep: stageASummary.minStep,
+        minLoss: stageASummary.minLoss,
+        finalLoss: stageASummary.finalLoss
+      ),
+      AutoABCStageResult(
+        stage: "B",
+        runName: stageBRun,
+        runDir: stageBRunDirs.root.path,
+        bestCheckpoint: stageBBestCheckpoint.path,
+        steps: stageBSummary.steps,
+        minStep: stageBSummary.minStep,
+        minLoss: stageBSummary.minLoss,
+        finalLoss: stageBSummary.finalLoss
+      ),
+      AutoABCStageResult(
+        stage: "C",
+        runName: stageCRun,
+        runDir: stageCRunDirs.root.path,
+        bestCheckpoint: stageCBestCheckpoint.path,
+        steps: stageCSummary.steps,
+        minStep: stageCSummary.minStep,
+        minLoss: stageCSummary.minLoss,
+        finalLoss: stageCSummary.finalLoss
+      ),
+    ]
+    let recommendedStage = stageResults.min { $0.minLoss < $1.minLoss } ?? stageResults[stageResults.count - 1]
+
+    let summary = AutoABCSummary(
+      createdAtUTC: ISO8601DateFormatter().string(from: Date()),
+      runPrefix: prefix,
+      initialCheckpoint: initialCheckpointPath,
+      split: split.rawValue,
+      stages: stageResults,
+      bestCheckpoint: recommendedStage.bestCheckpoint,
+      bestLoss: recommendedStage.minLoss
+    )
+    let summaryPath = runsBase.appendingPathComponent("\(prefix)_auto_abc_summary.json")
+    try writeJSON(summary, to: summaryPath)
+
+    log("Auto A/B/C summary written: \(summaryPath.path)")
+    log(
+      "Auto A/B/C recommended checkpoint: \(recommendedStage.bestCheckpoint) "
+        + "(stage=\(recommendedStage.stage), minLoss=\(fmt(recommendedStage.minLoss)))"
+    )
+  }
+
+  private static func loadTrainSummary(from path: URL) throws -> TrainSummaryValues {
+    let data = try Data(contentsOf: path)
+    let dict = try JSONDecoder().decode([String: String].self, from: data)
+
+    guard let stepsRaw = dict["steps"], let steps = Int(stepsRaw) else {
+      throw CLIError.invalid("Missing or invalid 'steps' in \(path.path)")
+    }
+    guard let minStepRaw = dict["minStep"], let minStep = Int(minStepRaw) else {
+      throw CLIError.invalid("Missing or invalid 'minStep' in \(path.path)")
+    }
+    guard let minLossRaw = dict["minLoss"], let minLoss = Float(minLossRaw) else {
+      throw CLIError.invalid("Missing or invalid 'minLoss' in \(path.path)")
+    }
+    guard let finalLossRaw = dict["finalLoss"], let finalLoss = Float(finalLossRaw) else {
+      throw CLIError.invalid("Missing or invalid 'finalLoss' in \(path.path)")
+    }
+
+    return TrainSummaryValues(steps: steps, minStep: minStep, minLoss: minLoss, finalLoss: finalLoss)
+  }
+
+  private static func writeJSON<T: Encodable>(_ value: T, to url: URL) throws {
+    let encoder = JSONEncoder()
+    encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+    let data = try encoder.encode(value)
+    try data.write(to: url)
+  }
+
+  private static func parseBoolOption(_ raw: String?, defaultValue: Bool) -> Bool {
+    guard let raw else { return defaultValue }
+    let normalized = raw.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+    switch normalized {
+    case "1", "true", "yes", "y", "on":
+      return true
+    case "0", "false", "no", "n", "off":
+      return false
+    default:
+      return defaultValue
+    }
+  }
+
+  private static func parsePositiveIntOption(_ raw: String?, key: String, defaultValue: Int) throws -> Int {
+    guard let raw else { return defaultValue }
+    guard let parsed = Int(raw), parsed > 0 else {
+      throw CLIError.invalid("Invalid positive integer for --\(key): \(raw)")
+    }
+    return parsed
+  }
+
+  private static func parseNonNegativeIntOption(_ raw: String?, key: String, defaultValue: Int) throws -> Int {
+    guard let raw else { return defaultValue }
+    guard let parsed = Int(raw), parsed >= 0 else {
+      throw CLIError.invalid("Invalid non-negative integer for --\(key): \(raw)")
+    }
+    return parsed
+  }
+
+  private static func parseNonNegativeFloatOption(
+    _ raw: String?,
+    key: String,
+    defaultValue: Float
+  ) throws -> Float {
+    guard let raw else { return defaultValue }
+    guard let parsed = Float(raw), parsed >= 0 else {
+      throw CLIError.invalid("Invalid non-negative float for --\(key): \(raw)")
+    }
+    return parsed
+  }
+
+  private static func parseAutoABCPreset(_ raw: String?) throws -> AutoABCPreset {
+    guard let raw else { return .baseline }
+    let normalized = raw.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+    guard let preset = AutoABCPreset(rawValue: normalized) else {
+      throw CLIError.invalid(
+        "Invalid value for --auto-abc-preset: \(raw) (expected baseline|best-low-loss)"
+      )
+    }
+    return preset
+  }
+
+  private static func applyAutoABCPreset(
+    _ preset: AutoABCPreset,
+    to config: DDSPE2EConfig
+  ) -> DDSPE2EConfig {
+    var cfg = config
+    switch preset {
+    case .baseline:
+      return cfg
+    case .bestLowLoss:
+      // Mirrors the best-known A/B/C chain baseline so auto mode is apples-to-apples.
+      cfg.shuffleChunks = false
+      cfg.fixedBatch = true
+      cfg.seed = 1
+      cfg.batchSize = 1
+      cfg.gradAccumSteps = 1
+      cfg.gradClip = 1.0
+      cfg.gradClipMode = .element
+      cfg.normalizeGradByFrames = false
+
+      cfg.mseLossWeight = 0.0
+      cfg.spectralWeight = 1.0
+      cfg.spectralLogmagWeight = 1.0
+      cfg.spectralLossMode = .l1
+      cfg.spectralWindowSizes = [64, 128, 256, 512, 1024]
+      cfg.spectralHopDivisor = 4
+      cfg.spectralWarmupSteps = 0
+      cfg.spectralRampSteps = 0
+
+      cfg.modelHiddenSize = 128
+      cfg.modelNumLayers = 2
+      cfg.numHarmonics = 64
+      cfg.harmonicHeadMode = .expSigmoid
+      cfg.enableNoiseFilter = true
+      cfg.decoderBackbone = .transformer
+      cfg.transformerDModel = 64
+      cfg.transformerLayers = 2
+      cfg.transformerFFMultiplier = 2
+      cfg.transformerCausal = true
+      cfg.transformerUsePositionalEncoding = true
+      cfg.controlSmoothingMode = .off
+      cfg.loudnessLossMode = .dbL1
+      return cfg
+    }
+  }
+
+  private static func timestampString() -> String {
+    let formatter = DateFormatter()
+    formatter.dateFormat = "yyyyMMdd_HHmmss"
+    formatter.timeZone = TimeZone(secondsFromGMT: 0)
+    return formatter.string(from: Date())
   }
 
   private static func handleProbeSmoothing(_ options: [String: String]) throws {
@@ -219,6 +661,13 @@ struct DDSPE2EMain {
       --shuffle <true|false>
       --fixed-batch <true|false>
       --model-hidden <int>
+      --model-layers <int>
+      --decoder-backbone <mlp|transformer>
+      --transformer-d-model <int>
+      --transformer-layers <int>
+      --transformer-ff-multiplier <int>
+      --transformer-causal <true|false>
+      --transformer-positional-encoding <true|false>
       --harmonics <int>
       --harmonic-head-mode <legacy|normalized|softmax-db|exp-sigmoid>
       --control-smoothing <fir|off>
@@ -255,6 +704,11 @@ struct DDSPE2EMain {
       --spectral-hop-divisor <int>
       --spectral-warmup-steps <int>
       --spectral-ramp-steps <int>
+      --loudness-weight <float>
+      --loudness-loss-mode <linear-l2|db-l1>
+      --loudness-weight-end <float>
+      --loudness-warmup-steps <int>
+      --loudness-ramp-steps <int>
       --mse-weight <float>
       --log-every <int>
       --checkpoint-every <int>
@@ -263,6 +717,15 @@ struct DDSPE2EMain {
       --render-every <int>
       --render-wav <path>
       --dump-controls-every <int>
+      --auto-abc <true|false> (default: false; runs staged A->B->C sequence in one command)
+      --auto-abc-steps-a <int> (default: --steps value)
+      --auto-abc-steps-b <int> (default: 300)
+      --auto-abc-steps-c <int> (default: 300)
+      --auto-abc-patience-a <int> (default: 40)
+      --auto-abc-patience-b <int> (default: 40)
+      --auto-abc-patience-c <int> (default: 40)
+      --auto-abc-min-delta <float> (default: max(1e-7, --early-stop-min-delta))
+      --auto-abc-preset <baseline|best-low-loss> (default: baseline)
 
     Examples:
       swift run DDSPE2E dump-config --output ddsp_config.json
