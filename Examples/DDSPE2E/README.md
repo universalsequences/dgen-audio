@@ -364,6 +364,76 @@ Use `--fixed-batch true` to reuse the same sampled chunk set every training step
 - with `batch-size = B`: repeats the same `B` chunk IDs each step
 - useful for sanity checks and optimization A/B tests where batch difficulty should not change over time
 
+## Decoder Backbone
+
+By default, training uses the transformer backbone.
+
+- `--decoder-backbone transformer` (default): temporal backbone used for current best results
+- `--decoder-backbone mlp` (legacy): older framewise baseline path kept for compatibility and A/B checks
+
+### Architecture At A Glance (Pseudocode)
+
+```text
+conditioning features [F,5]
+  = [f0_norm, loudness_norm, uv, delta_f0, delta_loudness]
+        |
+        v
+backbone (selected by --decoder-backbone)
+  - transformer: input projection + N transformer blocks
+  - mlp (legacy): stacked dense+tanh layers
+        |
+        v
+hidden [F,H]
+        |
+        v
+heads (shared for both backbones)
+  harm_logits  = hidden @ W_harm  + b_harm   -> harmonicAmps [F,K]
+  hgain_logits = hidden @ W_hgain + b_hgain  -> harmonicGain [F,1]
+  ngain_logits = hidden @ W_noise + b_noise  -> noiseGain [F,1]
+  filter_logits(optional) -> noiseFilter [F,Kf]
+        |
+        v
+activation mapping by harmonic-head-mode
+  -> DecoderControls
+        |
+        v
+DDSPSynth.renderSignal(controls, f0, uv, ...)
+        |
+        v
+predicted audio -> training losses -> gradients back through synth, heads, backbone
+```
+
+Transformer block used in this project:
+
+```text
+input x [F,H]
+
+attn_input = LayerNorm(x)
+Q = attn_input @ W_q
+K = attn_input @ W_k
+V = attn_input @ W_v
+
+scores = (Q @ K^T) / sqrt(H)
+scores += causal_or_block_mask (if enabled)
+weights = softmax(scores)
+attn_out = (weights @ V) @ W_o
+
+x1 = x + attn_out
+
+ff_input = LayerNorm(x1)
+ff_hidden = relu(ff_input @ W_ff1 + b_ff1)
+ff_out = ff_hidden @ W_ff2 + b_ff2
+
+output y = x1 + ff_out
+```
+
+Code map for quick reading:
+- Backbone switch + forward entry: `Examples/DDSPE2E/ModelDecoder.swift`
+- Transformer forward + blocks + attention + masks + layer norm: `Examples/DDSPE2E/ModelDecoder.swift`
+- Head mapping to synth controls: `Examples/DDSPE2E/ModelDecoder.swift`
+- Control-to-audio rendering: `Examples/DDSPE2E/Synth.swift`
+- Training call path (model forward + synth render + loss): `Examples/DDSPE2E/Trainer.swift`
+
 ## Harmonic Head Mode
 
 By default, training uses the legacy harmonic head behavior.
@@ -412,6 +482,13 @@ By default, training uses the legacy harmonic head behavior.
 - `--shuffle <true|false>` (default: `true`)
 - `--fixed-batch <true|false>` (default: `false`)
 - `--model-hidden <int>` (default: `32`)
+- `--model-layers <int>` (default: `1`)
+- `--decoder-backbone <transformer|mlp>` (default: `transformer`; `mlp` is legacy)
+- `--transformer-d-model <int>` (default: `64`)
+- `--transformer-layers <int>` (default: `2`)
+- `--transformer-ff-multiplier <int>` (default: `2`)
+- `--transformer-causal <true|false>` (default: `true`)
+- `--transformer-positional-encoding <true|false>` (default: `true`)
 - `--harmonics <int>` (default: `16`)
 - `--harmonic-head-mode <legacy|normalized|softmax-db|exp-sigmoid>` (default: `legacy`)
 - `--control-smoothing <fir|off>` (default: `fir`)

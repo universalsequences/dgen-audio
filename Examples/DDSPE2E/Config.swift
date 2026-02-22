@@ -64,7 +64,7 @@ struct DDSPE2EConfig: Codable {
   // M2 decoder-only model/training parameters
   var modelHiddenSize: Int = 32
   var modelNumLayers: Int = 1
-  var decoderBackbone: DecoderBackbone = .mlp
+  var decoderBackbone: DecoderBackbone = .transformer
   var transformerDModel: Int = 64
   var transformerLayers: Int = 2
   var transformerFFMultiplier: Int = 2
@@ -341,7 +341,7 @@ struct DDSPE2EConfig: Codable {
     if let value = options["decoder-backbone"] {
       guard let backbone = DecoderBackbone(rawValue: value.lowercased()) else {
         throw ConfigError.invalid(
-          "Invalid decoder backbone for --decoder-backbone: \(value) (expected mlp|transformer)"
+          "Invalid decoder backbone for --decoder-backbone: \(value) (expected transformer|mlp; mlp is legacy)"
         )
       }
       decoderBackbone = backbone

@@ -662,7 +662,7 @@ struct DDSPE2EMain {
       --fixed-batch <true|false>
       --model-hidden <int>
       --model-layers <int>
-      --decoder-backbone <mlp|transformer>
+      --decoder-backbone <transformer|mlp> (mlp is legacy)
       --transformer-d-model <int>
       --transformer-layers <int>
       --transformer-ff-multiplier <int>

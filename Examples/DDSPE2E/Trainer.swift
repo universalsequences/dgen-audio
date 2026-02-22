@@ -292,6 +292,8 @@ enum DDSPE2ETrainer {
             + "for clean temporal-backbone A/B use --control-smoothing off."
         )
       }
+    } else {
+      logger("WARNING: decoder-backbone=mlp is a legacy path; transformer is the default.")
     }
 
     if config.batchSize > 1 {
