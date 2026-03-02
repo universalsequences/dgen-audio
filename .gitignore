@@ -42,3 +42,4 @@ test_kernel_no_batch.metal
 test_kernel_batch.metal
 KERNEL_OPTIMIZATIONS.md
 /.ddsp_cache_tinysol_large256
+bending_metal.wav

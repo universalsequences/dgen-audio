@@ -8,6 +8,7 @@ let package = Package(
     ],
     products: [
         .executable(name: "DDSPE2E", targets: ["DDSPE2E"]),
+        .executable(name: "BendingMetal", targets: ["BendingMetal"]),
         .library(name: "DGen", targets: ["DGen"]),
         .library(name: "DGenLazy", targets: ["DGenLazy"]),
     ],
@@ -26,6 +27,11 @@ let package = Package(
             dependencies: ["DGenLazy"],
             path: "Examples/DDSPE2E",
             exclude: ["README.md"]
+        ),
+        .executableTarget(
+            name: "BendingMetal",
+            dependencies: ["DGenLazy"],
+            path: "Examples/BendingMetal"
         ),
         .target(
             name: "DGenLazy",

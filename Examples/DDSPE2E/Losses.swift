@@ -15,6 +15,8 @@ enum DDSPTrainingLosses {
     spectralLossMode: SpectralLossModeOption,
     loudnessWeight: Float = 0.0,
     loudnessLossMode: LoudnessLossModeOption = .linearL2,
+    noiseDominanceWeight: Float = 0.0,
+    noiseDominanceTargetRatio: Float = 1.0,
     harmonicGain: DGenLazy.Tensor? = nil,
     noiseGain: DGenLazy.Tensor? = nil,
     targetLoudnessNorm: DGenLazy.Tensor? = nil,
@@ -93,6 +95,21 @@ enum DDSPTrainingLosses {
       hasTerm = true
     }
 
+    if noiseDominanceWeight > 0,
+      let harmonicGain,
+      let noiseGain
+    {
+      // Penalize excess noise gain beyond a harmonic-scaled target:
+      // excess = max(noiseGain - targetRatio * harmonicGain, 0)
+      // penalty = mean(excess^2)
+      let targetRatio = max(0.0, noiseDominanceTargetRatio)
+      let excess = max(noiseGain - harmonicGain * targetRatio, 0.0)
+      let penaltyTensor = (excess * excess).mean()
+      let penalty = (DGenLazy.Tensor([0.0]) + penaltyTensor).peek(Signal.constant(0.0))
+      total = total + penalty * noiseDominanceWeight
+      hasTerm = true
+    }
+
     // Preserve a valid scalar loss signal without forcing extra loss terms into the graph.
     return hasTerm ? total : Signal.constant(0.0)
   }
@@ -111,6 +128,8 @@ enum DDSPTrainingLosses {
     spectralLossMode: SpectralLossModeOption,
     loudnessWeight: Float = 0.0,
     loudnessLossMode: LoudnessLossModeOption = .linearL2,
+    noiseDominanceWeight: Float = 0.0,
+    noiseDominanceTargetRatio: Float = 1.0,
     harmonicGain: DGenLazy.Tensor? = nil,
     noiseGain: DGenLazy.Tensor? = nil,
     targetLoudnessNorm: DGenLazy.Tensor? = nil,
@@ -188,6 +207,18 @@ enum DDSPTrainingLosses {
       // Ensure a rank-1 tensor before peek; mean() can become a scalar lazy node.
       let envLoss = (DGenLazy.Tensor([0.0]) + envLossTensor).peek(Signal.constant(0.0))
       total = total + envLoss * loudnessWeight
+      hasTerm = true
+    }
+
+    if noiseDominanceWeight > 0,
+      let harmonicGain,
+      let noiseGain
+    {
+      let targetRatio = max(0.0, noiseDominanceTargetRatio)
+      let excess = max(noiseGain - harmonicGain * targetRatio, 0.0)
+      let penaltyTensor = (excess * excess).mean()
+      let penalty = (DGenLazy.Tensor([0.0]) + penaltyTensor).peek(Signal.constant(0.0))
+      total = total + penalty * noiseDominanceWeight
       hasTerm = true
     }
 

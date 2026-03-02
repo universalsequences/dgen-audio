@@ -263,7 +263,7 @@ public class CRenderer: Renderer {
     // Declare globals
     let sortedGlobals = ctx.globals.sorted()
     code.append("const int VOICE_COUNT = \(voiceCount);")
-    code.append("const int SCRATCH_STRIDE = 512;")
+    code.append("const int SCRATCH_STRIDE = \(max(512, graph.maxFrameCount));")
     for varId in sortedGlobals {
       code.append(
         "float t\(varId)_g[VOICE_COUNT * SCRATCH_STRIDE] __attribute__((aligned(64))) = {0};"
@@ -540,11 +540,14 @@ public class CRenderer: Renderer {
 
     case .noise(let cellId):
       // Xorshift32 PRNG - better spectral properties than LCG
+      // State is stored as raw uint32 bits in a float slot via memcpy
+      // to avoid float round-trip truncation (float only has 23-bit mantissa,
+      // which collapses the 32-bit state space into a short cycle)
       if uop.isSimd {
         // For SIMD, generate 4 random values using 4 sequential xorshift updates
         let expr = """
           ({
-              uint32_t s = (uint32_t)memory[\(cellId)];
+              uint32_t s; memcpy(&s, &memory[\(cellId)], sizeof(uint32_t));
               if (s == 0u) s = 1u;
               s ^= s << 13; s ^= s >> 17; s ^= s << 5;
               float r0 = (float)s / 4294967296.0f;
@@ -554,7 +557,7 @@ public class CRenderer: Renderer {
               float r2 = (float)s / 4294967296.0f;
               s ^= s << 13; s ^= s >> 17; s ^= s << 5;
               float r3 = (float)s / 4294967296.0f;
-              memory[\(cellId)] = (float)s;
+              memcpy(&memory[\(cellId)], &s, sizeof(uint32_t));
               (float32x4_t){r0, r1, r2, r3};
           })
           """
@@ -562,10 +565,10 @@ public class CRenderer: Renderer {
       } else {
         let expr = """
           ({
-              uint32_t s = (uint32_t)memory[\(cellId)];
+              uint32_t s; memcpy(&s, &memory[\(cellId)], sizeof(uint32_t));
               if (s == 0u) s = 1u;
               s ^= s << 13; s ^= s >> 17; s ^= s << 5;
-              memory[\(cellId)] = (float)s;
+              memcpy(&memory[\(cellId)], &s, sizeof(uint32_t));
               (float)s / 4294967296.0f;
           })
           """

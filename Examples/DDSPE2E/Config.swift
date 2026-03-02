@@ -116,6 +116,8 @@ struct DDSPE2EConfig: Codable {
   var loudnessLossWeightEnd: Float?
   var loudnessLossWarmupSteps: Int = 0
   var loudnessLossRampSteps: Int = 0
+  var noiseDominanceWeight: Float = 0.0
+  var noiseDominanceTargetRatio: Float = 1.0
   var mseLossWeight: Float = 1.0
   var logEvery: Int = 10
   var checkpointEvery: Int = 100
@@ -192,6 +194,8 @@ struct DDSPE2EConfig: Codable {
     case loudnessLossWeightEnd
     case loudnessLossWarmupSteps
     case loudnessLossRampSteps
+    case noiseDominanceWeight
+    case noiseDominanceTargetRatio
     case mseLossWeight
     case logEvery
     case checkpointEvery
@@ -306,6 +310,10 @@ struct DDSPE2EConfig: Codable {
       try c.decodeIfPresent(Int.self, forKey: .loudnessLossWarmupSteps) ?? d.loudnessLossWarmupSteps
     loudnessLossRampSteps =
       try c.decodeIfPresent(Int.self, forKey: .loudnessLossRampSteps) ?? d.loudnessLossRampSteps
+    noiseDominanceWeight =
+      try c.decodeIfPresent(Float.self, forKey: .noiseDominanceWeight) ?? d.noiseDominanceWeight
+    noiseDominanceTargetRatio =
+      try c.decodeIfPresent(Float.self, forKey: .noiseDominanceTargetRatio) ?? d.noiseDominanceTargetRatio
     mseLossWeight = try c.decodeIfPresent(Float.self, forKey: .mseLossWeight) ?? d.mseLossWeight
     logEvery = try c.decodeIfPresent(Int.self, forKey: .logEvery) ?? d.logEvery
     checkpointEvery = try c.decodeIfPresent(Int.self, forKey: .checkpointEvery) ?? d.checkpointEvery
@@ -525,6 +533,12 @@ struct DDSPE2EConfig: Codable {
     if let value = options["loudness-ramp-steps"] {
       loudnessLossRampSteps = try parseInt(value, key: "loudness-ramp-steps")
     }
+    if let value = options["noise-dominance-weight"] {
+      noiseDominanceWeight = try parseFloat(value, key: "noise-dominance-weight")
+    }
+    if let value = options["noise-dominance-target-ratio"] {
+      noiseDominanceTargetRatio = try parseFloat(value, key: "noise-dominance-target-ratio")
+    }
     if let value = options["mse-weight"] {
       mseLossWeight = try parseFloat(value, key: "mse-weight")
     }
@@ -718,6 +732,12 @@ struct DDSPE2EConfig: Codable {
     }
     guard loudnessLossRampSteps >= 0 else {
       throw ConfigError.invalid("loudnessLossRampSteps must be >= 0")
+    }
+    guard noiseDominanceWeight >= 0 else {
+      throw ConfigError.invalid("noiseDominanceWeight must be >= 0")
+    }
+    guard noiseDominanceTargetRatio >= 0 else {
+      throw ConfigError.invalid("noiseDominanceTargetRatio must be >= 0")
     }
     guard mseLossWeight >= 0 else {
       throw ConfigError.invalid("mseLossWeight must be >= 0")

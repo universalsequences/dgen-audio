@@ -283,6 +283,42 @@ public func max(_ a: Tensor, _ b: Double) -> Tensor {
   return Tensor(nodeId: nodeId, graph: a.graph, shape: a.shape, requiresGrad: a.requiresGrad)
 }
 
+// SignalTensor min/max
+
+public func min(_ a: SignalTensor, _ b: SignalTensor) -> SignalTensor {
+  let nodeId = a.graph.node(.min, [a.nodeId, b.nodeId])
+  let outShape = broadcastShape(a.shape, b.shape)
+  return SignalTensor(
+    nodeId: nodeId, graph: a.graph, shape: outShape, requiresGrad: a.requiresGrad || b.requiresGrad)
+}
+
+public func min(_ a: SignalTensor, _ b: Double) -> SignalTensor {
+  let bNode = a.graph.node(.constant(Float(b)))
+  let nodeId = a.graph.node(.min, [a.nodeId, bNode])
+  return SignalTensor(nodeId: nodeId, graph: a.graph, shape: a.shape, requiresGrad: a.requiresGrad)
+}
+
+public func min(_ a: Double, _ b: SignalTensor) -> SignalTensor {
+  return min(b, a)
+}
+
+public func max(_ a: SignalTensor, _ b: SignalTensor) -> SignalTensor {
+  let nodeId = a.graph.node(.max, [a.nodeId, b.nodeId])
+  let outShape = broadcastShape(a.shape, b.shape)
+  return SignalTensor(
+    nodeId: nodeId, graph: a.graph, shape: outShape, requiresGrad: a.requiresGrad || b.requiresGrad)
+}
+
+public func max(_ a: SignalTensor, _ b: Double) -> SignalTensor {
+  let bNode = a.graph.node(.constant(Float(b)))
+  let nodeId = a.graph.node(.max, [a.nodeId, bNode])
+  return SignalTensor(nodeId: nodeId, graph: a.graph, shape: a.shape, requiresGrad: a.requiresGrad)
+}
+
+public func max(_ a: Double, _ b: SignalTensor) -> SignalTensor {
+  return max(b, a)
+}
+
 // MARK: - Modulo
 
 /// Modulo operation (remainder after division)

@@ -256,13 +256,16 @@ extension TensorMemoryMaterializationPass {
 
     let isInFeedbackLoop = backend == .c && nodeId.map { feedbackClusterNodes.contains($0) } ?? false
 
-    let needsFrameAwareForFlow = isFrameBased && !isInFeedbackLoop &&
-      (isOutbound || intraBlockFrameAwareCells.contains(lazyCellId))
+    // Outbound tensors crossing block boundaries always need frame-aware storage,
+    // even if produced in feedback loops — downstream blocks read per-frame.
+    let needsFrameAwareForFlow = isFrameBased &&
+      (isOutbound || (!isInFeedbackLoop && intraBlockFrameAwareCells.contains(lazyCellId)))
 
     let shouldMaterializeNode = nodeId.map { graph.materializeNodes.contains($0) } ?? false
     let shouldMaterialize = shouldMaterializeNode || isOutbound
 
-    let needsFrameAwareForMaterialize = shouldMaterialize && isFrameBased && !isInFeedbackLoop
+    let needsFrameAwareForMaterialize = shouldMaterialize && isFrameBased &&
+      (!isInFeedbackLoop || isOutbound)
     let needsFrameAwareAlloc = needsFrameAwareForFlow || needsFrameAwareForMaterialize
 
     let shouldAllocate = shouldMaterialize || needsFrameAwareAlloc

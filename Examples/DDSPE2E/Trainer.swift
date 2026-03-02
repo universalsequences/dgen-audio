@@ -257,6 +257,8 @@ enum DDSPE2ETrainer {
       "loudnessWeightEnd": "\(config.loudnessLossWeightEnd ?? config.loudnessLossWeight)",
       "loudnessWarmupSteps": "\(config.loudnessLossWarmupSteps)",
       "loudnessRampSteps": "\(config.loudnessLossRampSteps)",
+      "noiseDominanceWeight": "\(config.noiseDominanceWeight)",
+      "noiseDominanceTargetRatio": "\(config.noiseDominanceTargetRatio)",
       "gradClipMode": config.gradClipMode.rawValue,
       "gradClip": "\(config.gradClip)",
       "normalizeGradByFrames": "\(config.normalizeGradByFrames)",
@@ -505,6 +507,8 @@ enum DDSPE2ETrainer {
           spectralLossMode: config.spectralLossMode,
           loudnessWeight: loudnessWeight,
           loudnessLossMode: config.loudnessLossMode,
+          noiseDominanceWeight: config.noiseDominanceWeight,
+          noiseDominanceTargetRatio: config.noiseDominanceTargetRatio,
           harmonicGain: controls.harmonicGain,
           noiseGain: controls.noiseGain,
           targetLoudnessNorm: loudnessTargetTensor,
@@ -704,7 +708,7 @@ enum DDSPE2ETrainer {
           gradInfo = ""
         }
         logger(
-          "step=\(step) loss=\(formatLoss(stepLoss)) lr=\(formatLR(currentLR)) specW=\(format(spectralWeight)) specLogW=\(format(config.spectralLogmagWeight)) loudW=\(format(loudnessWeight)) entW=\(format(harmonicEntropyWeight)) concW=\(format(harmonicConcentrationWeight)) temp=\(format(softmaxTemperature)) "
+          "step=\(step) loss=\(formatLoss(stepLoss)) lr=\(formatLR(currentLR)) specW=\(format(spectralWeight)) specLogW=\(format(config.spectralLogmagWeight)) loudW=\(format(loudnessWeight)) ndW=\(format(config.noiseDominanceWeight)) ndR=\(format(config.noiseDominanceTargetRatio)) entW=\(format(harmonicEntropyWeight)) concW=\(format(harmonicConcentrationWeight)) temp=\(format(softmaxTemperature)) "
             + "chunk=\(lastEntry.id) accum=\(gradAccum)\(gradInfo) "
             + "tStepMs=\(format(Double(stepMs))) tEMAms=\(format(Double(emaStepMs))) "
             + "tLoadMs=\(format(Double(loadMs))) tGraphMs=\(format(Double(graphMs))) "
@@ -1017,6 +1021,8 @@ enum DDSPE2ETrainer {
         spectralLossMode: config.spectralLossMode,
         loudnessWeight: loudnessWeight,
         loudnessLossMode: config.loudnessLossMode,
+        noiseDominanceWeight: config.noiseDominanceWeight,
+        noiseDominanceTargetRatio: config.noiseDominanceTargetRatio,
         harmonicGain: controls.harmonicGain,
         noiseGain: controls.noiseGain,
         targetLoudnessNorm: loudnessTargetTensor,
@@ -1205,7 +1211,7 @@ enum DDSPE2ETrainer {
           gradInfo = ""
         }
         logger(
-          "step=\(step) loss=\(formatLoss(stepLoss)) lr=\(formatLR(currentLR)) specW=\(format(spectralWeight)) specLogW=\(format(config.spectralLogmagWeight)) loudW=\(format(loudnessWeight)) entW=\(format(harmonicEntropyWeight)) concW=\(format(harmonicConcentrationWeight)) temp=\(format(softmaxTemperature)) "
+          "step=\(step) loss=\(formatLoss(stepLoss)) lr=\(formatLR(currentLR)) specW=\(format(spectralWeight)) specLogW=\(format(config.spectralLogmagWeight)) loudW=\(format(loudnessWeight)) ndW=\(format(config.noiseDominanceWeight)) ndR=\(format(config.noiseDominanceTargetRatio)) entW=\(format(harmonicEntropyWeight)) concW=\(format(harmonicConcentrationWeight)) temp=\(format(softmaxTemperature)) "
             + "batch=\(B)\(gradInfo) "
             + "tStepMs=\(format(Double(stepMs))) tEMAms=\(format(Double(emaStepMs))) "
             + "tLoadMs=\(format(Double(loadMs))) tGraphMs=\(format(Double(graphMs))) "

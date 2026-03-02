@@ -195,6 +195,11 @@ Needle-moving preset (measured on February 21, 2026):
 - `--loudness-weight 0.2 --loudness-loss-mode db-l1`
 - overfit probe improved from `3.265924e-4` to `2.5940128e-4` (about `20.6%` lower)
 
+Optional anti-hiss regularizer:
+- `--noise-dominance-weight <float>` penalizes excessive noise gain relative to harmonic gain
+- `--noise-dominance-target-ratio <float>` sets allowed noise-to-harmonic gain ratio before penalty applies
+- penalty form is `mean(max(noiseGain - ratio * harmonicGain, 0)^2) * weight`
+
 ### Best Known Low-Loss Script (A/B/C Staging)
 
 The current best overfit probe was reached with a 3-stage sequence that combines:
@@ -462,6 +467,24 @@ By default, training uses the legacy harmonic head behavior.
 - `preprocess --input <wav-dir> --cache <cache-dir> [--config <json>] [overrides]`
 - `inspect-cache --cache <cache-dir> [--split train|val] [--limit N]`
 - `train --cache <cache-dir> [--runs-dir <dir>] [--run-name <name>] [--steps N] [--split train|val] [--mode dry|m2] [--config <json>] [overrides]`
+- `render-checkpoint-batch --cache <cache-dir> --init-checkpoint <path> [--split train|val] [--batch-size N] [--output <dir>] [--config <json>] [overrides]`
+
+### Render A Fixed Batch From A Checkpoint
+
+Use this to export all items from the selected fixed batch (for example all 8 audios) without running training updates.
+
+```bash
+swift run DDSPE2E render-checkpoint-batch \
+  --cache .ddsp_cache_tinysol_large256 \
+  --init-checkpoint runs/autoabc_tinysol_large256_b32_stageC/checkpoints/model_best.json \
+  --split train \
+  --batch-size 8 \
+  --output runs/autoabc_tinysol_large256_b32_stageC/render_batch8
+```
+
+Notes:
+- If `--config` is omitted, the command auto-uses `runs/<run>/resolved_config.json` when checkpoint is under `runs/<run>/checkpoints/`.
+- Output directory includes per-item WAVs and `render_manifest.json` with chunk IDs and paths.
 
 ## CLI Overrides (Config)
 
@@ -524,6 +547,8 @@ By default, training uses the legacy harmonic head behavior.
 - `--loudness-weight-end <float>` (default: unset; falls back to `--loudness-weight`)
 - `--loudness-warmup-steps <int>` (default: `0`)
 - `--loudness-ramp-steps <int>` (default: `0`)
+- `--noise-dominance-weight <float>` (default: `0.0`)
+- `--noise-dominance-target-ratio <float>` (default: `1.0`)
 - `--mse-weight <float>` (default: `1.0`)
 - `--log-every <int>` (default: `10`)
 - `--checkpoint-every <int>` (default: `100`)
