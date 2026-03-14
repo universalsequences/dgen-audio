@@ -409,10 +409,10 @@ public class CRenderer: Renderer {
       switch b {
       case .constant(_, let val):
         if uop.isSimd {
-          let expr = "vmulq_f32(\(g(a)), vdupq_n_f32(\(1.0/val)f))"
+          let expr = "vdivq_f32(\(g(a)), vdupq_n_f32(\(val)f))"
           return emitAssign(uop, expr, ctx)
         } else {
-          let expr = "(\(g(a)) * \(1.0/val)f)"
+          let expr = "(\(g(a)) / \(val)f)"
           return emitAssign(uop, expr, ctx)
         }
       default:
@@ -433,7 +433,7 @@ public class CRenderer: Renderer {
             return emitAssign(uop, expr, ctx)
           } else {
             let expr =
-              "vsubq_f32(\(g(a)), vmulq_f32(vdupq_n_f32(\(val)f), vrndmq_f32(vmulq_f32(\(g(a)), vdupq_n_f32(\(1.0/val)f)))))"
+              "vsubq_f32(\(g(a)), vmulq_f32(vdupq_n_f32(\(val)f), vrndmq_f32(vdivq_f32(\(g(a)), vdupq_n_f32(\(val)f)))))"
             return emitAssign(uop, expr, ctx)
           }
         } else {
