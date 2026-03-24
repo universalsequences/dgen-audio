@@ -38,6 +38,9 @@ public class Signal: LazyValue {
   /// Memory cell for stateful signals (phasor, history, etc.)
   internal var cellId: CellID?
 
+  /// Public read-only accessor for param cell IDs (used by DGenLisp)
+  public var memoryCellId: CellID? { cellId }
+
   /// Track which graph generation this signal belongs to
   private var graphId: Int = -1
 
@@ -224,6 +227,21 @@ public class Signal: LazyValue {
     let cellId = graph.alloc()
     graph.cellInitialValues[cellId] = 1.0
     let nodeId = graph.node(.click(cellId))
+    return Signal(nodeId: nodeId, graph: graph, requiresGrad: false)
+  }
+
+  /// Convert phasor (0→1) to triangle wave (0→1→0)
+  public func triangle(duty: Signal? = nil) -> Signal {
+    let graph = self.graph
+    let dutyNode = duty?.nodeId
+    let nodeId = graph.graph.triangle(self.nodeId, dutyNode)
+    return Signal(nodeId: nodeId, graph: graph, requiresGrad: false)
+  }
+
+  /// Detect ramp resets (wrap-arounds) and output triggers
+  public func rampToTrig() -> Signal {
+    let graph = self.graph
+    let nodeId = graph.graph.rampToTrig(self.nodeId)
     return Signal(nodeId: nodeId, graph: graph, requiresGrad: false)
   }
 

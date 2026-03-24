@@ -172,6 +172,12 @@ public func pow(_ x: Tensor, _ y: Float) -> Tensor {
   return Tensor(nodeId: nodeId, graph: x.graph, shape: x.shape, requiresGrad: x.requiresGrad)
 }
 
+public func pow(_ x: Float, _ y: Tensor) -> Tensor {
+  let xNode = y.graph.node(.constant(x))
+  let nodeId = y.graph.node(.pow, [xNode, y.nodeId])
+  return Tensor(nodeId: nodeId, graph: y.graph, shape: y.shape, requiresGrad: y.requiresGrad)
+}
+
 public func pow(_ x: Signal, _ y: Signal) -> Signal {
   let nodeId = x.graph.node(.pow, [x.nodeId, y.nodeId])
   return Signal(nodeId: nodeId, graph: x.graph, requiresGrad: x.requiresGrad || y.requiresGrad)
@@ -181,6 +187,73 @@ public func pow(_ x: Signal, _ y: Float) -> Signal {
   let yNode = x.graph.node(.constant(y))
   let nodeId = x.graph.node(.pow, [x.nodeId, yNode])
   return Signal(nodeId: nodeId, graph: x.graph, requiresGrad: x.requiresGrad)
+}
+
+public func pow(_ x: Float, _ y: Signal) -> Signal {
+  let xNode = y.graph.node(.constant(x))
+  let nodeId = y.graph.node(.pow, [xNode, y.nodeId])
+  return Signal(nodeId: nodeId, graph: y.graph, requiresGrad: y.requiresGrad)
+}
+
+public func pow(_ x: Signal, _ y: Tensor) -> SignalTensor {
+  y.refresh()
+  let nodeId = x.graph.node(.pow, [x.nodeId, y.nodeId])
+  return SignalTensor(
+    nodeId: nodeId, graph: x.graph, shape: y.shape, requiresGrad: x.requiresGrad || y.requiresGrad)
+}
+
+public func pow(_ x: Tensor, _ y: Signal) -> SignalTensor {
+  x.refresh()
+  let nodeId = y.graph.node(.pow, [x.nodeId, y.nodeId])
+  return SignalTensor(
+    nodeId: nodeId, graph: y.graph, shape: x.shape, requiresGrad: x.requiresGrad || y.requiresGrad)
+}
+
+public func pow(_ x: SignalTensor, _ y: SignalTensor) -> SignalTensor {
+  let nodeId = x.graph.node(.pow, [x.nodeId, y.nodeId])
+  let outShape = broadcastShape(x.shape, y.shape)
+  return SignalTensor(
+    nodeId: nodeId, graph: x.graph, shape: outShape, requiresGrad: x.requiresGrad || y.requiresGrad)
+}
+
+public func pow(_ x: SignalTensor, _ y: Signal) -> SignalTensor {
+  let nodeId = x.graph.node(.pow, [x.nodeId, y.nodeId])
+  return SignalTensor(
+    nodeId: nodeId, graph: x.graph, shape: x.shape, requiresGrad: x.requiresGrad || y.requiresGrad)
+}
+
+public func pow(_ x: Signal, _ y: SignalTensor) -> SignalTensor {
+  let nodeId = y.graph.node(.pow, [x.nodeId, y.nodeId])
+  return SignalTensor(
+    nodeId: nodeId, graph: y.graph, shape: y.shape, requiresGrad: x.requiresGrad || y.requiresGrad)
+}
+
+public func pow(_ x: SignalTensor, _ y: Tensor) -> SignalTensor {
+  y.refresh()
+  let nodeId = x.graph.node(.pow, [x.nodeId, y.nodeId])
+  return SignalTensor(
+    nodeId: nodeId, graph: x.graph, shape: broadcastShape(x.shape, y.shape),
+    requiresGrad: x.requiresGrad || y.requiresGrad)
+}
+
+public func pow(_ x: Tensor, _ y: SignalTensor) -> SignalTensor {
+  x.refresh()
+  let nodeId = y.graph.node(.pow, [x.nodeId, y.nodeId])
+  return SignalTensor(
+    nodeId: nodeId, graph: y.graph, shape: broadcastShape(x.shape, y.shape),
+    requiresGrad: x.requiresGrad || y.requiresGrad)
+}
+
+public func pow(_ x: SignalTensor, _ y: Float) -> SignalTensor {
+  let yNode = x.graph.node(.constant(y))
+  let nodeId = x.graph.node(.pow, [x.nodeId, yNode])
+  return SignalTensor(nodeId: nodeId, graph: x.graph, shape: x.shape, requiresGrad: x.requiresGrad)
+}
+
+public func pow(_ x: Float, _ y: SignalTensor) -> SignalTensor {
+  let xNode = y.graph.node(.constant(x))
+  let nodeId = y.graph.node(.pow, [xNode, y.nodeId])
+  return SignalTensor(nodeId: nodeId, graph: y.graph, shape: y.shape, requiresGrad: y.requiresGrad)
 }
 
 // MARK: - Activation Functions
@@ -403,6 +476,14 @@ public func gswitch(_ cond: Tensor, _ a: Double, _ b: Tensor) -> Tensor {
   return Tensor(
     nodeId: nodeId, graph: cond.graph, shape: outShape,
     requiresGrad: cond.requiresGrad || b.requiresGrad)
+}
+
+/// Multi-way selector: returns 0 for mode <= 0, otherwise returns the selected option.
+/// Mode values are 1-based.
+public func selector(_ mode: Signal, _ options: [Signal]) -> Signal {
+  let nodeId = mode.graph.node(.selector, [mode.nodeId] + options.map(\.nodeId))
+  let needsGrad = mode.requiresGrad || options.contains(where: \.requiresGrad)
+  return Signal(nodeId: nodeId, graph: mode.graph, requiresGrad: needsGrad)
 }
 
 // MARK: - Loss Functions
@@ -908,6 +989,21 @@ extension Signal {
     return Signal(nodeId: nodeId, graph: graph, requiresGrad: needsGrad)
   }
 
+  /// Compressor with explicit isSideChain signal for dynamic sidechain switching.
+  public func compressor(
+    ratio: Signal, threshold: Signal, knee: Signal,
+    attack: Signal, release: Signal,
+    isSideChain: Signal, sidechain: Signal
+  ) -> Signal {
+    let nodeId = graph.graph.compressor(
+      self.nodeId, ratio.nodeId, threshold.nodeId, knee.nodeId,
+      attack.nodeId, release.nodeId, isSideChain.nodeId, sidechain.nodeId)
+    let needsGrad = requiresGrad || ratio.requiresGrad || threshold.requiresGrad
+      || knee.requiresGrad || attack.requiresGrad || release.requiresGrad
+      || isSideChain.requiresGrad || sidechain.requiresGrad
+    return Signal(nodeId: nodeId, graph: graph, requiresGrad: needsGrad)
+  }
+
   /// Compressor with Float parameters
   public func compressor(
     ratio: Float, threshold: Float, knee: Float,
@@ -996,6 +1092,21 @@ extension SignalTensor {
     let needsGrad = requiresGrad || ratio.requiresGrad || threshold.requiresGrad
       || knee.requiresGrad || attack.requiresGrad || release.requiresGrad
       || (sidechain?.requiresGrad ?? false)
+    return SignalTensor(nodeId: nodeId, graph: graph, shape: shape, requiresGrad: needsGrad)
+  }
+
+  /// Compressor with explicit isSideChain signal for dynamic sidechain switching.
+  public func compressor(
+    ratio: Signal, threshold: Signal, knee: Signal,
+    attack: Signal, release: Signal,
+    isSideChain: Signal, sidechain: Signal
+  ) -> SignalTensor {
+    let nodeId = graph.graph.compressor(
+      self.nodeId, ratio.nodeId, threshold.nodeId, knee.nodeId,
+      attack.nodeId, release.nodeId, isSideChain.nodeId, sidechain.nodeId)
+    let needsGrad = requiresGrad || ratio.requiresGrad || threshold.requiresGrad
+      || knee.requiresGrad || attack.requiresGrad || release.requiresGrad
+      || isSideChain.requiresGrad || sidechain.requiresGrad
     return SignalTensor(nodeId: nodeId, graph: graph, shape: shape, requiresGrad: needsGrad)
   }
 

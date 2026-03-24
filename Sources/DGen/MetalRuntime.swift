@@ -271,6 +271,15 @@ public class MetalCompiledKernel: CompiledKernelRuntime {
     }
   }
 
+  /// Zero only transient buffers (outputs, inputs), preserving memory state.
+  /// Used in "retain" mode where GPU memory persists across kernel executions.
+  public func zeroTransientBuffers() {
+    for (name, buffer) in bufferPool {
+      if name == "frameCount" || name == "memory" { continue }
+      memset(buffer.contents(), 0, buffer.length)
+    }
+  }
+
   public func run(
     outputs: UnsafeMutablePointer<Float>, inputs: UnsafePointer<Float>, frameCount: Int,
     volumeScale: Float = 1.0
@@ -305,7 +314,8 @@ public class MetalCompiledKernel: CompiledKernelRuntime {
 
       guard index < pipelineStates.count else { continue }
       _ = encodeKernel(
-        kernel, pipelineState: pipelineStates[index], encoder: computeEncoder, frameCount: frameCount)
+        kernel, pipelineState: pipelineStates[index], encoder: computeEncoder,
+        frameCount: frameCount)
 
       if sharedEncoder == nil { computeEncoder.endEncoding() }
       if debugGradients {
@@ -372,7 +382,9 @@ public class MetalCompiledKernel: CompiledKernelRuntime {
   /// Returns per-kernel results sorted by index (not timed order).
   /// Note: kernels run on whatever data is currently in the buffers,
   /// so call this after a real backward pass to profile realistic workloads.
-  public func profileKernels(frameCount: Int) -> [(index: Int, name: String, dispatchInfo: String, gpuMs: Double)] {
+  public func profileKernels(frameCount: Int) -> [(
+    index: Int, name: String, dispatchInfo: String, gpuMs: Double
+  )] {
     if let frameCountBuffer = bufferPool["frameCount"] {
       frameCountBuffer.contents().assumingMemoryBound(to: UInt32.self)[0] = UInt32(frameCount)
     }
@@ -381,12 +393,13 @@ public class MetalCompiledKernel: CompiledKernelRuntime {
 
     for (index, kernel) in kernels.enumerated() {
       guard index < pipelineStates.count,
-            let commandBuffer = commandQueue.makeCommandBuffer(),
-            let computeEncoder = commandBuffer.makeComputeCommandEncoder()
+        let commandBuffer = commandQueue.makeCommandBuffer(),
+        let computeEncoder = commandBuffer.makeComputeCommandEncoder()
       else { continue }
 
       let dispatchInfo = encodeKernel(
-        kernel, pipelineState: pipelineStates[index], encoder: computeEncoder, frameCount: frameCount)
+        kernel, pipelineState: pipelineStates[index], encoder: computeEncoder,
+        frameCount: frameCount)
 
       computeEncoder.endEncoding()
       commandBuffer.commit()

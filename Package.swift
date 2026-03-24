@@ -9,6 +9,7 @@ let package = Package(
     products: [
         .executable(name: "DDSPE2E", targets: ["DDSPE2E"]),
         .executable(name: "BendingMetal", targets: ["BendingMetal"]),
+        .executable(name: "DGenLisp", targets: ["DGenLisp"]),
         .library(name: "DGen", targets: ["DGen"]),
         .library(name: "DGenLazy", targets: ["DGenLazy"]),
     ],
@@ -33,6 +34,11 @@ let package = Package(
             dependencies: ["DGenLazy"],
             path: "Examples/BendingMetal"
         ),
+        .executableTarget(
+            name: "DGenLisp",
+            dependencies: ["DGenLazy"],
+            path: "Sources/DGenLisp"
+        ),
         .target(
             name: "DGenLazy",
             dependencies: ["DGen"]
@@ -46,6 +52,11 @@ let package = Package(
             name: "DGenLazyTests",
             dependencies: ["DGenLazy", "DGen", "DDSPE2E"],
             path: "Tests/DGenLazyTests"
+        ),
+        .testTarget(
+            name: "DGenLispTests",
+            dependencies: ["DGenLisp", "DGenLazy"],
+            path: "Tests/DGenLispTests"
         ),
     ]
 )

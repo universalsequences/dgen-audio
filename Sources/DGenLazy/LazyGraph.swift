@@ -102,6 +102,22 @@ public class LazyGraph {
     signals.append(WeakRef(signal))
   }
 
+  // MARK: - Public API for DGenLisp
+
+  /// Add an output signal to the graph for compilation
+  public func addOutput(_ signal: Signal, channel: Int) {
+    let _ = node(.output(channel), [signal.nodeId])
+  }
+
+  /// Compile the graph without creating a runtime (for dylib export)
+  public func compileOnly(frameCount: Int, voiceCount: Int = 1) throws -> CompilationResult {
+    return try CompilationPipeline.compile(
+      graph: graph,
+      backend: .c,
+      options: .init(frameCount: frameCount, debug: DGenConfig.debug, voiceCount: voiceCount, enableBufferReuse: DGenConfig.enableBufferReuse)
+    )
+  }
+
   // MARK: - Graph Clearing
 
   /// Clear computation nodes while preserving parameter state and compilation cache

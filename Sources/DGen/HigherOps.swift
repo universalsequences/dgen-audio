@@ -643,6 +643,8 @@ extension Graph {
     let MAX_DELAY = 88000
     let bufferBase = alloc(vectorWidth: MAX_DELAY)
     let writePosCellId = alloc()
+    persistentCells.insert(bufferBase)
+    persistentCells.insert(writePosCellId)
 
     // Constants
     let one = n(.constant(1.0))
@@ -661,7 +663,9 @@ extension Graph {
     func wrap0ToL(_ x: NodeID, _ L: NodeID) -> NodeID {
       let q = n(.div, x, L)
       let qFloor = n(.floor, q)
-      return n(.sub, x, n(.mul, qFloor, L))
+      let wrapped = n(.sub, x, n(.mul, qFloor, L))
+      let wrappedHigh = n(.gswitch, n(.gte, wrapped, L), n(.sub, wrapped, L), wrapped)
+      return n(.gswitch, n(.lt, wrappedHigh, zero), n(.add, wrappedHigh, L), wrappedHigh)
     }
 
     // Read position in samples (float)
@@ -674,9 +678,12 @@ extension Graph {
     let i0 = n(.floor, readPos)
     let frac = n(.sub, readPos, i0)
 
-    // i1 = (i0 + 1) wrapped
+    // i1 = (i0 + 1) wrapped — use a conditional instead of wrap0ToL to avoid
+    // float-reciprocal precision: wrap0ToL(88000, 88000) can return 88000 (not 0)
+    // when 88000 * (1/88000_approx) < 1 due to float rounding, causing OOB reads.
+    // Since i0 is in [0, MAX_DELAY-1], i1raw is at most MAX_DELAY; one check suffices.
     let i1raw = n(.add, i0, one)
-    let i1 = wrap0ToL(i1raw, maxDelay)
+    let i1 = n(.gswitch, n(.gte, i1raw, maxDelay), zero, i1raw)
 
     let s0 = n(.memoryRead(bufferBase), i0)
     let s1 = n(.memoryRead(bufferBase), i1)
