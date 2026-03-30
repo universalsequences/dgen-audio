@@ -8,6 +8,7 @@ let package = Package(
     ],
     products: [
         .executable(name: "DDSPE2E", targets: ["DDSPE2E"]),
+        .executable(name: "HarmonicE2E", targets: ["HarmonicE2E"]),
         .executable(name: "BendingMetal", targets: ["BendingMetal"]),
         .executable(name: "DGenLisp", targets: ["DGenLisp"]),
         .library(name: "DGen", targets: ["DGen"]),
@@ -27,6 +28,12 @@ let package = Package(
             name: "DDSPE2E",
             dependencies: ["DGenLazy"],
             path: "Examples/DDSPE2E",
+            exclude: ["README.md"]
+        ),
+        .executableTarget(
+            name: "HarmonicE2E",
+            dependencies: ["DGenLazy"],
+            path: "Examples/HarmonicE2E",
             exclude: ["README.md"]
         ),
         .executableTarget(
@@ -50,7 +57,7 @@ let package = Package(
         ),
         .testTarget(
             name: "DGenLazyTests",
-            dependencies: ["DGenLazy", "DGen", "DDSPE2E"],
+            dependencies: ["DGenLazy", "DGen", "DDSPE2E", "HarmonicE2E"],
             path: "Tests/DGenLazyTests"
         ),
         .testTarget(

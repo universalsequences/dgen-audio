@@ -131,7 +131,14 @@ extension LazyGraph {
             options: .init(frameCount: frameCount, debug: DGenConfig.debug, enableBufferReuse: DGenConfig.enableBufferReuse)
         )
 
+        if DGenConfig.debug {
+            let kernelCount = result.kernels.count
+            let totalSourceChars = result.kernels.reduce(0) { $0 + $1.source.count }
+            print("DGenLazy.compile: kernels=\(kernelCount) totalSourceChars=\(totalSourceChars) frameCount=\(frameCount)")
+        }
+
         if let outputPath = DGenConfig.kernelOutputPath {
+            print("DGenLazy.compile: kernelOutputPath=\(outputPath)")
             writeKernelsToDisk(result, outputPath)
         }
 

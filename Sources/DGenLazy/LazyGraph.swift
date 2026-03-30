@@ -109,6 +109,10 @@ public class LazyGraph {
     let _ = node(.output(channel), [signal.nodeId])
   }
 
+  public var debugNodeCount: Int { graph.nodes.count }
+  public var debugTensorCount: Int { graph.tensors.count }
+  public var debugMemoryCellCount: Int { graph.totalMemoryCells }
+
   /// Compile the graph without creating a runtime (for dylib export)
   public func compileOnly(frameCount: Int, voiceCount: Int = 1) throws -> CompilationResult {
     return try CompilationPipeline.compile(

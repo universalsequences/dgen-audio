@@ -39,7 +39,15 @@ You also get the full tensor operation library (conv2d, matmul, reshape, transpo
 
 **Forward pass**: solid and useful. Multiple backends, automatic parallelism, rich tensor + DSP primitive library.
 
-**Backward pass (training)**: the machinery works — gradients flow through temporal feedback (BPTT), spectral operations, and the full tensor op library. Transformers, differentiable FFTs, and complex patches all differentiate correctly. But I haven't yet proven it can learn something non-trivial end-to-end (e.g., DDSP-style synthesis, learning a drum sound from audio). Until that's demonstrated, consider training support experimental.
+**Backward pass (training)**: works end-to-end for small but real examples. Gradients flow through temporal feedback (BPTT), spectral operations, and the tensor op library, and the repo now includes a batched end-to-end audio training example in [`Examples/HarmonicE2E`](./Examples/HarmonicE2E). That example runs:
+
+- WAV preprocessing and caching
+- feature extraction (`f0`, loudness, voiced/unvoiced)
+- neural control prediction
+- differentiable harmonic plus learned-noise synthesis
+- spectral loss, checkpoints, and audio renders
+
+Training support is still experimental in the broader sense: this is not yet a paper-faithful DDSP implementation or a proven high-fidelity timbre model across varied datasets. But it is no longer accurate to say DGen cannot train anything meaningful.
 
 ## Quick Start
 
@@ -56,6 +64,10 @@ let samples = try wave.realize(frames: 1024)
 ```
 
 ## Examples
+
+### End-to-End Audio Training
+
+For the clearest current training example, see [`Examples/HarmonicE2E`](./Examples/HarmonicE2E). It is a deliberately small monophonic resynthesis pipeline that demonstrates batched end-to-end differentiable audio training in Swift.
 
 ### Tensor Operations
 

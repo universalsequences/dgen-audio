@@ -154,6 +154,182 @@ final class KernelAnalysisTests: XCTestCase {
     print("Wrote signal-tensor phasor kernel dump to \(kernelPath)")
   }
 
+  func testForwardTimeVaryingCutoffBiquadKernelAvoidsSerializingControlFrames() throws {
+    DGenConfig.sampleRate = 24_000.0
+    DGenConfig.maxFrameCount = 16_384
+    let previousKernelPath = DGenConfig.kernelOutputPath
+    let kernelPath = "/tmp/time_varying_cutoff_biquad_noise.metal"
+    DGenConfig.kernelOutputPath = kernelPath
+    defer {
+      DGenConfig.kernelOutputPath = previousKernelPath
+      DGenConfig.maxFrameCount = 4096
+    }
+
+    LazyGraphContext.reset()
+
+    let frames = 16_384
+    let controlFrames = 64
+    let cutoffData = (0..<controlFrames).map { i in
+      250.0 + (Float(i) / Float(max(1, controlFrames - 1))) * 8_000.0
+    }
+    let cutoffFrames = Tensor(cutoffData)
+
+    let playhead = Signal.phasor(DGenConfig.sampleRate / Float(frames)) * Float(controlFrames - 1)
+    let cutoff = cutoffFrames.peek(playhead)
+
+    let filteredNoise = Signal.noise().biquad(
+      cutoff: cutoff,
+      resonance: Signal.constant(0.707),
+      gain: Signal.constant(1.0),
+      mode: Signal.constant(0.0)
+    )
+
+    // Force a compiled realization so kernel dumping runs.
+    _ = try filteredNoise.realize(frames: frames)
+
+    let kernelSource = try String(contentsOfFile: kernelPath, encoding: .utf8)
+    XCTAssertTrue(kernelSource.contains("kernel void"))
+
+    // Known bad shape: a sequential kernel with only one active thread serializing
+    // frameCount * 64 work, where 64 is the control-frame dimension.
+    let hasPathologicalSerialization =
+      kernelSource.contains("DispatchMode: perFrameScaled(64)")
+      && kernelSource.contains("if (id >= 0 && id < (uint)(1))")
+      && kernelSource.contains("for (uint i = 0; i < t")
+      && kernelSource.contains("frameCount + _frameIndex")
+
+    XCTAssertFalse(
+      hasPathologicalSerialization,
+      "Forward-only time-varying cutoff biquad should not serialize frameCount * 64 work in one thread. See \(kernelPath)."
+    )
+  }
+
+  func testBackwardTimeVaryingCutoffBiquadKernelAvoidsSerializingControlFrames() throws {
+    DGenConfig.sampleRate = 24_000.0
+    DGenConfig.maxFrameCount = 16_384
+    let previousKernelPath = DGenConfig.kernelOutputPath
+    let kernelPath = "/tmp/time_varying_cutoff_biquad_noise_backward.metal"
+    DGenConfig.kernelOutputPath = kernelPath
+    defer {
+      DGenConfig.kernelOutputPath = previousKernelPath
+      DGenConfig.maxFrameCount = 4096
+    }
+
+    LazyGraphContext.reset()
+
+    let frames = 16_384
+    let controlFrames = 64
+    let cutoffData = (0..<controlFrames).map { i in
+      250.0 + (Float(i) / Float(max(1, controlFrames - 1))) * 8_000.0
+    }
+    let cutoffFrames = Tensor(cutoffData)
+    let cutoffScale = Signal.param(1.0)
+
+    let playhead = Signal.phasor(DGenConfig.sampleRate / Float(frames)) * Float(controlFrames - 1)
+    let cutoff = cutoffFrames.peek(playhead) * cutoffScale
+
+    let filteredNoise = Signal.noise().biquad(
+      cutoff: cutoff,
+      resonance: Signal.constant(0.707),
+      gain: Signal.constant(1.0),
+      mode: Signal.constant(0.0)
+    )
+    let loss = mse(filteredNoise, Signal.constant(0.0))
+
+    _ = try loss.backward(frames: frames)
+
+    let kernelSource = try String(contentsOfFile: kernelPath, encoding: .utf8)
+    XCTAssertTrue(kernelSource.contains("kernel void"))
+
+    let hasPathologicalSerialization =
+      kernelSource.contains("DispatchMode: perFrameScaled(64)")
+      && kernelSource.contains("if (id >= 0 && id < (uint)(1))")
+      && kernelSource.contains("for (uint i = 0; i < t")
+      && kernelSource.contains("frameCount + _frameIndex")
+
+    XCTAssertFalse(
+      hasPathologicalSerialization,
+      "Backward time-varying cutoff biquad should avoid serializing frameCount * 64 work in one thread. See \(kernelPath)."
+    )
+  }
+
+  func testBackwardMixedHarmonicAndTimeVaryingBiquadNoiseKernelAvoidsSerializingControlFrames() throws {
+    DGenConfig.sampleRate = 24_000.0
+    DGenConfig.maxFrameCount = 16_384
+    let previousKernelPath = DGenConfig.kernelOutputPath
+    let kernelPath = "/tmp/mixed_harmonic_biquad_noise_backward.metal"
+    DGenConfig.kernelOutputPath = kernelPath
+    defer {
+      DGenConfig.kernelOutputPath = previousKernelPath
+      DGenConfig.maxFrameCount = 4096
+    }
+
+    LazyGraphContext.reset()
+
+    let frames = 16_384
+    let controlFrames = 64
+    let harmonics = 32
+
+    let playhead = Signal.phasor(DGenConfig.sampleRate / Float(frames)) * Float(controlFrames - 1)
+    let harmonicIndices = Tensor((0..<harmonics).map { Float($0 + 1) })
+
+    let harmonicAmpFrames = Tensor(
+      (0..<controlFrames).flatMap { frame in
+        let frameNorm = Float(frame) / Float(max(1, controlFrames - 1))
+        return (0..<harmonics).map { h in
+          let harmonicNorm = Float(h) / Float(max(1, harmonics - 1))
+          return 0.1 + 0.9 * max(0.0, 1.0 - abs(frameNorm - harmonicNorm))
+        }
+      }
+    ).reshape([controlFrames, harmonics])
+
+    let gainFrames = Tensor((0..<controlFrames).map { frame in
+      let x = Float(frame) / Float(max(1, controlFrames - 1))
+      return 0.2 + 0.6 * x
+    })
+
+    let cutoffFrames = Tensor((0..<controlFrames).map { i in
+      250.0 + (Float(i) / Float(max(1, controlFrames - 1))) * 8_000.0
+    })
+
+    let baseF0 = Signal.constant(220.0)
+    let harmonicFreqs = harmonicIndices * baseF0
+    let harmonicPhases = Signal.statefulPhasor(harmonicFreqs)
+    let harmonicSines = sin(harmonicPhases * 2.0 * Float.pi)
+    let harmonicAmps = harmonicAmpFrames.peekRow(playhead)
+    let harmonicGain = gainFrames.peek(playhead)
+    let harmonicOut = (harmonicSines * harmonicAmps).sum() * harmonicGain
+
+    let cutoffScale = Signal.param(1.0)
+    let cutoff = cutoffFrames.peek(playhead) * cutoffScale
+    let noiseGain = gainFrames.peek(playhead) * 0.1
+    let noiseOut = Signal.noise().biquad(
+      cutoff: cutoff,
+      resonance: Signal.constant(0.707),
+      gain: Signal.constant(1.0),
+      mode: Signal.constant(0.0)
+    ) * noiseGain
+
+    let mixed = harmonicOut + noiseOut
+    let loss = mse(mixed, Signal.constant(0.0))
+
+    _ = try loss.backward(frames: frames)
+
+    let kernelSource = try String(contentsOfFile: kernelPath, encoding: .utf8)
+    XCTAssertTrue(kernelSource.contains("kernel void"))
+
+    let hasPathologicalSerialization =
+      kernelSource.contains("DispatchMode: perFrameScaled(64)")
+      && kernelSource.contains("if (id >= 0 && id < (uint)(1))")
+      && kernelSource.contains("for (uint i = 0; i < t")
+      && kernelSource.contains("frameCount + _frameIndex")
+
+    XCTAssertFalse(
+      hasPathologicalSerialization,
+      "Mixed harmonic + time-varying biquad noise backward should avoid serializing frameCount * 64 work in one thread. See \(kernelPath)."
+    )
+  }
+
   func testPeekBackwardABAnalytics() throws {
     DGenConfig.sampleRate = 4000.0
     DGenConfig.maxFrameCount = 512

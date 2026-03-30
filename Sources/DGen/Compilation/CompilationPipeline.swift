@@ -317,21 +317,26 @@ public struct CompilationPipeline {
     }
 
     var finalBlocks = separatedBlocks.compactMap { $0 }
-    if graphContainsSpectralLossOps(graph) {
+    if graphContainsIsolatedPasses(graph) {
       finalBlocks = isolateSpectralPasses(finalBlocks, graph)
     }
     return finalBlocks
   }
 
-  /// Checks whether the graph needs spectral-pass isolation to prevent pass overlap.
-  private static func graphContainsSpectralLossOps(_ graph: Graph) -> Bool {
+  /// Checks whether the graph needs isolated-pass handling.
+  ///
+  /// This includes:
+  /// - FFT/spectral kernels that must not share scratch or dispatch shape
+  /// - scalar grad-write passes that must not inherit tensor thread scaling
+  private static func graphContainsIsolatedPasses(_ graph: Graph) -> Bool {
     graph.nodes.values.contains { node in
       switch node.op {
       case .spectralLossFFT, .spectralLossFFTGradInline, .spectralLossFFTGradSpec,
         .spectralLossFFTGradIFFT, .spectralLossFFTGradRead, .spectralLossFFTGradRead2,
         .spectralLossFFTBatched, .spectralLossFFTBatchedReduce,
         .spectralLossFFTBatchedGradSpec, .spectralLossFFTBatchedGradIFFT,
-        .spectralLossFFTBatchedGradRead, .spectralLossFFTBatchedGradRead2:
+        .spectralLossFFTBatchedGradRead, .spectralLossFFTBatchedGradRead2,
+        .sampleGradWrite, .selectRowGradWrite, .peekGradWrite:
         return true
       default:
         return false

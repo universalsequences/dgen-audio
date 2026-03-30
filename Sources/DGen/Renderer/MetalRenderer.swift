@@ -1074,7 +1074,7 @@ public class MetalRenderer: Renderer, UOpEmitter {
       // In Metal, threadIndex maps to 'id' (thread_position_in_grid)
       let idx =
         (currentFrameOrder == .parallel || currentThreadCountOverride != nil)
-        ? "id"
+        ? threadIndexExpr()
         : "i"
       return emitAssign(uop, idx, ctx)
 
@@ -1114,7 +1114,7 @@ public class MetalRenderer: Renderer, UOpEmitter {
 
     case .output(let channel, let val):
       // Store output value to a device buffer that can be read back
-      let baseIdx = (currentFrameOrder == .parallel) ? "id" : "i"
+      let baseIdx = (currentFrameOrder == .parallel) ? threadIndexExpr() : "i"
       let idx =
         frameIndexOverride
         ?? (currentThreadCountScale == nil
@@ -1136,7 +1136,8 @@ public class MetalRenderer: Renderer, UOpEmitter {
       }
       parallelRangeVars.insert(varId)  // Track this as a parallel range loop variable
       if parallelRangeMode == .thread {
-        return "if (id < \(count)) { uint _pr\(varId) = id;"
+        let idx = threadIndexExpr()
+        return "if (\(idx) < \(count)) { uint _pr\(varId) = \(idx);"
       }
       return "for (uint _pr\(varId) = 0; _pr\(varId) < \(count); _pr\(varId)++) {"
     case .endParallelRange:
@@ -1217,7 +1218,7 @@ public class MetalRenderer: Renderer, UOpEmitter {
         return "_pr\(id)"
       } else if ctx.globals.contains(id) {
         let tapeSlot = ctx.getGlobalId(id)
-        let baseIdx = (currentFrameOrder == .parallel) ? "id" : "i"
+        let baseIdx = (currentFrameOrder == .parallel) ? threadIndexExpr() : "i"
         let idx =
           staticGlobalVars.contains(id)
           ? "0"
@@ -1232,7 +1233,7 @@ public class MetalRenderer: Renderer, UOpEmitter {
     case .global(let id):
       // Global variables are accessed through global buffers
       let tapeSlot = ctx.getGlobalId(id)
-      let baseIdx = (currentFrameOrder == .parallel) ? "id" : "i"
+      let baseIdx = (currentFrameOrder == .parallel) ? threadIndexExpr() : "i"
       let idx =
         staticGlobalVars.contains(id)
         ? "0"
@@ -1254,6 +1255,10 @@ public class MetalRenderer: Renderer, UOpEmitter {
     }
     let typeStr = uop.scalarType == .int ? "int" : "float"
     return "\(typeStr) \(lhs) = \(expr);"
+  }
+
+  private func threadIndexExpr() -> String {
+    isGemmKernel ? "gid.x" : "id"
   }
 }
 
