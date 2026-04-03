@@ -212,12 +212,25 @@ private func emitStandardBlockBodyUOps(
 
   for nodeId in block.nodes {
     if !emittedThreadScale, !emittedStatefulTensorThreadIndex, let tensorIndex = block.tensorIndex {
-      // Don't give tensorIndex to inherently scalar stateful ops (accum, phasor, etc.)
-      // These have single-cell state and their own scalar emit path. Giving them a
-      // tensor index causes indexed memory access on single-cell state:
-      // memory[cell + idx] for idx=0..N corrupts adjacent memory.
-      let isScalarOp = g.nodes[nodeId]?.op.isInherentlyScalar ?? false
-      if !isScalarOp {
+      // Most inherently scalar stateful ops must not receive a tensorIndex because they use
+      // single-cell state. Tensor-shaped phasor/accum/latch are the exception: their emit path
+      // handles indexed state explicitly and their cell allocation is expanded during tensor
+      // output binding, so they must keep the tensorIndex to read tensor inputs correctly.
+      let node = g.nodes[nodeId]
+      let keepsTensorIndexForTensorStatefulOp: Bool
+      if let node, case .tensor = node.shape {
+        switch node.op {
+        case .phasor, .accum, .latch:
+          keepsTensorIndexForTensorStatefulOp = true
+        default:
+          keepsTensorIndexForTensorStatefulOp = false
+        }
+      } else {
+        keepsTensorIndexForTensorStatefulOp = false
+      }
+
+      let isScalarOp = node?.op.isInherentlyScalar ?? false
+      if !isScalarOp || keepsTensorIndexForTensorStatefulOp {
         ctx.tensorIndices[nodeId] = tensorIndex
       }
     }
@@ -308,7 +321,11 @@ private func determineVectorPlan(
     let isFrameBased = block.temporality == .frameBased
     canUseSIMD = !hasSIMDBlockers && !isFrameBased && (size % 4 == 0)
   } else {
-    canUseSIMD = false
+    if backend == .c && block.frameOrder == .parallel {
+      canUseSIMD = true
+    } else {
+      canUseSIMD = false
+    }
   }
 
   // vectorWidth and simdIncrement are always the same: 4 for SIMD, 1 otherwise

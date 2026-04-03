@@ -110,4 +110,44 @@ final class CBackendTests: XCTestCase {
         XCTAssert(source.contains("vst1q_f32"), "Tensor writes should use SIMD stores")
         DGenConfig.kernelOutputPath = nil
     }
+
+    func testStatefulTensorPhasorScaledAndSummedDoesNotEmitUnknownLazy() throws {
+        let previousOutputPath = DGenConfig.kernelOutputPath
+        DGenConfig.sampleRate = 44100.0
+        DGenConfig.kernelOutputPath = "/tmp/test_stateful_tensor_phasor_scaled_sum.c"
+        defer {
+            DGenConfig.kernelOutputPath = previousOutputPath
+        }
+
+        let freqs = Tensor([100.0, 200.0, 300.0, 400.0])
+        let signal = (Signal.statefulPhasor(freqs) * (2.0 * Float.pi)).sum()
+        do {
+            let result = try signal.realize(frames: 8)
+
+            XCTAssertEqual(result.count, 8)
+            XCTAssertFalse(result.contains(where: \.isNaN), "Output should not contain NaN")
+            XCTAssertFalse(result.contains(where: \.isInfinite), "Output should not contain Inf")
+        } catch {
+            let source = (try? String(
+                contentsOfFile: "/tmp/test_stateful_tensor_phasor_scaled_sum.c",
+                encoding: .utf8
+            )) ?? ""
+
+            if source.localizedCaseInsensitiveContains("unknown lazy") {
+                XCTFail(
+                    "C backend emitted 'unknown lazy' for tensor -> stateful phasor -> * twopi -> sum -> out.\n\(error)"
+                )
+                return
+            }
+
+            throw error
+        }
+
+        let source = try String(
+            contentsOfFile: "/tmp/test_stateful_tensor_phasor_scaled_sum.c",
+            encoding: .utf8
+        )
+        XCTAssertFalse(source.localizedCaseInsensitiveContains("unknown lazy"))
+        XCTAssertFalse(source.contains("UNKNOWN LAZY"))
+    }
 }

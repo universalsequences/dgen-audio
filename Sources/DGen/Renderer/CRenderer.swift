@@ -2,10 +2,16 @@ import Foundation
 
 public class CRenderer: Renderer {
 
+  public struct GlobalLoadState {
+    public var scalarLoaded: Bool = false
+    public var simdLoaded: Bool = false
+  }
+
   // MC support parameters supplied by CompilationPipeline.Options
   public var voiceCount: Int = 1
   public var voiceCellIdOpt: Int? = nil
-  public var loadedGlobal: [Int: Bool] = [:]
+  public var loadedGlobal: [Int: GlobalLoadState] = [:]
+  private var loadedGlobalScopeStack: [[Int: GlobalLoadState]] = []
   private var staticGlobalVars: Set<VarID> = []
   private var frameIndexOverride: String? = nil
   private var currentThreadCountScale: Int? = nil
@@ -16,6 +22,8 @@ public class CRenderer: Renderer {
 
   // Stack of parallel range loop variable names for threadIndex resolution
   private var parallelRangeVarStack: [String] = []
+  private var activeLoopVarNames: [VarID: String] = [:]
+  private var loopVarBindingStack: [VarID?] = []
 
   // Track the emitted type of each variable in current scope
   public enum EmittedType {
@@ -200,6 +208,8 @@ public class CRenderer: Renderer {
     frameIndexOverride = nil
     currentThreadCountScale = scheduleItem.dispatchMode.threadCountScale
     parallelRangeVarStack = []  // Reset parallel range tracking for new kernel
+    activeLoopVarNames = [:]
+    loopVarBindingStack = []
     inScaledFrameLoop = false  // Reset scaled frame loop tracking
     var code: [String] = []
 
@@ -293,6 +303,7 @@ public class CRenderer: Renderer {
     code.append("  int i = 0;")
 
     loadedGlobal = [:]
+    loadedGlobalScopeStack = []
     varEmittedTypes = [:]
 
     // Define constants and memory (sorted by constantId for deterministic output)
@@ -321,11 +332,11 @@ public class CRenderer: Renderer {
       var diff = 0
       switch uop.op {
       case .beginIf, .beginForLoop, .beginHopCheck:
+        loadedGlobalScopeStack.append(loadedGlobal)
         diff = 1
       case .beginLoop, .beginReverseLoop:
+        loadedGlobalScopeStack.append(loadedGlobal)
         diff = 1
-        // Reset for each new loop scope - variables need to be redeclared
-        loadedGlobal = [:]
         varEmittedTypes = [:]
         frameIndexOverride = nil  // Reset frame index override for new loop scope
         // Track if this is a scaled frame loop (used to decide if parallel range needs its own loop)
@@ -333,17 +344,27 @@ public class CRenderer: Renderer {
           inScaledFrameLoop = true
         }
       case .beginParallelRange:
+        loadedGlobalScopeStack.append(loadedGlobal)
         // Always indent - we emit { } for scope even without a loop
         diff = 1
       case .endIf, .endHopCheck:
+        if let previous = loadedGlobalScopeStack.popLast() {
+          loadedGlobal = previous
+        }
         indent -= 1
       case .endLoop:
+        if let previous = loadedGlobalScopeStack.popLast() {
+          loadedGlobal = previous
+        }
         indent -= 1
         // Reset frame index override when exiting loop scope
         frameIndexOverride = nil
         // Reset scaled frame loop tracking
         inScaledFrameLoop = false
       case .endParallelRange:
+        if let previous = loadedGlobalScopeStack.popLast() {
+          loadedGlobal = previous
+        }
         indent -= 1
         // Reset frame index override when exiting loop scope
         // since _frameIndex variable goes out of scope in C
@@ -376,6 +397,16 @@ public class CRenderer: Renderer {
   private func isIntTypedOffset(_ offset: Lazy) -> Bool {
     guard case .variable(let varId, _) = offset else { return false }
     return varEmittedTypes[varId] == .int_
+  }
+
+  /// Render a Lazy value using its scalar form regardless of the surrounding UOp vector width.
+  /// This is required for scalar-typed memory offsets that may also have an opportunistic SIMD
+  /// alias in scope; address arithmetic must use the scalar symbol, not `simd{id}`.
+  private func emitScalarLazy(_ lazy: Lazy, ctx: IRContext, isOut: Bool = false) -> String {
+    if case .variable(let id, _) = lazy, let loopVarName = activeLoopVarNames[id] {
+      return loopVarName
+    }
+    return emitLazy(lazy, ctx: ctx, vectorWidth: 1, isOut: isOut)
   }
 
   func emit(_ uop: UOp, ctx: IRContext) -> String {
@@ -577,7 +608,6 @@ public class CRenderer: Renderer {
 
     case .memoryRead(let base, let offset):
       if uop.isSimd {
-        let offsetExpr = g(offset)
         // Check offset type to determine how to handle it
         let offsetType: EmittedType
         if case .variable(let varId, _) = offset {
@@ -589,9 +619,11 @@ public class CRenderer: Renderer {
         switch offsetType {
         case .int_, .float_:
           // Offset is scalar (int or float) - use direct SIMD load
-          return emitAssign(uop, "vld1q_f32(&memory[\(base) + (int)\(offsetExpr)])", ctx)
+          let scalarOffsetExpr = emitScalarLazy(offset, ctx: ctx)
+          return emitAssign(uop, "vld1q_f32(&memory[\(base) + (int)\(scalarOffsetExpr)])", ctx)
         case .float32x4:
           // Offset is a SIMD vector - gather 4 values from different locations
+          let offsetExpr = g(offset)
           let gatherExpr = """
             (float32x4_t){
                 memory[\(base) + (int)vgetq_lane_f32(\(offsetExpr), 0)],
@@ -612,7 +644,6 @@ public class CRenderer: Renderer {
 
     case .memoryWrite(let base, let offset, let value):
       if uop.isSimd {
-        let offsetExpr = g(offset)
         let valueExpr = g(value)
         // Check offset type to determine how to handle it
         let offsetType: EmittedType
@@ -625,9 +656,11 @@ public class CRenderer: Renderer {
         switch offsetType {
         case .int_, .float_:
           // Offset is scalar (int or float) - use direct SIMD store
-          return "vst1q_f32(&memory[\(base) + (int)\(offsetExpr)], \(valueExpr));"
+          let scalarOffsetExpr = emitScalarLazy(offset, ctx: ctx)
+          return "vst1q_f32(&memory[\(base) + (int)\(scalarOffsetExpr)], \(valueExpr));"
         case .float32x4:
           // Offset is a SIMD vector - scatter 4 values to different locations
+          let offsetExpr = g(offset)
           return """
             memory[\(base) + (int)vgetq_lane_f32(\(offsetExpr), 0)] = vgetq_lane_f32(\(valueExpr), 0);
             memory[\(base) + (int)vgetq_lane_f32(\(offsetExpr), 1)] = vgetq_lane_f32(\(valueExpr), 1);
@@ -854,13 +887,17 @@ public class CRenderer: Renderer {
       }
 
     case .beginLoop(let iters, let step):
+      loopVarBindingStack.append(nil)
       return "for (int i = 0; i < \(g(iters)); i += \(step)) {"
     case .beginReverseLoop(let iters):
+      loopVarBindingStack.append(nil)
       return "for (int i = \(g(iters)) - 1; i >= 0; i--) {"
     case .beginForLoop(let loopVar, let count):
       guard case .variable(let varId, _) = loopVar else {
         fatalError("beginForLoop requires variable")
       }
+      activeLoopVarNames[varId] = "t\(varId)"
+      loopVarBindingStack.append(varId)
       // Emit count as integer to avoid "t < 33.0" in loop bounds
       let countStr: String
       if case .constant(_, let val) = count {
@@ -869,7 +906,11 @@ public class CRenderer: Renderer {
         countStr = "(int)\(g(count))"
       }
       return "for (int t\(varId) = 0; t\(varId) < \(countStr); t\(varId)++) {"
-    case .endLoop: return "}"
+    case .endLoop:
+      if let boundVarId = loopVarBindingStack.popLast() ?? nil {
+        activeLoopVarNames.removeValue(forKey: boundVarId)
+      }
+      return "}"
 
     case .threadIndex:
       // In C, threadIndex maps to the loop variable
@@ -917,36 +958,57 @@ public class CRenderer: Renderer {
     case .frameCount: return "/* frameCount available as function parameter */"
 
     case .loadGlobal(let id):
-      if loadedGlobal[id] != nil {
-        return "/* skip load */"
-      }
-      loadedGlobal[id] = true
-
       // Compute the correct index - use scaled index when in a scaled frame loop
       let baseIdx = "i"
       let idx =
         frameIndexOverride
         ?? (currentThreadCountScale == nil ? baseIdx : "(\(baseIdx) / \(currentThreadCountScale!))")
 
+      var state = loadedGlobal[id] ?? GlobalLoadState()
+
       if uop.isSimd {
-        // Create a proper SIMD variable declaration for loadGlobal
+        guard !state.simdLoaded else {
+          return "/* skip simd load */"
+        }
+        state.simdLoaded = true
+        loadedGlobal[id] = state
+
         if staticGlobalVars.contains(id) {
           return "float32x4_t simd\(id) = vdupq_n_f32(t\(id)[0]);"
         }
         return "float32x4_t simd\(id) = vld1q_f32(t\(id) + \(idx));"
       } else {
-        // if this global is required by a beginParallelRange element then we need
-        // a simd version where we
-        let simdVersion: String
-        let scalarVersion: String
-        if staticGlobalVars.contains(id) {
-          simdVersion = "float32x4_t simd\(id) = vdupq_n_f32(t\(id)[0]); /* extra */"
-          scalarVersion = emitAssign(uop, "t\(id)[0]", ctx)
-        } else {
-          simdVersion = "float32x4_t simd\(id) = vdupq_n_f32(t\(id)[\(idx)]); /* extra */"
-          scalarVersion = emitAssign(uop, "t\(id)[\(idx)]", ctx)
+        var lines: [String] = []
+
+        if !state.simdLoaded {
+          if staticGlobalVars.contains(id) {
+            lines.append("float32x4_t simd\(id) = vdupq_n_f32(t\(id)[0]); /* extra */")
+          } else {
+            lines.append("float32x4_t simd\(id) = vld1q_f32(t\(id) + \(idx)); /* extra */")
+          }
+          state.simdLoaded = true
         }
-        return simdVersion + "\n    " + scalarVersion
+
+        if !state.scalarLoaded {
+          if staticGlobalVars.contains(id) {
+            lines.append(emitAssign(uop, "t\(id)[0]", ctx))
+          } else {
+            lines.append(emitAssign(uop, "t\(id)[\(idx)]", ctx))
+          }
+          state.scalarLoaded = true
+        }
+
+        loadedGlobal[id] = state
+
+        guard !lines.isEmpty else {
+          return "/* skip scalar load */"
+        }
+
+        if staticGlobalVars.contains(id) {
+          return lines.joined(separator: "\n    ")
+        } else {
+          return lines.joined(separator: "\n    ")
+        }
       }
 
     // Parallel range - for C, render as a simple for loop
@@ -972,6 +1034,7 @@ public class CRenderer: Renderer {
         // No loop needed - outer frame loop covers all iterations
         // Push "i" so threadIndex knows to use the frame loop variable
         parallelRangeVarStack.append("i")
+        loopVarBindingStack.append(nil)
         // Still emit { } to create a scope for local variables like _frameIndex
         return "{ /* parallel range covered by scaled frame loop */"
       }
@@ -979,12 +1042,17 @@ public class CRenderer: Renderer {
       // Push loop variable name onto stack for threadIndex resolution
       let loopVarName = "\(pre)\(varId)"
       parallelRangeVarStack.append(loopVarName)
+      activeLoopVarNames[varId] = loopVarName
+      loopVarBindingStack.append(varId)
       return
         "for (int \(loopVarName) = 0; \(loopVarName) < \(count); \(loopVarName)+=\(incr)) {"
     case .endParallelRange:
       // Pop the loop variable from the stack
       if !parallelRangeVarStack.isEmpty {
         parallelRangeVarStack.removeLast()
+      }
+      if let boundVarId = loopVarBindingStack.popLast() ?? nil {
+        activeLoopVarNames.removeValue(forKey: boundVarId)
       }
       // Always emit closing brace - we emit { } for scope even without loop
       return "}"
