@@ -33,6 +33,12 @@ public enum DGenConfig {
     /// Enable debug output during compilation (prints block structure, etc.)
     public static var debug: Bool = false
 
+    /// GEMM codegen strategy for Metal matmul kernels.
+    /// - .none: skip GEMM rewrite, use naive matmul lowering
+    /// - .registerTiled: SIMD matrix intrinsics with register-level reuse (default)
+    /// - .threadgroupStaged: cooperative threadgroup-memory staging for cross-SIMD-group reuse
+    public static var gemmStrategy: GEMMStrategy = .registerTiled
+
     /// Enable buffer liveness analysis and reuse to reduce memory allocations
     public static var enableBufferReuse: Bool = true
 }

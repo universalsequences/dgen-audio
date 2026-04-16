@@ -248,6 +248,7 @@ extension TensorMemoryMaterializationPass {
       nodeId.map { frameBasedNodes.contains($0) || hopBasedNodes[$0] != nil } ?? false
     let isChunkedGemmPartial = nodeId.flatMap { graph.nodes[$0] }.map {
       if case .gemmChunkPartials = $0.op { return true }
+      if case .gemmStagedChunkPartials = $0.op { return true }
       return false
     } ?? false
     // Chunked GEMM partial outputs already encode chunk dimension in their tensor shape.

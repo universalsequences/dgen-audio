@@ -49,6 +49,19 @@ public enum Backend {
   case metal
 }
 
+/// GEMM codegen strategy for Metal matmul kernels.
+///
+/// - none: Skip GEMMPass entirely. Naive scalar matmul.
+/// - registerTiled: One SIMD group per 8×8 output tile. Register-level reuse only.
+/// - threadgroupStaged: One threadgroup owns a block of output tiles, cooperatively
+///   stages A/B strips into threadgroup memory, barriers, computes. Falls back to
+///   registerTiled for shapes that don't meet the staged eligibility (M/N % 16, K % 8).
+public enum GEMMStrategy: Equatable, Sendable {
+  case none
+  case registerTiled
+  case threadgroupStaged
+}
+
 /// Main compilation pipeline that converts a Graph into compiled kernels
 public struct CompilationPipeline {
 
@@ -65,6 +78,7 @@ public struct CompilationPipeline {
     /// If omitted while `voiceCount > 1`, compilation allocates a dedicated cell.
     public let voiceCellId: Int?
     public let enableBufferReuse: Bool
+    public let gemmStrategy: GEMMStrategy
 
     public init(
       frameCount: Int = 128,
@@ -73,7 +87,8 @@ public struct CompilationPipeline {
       forceScalar: Bool = false,
       voiceCount: Int = 1,
       voiceCellId: Int? = nil,
-      enableBufferReuse: Bool = false
+      enableBufferReuse: Bool = false,
+      gemmStrategy: GEMMStrategy = .registerTiled
     ) {
       self.frameCount = frameCount
       self.debug = debug
@@ -82,6 +97,7 @@ public struct CompilationPipeline {
       self.voiceCount = voiceCount
       self.voiceCellId = voiceCellId
       self.enableBufferReuse = enableBufferReuse
+      self.gemmStrategy = gemmStrategy
     }
   }
 
@@ -267,9 +283,9 @@ public struct CompilationPipeline {
         : findSequentialNodes(graph, feedbackClusters: feedbackClusters, backend: backend)
     }
 
-    if backend == .metal {
+    if backend == .metal && options.gemmStrategy != .none {
       timings.measure("gemmPass") {
-        GraphPrepPasses.gemmPass(graph: graph)
+        GraphPrepPasses.gemmPass(graph: graph, strategy: options.gemmStrategy)
       }
     }
 

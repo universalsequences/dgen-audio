@@ -390,7 +390,7 @@ public class MetalRenderer: Renderer, UOpEmitter {
       return variableIdsUsed(in: a).union(variableIdsUsed(in: b))
 
     case .memoryRead(_, let a), .beginLoop(let a, _), .simdgroupLoad(_, let a, _, _),
-      .threadgroupRead(_, let a):
+      .simdgroupLoadScratch(_, let a, _, _), .threadgroupRead(_, let a):
       return variableIdsUsed(in: a)
 
     case .memoryWrite(_, let a, let b), .memoryAccumulate(_, let a, let b),
@@ -681,6 +681,14 @@ public class MetalRenderer: Renderer, UOpEmitter {
           op: .beginRange(.constant(0, 0), .constant(0, Float(totalThreads))), value: .empty)
         scheduleItem.ops.append(beginRange)
         hasFrameLoop = false
+
+      case .gemmStaged(let tilesM, let tilesN, _, _, _, let tpg, let depth):
+        let d = max(1, depth ?? 1)
+        let totalThreads = tilesM * tilesN * d * tpg
+        let beginRange = UOp(
+          op: .beginRange(.constant(0, 0), .constant(0, Float(totalThreads))), value: .empty)
+        scheduleItem.ops.append(beginRange)
+        hasFrameLoop = false
       }
 
       // Hop-based temporality: wrap body in hop check conditional.
@@ -718,10 +726,18 @@ public class MetalRenderer: Renderer, UOpEmitter {
     currentThreadCountOverride = scheduleItem.dispatchMode.fixedThreadCount
     currentTemporality = scheduleItem.temporality  // Set temporality for gradient indexing
     currentFrameOrder = scheduleItem.frameOrder
-    isGemmKernel = {
-      if case .gemm = scheduleItem.dispatchMode { return true }
-      return false
-    }()
+    let isGemmStagedKernel: Bool
+    switch scheduleItem.dispatchMode {
+    case .gemmStaged:
+      isGemmKernel = true
+      isGemmStagedKernel = true
+    case .gemm:
+      isGemmKernel = true
+      isGemmStagedKernel = false
+    default:
+      isGemmKernel = false
+      isGemmStagedKernel = false
+    }
     usesThreadgroupScratch = Self.hasThreadgroupScratch(scheduleItem)
     let (inputs, outputs) = analyzeDependencies(scheduleItem: scheduleItem, ctx: ctx)
 
@@ -769,6 +785,10 @@ public class MetalRenderer: Renderer, UOpEmitter {
 
     if isGemmKernel {
       parameters.append("    uint3 gid [[threadgroup_position_in_grid]]")
+      if isGemmStagedKernel {
+        parameters.append("    uint tid_in_tg [[thread_index_in_threadgroup]]")
+        parameters.append("    uint sgid [[simdgroup_index_in_threadgroup]]")
+      }
     } else {
       parameters.append("    uint id [[thread_position_in_grid]]")
     }
@@ -1174,6 +1194,10 @@ public class MetalRenderer: Renderer, UOpEmitter {
       return emitAssign(uop, "gid.y", ctx)
     case .threadgroupPositionZ:
       return emitAssign(uop, "gid.z", ctx)
+    case .threadIndexInThreadgroup:
+      return emitAssign(uop, "tid_in_tg", ctx)
+    case .simdgroupIndexInThreadgroup:
+      return emitAssign(uop, "sgid", ctx)
 
     // GEMM simdgroup matrix operations
     case .simdgroupMatrixZero:
@@ -1185,6 +1209,12 @@ public class MetalRenderer: Renderer, UOpEmitter {
       let transposeArgs = transpose ? ", ulong2(0, 0), true" : ""
       return
         "metal::simdgroup_float8x8 \(lhs) = metal::simdgroup_float8x8(0); metal::simdgroup_load(\(lhs), &memory[\(cellId) + \(cast)\(g(offset))], \(stride)\(transposeArgs));"
+    case .simdgroupLoadScratch(let scratchId, let offset, let stride, let transpose):
+      let lhs = emitLazy(uop.value, ctx: ctx, isOut: true)
+      let cast = intCastPrefix(for: offset)
+      let transposeArgs = transpose ? ", ulong2(0, 0), true" : ""
+      return
+        "metal::simdgroup_float8x8 \(lhs) = metal::simdgroup_float8x8(0); metal::simdgroup_load(\(lhs), &scratch_\(scratchId)[\(cast)\(g(offset))], \(stride)\(transposeArgs));"
     case .simdgroupStore(let src, let cellId, let offset, let stride):
       let cast = intCastPrefix(for: offset)
       return
@@ -1201,6 +1231,8 @@ public class MetalRenderer: Renderer, UOpEmitter {
     case .threadgroupWrite(let scratchId, let offset, let value):
       let cast = intCastPrefix(for: offset)
       return "scratch_\(scratchId)[\(cast)\(g(offset))] = \(g(value));"
+    case .threadgroupBarrier:
+      return "threadgroup_barrier(metal::mem_flags::mem_threadgroup);"
 
     default:
       return "/* \(uop.prettyDescription()) */"

@@ -118,7 +118,12 @@ public class LazyGraph {
     return try CompilationPipeline.compile(
       graph: graph,
       backend: .c,
-      options: .init(frameCount: frameCount, debug: DGenConfig.debug, voiceCount: voiceCount, enableBufferReuse: DGenConfig.enableBufferReuse)
+      options: .init(
+        frameCount: frameCount,
+        debug: DGenConfig.debug,
+        voiceCount: voiceCount,
+        enableBufferReuse: DGenConfig.enableBufferReuse,
+        gemmStrategy: DGenConfig.gemmStrategy)
     )
   }
 

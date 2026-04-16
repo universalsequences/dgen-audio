@@ -542,16 +542,17 @@ private func groupRegularTensorBlock(
       }
       currentShape = nil
 
-    } else if case .gemm = node.op {
-      // GEMM manages its own dispatch — isolate into its own block
+    } else if node.op.isSelfDispatchedGemm {
+      // GEMM variants manage their own dispatch — isolate into their own block.
       appendCurrentGroupingBlockIfNeeded(&currentBlock, grouped: &grouped)
       var gemmBlock = makeTensorGroupingBlock(from: block)
       gemmBlock.nodes.append(nodeId)
-      gemmBlock.shape = nil  // GEMM has its own dispatch, no shape-based threading
+      gemmBlock.shape = nil
       grouped.append(gemmBlock)
       currentBlock = makeTensorGroupingBlock(from: block)
       currentShape = nil
       continue
+
     } else if case .gemmSmall(let M, let N, _, _, _) = node.op {
       // gemmSmall uses perFrameScaled(M*N) dispatch — isolate into its own block
       appendCurrentGroupingBlockIfNeeded(&currentBlock, grouped: &grouped)
@@ -563,17 +564,6 @@ private func groupRegularTensorBlock(
       currentBlock = makeTensorGroupingBlock(from: block)
       currentShape = nil
       continue
-    } else if case .gemmChunkPartials = node.op {
-      // Chunked GEMM partials use explicit 3D tiled dispatch.
-      appendCurrentGroupingBlockIfNeeded(&currentBlock, grouped: &grouped)
-      var gemmBlock = makeTensorGroupingBlock(from: block)
-      gemmBlock.nodes.append(nodeId)
-      gemmBlock.shape = nil
-      grouped.append(gemmBlock)
-      currentBlock = makeTensorGroupingBlock(from: block)
-      currentShape = nil
-      continue
-
     } else if case .constant = node.op {
       // Constants do not affect grouping state.
     } else if case .overlapAdd = node.op {

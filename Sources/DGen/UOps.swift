@@ -100,10 +100,15 @@ public enum Op {
   case threadgroupPositionX  // gid.x — column tile index
   case threadgroupPositionY  // gid.y — row tile index
   case threadgroupPositionZ  // gid.z — frame index (for per-frame GEMM)
+  case threadIndexInThreadgroup  // [[thread_index_in_threadgroup]] — flat tid within TG
+  case simdgroupIndexInThreadgroup  // [[simdgroup_index_in_threadgroup]] — SIMD group ID within TG
 
   // GEMM / simdgroup matrix operations (Metal tensor cores)
   case simdgroupMatrixZero  // declare simdgroup_float8x8, zero-initialized
   case simdgroupLoad(CellID, Lazy, Int, Bool)  // simdgroup_load(dest, memory[cell] + offset, stride, transpose)
+  /// Load an 8×8 matrix tile from threadgroup scratch memory rather than device memory.
+  /// (scratchId, offset, stride, transpose).
+  case simdgroupLoadScratch(scratchId: Int, Lazy, Int, Bool)
   case simdgroupStore(Lazy, CellID, Lazy, Int)  // simdgroup_store(src, memory[cell] + offset, stride)
   case simdgroupMultiplyAccumulate(Lazy, Lazy, Lazy)  // acc = a * b + acc
 
@@ -111,6 +116,7 @@ public enum Op {
   case threadgroupArrayDecl(scratchId: Int, size: Int)  // declare threadgroup float scratch_N[size]
   case threadgroupRead(scratchId: Int, Lazy)    // read scratch_N[offset]
   case threadgroupWrite(scratchId: Int, Lazy, Lazy)   // scratch_N[offset] = value
+  case threadgroupBarrier  // threadgroup_barrier(metal::mem_flags::mem_threadgroup);
 
   public var isDefineGlobal: Bool {
     if case .defineGlobal = self { return true }
@@ -190,6 +196,8 @@ public enum Op {
     case .beginIf(let c): return .beginIf(r(c))
     case .beginHopCheck(let c): return .beginHopCheck(r(c))
     case .simdgroupLoad(let c, let o, let s, let t): return .simdgroupLoad(c, r(o), s, t)
+    case .simdgroupLoadScratch(let id, let o, let s, let t):
+      return .simdgroupLoadScratch(scratchId: id, r(o), s, t)
     case .simdgroupStore(let src, let c, let o, let s): return .simdgroupStore(r(src), c, r(o), s)
     case .simdgroupMultiplyAccumulate(let a, let b, let acc):
       return .simdgroupMultiplyAccumulate(r(a), r(b), r(acc))

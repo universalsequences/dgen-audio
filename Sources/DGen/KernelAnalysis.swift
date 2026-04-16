@@ -50,7 +50,7 @@ private func classify(_ op: Op) -> OpClass {
   // Memory ops
   case .load, .store, .memoryRead, .memoryWrite, .memoryAccumulate,
        .delay1, .loadGlobal, .loadTape,
-       .simdgroupLoad, .simdgroupStore,
+       .simdgroupLoad, .simdgroupLoadScratch, .simdgroupStore,
        .threadgroupRead, .threadgroupWrite:
     return .memory
 
@@ -75,7 +75,8 @@ private func classify(_ op: Op) -> OpClass {
        .broadcastAccess, .sumAxisMarker, .maxAxisMarker, .meanAxisMarker,
        .expandAxisMarker, .beginHopCheck, .endHopCheck,
        .beginReverseLoop, .threadgroupPositionX, .threadgroupPositionY, .threadgroupPositionZ,
-       .threadgroupArrayDecl:
+       .threadIndexInThreadgroup, .simdgroupIndexInThreadgroup,
+       .threadgroupArrayDecl, .threadgroupBarrier:
     return .control
 
   // GEMM simdgroup ops — multiply-accumulate is the core compute
