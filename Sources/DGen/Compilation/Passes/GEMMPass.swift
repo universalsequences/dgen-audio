@@ -58,19 +58,55 @@ extension GraphPrepPasses {
 
   /// Choose between SIMD-group GEMM (8-aligned) and element-parallel fallback.
   private static func gemmOp(
-    M: Int, N: Int, K: Int, transA: Bool, transB: Bool
+    M: Int, N: Int, K: Int, transA: Bool, transB: Bool, strategy: GEMMStrategy
   ) -> LazyOp {
-    let aligned = M % 8 == 0 && N % 8 == 0 && K % 8 == 0
-    return aligned
-      ? .gemm(M, N, K, transA, transB)
-      : .gemmSmall(M, N, K, transA, transB)
+    let aligned8 = M % 8 == 0 && N % 8 == 0 && K % 8 == 0
+    if !aligned8 {
+      return .gemmSmall(M, N, K, transA, transB)
+    }
+    // Threadgroup-staged variant: requires 16-aligned M/N (16×16 output block)
+    // and 8-aligned K. Falls back to register-tiled .gemm otherwise.
+    if strategy == .threadgroupStaged
+      && M % MetalGemmStaged.blockM == 0
+      && N % MetalGemmStaged.blockN == 0
+      && K % MetalGemmStaged.blockK == 0
+    {
+      return .gemmStaged(
+        M, N, K, transA, transB,
+        MetalGemmStaged.blockM, MetalGemmStaged.blockN, MetalGemmStaged.blockK)
+    }
+    return .gemm(M, N, K, transA, transB)
+  }
+
+  /// Block-dimension constants for the threadgroup-staged GEMM variant.
+  /// Chosen to give 2×2 SIMD groups per threadgroup (128 threads), with each
+  /// SIMD group owning one 8×8 output tile via simdgroup matrix intrinsics.
+  enum MetalGemmStaged {
+    static let blockM: Int = 16
+    static let blockN: Int = 16
+    static let blockK: Int = 8
+    static let threadsPerSIMDGroup: Int = 32
+
+    /// Build the staged `DispatchMode` from staged GEMM parameters.
+    /// `depth == nil` for per-frame dispatch; non-nil for chunked-partials.
+    static func dispatchMode(
+      M: Int, N: Int, blockM: Int, blockN: Int, blockK: Int, depth: Int?
+    ) -> DispatchMode {
+      // One SIMD group per 8×8 output tile within the block.
+      let simdGroupsPerTG = (blockM / 8) * (blockN / 8)
+      return .gemmStaged(
+        tilesM: M / blockM, tilesN: N / blockN,
+        blockM: blockM, blockN: blockN, blockK: blockK,
+        threadsPerGroup: simdGroupsPerTG * threadsPerSIMDGroup,
+        depth: depth)
+    }
   }
 
   /// Detects `sumAxis(mul(a, b))` patterns that represent matrix multiplication and
   /// rewrites them as `.gemm` nodes, removing orphaned intermediate nodes.
   /// Handles both forward patterns (broadcast size-1 dims) and backward patterns
   /// (expandAxis from sumAxis backward).
-  static func gemmPass(graph: Graph) {
+  static func gemmPass(graph: Graph, strategy: GEMMStrategy = .registerTiled) {
     for (nodeId, node) in graph.nodes {
       guard node.inputs.count == 1,
         let mulNode = graph.nodes[node.inputs[0]]
@@ -166,7 +202,7 @@ extension GraphPrepPasses {
         let transB = !rightHasTranspose
         graph.nodes[nodeId] = Node(
           id: nodeId,
-          op: gemmOp(M: M, N: N, K: K, transA: transA, transB: transB),
+          op: gemmOp(M: M, N: N, K: K, transA: transA, transB: transB, strategy: strategy),
           inputs: [leftSource, rightSource])
         graph.nodes[nodeId]?.shape = .tensor([M, N])
 
@@ -192,7 +228,7 @@ extension GraphPrepPasses {
 
       graph.nodes[nodeId] = Node(
         id: nodeId,
-        op: gemmOp(M: M, N: N, K: K, transA: match.transA, transB: match.transB),
+        op: gemmOp(M: M, N: N, K: K, transA: match.transA, transB: match.transB, strategy: strategy),
         inputs: [match.leftSource, match.rightSource])
       graph.nodes[nodeId]?.shape = .tensor([M, N])
 
@@ -360,6 +396,9 @@ extension GraphPrepPasses {
       let K: Int
       let transA: Bool
       let transB: Bool
+      /// When non-nil, the source GEMM was `.gemmStaged` with these block dims;
+      /// rewrite to `.gemmStagedChunkPartials`. When nil, rewrite to `.gemmChunkPartials`.
+      let stagedBlock: (blockM: Int, blockN: Int, blockK: Int)?
     }
 
     var matches: [Match] = []
@@ -372,9 +411,20 @@ extension GraphPrepPasses {
       let (sourceNodeId, viewNodeIds, outputHasTranspose, _) = traceViewChain(
         from: node.inputs[0], graph: graph)
       guard let gemmNode = graph.nodes[sourceNodeId],
-        case .gemm(let M, let N, let K, let transA, let transB) = gemmNode.op,
         gemmNode.inputs.count == 2
       else { continue }
+
+      let M: Int, N: Int, K: Int, transA: Bool, transB: Bool
+      let stagedBlock: (blockM: Int, blockN: Int, blockK: Int)?
+      switch gemmNode.op {
+      case .gemm(let m, let n, let k, let ta, let tb):
+        M = m; N = n; K = k; transA = ta; transB = tb
+        stagedBlock = nil
+      case .gemmStaged(let m, let n, let k, let ta, let tb, let bM, let bN, let bK):
+        M = m; N = n; K = k; transA = ta; transB = tb
+        stagedBlock = (bM, bN, bK)
+      default: continue
+      }
 
       let hasOtherConsumer = graph.nodes.values.contains {
         $0.id != nodeId && !viewNodeIds.contains($0.id) && $0.inputs.contains(sourceNodeId)
@@ -395,7 +445,8 @@ extension GraphPrepPasses {
           N: N,
           K: K,
           transA: transA,
-          transB: transB
+          transB: transB,
+          stagedBlock: stagedBlock
         ))
     }
 
@@ -409,9 +460,17 @@ extension GraphPrepPasses {
         case .tensorAccumulate = node.op
       else { continue }
 
+      let partialOp: LazyOp
+      if let block = match.stagedBlock {
+        partialOp = .gemmStagedChunkPartials(
+          match.M, match.N, match.K, match.transA, match.transB, chunkSize, chunkCount,
+          block.blockM, block.blockN, block.blockK)
+      } else {
+        partialOp = .gemmChunkPartials(
+          match.M, match.N, match.K, match.transA, match.transB, chunkSize, chunkCount)
+      }
       let partialNodeId = graph.n(
-        .gemmChunkPartials(
-          match.M, match.N, match.K, match.transA, match.transB, chunkSize, chunkCount),
+        partialOp,
         match.gemmInputs,
         shape: .tensor([chunkCount, match.M, match.N])
       )

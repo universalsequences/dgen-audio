@@ -356,13 +356,25 @@ public class MetalCompiledKernel: CompiledKernelRuntime {
       }
     }
 
-    if case .gemm(let tilesM, let tilesN, let fixedDepth) = kernel.dispatchMode {
-      let depth = fixedDepth ?? (kernel.temporality == .static_ ? 1 : frameCount)
+    let gemmParams: (tilesM: Int, tilesN: Int, fixedDepth: Int?, tpg: Int, label: String)?
+    switch kernel.dispatchMode {
+    case .gemm(let tilesM, let tilesN, let fixedDepth):
+      gemmParams = (tilesM, tilesN, fixedDepth, 32, "gemm")
+    case .gemmStaged(let tilesM, let tilesN, _, _, _, let tpg, let fixedDepth):
+      gemmParams = (tilesM, tilesN, fixedDepth, tpg, "gemmStaged")
+    default:
+      gemmParams = nil
+    }
+    if let g = gemmParams {
+      let depth = g.fixedDepth ?? (kernel.temporality == .static_ ? 1 : frameCount)
       encoder.dispatchThreadgroups(
-        MTLSize(width: tilesN, height: tilesM, depth: max(1, depth)),
-        threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1)
+        MTLSize(width: g.tilesN, height: g.tilesM, depth: max(1, depth)),
+        threadsPerThreadgroup: MTLSize(width: g.tpg, height: 1, depth: 1)
       )
-      return "gemm(\(tilesM)x\(tilesN)x\(depth))"
+      if g.label == "gemmStaged" {
+        return "gemmStaged(\(g.tilesM)x\(g.tilesN)x\(depth) tpg=\(g.tpg))"
+      }
+      return "gemm(\(g.tilesM)x\(g.tilesN)x\(depth))"
     }
 
     let totalThreads = kernel.dispatchMode.threadCount(frameCount: frameCount)

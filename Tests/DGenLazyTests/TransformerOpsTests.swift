@@ -169,6 +169,55 @@ final class TransformerOpsTests: XCTestCase {
     return (output: weights.matmul(V), weights: weights)
   }
 
+  /// Simulate autoregressive decoding with a KV cache.
+  ///
+  /// Each step projects the new token once, appends its K/V to cache, and computes
+  /// attention only for the current query against cached prefixes.
+  private static func incrementalAttentionWithKVCache(
+    input: [[Float]],
+    WQ: [[Float]],
+    WK: [[Float]],
+    WV: [[Float]]
+  ) -> (output: [Float], cacheLengths: [Int]) {
+    let dv = WV[0].count
+    var cachedK: [[Float]] = []
+    var cachedV: [[Float]] = []
+    var output: [Float] = []
+    var cacheLengths: [Int] = []
+
+    for token in input {
+      LazyGraphContext.reset()
+
+      let x = Tensor([token])
+      let wq = Tensor(WQ)
+      let wk = Tensor(WK)
+      let wv = Tensor(WV)
+
+      let q = x.matmul(wq)
+      let k = x.matmul(wk)
+      let v = x.matmul(wv)
+
+      let kRow = try! k.realize()
+      let vRow = try! v.realize()
+
+      cachedK.append(kRow)
+      cachedV.append(vRow)
+      cacheLengths.append(cachedK.count)
+
+      let qTensor = Tensor([try! q.realize()])
+      let kCacheTensor = Tensor(cachedK)
+      let vCacheTensor = Tensor(cachedV)
+
+      let scores = qTensor.matmul(kCacheTensor.transpose()) / Foundation.sqrt(Float(WQ[0].count))
+      let weights = scores.softmax(axis: -1)
+      let stepOutput = try! weights.matmul(vCacheTensor).realize()
+      precondition(stepOutput.count == dv)
+      output.append(contentsOf: stepOutput)
+    }
+
+    return (output: output, cacheLengths: cacheLengths)
+  }
+
   func testAttentionForward() throws {
     // X: [4, 3] - 4 sequence positions, 3-dim embedding
     let X = Tensor([
@@ -212,6 +261,59 @@ final class TransformerOpsTests: XCTestCase {
     for val in outputVals {
       XCTAssertFalse(val.isNaN, "no NaN in output")
       XCTAssertFalse(val.isInfinite, "no Inf in output")
+    }
+  }
+
+  func testKVCacheMatchesFullCausalAttention() throws {
+    let xData: [[Float]] = [
+      [1.0, 0.0, 0.5],
+      [0.0, 1.0, 1.0],
+      [1.0, 1.0, 0.0],
+      [0.5, 0.5, 1.0],
+    ]
+    let wqData: [[Float]] = [
+      [0.6, -0.2],
+      [0.1, 0.5],
+      [0.3, 0.4],
+    ]
+    let wkData: [[Float]] = [
+      [0.4, 0.2],
+      [-0.3, 0.7],
+      [0.5, -0.1],
+    ]
+    let wvData: [[Float]] = [
+      [0.2, 0.8],
+      [0.6, -0.4],
+      [0.5, 0.3],
+    ]
+
+    let X = Tensor(xData)
+    let WQ = Tensor(wqData)
+    let WK = Tensor(wkData)
+    let WV = Tensor(wvData)
+    let causalMask = Tensor([
+      [0, -1e9, -1e9, -1e9],
+      [0, 0, -1e9, -1e9],
+      [0, 0, 0, -1e9],
+      [0, 0, 0, 0],
+    ])
+
+    let (fullOutput, _) = Self.attention(X, WQ, WK, WV, mask: causalMask)
+    let fullOutputValues = try fullOutput.realize()
+
+    let (cachedOutputValues, cacheLengths) = Self.incrementalAttentionWithKVCache(
+      input: xData,
+      WQ: wqData,
+      WK: wkData,
+      WV: wvData)
+
+    XCTAssertEqual(cacheLengths, [1, 2, 3, 4], "KV cache should grow one token per decode step")
+    XCTAssertEqual(cachedOutputValues.count, fullOutputValues.count)
+
+    for i in 0..<fullOutputValues.count {
+      XCTAssertEqual(
+        cachedOutputValues[i], fullOutputValues[i], accuracy: 1e-4,
+        "incremental KV-cache decode should match full causal attention at index \(i)")
     }
   }
 
@@ -588,5 +690,122 @@ final class TransformerOpsTests: XCTestCase {
     let minHit = hitPreds.min()!
     let maxRest = restPreds.max()!
     XCTAssertGreaterThan(minHit, maxRest, "All hits should score higher than all rests")
+  }
+
+  func testTwoLayerAttention() throws {
+    // Teacher: fixed projection matrices
+    let teacherWQ1 = Tensor([
+      [0.5, 0.1, -0.3],
+      [-0.2, 0.8, 0.1],
+      [0.3, -0.1, 0.6],
+    ])
+    let teacherWK1 = Tensor([
+      [0.4, -0.2, 0.5],
+      [0.1, 0.7, -0.1],
+      [-0.3, 0.2, 0.4],
+    ])
+    let teacherWV1 = Tensor([
+      [0.6, 0.0, -0.2],
+      [-0.1, 0.5, 0.3],
+      [0.2, -0.3, 0.7],
+    ])
+
+    let teacherWQ2 = Tensor([
+      [0.3, 0.1, 0.5],
+      [-0.3, -0.2, 0.3],
+      [0.1, 0.3, 0.6],
+    ])
+
+    let teacherWK2 = Tensor([
+      [0.1, 0.3, 0.5],
+      [0.03, -0.3, -0.6],
+      [0.3, 0.3, 0.1],
+    ])
+
+    let teacherWV2 = Tensor([
+      [0.1, 0.3, 0.5],
+      [0.03, -0.3, -0.6],
+      [0.3, 0.3, 0.1],
+    ])
+
+    // Student: learnable params initialized to small values
+    let studentWQ1 = Tensor.param(
+      [3, 3],
+      data: [
+        0.1, 0.1, 0.1,
+        0.1, 0.1, 0.1,
+        0.1, 0.1, 0.1,
+      ])
+    let studentWK1 = Tensor.param(
+      [3, 3],
+      data: [
+        0.1, 0.1, 0.1,
+        0.1, 0.1, 0.1,
+        0.1, 0.1, 0.1,
+      ])
+    let studentWV1 = Tensor.param(
+      [3, 3],
+      data: [
+        0.1, 0.1, 0.1,
+        0.1, 0.1, 0.1,
+        0.1, 0.1, 0.1,
+      ])
+
+    let studentWK2 = Tensor.param(
+      [3, 3],
+      data: [
+        0.1, 0.1, 0.3,
+        0.3, 0.1, 0.3,
+        0.3, 0.3, 0.3,
+      ])
+
+    let studentWV2 = Tensor.param(
+      [3, 3],
+      data: [
+        0.1, 0.1, 0.3,
+        0.3, 0.1, 0.3,
+        0.3, 0.3, 0.3,
+      ])
+
+    let studentWQ2 = Tensor.param(
+      [3, 3],
+      data: [
+        0.1, 0.1, 0.3,
+        0.3, 0.1, 0.3,
+        0.3, 0.3, 0.3,
+      ])
+
+    // Input X: [4, 3]
+    let X = Tensor([
+      [1, 0, 0],
+      [0, 1, 0],
+      [0, 0, 1],
+      [1, 1, 0],
+    ])
+
+    let optimizer = Adam(
+      params: [studentWQ1, studentWK1, studentWV1, studentWQ2, studentWK2, studentWV2], lr: 0.005)
+    let epochs = 170
+    var losses: [Float] = []
+
+    for _ in 0..<epochs {
+      // Rebuild graph fresh each iteration
+      let (teacherLayer1, _) = Self.attention(X, teacherWQ1, teacherWK1, teacherWV1)
+      let (teacherOut, _) = Self.attention(teacherLayer1, teacherWQ2, teacherWK2, teacherWV2)
+      let (studentLayer1, _) = Self.attention(X, studentWQ1, studentWK1, studentWV1)
+      let (studentOut, _) = Self.attention(studentLayer1, studentWQ2, studentWK2, studentWV2)
+
+      let diff = studentOut - teacherOut
+      let loss = (diff * diff).sum()
+
+      let lossValue = try loss.backward(frameCount: 1).first ?? 0
+      losses.append(lossValue)
+
+      optimizer.step()
+      optimizer.zeroGrad()
+    }
+
+    XCTAssertGreaterThan(losses[0], losses.last!, "Loss should decrease")
+    XCTAssertLessThan(losses.last!, losses[0] * 0.3, "Final loss < 30% of initial")
   }
 }

@@ -137,8 +137,14 @@ extension UOpBlockFinalization {
       switch node.op {
       case .gemm(let M, let N, _, _, _):
         return .gemm(tilesM: M / 8, tilesN: N / 8)
+      case .gemmStaged(let M, let N, _, _, _, let blockM, let blockN, let blockK):
+        return GraphPrepPasses.MetalGemmStaged.dispatchMode(
+          M: M, N: N, blockM: blockM, blockN: blockN, blockK: blockK, depth: nil)
       case .gemmChunkPartials(let M, let N, _, _, _, _, let chunkCount):
         return .gemm(tilesM: M / 8, tilesN: N / 8, depth: chunkCount)
+      case .gemmStagedChunkPartials(let M, let N, _, _, _, _, let chunkCount, let blockM, let blockN, let blockK):
+        return GraphPrepPasses.MetalGemmStaged.dispatchMode(
+          M: M, N: N, blockM: blockM, blockN: blockN, blockK: blockK, depth: chunkCount)
       case .gemmSmall(let M, let N, _, _, _):
         return .perFrameScaled(M * N)
       default: continue

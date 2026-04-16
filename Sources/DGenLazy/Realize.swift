@@ -110,14 +110,17 @@ extension LazyGraph {
     /// Compile and run the graph, returning the execution context
     func compile(frameCount: Int) throws -> ExecutionContext {
         // Use cached compilation if available and not dirty
-        if !isDirty, let cached = compilationCache, let runtime = runtimeCache {
+        let compileFingerprint =
+            "\(graph.nodes.count)|\(graph.tensors.count)|\(frameCount)|backend:\(DGenConfig.backend)|gemm:\(DGenConfig.gemmStrategy)|reuse:\(DGenConfig.enableBufferReuse)"
+
+        if !isDirty, let cached = compilationCache, let runtime = runtimeCache,
+           let fullCached = fullCompilationCache, fullCached.fingerprint == compileFingerprint {
             return ExecutionContext(compilationResult: cached, runtime: runtime, frameCount: frameCount)
         }
 
         // Fast path: reuse full compilation cache when graph topology is unchanged.
         // CompilationResult.graph is a reference type, so cached results see current tensor data.
-        let fingerprint = "\(graph.nodes.count)|\(graph.tensors.count)|\(frameCount)"
-        if let cached = fullCompilationCache, cached.fingerprint == fingerprint {
+        if let cached = fullCompilationCache, cached.fingerprint == compileFingerprint {
             compilationCache = cached.result
             runtimeCache = cached.runtime
             isDirty = false
@@ -128,10 +131,21 @@ extension LazyGraph {
         let result = try CompilationPipeline.compile(
             graph: graph,
             backend: DGenConfig.backend,
-            options: .init(frameCount: frameCount, debug: DGenConfig.debug, enableBufferReuse: DGenConfig.enableBufferReuse)
+            options: .init(
+                frameCount: frameCount,
+                debug: DGenConfig.debug,
+                enableBufferReuse: DGenConfig.enableBufferReuse,
+                gemmStrategy: DGenConfig.gemmStrategy)
         )
 
+        if DGenConfig.debug {
+            let kernelCount = result.kernels.count
+            let totalSourceChars = result.kernels.reduce(0) { $0 + $1.source.count }
+            print("DGenLazy.compile: kernels=\(kernelCount) totalSourceChars=\(totalSourceChars) frameCount=\(frameCount)")
+        }
+
         if let outputPath = DGenConfig.kernelOutputPath {
+            print("DGenLazy.compile: kernelOutputPath=\(outputPath)")
             writeKernelsToDisk(result, outputPath)
         }
 
@@ -146,7 +160,7 @@ extension LazyGraph {
             runtimeCacheByKernelHash[kernelHash] = runtime
         }
 
-        fullCompilationCache = (fingerprint: fingerprint, result: result, runtime: runtime)
+        fullCompilationCache = (fingerprint: compileFingerprint, result: result, runtime: runtime)
         compilationCache = result
         runtimeCache = runtime
         isDirty = false

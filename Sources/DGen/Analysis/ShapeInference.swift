@@ -232,10 +232,16 @@ public func inferShape(op: LazyOp, inputs: [ValueShape], graph: Graph) throws ->
   case .gemm(let M, let N, _, _, _):
     return .tensor([M, N])
 
+  case .gemmStaged(let M, let N, _, _, _, _, _, _):
+    return .tensor([M, N])
+
   case .gemmSmall(let M, let N, _, _, _):
     return .tensor([M, N])
 
   case .gemmChunkPartials(let M, let N, _, _, _, _, let chunkCount):
+    return .tensor([chunkCount, M, N])
+
+  case .gemmStagedChunkPartials(let M, let N, _, _, _, _, let chunkCount, _, _, _):
     return .tensor([chunkCount, M, N])
 
   // Batched spectral loss: GradRead ops output [B] tensors

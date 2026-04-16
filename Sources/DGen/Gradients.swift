@@ -1174,8 +1174,11 @@ extension LazyOp {
     // MARK: Non-differentiable compute ops
 
     case .gradPhasor(_), .gradDeterministicPhasor, .gemm(_, _, _, _, _), .sumMulAxis0,
+      .gemmStaged(_, _, _, _, _, _, _, _),
       .gemmSmall(_, _, _, _, _),
-      .gemmChunkPartials(_, _, _, _, _, _, _), .chunkPartialsReduceToCell(_, _, _, _, _):
+      .gemmChunkPartials(_, _, _, _, _, _, _),
+      .gemmStagedChunkPartials(_, _, _, _, _, _, _, _, _, _),
+      .chunkPartialsReduceToCell(_, _, _, _, _):
       return node.inputs.map { _ in nil }
     }
   }

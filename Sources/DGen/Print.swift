@@ -187,6 +187,8 @@ extension UOp {
             opStr = "\(ANSI.cyan)simdgroupMatrixZero\(ANSI.reset)"
         case let .simdgroupLoad(cellId, offset, stride, transpose):
             opStr = "\(ANSI.cyan)simdgroupLoad\(ANSI.reset)(cell=\(cellId), offset=\(offset), stride=\(stride)\(transpose ? ", T" : ""))"
+        case let .simdgroupLoadScratch(scratchId, offset, stride, transpose):
+            opStr = "\(ANSI.cyan)simdgroupLoadScratch\(ANSI.reset)(scratch=\(scratchId), offset=\(offset), stride=\(stride)\(transpose ? ", T" : ""))"
         case let .simdgroupStore(src, cellId, offset, stride):
             opStr = "\(ANSI.cyan)simdgroupStore\(ANSI.reset)(src=\(src), cell=\(cellId), offset=\(offset), stride=\(stride))"
         case let .simdgroupMultiplyAccumulate(a, b, acc):
@@ -197,6 +199,12 @@ extension UOp {
             opStr = "\(ANSI.cyan)threadgroupRead\(ANSI.reset)(scratch=\(scratchId), \(offset))"
         case let .threadgroupWrite(scratchId, offset, value):
             opStr = "\(ANSI.cyan)threadgroupWrite\(ANSI.reset)(scratch=\(scratchId), \(offset), \(value))"
+        case .threadgroupBarrier:
+            opStr = "\(ANSI.magenta)threadgroupBarrier\(ANSI.reset)"
+        case .threadIndexInThreadgroup:
+            opStr = "\(ANSI.magenta)tidInThreadgroup\(ANSI.reset)"
+        case .simdgroupIndexInThreadgroup:
+            opStr = "\(ANSI.magenta)sgidInThreadgroup\(ANSI.reset)"
         }
 
         return "\(ANSI.bold)UOp\(ANSI.reset)(op: \(opStr), value: \(value))"

@@ -222,6 +222,21 @@ extension IRBuilder {
     return emitIntOp(.threadgroupPositionZ)
   }
 
+  /// Flat thread index within the current threadgroup (Metal's `thread_index_in_threadgroup`).
+  public func threadIndexInThreadgroup() -> Expr {
+    return emitIntOp(.threadIndexInThreadgroup)
+  }
+
+  /// SIMD-group index within the current threadgroup (Metal's `simdgroup_index_in_threadgroup`).
+  public func simdgroupIndexInThreadgroup() -> Expr {
+    return emitIntOp(.simdgroupIndexInThreadgroup)
+  }
+
+  /// Emit a threadgroup barrier (sync all threads in the threadgroup, ordering threadgroup-memory writes).
+  public func threadgroupBarrier() {
+    ops.append(UOp(op: .threadgroupBarrier, value: .empty))
+  }
+
   // MARK: - SIMD Group Matrix Ops
 
   /// Declare a zero-initialized simdgroup_float8x8 matrix variable.
@@ -236,6 +251,13 @@ extension IRBuilder {
   public func simdgroupLoad(_ cellId: CellID, offset: Expr, stride: Int, transpose: Bool = false) -> Expr {
     let dest = ctx.useVariable(src: nodeId)
     ops.append(UOp(op: .simdgroupLoad(cellId, offset.lazy, stride, transpose), value: dest))
+    return value(dest)
+  }
+
+  /// Load an 8×8 tile from threadgroup scratch memory (`scratch_<id>`).
+  public func simdgroupLoadScratch(_ scratchId: Int, offset: Expr, stride: Int, transpose: Bool = false) -> Expr {
+    let dest = ctx.useVariable(src: nodeId)
+    ops.append(UOp(op: .simdgroupLoadScratch(scratchId: scratchId, offset.lazy, stride, transpose), value: dest))
     return value(dest)
   }
 

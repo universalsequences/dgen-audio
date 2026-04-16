@@ -83,6 +83,43 @@ final class MatmulKernelTests: XCTestCase {
     print("matmul 8x8 GEMM result verified against CPU reference")
   }
 
+  /// 8x8 matmul with GEMM pass disabled — should compile the original
+  /// view-composition matmul instead of rewriting to GEMM/WMMA.
+  func testMatmul8x8WithoutGemmPassKernel() throws {
+    DGenConfig.kernelOutputPath = "/tmp/matmul_8x8_no_gemm_pass.metal"
+    DGenConfig.gemmStrategy = .none
+    defer {
+      DGenConfig.kernelOutputPath = nil
+      DGenConfig.gemmStrategy = .registerTiled
+    }
+
+    let M = 8
+    let K = 8
+    let N = 8
+    let dataA = (0..<M * K).map { Float($0 + 1) * 0.01 }
+    let dataB = (0..<K * N).map { Float($0 + 1) * 0.01 }
+    let expected = cpuMatmul(dataA, dataB, M: M, K: K, N: N)
+
+    let A = Tensor(dataA).reshape([M, K])
+    let B = Tensor(dataB).reshape([K, N])
+    let C = A.matmul(B)
+    let result = try C.realize()
+
+    XCTAssertEqual(result.count, M * N)
+    for i in 0..<result.count {
+      XCTAssertEqual(
+        result[i], expected[i], accuracy: 1e-3,
+        "Mismatch at index \(i): got \(result[i]), expected \(expected[i])")
+    }
+
+    let kernelSource = try String(
+      contentsOfFile: "/tmp/matmul_8x8_no_gemm_pass.metal", encoding: .utf8)
+    XCTAssertFalse(kernelSource.contains("DispatchMode: gemm("))
+    XCTAssertFalse(kernelSource.contains("simdgroup_float8x8"))
+    XCTAssertFalse(kernelSource.contains("simdgroup_multiply_accumulate"))
+    print("matmul 8x8 without GEMM pass wrote /tmp/matmul_8x8_no_gemm_pass.metal")
+  }
+
   /// 64x64 matmul — exercises multi-tile GEMM (8 tiles per dimension).
   func testMatmul64x64Kernel() throws {
     DGenConfig.kernelOutputPath = "/tmp/matmul_64x64.metal"

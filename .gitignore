@@ -43,3 +43,5 @@ test_kernel_batch.metal
 KERNEL_OPTIMIZATIONS.md
 /.ddsp_cache_tinysol_large256
 bending_metal.wav
+.harmonic_cache_accordion
+.harmonic_cache_accordion_24k

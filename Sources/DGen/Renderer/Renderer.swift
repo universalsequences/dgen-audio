@@ -52,6 +52,14 @@ public enum DispatchMode: Equatable {
   /// tilesM × tilesN × depth threadgroups, each handling one 8×8 output tile.
   /// When depth is nil, runtime frameCount is used (1 for static blocks).
   case gemm(tilesM: Int, tilesN: Int, depth: Int? = nil)
+
+  /// Threadgroup-staged GEMM: tilesM × tilesN × depth threadgroups, each owning a
+  /// (blockM × blockN) output region computed cooperatively across `threadsPerGroup`
+  /// threads. A/B strips are staged into threadgroup memory and shared across SIMD
+  /// groups within the threadgroup.
+  case gemmStaged(tilesM: Int, tilesN: Int,
+                  blockM: Int, blockN: Int, blockK: Int,
+                  threadsPerGroup: Int, depth: Int? = nil)
 }
 
 extension DispatchMode {
@@ -66,6 +74,9 @@ extension DispatchMode {
     case .gemm(let tilesM, let tilesN, let depth):
       let d = depth ?? 1
       return max(1, tilesM) * max(1, tilesN) * max(1, d) * 32
+    case .gemmStaged(let tilesM, let tilesN, _, _, _, let tpg, let depth):
+      let d = depth ?? 1
+      return max(1, tilesM) * max(1, tilesN) * max(1, d) * max(1, tpg)
     }
   }
 
@@ -73,7 +84,7 @@ extension DispatchMode {
   var hasRendererFrameLoop: Bool {
     switch self {
     case .singleThreaded, .fixedWithFrameLoop: return true
-    case .perFrame, .perFrameThreadgroup1, .perFrameScaled, .perFrameScaledThreadgroup1, .staticThreads, .selfManaged, .gemm:
+    case .perFrame, .perFrameThreadgroup1, .perFrameScaled, .perFrameScaledThreadgroup1, .staticThreads, .selfManaged, .gemm, .gemmStaged:
       return false
     }
   }
@@ -84,6 +95,7 @@ extension DispatchMode {
     case .singleThreaded, .selfManaged, .perFrameThreadgroup1, .perFrameScaledThreadgroup1:
       return 1
     case .gemm: return 32
+    case .gemmStaged(_, _, _, _, _, let tpg, _): return tpg
     default: return nil
     }
   }

@@ -236,6 +236,10 @@ public enum LazyOp {
   // 2) chunk reduction accumulates those partials into target cell.
   // Triggered by GEMMPass when matching tensorAccumulate(view* -> gemm(...)).
   case gemmChunkPartials(Int, Int, Int, Bool, Bool, Int, Int)  // (M, N, K, transA, transB, chunkSize, chunkCount)
+  /// Threadgroup-staged variant of gemmChunkPartials: same two-pass reduction
+  /// shape, but the inner per-frame GEMM uses cooperative threadgroup-memory staging.
+  /// (M, N, K, transA, transB, chunkSize, chunkCount, blockM, blockN, blockK)
+  case gemmStagedChunkPartials(Int, Int, Int, Bool, Bool, Int, Int, Int, Int, Int)
   case chunkPartialsReduceToCell(CellID, Int, Int, Int, Bool)  // (targetCell, M, N, chunkCount, outputTransposed)
   case historyWrite(CellID)
   case historyReadWrite(CellID)
@@ -260,6 +264,10 @@ public enum LazyOp {
   case sumAxis(Int)  // Reduce along a specific axis
   case sumMulAxis0  // Fused reduction: sum over axis 0 of elementwise mul for 2D tensors
   case gemm(Int, Int, Int, Bool, Bool)  // Matrix multiply via tensor cores: gemm(M, N, K, transA, transB)
+  /// Threadgroup-staged matmul: cooperatively stages A/B strips into threadgroup
+  /// memory and computes a (blockM × blockN) output region per threadgroup.
+  /// Tuple: (M, N, K, transA, transB, blockM, blockN, blockK).
+  case gemmStaged(Int, Int, Int, Bool, Bool, Int, Int, Int)
   /// Element-parallel matmul for non-8-aligned M/N/K.
   /// Dispatches perFrameScaled(M*N): one thread per output element, inner K-loop.
   case gemmSmall(Int, Int, Int, Bool, Bool)  // M, N, K, transA, transB
@@ -311,6 +319,17 @@ public enum LazyOp {
   public var isInherentlyScalar: Bool {
     switch self {
     case .accum, .phasor, .click, .latch, .noise:
+      return true
+    default:
+      return false
+    }
+  }
+
+  /// GEMM variants that own their dispatch grid (excludes `.gemmSmall`, which
+  /// uses `perFrameScaled` and carries a shape-driven `tensorIndex`).
+  public var isSelfDispatchedGemm: Bool {
+    switch self {
+    case .gemm, .gemmStaged, .gemmChunkPartials, .gemmStagedChunkPartials:
       return true
     default:
       return false
