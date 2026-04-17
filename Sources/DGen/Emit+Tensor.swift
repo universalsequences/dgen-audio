@@ -194,9 +194,13 @@ extension LazyOp {
         }
         if ctx.frameAwareTensorCells.contains(tensor.cellId) {
           let elemIdx = b.tensorMemoryIndex(tensor, indices: indices)
+          // Frame stride is the underlying storage size, not the view size.
+          // View tensors (e.g. pool/expand) can have shape larger than base storage.
+          let tensorSize = ctx.g.frameAwareCells[tensor.cellId]?.tensorSize
+            ?? tensor.shape.reduce(1, *)
           return b.frameAwareTensorRead(
             cellId: tensor.cellId,
-            tensorSize: tensor.shape.reduce(1, *),
+            tensorSize: tensorSize,
             elemIdx: elemIdx
           )
         }
@@ -246,8 +250,10 @@ extension LazyOp {
           var inIndices = inStaticIndices
           inIndices[axis] = reduceIdx
           val = b.tensorRead(inTensor, indices: inIndices)
-        } else if inIsFrameAware {
-          // Non-padded frame-aware tensor: use direct frame-aware read
+        } else if inIsFrameAware && inTensor.transforms.isEmpty {
+          // Non-padded, non-viewed frame-aware tensor: direct frame-aware read.
+          // View tensors must take the general tensorRead path so their transform
+          // chain maps view indices to base storage indices.
           val = b.frameAwareTensorRead(
             cellId: inTensor.cellId, tensorSize: inTensorSize, elemIdx: inFlatIdx)
         } else if inTensor.transforms.isEmpty {
