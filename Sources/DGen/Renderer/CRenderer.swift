@@ -658,6 +658,17 @@ public class CRenderer: Renderer {
         return emitAssign(uop, "memory[\(base) + \(safeOffset)]", ctx)
       }
 
+    case .simdBroadcastLoad(let base, let offset):
+      // Scalar load + broadcast to all lanes in SIMD context.
+      // Used for runtime-variable lane-uniform values (e.g. dynamic kernel weights).
+      let offsetExpr = emitScalarLazy(offset, ctx: ctx)
+      if uop.isSimd {
+        return emitAssign(
+          uop, "vdupq_n_f32(memory[\(base) + (int)\(offsetExpr)])", ctx)
+      } else {
+        return emitAssign(uop, "memory[\(base) + (int)\(offsetExpr)]", ctx)
+      }
+
     case .memoryWrite(let base, let offset, let value):
       if uop.isSimd {
         let valueExpr = g(value)

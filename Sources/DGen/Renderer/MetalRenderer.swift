@@ -389,7 +389,8 @@ public class MetalRenderer: Renderer, UOpEmitter {
       .or(let a, let b), .xor(let a, let b), .beginRange(let a, let b), .beginForLoop(let a, let b):
       return variableIdsUsed(in: a).union(variableIdsUsed(in: b))
 
-    case .memoryRead(_, let a), .beginLoop(let a, _), .simdgroupLoad(_, let a, _, _),
+    case .memoryRead(_, let a), .simdBroadcastLoad(_, let a),
+      .beginLoop(let a, _), .simdgroupLoad(_, let a, _, _),
       .simdgroupLoadScratch(_, let a, _, _), .threadgroupRead(_, let a):
       return variableIdsUsed(in: a)
 
@@ -501,7 +502,7 @@ public class MetalRenderer: Renderer, UOpEmitter {
     var info = KernelAccessInfo()
     for uop in scheduleItem.ops {
       switch uop.op {
-      case .memoryRead(let base, _):
+      case .memoryRead(let base, _), .simdBroadcastLoad(let base, _):
         info.reads.insert(base)
       case .memoryWrite(let base, _, _):
         info.writes.insert(base)
@@ -988,6 +989,11 @@ public class MetalRenderer: Renderer, UOpEmitter {
         """
       return emitAssign(uop, expr, ctx)
     case .memoryRead(let base, let offset):
+      let cast = intCastPrefix(for: offset)
+      return emitAssign(uop, "memory[\(base) + \(cast)\(g(offset))]", ctx)
+    case .simdBroadcastLoad(let base, let offset):
+      // On Metal each thread processes one element, so a lane-uniform broadcast
+      // has the same shape as a plain scalar read — no per-lane materialization.
       let cast = intCastPrefix(for: offset)
       return emitAssign(uop, "memory[\(base) + \(cast)\(g(offset))]", ctx)
     case .memoryWrite(let base, let offset, let value):

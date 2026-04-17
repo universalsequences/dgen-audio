@@ -25,17 +25,20 @@ func emitOptimizedConv2D(
     case .tensor(let inShape) = g.nodes[node.inputs[0]]?.shape, inShape.count == 2,
     let inTensor = g.nodeToTensor[node.inputs[0]].flatMap({ g.tensors[$0] }),
     let kTensor = g.nodeToTensor[node.inputs[1]].flatMap({ g.tensors[$0] }),
-    let kernelData = kTensor.data,
     let outCell = g.nodeToTensor[node.id].flatMap({ g.tensors[$0] })?.cellId
   else {
     throw DGenError.tensorError(
-      op: "conv2d(optimized)", reason: "missing shape/tensor/kernel data")
+      op: "conv2d(optimized)", reason: "missing shape/tensor data")
   }
 
   let (inH, inW) = (inShape[0], inShape[1])
   let (kH, kW) = (kernelShape[0], kernelShape[1])
   let (padH, padW) = (kH / 2, kW / 2)
   let inCell = inTensor.cellId
+  let kernelCell = kTensor.cellId
+  // Fast path: kernel data baked at graph-build time → hoist each weight as a
+  // preamble-broadcast constant. Runtime path: load and broadcast inside the loop.
+  let kernelData = kTensor.data
 
   // Mask tensor layout: [leftMask[0..3], fullMask[0..3], rightMask[0..3]].
   let leftMaskOffset = 0
@@ -90,8 +93,15 @@ func emitOptimizedConv2D(
               v = v * mask
             }
 
-            // Kernel weight as preamble-broadcast constant — every lane the same value.
-            let kVal = b.constant(kernelData[ky * kW + kx])
+            // Kernel weight: constant path broadcasts via the kernel preamble,
+            // runtime path loads+broadcasts inline via simdBroadcastLoad.
+            let kIdx = ky * kW + kx
+            let kVal: Expr
+            if let data = kernelData {
+              kVal = b.constant(data[kIdx])
+            } else {
+              kVal = b.simdBroadcastLoad(kernelCell, b.intConstant(kIdx))
+            }
             let tap = v * kVal
 
             if let r = running {

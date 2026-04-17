@@ -64,6 +64,18 @@ extension IRBuilder {
     return self.value(dest)
   }
 
+  /// Read a single float from `memory[cellId + offset]` and, in a SIMD block,
+  /// broadcast it across all 4 lanes (`vdupq_n_f32`). In scalar context this is
+  /// identical to `memoryRead`. Used when a lane-uniform value needs to flow
+  /// into lane-wise arithmetic — e.g. a runtime-variable kernel coefficient
+  /// multiplying a vector input tap.
+  public func simdBroadcastLoad(_ cellId: CellID, _ offset: Expr) -> Expr {
+    let dest = ctx.useVariable(src: nodeId)
+    let uop = UOp(op: .simdBroadcastLoad(cellId, offset.lazy), value: dest)
+    ops.append(uop)
+    return value(dest)
+  }
+
   // MARK: - Tensor Ops (register-cached)
 
   /// Load from a tensor cell. Returns the cached register value if available,

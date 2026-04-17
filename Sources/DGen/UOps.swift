@@ -53,6 +53,11 @@ public enum Op {
   case memoryRead(CellID, Lazy)
   case memoryWrite(CellID, Lazy, Lazy)
   case memoryAccumulate(CellID, Lazy, Lazy)  // Atomic add to memory cell
+  /// Read one float from `memory[cell + offset]` and, in a SIMD block, broadcast
+  /// it across all 4 lanes (`vdupq_n_f32`). In scalar mode this is equivalent
+  /// to `memoryRead`. Used for runtime-variable kernel coefficients and other
+  /// lane-uniform loads inside NEON inner loops.
+  case simdBroadcastLoad(CellID, Lazy)
   case latch(Lazy, Lazy)
   case beginIf(Lazy)
   case gswitch(Lazy, Lazy, Lazy)
@@ -129,6 +134,7 @@ public enum Op {
     case .load(let cellId), .store(let cellId, _), .delay1(let cellId, _),
       .memoryRead(let cellId, _), .memoryWrite(let cellId, _, _),
       .memoryAccumulate(let cellId, _, _),
+      .simdBroadcastLoad(let cellId, _),
       .noise(let cellId),
       .simdgroupLoad(let cellId, _, _, _), .simdgroupStore(_, let cellId, _, _):
       return cellId
@@ -178,6 +184,7 @@ public enum Op {
     case .round(let a): return .round(r(a))
     case .memoryRead(let c, let o): return .memoryRead(c, r(o))
     case .memoryWrite(let c, let o, let v): return .memoryWrite(c, r(o), r(v))
+    case .simdBroadcastLoad(let c, let o): return .simdBroadcastLoad(c, r(o))
     case .memoryAccumulate(let c, let o, let v): return .memoryAccumulate(c, r(o), r(v))
     case .latch(let a, let b): return .latch(r(a), r(b))
     case .gswitch(let c, let a, let b): return .gswitch(r(c), r(a), r(b))
@@ -222,6 +229,7 @@ public enum Op {
     case .memoryWrite(_, let offset, let value): return .memoryWrite(newCellId, offset, value)
     case .memoryAccumulate(_, let offset, let value):
       return .memoryAccumulate(newCellId, offset, value)
+    case .simdBroadcastLoad(_, let offset): return .simdBroadcastLoad(newCellId, offset)
     case .simdgroupLoad(_, let offset, let stride, let transpose):
       return .simdgroupLoad(newCellId, offset, stride, transpose)
     case .simdgroupStore(let src, _, let offset, let stride):
