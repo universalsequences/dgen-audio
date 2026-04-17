@@ -23,15 +23,15 @@ extension LazyOp {
         let acc = b.float(0.0)
 
         b.loop(kernelSize) { kx in
-          let inX = outX + b.cast(kx, to: .float) - b.constant(Float(pad))
-          let inBounds = (inX >= b.constant(0)) * (inX < b.constant(Float(inLen)))
+          let inX = outX + kx - b.intConstant(pad)
+          let inBounds = (inX >= b.intConstant(0)) * (inX < b.intConstant(inLen))
 
-          let rawIdx = b.tensorMemoryIndex(inTensor, indices: [b.cast(inX, to: .int)])
-          let safeIdx = b.gswitch(inBounds, rawIdx, b.constant(0))
+          let rawIdx = b.tensorMemoryIndex(inTensor, indices: [inX])
+          let safeIdx = b.gswitch(inBounds, rawIdx, b.intConstant(0))
           let inVal = b.gswitch(
             inBounds, b.memoryRead(inTensor.cellId, safeIdx), b.constant(0))
 
-          let kMemIdx = b.tensorMemoryIndex(kTensor, indices: [b.cast(kx, to: .int)])
+          let kMemIdx = b.tensorMemoryIndex(kTensor, indices: [kx])
           let kVal = b.memoryRead(kTensor.cellId, kMemIdx)
 
           acc.accumulate(inVal * kVal)
@@ -56,33 +56,34 @@ extension LazyOp {
       let (padH, padW) = (kH / 2, kW / 2)
 
       b.parallelRange(outShape.reduce(1, *)) { flatIdx in
-        let outY = b.cast(flatIdx, to: .int) / b.constant(Float(inW))
-        let outX = b.cast(flatIdx, to: .int) % b.constant(Float(inW))
+        let flatInt = b.cast(flatIdx, to: .int)
+        let outY = flatInt / b.intConstant(inW)
+        let outX = flatInt % b.intConstant(inW)
         let acc = b.float(0.0)
 
         b.loop(kH) { ky in
           b.loop(kW) { kx in
-            let inY = outY + b.cast(ky, to: .float) - b.constant(Float(padH))
-            let inX = outX + b.cast(kx, to: .float) - b.constant(Float(padW))
+            let inY = outY + ky - b.intConstant(padH)
+            let inX = outX + kx - b.intConstant(padW)
 
             let inBounds =
-              (inY >= b.constant(0)) * (inY < b.constant(Float(inH)))
-              * (inX >= b.constant(0)) * (inX < b.constant(Float(inW)))
+              (inY >= b.intConstant(0)) * (inY < b.intConstant(inH))
+              * (inX >= b.intConstant(0)) * (inX < b.intConstant(inW))
 
             let rawIdx = b.tensorMemoryIndex(
-              inTensor, indices: [b.cast(inY, to: .int), b.cast(inX, to: .int)])
-            let safeIdx = b.gswitch(inBounds, rawIdx, b.constant(0))
+              inTensor, indices: [inY, inX])
+            let safeIdx = b.gswitch(inBounds, rawIdx, b.intConstant(0))
             let inVal = b.gswitch(
               inBounds, b.memoryRead(inTensor.cellId, safeIdx), b.constant(0))
 
             let kMemIdx = b.tensorMemoryIndex(
-              kTensor, indices: [b.cast(ky, to: .int), b.cast(kx, to: .int)])
+              kTensor, indices: [ky, kx])
             let kVal = b.memoryRead(kTensor.cellId, kMemIdx)
 
             acc.accumulate(inVal * kVal)
           }
         }
-        _ = b.memoryWrite(outCell, b.cast(flatIdx, to: .int), acc.value)
+        _ = b.memoryWrite(outCell, flatInt, acc.value)
       }
 
     case .sum:

@@ -13,9 +13,11 @@ extension IRBuilder {
   /// Rendered as `select(els, then, cond)` in Metal or `cond ? then : els` in C.
   public func gswitch(_ cond: Expr, _ then: Expr, _ els: Expr) -> Expr {
     let thunk = u_switch(cond.lazy, then.lazy, els.lazy)
-    let uop = thunk(ctx, nil)
+    var uop = thunk(ctx, nil)
+    let allInt = cond.scalarType == .int && then.scalarType == .int && els.scalarType == .int
+    if allInt { uop.scalarType = .int }
     ops.append(uop)
-    return value(uop.value)
+    return value(uop.value, scalarType: allInt ? .int : .float)
   }
 
   /// Emit a conditional block using the legacy `beginIf`/`endIf` UOp pair.

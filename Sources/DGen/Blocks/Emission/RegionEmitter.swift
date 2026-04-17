@@ -125,8 +125,11 @@ public func emitScalarBlockWithShapeTransitions(
     transitions: transitions, skipRegions: skipRegions)
 
   // Metal: parallelize elements across threads when a single active region has uniform
-  // element count. Guards: no scalar nodes (would execute per-thread), no conv (own loops),
-  // single active region (cross-region deps would race without barriers).
+  // element count. Guards: no scalar nodes (would execute per-thread), single active
+  // region (cross-region deps would race without barriers).
+  //
+  // Conv regions are eligible: conv2d's inner parallelRange auto-consumes the outer
+  // elemIdx via ctx.frameAwareTensorElementIndex, so one GPU thread handles one output pixel.
   if backend == .metal {
     var uniformCount: Int? = nil
     var canParallelize = true
@@ -140,7 +143,6 @@ public func emitScalarBlockWithShapeTransitions(
       let active = region.isSkipped ? [] : region.tensorNodes
       guard !active.isEmpty else { continue }
       activeRegionCount += 1
-      if region.isConvOnly { canParallelize = false; break }
       let count = region.shape.reduce(1, *)
       if count <= 1 { continue }
       if let existing = uniformCount {
@@ -155,8 +157,21 @@ public func emitScalarBlockWithShapeTransitions(
     if activeRegionCount > 1 { canParallelize = false }
     if canParallelize, let elemCount = uniformCount {
       let setup = IRBuilder(ctx: ctx, nodeId: block.nodes[block.nodes.count - 1])
-      let (_, elemIdx) = setup.setupFlatThreading(tensorSize: elemCount)
+      let (frameIdx, elemIdx) = setup.setupFlatThreading(tensorSize: elemCount)
       var uops: [UOp] = setup.ops
+      // Expose the decomposed indices so conv2d/conv1d's inner parallelRange consumes
+      // the outer elemIdx instead of emitting its own loop.
+      let savedElem = ctx.frameAwareTensorElementIndex
+      let savedFrame = ctx.frameAwareTensorFrameIndex
+      let savedInBlock = ctx.isInFrameAwareTensorBlock
+      ctx.frameAwareTensorElementIndex = elemIdx.lazy
+      ctx.frameAwareTensorFrameIndex = frameIdx.lazy
+      ctx.isInFrameAwareTensorBlock = true
+      defer {
+        ctx.frameAwareTensorElementIndex = savedElem
+        ctx.frameAwareTensorFrameIndex = savedFrame
+        ctx.isInFrameAwareTensorBlock = savedInBlock
+      }
       for region in regions {
         uops += try emitRegion(region, ctx: ctx, g: g, parallelElemIdx: elemIdx.lazy)
       }

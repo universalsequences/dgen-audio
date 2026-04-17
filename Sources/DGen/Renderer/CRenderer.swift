@@ -736,25 +736,25 @@ public class CRenderer: Renderer {
       let expr =
         uop.isSimd
         ? "vbslq_f32(vcgtq_f32(\(g(a)), \(g(b))), vdupq_n_f32(1.0f), vdupq_n_f32(0.0f))"
-        : "\(g(a)) > \(g(b))"
+        : "\(gi(a)) > \(gi(b))"
       return emitAssign(uop, expr, ctx)
     case .gte(let a, let b):
       let expr =
         uop.isSimd
         ? "vbslq_f32(vcgeq_f32(\(g(a)), \(g(b))), vdupq_n_f32(1.0f), vdupq_n_f32(0.0f))"
-        : "\(g(a)) >= \(g(b))"
+        : "\(gi(a)) >= \(gi(b))"
       return emitAssign(uop, expr, ctx)
     case .lte(let a, let b):
       let expr =
         uop.isSimd
         ? "vbslq_f32(vcleq_f32(\(g(a)), \(g(b))), vdupq_n_f32(1.0f), vdupq_n_f32(0.0f))"
-        : "\(g(a)) <= \(g(b))"
+        : "\(gi(a)) <= \(gi(b))"
       return emitAssign(uop, expr, ctx)
     case .lt(let a, let b):
       let expr =
         uop.isSimd
         ? "vbslq_f32(vcltq_f32(\(g(a)), \(g(b))), vdupq_n_f32(1.0f), vdupq_n_f32(0.0f))"
-        : "\(g(a)) < \(g(b))"
+        : "\(gi(a)) < \(gi(b))"
       return emitAssign(uop, expr, ctx)
     case .eq(let a, let b):
       // Constant-fold equality when both operands are constants
@@ -781,7 +781,8 @@ public class CRenderer: Renderer {
         let expr = "vbslq_f32(\(mask), \(g(a)), \(g(b)))"
         return emitAssign(uop, expr, ctx)
       } else {
-        let expr = "\(g(cond)) > 0.0f ? \(g(a)) : \(g(b))"
+        let condZero = isIntTypedOffset(cond) ? "0" : "0.0f"
+        let expr = "\(g(cond)) > \(condZero) ? \(gi(a)) : \(gi(b))"
         return emitAssign(uop, expr, ctx)
       }
     case .delay1(let cell, let curr):
