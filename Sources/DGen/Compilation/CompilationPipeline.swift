@@ -289,6 +289,10 @@ public struct CompilationPipeline {
       }
     }
 
+    timings.measure("conv2dPass") {
+      GraphPrepPasses.conv2dPass(graph: graph)
+    }
+
     let sortedNodes = timings.measure("topologicalSort") {
       topologicalSort(
         graph, feedbackClusters: feedbackClusters, scalarNodeSet: scalarNodeSet,

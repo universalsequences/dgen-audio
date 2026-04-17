@@ -93,7 +93,15 @@ public func upgradeElementLoopsToSIMD(_ uops: inout [UOp]) {
         }
       case .memoryRead(_, let offset), .memoryWrite(_, let offset, _):
         if case .variable(let vid, _) = offset, vid != loopVarId {
-          hasBlocker = true
+          // Allow affine offsets of the form `loopVar + const` so lane j
+          // reads at base + C + j — a contiguous vld1q_f32.
+          if let lvId = loopVarId,
+            isAffineOfLoopVar(offset, loopVarId: lvId, in: uops, upTo: k)
+          {
+            // affine; not a blocker
+          } else {
+            hasBlocker = true
+          }
         }
       default:
         break
@@ -125,4 +133,40 @@ public func upgradeElementLoopsToSIMD(_ uops: inout [UOp]) {
 
     i = endIdx + 1
   }
+}
+
+/// Returns true when `offset` is either the loop variable, a constant, or the sum
+/// of the loop variable and a constant. Used by the SIMD upgrade blocker check to
+/// allow per-lane contiguous loads at `base + loopVar + C(lane=0)`.
+private func isAffineOfLoopVar(
+  _ offset: Lazy, loopVarId: VarID, in uops: [UOp], upTo: Int
+) -> Bool {
+  switch offset {
+  case .constant:
+    return true
+  case .variable(let vid, _):
+    if vid == loopVarId { return true }
+    for j in 0..<upTo {
+      guard case .variable(let producedVid, _) = uops[j].value, producedVid == vid
+      else { continue }
+      if case .add(let a, let b) = uops[j].op {
+        return (isLoopVar(a, loopVarId: loopVarId) && isConstantLazy(b))
+          || (isLoopVar(b, loopVarId: loopVarId) && isConstantLazy(a))
+      }
+      return false
+    }
+    return false
+  default:
+    return false
+  }
+}
+
+private func isLoopVar(_ expr: Lazy, loopVarId: VarID) -> Bool {
+  if case .variable(let vid, _) = expr, vid == loopVarId { return true }
+  return false
+}
+
+private func isConstantLazy(_ expr: Lazy) -> Bool {
+  if case .constant = expr { return true }
+  return false
 }

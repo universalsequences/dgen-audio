@@ -67,6 +67,13 @@ open class Graph {
     /// Used to separate forward and gradient node ordering during compilation.
     public var lastForwardNodeId: NodeID?
 
+    /// Conv2d nodes the Conv2DPass has annotated for SIMD-unrolled emission.
+    public var simdOptimizedConv2Ds: Set<NodeID> = []
+
+    /// Mask tensor node associated with each SIMD-optimized conv2d (contains per-kx
+    /// edge-zeroing masks concatenated into a single constant tensor).
+    public var conv2dMaskNodes: [NodeID: NodeID] = [:]
+
     public init() {}
 
     public init(sampleRate: Float) {
