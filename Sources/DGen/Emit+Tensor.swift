@@ -40,6 +40,16 @@ extension LazyOp {
       }
 
     case .conv2d(let kernelShape):
+      // If the Conv2DPass annotated this node and seeded a mask cell, emit the
+      // SIMD-unrolled path. Falls through to the generic scalar emission otherwise.
+      if g.simdOptimizedConv2Ds.contains(nodeId),
+        let maskCellId = g.conv2dMaskCells[nodeId]
+      {
+        try emitOptimizedConv2D(
+          b: b, ctx: ctx, g: g, node: node, maskCellId: maskCellId)
+        return
+      }
+
       guard node.inputs.count >= 2,
         case .tensor(let outShape) = node.shape,
         case .tensor(let inShape) = g.nodes[node.inputs[0]]?.shape, inShape.count == 2,

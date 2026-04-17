@@ -89,7 +89,18 @@ public func upgradeElementLoopsToSIMD(_ uops: inout [UOp]) {
         hasBlocker = true
       case .add, .sub, .mul, .div:
         if uops[k].scalarType == .int {
-          hasBlocker = true
+          // Int arithmetic in SIMD bodies is rendered as scalar int (one value
+          // per iteration, lane-uniform) — safe as long as it's only used to
+          // build memoryRead/Write offsets. Allow `loopVar + const` style adds
+          // since they're the common pattern for unrolled tap addresses.
+          if case .add(let a, let b) = uops[k].op,
+            (isLoopVar(a, loopVarId: loopVarId!) && isConstantLazy(b))
+              || (isLoopVar(b, loopVarId: loopVarId!) && isConstantLazy(a))
+          {
+            // allowed
+          } else {
+            hasBlocker = true
+          }
         }
       case .memoryRead(_, let offset), .memoryWrite(_, let offset, _):
         if case .variable(let vid, _) = offset, vid != loopVarId {

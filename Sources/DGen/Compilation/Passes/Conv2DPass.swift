@@ -9,12 +9,27 @@ extension GraphPrepPasses {
   /// The actual NEON code comes from `emitOptimizedConv2D` which is gated by the
   /// annotation set.
   static func conv2dPass(graph: Graph) {
+    // 4-lane column masks for SIMD conv2d edge handling: left, full, right.
+    // Concatenated into a single 12-float buffer indexed by 4×{0,1,2}.
+    let maskData: [Float] = [
+      0, 1, 1, 1,   // left edge  — lane 0 zero
+      1, 1, 1, 1,   // fully in bounds
+      1, 1, 1, 0,   // right edge — lane 3 zero
+    ]
+
     for (nodeId, node) in graph.nodes {
       guard case .conv2d = node.op else { continue }
       guard isSIMDEligible(node: node, graph: graph) else { continue }
 
-      // TODO(phase1-step3): allocate mask tensor and populate graph.conv2dMaskNodes.
+      let maskCellId = graph.alloc(vectorWidth: maskData.count)
+      let maskTensorId = graph.nextTensorId
+      graph.nextTensorId += 1
+      graph.tensors[maskTensorId] = Tensor(
+        id: maskTensorId, shape: [3, 4], cellId: maskCellId, data: maskData)
+      graph.cellToTensor[maskCellId] = maskTensorId
+
       graph.simdOptimizedConv2Ds.insert(nodeId)
+      graph.conv2dMaskCells[nodeId] = maskCellId
     }
   }
 

@@ -70,9 +70,9 @@ open class Graph {
     /// Conv2d nodes the Conv2DPass has annotated for SIMD-unrolled emission.
     public var simdOptimizedConv2Ds: Set<NodeID> = []
 
-    /// Mask tensor node associated with each SIMD-optimized conv2d (contains per-kx
-    /// edge-zeroing masks concatenated into a single constant tensor).
-    public var conv2dMaskNodes: [NodeID: NodeID] = [:]
+    /// Mask tensor cell associated with each SIMD-optimized conv2d — 12 floats laid
+    /// out as three contiguous 4-lane masks: left-edge, full, right-edge.
+    public var conv2dMaskCells: [NodeID: CellID] = [:]
 
     public init() {}
 

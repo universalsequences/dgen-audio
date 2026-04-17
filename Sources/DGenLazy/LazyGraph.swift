@@ -156,7 +156,7 @@ public class LazyGraph {
     graph.gradCarryCells.removeAll()
     graph.lastForwardNodeId = nil
     graph.simdOptimizedConv2Ds.removeAll()
-    graph.conv2dMaskNodes.removeAll()
+    graph.conv2dMaskCells.removeAll()
 
     // 5. Clear gradient cells from registry (they'll be recreated on next backward)
     parameterRegistry.tensorGradCells.removeAll()

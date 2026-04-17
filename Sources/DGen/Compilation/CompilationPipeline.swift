@@ -289,10 +289,6 @@ public struct CompilationPipeline {
       }
     }
 
-    timings.measure("conv2dPass") {
-      GraphPrepPasses.conv2dPass(graph: graph)
-    }
-
     let sortedNodes = timings.measure("topologicalSort") {
       topologicalSort(
         graph, feedbackClusters: feedbackClusters, scalarNodeSet: scalarNodeSet,
@@ -301,6 +297,11 @@ public struct CompilationPipeline {
 
     try timings.measure("shapeInference") {
       try ShapeInferencePass.inferNodeShapes(graph: graph, sortedNodes: sortedNodes)
+    }
+
+    // Run after shape inference so conv2d's input tensors have known shapes.
+    timings.measure("conv2dPass") {
+      GraphPrepPasses.conv2dPass(graph: graph)
     }
 
     timings.measure("allocateTensorOutputs") {

@@ -421,14 +421,26 @@ public class CRenderer: Renderer {
       return "/* t\(varId) declared globally */"
 
     case .add(let a, let b):
+      // Int-typed arithmetic inside a SIMD block is semantically scalar
+      // (one value per iteration, not per-lane) — emit scalar C and let
+      // emitAssign declare the result as `int` not `float32x4_t`.
+      if uop.scalarType == .int {
+        return emitAssign(uop, "\(gi(a)) + \(gi(b))", ctx)
+      }
       let expr = uop.isSimd ? "vaddq_f32(\(g(a)), \(g(b)))" : "\(gi(a)) + \(gi(b))"
       return emitAssign(uop, expr, ctx)
 
     case .mul(let a, let b):
+      if uop.scalarType == .int {
+        return emitAssign(uop, "\(gi(a)) * \(gi(b))", ctx)
+      }
       let expr = uop.isSimd ? "vmulq_f32(\(g(a)), \(g(b)))" : "\(gi(a)) * \(gi(b))"
       return emitAssign(uop, expr, ctx)
 
     case .sub(let a, let b):
+      if uop.scalarType == .int {
+        return emitAssign(uop, "\(gi(a)) - \(gi(b))", ctx)
+      }
       let expr = uop.isSimd ? "vsubq_f32(\(g(a)), \(g(b)))" : "\(gi(a)) - \(gi(b))"
       return emitAssign(uop, expr, ctx)
 
@@ -612,6 +624,10 @@ public class CRenderer: Renderer {
         let offsetType: EmittedType
         if case .variable(let varId, _) = offset {
           offsetType = varEmittedTypes[varId] ?? .float32x4
+        } else if case .constant = offset {
+          // Compile-time constant offset — treat as scalar so we get a
+          // contiguous 4-wide load at a fixed address, not a 4-way gather.
+          offsetType = .int_
         } else {
           offsetType = .float32x4
         }
@@ -649,6 +665,9 @@ public class CRenderer: Renderer {
         let offsetType: EmittedType
         if case .variable(let varId, _) = offset {
           offsetType = varEmittedTypes[varId] ?? .float32x4
+        } else if case .constant = offset {
+          // Compile-time constant offset — treat as scalar for a contiguous store.
+          offsetType = .int_
         } else {
           offsetType = .float32x4
         }
@@ -1132,6 +1151,20 @@ public class CRenderer: Renderer {
   {
     let varId = extractVarId(uop.value)
     let isGlobal = ctx.globals.contains(varId)
+
+    // Int-typed UOps stay scalar `int` even when surrounded by a SIMD block.
+    // The value is lane-uniform (one per iteration), typically feeding memoryRead
+    // offsets where the scalar-int path produces clean contiguous loads.
+    // Force scalar naming (`t<id>`) so consumers using `emitScalarLazy` resolve
+    // to the same identifier.
+    if uop.scalarType == .int && !forceFloatType {
+      varEmittedTypes[varId] = .int_
+      let lhs = emitLazy(uop.value, ctx: ctx, vectorWidth: 1, isOut: true)
+      if isGlobal {
+        return "\(lhs) = \(expr);"
+      }
+      return "int \(lhs) = \(expr);"
+    }
 
     if uop.isSimd {
       // Track type as float32x4 (or float if forced)
