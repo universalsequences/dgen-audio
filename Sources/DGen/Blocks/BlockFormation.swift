@@ -666,7 +666,20 @@ func determineTensorBlocks(_ blocks: [Block], _ graph: Graph, _ ctx: IRContext) 
 
   for block in blocks {
     if block.frameOrder == .sequential {
-      determined.append(contentsOf: splitScalarBlockForTensorGrouping(block, graph: graph, ctx: ctx))
+      var split = splitScalarBlockForTensorGrouping(block, graph: graph, ctx: ctx)
+      // Scalar blocks that happen to "own" a tensorRef (e.g. bufferView's write
+      // block, [memoryWrite, tensorRef]) inherit the tensorRef's shape here.
+      // Without this sweep, `wrapBodyUOpsWithTensorLoopIfNeeded` wraps the
+      // scalar memoryWrite in `parallelRange(tensorSize)` — a dead inner loop
+      // that executes the same per-frame write hundreds of times.
+      //
+      // Only touch blocks that stayed sequential; the parallel tensor-suffix
+      // needs its shape to keep `determineVectorPlan` from promoting it to
+      // SIMD-4 (its body contains scalar element loops emitted by FFT/IFFT).
+      for i in split.indices where split[i].frameOrder == .sequential {
+        clearWastedTensorLoopMetadata(&split[i], graph: graph)
+      }
+      determined.append(contentsOf: split)
       continue
     }
     determined.append(contentsOf: groupRegularTensorBlock(block, graph: graph, ctx: ctx))

@@ -205,8 +205,11 @@ extension LazyOp {
         // Store the result
         _ = b.memoryWrite(cellId, b.cast(idx, to: .int), newLatched)
 
-        // Output the latched value (returns old value, like scalar latch)
-        try b.writeOutput(node, latched)
+        // Output the fresh value — matches scalar `.latch` semantics where
+        // the result is `value` on trigger frames and `old cell` otherwise
+        // (u_latch's `mutate(latched, to: value)`). Without this the tensor
+        // latch lags the scalar version by one hop.
+        try b.writeOutput(node, newLatched)
       } else {
         // Scalar latch: use original implementation
         let value = b.value(inputs[0])

@@ -1244,6 +1244,12 @@ public class CRenderer: Renderer {
         // AND a store to the global buffer for cross-block transfer
         let localVar = "simd\(varId)"
         let globalStore = emitLazy(uop.value, ctx: ctx, vectorWidth: uop.vectorWidth, isOut: true)
+        // Record that simd<varId> is now declared in this scope so subsequent
+        // loadGlobal emissions (scalar "extra" path or another SIMD load) don't
+        // re-declare it.
+        var state = loadedGlobal[varId] ?? GlobalLoadState()
+        state.simdLoaded = true
+        loadedGlobal[varId] = state
         return "float32x4_t \(localVar) = \(expr); vst1q_f32(\(globalStore), \(localVar));"
       } else {
         let lhs = emitLazy(uop.value, ctx: ctx, vectorWidth: uop.vectorWidth, isOut: true)

@@ -126,12 +126,18 @@ Keep `partitionedConvolve` as sugar that internally instantiates
 
 ## Follow-on ops to add after the decomposition
 
-- **`polarFFT`** `(re, im) → (mag, phase)`. Implemented as `sqrt(re² + im²)` and
-  `atan2(im, re)`. Both pure compositions of existing ops — but worth a node
-  for discoverability and ergonomics.
-- **`rectFFT`** `(mag, phase) → (re, im)`. `mag · cos(phase)`, `mag · sin(phase)`.
-- **`complexConj`** `(re, im) → (re, -im)`. One-liner but useful for
-  matched filtering / time reversal.
+- [DONE] **`polarFFT`** `(re, im) → (mag, phase)`. `sqrt(re² + im²)` and
+  `atan2(im, re)`. Two outlets, pure composition.
+- [DONE] **`rectFFT`** `(mag, phase) → (re, im)`. `mag · cos(phase)`, `mag · sin(phase)`.
+- [DONE] **`complexConj`** `(re, im) → (re, -im)`.
+- [DONE] **`hopHold @hopSize`** — sample-and-hold that latches a frame-rate
+  scalar (phasor, envelope, noise, LFO) at hop boundaries and emits the held
+  value every frame. Tags its output as hop-producing via `nodeHopRate`, so
+  downstream spectral ops stay hop-gated instead of demoting the whole chain
+  to sample rate. Required for patterns like `phasor → * pi → hopHold →
+  rectFFT.phase` — without it the per-sample modulation forces FFT/IFFT into
+  the frame loop. Scalar-per-frame execution is enforced because the
+  underlying `.latch` op is flagged `isInherentlyScalar`.
 - **`spectrumRoll  @bins`** — circular shift the spectrum along the last dim.
   Frequency shifting / spectral slide effects.
 - **`spectrumDisplay`** — visualization node. Not a DSP op; a patch-editor
@@ -156,26 +162,52 @@ Keep `partitionedConvolve` as sugar that internally instantiates
 
 ## Implementation order (my plan)
 
-1. [IN PROGRESS] **Split `partitionedConvolve`** → `partitionIR` +
-   `partitionedSpectralMAC`. Keep the all-in-one as sugar.
-2. **`complexMul`** — 4-in / 2-out wrapper, no new UOp.
-3. **`polarFFT` / `rectFFT`** — same, pure compositions.
-4. **`spectrumHistory`** — needs a new UOp (`spectrumRingWrite`) or
+1. [DONE] **Split `partitionedConvolve`** → `partitionIR` +
+   `partitionedSpectralMAC` + `complexMul`. All-in-one kept as sugar.
+2. [DONE] **`complexMul`** — 4-in / 2-out wrapper, no new UOp.
+3. [DONE] **`polarFFT` / `rectFFT` / `complexConj`** — pure compositions.
+4. [DONE] **`hopHold`** — frame-rate → hop-rate bridge for modulators.
+   Unblocks `phasor → * pi → hopHold → rectFFT.phase` patterns.
+5. [NEXT] **`spectrumHistory`** — needs a new UOp (`spectrumRingWrite`) or
    extraction of the ring logic from `partitionedSpectralMACCall`. Design
-   the tensor-view surface carefully.
-5. **Bigger bets** (modulated K, phase vocoder, etc.) once the primitives
+   the tensor-view surface carefully so `selectRow`/`shrink` across the
+   K-axis produces a valid `[N]` tensor at any row. Unlocks spectral
+   freeze, phase vocoder, anything that needs to look at recent spectra.
+6. **Bigger bets** (modulated K, phase vocoder, etc.) once the primitives
    are in place.
 
-## Files to touch for step 1
+### Block-formation fix that landed alongside hopHold
 
-- `patch-editor/Sources/Engine/operators/gen/GenSpectral.swift` — add
-  `GenPartitionIROperator` (2-output) and `GenPartitionedSpectralMACOperator`
-  (2-output).
-- `patch-editor/Sources/Engine/operators/gen/GenPartitionedConvolve.swift` —
-  keep; refactor `createGraphNode` to internally call the two new helpers
-  (or inline; doesn't matter at DGen level).
-- `patch-editor/Sources/Engine/TestUtilities.swift` — register the two new
-  operators.
-- No DGen changes required for step 1 — the `partitionedSpectralConvolve`
-  primitive already accepts `(xRe, xIm, irRe, irIm)` and returns `(yRe,
-  yIm)`; the 4-piece decomp is purely a patch-editor-side split.
+`bufferView`'s scalar write block previously ran a dead inner
+`for (int t1 = 0; t1 < N; t1++) memory[ring + pos] = in[i];` loop —
+writing the same per-frame scalar N times because the block had inherited
+its tensorRef's shape but contained only scalar memoryWrite / tensorRef
+ops. Fixed by `clearWastedTensorLoopMetadata` in the sequential-path
+branch of `determineTensorBlocks` (BlockFormation.swift:664). Restricted
+to sequential blocks so the parallel tensor-suffix keeps its shape — the
+shape is what blocks `determineVectorPlan` from promoting
+FFT/IFFT-emitting blocks to SIMD-4. Observed on the paulstretch-ish patch:
+~23% → ~8% CPU at N=1024 hop=256.
+
+## Files to touch for step 5 (`spectrumHistory`)
+
+- `Sources/DGen/LazyOp.swift` — add `.spectrumRingWrite(K, N, ringReCell,
+  ringImCell, counterCell)`. Mark `emitsInternalIteration` so the
+  block-wrap strip keeps working.
+- `Sources/DGen/Emit+PartitionedConvolution.swift` or a new
+  `Emit+SpectrumHistory.swift` — port the mirror-write half of
+  `partitionedSpectralMACCall` into a standalone emit.
+- `Sources/DGen/HigherOps+SpectrumHistory.swift` — `graph.spectrumHistory(
+  reInput, imInput, K, N, hopSize, hopCounterNode) -> (histReNodeId,
+  histImNodeId)` where the returned nodes are tensorRefs over `[K, N]`
+  views of the ring cells. Tricky bit: expose a *readable* `[K, N]` tensor
+  whose row 0 = most recent hop, without requiring a separate
+  materialization pass. Options: mirror-row read path (row i = `(p − i + 2K)
+  mod K`) via a sliding-window-style transform, OR zero copy by reading
+  the mirror half directly.
+- `Sources/DGen/Analysis/ShapeInference.swift` — shape rule:
+  `.tensor([K, N])` for the output tensor.
+- patch-editor: `GenSpectrumHistory.swift` (1 inlet pair → 2 outlet pair).
+- Test: `Tests/DGenTests/SpectrumHistoryTests.swift` — verify that after
+  feeding N frames, reading row 0 matches the most recent hop spectrum
+  (re/im) byte-for-byte, and row K-1 matches N-K hops ago.

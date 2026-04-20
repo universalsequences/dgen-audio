@@ -86,7 +86,11 @@ extension LazyOp {
         throw DGenError.insufficientInputs(
           operator: "atan2", expected: 2, actual: inputs.count)
       }
-      b.use(val: b.atan2(b.value(inputs[0]), b.value(inputs[1])))
+      // Route through emitBinaryOp so tensor inputs (tensorRef, views, etc.)
+      // get resolved via readInput → tensorRead using the block's tensorIndex.
+      // Previously used `b.value()` directly, which returns `.empty` for
+      // tensorRef nodes and renders as `/* unknown lazy */` in the C backend.
+      try emitBinaryOp(b: b, g: g, node: node, inputs: inputs) { b.atan2($0, $1) }
     case .pow:
       guard inputs.count == 2 else {
         throw DGenError.insufficientInputs(
