@@ -2,6 +2,8 @@
 /// High-level: readInput, writeOutput, broadcastIndices.
 /// Indexing: stridedIndex, tensorMemoryIndex, flatToMultiIndex, multiIndexToFlat, broadcastIndex.
 
+import Foundation
+
 extension IRBuilder {
 
   // MARK: - High-level tensor I/O

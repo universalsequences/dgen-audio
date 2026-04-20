@@ -128,6 +128,25 @@ public enum LazyOp {
     gradTime2Cell: CellID
   )
 
+  // Accelerate-framework FFT (C backend only). Calls vDSP_fft_zip for in-place
+  // complex FFT. Writes result to reCell/imCell, exposed downstream as two [N]
+  // tensorRef views. Forward variant takes a real [N] input (im cleared internally).
+  case acceleratedFFT(windowSize: Int, reCell: CellID, imCell: CellID)
+  // Accelerate-framework IFFT (C backend only). Takes two [N] inputs (re, im),
+  // calls vDSP_fft_zip with FFT_INVERSE, normalizes by 1/N, returns real [N].
+  case acceleratedIFFT(windowSize: Int, reCell: CellID, imCell: CellID)
+
+  // Partitioned spectral convolution (UPOLS). Inputs: live (re, im) spectra of
+  // shape [N] at hop-rate, and two static [K, N] IR partition tensors (re, im).
+  // Writes last K input spectra into a mirror-layout [2K, N] ring per channel,
+  // computes Y[n] = Σ_{k=0..K-1} H[k] * X[n-k] as a complex MAC, writes to the
+  // two owned output cells. Exposed downstream as two [N] tensorRef views.
+  case partitionedSpectralConvolve(
+    K: Int, N: Int, hopSize: Int,
+    ringReCell: CellID, ringImCell: CellID,
+    hopCounterCell: CellID, partitionCounterCell: CellID,
+    reOutCell: CellID, imOutCell: CellID)
+
   // Batched FFT-based spectral loss: processes [B] SignalTensors independently per batch element
   case spectralLossFFTBatched(
     windowSize: Int,
@@ -330,6 +349,40 @@ public enum LazyOp {
   public var isSelfDispatchedGemm: Bool {
     switch self {
     case .gemm, .gemmStaged, .gemmChunkPartials, .gemmStagedChunkPartials:
+      return true
+    default:
+      return false
+    }
+  }
+
+  /// Ops whose emit handles its own iteration (internal `b.loop` /
+  /// `b.parallelRange` / explicit vDSP calls) and does NOT consume the
+  /// block-level `tensorIndex`. Such ops must not force a block's body to be
+  /// wrapped in `parallelRange(block.shape.reduce(1,*))` — doing so makes the
+  /// emit run `block.shape` times with no benefit. `.tensorRef` also counts:
+  /// it emits no code at all. `.seq` just returns its last input's value.
+  ///
+  /// Note: forward `.selectRow`, `.peek`, `.sampleInline` still rely on the
+  /// block's tensorIndex and must NOT be listed here. GEMM and conv variants
+  /// are explicitly isolated into their own blocks by block formation, so
+  /// their self-iteration does not interact with a sibling compute op's wrapper.
+  public var emitsInternalIteration: Bool {
+    switch self {
+    case .tensorRef,
+      .seq,
+      .acceleratedFFT, .acceleratedIFFT,
+      .overlapAdd, .overlapAddGradStore, .overlapAddGradGather,
+      .bufferViewGradStore, .bufferViewGradRead,
+      .partitionedSpectralConvolve,
+      .gemm, .gemmStaged, .gemmChunkPartials, .gemmStagedChunkPartials,
+      .gemmSmall,
+      .conv1d, .conv2d,
+      .tensorAccumulate, .chunkPartialsReduceToCell,
+      .spectralLossFFT, .spectralLossFFTGradSpec, .spectralLossFFTGradIFFT,
+      .spectralLossFFTGradInline, .spectralLossFFTGradRead, .spectralLossFFTGradRead2,
+      .spectralLossFFTBatched, .spectralLossFFTBatchedReduce,
+      .spectralLossFFTBatchedGradSpec, .spectralLossFFTBatchedGradIFFT,
+      .spectralLossFFTBatchedGradRead2:
       return true
     default:
       return false

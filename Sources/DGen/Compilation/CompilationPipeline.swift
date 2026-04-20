@@ -152,6 +152,7 @@ public struct CompilationPipeline {
     name: String = "kernel"
   ) throws -> CompilationResult {
     validateFrameCount(options, graph: graph)
+    try rejectUnsupportedBackendOps(graph: graph, backend: backend)
     var timings = PipelineTimings()
 
     let prep = try runGraphPreparationPasses(
@@ -258,6 +259,27 @@ public struct CompilationPipeline {
       "frameCount (\(options.frameCount)) exceeds graph.maxFrameCount (\(graph.maxFrameCount)). "
         + "Set graph.maxFrameCount to at least \(options.frameCount) before compilation."
     )
+  }
+
+  /// Reject ops that require a specific backend. Currently: acceleratedFFT/IFFT
+  /// depend on Apple's Accelerate framework (vDSP) and are C-only — using them
+  /// on Metal is a compile-time error directing the user to tensorFFT instead.
+  private static func rejectUnsupportedBackendOps(graph: Graph, backend: Backend) throws {
+    guard backend == .metal else { return }
+    for (_, node) in graph.nodes {
+      switch node.op {
+      case .acceleratedFFT, .acceleratedIFFT:
+        throw DGenError.compilationFailed(
+          "acceleratedFFT/acceleratedIFFT require the Accelerate framework and are "
+            + "only supported on the C backend. Use tensorFFT/tensorIFFT for Metal.")
+      case .partitionedSpectralConvolve:
+        throw DGenError.compilationFailed(
+          "partitionedSpectralConvolve depends on acceleratedFFT-style hop-rate "
+            + "scheduling and is only supported on the C backend.")
+      default:
+        break
+      }
+    }
   }
 
   /// Runs graph-level analysis passes that prepare sorting and scalar execution decisions.

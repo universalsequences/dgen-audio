@@ -264,6 +264,72 @@ final class FFTTests: XCTestCase {
         XCTAssertLessThan(maxShapeError, 0.01, "Output should match cosine shape")
     }
 
+    /// Repro: raw DGen graph — input -> bufferView -> FFT -> IFFT -> overlapAdd -> output
+    /// User reports C backend compile failure with
+    /// "use of undeclared identifier 'simdNNNN'" referencing loop vars from another scope.
+    func testInputBufferViewFFTIFFT_N256_Hop128_CCompiles() throws {
+        let N = 256
+        let hop = 128
+        let sr: Float = 44100.0
+        let framesPerRun = 256
+
+        let g = Graph(sampleRate: sr, maxFrameCount: framesPerRun)
+
+        // Graph: in -> bufferView -> fft -> ifft -> overlap-add -> out
+        let signal = g.n(.input(0))
+        let buffered = g.bufferView(signal, size: N, hopSize: hop)
+        let flat = try g.reshape(buffered, to: [N])
+        let (re, im) = g.tensorFFT(flat, N: N)
+        let reconstructed = g.tensorIFFT(re, im, N: N)
+        let output = g.overlapAdd(reconstructed, windowSize: N, hopSize: hop)
+        _ = g.n(.output(0), output)
+
+        let result = try CompilationPipeline.compile(
+            graph: g, backend: .c,
+            options: .init(frameCount: framesPerRun, debug: false)
+        )
+
+        try? FileManager.default.removeItem(atPath: "/tmp/fft_input_n256_hop128.c")
+        try result.source.write(toFile: "/tmp/fft_input_n256_hop128.c", atomically: true, encoding: .utf8)
+
+        let cRuntime = CCompiledKernel(
+            source: result.source,
+            cellAllocations: result.cellAllocations,
+            memorySize: result.totalMemorySlots
+        )
+        try cRuntime.compileAndLoad()
+    }
+
+    /// Wiring a tensor (e.g. ifft result) straight to .output must throw a clear
+    /// DGenError directing users to add overlapAdd, not produce a broken kernel.
+    func testTensorToOutputRaisesClearError() throws {
+        let N = 1024
+        let hop = 128
+        let sr: Float = 44100.0
+        let framesPerRun = 256
+
+        let g = Graph(sampleRate: sr, maxFrameCount: framesPerRun)
+
+        let signal = g.n(.input(0))
+        let buffered = g.bufferView(signal, size: N, hopSize: hop)
+        let (re, im) = g.tensorFFT(buffered, N: N)
+        let reconstructed = g.tensorIFFT(re, im, N: N)
+        _ = g.n(.output(0), reconstructed)
+
+        XCTAssertThrowsError(
+            try CompilationPipeline.compile(
+                graph: g, backend: .c,
+                options: .init(frameCount: framesPerRun, debug: false)
+            )
+        ) { error in
+            let message = String(describing: error)
+            XCTAssertTrue(
+                message.contains("overlapAdd"),
+                "Error should direct user to overlapAdd; got: \(message)"
+            )
+        }
+    }
+
     /// Diagnostic: dump raw samples around hop boundaries to see the glitch pattern
     func testTensorFFTHopBoundaryDiagnostic() throws {
         let N = 1024

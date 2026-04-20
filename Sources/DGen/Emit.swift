@@ -263,6 +263,13 @@ extension LazyOp {
       .bufferViewGradStore, .bufferViewGradRead:
       try emitFFT(b: b, ctx: ctx, g: g, node: node, inputs: inputs, nodeId: nodeId)
 
+    case .acceleratedFFT, .acceleratedIFFT:
+      try emitAcceleratedFFT(b: b, ctx: ctx, g: g, node: node, inputs: inputs, nodeId: nodeId)
+
+    case .partitionedSpectralConvolve:
+      try emitPartitionedSpectralConvolve(
+        b: b, ctx: ctx, g: g, node: node, inputs: inputs, nodeId: nodeId)
+
     case .gemm, .gemmChunkPartials:
       try emitGemm(b: b, ctx: ctx, g: g, node: node, nodeId: nodeId, ops: &ops)
 

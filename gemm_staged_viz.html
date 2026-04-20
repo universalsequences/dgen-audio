@@ -1,0 +1,471 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Threadgroup-Staged GEMM — Step-by-Step</title>
+<style>
+  * { box-sizing: border-box; }
+  body {
+    font-family: "SF Mono", "Menlo", monospace;
+    margin: 24px;
+    background: #0f1115;
+    color: #d8dee9;
+  }
+  h1 { font-size: 18px; font-weight: 500; margin: 0 0 6px 0; color: #ebcb8b; }
+  .sub { font-size: 12px; color: #888; margin-bottom: 12px; }
+  .legend {
+    font-size: 11px;
+    color: #aaa;
+    margin-bottom: 16px;
+    display: flex;
+    gap: 14px;
+    flex-wrap: wrap;
+  }
+  .legend .swatch {
+    display: inline-block;
+    width: 12px;
+    height: 12px;
+    vertical-align: middle;
+    margin-right: 4px;
+    border: 1px solid #555;
+  }
+  .step-info {
+    background: #1b1f27;
+    padding: 12px 14px;
+    margin: 10px 0 16px 0;
+    border-left: 3px solid #5e81ac;
+    min-height: 50px;
+    font-size: 13px;
+    line-height: 1.5;
+  }
+  .step-info .tag {
+    display: inline-block;
+    background: #5e81ac;
+    color: #0f1115;
+    padding: 1px 6px;
+    font-size: 11px;
+    margin-right: 6px;
+    font-weight: 600;
+  }
+
+  .layout {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 32px;
+    align-items: start;
+  }
+  .column { display: flex; flex-direction: column; gap: 18px; }
+
+  .panel { background: #1b1f27; padding: 10px 12px 12px 12px; border: 1px solid #2a2f3a; }
+  .panel-title {
+    font-size: 11px;
+    color: #81a1c1;
+    margin-bottom: 6px;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+  }
+  .panel-sub { font-size: 10px; color: #666; margin-bottom: 8px; }
+
+  .matrix { display: grid; gap: 1px; background: #0a0c10; padding: 1px; width: max-content; }
+  .cell {
+    width: 11px;
+    height: 11px;
+    background: #23272e;
+    transition: background 120ms, box-shadow 120ms;
+  }
+  .cell.reading    { background: #ebcb8b; box-shadow: 0 0 3px #ebcb8b; } /* source being read from DRAM */
+  .cell.in-scratch { background: #5e81ac; }                              /* staged in scratch */
+  .cell.sg00-read  { background: #bf616a; }                              /* SG(0,0) currently reading this */
+  .cell.sg01-read  { background: #88c0d0; }
+  .cell.sg10-read  { background: #a3be8c; }
+  .cell.sg11-read  { background: #b48ead; }
+  .cell.sg00-out   { background: #7a3538; }                              /* SG(0,0) output written */
+  .cell.sg01-out   { background: #496e78; }
+  .cell.sg10-out   { background: #5c7250; }
+  .cell.sg11-out   { background: #725868; }
+
+  .accumulators { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+  .acc {
+    background: #14171d;
+    padding: 6px;
+    border: 1px solid #2a2f3a;
+    font-size: 10px;
+  }
+  .acc .label { display: flex; justify-content: space-between; margin-bottom: 4px; color: #aaa; }
+  .acc .label .name { font-weight: 600; }
+  .acc .swatch { display: inline-block; width: 8px; height: 8px; margin-right: 4px; }
+  .acc .bar {
+    height: 6px;
+    background: #23272e;
+    position: relative;
+    margin-top: 3px;
+  }
+  .acc .bar-fill { height: 100%; background: #5e81ac; transition: width 200ms; }
+  .acc .k-done { font-size: 9px; color: #888; margin-top: 2px; }
+
+  .controls { display: flex; gap: 8px; align-items: center; margin-top: 20px; }
+  .btn {
+    background: #2a2f3a;
+    color: #e8eaed;
+    border: 1px solid #404651;
+    padding: 6px 14px;
+    font-family: inherit;
+    font-size: 12px;
+    cursor: pointer;
+  }
+  .btn:hover { background: #343a46; }
+  .btn:disabled { opacity: 0.4; cursor: not-allowed; }
+  .btn.primary { background: #5e81ac; border-color: #5e81ac; color: #0f1115; font-weight: 600; }
+  .btn.primary:hover { background: #81a1c1; }
+  .step-counter { font-size: 12px; color: #888; margin-left: auto; }
+
+  .kernel-slice {
+    background: #14171d;
+    padding: 10px 12px;
+    margin-top: 16px;
+    border: 1px solid #2a2f3a;
+    font-size: 11px;
+    white-space: pre;
+    overflow-x: auto;
+    color: #9aa5b1;
+    line-height: 1.5;
+  }
+  .kernel-slice .hl { background: #ebcb8b33; color: #ebcb8b; }
+  .kernel-slice .cmt { color: #565f6b; }
+</style>
+</head>
+<body>
+
+<h1>Threadgroup-Staged GEMM — 32×32 @ 32×32</h1>
+<div class="sub">
+  One threadgroup owning C[0:16, 0:16]. blockM=16, blockN=16, blockK=8 →
+  4 SIMD groups × 32 threads = 128 threads/TG. K=32 → 4 K-strips.
+</div>
+
+<div class="legend">
+  <span><span class="swatch" style="background:#ebcb8b"></span>being read from DRAM</span>
+  <span><span class="swatch" style="background:#5e81ac"></span>staged in scratch</span>
+  <span><span class="swatch" style="background:#bf616a"></span>SG(0,0)</span>
+  <span><span class="swatch" style="background:#88c0d0"></span>SG(0,1)</span>
+  <span><span class="swatch" style="background:#a3be8c"></span>SG(1,0)</span>
+  <span><span class="swatch" style="background:#b48ead"></span>SG(1,1)</span>
+</div>
+
+<div class="step-info" id="step-info"><span class="tag">step 0</span>Press Next to begin.</div>
+
+<div class="layout">
+  <div class="column">
+    <div class="panel">
+      <div class="panel-title">B — the right-hand matrix <span style="color:#666">(showing cols 0..15 for this TG)</span></div>
+      <div class="panel-sub">K rows × 16 cols = 32 × 16. B-strip (8 rows × 16 cols) loaded per K-iter.</div>
+      <div class="matrix" id="b-matrix"></div>
+    </div>
+    <div class="panel">
+      <div class="panel-title">C — output (this threadgroup's 16×16 block)</div>
+      <div class="panel-sub">Each 8×8 quadrant owned by one SIMD group. Written in the final store.</div>
+      <div class="matrix" id="c-matrix"></div>
+    </div>
+  </div>
+  <div class="column">
+    <div class="panel">
+      <div class="panel-title">A — the left-hand matrix <span style="color:#666">(showing rows 0..15 for this TG)</span></div>
+      <div class="panel-sub">16 rows × K cols = 16 × 32. A-strip (16 rows × 8 cols) loaded per K-iter.</div>
+      <div class="matrix" id="a-matrix"></div>
+    </div>
+    <div class="panel">
+      <div class="panel-title">scratch_0 — A-strip in threadgroup memory</div>
+      <div class="panel-sub">blockM × blockK = 16 × 8 floats. Reused by 2 SIMD groups (top half by SG(0,0)+SG(0,1), bottom by SG(1,0)+SG(1,1)).</div>
+      <div class="matrix" id="scratch0"></div>
+    </div>
+    <div class="panel">
+      <div class="panel-title">scratch_1 — B-strip in threadgroup memory</div>
+      <div class="panel-sub">blockK × blockN = 8 × 16 floats. Reused by 2 SIMD groups (left half by SG(0,0)+SG(1,0), right by SG(0,1)+SG(1,1)).</div>
+      <div class="matrix" id="scratch1"></div>
+    </div>
+    <div class="panel">
+      <div class="panel-title">Per-SIMD-group accumulators (persist across K-loop)</div>
+      <div class="panel-sub">Each is a simdgroup_float8x8. Starts at 0, += 1024 FLOPs per K-iter, stored to C at the end.</div>
+      <div class="accumulators" id="accumulators"></div>
+    </div>
+  </div>
+</div>
+
+<div class="kernel-slice" id="kernel-slice"></div>
+
+<div class="controls">
+  <button class="btn" id="btn-prev">← Prev</button>
+  <button class="btn primary" id="btn-next">Next →</button>
+  <button class="btn" id="btn-play">Play</button>
+  <button class="btn" id="btn-reset">Reset</button>
+  <span class="step-counter" id="step-counter"></span>
+</div>
+
+<script>
+(() => {
+  const M = 16, N = 16, K = 32;      // this TG's view (16 rows of A, 16 cols of B, full K)
+  const BM = 16, BN = 16, BK = 8;    // block dims
+  const NUM_K_STRIPS = K / BK;       // 4
+  const SG_ROWS = BM / 8;            // 2
+  const SG_COLS = BN / 8;            // 2
+
+  // --- build steps ---
+  // Each step is { phase: "init" | "load" | "mac" | "store", kStrip: 0..3 | null, text: "..." }
+  const steps = [
+    { phase: "init", kStrip: null, text:
+      "Initial state. The threadgroup owns a 16×16 output block of C. " +
+      "It will execute 4 iterations over the K dimension (K=32, blockK=8 → 4 strips). " +
+      "Each iteration: cooperatively stage an A-strip and B-strip into threadgroup scratch memory, " +
+      "then each of the 4 SIMD groups does a simdgroup_multiply_accumulate against its owned 8×8 portion." },
+  ];
+  for (let k = 0; k < NUM_K_STRIPS; k++) {
+    steps.push({ phase: "load", kStrip: k, text:
+      `K-iter ${k}/${NUM_K_STRIPS - 1} — COOPERATIVE LOAD. ` +
+      `All 128 threads read one float each from DRAM: 128 go into the A-strip (rows 0..15 of A, cols ${k*BK}..${k*BK+BK-1}), ` +
+      `128 go into the B-strip (rows ${k*BK}..${k*BK+BK-1} of B, cols 0..15). ` +
+      `Then threadgroup_barrier(): wait until scratch_0 and scratch_1 are fully populated.` });
+    steps.push({ phase: "mac", kStrip: k, text:
+      `K-iter ${k}/${NUM_K_STRIPS - 1} — PER-SIMD MAC. ` +
+      `Each of the 4 SIMD groups does ONE simdgroup_multiply_accumulate (1024 FLOPs) against an 8×8 tile from scratch_0 and an 8×8 tile from scratch_1. ` +
+      `SG(0,0) and SG(0,1) BOTH read the top half of scratch_0 → that 64-float A-tile was loaded once from DRAM, now feeds 2 MACs. ` +
+      `Same for the bottom half (SG(1,0)+SG(1,1)) and both halves of scratch_1. ` +
+      `This 2× register-level reuse is where the AI doubles from 2 → 4 FLOPs/byte. ` +
+      `Another barrier follows so the next iter's writes don't race these reads.` });
+  }
+  steps.push({ phase: "store", kStrip: null, text:
+    "STORE. K-loop done. Each SIMD group's accumulator (4× simdgroup_float8x8) is written to its owned 8×8 region of C via simdgroup_store. " +
+    "Four 8×8 tiles, together forming the 16×16 output block this threadgroup was responsible for. " +
+    "Done." });
+
+  // --- matrix builders ---
+  function buildMatrix(id, rows, cols) {
+    const el = document.getElementById(id);
+    el.style.gridTemplateColumns = `repeat(${cols}, 11px)`;
+    const cells = [];
+    for (let r = 0; r < rows; r++) {
+      for (let c = 0; c < cols; c++) {
+        const d = document.createElement("div");
+        d.className = "cell";
+        d.dataset.r = r;
+        d.dataset.c = c;
+        el.appendChild(d);
+        cells.push(d);
+      }
+    }
+    return { el, rows, cols, cells, cellAt: (r, c) => cells[r * cols + c] };
+  }
+  const A       = buildMatrix("a-matrix", M, K);
+  const B       = buildMatrix("b-matrix", K, N);
+  const C       = buildMatrix("c-matrix", M, N);
+  const scratch0 = buildMatrix("scratch0", BM, BK);   // 16 × 8
+  const scratch1 = buildMatrix("scratch1", BK, BN);   //  8 × 16
+
+  // --- accumulators ---
+  const accContainer = document.getElementById("accumulators");
+  const sgMeta = [
+    { name: "SG(0,0)", row: 0, col: 0, color: "#bf616a" },
+    { name: "SG(0,1)", row: 0, col: 1, color: "#88c0d0" },
+    { name: "SG(1,0)", row: 1, col: 0, color: "#a3be8c" },
+    { name: "SG(1,1)", row: 1, col: 1, color: "#b48ead" },
+  ];
+  const accEls = sgMeta.map(sg => {
+    const box = document.createElement("div");
+    box.className = "acc";
+    box.innerHTML = `
+      <div class="label">
+        <span class="name"><span class="swatch" style="background:${sg.color}"></span>${sg.name}</span>
+        <span class="flops">0 FLOPs</span>
+      </div>
+      <div class="bar"><div class="bar-fill" style="background:${sg.color}; width:0%"></div></div>
+      <div class="k-done">K-iters done: 0 / ${NUM_K_STRIPS}</div>
+    `;
+    accContainer.appendChild(box);
+    return {
+      box, sg,
+      flopsEl: box.querySelector(".flops"),
+      barEl: box.querySelector(".bar-fill"),
+      kDoneEl: box.querySelector(".k-done"),
+    };
+  });
+
+  // --- rendering ---
+  function clearClasses(matrix) {
+    for (const c of matrix.cells) c.className = "cell";
+  }
+
+  function render(stepIdx) {
+    const step = steps[stepIdx];
+    document.getElementById("step-counter").textContent = `step ${stepIdx + 1} / ${steps.length}`;
+    document.getElementById("step-info").innerHTML =
+      `<span class="tag">${step.phase.toUpperCase()}${step.kStrip != null ? " • K=" + step.kStrip : ""}</span>${step.text}`;
+
+    clearClasses(A); clearClasses(B); clearClasses(scratch0); clearClasses(scratch1);
+
+    // C: reflect which SGs have stored their tiles (cumulative — only filled after store step).
+    clearClasses(C);
+    if (step.phase === "store") {
+      for (const sg of sgMeta) {
+        for (let r = 0; r < 8; r++) {
+          for (let c = 0; c < 8; c++) {
+            C.cellAt(sg.row * 8 + r, sg.col * 8 + c).classList.add(`sg${sg.row}${sg.col}-out`);
+          }
+        }
+      }
+    }
+
+    // Which strips are currently staged in scratch? (cumulative up through latest completed load)
+    // "Staged" = the most recent strip load is visible in scratch until next load overwrites.
+    let currentK = null;
+    if (step.phase === "load" || step.phase === "mac") currentK = step.kStrip;
+    else if (step.phase === "store") currentK = NUM_K_STRIPS - 1; // last K persists as stale scratch
+
+    if (step.phase === "load") {
+      // Highlight the source cells being read from DRAM this iter.
+      const k = step.kStrip;
+      for (let r = 0; r < BM; r++) {
+        for (let c = 0; c < BK; c++) {
+          A.cellAt(r, k * BK + c).classList.add("reading");
+          scratch0.cellAt(r, c).classList.add("in-scratch");
+        }
+      }
+      for (let r = 0; r < BK; r++) {
+        for (let c = 0; c < BN; c++) {
+          B.cellAt(k * BK + r, c).classList.add("reading");
+          scratch1.cellAt(r, c).classList.add("in-scratch");
+        }
+      }
+    } else if (step.phase === "mac") {
+      // Scratch is fully populated for this K. Color it by which SG reads which 8×8 slice.
+      // scratch_0 (16×8): top half read by SG(0,0) AND SG(0,1); bottom by SG(1,0) AND SG(1,1).
+      // We alternate cell colors to show joint ownership of the same tile.
+      for (let r = 0; r < BM; r++) {
+        for (let c = 0; c < BK; c++) {
+          const sgRow = Math.floor(r / 8);
+          // each cell read by 2 SGs — alternate cells checkerboard-style for visual clarity
+          const cls = (c % 2 === 0)
+            ? `sg${sgRow}0-read`
+            : `sg${sgRow}1-read`;
+          scratch0.cellAt(r, c).classList.add(cls);
+        }
+      }
+      // scratch_1 (8×16): left half read by SG(0,0) AND SG(1,0); right by SG(0,1) AND SG(1,1).
+      for (let r = 0; r < BK; r++) {
+        for (let c = 0; c < BN; c++) {
+          const sgCol = Math.floor(c / 8);
+          const cls = (r % 2 === 0)
+            ? `sg0${sgCol}-read`
+            : `sg1${sgCol}-read`;
+          scratch1.cellAt(r, c).classList.add(cls);
+        }
+      }
+      // Also keep A/B source regions dim-lit so the reader sees where the strip came from.
+      const k = step.kStrip;
+      for (let r = 0; r < BM; r++) {
+        for (let c = 0; c < BK; c++) A.cellAt(r, k * BK + c).classList.add("in-scratch");
+      }
+      for (let r = 0; r < BK; r++) {
+        for (let c = 0; c < BN; c++) B.cellAt(k * BK + r, c).classList.add("in-scratch");
+      }
+    }
+
+    // Accumulator progress: count of completed MAC phases for each SG.
+    let completedMacs = 0;
+    for (let i = 0; i <= stepIdx; i++) {
+      if (steps[i].phase === "mac") completedMacs++;
+    }
+    for (const acc of accEls) {
+      const flops = completedMacs * 1024;
+      acc.flopsEl.textContent = `${flops.toLocaleString()} FLOPs`;
+      acc.barEl.style.width = `${(completedMacs / NUM_K_STRIPS) * 100}%`;
+      acc.kDoneEl.textContent = `K-iters done: ${completedMacs} / ${NUM_K_STRIPS}`;
+    }
+
+    renderKernelSlice(step);
+  }
+
+  // --- annotated kernel slice tied to current step ---
+  const kernelEl = document.getElementById("kernel-slice");
+  function renderKernelSlice(step) {
+    const hl = (s) => `<span class="hl">${s}</span>`;
+    const cmt = (s) => `<span class="cmt">${s}</span>`;
+    let body = "";
+    if (step.phase === "init") {
+      body =
+`${cmt("// Setup — runs once per threadgroup before the K-loop.")}
+threadgroup float scratch_0[128];   ${cmt("// 16×8 A-strip scratchpad")}
+threadgroup float scratch_1[128];   ${cmt("// 8×16 B-strip scratchpad")}
+int sgRow = sgid / 2;               ${cmt("// which row-of-8×8-tiles this SIMD group owns (0 or 1)")}
+int sgCol = sgid % 2;               ${cmt("// which col-of-8×8-tiles this SIMD group owns (0 or 1)")}
+simdgroup_float8x8 acc = simdgroup_float8x8(0);   ${cmt("// per-SIMD-group accumulator, persists across all K-iters")}
+
+for (uint k = 0; k < 4; k++) { ${cmt("/* K-loop — 4 iterations */")} ... }`;
+    } else if (step.phase === "load") {
+      body =
+`for (uint k = 0; k < 4; k++) {
+    ${cmt("// PHASE 1 — cooperative strip load (each thread loads 1 A float + 1 B float)")}
+${hl("    scratch_0[aStripRow*8 + aStripCol]   = memory[0    + (tileRow*16+aStripRow)*32 + (k*8+aStripCol)];")}
+${hl("    scratch_1[bStripRow*16 + bStripCol]  = memory[1024 + (k*8+bStripRow)*32 + (tileCol*16+bStripCol)];")}
+    threadgroup_barrier(mem_threadgroup);   ${cmt("// wait until all 128 threads finish staging")}
+
+    ${cmt("// PHASE 2 — per-SIMD MAC (next step)")}
+    ...
+}`;
+    } else if (step.phase === "mac") {
+      body =
+`for (uint k = 0; k < 4; k++) {
+    ${cmt("// PHASE 1 — already done")}
+    ...
+
+    ${cmt("// PHASE 2 — per-SIMD MAC")}
+${hl("    simdgroup_load(a, &scratch_0[sgRow*64], 8);       // 8×8 A-tile from scratch (NOT DRAM)")}
+${hl("    simdgroup_load(b, &scratch_1[sgCol*8],  16);      // 8×8 B-tile from scratch")}
+${hl("    simdgroup_multiply_accumulate(acc, a, b, acc);    // 1024 FLOPs into this SG's accumulator")}
+    threadgroup_barrier(mem_threadgroup);   ${cmt("// so next iter's writes don't race these reads")}
+}`;
+    } else if (step.phase === "store") {
+      body =
+`${cmt("// K-loop done. Each SIMD group's accumulator is complete.")}
+${hl("simdgroup_store(acc, &memory[2048 + (tileRow*16+sgRow*8)*32 + tileCol*16+sgCol*8], 32);")}
+${cmt("//                                  ^ this SG's 8×8 region of C")}
+${cmt("// Together, the 4 stores fill in the 16×16 block this threadgroup owned.")}`;
+    }
+    kernelEl.innerHTML = body;
+  }
+
+  // --- controls ---
+  let idx = 0;
+  let playing = false;
+  let playTimer = null;
+  const btnPrev = document.getElementById("btn-prev");
+  const btnNext = document.getElementById("btn-next");
+  const btnPlay = document.getElementById("btn-play");
+  const btnReset = document.getElementById("btn-reset");
+
+  function update() {
+    render(idx);
+    btnPrev.disabled = idx === 0;
+    btnNext.disabled = idx === steps.length - 1;
+  }
+  btnPrev.onclick = () => { if (idx > 0) { idx--; update(); } };
+  btnNext.onclick = () => { if (idx < steps.length - 1) { idx++; update(); } };
+  btnReset.onclick = () => { idx = 0; update(); stopPlay(); };
+  function stopPlay() {
+    playing = false;
+    btnPlay.textContent = "Play";
+    if (playTimer) { clearInterval(playTimer); playTimer = null; }
+  }
+  btnPlay.onclick = () => {
+    if (playing) { stopPlay(); return; }
+    playing = true;
+    btnPlay.textContent = "Pause";
+    playTimer = setInterval(() => {
+      if (idx < steps.length - 1) { idx++; update(); }
+      else stopPlay();
+    }, 1400);
+  };
+
+  update();
+})();
+</script>
+</body>
+</html>

@@ -1,0 +1,30 @@
+{
+  "checkpointEvery" : 100,
+  "chunkHop" : 8192,
+  "chunkSize" : 16384,
+  "frameHop" : 256,
+  "frameSize" : 1024,
+  "learningRate" : 0.001,
+  "logEvery" : 10,
+  "maxF0Hz" : 1000,
+  "minF0Hz" : 50,
+  "modelHiddenSize" : 64,
+  "modelNumLayers" : 2,
+  "mseLossWeight" : 0,
+  "numHarmonics" : 16,
+  "peakNormalizeTo" : 0.99,
+  "sampleRate" : 16000,
+  "seed" : 1337,
+  "shuffleChunks" : true,
+  "silenceRMS" : 0.0005,
+  "spectralHopDivisor" : 4,
+  "spectralLogmagWeight" : 0.5,
+  "spectralWeight" : 1,
+  "spectralWindowSizes" : [
+    128,
+    256,
+    512
+  ],
+  "trainSplit" : 0.9,
+  "voicedThreshold" : 0.3
+}

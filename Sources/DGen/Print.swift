@@ -207,6 +207,11 @@ extension UOp {
             opStr = "\(ANSI.magenta)tidInThreadgroup\(ANSI.reset)"
         case .simdgroupIndexInThreadgroup:
             opStr = "\(ANSI.magenta)sgidInThreadgroup\(ANSI.reset)"
+        case let .acceleratedFFTCall(log2N, reCell, imCell, inverse):
+            let dir = inverse ? "inverse" : "forward"
+            opStr = "\(ANSI.magenta)acceleratedFFTCall\(ANSI.reset)(log2N=\(log2N), re=\(reCell), im=\(imCell), \(dir))"
+        case let .partitionedSpectralMACCall(K, N, pIdx, rRe, rIm, iRe, iIm, oRe, oIm):
+            opStr = "\(ANSI.magenta)partitionedSpectralMACCall\(ANSI.reset)(K=\(K), N=\(N), pIdx=\(pIdx), ring=[\(rRe),\(rIm)], ir=[\(iRe),\(iIm)], out=[\(oRe),\(oIm)])"
         }
 
         return "\(ANSI.bold)UOp\(ANSI.reset)(op: \(opStr), value: \(value))"

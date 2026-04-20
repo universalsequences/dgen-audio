@@ -219,6 +219,7 @@ public class CRenderer: Renderer {
       #include <arm_neon.h>
       #include <stdint.h>
       #include <stdio.h>
+      #include <string.h>
       #include <math.h>
       #include <Accelerate/Accelerate.h>
       #include <mach/mach_time.h>
@@ -387,8 +388,18 @@ public class CRenderer: Renderer {
 
   /// Render a Lazy value, optionally as an integer literal for int-typed constants
   private func emitLazyTyped(_ lazy: Lazy, ctx: IRContext, vectorWidth: Int, asInt: Bool) -> String {
-    if asInt, case .constant(_, let val) = lazy {
-      return "\(Int(val))"
+    if asInt {
+      if case .constant(_, let val) = lazy {
+        return "\(Int(val))"
+      }
+      // Int-typed UOps always declare their output as `int t{id}` (see emitAssign),
+      // never as `simd{id}`, even when surrounded by a SIMD block. Consumers of int
+      // values must therefore reference the scalar form. Honor active loop-var
+      // renames (e.g. a parallel-range counter named `simd{id}` that is itself int).
+      if case .variable(let id, _) = lazy, let loopVarName = activeLoopVarNames[id] {
+        return loopVarName
+      }
+      return emitLazy(lazy, ctx: ctx, vectorWidth: 1, isOut: false)
     }
     return emitLazy(lazy, ctx: ctx, vectorWidth: vectorWidth, isOut: false)
   }
@@ -1103,6 +1114,53 @@ public class CRenderer: Renderer {
     case .threadgroupWrite(let scratchId, let offset, let value):
       let cast = isIntTypedOffset(offset) ? "" : "(int)"
       return "scratch_\(scratchId)[\(cast)\(g(offset))] = \(g(value));"
+
+    case .partitionedSpectralMACCall(
+      let K, let N,
+      let partitionIdxCell,
+      let ringReCell, let ringImCell,
+      let irReCell, let irImCell,
+      let reOutCell, let imOutCell):
+      // Zero the output, then K calls to vDSP_zvma: Y = X[k] * H[k] + Y.
+      // Each partition is a heavily NEON-optimized N-element complex MAC.
+      return """
+        {
+          int _dgen_p = (int)memory[\(partitionIdxCell)];
+          memset(&memory[\(reOutCell)], 0, \(N) * sizeof(float));
+          memset(&memory[\(imOutCell)], 0, \(N) * sizeof(float));
+          DSPSplitComplex _dgen_Y = { .realp = &memory[\(reOutCell)], .imagp = &memory[\(imOutCell)] };
+          for (int _dgen_k = 0; _dgen_k < \(K); _dgen_k++) {
+            int _dgen_ring_off = (_dgen_p + \(K) - _dgen_k) * \(N);
+            DSPSplitComplex _dgen_X = {
+              .realp = &memory[\(ringReCell) + _dgen_ring_off],
+              .imagp = &memory[\(ringImCell) + _dgen_ring_off]
+            };
+            int _dgen_ir_off = _dgen_k * \(N);
+            DSPSplitComplex _dgen_H = {
+              .realp = &memory[\(irReCell) + _dgen_ir_off],
+              .imagp = &memory[\(irImCell) + _dgen_ir_off]
+            };
+            vDSP_zvma(&_dgen_X, 1, &_dgen_H, 1, &_dgen_Y, 1, &_dgen_Y, 1, \(N));
+          }
+        }
+        """
+
+    case .acceleratedFFTCall(let log2N, let reCell, let imCell, let inverse):
+      let direction = inverse ? "kFFTDirection_Inverse" : "kFFTDirection_Forward"
+      // Lazy-init a per-log2N FFTSetup using a static — persists across frames,
+      // single-threaded audio callback means no locking needed.
+      // FFT_CALL_USES: re=\(reCell), im=\(imCell) — keeps cell refs visible to
+      // textual search tools without affecting generated semantics.
+      return """
+        {
+          static FFTSetup _dgen_fft_setup_\(log2N) = NULL;
+          if (_dgen_fft_setup_\(log2N) == NULL) {
+            _dgen_fft_setup_\(log2N) = vDSP_create_fftsetup(\(log2N), kFFTRadix2);
+          }
+          DSPSplitComplex _dgen_sc = { .realp = &memory[\(reCell)], .imagp = &memory[\(imCell)] };
+          vDSP_fft_zip(_dgen_fft_setup_\(log2N), &_dgen_sc, 1, \(log2N), \(direction));
+        }
+        """
 
     default:
       return "/* \(uop.prettyDescription()) */"

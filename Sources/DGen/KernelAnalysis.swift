@@ -85,6 +85,14 @@ private func classify(_ op: Op) -> OpClass {
     return .control
   case .simdgroupMultiplyAccumulate:
     return .arithmetic
+
+  // Accelerate-framework FFT call: opaque, treated as transcendental-class work.
+  case .acceleratedFFTCall:
+    return .transcendental
+
+  // vDSP-backed partitioned spectral MAC: opaque, heavy arithmetic.
+  case .partitionedSpectralMACCall:
+    return .arithmetic
   }
 }
 

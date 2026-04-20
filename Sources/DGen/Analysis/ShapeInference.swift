@@ -256,6 +256,7 @@ public func inferShape(op: LazyOp, inputs: [ValueShape], graph: Graph) throws ->
     .spectralLossFFTGradInline, .spectralLossFFTGradRead, .spectralLossFFTGradRead2,
     .spectralLossFFTBatched, .spectralLossFFTBatchedReduce,
     .spectralLossFFTBatchedGradSpec, .spectralLossFFTBatchedGradIFFT,
+    .acceleratedFFT, .acceleratedIFFT, .partitionedSpectralConvolve,
     .selectRowGradWrite, .selectRowGradReduce,
     .selector,
     .memoryRead, .memoryWrite, .memoryAccumulate, .memoryCellSum,

@@ -942,6 +942,16 @@ extension LazyOp {
     case .spectralLossFFTBatchedGradRead2(_, _, _, _, _):
       return node.inputs.map { _ in nil }
 
+    case .acceleratedFFT, .acceleratedIFFT:
+      // Accelerate-based FFT/IFFT are not differentiable (no backward rule).
+      // Use tensorFFT/tensorIFFT for trainable pipelines.
+      return node.inputs.map { _ in nil }
+
+    case .partitionedSpectralConvolve:
+      // Convolution reverb is not a trainable op — ring buffer state spans hops
+      // and complicates BPTT. Return no-gradient for all inputs.
+      return node.inputs.map { _ in nil }
+
     case .selectRow:
       // selectRow(tensor2D, rowIndex) -> 1D tensor [numCols]
       // Gradient uses frame-indexed storage for determinism (no atomics in write phase)

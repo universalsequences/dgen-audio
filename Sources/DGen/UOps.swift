@@ -117,6 +117,23 @@ public enum Op {
   case simdgroupStore(Lazy, CellID, Lazy, Int)  // simdgroup_store(src, memory[cell] + offset, stride)
   case simdgroupMultiplyAccumulate(Lazy, Lazy, Lazy)  // acc = a * b + acc
 
+  // Accelerate-framework FFT call (C backend only). Emits vDSP_fft_zip on the
+  // [reCell, imCell] buffers. For inverse, also scales by 1/N.
+  case acceleratedFFTCall(log2N: Int, reCell: CellID, imCell: CellID, inverse: Bool)
+
+  // Partitioned spectral complex-MAC (C backend only). Emits a tight loop
+  // calling vDSP_zvma per partition to compute
+  //   Y[n] = Σ_{k=0..K-1} X_ring[(p+K-k)*N .. +N] * H[k*N .. +N]
+  // where p is read from partitionIdxCell. X_ring lives in ringReCell/ringImCell
+  // (mirror-layout [2K, N]), H in irReCell/irImCell ([K, N]), Y written to
+  // reOutCell/imOutCell (both [N]). Y is zeroed first.
+  case partitionedSpectralMACCall(
+    K: Int, N: Int,
+    partitionIdxCell: CellID,
+    ringReCell: CellID, ringImCell: CellID,
+    irReCell: CellID, irImCell: CellID,
+    reOutCell: CellID, imOutCell: CellID)
+
   // Threadgroup shared memory (on-chip SRAM for FFT scratch)
   case threadgroupArrayDecl(scratchId: Int, size: Int)  // declare threadgroup float scratch_N[size]
   case threadgroupRead(scratchId: Int, Lazy)    // read scratch_N[offset]
@@ -217,6 +234,32 @@ public enum Op {
 
   /// Returns a new Op with the cell ID remapped, or nil if no remapping is needed.
   public func withRemappedCellId(_ remapping: [CellID: CellID]) -> Op? {
+    // Ops that reference multiple cells need explicit remapping.
+    if case .acceleratedFFTCall(let log2N, let reCell, let imCell, let inverse) = self {
+      let newRe = remapping[reCell] ?? reCell
+      let newIm = remapping[imCell] ?? imCell
+      if newRe == reCell && newIm == imCell { return nil }
+      return .acceleratedFFTCall(log2N: log2N, reCell: newRe, imCell: newIm, inverse: inverse)
+    }
+    if case .partitionedSpectralMACCall(
+      let K, let N, let pIdx, let rRe, let rIm, let iRe, let iIm, let oRe, let oIm) = self
+    {
+      let nPIdx = remapping[pIdx] ?? pIdx
+      let nRRe = remapping[rRe] ?? rRe
+      let nRIm = remapping[rIm] ?? rIm
+      let nIRe = remapping[iRe] ?? iRe
+      let nIIm = remapping[iIm] ?? iIm
+      let nORe = remapping[oRe] ?? oRe
+      let nOIm = remapping[oIm] ?? oIm
+      if nPIdx == pIdx && nRRe == rRe && nRIm == rIm && nIRe == iRe
+        && nIIm == iIm && nORe == oRe && nOIm == oIm { return nil }
+      return .partitionedSpectralMACCall(
+        K: K, N: N,
+        partitionIdxCell: nPIdx,
+        ringReCell: nRRe, ringImCell: nRIm,
+        irReCell: nIRe, irImCell: nIIm,
+        reOutCell: nORe, imOutCell: nOIm)
+    }
     guard let cellId = memoryCellId, let newCellId = remapping[cellId] else {
       return nil
     }

@@ -365,14 +365,26 @@ extension LazyOp {
 
       // If the source is a shape-[1] tensor, read from its memory cell
       // instead of referencing a variable that may live in another kernel scope.
+      // For tensors with more than one element, error out — .output() emits one
+      // scalar per frame, so a frame-rate conversion (e.g. overlapAdd) is required.
       let outputValue: Expr
       if let srcNode = ctx.g.nodes[sourceId],
         case .tensor(let shape) = srcNode.shape,
-        shape.reduce(1, *) == 1,
         let tensorId = ctx.g.nodeToTensor[sourceId],
         let tensor = ctx.g.tensors[tensorId]
       {
-        outputValue = b.memoryRead(tensor.cellId, b.cast(b.constant(0), to: .int))
+        let size = shape.reduce(1, *)
+        if size == 1 {
+          outputValue = b.memoryRead(tensor.cellId, b.cast(b.constant(0), to: .int))
+        } else {
+          throw DGenError.tensorError(
+            op: "output",
+            reason:
+              "output expects a scalar signal, got tensor of shape \(shape) (size \(size)). "
+              + "To emit a frame-rate signal from a tensor (e.g. after ifft), add an "
+              + "overlapAdd node: `ifft -> overlapAdd @windowSize \(size) @hopSize <H> -> out`."
+          )
+        }
       } else {
         outputValue = b.value(inputs[0])
       }
