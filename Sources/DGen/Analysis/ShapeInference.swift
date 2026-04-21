@@ -187,6 +187,12 @@ public func inferShape(op: LazyOp, inputs: [ValueShape], graph: Graph) throws ->
   case .hopTensorNoise(_, _, let size):
     return .tensor([size])
 
+  case .spectrumDelay(_, _, _, let N, _):
+    return .tensor([N])
+
+  case .spectrumDelayMod(_, _, _, let N, _):
+    return .tensor([N])
+
   case .peekGradWrite(_, _, _, _, _, _, _), .peekGradReduce(_, _, _, _, _, _, _):
     return .scalar
 
@@ -262,7 +268,7 @@ public func inferShape(op: LazyOp, inputs: [ValueShape], graph: Graph) throws ->
     .spectralLossFFTGradInline, .spectralLossFFTGradRead, .spectralLossFFTGradRead2,
     .spectralLossFFTBatched, .spectralLossFFTBatchedReduce,
     .spectralLossFFTBatchedGradSpec, .spectralLossFFTBatchedGradIFFT,
-    .acceleratedFFT, .acceleratedIFFT, .partitionedSpectralConvolve,
+    .acceleratedFFT, .acceleratedIFFT, .phaseVocoderPitchShift, .partitionedSpectralConvolve,
     .selectRowGradWrite, .selectRowGradReduce,
     .selector,
     .memoryRead, .memoryWrite, .memoryAccumulate, .memoryCellSum,

@@ -282,6 +282,114 @@ extension LazyOp {
       }
       ctx.values[nodeId] = .empty
 
+    case .spectrumDelay(let ringCell, let rowCell, let outputCell, let N, let hops):
+      // One-hop delay line for `[N]` spectra. Inputs: [input, hopCounter].
+      // On hop boundaries (counter == 0): write current input to ring row
+      // `rowCell`, advance rowCell, copy the NEW (= oldest) ring row into
+      // `outputCell`. Downstream reads `outputCell` as a static [N] tensor.
+      guard node.inputs.count == 2 else {
+        throw DGenError.insufficientInputs(
+          operator: "spectrumDelay", expected: 2, actual: node.inputs.count)
+      }
+      guard let inputTensorId = g.nodeToTensor[node.inputs[0]],
+        let inputTensor = g.tensors[inputTensorId]
+      else {
+        throw DGenError.tensorError(
+          op: "spectrumDelay", reason: "input 0 must be a tensor node")
+      }
+      let counter = b.value(inputs[1])
+      let zero = b.constant(0.0)
+      let one = b.constant(1.0)
+      let rows = b.constant(Float(hops + 1))
+      let Nint = b.intConstant(N)
+
+      b.if_(counter == zero) {
+        let rowF = b.memoryRead(rowCell, zero)
+        let rowIdx = b.cast(rowF, to: .int)
+        // Write current input spectrum to ring row `rowIdx`.
+        b.loop(N) { e in
+          let value = b.tensorRead(inputTensor, flatIdx: e, shape: [N])
+          _ = b.memoryWrite(ringCell, rowIdx * Nint + e, value)
+        }
+        // Advance row counter, modulo (hops + 1).
+        let nextRow = b.gswitch(rowF + one >= rows, zero, rowF + one)
+        let nextRowIdx = b.cast(nextRow, to: .int)
+        _ = b.memoryWrite(rowCell, zero, nextRow)
+        // Copy the new row (= oldest spectrum, `hops` hops ago) to output.
+        b.loop(N) { e in
+          let v = b.memoryRead(ringCell, nextRowIdx * Nint + e)
+          _ = b.memoryWrite(outputCell, e, v)
+        }
+      }
+      ctx.values[nodeId] = .empty
+
+    case .spectrumDelayMod(let ringCell, let rowCell, let outputCell, let N, let maxHops):
+      // Modulated fractional spectrum delay. Inputs: [input, counter, delay].
+      // `delay` is a hop-rate scalar in `[0, maxHops]`. On hop boundaries:
+      //   1. Write current input to ring[rowCell]
+      //   2. Advance rowCell mod (maxHops + 1)
+      //   3. Linearly interpolate between the ring rows at `floor(delay)`
+      //      and `floor(delay)+1` hops ago; write result to outputCell.
+      guard node.inputs.count == 3 else {
+        throw DGenError.insufficientInputs(
+          operator: "spectrumDelayMod", expected: 3, actual: node.inputs.count)
+      }
+      guard let inputTensorId2 = g.nodeToTensor[node.inputs[0]],
+        let inputTensor2 = g.tensors[inputTensorId2]
+      else {
+        throw DGenError.tensorError(
+          op: "spectrumDelayMod", reason: "input 0 must be a tensor node")
+      }
+      let counterM = b.value(inputs[1])
+      let delayVal = b.value(inputs[2])
+      let zeroM = b.constant(0.0)
+      let oneM = b.constant(1.0)
+      let rowsF = b.constant(Float(maxHops + 1))
+      let maxDelayF = b.constant(Float(maxHops))
+      let NintM = b.intConstant(N)
+      let rowsInt = b.intConstant(maxHops + 1)
+
+      b.if_(counterM == zeroM) {
+        // 1. Write current input to ring[rowCell].
+        let rowF = b.memoryRead(rowCell, zeroM)
+        let rowIdx = b.cast(rowF, to: .int)
+        b.loop(N) { e in
+          let v = b.tensorRead(inputTensor2, flatIdx: e, shape: [N])
+          _ = b.memoryWrite(ringCell, rowIdx * NintM + e, v)
+        }
+        // 2. Advance row counter.
+        let nextRowF = b.gswitch(rowF + oneM >= rowsF, zeroM, rowF + oneM)
+        _ = b.memoryWrite(rowCell, zeroM, nextRowF)
+
+        // 3. Clamp the modulated delay to `[0, maxHops]` so the
+        // interpolation reads two valid rows (kCeil never exceeds
+        // maxHops).
+        let dClamped = b.gswitch(
+          delayVal > maxDelayF, maxDelayF,
+          b.gswitch(delayVal < zeroM, zeroM, delayVal))
+        // kFloor = floor(delay), frac = delay - kFloor.
+        let kFloorF = b.floor(dClamped)
+        let frac = dClamped - kFloorF
+        let oneMinusFrac = oneM - frac
+        let kFloorInt = b.cast(kFloorF, to: .int)
+        let kCeilInt = kFloorInt + b.intConstant(1)
+        // `rowCell` now points to the NEXT write row (= oldest).
+        // The "just-written" row is `nextRowF - 1` wrapped.
+        // `k hops ago` row = (nextRowF - 1 - k + rows) mod rows.
+        let newRowIdx = b.cast(nextRowF, to: .int)
+        let baseInt = newRowIdx - b.intConstant(1) + rowsInt * b.intConstant(2)
+        let rowNear = b.mod(baseInt - kFloorInt, rowsInt)
+        let rowFar = b.mod(baseInt - kCeilInt, rowsInt)
+
+        b.loop(N) { e in
+          let near = b.memoryRead(ringCell, rowNear * NintM + e)
+          let far = b.memoryRead(ringCell, rowFar * NintM + e)
+          let mix = near * oneMinusFrac + far * frac
+          _ = b.memoryWrite(outputCell, e, mix)
+        }
+      }
+      ctx.values[nodeId] = .empty
+
     case .hopTensorNoise(let stateCell, let outputCell, let size):
       // Fused noise + hopHold. The single input is the hop counter accum;
       // on frames where counter == 0, generate N fresh random values into
@@ -304,6 +412,10 @@ extension LazyOp {
 
     case .acceleratedFFT, .acceleratedIFFT:
       try emitAcceleratedFFT(b: b, ctx: ctx, g: g, node: node, inputs: inputs, nodeId: nodeId)
+
+    case .phaseVocoderPitchShift:
+      try emitPhaseVocoderPitchShift(
+        b: b, ctx: ctx, g: g, node: node, inputs: inputs, nodeId: nodeId)
 
     case .partitionedSpectralConvolve:
       try emitPartitionedSpectralConvolve(

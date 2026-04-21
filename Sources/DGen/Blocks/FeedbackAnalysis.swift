@@ -273,6 +273,10 @@ public func findSequentialNodes(_ g: Graph, feedbackClusters: [[NodeID]], backen
       scalar.insert($0.id)  // Tensor noise shares a single PRNG state across N per-frame iterations — must stay scalar so the xorshift advances sequentially rather than being SIMD-vectorized 4-at-once
     case .hopTensorNoise(_, _, _):
       scalar.insert($0.id)  // Same reasoning as tensorNoise — the shared xorshift state must step sequentially, and the hop gate is emitted as scalar `if`
+    case .spectrumDelay(_, _, _, _, _):
+      scalar.insert($0.id)  // Ring-buffer write + row advance must happen sequentially on hop boundaries; the op emits its own scalar `if` gate
+    case .spectrumDelayMod(_, _, _, _, _):
+      scalar.insert($0.id)  // Same reasoning — plus the fractional interpolation reads two ring rows per element
     default: break
     }
   }

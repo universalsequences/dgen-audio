@@ -435,6 +435,185 @@ final class BlockFormationTests: XCTestCase {
         XCTAssertNotNil(result[2].tensorIndex)
     }
 
+    func testDetermineTensorBlocksSplitsSequentialTensorBodyFromScalarSuffix() throws {
+        let g = Graph()
+
+        let tensor = g.tensor(shape: [4], data: [1, 2, 3, 4])
+        let tensorMul = g.n(.mul, tensor, g.n(.constant(2.0)))
+        let overlapAdd = g.n(.overlapAdd(8, 4, g.alloc(), g.alloc(), g.alloc()), tensorMul)
+        let output = g.n(.output(0), overlapAdd)
+
+        try inferShapes(graph: g, sortedNodes: [tensor, tensorMul, overlapAdd, output])
+
+        var block = Block(frameOrder: .sequential)
+        block.nodes = [tensorMul, overlapAdd, output]
+
+        let result = determineTensorBlocks([block], g, IRContext(g: g))
+
+        XCTAssertEqual(result.count, 2)
+        XCTAssertEqual(result[0].nodes, [tensorMul])
+        XCTAssertEqual(result[0].frameOrder, .sequential)
+        XCTAssertNotNil(result[0].tensorIndex)
+        XCTAssertEqual(result[1].nodes, [overlapAdd, output])
+        XCTAssertNil(result[1].tensorIndex)
+    }
+
+    func testDetermineTensorBlocksSplitsHopProducingTensorSuffix() throws {
+        let g = Graph()
+
+        let tensor = g.tensor(shape: [4], data: [1, 2, 3, 4])
+        let rampCell = g.alloc(vectorWidth: 1)
+        let one = g.n(.constant(1.0))
+        let zero = g.n(.constant(0.0))
+        let big = g.n(.constant(1e9))
+        let ramp = g.n(.accum(rampCell), one, zero, zero, big)
+        let frameTensor = g.n(.add, tensor, ramp)
+        let hopTrigger = g.hopHold(ramp, hopSize: 4)
+        let held = g.latch(frameTensor, hopTrigger)
+        let post = g.n(.mul, held, g.n(.constant(2.0)))
+
+        try inferShapes(graph: g, sortedNodes: [tensor, one, zero, big, ramp, frameTensor, hopTrigger, held, post])
+
+        var block = Block(frameOrder: .sequential)
+        block.nodes = [frameTensor, held, post]
+
+        let result = determineTensorBlocks([block], g, IRContext(g: g))
+
+        XCTAssertEqual(result.count, 2)
+        XCTAssertEqual(result[0].nodes, [frameTensor])
+        XCTAssertNotNil(result[0].tensorIndex)
+        XCTAssertEqual(result[1].nodes, [held, post])
+        XCTAssertNotNil(result[1].tensorIndex)
+    }
+
+    func testDetermineTensorBlocksSplitsHopProducingTensorSuffixInRegularTensorBlock() throws {
+        let g = Graph()
+
+        let tensor = g.tensor(shape: [4], data: [1, 2, 3, 4])
+        let frameTensor = g.n(.add, tensor, g.n(.constant(1.0)))
+        let triggerCounter = g.alloc(vectorWidth: 1)
+        let one = g.n(.constant(1.0))
+        let zero = g.n(.constant(0.0))
+        let four = g.n(.constant(4.0))
+        let counter = g.n(.accum(triggerCounter), one, zero, zero, four)
+        let trigger = g.n(.eq, counter, zero)
+        g.nodeHopRate[trigger] = (4, counter)
+        let held = g.latch(frameTensor, trigger)
+        let post = g.n(.mul, held, g.n(.constant(2.0)))
+
+        try inferShapes(graph: g, sortedNodes: [tensor, frameTensor, one, zero, four, counter, trigger, held, post])
+
+        var block = Block(frameOrder: .parallel)
+        block.nodes = [frameTensor, held, post]
+
+        let result = determineTensorBlocks([block], g, IRContext(g: g))
+
+        XCTAssertEqual(result.count, 2)
+        XCTAssertEqual(result[0].nodes, [frameTensor])
+        XCTAssertEqual(result[1].nodes, [held, post])
+        XCTAssertNotNil(result[0].tensorIndex)
+        XCTAssertNotNil(result[1].tensorIndex)
+    }
+
+    func testDetermineTensorBlocksIsolatesAcceleratedFFTFromDownstreamTensorConsumers() throws {
+        let g = Graph()
+
+        let input = g.tensor(shape: [8], data: [1, 2, 3, 4, 5, 6, 7, 8])
+        let half = g.n(.constant(0.5))
+        let pre = g.n(.mul, input, half)
+        let (re, _) = g.acceleratedFFT(pre, N: 8)
+        let two = g.n(.constant(2.0))
+        let post = g.n(.mul, re, two)
+
+        let fftNode = g.nodes[re]?.inputs.first
+        XCTAssertNotNil(fftNode)
+
+        let sorted: [NodeID] = [input, half, pre, fftNode!, re, two, post]
+        try inferShapes(graph: g, sortedNodes: sorted)
+
+        var block = Block(frameOrder: .sequential)
+        block.nodes = [pre, fftNode!, re, post]
+
+        let result = determineTensorBlocks([block], g, IRContext(g: g))
+
+        XCTAssertEqual(result.count, 3)
+        XCTAssertEqual(result[0].nodes, [pre])
+        XCTAssertNotNil(result[0].tensorIndex)
+        XCTAssertEqual(result[1].nodes, [fftNode!])
+        XCTAssertNil(result[1].tensorIndex)
+        XCTAssertEqual(result[2].nodes, [re, post])
+        XCTAssertNotNil(result[2].tensorIndex)
+    }
+
+    func testPhaseVocoderResynthesisBlockIsHopBased() throws {
+        let N = 1024
+        let hop = 256
+        let framesPerRun = 256
+        let g = Graph(sampleRate: 44100.0, maxFrameCount: framesPerRun)
+
+        let input = g.n(.input(0))
+        let buffered = g.bufferView(input, size: N, hopSize: hop)
+        let flat = try g.reshape(buffered, to: [N])
+
+        var hannData = [Float](repeating: 0, count: N)
+        let sc = 2.0 * Float.pi / Float(N)
+        for i in 0..<N { hannData[i] = 0.5 - 0.5 * Foundation.cos(sc * Float(i)) }
+        let hannT = g.tensor(hannData)
+
+        let windowed = g.n(.mul, flat, hannT)
+        let (xRe, xIm) = g.acceleratedFFT(windowed, N: N)
+        let ratio = g.n(.constant(3.0))
+        let (yRe, yIm) = g.phaseVocoder(xRe, xIm, pitchRatio: ratio, N: N, hopSize: hop)
+        let td = g.acceleratedIFFT(yRe, yIm, N: N)
+        let windowedOut = g.n(.mul, td, hannT)
+        let scalar = g.overlapAdd(windowedOut, windowSize: N, hopSize: hop)
+        _ = g.n(.output(0), scalar)
+
+        let feedbackClusters = findFeedbackLoops(g)
+        let scalarNodeSet = findSequentialNodes(g, feedbackClusters: feedbackClusters, backend: .c)
+        let sortedNodes = topologicalSort(
+            g, feedbackClusters: feedbackClusters, scalarNodeSet: scalarNodeSet, debug: false)
+
+        try inferShapes(graph: g, sortedNodes: sortedNodes)
+        TensorOutputBindingPass.bindTensorOutputsAndReserveLazyCells(graph: g, sortedNodes: sortedNodes)
+
+        let blocks = partitionIntoBlocks(sorted: sortedNodes, scalar: scalarNodeSet, g: g, debug: false)
+        let fusedBlocks = fuseBlocks(blocks)
+        let isolatedBlocks = isolateSpectralPasses(fusedBlocks, g)
+        let reFusedBlocks = fuseBlocks(isolatedBlocks)
+        let context = IRContext(g: g)
+        var tensorBlocks = determineTensorBlocks(reFusedBlocks, g, context)
+
+        let temporalityResult = TemporalityPass.inferTemporality(graph: g, sortedNodes: sortedNodes)
+        TemporalityPass.assignBlockTemporality(
+            blocks: &tensorBlocks,
+            frameBasedNodes: temporalityResult.frameBasedNodes,
+            hopBasedNodes: temporalityResult.hopBasedNodes
+        )
+
+        let yReBlock = tensorBlocks.first { $0.nodes.contains(yRe) }
+        let yImBlock = tensorBlocks.first { $0.nodes.contains(yIm) }
+        XCTAssertNotNil(yReBlock)
+        XCTAssertNotNil(yImBlock)
+
+        if let yReBlock {
+            switch yReBlock.temporality {
+            case .hopBased(let hopSize, _):
+                XCTAssertEqual(hopSize, hop, "yRe block should be hop-gated at FFT hop size")
+            default:
+                XCTFail("phase-vocoder yRe block should be hop-based, got \(yReBlock.temporality)")
+            }
+        }
+        if let yImBlock {
+            switch yImBlock.temporality {
+            case .hopBased(let hopSize, _):
+                XCTAssertEqual(hopSize, hop, "yIm block should be hop-gated at FFT hop size")
+            default:
+                XCTFail("phase-vocoder yIm block should be hop-based, got \(yImBlock.temporality)")
+            }
+        }
+    }
+
     func testDetermineTensorBlocksSplitsOnNonFusableShapeTransition() throws {
         let g = Graph()
 

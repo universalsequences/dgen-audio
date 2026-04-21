@@ -459,6 +459,50 @@ private func firstNonViewTensorOffset(in block: Block, graph: Graph) -> Int? {
   }?.offset
 }
 
+/// Returns the first scalar-shaped, non-view node offset after tensor work begins.
+///
+/// This detects a tensor-to-scalar suffix such as `... -> overlapAdd -> output`.
+/// Keeping that suffix in the same sequential block would force the tensor region
+/// to inherit frame-based temporality from the scalar consumer.
+private func firstScalarSuffixOffset(
+  in block: Block, graph: Graph, after tensorOffset: Int
+) -> Int? {
+  guard tensorOffset + 1 < block.nodes.count else { return nil }
+  return block.nodes[(tensorOffset + 1)...].enumerated().first { (relativeOffset, nodeId) in
+    _ = relativeOffset
+    guard let node = graph.nodes[nodeId] else { return false }
+    if node.op.isViewOnly { return false }
+    if case .tensor = node.shape { return false }
+    return true
+  }.map { tensorOffset + 1 + $0.offset }
+}
+
+/// Returns the first hop-producing tensor node after non-hop tensor work has begun.
+///
+/// This isolates patterns like:
+/// `frame-rate tensor state update -> latch(triggered at hop) -> hop-rate FFT/IFFT chain`
+/// so the hop-producing suffix keeps hop-based scheduling.
+private func firstHopTensorSuffixOffset(
+  in block: Block, graph: Graph, after tensorOffset: Int
+) -> Int? {
+  guard tensorOffset + 1 < block.nodes.count else { return nil }
+
+  var sawNonHopTensor = false
+  for offset in tensorOffset..<block.nodes.count {
+    let nodeId = block.nodes[offset]
+    guard let node = graph.nodes[nodeId], !node.op.isViewOnly else { continue }
+    guard case .tensor = node.shape else { continue }
+
+    if graph.nodeHopRate[nodeId] != nil {
+      if sawNonHopTensor { return offset }
+    } else {
+      sawNonHopTensor = true
+    }
+  }
+
+  return nil
+}
+
 /// Returns true when a scalar block prefix contains inherently-scalar stateful ops.
 ///
 /// When true, the scalar prefix must be split out so tensor loop wrapping does not run
@@ -468,7 +512,14 @@ private func scalarPrefixNeedsSplit(
 ) -> Bool {
   guard firstTensorOffset > 0 else { return false }
   return block.nodes[0..<firstTensorOffset].contains { nodeId in
-    graph.nodes[nodeId]?.op.isInherentlyScalar ?? false
+    guard let op = graph.nodes[nodeId]?.op else { return false }
+    if op.isInherentlyScalar { return true }
+    switch op {
+    case .tensorRef, .seq:
+      return false
+    default:
+      return op.emitsInternalIteration
+    }
   }
 }
 
@@ -482,22 +533,45 @@ private func splitScalarBlockForTensorGrouping(
     return [modified]
   }
 
-  guard scalarPrefixNeedsSplit(block: block, firstTensorOffset: firstTensorOffset, graph: graph)
-  else {
+  let needsPrefixSplit = scalarPrefixNeedsSplit(
+    block: block, firstTensorOffset: firstTensorOffset, graph: graph)
+  let scalarSuffixOffset = firstScalarSuffixOffset(
+    in: block, graph: graph, after: firstTensorOffset)
+  let hopTensorSuffixOffset = firstHopTensorSuffixOffset(
+    in: block, graph: graph, after: firstTensorOffset)
+  let splitOffset = [scalarSuffixOffset, hopTensorSuffixOffset].compactMap { $0 }.min()
+
+  if !needsPrefixSplit && splitOffset == nil {
     var modified = block
     assignTensorIndexFromFirstTensorNode(to: &modified, graph: graph, ctx: ctx)
     return [modified]
   }
 
-  var scalarPrefix = makeTensorGroupingBlock(from: block)
-  scalarPrefix.nodes = Array(block.nodes[0..<firstTensorOffset])
+  var result: [Block] = []
+  let tensorStart = needsPrefixSplit ? firstTensorOffset : 0
+  let tensorEndExclusive = splitOffset ?? block.nodes.count
 
-  var tensorSuffix = makeTensorGroupingBlock(from: block)
-  tensorSuffix.frameOrder = .parallel
-  tensorSuffix.nodes = Array(block.nodes[firstTensorOffset...])
-  assignTensorIndexFromFirstTensorNode(to: &tensorSuffix, graph: graph, ctx: ctx)
+  if needsPrefixSplit {
+    var scalarPrefix = makeTensorGroupingBlock(from: block)
+    scalarPrefix.nodes = Array(block.nodes[0..<firstTensorOffset])
+    result.append(scalarPrefix)
+  }
 
-  return [scalarPrefix, tensorSuffix]
+  if tensorStart < tensorEndExclusive {
+    var tensorBody = makeTensorGroupingBlock(from: block)
+    tensorBody.frameOrder = needsPrefixSplit ? .parallel : block.frameOrder
+    tensorBody.nodes = Array(block.nodes[tensorStart..<tensorEndExclusive])
+    assignTensorIndexFromFirstTensorNode(to: &tensorBody, graph: graph, ctx: ctx)
+    result.append(tensorBody)
+  }
+
+  if let splitOffset {
+    var scalarSuffix = makeTensorGroupingBlock(from: block)
+    scalarSuffix.nodes = Array(block.nodes[splitOffset...])
+    result.append(contentsOf: splitScalarBlockForTensorGrouping(scalarSuffix, graph: graph, ctx: ctx))
+  }
+
+  return result
 }
 
 /// Strip `block.shape` / `block.tensorIndex` when the block contains no node
@@ -519,6 +593,7 @@ private func groupRegularTensorBlock(
   var grouped: [Block] = []
   var currentBlock = makeTensorGroupingBlock(from: block)
   var currentShape: Shape? = nil
+  var currentHasNonHopTensor = false
 
   for nodeId in block.nodes {
     guard let node = graph.nodes[nodeId] else {
@@ -529,13 +604,23 @@ private func groupRegularTensorBlock(
     // tensorRef only seeds tensor loop metadata; it should not force standalone compute blocks.
     if case .tensorRef = node.op {
       if case .tensor(let shape) = node.shape {
+        let isHopTensorRef = graph.nodeHopRate[nodeId] != nil
+        if currentShape != nil && isHopTensorRef && currentHasNonHopTensor {
+          appendCurrentGroupingBlockIfNeeded(&currentBlock, grouped: &grouped)
+          currentBlock = makeTensorGroupingBlock(from: block)
+          currentHasNonHopTensor = false
+        }
         if currentShape != nil && shape != currentShape {
           appendCurrentGroupingBlockIfNeeded(&currentBlock, grouped: &grouped)
           currentBlock = makeTensorGroupingBlock(from: block)
+          currentHasNonHopTensor = false
         }
         currentBlock.shape = shape
         currentBlock.tensorIndex = ctx.useVariable(src: nil)
         currentShape = shape
+        if !isHopTensorRef {
+          currentHasNonHopTensor = true
+        }
       }
       currentBlock.nodes.append(nodeId)
       continue
@@ -553,6 +638,7 @@ private func groupRegularTensorBlock(
         currentBlock = makeTensorGroupingBlock(from: block)
       }
       currentShape = nil
+      currentHasNonHopTensor = false
 
     } else if node.op.isSelfDispatchedGemm {
       // GEMM variants manage their own dispatch — isolate into their own block.
@@ -563,6 +649,7 @@ private func groupRegularTensorBlock(
       grouped.append(gemmBlock)
       currentBlock = makeTensorGroupingBlock(from: block)
       currentShape = nil
+      currentHasNonHopTensor = false
       continue
 
     } else if case .gemmSmall(let M, let N, _, _, _) = node.op {
@@ -575,22 +662,37 @@ private func groupRegularTensorBlock(
       grouped.append(gemmSmallBlock)
       currentBlock = makeTensorGroupingBlock(from: block)
       currentShape = nil
+      currentHasNonHopTensor = false
       continue
     } else if case .constant = node.op {
       // Constants do not affect grouping state.
-    } else if case .overlapAdd = node.op {
-      // overlapAdd has its own internal frame/scatter loop and must be isolated.
+    } else if node.op.emitsInternalIteration {
+      // Self-iterating ops like acceleratedFFT/IFFT, overlapAdd,
+      // partitionedSpectralConvolve, tensorAccumulate, etc. emit their own
+      // loops/vDSP calls and must not share a sibling tensor loop. Isolate the
+      // op itself, then let any downstream tensorRef-backed consumers start a
+      // fresh tensor region.
       appendCurrentGroupingBlockIfNeeded(&currentBlock, grouped: &grouped)
 
-      var overlapAddBlock = makeTensorGroupingBlock(from: block)
-      overlapAddBlock.frameOrder = .sequential
-      overlapAddBlock.nodes.append(nodeId)
-      grouped.append(overlapAddBlock)
+      var selfIteratingBlock = makeTensorGroupingBlock(from: block)
+      selfIteratingBlock.frameOrder = .sequential
+      selfIteratingBlock.nodes.append(nodeId)
+      grouped.append(selfIteratingBlock)
 
       currentBlock = makeTensorGroupingBlock(from: block)
       currentShape = nil
+      currentHasNonHopTensor = false
       continue
     } else if case .tensor(let shape) = node.shape {
+      let isHopTensor = graph.nodeHopRate[nodeId] != nil
+      if currentShape != nil && isHopTensor && currentHasNonHopTensor {
+        appendCurrentGroupingBlockIfNeeded(&currentBlock, grouped: &grouped)
+        currentBlock = makeTensorGroupingBlock(from: block)
+        currentBlock.tensorIndex = ctx.useVariable(src: nil)
+        currentBlock.shape = shape
+        currentShape = shape
+        currentHasNonHopTensor = false
+      }
       if shape != currentShape {
         // Axis reduces and concat-by-padding transitions stay in-region even when shape changes.
         if let previousShape = currentShape,
@@ -605,7 +707,11 @@ private func groupRegularTensorBlock(
           currentBlock.tensorIndex = ctx.useVariable(src: nil)
           currentBlock.shape = shape
           currentShape = shape
+          currentHasNonHopTensor = false
         }
+      }
+      if !isHopTensor {
+        currentHasNonHopTensor = true
       }
     } else {
       if currentShape != nil {
@@ -613,6 +719,7 @@ private func groupRegularTensorBlock(
         currentBlock = makeTensorGroupingBlock(from: block)
       }
       currentShape = nil
+      currentHasNonHopTensor = false
     }
 
     currentBlock.nodes.append(nodeId)

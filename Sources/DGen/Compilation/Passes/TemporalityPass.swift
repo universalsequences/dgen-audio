@@ -10,12 +10,39 @@ public struct TemporalityResult {
 enum TemporalityPass {}
 
 extension TemporalityPass {
+  /// Returns true when an op is safe to schedule at hop rate for a node that
+  /// carries explicit hop metadata.
+  ///
+  /// Most ops listed here already self-gate internally. Tensor-shaped
+  /// `.accum` / `.latch` are a special case: when a caller explicitly tags the
+  /// node with `graph.nodeHopRate`, running the enclosing block only on hop
+  /// frames is equivalent to their frame-rate form with zero/no-op work
+  /// between hops, and avoids a full per-sample `[N]` pass.
+  static func opEmitsFullHopGate(_ op: LazyOp, graph: Graph, nodeId: NodeID) -> Bool {
+    switch op {
+    case .hopTensorNoise, .spectrumDelay, .spectrumDelayMod:
+      return true
+    case .accum, .latch:
+      guard graph.nodeHopRate[nodeId] != nil,
+        let node = graph.nodes[nodeId],
+        case .tensor = node.shape
+      else {
+        return false
+      }
+      return true
+    default:
+      return false
+    }
+  }
+
   /// Returns true if an op is intrinsically frame-based (its value changes per frame).
   static func isIntrinsicallyFrameBased(_ op: LazyOp) -> Bool {
     switch op {
     case .phasor(_), .deterministicPhasor, .output(_), .accum(_), .input(_),
       .historyRead(_), .historyWrite(_), .historyReadWrite(_), .latch(_), .click(_),
       .noise(_), .tensorNoise(_, _, _), .hopTensorNoise(_, _, _),
+      .spectrumDelay(_, _, _, _, _),
+      .spectrumDelayMod(_, _, _, _, _),
       .overlapAdd(_, _, _, _, _):
       return true
     default:
@@ -49,14 +76,20 @@ extension TemporalityPass {
 
       if let hopRate = producesHopBasedOutput(node.op, graph: graph, nodeId: nodeId) {
         hopProducingNodes[nodeId] = hopRate
-        // Hop-producing ops that are also inherently frame-based (scalar
-        // `.latch` / `.accum` etc. whose cond was hop-rate) only update their
-        // persistent cell on hop boundaries — the value they expose downstream
-        // is effectively hop-rate. Marking them hop-based instead of
-        // frame-based lets their block be hop-gated, which cascades to any
-        // co-located spectral op (FFT / polar / rect) that would otherwise
-        // inherit frame-based temporality via block grouping.
-        if isIntrinsicallyFrameBased(node.op) {
+        // Explicitly-tagged hop outputs fall into two buckets:
+        //
+        // 1. Pure / derived ops (`add`, `mul`, `cos`, tensor latches already
+        //    held at hop rate, etc.) whose value only changes when their
+        //    hop-rate inputs change. These are safe to schedule hop-based.
+        //
+        // 2. Intrinsically frame-based stateful ops (`latch`, `accum`, ...)
+        //    that still need a stricter check. Only promote those when their
+        //    own emit semantics make hop-rate scheduling safe.
+        let shouldPromoteToHopBased =
+          !isIntrinsicallyFrameBased(node.op)
+          || opEmitsFullHopGate(node.op, graph: graph, nodeId: nodeId)
+
+        if shouldPromoteToHopBased {
           hopBasedNodes[nodeId] = hopRate
         } else {
           frameBasedNodes.insert(nodeId)

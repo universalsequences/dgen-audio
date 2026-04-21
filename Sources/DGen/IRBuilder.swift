@@ -1,4 +1,5 @@
 import Darwin
+import Foundation
 
 public final class IRBuilder {
   public let ctx: IRContext

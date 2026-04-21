@@ -314,7 +314,14 @@ private func determineVectorPlan(
   let hasSIMDBlockers = containsSIMDBlockers(bodyUops, backend: backend)
 
   let canUseSIMD: Bool
-  if let shape = block.shape, block.tensorIndex != nil {
+  if backend == .c, case .hopBased = block.temporality {
+    // Hop-rate C blocks often contain transform/index-heavy tensor reads
+    // under an outer hop gate. Rendering those as SIMD is currently unsafe:
+    // scalar loop-index math inside the body can be rewritten as lane-wise
+    // vector names, producing invalid C. Keep them scalar until the C
+    // renderer has a legality-aware lowering for hop-gated tensor loops.
+    canUseSIMD = false
+  } else if let shape = block.shape, block.tensorIndex != nil {
     let size = shape.reduce(1, *)
     // Frame-based tensor blocks must run element-by-element per frame
     // because their values change every frame (e.g., downstream of phasor(tensor)).

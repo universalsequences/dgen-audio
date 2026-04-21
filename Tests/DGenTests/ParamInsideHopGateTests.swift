@@ -363,7 +363,11 @@ final class ParamInsideHopGateTests: XCTestCase {
         let paramValue: Float = 7.0
         let physicalSlot =
             result.cellAllocations.cellMappings[pCell] ?? pCell
-        memPtr[physicalSlot] = paramValue
+        // Audiograph layer writes `vectorWidth` copies. Mirror it here.
+        let width = result.cellAllocations.cellVectorWidths[pCell] ?? 1
+        for i in 0..<width {
+            memPtr[physicalSlot + i] = paramValue
+        }
 
         var output = [Float](repeating: 0, count: framesPerRun)
         let input = [Float](repeating: 0, count: framesPerRun)

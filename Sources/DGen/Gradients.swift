@@ -711,6 +711,12 @@ extension LazyOp {
     case .hopTensorNoise(_, _, _):
       return []
 
+    case .spectrumDelay(_, _, _, _, _):
+      return []
+
+    case .spectrumDelayMod(_, _, _, _, _):
+      return []
+
     case .click(_):
       return [g.n(.constant(0.0), [])]
 
@@ -949,7 +955,7 @@ extension LazyOp {
     case .spectralLossFFTBatchedGradRead2(_, _, _, _, _):
       return node.inputs.map { _ in nil }
 
-    case .acceleratedFFT, .acceleratedIFFT:
+    case .acceleratedFFT, .acceleratedIFFT, .phaseVocoderPitchShift:
       // Accelerate-based FFT/IFFT are not differentiable (no backward rule).
       // Use tensorFFT/tensorIFFT for trainable pipelines.
       return node.inputs.map { _ in nil }

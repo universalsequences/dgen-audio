@@ -51,6 +51,11 @@ extension Graph {
     nodeToTensor[reNode] = reTensorId
     nodeToTensor[imNode] = imTensorId
 
+    if let hopRate = nodeHopRate[input] ?? nodeHopRate[fftOp] {
+      nodeHopRate[reNode] = hopRate
+      nodeHopRate[imNode] = hopRate
+    }
+
     return (re: reNode, im: imNode)
   }
 
@@ -81,6 +86,10 @@ extension Graph {
 
     let reNode = n(.tensorRef(reTensorId), [ifftOp], shape: .tensor([N]))
     nodeToTensor[reNode] = reTensorId
+
+    if let hopRate = nodeHopRate[re] ?? nodeHopRate[im] ?? nodeHopRate[ifftOp] {
+      nodeHopRate[reNode] = hopRate
+    }
 
     return reNode
   }

@@ -136,6 +136,22 @@ public enum LazyOp {
   // calls vDSP_fft_zip with FFT_INVERSE, normalizes by 1/N, returns real [N].
   case acceleratedIFFT(windowSize: Int, reCell: CellID, imCell: CellID)
 
+  // Dedicated hop-rate phase vocoder pitch shifter. Inputs:
+  //   [xRe, xIm, pitchRatio, hopCounter]
+  // Maintains previous analysis phase and synthesis phase internally, writes
+  // remapped complex output to reOutCell/imOutCell, exposed downstream as
+  // tensorRef views.
+  case phaseVocoderPitchShift(
+    windowSize: Int, hopSize: Int,
+    prevAnalysisPhaseCell: CellID,
+    synthPhaseCell: CellID,
+    tempMagCell: CellID,
+    tempOmegaCell: CellID,
+    initCell: CellID,
+    reOutCell: CellID,
+    imOutCell: CellID
+  )
+
   // Partitioned spectral convolution (UPOLS). Inputs: live (re, im) spectra of
   // shape [N] at hop-rate, and two static [K, N] IR partition tensors (re, im).
   // Writes last K input spectra into a mirror-layout [2K, N] ring per channel,
@@ -272,6 +288,8 @@ public enum LazyOp {
   case noise(CellID)
   case tensorNoise(CellID, CellID, Int)  // stateCell, outputCell, size — N independent random values per frame
   case hopTensorNoise(CellID, CellID, Int)  // stateCell, outputCell, size — regenerates only on hop boundaries (counter input == 0), holds between hops
+  case spectrumDelay(CellID, CellID, CellID, Int, Int)  // ringCell, rowCell, outputCell, N, hops — N-bin spectrum from `hops` hops ago
+  case spectrumDelayMod(CellID, CellID, CellID, Int, Int)  // ringCell, rowCell, outputCell, N, maxHops — fractional delay driven by a scalar `delay` input (0..maxHops)
   case constant(Float)
   case output(Int)
   case input(Int)
@@ -373,11 +391,14 @@ public enum LazyOp {
     case .tensorRef,
       .seq,
       .acceleratedFFT, .acceleratedIFFT,
+      .phaseVocoderPitchShift,
       .overlapAdd, .overlapAddGradStore, .overlapAddGradGather,
       .bufferViewGradStore, .bufferViewGradRead,
       .partitionedSpectralConvolve,
       .tensorNoise,
       .hopTensorNoise,
+      .spectrumDelay,
+      .spectrumDelayMod,
       .gemm, .gemmStaged, .gemmChunkPartials, .gemmStagedChunkPartials,
       .gemmSmall,
       .conv1d, .conv2d,

@@ -10,22 +10,11 @@ public func upgradeElementLoopsToSIMD(_ uops: inout [UOp]) {
     // Match both loop types and extract element count + loop variable.
     let elementCount: Int
     let loopVar: Lazy
-    let isParallelRange: Bool
 
     switch uops[i].op {
     case .beginParallelRange(let count, _):
       elementCount = count
       loopVar = uops[i].value
-      isParallelRange = true
-
-    case .beginForLoop(let lv, let countLazy):
-      guard case .constant(_, let countFloat) = countLazy else {
-        i += 1
-        continue
-      }
-      elementCount = Int(countFloat)
-      loopVar = lv
-      isParallelRange = false
 
     default:
       i += 1
@@ -136,11 +125,7 @@ public func upgradeElementLoopsToSIMD(_ uops: inout [UOp]) {
       uops[k].vectorWidth = 4
     }
 
-    if isParallelRange {
-      uops[endIdx].vectorWidth = 4
-    } else {
-      uops[endIdx] = UOp(op: .endParallelRange, value: uops[endIdx].value, vectorWidth: 4)
-    }
+    uops[endIdx].vectorWidth = 4
 
     i = endIdx + 1
   }
