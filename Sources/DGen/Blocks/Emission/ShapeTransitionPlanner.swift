@@ -571,12 +571,19 @@ func buildRegions(
     // Classify nodes as scalar (emitted outside element loop) or tensor.
     // View-only ops (reshape, transpose, shrink) are tensor-shaped metadata that
     // set ctx.values; they must be emitted so downstream ops find their inputs.
+    //
+    // Self-iterating ops (hopTensorNoise, overlapAdd, acceleratedFFT, …) emit
+    // their own `b.loop` / vDSP calls and DO NOT want to be wrapped in an
+    // additional element loop — doing so multiplies their work by the region
+    // size. Route them through the scalar path so they're emitted once.
     var scalarNodes: [NodeID] = []
     var tensorNodes: [NodeID] = []
     for idx in nodeRange {
       let nodeId = block.nodes[idx]
       guard let node = g.nodes[nodeId] else { continue }
-      if case .tensor = node.shape {
+      if node.op.emitsInternalIteration {
+        scalarNodes.append(nodeId)
+      } else if case .tensor = node.shape {
         tensorNodes.append(nodeId)
       } else if !node.op.isViewOnly {
         scalarNodes.append(nodeId)

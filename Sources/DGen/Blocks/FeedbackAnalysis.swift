@@ -269,6 +269,10 @@ public func findSequentialNodes(_ g: Graph, feedbackClusters: [[NodeID]], backen
       scalar.insert($0.id)  // Click reads/writes cell — needs sequential frame execution
     case .noise(_):
       scalar.insert($0.id)  // Noise PRNG reads/writes state cell — needs sequential frame execution
+    case .tensorNoise(_, _, _):
+      scalar.insert($0.id)  // Tensor noise shares a single PRNG state across N per-frame iterations — must stay scalar so the xorshift advances sequentially rather than being SIMD-vectorized 4-at-once
+    case .hopTensorNoise(_, _, _):
+      scalar.insert($0.id)  // Same reasoning as tensorNoise — the shared xorshift state must step sequentially, and the hop gate is emitted as scalar `if`
     default: break
     }
   }

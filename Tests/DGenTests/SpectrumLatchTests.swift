@@ -184,4 +184,53 @@ final class SpectrumLatchTests: XCTestCase {
         XCTAssertFalse(output.contains(where: \.isNaN))
         XCTAssertFalse(output.contains(where: \.isInfinite))
     }
+
+    /// Regression: a scalar `latch(signal, hopTrigger)` placed near a
+    /// spectral chain must not drag the chain to frame-rate. This was the
+    /// CPU-at-24% bug — the latch node's block was frame-based (since
+    /// `.latch` is inherently frame-based), and block formation grouped
+    /// the FFT into the same block, emitting a per-frame vDSP_fft call.
+    /// Fixed by marking hop-producing frame-based ops as hop-based in
+    /// TemporalityPass.
+    func testScalarLatchDoesNotDemoteNeighbouringFFTToFrameRate() throws {
+        let N = 256
+        let hop = 64
+        let framesPerRun = 128
+        let g = Graph(sampleRate: 44100.0, maxFrameCount: framesPerRun)
+
+        // FFT chain on input 0.
+        let in0 = g.n(.input(0))
+        let buffered = g.bufferView(in0, size: N, hopSize: hop)
+        let flat = try g.reshape(buffered, to: [N])
+        let (xRe, xIm) = g.acceleratedFFT(flat, N: N)
+
+        // Scalar latch on input 1 with a hop-rate trigger (simulates a
+        // secondary modulator latched at hop boundaries).
+        let in1 = g.n(.input(1))
+        let rampCell = g.alloc(vectorWidth: 1)
+        let one = g.n(.constant(1.0))
+        let zero = g.n(.constant(0.0))
+        let big = g.n(.constant(1e9))
+        let ramp = g.n(.accum(rampCell), one, zero, zero, big)
+        let hopTrigger = g.hopHold(ramp, hopSize: hop)
+        let latchedAux = g.latch(in1, hopTrigger)
+
+        // Mix the latched value into the spectrum (re *= latchedAux) so
+        // the graph has a real cross-wire — prevents the latch from being
+        // disconnected and DCE'd.
+        let reScaled = g.n(.mul, xRe, latchedAux)
+        let td = g.acceleratedIFFT(reScaled, xIm, N: N)
+        let out = g.overlapAdd(td, windowSize: N, hopSize: hop)
+        _ = g.n(.output(0), out)
+
+        let result = try CompilationPipeline.compile(
+            graph: g, backend: .c,
+            options: .init(frameCount: framesPerRun, debug: false))
+
+        let src = result.source
+        let fwd = src.components(separatedBy: "kFFTDirection_Forward").count - 1
+        let inv = src.components(separatedBy: "kFFTDirection_Inverse").count - 1
+        XCTAssertEqual(fwd, 1, "forward FFT must appear exactly once (hop-gated)")
+        XCTAssertEqual(inv, 1, "inverse FFT must appear exactly once (hop-gated)")
+    }
 }

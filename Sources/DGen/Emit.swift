@@ -267,6 +267,41 @@ extension LazyOp {
       .bufferViewGradStore, .bufferViewGradRead:
       try emitFFT(b: b, ctx: ctx, g: g, node: node, inputs: inputs, nodeId: nodeId)
 
+    case .tensorNoise(let stateCell, let outputCell, let size):
+      // Sequential loop over N elements, each advancing the shared xorshift
+      // state and storing one independent random value into the current
+      // frame's slice of the frame-aware outputCell. Downstream consumers
+      // read via the nodeToTensor mapping set up in `graph.noise(size:)`.
+      let two = b.constant(2.0)
+      let one = b.constant(1.0)
+      b.loop(size) { i in
+        let r = b.noise(stateCell)            // [0, 1) via xorshift, advances shared state
+        let scaled = r * two - one            // [-1, 1) to match scalar `.noise`
+        _ = b.frameAwareTensorWrite(
+          cellId: outputCell, tensorSize: size, elemIdx: i, value: scaled)
+      }
+      ctx.values[nodeId] = .empty
+
+    case .hopTensorNoise(let stateCell, let outputCell, let size):
+      // Fused noise + hopHold. The single input is the hop counter accum;
+      // on frames where counter == 0, generate N fresh random values into
+      // the persistent outputCell. Between hops the cell holds, so the
+      // tensorRef read path always returns the current hop's snapshot.
+      // This avoids the N-per-frame work that `tensorNoise → hopHold`
+      // would pay.
+      let counter = b.value(inputs[0])
+      let zeroScalar = b.constant(0.0)
+      let twoCh = b.constant(2.0)
+      let oneCh = b.constant(1.0)
+      b.if_(counter == zeroScalar) {
+        b.loop(size) { i in
+          let r = b.noise(stateCell)
+          let scaled = r * twoCh - oneCh
+          _ = b.memoryWrite(outputCell, i, scaled)
+        }
+      }
+      ctx.values[nodeId] = .empty
+
     case .acceleratedFFT, .acceleratedIFFT:
       try emitAcceleratedFFT(b: b, ctx: ctx, g: g, node: node, inputs: inputs, nodeId: nodeId)
 

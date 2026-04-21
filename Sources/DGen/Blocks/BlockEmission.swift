@@ -322,7 +322,13 @@ private func determineVectorPlan(
     canUseSIMD = !hasSIMDBlockers && !isFrameBased && (size % 4 == 0)
   } else {
     if backend == .c && block.frameOrder == .parallel {
-      canUseSIMD = true
+      // Respect SIMD blockers in the shape-less parallel path too.
+      // Blocks that contain their own `beginForLoop` (self-iterating ops
+      // like hopTensorNoise / overlapAdd / FFT internals) can't be safely
+      // SIMD-promoted — the inner scalar loop vars would get renamed to
+      // `simdN` and break references inside the body. Without this check
+      // the else branch silently set width=4 regardless of body content.
+      canUseSIMD = !hasSIMDBlockers
     } else {
       canUseSIMD = false
     }

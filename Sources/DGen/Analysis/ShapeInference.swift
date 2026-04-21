@@ -181,6 +181,12 @@ public func inferShape(op: LazyOp, inputs: [ValueShape], graph: Graph) throws ->
   case .bufferViewGradStore(_, _), .bufferViewGradRead(_, _):
     return .scalar
 
+  case .tensorNoise(_, _, let size):
+    return .tensor([size])
+
+  case .hopTensorNoise(_, _, let size):
+    return .tensor([size])
+
   case .peekGradWrite(_, _, _, _, _, _, _), .peekGradReduce(_, _, _, _, _, _, _):
     return .scalar
 

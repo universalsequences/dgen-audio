@@ -15,7 +15,8 @@ extension TemporalityPass {
     switch op {
     case .phasor(_), .deterministicPhasor, .output(_), .accum(_), .input(_),
       .historyRead(_), .historyWrite(_), .historyReadWrite(_), .latch(_), .click(_),
-      .noise(_), .overlapAdd(_, _, _, _, _):
+      .noise(_), .tensorNoise(_, _, _), .hopTensorNoise(_, _, _),
+      .overlapAdd(_, _, _, _, _):
       return true
     default:
       return false
@@ -48,7 +49,18 @@ extension TemporalityPass {
 
       if let hopRate = producesHopBasedOutput(node.op, graph: graph, nodeId: nodeId) {
         hopProducingNodes[nodeId] = hopRate
-        frameBasedNodes.insert(nodeId)
+        // Hop-producing ops that are also inherently frame-based (scalar
+        // `.latch` / `.accum` etc. whose cond was hop-rate) only update their
+        // persistent cell on hop boundaries — the value they expose downstream
+        // is effectively hop-rate. Marking them hop-based instead of
+        // frame-based lets their block be hop-gated, which cascades to any
+        // co-located spectral op (FFT / polar / rect) that would otherwise
+        // inherit frame-based temporality via block grouping.
+        if isIntrinsicallyFrameBased(node.op) {
+          hopBasedNodes[nodeId] = hopRate
+        } else {
+          frameBasedNodes.insert(nodeId)
+        }
         continue
       }
 

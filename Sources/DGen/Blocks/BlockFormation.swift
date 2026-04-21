@@ -673,10 +673,12 @@ func determineTensorBlocks(_ blocks: [Block], _ graph: Graph, _ ctx: IRContext) 
       // scalar memoryWrite in `parallelRange(tensorSize)` — a dead inner loop
       // that executes the same per-frame write hundreds of times.
       //
-      // Only touch blocks that stayed sequential; the parallel tensor-suffix
-      // needs its shape to keep `determineVectorPlan` from promoting it to
-      // SIMD-4 (its body contains scalar element loops emitted by FFT/IFFT).
-      for i in split.indices where split[i].frameOrder == .sequential {
+      // Scalar prefixes always strip when they contain no per-element work.
+      // The parallel tensor-suffix also strips when every node there is
+      // self-iterating (hopTensorNoise / FFT-family / overlapAdd) — the
+      // combined `determineVectorPlan` + `hasSIMDBlockers` check keeps
+      // SIMD-4 promotion from firing on blocks with internal scalar loops.
+      for i in split.indices {
         clearWastedTensorLoopMetadata(&split[i], graph: graph)
       }
       determined.append(contentsOf: split)

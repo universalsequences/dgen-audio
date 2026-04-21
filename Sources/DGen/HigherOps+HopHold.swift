@@ -45,17 +45,14 @@ extension Graph {
     // Trigger is 1 at hop boundaries (counter == 0), else 0.
     let trigger = n(.eq, counterAccum, hZero)
 
-    // `.latch` is flagged `isInherentlyScalar` in FeedbackAnalysis — the
-    // block it lives in runs scalar per-frame, so the read/write of the
-    // latch cell is properly sequenced (no SIMD-4 all-lanes-load-stale bug).
-    // `latch(value, cond)` stores `value` when `cond > 0`, else holds.
-    let latchCell = alloc(vectorWidth: 1)
-    persistentCells.insert(latchCell)
-    let held = n(.latch(latchCell), input, trigger)
+    // Registering the trigger as hop-producing lets `graph.latch` propagate
+    // the hop rate onto the latched output automatically, so downstream
+    // spectral ops stay hop-gated.
+    nodeHopRate[trigger] = (hopSize, counterAccum)
 
-    // Tag as hop-producing so TemporalityPass treats downstream consumers
-    // as hop-based. Same contract bufferView uses.
-    nodeHopRate[held] = (hopSize, counterAccum)
-    return held
+    // Delegate to `graph.latch` so scalar and tensor inputs both work:
+    // scalar input → scalar-wide cell (classic sample-and-hold),
+    // tensor input → cell sized to the tensor (per-element hold).
+    return latch(input, trigger)
   }
 }

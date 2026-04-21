@@ -270,6 +270,8 @@ public enum LazyOp {
   case deterministicPhasor  // Stateless phasor for constant frequency - parallelizable
   case accum(CellID)
   case noise(CellID)
+  case tensorNoise(CellID, CellID, Int)  // stateCell, outputCell, size — N independent random values per frame
+  case hopTensorNoise(CellID, CellID, Int)  // stateCell, outputCell, size — regenerates only on hop boundaries (counter input == 0), holds between hops
   case constant(Float)
   case output(Int)
   case input(Int)
@@ -374,6 +376,8 @@ public enum LazyOp {
       .overlapAdd, .overlapAddGradStore, .overlapAddGradGather,
       .bufferViewGradStore, .bufferViewGradRead,
       .partitionedSpectralConvolve,
+      .tensorNoise,
+      .hopTensorNoise,
       .gemm, .gemmStaged, .gemmChunkPartials, .gemmStagedChunkPartials,
       .gemmSmall,
       .conv1d, .conv2d,

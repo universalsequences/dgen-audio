@@ -704,6 +704,13 @@ extension LazyOp {
     case .noise(_):
       return [g.n(.constant(0.0), [])]
 
+    case .tensorNoise(_, _, _):
+      // Tensor noise is non-differentiable, same as scalar noise.
+      return []
+
+    case .hopTensorNoise(_, _, _):
+      return []
+
     case .click(_):
       return [g.n(.constant(0.0), [])]
 
