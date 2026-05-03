@@ -51,6 +51,15 @@ struct InputInfo {
     let modulatorSlot: Int?
 }
 
+struct TensorInfo {
+    var name: String
+    let shape: [Int]
+    let kind: String
+    let mutable: Bool
+    let sourceFile: String?
+    let data: [Float]?
+}
+
 struct MacroDefinition {
     let params: [String]
     let body: [ASTNode]
@@ -65,7 +74,13 @@ class LispEvaluator {
     var params: [ParamInfo] = []
     var outputs: [OutputInfo] = []
     var inputs: [InputInfo] = []
+    var tensors: [TensorInfo] = []
     var macroExpansionCounter: Int = 0
+    let sourceDirectory: URL
+
+    init(sourceDirectory: URL = URL(fileURLWithPath: FileManager.default.currentDirectoryPath)) {
+        self.sourceDirectory = sourceDirectory
+    }
 
     // MARK: - Top-level evaluation
 
@@ -155,6 +170,9 @@ class LispEvaluator {
         var result: EvalResult = .none
         for i in 2..<elements.count {
             result = try evaluateAST(elements[i])
+        }
+        if case .tensor = result, let idx = tensors.indices.last, tensors[idx].name.isEmpty {
+            tensors[idx].name = name
         }
         definitions[name] = result
         return .none
@@ -425,7 +443,9 @@ class LispEvaluator {
 
         // Tensor creation
         case "tensor":
-            return try evalTensor(regularArgs)
+            return try evalTensor(regularArgs, attributes: attributePairs)
+        case "wavetable":
+            return try evalWavetable(regularArgs, attributes: attributePairs, mutable: false)
         case "zeros":
             return try evalTensorCreate(regularArgs, fill: .zeros)
         case "ones":
@@ -436,6 +456,8 @@ class LispEvaluator {
             return try evalTensorCreate(regularArgs, fill: .randn)
         case "tensor-param":
             return try evalTensorParam(regularArgs, attributes: attributePairs)
+        case "wavetable-param":
+            return try evalWavetable(regularArgs, attributes: attributePairs, mutable: true)
 
         // Tensor ops
         case "matmul":
@@ -1097,7 +1119,10 @@ class LispEvaluator {
 
     // MARK: - Tensor ops
 
-    private func evalTensor(_ args: [ASTNode]) throws -> EvalResult {
+    private func evalTensor(_ args: [ASTNode], attributes: [(name: String, value: String)]) throws -> EvalResult {
+        if attrValue(attributes, "@file") != nil || attrValue(attributes, "@shape") != nil {
+            return try evalWavetable(args, attributes: attributes, mutable: false)
+        }
         guard args.count >= 2 else {
             throw LispError.invalidArgument("tensor requires at least 2 arguments (rows, cols)")
         }
@@ -1298,16 +1323,33 @@ class LispEvaluator {
     }
 
     private func evalTensorParam(_ args: [ASTNode], attributes: [(name: String, value: String)]) throws -> EvalResult {
+        if attrValue(attributes, "@file") != nil || attrValue(attributes, "@shape") != nil || attrValue(attributes, "@default-file") != nil {
+            return try evalWavetable(args, attributes: attributes, mutable: true)
+        }
         guard args.count >= 1 else {
             throw LispError.invalidArgument("tensor-param requires shape argument")
         }
-        let shape: [Int]
-        if case .atom(let str) = args[0], str.hasPrefix("[") {
-            shape = parseShape(str)
-        } else {
-            shape = try args.map { Int(try requireFloat(evaluateAST($0))) }
-        }
+        let shape = try parseShapeArgs(args)
         return .tensor(Tensor.param(shape))
+    }
+
+    private func evalWavetable(_ args: [ASTNode], attributes: [(name: String, value: String)], mutable: Bool) throws -> EvalResult {
+        let shape = try parseShapeFromArgsOrAttributes(args, attributes: attributes, op: mutable ? "wavetable-param" : "wavetable")
+        let fileAttr = attrValue(attributes, "@file") ?? attrValue(attributes, "@default-file")
+        let sourceFile = fileAttr.map(unquote)
+        let data = try sourceFile.map { try loadTensorData(file: $0, expectedShape: shape) }
+            ?? [Float](repeating: 0, count: shape.reduce(1, *))
+
+        let tensor = makeTensor(shape: shape, data: data, mutable: mutable)
+        tensors.append(TensorInfo(
+            name: attrValue(attributes, "@name").map(unquote) ?? "",
+            shape: shape,
+            kind: "wavetable",
+            mutable: mutable,
+            sourceFile: sourceFile,
+            data: data
+        ))
+        return .tensor(tensor)
     }
 
     // MARK: - Tensor sampling
@@ -1771,15 +1813,123 @@ class LispEvaluator {
         return value == "true" || value == "1"
     }
 
+    private func unquote(_ value: String) -> String {
+        if value.count >= 2, value.first == "\"", value.last == "\"" {
+            return String(value.dropFirst().dropLast())
+        }
+        return value
+    }
+
     private func parseShape(_ str: String) -> [Int] {
-        // Parse "[2,3]" or "2,3"
+        // Parse "[2,3]", "[2 3]", "2,3", or "2 3"
         let cleaned = str.trimmingCharacters(in: CharacterSet(charactersIn: "[]"))
-        return cleaned.split(separator: ",").compactMap { Int($0.trimmingCharacters(in: .whitespaces)) }
+        return cleaned
+            .split(whereSeparator: { $0 == "," || $0.isWhitespace })
+            .compactMap { Int($0.trimmingCharacters(in: .whitespaces)) }
     }
 
     private func parseIntList(_ str: String) -> [Int] {
         let cleaned = str.trimmingCharacters(in: CharacterSet(charactersIn: "[]"))
-        return cleaned.split(separator: ",").compactMap { Int($0.trimmingCharacters(in: .whitespaces)) }
+        return cleaned
+            .split(whereSeparator: { $0 == "," || $0.isWhitespace })
+            .compactMap { Int($0.trimmingCharacters(in: .whitespaces)) }
+    }
+
+    private func parseShapeArgs(_ args: [ASTNode]) throws -> [Int] {
+        if args.count == 1, case .atom(let str) = args[0], str.hasPrefix("[") {
+            return parseShape(str)
+        }
+        return try args.map { Int(try requireFloat(evaluateAST($0))) }
+    }
+
+    private func parseShapeFromArgsOrAttributes(
+        _ args: [ASTNode],
+        attributes: [(name: String, value: String)],
+        op: String
+    ) throws -> [Int] {
+        let shape: [Int]
+        if let shapeStr = attrValue(attributes, "@shape") {
+            shape = parseShape(shapeStr)
+        } else {
+            guard !args.isEmpty else {
+                throw LispError.invalidArgument("\(op) requires @shape [d1,d2,...] or shape arguments")
+            }
+            shape = try parseShapeArgs(args)
+        }
+        guard !shape.isEmpty, shape.allSatisfy({ $0 > 0 }) else {
+            throw LispError.invalidArgument("\(op) shape must contain positive dimensions")
+        }
+        return shape
+    }
+
+    private func makeTensor(shape: [Int], data: [Float], mutable: Bool) -> Tensor {
+        if mutable {
+            return Tensor.param(shape, data: data)
+        }
+        if shape.count == 1 {
+            return Tensor(data)
+        }
+        if shape.count == 2 {
+            let rows = shape[0]
+            let cols = shape[1]
+            let nested = (0..<rows).map { row in
+                Array(data[(row * cols)..<((row + 1) * cols)])
+            }
+            return Tensor(nested)
+        }
+        return Tensor.param(shape, data: data)
+    }
+
+    private func loadTensorData(file: String, expectedShape: [Int]) throws -> [Float] {
+        let url = URL(fileURLWithPath: file, relativeTo: sourceDirectory).standardizedFileURL
+        let rawData: Data
+        do {
+            rawData = try Data(contentsOf: url)
+        } catch {
+            throw LispError.invalidArgument("failed to read tensor file '\(file)' relative to \(sourceDirectory.path): \(error)")
+        }
+
+        let json: Any
+        do {
+            json = try JSONSerialization.jsonObject(with: rawData)
+        } catch {
+            throw LispError.invalidArgument("failed to parse tensor file '\(file)' as JSON: \(error)")
+        }
+
+        let loaded: (shape: [Int]?, data: [Float])
+        if let object = json as? [String: Any] {
+            let shape = (object["shape"] as? [Any])?.compactMap { item -> Int? in
+                if let int = item as? Int { return int }
+                if let number = item as? NSNumber { return number.intValue }
+                return nil
+            }
+            guard let dataValue = object["data"] else {
+                throw LispError.invalidArgument("tensor file '\(file)' object must contain a data array")
+            }
+            loaded = (shape, try flattenJsonFloats(dataValue, file: file))
+        } else {
+            loaded = (nil, try flattenJsonFloats(json, file: file))
+        }
+
+        if let fileShape = loaded.shape, fileShape != expectedShape {
+            throw LispError.invalidArgument("tensor file '\(file)' shape \(fileShape) does not match expected shape \(expectedShape)")
+        }
+
+        let expectedCount = expectedShape.reduce(1, *)
+        guard loaded.data.count == expectedCount else {
+            throw LispError.invalidArgument("tensor file '\(file)' has \(loaded.data.count) values, expected \(expectedCount) for shape \(expectedShape)")
+        }
+        return loaded.data
+    }
+
+    private func flattenJsonFloats(_ value: Any, file: String) throws -> [Float] {
+        if let array = value as? [Any] {
+            return try array.flatMap { try flattenJsonFloats($0, file: file) }
+        }
+        if let number = value as? NSNumber {
+            return [number.floatValue]
+        }
+        throw LispError.invalidArgument("tensor file '\(file)' contains a non-numeric value")
     }
 
     /// Parse "[0:2,1:3]" into [(Int,Int)?] ranges for shrink

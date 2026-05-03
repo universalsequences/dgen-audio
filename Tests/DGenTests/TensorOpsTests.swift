@@ -3408,6 +3408,53 @@ final class CTensorOpsTests: XCTestCase {
                 XCTAssertFalse(cResult.source.isEmpty)
         }
 
+        func testPeekInterpolatesFractionalChannel() throws {
+                let frameCount = 4
+                let g = Graph()
+
+                let data = g.tensor(shape: [2, 2], data: [
+                        0.0, 10.0,
+                        100.0, 110.0,
+                ])
+                let index = g.n(.constant(0.5))
+                let channel = g.n(.constant(0.5))
+                let peekResult = try g.peek(tensor: data, index: index, channel: channel)
+                _ = g.n(.output(0), peekResult)
+
+                let result = try CompilationPipeline.compile(
+                        graph: g,
+                        backend: .c,
+                        options: .init(frameCount: frameCount, debug: false)
+                )
+                let runtime = CCompiledKernel(
+                        source: result.source,
+                        cellAllocations: result.cellAllocations,
+                        memorySize: result.totalMemorySlots
+                )
+                try runtime.compileAndLoad()
+                guard let mem = runtime.allocateNodeMemory() else {
+                        XCTFail("Failed to allocate memory")
+                        return
+                }
+                defer { runtime.deallocateNodeMemory(mem) }
+                injectTensorData(result: result, memory: mem.assumingMemoryBound(to: Float.self))
+
+                var output = [Float](repeating: 0, count: frameCount)
+                let input = [Float](repeating: 0, count: frameCount)
+                output.withUnsafeMutableBufferPointer { outPtr in
+                        input.withUnsafeBufferPointer { inPtr in
+                                runtime.runWithMemory(
+                                        outputs: outPtr.baseAddress!,
+                                        inputs: inPtr.baseAddress!,
+                                        memory: mem,
+                                        frameCount: frameCount
+                                )
+                        }
+                }
+
+                XCTAssertEqual(output[0], 55.0, accuracy: 0.0001)
+        }
+
         /// Test: peek on a frame-based tensor (phasor with tensor input)
         /// This demonstrates that peek NOW properly handles frame-based tensors via lazy evaluation.
         func testPeekOnPhasorTensor() throws {

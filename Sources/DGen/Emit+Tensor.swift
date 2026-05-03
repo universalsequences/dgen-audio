@@ -650,17 +650,21 @@ extension LazyOp {
       let isNegative = wrappedIndex < zero
       let positiveIndex = b.gswitch(isNegative, wrappedIndex + channelSizeFloat, wrappedIndex)
 
-      // Clamp channel to valid range [0, numChannels-1]
-      let clampedChannel = b.floor(
-        b.max(zero, b.min(channel, b.constant(Float(numChannels - 1)))))
-      let channelOffset = channelSizeFloat * clampedChannel
+      // Clamp channel to valid range [0, numChannels-1], but preserve
+      // fractional channel position for bilinear table reads.
+      let maxChannel = b.constant(Float(numChannels - 1))
+      let clampedChannel = b.max(zero, b.min(channel, maxChannel))
+      let channelFloor = b.floor(clampedChannel)
+      let channelFrac = clampedChannel - channelFloor
+      let nextChannel = b.min(channelFloor + one, maxChannel)
 
-      // Calculate final read position
-      let finalReadPos = channelOffset + positiveIndex
+      // Linear interpolation for fractional indices, wrapped within a channel.
+      let flooredIndex = b.floor(positiveIndex)
+      let indexFrac = positiveIndex - flooredIndex
+      let nextIndex = b.gswitch(flooredIndex + one >= channelSizeFloat, zero, flooredIndex + one)
 
-      // Linear interpolation for fractional indices
-      let flooredPos = b.floor(finalReadPos)
-      let frac = finalReadPos - flooredPos
+      let channelOffsetA = channelSizeFloat * channelFloor
+      let channelOffsetB = channelSizeFloat * nextChannel
 
       // Get tensor cellId - either from concrete tensor or from input tensor
       let cellId: CellID
@@ -674,35 +678,41 @@ extension LazyOp {
           reason: "frame-based tensor peek requires tensor context - not yet implemented")
       }
 
-      // Prepare positions for interpolation
-      let nextPos = flooredPos + one
-
-      // Wrap nextPos if it crosses channel boundary
-      let nextChannelOffset = channelOffset + channelSizeFloat
-      let nextPosWrapped = b.gswitch(nextPos >= nextChannelOffset, channelOffset, nextPos)
+      let posA1 = channelOffsetA + flooredIndex
+      let posA2 = channelOffsetA + nextIndex
+      let posB1 = channelOffsetB + flooredIndex
+      let posB2 = channelOffsetB + nextIndex
 
       // Check if tensor is frame-aware (per-frame storage)
       // Frame-aware tensors store each frame's data at frameIndex * tensorSize
-      let readPos1: Expr
-      let readPos2: Expr
+      let readPosA1: Expr
+      let readPosA2: Expr
+      let readPosB1: Expr
+      let readPosB2: Expr
       if ctx.frameAwareTensorCells.contains(cellId) {
         // Frame-aware tensor: add frameIndex * tensorSize to read positions
         let tensorSizeFloat = b.constant(Float(channelSize * numChannels))
         let frameIdx = b.currentFrameIndex()
         let frameBase = frameIdx * tensorSizeFloat
-        readPos1 = frameBase + flooredPos
-        readPos2 = frameBase + nextPosWrapped
+        readPosA1 = frameBase + posA1
+        readPosA2 = frameBase + posA2
+        readPosB1 = frameBase + posB1
+        readPosB2 = frameBase + posB2
       } else {
-        readPos1 = flooredPos
-        readPos2 = nextPosWrapped
+        readPosA1 = posA1
+        readPosA2 = posA2
+        readPosB1 = posB1
+        readPosB2 = posB2
       }
 
-      // Read two samples for interpolation
-      let sample1 = b.memoryRead(cellId, b.cast(readPos1, to: .int))
-      let sample2 = b.memoryRead(cellId, b.cast(readPos2, to: .int))
-
-      // Linear interpolation: (1-frac)*sample1 + frac*sample2
-      let interpolated = b.mix(sample1, sample2, frac)
+      // Bilinear interpolation: sample index first, then channel/wave.
+      let sampleA1 = b.memoryRead(cellId, b.cast(readPosA1, to: .int))
+      let sampleA2 = b.memoryRead(cellId, b.cast(readPosA2, to: .int))
+      let sampleB1 = b.memoryRead(cellId, b.cast(readPosB1, to: .int))
+      let sampleB2 = b.memoryRead(cellId, b.cast(readPosB2, to: .int))
+      let channelA = b.mix(sampleA1, sampleA2, indexFrac)
+      let channelB = b.mix(sampleB1, sampleB2, indexFrac)
+      let interpolated = b.mix(channelA, channelB, channelFrac)
       b.use(val: interpolated)
 
     case .expand(let targetShape):

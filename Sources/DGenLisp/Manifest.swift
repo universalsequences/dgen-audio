@@ -23,6 +23,7 @@ struct PatchManifest: Codable {
     let outputs: [ManifestOutput]
     let modulators: [ManifestModulator]
     let modDestinations: [ManifestModDestination]
+    let tensors: [ManifestTensor]
     let tensorInitData: [ManifestTensorInit]
 }
 
@@ -74,6 +75,15 @@ struct ManifestModDestination: Codable {
 struct ManifestTensorInit: Codable {
     let offset: Int
     let data: [Float]
+}
+
+struct ManifestTensor: Codable {
+    let name: String
+    let cellOffset: Int
+    let shape: [Int]
+    let kind: String
+    let mutable: Bool
+    let sourceFile: String?
 }
 
 // MARK: - Manifest generation
@@ -156,6 +166,10 @@ func generateManifest(
     let manifestTensorInit = tensorInitPairs.map { (offset, data) in
         ManifestTensorInit(offset: offset, data: data)
     }
+    let manifestTensors = mapTensorMetadata(
+        evaluatorTensors: evaluator.tensors,
+        tensorInitPairs: tensorInitPairs
+    )
 
     return PatchManifest(
         version: 1,
@@ -171,8 +185,42 @@ func generateManifest(
         outputs: manifestOutputs,
         modulators: manifestModulators,
         modDestinations: manifestModDestinations,
+        tensors: manifestTensors,
         tensorInitData: manifestTensorInit
     )
+}
+
+private func mapTensorMetadata(
+    evaluatorTensors: [TensorInfo],
+    tensorInitPairs: [(Int, [Float])]
+) -> [ManifestTensor] {
+    var searchStart = 0
+    return evaluatorTensors.enumerated().compactMap { index, info in
+        let expectedCount = info.shape.reduce(1, *)
+        var matchIndex: Int? = nil
+
+        for i in searchStart..<tensorInitPairs.count {
+            let data = tensorInitPairs[i].1
+            guard data.count == expectedCount else { continue }
+            if let expectedData = info.data, expectedData.count == data.count {
+                let prefixMatches = zip(expectedData.prefix(16), data.prefix(16)).allSatisfy { abs($0 - $1) < 0.000001 }
+                if !prefixMatches { continue }
+            }
+            matchIndex = i
+            break
+        }
+
+        guard let i = matchIndex else { return nil }
+        searchStart = i + 1
+        return ManifestTensor(
+            name: info.name.isEmpty ? "tensor\(index)" : info.name,
+            cellOffset: tensorInitPairs[i].0,
+            shape: info.shape,
+            kind: info.kind,
+            mutable: info.mutable,
+            sourceFile: info.sourceFile
+        )
+    }
 }
 
 func writeManifest(_ manifest: PatchManifest, to dir: String, name: String) throws -> String {

@@ -6,6 +6,7 @@
 //   --sample-rate <rate>     Sample rate (default: 44100)
 //   --max-frames <count>     Max frame count (default: 4096)
 //   --voices <count>         Voice count for polyphony (default: 1)
+//   --asset-base <dir>        Base directory for relative tensor/wavetable files
 //   --debug                  Debug output
 //   -                        Read from stdin (also default if no file given)
 
@@ -22,6 +23,7 @@ struct CLIArgs {
     var sampleRate: Float = 44100
     var maxFrames: Int = 4096
     var voiceCount: Int = 1
+    var assetBase: String? = nil
     var debug: Bool = false
     var readStdin: Bool = false
 }
@@ -50,6 +52,9 @@ func parseArgs(_ args: [String]) -> CLIArgs {
         case "--voices":
             i += 1
             if i < args.count { cli.voiceCount = Int(args[i]) ?? 1 }
+        case "--asset-base":
+            i += 1
+            if i < args.count { cli.assetBase = args[i] }
         case "--debug":
             cli.debug = true
         case "-":
@@ -85,6 +90,7 @@ func printUsage() {
           --sample-rate <rate>     Sample rate (default: 44100)
           --max-frames <count>     Max frame count (default: 4096)
           --voices <count>         Voice count for polyphony (default: 1)
+          --asset-base <dir>        Base directory for relative tensor/wavetable files
           --debug                  Debug output
           -                        Read from stdin (also default if no file given)
           -h, --help               Show this help
@@ -104,6 +110,7 @@ func main() throws {
 
     // Read source
     let source: String
+    var inputDirectory = FileManager.default.currentDirectoryPath
     if cli.readStdin {
         source = readStdin()
     } else if let file = cli.inputFile {
@@ -111,6 +118,7 @@ func main() throws {
             fputs("Error: File not found: \(file)\n", stderr)
             exit(1)
         }
+        inputDirectory = URL(fileURLWithPath: file).deletingLastPathComponent().path
         source = try String(contentsOfFile: file, encoding: .utf8)
     } else {
         fputs("Error: No input file specified and stdin is empty\n", stderr)
@@ -133,7 +141,8 @@ func main() throws {
     let graph = LazyGraphContext.current
 
     // Evaluate lisp source
-    let evaluator = LispEvaluator()
+    let assetBase = cli.assetBase ?? inputDirectory
+    let evaluator = LispEvaluator(sourceDirectory: URL(fileURLWithPath: assetBase, isDirectory: true))
     do {
         let parsedNodes = try parseSource(source)
         let loweredNodes = try lowerModulation(in: parsedNodes)

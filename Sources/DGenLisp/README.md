@@ -276,14 +276,25 @@ Supported modulation modes are `additive`, `multiplicative`, and `semitone`.
 (full [d1,d2,...] value)     ; filled with constant
 (randn [d1,d2,...])          ; random normal
 (tensor-param [d1,d2,...])   ; learnable parameter tensor
+(wavetable @shape [512 32] @file "waves/factory.json")
+(wavetable-param @shape [512 32] @default-file "waves/init.json")
 ```
+
+`wavetable` and `wavetable-param` load JSON data relative to the compiled source
+file, or relative to `--asset-base` when that flag is provided. JSON may be a
+flat numeric array, nested numeric arrays, or an object with `shape` and `data`.
+The DGenLisp `peek` convention is `(peek tensor index channel)`, so wavetable
+banks should usually use shape `[samples waves]`. Flat wavetable data should
+store each channel/wave contiguously. Fractional `index` and fractional
+`channel` values are interpolated, so 2D wavetable reads are bilinear across
+sample position and wave position.
 
 ### Tensor Operations
 
 ```lisp
 (matmul a b)                           ; matrix multiply
-(peek tensor index)                    ; read scalar at index
-(peek tensor index channel)            ; read scalar at (index, channel)
+(peek tensor index)                    ; interpolated scalar at index
+(peek tensor index channel)            ; bilinear scalar at (index, channel)
 (peek-row tensor rowIndex)             ; read row → signalTensor
 (sample tensor index)                  ; interpolated row read → signalTensor
 (to-signal tensor)                     ; 1D tensor → signal via playback
@@ -367,11 +378,20 @@ Floats are promoted automatically when combined with graph types. Signals and te
   }],
   "inputs": [{"channel": 0, "name": "signal"}],
   "outputs": [{"channel": 0, "name": "audio"}],
+  "tensors": [{
+    "name": "waves",
+    "cellOffset": 100,
+    "shape": [512, 32],
+    "kind": "wavetable",
+    "mutable": false,
+    "sourceFile": "waves/factory.json"
+  }],
   "tensorInitData": [{"offset": 100, "data": [0.5, ...]}]
 }
 ```
 
 - `cellId` values are **physical** memory offsets (after remapping), ready for direct indexing into the memory buffer
+- `tensors` gives named metadata for tensor-backed assets and editable tensor slots
 - `tensorInitData` entries must be written to the memory buffer before the first `process()` call
 - `totalMemorySlots` is the required memory buffer size (in floats)
 
