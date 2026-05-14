@@ -39,7 +39,8 @@ extension TensorMemoryMaterializationPass {
 
     var lazyToReal: [CellID: CellID] = [:]
 
-    for (tensorId, tensor) in graph.tensors {
+    for tensorId in graph.tensors.keys.sorted() {
+      guard let tensor = graph.tensors[tensorId] else { continue }
       guard tensor.isLazy else { continue }
 
       let tensorSize = tensor.shape.reduce(1, *)
@@ -96,7 +97,7 @@ extension TensorMemoryMaterializationPass {
     hopBasedNodes: [NodeID: (Int, NodeID)]
   ) -> TensorCellLivenessAnalysis {
     var cellToNode: [CellID: NodeID] = [:]
-    for (nodeId, tensorId) in graph.nodeToTensor {
+    for (nodeId, tensorId) in graph.nodeToTensor.sorted(by: { $0.key < $1.key }) {
       if let tensor = graph.tensors[tensorId] {
         cellToNode[tensor.cellId] = nodeId
       }
@@ -278,7 +279,8 @@ extension TensorMemoryMaterializationPass {
 
   /// Updates view tensors that still reference lazy cell IDs after base-cell allocation.
   private static func patchViewCellIds(graph: Graph, lazyToReal: [CellID: CellID]) {
-    for (tensorId, tensor) in graph.tensors {
+    for tensorId in graph.tensors.keys.sorted() {
+      guard let tensor = graph.tensors[tensorId] else { continue }
       guard tensor.isView, let realCellId = lazyToReal[tensor.cellId] else { continue }
 
       graph.tensors[tensorId] = Tensor(

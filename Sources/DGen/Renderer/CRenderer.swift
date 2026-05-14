@@ -269,6 +269,15 @@ public class CRenderer: Renderer {
           return boolmask_to_float(m);
       }
 
+      // Replace NaN/Inf with 0 so a single bad node can't poison the whole graph.
+      static inline float sanitize_out_f32(float v) {
+          return isfinite(v) ? v : 0.0f;
+      }
+      static inline float32x4_t sanitize_out_f32x4(float32x4_t v) {
+          uint32x4_t finite = vcltq_f32(vabsq_f32(v), vdupq_n_f32(INFINITY));
+          return vbslq_f32(finite, v, vdupq_n_f32(0.0f));
+      }
+
       """)
 
     // Declare globals
@@ -908,24 +917,21 @@ public class CRenderer: Renderer {
     case .output(let channel, let val):
       let idxExpr = frameIndexOverride ?? "i"
       if uop.isSimd {
-        // When overriding frame index, fall back to scalar stores for correctness
         if frameIndexOverride != nil {
           let idx = "(int)(\(idxExpr))"
-          return "out[\(channel)][\(idx)] = \(g(val));"
+          return "out[\(channel)][\(idx)] = sanitize_out_f32(\(g(val)));"
         } else {
-          // For audiograph compatibility: use out[channel] directly
           let ptr = "out[\(channel)] + i"
-          return "vst1q_f32(\(ptr), \(g(val)));"
+          return "vst1q_f32(\(ptr), sanitize_out_f32x4(\(g(val))));"
         }
       } else {
-        // For audiograph compatibility: use out[channel][i] directly
         let baseIdx = "i"
         let idx =
           frameIndexOverride
           ?? (currentThreadCountScale == nil
             ? baseIdx : "(\(baseIdx) / \(currentThreadCountScale!))")
         let addr = "out[\(channel)][\(idx)]"
-        return "\(addr) = \(g(val));"
+        return "\(addr) = sanitize_out_f32(\(g(val)));"
       }
 
     case .beginLoop(let iters, let step):

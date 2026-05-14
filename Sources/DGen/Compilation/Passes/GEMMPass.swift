@@ -107,7 +107,8 @@ extension GraphPrepPasses {
   /// Handles both forward patterns (broadcast size-1 dims) and backward patterns
   /// (expandAxis from sumAxis backward).
   static func gemmPass(graph: Graph, strategy: GEMMStrategy = .registerTiled) {
-    for (nodeId, node) in graph.nodes {
+    for nodeId in graph.nodes.keys.sorted() {
+      guard let node = graph.nodes[nodeId] else { continue }
       guard node.inputs.count == 1,
         let mulNode = graph.nodes[node.inputs[0]]
       else { continue }

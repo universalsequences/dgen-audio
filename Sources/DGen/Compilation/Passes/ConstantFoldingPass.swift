@@ -7,7 +7,8 @@ extension GraphPrepPasses {
     var constantValues: [NodeID: Float] = [:]
 
     // Initialize with existing constants.
-    for (nodeId, node) in graph.nodes {
+    for nodeId in graph.nodes.keys.sorted() {
+      guard let node = graph.nodes[nodeId] else { continue }
       if case .constant(let value) = node.op {
         constantValues[nodeId] = value
       }
@@ -15,25 +16,31 @@ extension GraphPrepPasses {
 
     // Build consumer map: input -> [consumers].
     var consumers: [NodeID: [NodeID]] = [:]
-    for (nodeId, node) in graph.nodes {
+    for nodeId in graph.nodes.keys.sorted() {
+      guard let node = graph.nodes[nodeId] else { continue }
       for input in node.inputs {
         consumers[input, default: []].append(nodeId)
       }
     }
 
     // Initialize worklist with foldable nodes that have all-constant inputs.
-    var worklist = Set<NodeID>()
-    for (nodeId, node) in graph.nodes {
+    var worklist: [NodeID] = []
+    var queued = Set<NodeID>()
+    for nodeId in graph.nodes.keys.sorted() {
+      guard let node = graph.nodes[nodeId] else { continue }
       if canFoldOp(node.op) && !node.inputs.isEmpty
         && node.inputs.allSatisfy({ constantValues[$0] != nil })
       {
-        worklist.insert(nodeId)
+        worklist.append(nodeId)
+        queued.insert(nodeId)
       }
     }
 
     var foldedCount = 0
 
-    while let nodeId = worklist.popFirst() {
+    while !worklist.isEmpty {
+      let nodeId = worklist.removeFirst()
+      queued.remove(nodeId)
       guard let node = graph.nodes[nodeId] else { continue }
 
       let inputValues = node.inputs.compactMap { constantValues[$0] }
@@ -49,12 +56,14 @@ extension GraphPrepPasses {
       foldedCount += 1
 
       // Add newly-eligible consumers to worklist.
-      for consumer in consumers[nodeId] ?? [] {
+      for consumer in (consumers[nodeId] ?? []).sorted() {
         if let consumerNode = graph.nodes[consumer],
           canFoldOp(consumerNode.op),
-          consumerNode.inputs.allSatisfy({ constantValues[$0] != nil })
+          consumerNode.inputs.allSatisfy({ constantValues[$0] != nil }),
+          !queued.contains(consumer)
         {
-          worklist.insert(consumer)
+          worklist.append(consumer)
+          queued.insert(consumer)
         }
       }
     }

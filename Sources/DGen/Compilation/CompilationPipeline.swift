@@ -266,7 +266,8 @@ public struct CompilationPipeline {
   /// on Metal is a compile-time error directing the user to tensorFFT instead.
   private static func rejectUnsupportedBackendOps(graph: Graph, backend: Backend) throws {
     guard backend == .metal else { return }
-    for (_, node) in graph.nodes {
+    for nodeId in graph.nodes.keys.sorted() {
+      guard let node = graph.nodes[nodeId] else { continue }
       switch node.op {
       case .acceleratedFFT, .acceleratedIFFT:
         throw DGenError.compilationFailed(
@@ -440,7 +441,7 @@ public struct CompilationPipeline {
         backend: backend,
         frameCount: frameCount
       )
-      for cellId in graph.frameAwareCells.keys {
+      for cellId in graph.frameAwareCells.keys.sorted() {
         context.frameAwareTensorCells.insert(cellId)
       }
     }

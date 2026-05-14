@@ -339,7 +339,8 @@ public class GraphTrainingContext {
         // Initialize all tensors with initial data (not just TensorParameters)
         // Skip tensors that belong to TensorParameters - those were already written above
         let tensorParamCellIds = Set(tensorParameters.map { $0.cellId })
-        for (_, tensor) in graph.tensors {
+        for tensorId in graph.tensors.keys.sorted() {
+            guard let tensor = graph.tensors[tensorId] else { continue }
             // Skip if this tensor belongs to a TensorParameter (already handled above)
             if tensorParamCellIds.contains(tensor.cellId) {
                 continue

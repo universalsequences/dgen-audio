@@ -70,7 +70,8 @@ func remapVectorMemorySlots(
   // Float32 exact integer range when passed through initial_state buffers.
   var injectableCellIds: Set<CellID> = []
   if let graph = graph {
-    for (_, tensor) in graph.tensors {
+    for tensorId in graph.tensors.keys.sorted() {
+      guard let tensor = graph.tensors[tensorId] else { continue }
       if tensor.data != nil {
         injectableCellIds.insert(tensor.cellId)
       }

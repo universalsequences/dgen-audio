@@ -22,7 +22,8 @@ extension GraphPrepPasses {
       1, 1, 1, 0,   // right edge — lane 3 zero
     ]
 
-    for (nodeId, node) in graph.nodes {
+    for nodeId in graph.nodes.keys.sorted() {
+      guard let node = graph.nodes[nodeId] else { continue }
       guard case .conv2d = node.op else { continue }
       let (eligible, reason) = eligibilityReport(node: node, graph: graph)
       if DGenConv2DPassDebug.enabled {

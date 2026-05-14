@@ -342,13 +342,17 @@ public class TensorHistory {
 
   /// Write new state to the history buffer
   /// - Parameter value: The new tensor value to store
-  public func write(_ value: SignalTensor) {
-    let _ = graph.graph.tensorHistoryWrite(buffer, value.nodeId)
+  @discardableResult
+  public func write(_ value: SignalTensor) -> SignalTensor {
+    let nodeId = graph.graph.tensorHistoryWrite(buffer, value.nodeId)
+    return SignalTensor(nodeId: nodeId, graph: graph, shape: shape, requiresGrad: value.requiresGrad)
   }
 
   /// Write new state to the history buffer (from Tensor)
   /// - Parameter value: The new tensor value to store
-  public func write(_ value: Tensor) {
-    let _ = graph.graph.tensorHistoryWrite(buffer, value.nodeId)
+  @discardableResult
+  public func write(_ value: Tensor) -> Tensor {
+    let nodeId = graph.graph.tensorHistoryWrite(buffer, value.nodeId)
+    return Tensor(nodeId: nodeId, graph: graph, shape: shape, requiresGrad: value.requiresGrad)
   }
 }

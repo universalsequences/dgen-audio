@@ -291,4 +291,105 @@ final class AcceleratedFFTTests: XCTestCase {
         XCTAssertLessThan(maxDiff, 0.05,
                           "accelerated and tensor FFT should produce matching output")
     }
+
+    /// Regression test: conv1d applied to both re and im channels of an FFT inside a
+    /// hop-gated block must produce non-zero output. Previously, conv1d wrote its
+    /// output to a flat (non-frame-aware) memory slot while the downstream IFFT read
+    /// frame-aware, causing zero output for multi-hop invocations or mismatched reads.
+    ///
+    /// Graph: sine → bufferView → acceleratedFFT → conv1d(re) + conv1d(im) →
+    ///        acceleratedIFFT → * hann → overlapAdd → output
+    func testConv1dOnBothFFTChannelsProducesNonZeroOutput() throws {
+        let N = 1024
+        let hop = N / 4
+        let sr: Float = 44100.0
+        let freq: Float = 440.0
+        let framesPerRun = 256
+        let numRuns = 16
+
+        let g = Graph(sampleRate: sr, maxFrameCount: framesPerRun)
+
+        // Generate a sine wave input
+        let freqNode = g.n(.constant(freq))
+        let zero = g.n(.constant(0.0))
+        let twoPi = g.n(.constant(Float.pi * 2.0))
+        let phasorCell = g.alloc()
+        let phase = g.n(.phasor(phasorCell), freqNode, zero)
+        let signal = g.n(.sin, g.n(.mul, phase, twoPi))
+
+        // FFT pipeline
+        let buffered = g.bufferView(signal, size: N, hopSize: hop)
+        let flat = try g.reshape(buffered, to: [N])
+        let (re, im) = g.acceleratedFFT(flat, N: N)
+
+        // Apply a box blur kernel to both re and im channels
+        let kernelData: [Float] = [0.25, 0.5, 0.25]
+        let kernelNode = g.tensor(shape: [3], data: kernelData)
+        let reBlurred = g.n(.conv1d(3), re, kernelNode)
+        let imBlurred = g.n(.conv1d(3), im, kernelNode)
+
+        // Reconstruct
+        let reconstructed = g.acceleratedIFFT(reBlurred, imBlurred, N: N)
+
+        // Hann window
+        var hannData = [Float](repeating: 0, count: N)
+        for i in 0..<N {
+            hannData[i] = 0.5 * (1.0 - cos(2.0 * Float.pi * Float(i) / Float(N - 1)))
+        }
+        let hannWindow = g.tensor(shape: [N], data: hannData)
+        let windowed = g.n(.mul, reconstructed, hannWindow)
+
+        let output = g.overlapAdd(windowed, windowSize: N, hopSize: hop)
+        _ = g.n(.output(0), output)
+
+        let result = try CompilationPipeline.compile(
+            graph: g,
+            backend: .c,
+            options: .init(frameCount: framesPerRun, debug: false)
+        )
+
+        let cRuntime = CCompiledKernel(
+            source: result.source,
+            cellAllocations: result.cellAllocations,
+            memorySize: result.totalMemorySlots
+        )
+        try cRuntime.compileAndLoad()
+
+        guard let mem = cRuntime.allocateNodeMemory() else {
+            XCTFail("Failed to allocate memory")
+            return
+        }
+        defer { cRuntime.deallocateNodeMemory(mem) }
+
+        injectTensorData(result: result, memory: mem.assumingMemoryBound(to: Float.self))
+
+        var allOutput = [Float]()
+        let inputBuf = [Float](repeating: 0, count: framesPerRun)
+
+        for _ in 0..<numRuns {
+            var runOutput = [Float](repeating: 0, count: framesPerRun)
+            runOutput.withUnsafeMutableBufferPointer { outPtr in
+                inputBuf.withUnsafeBufferPointer { inPtr in
+                    cRuntime.runWithMemory(
+                        outputs: outPtr.baseAddress!,
+                        inputs: inPtr.baseAddress!,
+                        memory: mem,
+                        frameCount: framesPerRun
+                    )
+                }
+            }
+            allOutput.append(contentsOf: runOutput)
+        }
+
+        // After the pipeline stabilizes (needs N/hop = 4 hops = 1 run to fill),
+        // output must be non-zero. A box blur is an identity-like operation on
+        // smooth signals — it should preserve the sine wave amplitude.
+        let stableStart = framesPerRun * 4
+        let stableOutput = Array(allOutput[stableStart...])
+        let maxAmplitude = stableOutput.map { abs($0) }.max() ?? 0
+
+        print("Conv1d FFT roundtrip peak amplitude: \(maxAmplitude)")
+        XCTAssertGreaterThan(maxAmplitude, 0.1,
+            "conv1d on both FFT channels must produce non-zero output; got \(maxAmplitude)")
+    }
 }

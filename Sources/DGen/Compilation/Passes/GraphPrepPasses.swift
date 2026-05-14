@@ -11,7 +11,8 @@ extension GraphPrepPasses {
     let simdSafeNodes = findSIMDSafeAtomicNodes(graph: graph)
     var scalarSet = initialScalarSet
 
-    for node in graph.nodes.values {
+    for nodeId in graph.nodes.keys.sorted() {
+      guard let node = graph.nodes[nodeId] else { continue }
       guard case .seq = node.op else { continue }
       let hasScalarInput = node.inputs.contains { scalarSet.contains($0) }
       guard hasScalarInput else { continue }
@@ -26,7 +27,8 @@ extension GraphPrepPasses {
   /// Finds nodes that intentionally stay SIMD-safe even when traversed by scalar propagation.
   private static func findSIMDSafeAtomicNodes(graph: Graph) -> Set<NodeID> {
     var simdSafe = Set<NodeID>()
-    for (nodeId, node) in graph.nodes {
+    for nodeId in graph.nodes.keys.sorted() {
+      guard let node = graph.nodes[nodeId] else { continue }
       switch node.op {
       case .memoryAccumulate(_), .tensorAccumulate(_), .chunkPartialsReduceToCell(_, _, _, _, _):
         simdSafe.insert(nodeId)

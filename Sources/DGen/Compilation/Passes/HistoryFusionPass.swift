@@ -18,7 +18,8 @@ extension GraphPrepPasses {
     var historyReads: [CellID: NodeID] = [:]
     var historyWrites: [CellID: (nodeId: NodeID, inputs: [NodeID])] = [:]
 
-    for (nodeId, node) in graph.nodes {
+    for nodeId in graph.nodes.keys.sorted() {
+      guard let node = graph.nodes[nodeId] else { continue }
       switch node.op {
       case .historyRead(let cellId):
         historyReads[cellId] = nodeId
@@ -30,7 +31,8 @@ extension GraphPrepPasses {
     }
 
     // For each cellId that has both read and write, check if they're not in feedback loops.
-    for (cellId, readNodeId) in historyReads {
+    for cellId in historyReads.keys.sorted() {
+      guard let readNodeId = historyReads[cellId] else { continue }
       if let writeInfo = historyWrites[cellId] {
         // Check if neither the read nor write node is in a feedback loop.
         if !nodesInFeedback.contains(readNodeId) && !nodesInFeedback.contains(writeInfo.nodeId) {

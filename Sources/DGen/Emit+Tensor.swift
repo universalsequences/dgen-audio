@@ -18,7 +18,17 @@ extension LazyOp {
       let inLen = inShape[0]
       let pad = kernelSize / 2
 
-      b.parallelRange(outShape.reduce(1, *)) { flatIdx in
+      // Frame-aware offset: if input/output cells cross block boundaries in a
+      // frame/hop-based block, their memory is laid out as frameIdx * tensorSize + elemIdx.
+      let inFrameOffset: Expr? = ctx.frameAwareTensorCells.contains(inTensor.cellId)
+        ? b.currentFrameIndex() * b.intConstant(inLen)
+        : nil
+      let outLen = outShape.reduce(1, *)
+      let outFrameOffset: Expr? = ctx.frameAwareTensorCells.contains(outCell)
+        ? b.currentFrameIndex() * b.intConstant(outLen)
+        : nil
+
+      b.parallelRange(outLen) { flatIdx in
         let outX = b.cast(flatIdx, to: .int)
         let acc = b.float(0.0)
 
@@ -26,17 +36,20 @@ extension LazyOp {
           let inX = outX + kx - b.intConstant(pad)
           let inBounds = (inX >= b.intConstant(0)) * (inX < b.intConstant(inLen))
 
-          let rawIdx = b.tensorMemoryIndex(inTensor, indices: [inX])
-          let safeIdx = b.gswitch(inBounds, rawIdx, b.intConstant(0))
+          let baseIdx = inFrameOffset.map { $0 + inX } ?? inX
+          let safeIdx = b.gswitch(inBounds, baseIdx, b.intConstant(0))
           let inVal = b.gswitch(
             inBounds, b.memoryRead(inTensor.cellId, safeIdx), b.constant(0))
 
-          let kMemIdx = b.tensorMemoryIndex(kTensor, indices: [kx])
+          // Kernel is always a contiguous static array; use flat index directly
+          // to avoid baseStrides dimension mismatch (e.g. [3,1] reshaped to [3]).
+          let kMemIdx = b.intConstant(kTensor.offset) + kx
           let kVal = b.memoryRead(kTensor.cellId, kMemIdx)
 
           acc.accumulate(inVal * kVal)
         }
-        _ = b.memoryWrite(outCell, b.cast(flatIdx, to: .int), acc.value)
+        let writeIdx = outFrameOffset.map { $0 + outX } ?? outX
+        _ = b.memoryWrite(outCell, writeIdx, acc.value)
       }
 
     case .conv2d(let kernelShape):

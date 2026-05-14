@@ -310,7 +310,8 @@ public func injectTensorData(
 ) {
   var maxIdx = 0
   var tensorCount = 0
-  for (_, tensor) in graph.tensors {
+  for tensorId in graph.tensors.keys.sorted() {
+    guard let tensor = graph.tensors[tensorId] else { continue }
     guard let data = tensor.data else { continue }
 
     // Get physical memory offset from cell mapping
@@ -347,7 +348,8 @@ public func collectTensorInitData(graph: Graph, cellAllocations: CellAllocations
   Int, [Float]
 )] {
   var result: [(Int, [Float])] = []
-  for (_, tensor) in graph.tensors {
+  for tensorId in graph.tensors.keys.sorted() {
+    guard let tensor = graph.tensors[tensorId] else { continue }
     guard let data = tensor.data else { continue }
     let physicalOffset = cellAllocations.cellMappings[tensor.cellId] ?? tensor.cellId
     result.append((physicalOffset, Array(data.prefix(tensor.size))))
