@@ -376,7 +376,7 @@ public class MetalRenderer: Renderer, UOpEmitter {
   private func variableIdsUsed(in op: Op) -> Set<VarID> {
     switch op {
     case .store(_, let a), .delay1(_, let a), .abs(let a), .sign(let a), .sin(let a), .cos(let a),
-      .tan(let a), .tanh(let a), .exp(let a), .log(let a), .log10(let a), .sqrt(let a),
+      .tan(let a), .atan(let a), .tanh(let a), .exp(let a), .log(let a), .log10(let a), .sqrt(let a),
       .floor(let a), .ceil(let a), .round(let a), .beginIf(let a), .beginReverseLoop(let a),
       .beginHopCheck(let a), .setFrameIndex(let a), .identity(let a), .declareVar(let a),
       .cast(let a, _), .loadTape(let a, _), .output(_, let a):
@@ -1007,6 +1007,7 @@ public class MetalRenderer: Renderer, UOpEmitter {
     case .sin(let a): return emitAssign(uop, "metal::sin(\(g(a)))", ctx)
     case .cos(let a): return emitAssign(uop, "metal::cos(\(g(a)))", ctx)
     case .tan(let a): return emitAssign(uop, "metal::tan(\(g(a)))", ctx)
+    case .atan(let a): return emitAssign(uop, "metal::atan(\(g(a)))", ctx)
     case .tanh(let a): return emitAssign(uop, "metal::tanh(\(g(a)))", ctx)
     case .exp(let a): return emitAssign(uop, "metal::exp(\(g(a)))", ctx)
     case .log(let a): return emitAssign(uop, "metal::log(\(g(a)))", ctx)

@@ -64,7 +64,7 @@ func emitTernaryOp(
 
 // frontend
 public enum LazyOp {
-  case add, sub, div, mul, abs, sign, sin, cos, tan, tanh, exp, log, log10, sqrt, atan2, gt, gte,
+  case add, sub, div, mul, abs, sign, sin, cos, tan, atan, tanh, exp, log, log10, sqrt, atan2, gt, gte,
     lte,
     lt, eq,
     gswitch, mix, pow, floor, ceil, round, mod, min, max, and, or, xor

@@ -135,6 +135,12 @@ extension LazyOp {
           operator: "tan", expected: 1, actual: inputs.count)
       }
       try emitUnaryOp(b: b, g: g, node: node, inputs: inputs) { b.tan($0) }
+    case .atan:
+      guard inputs.count == 1 else {
+        throw DGenError.insufficientInputs(
+          operator: "atan", expected: 1, actual: inputs.count)
+      }
+      try emitUnaryOp(b: b, g: g, node: node, inputs: inputs) { b.atan($0) }
     case .tanh:
       guard inputs.count == 1 else {
         throw DGenError.insufficientInputs(

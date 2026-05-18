@@ -200,7 +200,7 @@ public func inferShape(op: LazyOp, inputs: [ValueShape], graph: Graph) throws ->
     return .scalar
 
   // Elementwise ops: broadcast tensor shapes, or inherit the single tensor shape, or scalar
-  case .add, .sub, .mul, .div, .sin, .cos, .exp, .sqrt, .tanh,
+  case .add, .sub, .mul, .div, .sin, .cos, .exp, .sqrt, .tanh, .atan,
     .tan, .log, .log10, .abs, .sign, .floor, .ceil, .round,
     .pow, .mod, .min, .max, .atan2, .gt, .gte, .lt, .lte, .eq,
     .and, .or, .xor, .gswitch, .mix,

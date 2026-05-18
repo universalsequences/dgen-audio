@@ -734,6 +734,10 @@ public class CRenderer: Renderer {
       let expr = uop.isSimd ? "vtanf(\(g(a)))" : "tanf(\(g(a)))"
       return emitAssign(uop, expr, ctx)
 
+    case .atan(let a):
+      let expr = uop.isSimd ? "vatanf(\(g(a)))" : "atanf(\(g(a)))"
+      return emitAssign(uop, expr, ctx)
+
     case .tanh(let a):
       let expr = uop.isSimd ? "vtanhf(\(g(a)))" : "tanhf(\(g(a)))"
       return emitAssign(uop, expr, ctx)

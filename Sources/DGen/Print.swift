@@ -57,6 +57,8 @@ extension UOp {
             opStr = "\(ANSI.green)cos\(ANSI.reset)(\(a))"
         case let .tan(a):
             opStr = "\(ANSI.green)tan\(ANSI.reset)(\(a))"
+        case let .atan(a):
+            opStr = "\(ANSI.green)atan\(ANSI.reset)(\(a))"
         case let .tanh(a):
             opStr = "\(ANSI.green)tanh\(ANSI.reset)(\(a))"
         case let .exp(a):

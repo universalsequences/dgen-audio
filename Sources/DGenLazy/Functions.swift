@@ -48,6 +48,11 @@ public func tan(_ x: Tensor) -> Tensor {
   return Tensor(nodeId: nodeId, graph: x.graph, shape: x.shape, requiresGrad: x.requiresGrad)
 }
 
+public func atan(_ x: Tensor) -> Tensor {
+  let nodeId = x.graph.node(.atan, [x.nodeId])
+  return Tensor(nodeId: nodeId, graph: x.graph, shape: x.shape, requiresGrad: x.requiresGrad)
+}
+
 public func tanh(_ x: Tensor) -> Tensor {
   let nodeId = x.graph.node(.tanh, [x.nodeId])
   return Tensor(nodeId: nodeId, graph: x.graph, shape: x.shape, requiresGrad: x.requiresGrad)
@@ -110,6 +115,11 @@ public func tan(_ x: Signal) -> Signal {
   return Signal(nodeId: nodeId, graph: x.graph, requiresGrad: x.requiresGrad)
 }
 
+public func atan(_ x: Signal) -> Signal {
+  let nodeId = x.graph.node(.atan, [x.nodeId])
+  return Signal(nodeId: nodeId, graph: x.graph, requiresGrad: x.requiresGrad)
+}
+
 public func tanh(_ x: Signal) -> Signal {
   let nodeId = x.graph.node(.tanh, [x.nodeId])
   return Signal(nodeId: nodeId, graph: x.graph, requiresGrad: x.requiresGrad)
@@ -124,6 +134,11 @@ public func sin(_ x: SignalTensor) -> SignalTensor {
 
 public func cos(_ x: SignalTensor) -> SignalTensor {
   let nodeId = x.graph.node(.cos, [x.nodeId])
+  return SignalTensor(nodeId: nodeId, graph: x.graph, shape: x.shape, requiresGrad: x.requiresGrad)
+}
+
+public func atan(_ x: SignalTensor) -> SignalTensor {
+  let nodeId = x.graph.node(.atan, [x.nodeId])
   return SignalTensor(nodeId: nodeId, graph: x.graph, shape: x.shape, requiresGrad: x.requiresGrad)
 }
 
@@ -644,6 +659,7 @@ extension Tensor {
   public func sqrt() -> Tensor { DGenLazy.sqrt(self) }
   public func sin() -> Tensor { DGenLazy.sin(self) }
   public func cos() -> Tensor { DGenLazy.cos(self) }
+  public func atan() -> Tensor { DGenLazy.atan(self) }
   public func tanh() -> Tensor { DGenLazy.tanh(self) }
   public func relu() -> Tensor { DGenLazy.relu(self) }
   public func sigmoid() -> Tensor { DGenLazy.sigmoid(self) }
@@ -667,6 +683,7 @@ extension Signal {
   public func sqrt() -> Signal { DGenLazy.sqrt(self) }
   public func sin() -> Signal { DGenLazy.sin(self) }
   public func cos() -> Signal { DGenLazy.cos(self) }
+  public func atan() -> Signal { DGenLazy.atan(self) }
   public func tanh() -> Signal { DGenLazy.tanh(self) }
   public func relu() -> Signal { DGenLazy.relu(self) }
   public func sigmoid() -> Signal { DGenLazy.sigmoid(self) }
@@ -689,6 +706,7 @@ extension SignalTensor {
   public func log() -> SignalTensor { DGenLazy.log(self) }
   public func sin() -> SignalTensor { DGenLazy.sin(self) }
   public func cos() -> SignalTensor { DGenLazy.cos(self) }
+  public func atan() -> SignalTensor { DGenLazy.atan(self) }
   public func exp() -> SignalTensor { DGenLazy.exp(self) }
   public func tanh() -> SignalTensor { DGenLazy.tanh(self) }
   public func relu() -> SignalTensor { DGenLazy.relu(self) }

@@ -1,7 +1,7 @@
 import Darwin
 
 /// IRBuilder extension for math operations.
-/// Unary: abs, sign, sin, cos, tan, tanh, exp, log, log10, sqrt, neg, floor, ceil, round.
+/// Unary: abs, sign, sin, cos, tan, atan, tanh, exp, log, log10, sqrt, neg, floor, ceil, round.
 /// Binary: pow, atan2, and, or, xor, min, max, mod, mix.
 /// Other: selector, noise, applyUOp.
 ///
@@ -55,6 +55,15 @@ extension IRBuilder {
     if case .constant(_, let c) = val.lazy { return constant(tanf(c)) }
     let dest = ctx.useVariable(src: nodeId)
     let uop = UOp(op: .tan(val.lazy), value: dest)
+    ops.append(uop)
+    return value(dest)
+  }
+
+  /// Emit arctangent. Constant-folds.
+  public func atan(_ val: Expr) -> Expr {
+    if case .constant(_, let c) = val.lazy { return constant(atanf(c)) }
+    let dest = ctx.useVariable(src: nodeId)
+    let uop = UOp(op: .atan(val.lazy), value: dest)
     ops.append(uop)
     return value(dest)
   }

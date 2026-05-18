@@ -201,19 +201,22 @@ final class SpectralTensorUpgradeTests: XCTestCase {
     XCTAssertEqual(try tensor(e, "im").shape, [2])
   }
 
-  func testAtan2AndLog10AreExposed() throws {
+  func testAtanAndAtan2AndLog10AreExposed() throws {
     let e = try evaluator(
       """
-      (def a (atan2 1 0))
-      (def b (log10 100))
+      (def a (atan 1))
+      (def b (atan2 1 0))
+      (def c (log10 100))
       """)
     guard case .float(let a)? = e.definitions["a"],
-      case .float(let b)? = e.definitions["b"]
+      case .float(let b)? = e.definitions["b"],
+      case .float(let c)? = e.definitions["c"]
     else {
       return XCTFail("expected floats")
     }
-    XCTAssertEqual(a, Float.pi / 2, accuracy: 0.0001)
-    XCTAssertEqual(b, 2, accuracy: 0.0001)
+    XCTAssertEqual(a, Float.pi / 4, accuracy: 0.0001)
+    XCTAssertEqual(b, Float.pi / 2, accuracy: 0.0001)
+    XCTAssertEqual(c, 2, accuracy: 0.0001)
   }
 
   // MARK: - Complex Helpers

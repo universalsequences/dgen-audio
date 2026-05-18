@@ -498,7 +498,7 @@ class LispEvaluator {
       return try evalMod(regularArgs)
 
     // Unary math
-    case "sin", "cos", "tan", "tanh", "exp", "log", "log10", "sqrt", "abs", "sign",
+    case "sin", "cos", "tan", "atan", "tanh", "exp", "log", "log10", "sqrt", "abs", "sign",
       "floor", "ceil", "round", "relu", "sigmoid":
       return try evalUnaryMath(regularArgs, fn: op)
 
@@ -897,6 +897,7 @@ class LispEvaluator {
       case "sin": return .float(Foundation.sin(f))
       case "cos": return .float(Foundation.cos(f))
       case "tan": return .float(Foundation.tan(f))
+      case "atan": return .float(Foundation.atan(f))
       case "tanh": return .float(Foundation.tanh(f))
       case "exp": return .float(Foundation.exp(f))
       case "log": return .float(Foundation.log(f))
@@ -917,6 +918,7 @@ class LispEvaluator {
       case "sin": return .signal(DGenLazy.sin(s))
       case "cos": return .signal(DGenLazy.cos(s))
       case "tan": return .signal(DGenLazy.tan(s))
+      case "atan": return .signal(DGenLazy.atan(s))
       case "tanh": return .signal(DGenLazy.tanh(s))
       case "exp": return .signal(DGenLazy.exp(s))
       case "log": return .signal(DGenLazy.log(s))
@@ -937,6 +939,7 @@ class LispEvaluator {
       case "sin": return .tensor(DGenLazy.sin(t))
       case "cos": return .tensor(DGenLazy.cos(t))
       case "tan": return .tensor(DGenLazy.tan(t))
+      case "atan": return .tensor(DGenLazy.atan(t))
       case "tanh": return .tensor(DGenLazy.tanh(t))
       case "exp": return .tensor(DGenLazy.exp(t))
       case "log": return .tensor(DGenLazy.log(t))
@@ -956,6 +959,7 @@ class LispEvaluator {
       switch fn {
       case "sin": return .signalTensor(DGenLazy.sin(st))
       case "cos": return .signalTensor(DGenLazy.cos(st))
+      case "atan": return .signalTensor(DGenLazy.atan(st))
       case "exp": return .signalTensor(DGenLazy.exp(st))
       case "log": return .signalTensor(DGenLazy.log(st))
       case "log10": return .signalTensor(DGenLazy.log10(st))

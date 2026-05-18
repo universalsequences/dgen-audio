@@ -320,6 +320,14 @@ extension LazyOp {
       let secSq = g.n(.div, [one, cosXSq])
       return [g.n(.mul, [secSq, gradOutput])]
 
+    case .atan:
+      // d(atan(x))/dx = 1/(1+x^2) * grad
+      let x = node.inputs[0]
+      let one = g.n(.constant(1.0), [])
+      let xSq = g.n(.mul, [x, x])
+      let denom = g.n(.add, [one, xSq])
+      return [g.n(.mul, [g.n(.div, [one, denom]), gradOutput])]
+
     case .tanh:
       // d(tanh(x))/dx = (1 - tanh^2(x)) * grad
       let x = node.inputs[0]

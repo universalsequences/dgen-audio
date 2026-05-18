@@ -85,7 +85,7 @@ extension GraphPrepPasses {
     case .and, .or, .xor:
       return true
     // Unary math
-    case .abs, .sign, .sin, .cos, .tan, .tanh, .exp, .log, .log10, .sqrt,
+    case .abs, .sign, .sin, .cos, .tan, .atan, .tanh, .exp, .log, .log10, .sqrt,
       .floor, .ceil, .round, .atan2:
       return true
     // Control flow (key for biquad)
@@ -104,6 +104,7 @@ extension GraphPrepPasses {
     case .sin: return inputs.count == 1 ? sin(inputs[0]) : nil
     case .cos: return inputs.count == 1 ? cos(inputs[0]) : nil
     case .tan: return inputs.count == 1 ? tan(inputs[0]) : nil
+    case .atan: return inputs.count == 1 ? atan(inputs[0]) : nil
     case .tanh: return inputs.count == 1 ? tanh(inputs[0]) : nil
     case .exp: return inputs.count == 1 ? exp(inputs[0]) : nil
     case .log: return inputs.count == 1 && inputs[0] > 0 ? log(inputs[0]) : nil

@@ -44,7 +44,7 @@ private enum OpClass {
 private func classify(_ op: Op) -> OpClass {
   switch op {
   // Transcendental ops
-  case .sin, .cos, .tan, .tanh, .exp, .log, .log10, .sqrt, .pow, .atan2:
+  case .sin, .cos, .tan, .atan, .tanh, .exp, .log, .log10, .sqrt, .pow, .atan2:
     return .transcendental
 
   // Memory ops
