@@ -5,7 +5,7 @@
 This document specifies a first-pass modulation language feature for DGenLisp.
 
 The goal is to let instrument authors declare modulatable destinations in DSP code
-without manually creating source selectors, modulation depth parameters, or
+without manually creating active flags, modulation depth parameters, or
 destination-specific resolution code.
 
 This is intended for synth-style workflows similar to Elektron machines:
@@ -118,14 +118,15 @@ This is preferred over silently rewriting every reference to `cutoff`, because:
 For each modulatable parameter, the compiler generates:
 
 - the original base parameter
-- one hidden modulation source selector parameter
-- one hidden modulation depth parameter
+- one hidden modulation active parameter
+- one hidden modulation depth parameter per declared modulator
 - one internal expression that resolves the final modulated value
 
 For a destination `cutoff`, generated internal symbols are conceptually:
 
-- `cutoff__mod_source`
-- `cutoff__mod_depth`
+- `cutoff__mod_active`
+- `cutoff__mod_depth__slot1`
+- `cutoff__mod_depth__slot2`
 - `cutoff__resolved`
 
 These names are illustrative. Exact internal naming may differ, but must be reserved and collision-safe.
@@ -147,15 +148,16 @@ For:
 the compiler generates hidden host parameters:
 
 ```lisp
-(param cutoff__mod_source @default 0 @min 0 @max N)
-(param cutoff__mod_depth @default 0 @min -6000 @max 6000 @unit Hz)
+(param cutoff__mod_active @default 0 @min 0 @max 1)
+(param cutoff__mod_depth__slot1 @default 0 @min -6000 @max 6000 @unit Hz)
+(param cutoff__mod_depth__slot2 @default 0 @min -6000 @max 6000 @unit Hz)
 ```
 
 Where:
 
 - `N` is the number of declared modulation buses
-- source `0` means `off`
-- source `1..N` selects the corresponding `@modulator` input
+- active `0` means no modulation lanes are active
+- active nonzero means the DSP sums `modulator * depth` for each declared lane
 
 These generated parameters must appear in the manifest and be linked back to the base destination.
 
@@ -197,13 +199,13 @@ Intended for:
 Generated form conceptually:
 
 ```lisp
-(def cutoff__mod_selected
-  (selector cutoff__mod_source mod1 mod2 mod3 mod4))
-
 (def cutoff__resolved
-  (clip (+ cutoff (* cutoff__mod_selected cutoff__mod_depth))
-        cutoff_min
-        cutoff_max))
+  (__modulated-param cutoff cutoff__mod_active
+    mod1 cutoff__mod_depth__slot1
+    mod2 cutoff__mod_depth__slot2
+    mod3 cutoff__mod_depth__slot3
+    mod4 cutoff__mod_depth__slot4
+    @mode additive @min cutoff_min @max cutoff_max))
 ```
 
 Where:
@@ -222,13 +224,13 @@ Intended for:
 Generated form conceptually:
 
 ```lisp
-(def rate__mod_selected
-  (selector rate__mod_source mod1 mod2 mod3 mod4))
-
 (def rate__resolved
-  (clip (* rate (+ 1 (* rate__mod_selected rate__mod_depth)))
-        rate_min
-        rate_max))
+  (__modulated-param rate rate__mod_active
+    mod1 rate__mod_depth__slot1
+    mod2 rate__mod_depth__slot2
+    mod3 rate__mod_depth__slot3
+    mod4 rate__mod_depth__slot4
+    @mode multiplicative @min rate_min @max rate_max))
 ```
 
 Default depth range for multiplicative mode should be conservative, for example:
@@ -247,13 +249,13 @@ Intended for:
 Generated form conceptually:
 
 ```lisp
-(def pitch__mod_selected
-  (selector pitch__mod_source mod1 mod2 mod3 mod4))
-
 (def pitch__resolved
-  (* pitch
-     (exp (* (log 2)
-             (/ (* pitch__mod_selected pitch__mod_depth) 12)))))
+  (__modulated-param pitch pitch__mod_active
+    mod1 pitch__mod_depth__slot1
+    mod2 pitch__mod_depth__slot2
+    mod3 pitch__mod_depth__slot3
+    mod4 pitch__mod_depth__slot4
+    @mode semitone @min pitch_min @max pitch_max))
 ```
 
 Depth in semitone mode is measured in semitones.
@@ -312,8 +314,11 @@ Example:
     "name": "cutoff",
     "paramCellId": 17,
     "mode": "additive",
-    "sourceCellId": 101,
-    "depthCellId": 102,
+    "activeCellId": 101,
+    "depthLanes": [
+      { "slot": 1, "depthCellId": 102 },
+      { "slot": 2, "depthCellId": 103 }
+    ],
     "min": 60,
     "max": 12000,
     "unit": "Hz"
@@ -326,8 +331,8 @@ Required fields:
 - `name`
 - `paramCellId`
 - `mode`
-- `sourceCellId`
-- `depthCellId`
+- `activeCellId`
+- `depthLanes`
 - `min`
 - `max`
 
@@ -344,16 +349,16 @@ The host can render a modulation UI using manifest metadata only.
 For each `modDestination`, the host can display:
 
 - destination name
-- source selector bound to `sourceCellId`
-- modulation amount bound to `depthCellId`
+- active flag bound to `activeCellId`
+- per-modulator depth controls bound to `depthLanes[].depthCellId`
 
 For each `modulator`, the host can display valid available sources.
 
 V1 host model:
 
-- one source selector per destination
-- one amount control per destination
-- source `0` = off
+- one active flag per destination
+- one amount control per destination/modulator lane
+- active `0` = off
 
 ## Defaults
 
@@ -425,12 +430,10 @@ Implement exactly this scope first:
 - `@mod true` and `@mod-mode <mode>` on `param`
 - optional `@mod-depth-min/max`
 - `(mod paramName)` expression
-- generated hidden source/depth params
+- generated hidden active/depth params
 - `modulators` in manifest
 - `modDestinations` in manifest
-- one source + one depth per destination
-
-Do not implement multiple lanes per destination until this simpler model is proven.
+- one active flag + one depth per declared modulator per destination
 
 ## Future Extensions
 

@@ -5,6 +5,7 @@ import Foundation
 
 /// Check if any UOps contain patterns that prevent SIMD optimization:
 /// - Inner loops (beginLoop, beginForLoop)
+/// - Runtime control flow and mutation in the C backend
 /// - View operations (reshape, transpose, shrink) that require complex index arithmetic (C only)
 /// - Broadcast access (non-contiguous strides or shape mismatch) (C only)
 ///
@@ -17,6 +18,8 @@ private func containsSIMDBlockers(_ uops: [UOp], backend: Backend) -> Bool {
     switch uop.op {
     case .beginLoop, .beginForLoop, .beginReverseLoop:
       return true
+    case .beginIf, .endIf, .mutate, .declareVar:
+      if case .c = backend { return true }
     case .reshape, .transpose, .shrink, .pad:
       // Metal handles these fine with per-thread execution
       if case .c = backend { return true }

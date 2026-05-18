@@ -401,6 +401,13 @@ extension LazyOp {
       }
       return grads
 
+    case .modulatedParam:
+      // Host modulation routing is not part of the training surface.
+      // Preserve gradient flow to the base parameter and treat active/depth lanes
+      // as non-differentiable controls.
+      let zero = g.n(.constant(0.0), [])
+      return node.inputs.enumerated().map { index, _ in index == 0 ? gradOutput : zero }
+
     case .mix:
       // mix(x, y, t) = x * (1-t) + y * t
       // d/dx = (1-t) * grad

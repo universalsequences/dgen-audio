@@ -237,6 +237,40 @@ extension LazyOp {
       let mode = inputs[0]
       let options = Array(inputs.dropFirst())
       b.use(val: b.selector(b.value(mode), options.map { b.value($0) }))
+    case .modulatedParam(let mode, let minValue, let maxValue, let activeCellId, let lanes):
+      guard inputs.count == 1 else {
+        throw DGenError.insufficientInputs(
+          operator: "modulatedParam", expected: 1, actual: inputs.count)
+      }
+      guard case .param(let baseCellId) = g.nodes[node.inputs[0]]?.op else {
+        throw DGenError.compilationFailed("modulatedParam input must be a parameter")
+      }
+      let zeroOffset = b.intConstant(0)
+      let base = b.simdBroadcastLoad(baseCellId, zeroOffset)
+      let active = b.simdBroadcastLoad(activeCellId, zeroOffset)
+      var modulation = b.constant(0.0)
+      for lane in lanes {
+        let modulator = b.input(lane.modulatorChannel)
+        let depth = b.simdBroadcastLoad(lane.depthCellId, zeroOffset)
+        modulation = modulation + (modulator * depth)
+      }
+
+      let resolved: Expr
+      switch mode {
+      case .additive:
+        resolved = b.min(b.max(base + modulation, b.constant(minValue)), b.constant(maxValue))
+      case .multiplicative:
+        resolved = b.min(
+          b.max(base * (b.constant(1.0) + modulation), b.constant(minValue)),
+          b.constant(maxValue))
+      case .semitone:
+        resolved = b.min(
+          b.max(
+            base * b.exp(b.constant(logf(2.0)) * (modulation / b.constant(12.0))),
+            b.constant(minValue)),
+          b.constant(maxValue))
+      }
+      b.use(val: b.gswitch(active > b.constant(0.0), resolved, base))
     case .mix:
       guard inputs.count == 3 else {
         throw DGenError.insufficientInputs(

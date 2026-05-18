@@ -30,6 +30,7 @@ struct PatchManifest: Codable {
 struct ManifestParam: Codable {
     let name: String
     let cellId: Int
+    let cellSpan: Int
     let defaultValue: Float  // JSON key: "default"
     let min: Float?
     let max: Float?
@@ -37,7 +38,7 @@ struct ManifestParam: Codable {
     let hidden: Bool?
 
     enum CodingKeys: String, CodingKey {
-        case name, cellId
+        case name, cellId, cellSpan
         case defaultValue = "default"
         case min, max, unit, hidden
     }
@@ -63,13 +64,18 @@ struct ManifestModDestination: Codable {
     let name: String
     let paramCellId: Int
     let mode: String
-    let sourceCellId: Int
-    let depthCellId: Int
+    let activeCellId: Int
+    let depthLanes: [ManifestModDepthLane]
     let min: Float
     let max: Float
     let unit: String?
     let depthMin: Float?
     let depthMax: Float?
+}
+
+struct ManifestModDepthLane: Codable {
+    let slot: Int
+    let depthCellId: Int
 }
 
 struct ManifestTensorInit: Codable {
@@ -93,19 +99,29 @@ func generateManifest(
     evaluator: LispEvaluator,
     options: CompilerOptions
 ) -> PatchManifest {
-    let cellMappings = compilerResult.compilationResult.cellAllocations.cellMappings
+    let compilation = compilerResult.compilationResult
+    let cellMappings = compilation.cellAllocations.cellMappings
+    let cellVectorWidths = compilation.cellAllocations.cellVectorWidths
+    let cellAllocationSizes = compilation.graph.cellAllocationSizes
 
     // Map param cell IDs to physical cell IDs
     let manifestParams = evaluator.params.map { param -> ManifestParam in
         let physicalCellId: Int
+        let cellSpan: Int
         if let logicalId = param.cellId {
             physicalCellId = cellMappings[logicalId] ?? logicalId
+            cellSpan = max(
+                cellVectorWidths[logicalId] ?? 1,
+                cellAllocationSizes[logicalId] ?? 1
+            )
         } else {
             physicalCellId = -1
+            cellSpan = 1
         }
         return ManifestParam(
             name: param.name,
             cellId: physicalCellId,
+            cellSpan: cellSpan,
             defaultValue: param.defaultValue,
             min: param.min,
             max: param.max,
@@ -131,25 +147,37 @@ func generateManifest(
     let paramsByName = Dictionary(uniqueKeysWithValues: evaluator.params.map { ($0.name, $0) })
     let manifestModDestinations = evaluator.params.compactMap { param -> ManifestModDestination? in
         guard let mode = param.modulationMode,
-              let sourceName = param.modulationSourceParamName,
-              let depthName = param.modulationDepthParamName,
+              let activeName = param.modulationActiveParamName,
               let min = param.min,
               let max = param.max,
               let paramCell = param.cellId,
-              let sourceParam = paramsByName[sourceName],
-              let depthParam = paramsByName[depthName],
-              let sourceCell = sourceParam.cellId,
-              let depthCell = depthParam.cellId
+              let activeParam = paramsByName[activeName],
+              let activeCell = activeParam.cellId
         else {
             return nil
         }
+
+        let depthLanes = evaluator.params.compactMap { depthParam -> ManifestModDepthLane? in
+            guard depthParam.generatedKind == "modulation-depth",
+                  depthParam.generatedFor == param.name,
+                  let slot = depthParam.generatedModulatorSlot,
+                  let depthCell = depthParam.cellId
+            else {
+                return nil
+            }
+            return ManifestModDepthLane(
+                slot: slot,
+                depthCellId: cellMappings[depthCell] ?? depthCell
+            )
+        }
+        .sorted { $0.slot < $1.slot }
 
         return ManifestModDestination(
             name: param.name,
             paramCellId: cellMappings[paramCell] ?? paramCell,
             mode: mode.rawValue,
-            sourceCellId: cellMappings[sourceCell] ?? sourceCell,
-            depthCellId: cellMappings[depthCell] ?? depthCell,
+            activeCellId: cellMappings[activeCell] ?? activeCell,
+            depthLanes: depthLanes,
             min: min,
             max: max,
             unit: param.unit,

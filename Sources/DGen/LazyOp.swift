@@ -15,6 +15,22 @@ public enum SpectralLossMode: String, Codable, Sendable {
   case l1
 }
 
+public enum ModulatedParamMode: String, Codable, Sendable {
+  case additive
+  case multiplicative
+  case semitone
+}
+
+public struct ModulatedParamLane: Hashable, Codable, Sendable {
+  public let modulatorChannel: Int
+  public let depthCellId: CellID
+
+  public init(modulatorChannel: Int, depthCellId: CellID) {
+    self.modulatorChannel = modulatorChannel
+    self.depthCellId = depthCellId
+  }
+}
+
 // MARK: - Tensor Emit Helpers
 
 /// Emit a binary op for scalars or tensors.
@@ -261,6 +277,15 @@ public enum LazyOp {
     gradWriteCell: CellID, rowIdxCell: CellID, gradCell: CellID, numRows: Int, numCols: Int,
     maxFrameCount: Int)
   case selector  // selector(mode, options[])
+  /// Fast-path modulation destination. Inputs are:
+  /// [baseParam].
+  /// When active is zero, returns baseParam without reading or summing modulation lanes.
+  case modulatedParam(
+    mode: ModulatedParamMode,
+    min: Float,
+    max: Float,
+    activeCellId: CellID,
+    lanes: [ModulatedParamLane])
   case memoryRead(CellID)
   case memoryWrite(CellID)
   case memoryAccumulate(CellID)  // Atomic add to memory cell

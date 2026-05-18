@@ -204,6 +204,7 @@ public func inferShape(op: LazyOp, inputs: [ValueShape], graph: Graph) throws ->
     .tan, .log, .log10, .abs, .sign, .floor, .ceil, .round,
     .pow, .mod, .min, .max, .atan2, .gt, .gte, .lt, .lte, .eq,
     .and, .or, .xor, .gswitch, .mix,
+    .modulatedParam,
     .phasor(_), .accum(_), .latch(_), .deterministicPhasor, .gradPhasor, .gradDeterministicPhasor:
     let tensors = inputs.filter { x in
       if case .tensor(_) = x { return true }

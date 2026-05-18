@@ -56,7 +56,13 @@ func remapVectorMemorySlots(
   for block in uopBlocks {
     for uop in block.ops {
       if let cellId = uop.op.memoryCellId {
-        registerCell(cellId, vectorWidth: block.vectorWidth)
+        let memoryWidth: Int
+        if case .simdBroadcastLoad = uop.op {
+          memoryWidth = 1
+        } else {
+          memoryWidth = block.vectorWidth
+        }
+        registerCell(cellId, vectorWidth: memoryWidth)
       }
     }
   }

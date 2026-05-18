@@ -37,10 +37,10 @@ final class ModulationTests: XCTestCase {
         let lowered = try lowerModulation(in: parseSource(source))
         let loweredAtoms = flattenAtoms(lowered)
 
-        XCTAssertTrue(loweredAtoms.contains("__mod__cutoff__source"))
-        XCTAssertTrue(loweredAtoms.contains("__mod__cutoff__depth"))
+        XCTAssertTrue(loweredAtoms.contains("__mod__cutoff__active"))
+        XCTAssertTrue(loweredAtoms.contains("__mod__cutoff__depth__slot1"))
         XCTAssertTrue(loweredAtoms.contains("__mod__cutoff__resolved"))
-        XCTAssertTrue(loweredAtoms.contains("selector"))
+        XCTAssertTrue(loweredAtoms.contains("__modulated-param"))
         XCTAssertTrue(loweredAtoms.contains("mod1"))
     }
 
@@ -88,8 +88,13 @@ final class ModulationTests: XCTestCase {
         XCTAssertEqual(manifest.modulators.map(\.inputChannel), [4, 5])
 
         let hiddenNames = Set(manifest.params.compactMap { $0.hidden == true ? $0.name : nil })
-        XCTAssertTrue(hiddenNames.contains("__mod__cutoff__source"))
-        XCTAssertTrue(hiddenNames.contains("__mod__cutoff__depth"))
+        XCTAssertTrue(hiddenNames.contains("__mod__cutoff__active"))
+        XCTAssertTrue(hiddenNames.contains("__mod__cutoff__depth__slot1"))
+        XCTAssertTrue(hiddenNames.contains("__mod__cutoff__depth__slot2"))
+        let paramsByName = Dictionary(uniqueKeysWithValues: manifest.params.map { ($0.name, $0) })
+        XCTAssertEqual(paramsByName["__mod__cutoff__active"]?.cellSpan, 1)
+        XCTAssertEqual(paramsByName["__mod__cutoff__depth__slot1"]?.cellSpan, 1)
+        XCTAssertEqual(paramsByName["__mod__cutoff__depth__slot2"]?.cellSpan, 1)
 
         XCTAssertEqual(manifest.modDestinations.count, 1)
         let destination = try XCTUnwrap(manifest.modDestinations.first)
@@ -99,6 +104,47 @@ final class ModulationTests: XCTestCase {
         XCTAssertEqual(destination.max, 12000)
         XCTAssertEqual(destination.depthMin, -6000)
         XCTAssertEqual(destination.depthMax, 6000)
+        XCTAssertEqual(destination.depthLanes.map(\.slot), [1, 2])
+    }
+
+    func testManifestKeepsScalarParamCellSpanWhenBroadcastInSIMD() throws {
+        let source = """
+        (param gain @default 0.5 @min 0 @max 1)
+        (out (* gain 0.25) 1)
+        """
+
+        let evaluator = LispEvaluator()
+        try evaluator.evaluate(nodes: parseSource(source))
+
+        let graph = LazyGraphContext.current
+        for output in evaluator.outputs {
+            graph.addOutput(output.signal, channel: output.channel)
+        }
+
+        let compilation = try graph.compileOnly(frameCount: 64, voiceCount: 1)
+        let compilerResult = CompilerResult(
+            dylibPath: "",
+            cSourcePath: "",
+            compilationResult: compilation,
+            cSource: ""
+        )
+        let options = CompilerOptions(
+            outputDir: ".",
+            name: "patch",
+            sampleRate: 48_000,
+            maxFrames: 64,
+            voiceCount: 1,
+            debug: false
+        )
+
+        let manifest = generateManifest(
+            compilerResult: compilerResult,
+            evaluator: evaluator,
+            options: options
+        )
+
+        let gain = try XCTUnwrap(manifest.params.first { $0.name == "gain" })
+        XCTAssertEqual(gain.cellSpan, 1)
     }
 
     func testPercentIsModuloOperator() throws {

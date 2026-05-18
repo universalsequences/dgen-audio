@@ -93,7 +93,7 @@ Local `def` and `make-history` bindings inside macros are automatically scoped â
 ```
 
 The name becomes a symbol you can use in expressions. Parameters appear in the manifest with their physical memory cell ID for host-side control.
-Modulatable params generate hidden modulation source/depth params plus `modDestinations` metadata in the manifest.
+Modulatable params generate one hidden active flag plus one hidden depth param per declared modulator, and expose those cells through `modDestinations` metadata in the manifest.
 
 #### in â€” audio input channel
 

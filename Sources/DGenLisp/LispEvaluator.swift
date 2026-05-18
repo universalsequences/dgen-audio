@@ -35,9 +35,9 @@ struct ParamInfo {
   let modulationMode: ModulationMode?
   let modulationDepthMin: Float?
   let modulationDepthMax: Float?
-  let modulationSourceParamName: String?
-  let modulationDepthParamName: String?
+  let modulationActiveParamName: String?
   let modulationResolvedSymbolName: String?
+  let generatedModulatorSlot: Int?
 }
 
 struct OutputInfo {
@@ -680,6 +680,8 @@ class LispEvaluator {
       return try evalGswitch(regularArgs)
     case "selector":
       return try evalSelector(regularArgs)
+    case "__modulated-param":
+      return try evalModulatedParam(regularArgs, attributes: attributePairs)
 
     default:
       throw LispError.unknownOperator(opName)
@@ -1284,9 +1286,9 @@ class LispEvaluator {
     }
     let modulationDepthMin = Float(attrValue(attributes, "@mod-depth-min") ?? "")
     let modulationDepthMax = Float(attrValue(attributes, "@mod-depth-max") ?? "")
-    let modulationSourceParamName = attrValue(attributes, "@mod-source-param")
-    let modulationDepthParamName = attrValue(attributes, "@mod-depth-param")
+    let modulationActiveParamName = attrValue(attributes, "@mod-active-param")
     let modulationResolvedSymbolName = attrValue(attributes, "@mod-resolved-symbol")
+    let generatedModulatorSlot = Int(attrValue(attributes, "@modulator-slot") ?? "")
 
     let signal = Signal.param(defaultVal, min: minVal, max: maxVal)
 
@@ -1303,9 +1305,9 @@ class LispEvaluator {
       modulationMode: modulationMode,
       modulationDepthMin: modulationDepthMin,
       modulationDepthMax: modulationDepthMax,
-      modulationSourceParamName: modulationSourceParamName,
-      modulationDepthParamName: modulationDepthParamName,
-      modulationResolvedSymbolName: modulationResolvedSymbolName
+      modulationActiveParamName: modulationActiveParamName,
+      modulationResolvedSymbolName: modulationResolvedSymbolName,
+      generatedModulatorSlot: generatedModulatorSlot
     )
     params.append(info)
     definitions[name] = .signal(signal)
@@ -2360,6 +2362,43 @@ class LispEvaluator {
       try requireSignal(coerceToSignal(evaluateAST(arg)))
     }
     return .signal(DGenLazy.selector(mode, options))
+  }
+
+  private func evalModulatedParam(
+    _ args: [ASTNode],
+    attributes: [(name: String, value: String)]
+  ) throws -> EvalResult {
+    guard args.count >= 2, args.count % 2 == 0 else {
+      throw LispError.invalidArgument(
+        "__modulated-param requires base, active, and modulator/depth pairs")
+    }
+    guard let modeRaw = attrValue(attributes, "@mode"),
+          let mode = ModulatedParamMode(rawValue: modeRaw.lowercased()),
+          let minValue = Float(attrValue(attributes, "@min") ?? ""),
+          let maxValue = Float(attrValue(attributes, "@max") ?? "")
+    else {
+      throw LispError.invalidArgument(
+        "__modulated-param requires @mode, @min, and @max attributes")
+    }
+
+    let base = try requireSignal(coerceToSignal(evaluateAST(args[0])))
+    let active = try requireSignal(coerceToSignal(evaluateAST(args[1])))
+    var lanes: [(modulator: Signal, depth: Signal)] = []
+    var index = 2
+    while index < args.count {
+      let modulator = try requireSignal(coerceToSignal(evaluateAST(args[index])))
+      let depth = try requireSignal(coerceToSignal(evaluateAST(args[index + 1])))
+      lanes.append((modulator, depth))
+      index += 2
+    }
+
+    return .signal(DGenLazy.modulatedParam(
+      base,
+      active: active,
+      lanes: lanes,
+      mode: mode,
+      min: minValue,
+      max: maxValue))
   }
 
   private func evalBuffer(_ args: [ASTNode]) throws -> EvalResult {

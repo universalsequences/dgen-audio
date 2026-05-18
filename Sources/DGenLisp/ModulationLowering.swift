@@ -20,8 +20,7 @@ struct TopLevelModulationParam {
     let unit: String?
     let depthMin: Float
     let depthMax: Float
-    let sourceParamName: String
-    let depthParamName: String
+    let activeParamName: String
     let resolvedSymbolName: String
 }
 
@@ -144,8 +143,7 @@ private func preScanModulation(_ nodes: [ASTNode]) throws -> PreScanResult {
                 unit: attributes["@unit"],
                 depthMin: depthRange.min,
                 depthMax: depthRange.max,
-                sourceParamName: "__mod__\(name)__source",
-                depthParamName: "__mod__\(name)__depth",
+                activeParamName: "__mod__\(name)__active",
                 resolvedSymbolName: "__mod__\(name)__resolved"
             )
 
@@ -186,50 +184,52 @@ private func lowerTopLevelNode(_ node: ASTNode, preScan: PreScanResult) throws -
         attrs,
         additions: [
             ("@mod", "true"),
+            ("@mod-active-param", modParam.activeParamName),
             ("@mod-mode", modParam.mode.rawValue),
             ("@mod-depth-min", formatFloat(modParam.depthMin)),
             ("@mod-depth-max", formatFloat(modParam.depthMax)),
-            ("@mod-source-param", modParam.sourceParamName),
-            ("@mod-depth-param", modParam.depthParamName),
             ("@mod-resolved-symbol", modParam.resolvedSymbolName),
         ]
     )
     rebuiltElements = rebuildTopLevelForm(elements: elements, attributes: rebuiltAttributes)
 
-    let generatedSource = makeParamNode(
-        name: modParam.sourceParamName,
+    let generatedActive = makeParamNode(
+        name: modParam.activeParamName,
         attributes: [
             ("@default", "0"),
             ("@min", "0"),
-            ("@max", formatFloat(Float(preScan.modulatorsBySlot.keys.max() ?? 0))),
+            ("@max", "1"),
             ("@hidden", "true"),
-            ("@generated", "modulation-source"),
+            ("@generated", "modulation-active"),
             ("@generated-for", modParam.name),
         ]
     )
 
-    var depthAttributes: [(String, String)] = [
-        ("@default", "0"),
-        ("@min", formatFloat(modParam.depthMin)),
-        ("@max", formatFloat(modParam.depthMax)),
-        ("@hidden", "true"),
-        ("@generated", "modulation-depth"),
-        ("@generated-for", modParam.name),
-    ]
-    if let unit = modParam.unit {
-        depthAttributes.append(("@unit", unit))
+    let generatedDepths = preScan.modulatorsBySlot.keys.sorted().map { slot -> ASTNode in
+        var depthAttributes: [(String, String)] = [
+            ("@default", "0"),
+            ("@min", formatFloat(modParam.depthMin)),
+            ("@max", formatFloat(modParam.depthMax)),
+            ("@hidden", "true"),
+            ("@generated", "modulation-depth"),
+            ("@generated-for", modParam.name),
+            ("@modulator-slot", String(slot)),
+        ]
+        if let unit = modParam.unit {
+            depthAttributes.append(("@unit", unit))
+        }
+        return makeParamNode(
+            name: depthParamName(paramName: modParam.name, slot: slot),
+            attributes: depthAttributes
+        )
     }
-    let generatedDepth = makeParamNode(
-        name: modParam.depthParamName,
-        attributes: depthAttributes
-    )
 
     let resolvedDef = makeResolvedDef(
         param: modParam,
         modulatorsBySlot: preScan.modulatorsBySlot
     )
 
-    return [ASTNode.list(rebuiltElements), generatedSource, generatedDepth, resolvedDef]
+    return [ASTNode.list(rebuiltElements), generatedActive] + generatedDepths + [resolvedDef]
 }
 
 private func rewriteModExpressions(
@@ -278,71 +278,40 @@ private func makeResolvedDef(
     param: TopLevelModulationParam,
     modulatorsBySlot: [Int: TopLevelModulator]
 ) -> ASTNode {
-    let selectorOptions: [ASTNode] = (1...(modulatorsBySlot.keys.max() ?? 0)).map { slot in
-        if let modulator = modulatorsBySlot[slot], let name = modulator.name {
-            return .atom(name)
+    let laneArgs: [ASTNode] = modulatorsBySlot.keys.sorted().flatMap { slot in
+        guard let modulator = modulatorsBySlot[slot], let name = modulator.name else {
+            return [ASTNode]()
         }
-        return .atom("0")
+        return [
+            .atom(name),
+            .atom(depthParamName(paramName: param.name, slot: slot)),
+        ]
     }
 
-    let selectorExpr = ASTNode.list(
-        [.atom("selector"), .atom(param.sourceParamName)] + selectorOptions
-    )
-
-    let productExpr = ASTNode.list([
-        .atom("*"),
-        selectorExpr,
-        .atom(param.depthParamName),
-    ])
-
-    let resolvedExpr: ASTNode
-    switch param.mode {
-    case .additive:
-        resolvedExpr = ASTNode.list([
-            .atom("clip"),
-            ASTNode.list([.atom("+"), .atom(param.name), productExpr]),
-            .atom(formatFloat(param.min)),
-            .atom(formatFloat(param.max)),
-        ])
-    case .multiplicative:
-        resolvedExpr = ASTNode.list([
-            .atom("clip"),
-            ASTNode.list([
-                .atom("*"),
-                .atom(param.name),
-                ASTNode.list([
-                    .atom("+"),
-                    .atom("1"),
-                    productExpr,
-                ]),
-            ]),
-            .atom(formatFloat(param.min)),
-            .atom(formatFloat(param.max)),
-        ])
-    case .semitone:
-        resolvedExpr = ASTNode.list([
-            .atom("*"),
+    let resolvedExpr = ASTNode.list(
+        [
+            .atom("__modulated-param"),
             .atom(param.name),
-            ASTNode.list([
-                .atom("exp"),
-                ASTNode.list([
-                    .atom("*"),
-                    ASTNode.list([.atom("log"), .atom("2")]),
-                    ASTNode.list([
-                        .atom("/"),
-                        productExpr,
-                        .atom("12"),
-                    ]),
-                ]),
-            ]),
-        ])
-    }
+            .atom(param.activeParamName),
+        ] + laneArgs + [
+            .atom("@mode"),
+            .atom(param.mode.rawValue),
+            .atom("@min"),
+            .atom(formatFloat(param.min)),
+            .atom("@max"),
+            .atom(formatFloat(param.max)),
+        ]
+    )
 
     return ASTNode.list([
         .atom("def"),
         .atom(param.resolvedSymbolName),
         resolvedExpr,
     ])
+}
+
+private func depthParamName(paramName: String, slot: Int) -> String {
+    "__mod__\(paramName)__depth__slot\(slot)"
 }
 
 private func makeParamNode(name: String, attributes: [(String, String)]) -> ASTNode {

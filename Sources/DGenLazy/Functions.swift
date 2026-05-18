@@ -501,6 +501,39 @@ public func selector(_ mode: Signal, _ options: [Signal]) -> Signal {
   return Signal(nodeId: nodeId, graph: mode.graph, requiresGrad: needsGrad)
 }
 
+public func modulatedParam(
+  _ base: Signal,
+  active: Signal,
+  lanes: [(modulator: Signal, depth: Signal)],
+  mode: ModulatedParamMode,
+  min: Float,
+  max: Float
+) -> Signal {
+  guard let activeCellId = active.memoryCellId else {
+    fatalError("modulatedParam active signal must be a parameter")
+  }
+  let opLanes = lanes.map { lane -> ModulatedParamLane in
+    guard let depthCellId = lane.depth.memoryCellId else {
+      fatalError("modulatedParam depth signals must be parameters")
+    }
+    guard let modulatorNode = base.graph.graph.nodes[lane.modulator.nodeId],
+          case .input(let channel) = modulatorNode.op
+    else {
+      fatalError("modulatedParam modulators must be input signals")
+    }
+    return ModulatedParamLane(modulatorChannel: channel, depthCellId: depthCellId)
+  }
+  let nodeId = base.graph.node(
+    .modulatedParam(
+      mode: mode,
+      min: min,
+      max: max,
+      activeCellId: activeCellId,
+      lanes: opLanes),
+    [base.nodeId])
+  return Signal(nodeId: nodeId, graph: base.graph, requiresGrad: base.requiresGrad)
+}
+
 // MARK: - Loss Functions
 
 /// Mean squared error loss

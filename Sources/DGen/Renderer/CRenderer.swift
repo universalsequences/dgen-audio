@@ -104,6 +104,7 @@ public class CRenderer: Renderer {
     var currentFrameOrder: FrameOrder? = nil
     var currentTemporality: Temporality? = nil
     var currentDispatchMode: DispatchMode? = nil
+    var currentVectorWidth: Int? = nil
     var hopCheckOpen = false  // Track if we have an open hop check conditional
     var loopOpen = false
 
@@ -120,6 +121,7 @@ public class CRenderer: Renderer {
         currentFrameOrder != block.frameOrder
         || currentTemporality != block.temporality
         || currentDispatchMode != block.dispatchMode
+        || currentVectorWidth != block.vectorWidth
 
       if needsNewLoop {
         // Close previous hop check if open
@@ -182,6 +184,7 @@ public class CRenderer: Renderer {
         currentFrameOrder = block.frameOrder
         currentTemporality = block.temporality
         currentDispatchMode = block.dispatchMode
+        currentVectorWidth = block.vectorWidth
       }
 
       for uop in block.ops {

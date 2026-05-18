@@ -150,7 +150,11 @@ extension LazyOp {
         b.use(val: inputVal)
       }
     case .param(let cellId):
-      b.use(val: b.load(cellId))
+      if (g.cellAllocationSizes[cellId] ?? 1) > 1 {
+        b.use(val: b.load(cellId))
+      } else {
+        b.use(val: b.simdBroadcastLoad(cellId, b.intConstant(0)))
+      }
     case .historyReadWrite(let cellId):
       // for simd its beyond just this -- we need to ensure that we shift the results 1
       guard inputs.count == 1 else {
