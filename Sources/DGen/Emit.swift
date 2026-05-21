@@ -237,13 +237,10 @@ extension LazyOp {
       let mode = inputs[0]
       let options = Array(inputs.dropFirst())
       b.use(val: b.selector(b.value(mode), options.map { b.value($0) }))
-    case .modulatedParam(let mode, let minValue, let maxValue, let activeCellId, let lanes):
+    case .modulatedParam(let mode, let minValue, let maxValue, let baseCellId, let activeCellId, let lanes):
       guard inputs.count == 1 else {
         throw DGenError.insufficientInputs(
           operator: "modulatedParam", expected: 1, actual: inputs.count)
-      }
-      guard case .param(let baseCellId) = g.nodes[node.inputs[0]]?.op else {
-        throw DGenError.compilationFailed("modulatedParam input must be a parameter")
       }
       let zeroOffset = b.intConstant(0)
       let base = b.simdBroadcastLoad(baseCellId, zeroOffset)

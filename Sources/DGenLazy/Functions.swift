@@ -509,6 +509,9 @@ public func modulatedParam(
   min: Float,
   max: Float
 ) -> Signal {
+  guard let baseCellId = base.memoryCellId else {
+    fatalError("modulatedParam base signal must be a parameter")
+  }
   guard let activeCellId = active.memoryCellId else {
     fatalError("modulatedParam active signal must be a parameter")
   }
@@ -528,6 +531,7 @@ public func modulatedParam(
       mode: mode,
       min: min,
       max: max,
+      baseCellId: baseCellId,
       activeCellId: activeCellId,
       lanes: opLanes),
     [base.nodeId])

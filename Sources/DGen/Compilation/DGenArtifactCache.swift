@@ -127,6 +127,7 @@ extension Graph {
     lines.append("lazyCells=\(lazyCells.sorted())")
     lines.append("materializeNodes=\(materializeNodes.sorted())")
     lines.append("persistentCells=\(persistentCells.sorted())")
+    lines.append("parameterCells=\(parameterCells.sorted())")
     lines.append("gradientSideEffects=\(gradientSideEffects)")
     lines.append("lastForwardNodeId=\(String(describing: lastForwardNodeId))")
 

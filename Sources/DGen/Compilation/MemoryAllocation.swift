@@ -71,6 +71,12 @@ func remapVectorMemorySlots(
     registerCell(voiceCellId, vectorWidth: 4)
   }
 
+  if let graph = graph {
+    for cellId in graph.parameterCells {
+      registerCell(cellId, vectorWidth: 1)
+    }
+  }
+
   // Collect cells with injectable initial data (e.g. twiddle factors).
   // These get placed at low physical offsets so their indices stay within
   // Float32 exact integer range when passed through initial_state buffers.
@@ -104,6 +110,7 @@ func remapVectorMemorySlots(
     // Includes load/store/delay1 cells (detected from UOps) AND cells explicitly
     // marked as persistent by graph construction (circular buffers, ring buffers).
     var persistentCells: Set<CellID> = graph?.persistentCells ?? []
+    let parameterCells: Set<CellID> = graph?.parameterCells ?? []
     var accumulateCells: Set<CellID> = []  // memoryAccumulate — need zeroed memory
     var cellFirstUse: [CellID: Int] = [:]
     var cellLastUse: [CellID: Int] = [:]
@@ -141,6 +148,7 @@ func remapVectorMemorySlots(
     for cellId in memoryUsage.keys {
       if injectableCellIds.contains(cellId) { continue }
       if persistentCells.contains(cellId) { continue }
+      if parameterCells.contains(cellId) { continue }
       if cellId == voiceCellId { continue }
       reuseEligible.insert(cellId)
     }

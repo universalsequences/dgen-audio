@@ -277,13 +277,15 @@ public enum LazyOp {
     gradWriteCell: CellID, rowIdxCell: CellID, gradCell: CellID, numRows: Int, numCols: Int,
     maxFrameCount: Int)
   case selector  // selector(mode, options[])
-  /// Fast-path modulation destination. Inputs are:
+  /// Host-routed modulation destination. Inputs are:
   /// [baseParam].
-  /// When active is zero, returns baseParam without reading or summing modulation lanes.
+  /// Scalar parameter cells are loaded as lane-uniform values so the same op is
+  /// safe in scalar and SIMD C frame loops.
   case modulatedParam(
     mode: ModulatedParamMode,
     min: Float,
     max: Float,
+    baseCellId: CellID,
     activeCellId: CellID,
     lanes: [ModulatedParamLane])
   case memoryRead(CellID)

@@ -56,6 +56,10 @@ open class Graph {
     /// These must not be shared with other cells during buffer reuse optimization.
     public var persistentCells: Set<CellID> = []
 
+    /// Host-addressable parameter cells.
+    /// These must keep unique physical slots even when their compile-time lifetimes do not overlap.
+    public var parameterCells: Set<CellID> = []
+
     /// Nodes that should have their tensor results materialized in memory (for realize())
     public var materializeNodes: Set<NodeID> = []
 
@@ -111,6 +115,10 @@ open class Graph {
         let id = next
         next += 1
         nodes[id] = Node(id: id, op: op, inputs: ins)
+
+        if case .param(let cellId) = op {
+            parameterCells.insert(cellId)
+        }
 
         // If shape is explicitly provided, use it. Otherwise, infer from inputs.
         if let explicitShape = shape {

@@ -147,6 +147,153 @@ final class ModulationTests: XCTestCase {
         XCTAssertEqual(gain.cellSpan, 1)
     }
 
+    func testModulatableParamCellsDoNotOverlapLaterParamsWithADSRPreamble() throws {
+        let source = """
+        (def samplerate 48000.0)
+
+        (defmacro adsr (gate_sig trigger_sig attack_ms decay_ms sustain release_ms)
+          (make-history env)
+          (make-history gate_hist)
+          (make-history stage_hist)
+
+          (def sr samplerate)
+          (def env_time_scale 6.907755)
+          (def reset_samples (* 0.003 sr))
+          (def attack_samples (max 1.0 (* attack_ms 0.001 sr)))
+          (def decay_samples (max 1.0 (* decay_ms 0.001 sr)))
+          (def release_samples (max 1.0 (* release_ms 0.001 sr)))
+          (def reset_coeff (- 1.0 (exp (/ (* -1.0 env_time_scale) reset_samples))))
+          (def decay_coeff (- 1.0 (exp (/ (* -1.0 env_time_scale) decay_samples))))
+          (def release_coeff (- 1.0 (exp (/ (* -1.0 env_time_scale) release_samples))))
+
+          (def prev_env (read-history env))
+          (def prev_gate (read-history gate_hist))
+          (def prev_stage (read-history stage_hist))
+
+          (def gate_on (gt gate_sig 0.5))
+          (def gate_rising (* gate_on (lte prev_gate 0.5)))
+          (def retrigger (max gate_rising trigger_sig))
+          (def attack_stage 1.0)
+          (def decay_stage 2.0)
+          (def reset_stage 3.0)
+          (def attack_done (gte prev_env 0.999))
+          (def reset_done (lte prev_env 0.0001))
+
+          (def stage_from_gate
+            (gswitch gate_on
+              (gswitch retrigger
+                (gswitch (gt prev_env 0.0001) reset_stage attack_stage)
+                prev_stage)
+              0.0))
+
+          (def stage
+            (gswitch (eq stage_from_gate reset_stage)
+              (gswitch reset_done attack_stage reset_stage)
+              (gswitch attack_done
+                (gswitch (eq stage_from_gate attack_stage) decay_stage stage_from_gate)
+                stage_from_gate)))
+
+          (def target
+            (gswitch gate_on
+              (gswitch (eq stage reset_stage)
+                0.0
+                (gswitch (eq stage attack_stage) 1.0 sustain))
+              0.0))
+
+          (def rate
+            (gswitch gate_on
+              (gswitch (eq stage reset_stage) reset_coeff decay_coeff)
+              release_coeff))
+
+          (def one_pole_level (+ prev_env (* rate (- target prev_env))))
+          (def attack_level (+ prev_env (/ 1.0 attack_samples)))
+          (def level_raw
+            (gswitch (eq stage attack_stage)
+              attack_level
+              one_pole_level))
+          (def level (clip level_raw 0 1))
+          (write-history env level)
+          (write-history gate_hist gate_sig)
+          (write-history stage_hist stage)
+          level)
+
+        (defmacro op (input input2) (def phasor1 (phasor input)) (def mul1 (* phasor1 input2)) mul1)
+        (def gate (in 1 @name gate))
+        (def pitch (in 2 @name pitch))
+        (def velocity (in 3 @name velocity))
+        (def trigger (in 4 @name trigger))
+        (def mod1 (in 5 @name mod1 @modulator 1))
+        (def mod2 (in 6 @name mod2 @modulator 2))
+        (def mod3 (in 7 @name mod3 @modulator 3))
+        (def mod4 (in 8 @name mod4 @modulator 4))
+        (def mod5 (in 9 @name mod5 @modulator 5))
+        (def mod6 (in 10 @name mod6 @modulator 6))
+        (def ext1 (in 11 @name ext1 @modulator 7))
+        (def ext2 (in 12 @name ext2 @modulator 8))
+        (def ext3 (in 13 @name ext3 @modulator 9))
+        (def ext4 (in 14 @name ext4 @modulator 10))
+        (param xout @default 1.0 @min 1.0 @max 2.0 @mod true @mod-mode additive)
+        (def modulated1 (mod xout))
+        (def op1 (op pitch modulated1))
+        (param attack @default 5.0 @min 0.0 @max 1000.0 @unit ms)
+        (param decay @default 120.0 @min 1.0 @max 2000.0 @unit ms)
+        (param sustain @default 0.8 @min 0.0 @max 1.0)
+        (param release @default 180.0 @min 1.0 @max 5000.0 @unit ms)
+        (param gain @default 0.5 @min 0.0 @max 1.0 @mod true @mod-mode additive)
+        (def env (adsr gate trigger attack decay sustain release))
+        (def osc (scale op1 0.0 1.0 -1.0 1.0))
+        (out (* osc env velocity (mod gain)) 1 @name audio)
+        """
+
+        let evaluator = LispEvaluator()
+        let lowered = try lowerModulation(in: parseSource(source))
+        try evaluator.evaluate(nodes: lowered)
+
+        let graph = LazyGraphContext.current
+        for output in evaluator.outputs {
+            graph.addOutput(output.signal, channel: output.channel)
+        }
+
+        let compilation = try graph.compileOnly(frameCount: 128, voiceCount: 12)
+        let compilerResult = CompilerResult(
+            dylibPath: "",
+            cSourcePath: "",
+            compilationResult: compilation,
+            cSource: compilation.kernels.map { $0.source }.joined(separator: "\n\n")
+        )
+        let options = CompilerOptions(
+            outputDir: ".",
+            name: "patch",
+            sampleRate: 48_000,
+            maxFrames: 128,
+            voiceCount: 12,
+            debug: false
+        )
+
+        let manifest = generateManifest(
+            compilerResult: compilerResult,
+            evaluator: evaluator,
+            options: options
+        )
+
+        var ownerByCell: [Int: String] = [:]
+        var collisions: [String] = []
+        for param in manifest.params {
+            for cell in param.cellId..<(param.cellId + param.cellSpan) {
+                if let owner = ownerByCell[cell] {
+                    collisions.append("memory[\(cell)] is shared by \(owner) and \(param.name)")
+                } else {
+                    ownerByCell[cell] = param.name
+                }
+            }
+        }
+
+        XCTAssertTrue(
+            collisions.isEmpty,
+            "DGenLisp manifest assigned overlapping param cells:\n\(collisions.joined(separator: "\n"))"
+        )
+    }
+
     func testPercentIsModuloOperator() throws {
         let evaluator = LispEvaluator()
         try evaluator.evaluate(nodes: parseSource("""
