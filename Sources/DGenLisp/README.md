@@ -55,7 +55,11 @@ false         ; 0.0
 ```lisp
 (def name expr)
 (def osc (sin (* (phasor 440) twopi)))
+(def (x y z) (tuple 1 2 3))
 ```
+
+Destructuring `def` binds each name from a tuple-producing expression. Built-in multi-output
+operators like `fft` return tuples, and macros can return explicit tuples with `(tuple ...)`.
 
 #### defmacro — define a reusable macro
 
@@ -68,6 +72,9 @@ false         ; 0.0
   (def v (+ sig (* g ds)))
   (write-history h v)
   (- ds (* g v)))
+
+(defmacro multi (a b c)
+  (tuple (* a 2) (* a b) (* b c)))
 ```
 
 Local `def` and `make-history` bindings inside macros are automatically scoped — multiple calls to the same macro won't collide.

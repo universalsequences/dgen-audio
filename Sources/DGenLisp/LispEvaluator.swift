@@ -668,6 +668,8 @@ class LispEvaluator {
       return try evalOverlapAdd(regularArgs)
 
     // Utility
+    case "tuple":
+      return try evalTuple(regularArgs)
     case "scale":
       return try evalScale(regularArgs)
     case "triangle":
@@ -689,6 +691,13 @@ class LispEvaluator {
   }
 
   // MARK: - Arithmetic
+
+  private func evalTuple(_ args: [ASTNode]) throws -> EvalResult {
+    guard !args.isEmpty else {
+      throw LispError.invalidArgument("tuple requires at least 1 argument")
+    }
+    return .tuple(try args.map { try evaluateAST($0) })
+  }
 
   private func evalBinaryArith(_ args: [ASTNode], op: String) throws -> EvalResult {
     guard args.count == 2 else {

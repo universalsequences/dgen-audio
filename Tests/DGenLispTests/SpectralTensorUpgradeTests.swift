@@ -128,6 +128,51 @@ final class SpectralTensorUpgradeTests: XCTestCase {
     }
   }
 
+  func testTupleOperatorSupportsDestructuringDef() throws {
+    let e = try evaluator(
+      """
+      (def (x1 x2 x3) (tuple (* 1 2) (* 2 3) (* 3 4)))
+      """)
+    guard case .float(let x1)? = e.definitions["x1"],
+      case .float(let x2)? = e.definitions["x2"],
+      case .float(let x3)? = e.definitions["x3"]
+    else {
+      return XCTFail("expected destructured float tuple bindings")
+    }
+    XCTAssertEqual(x1, 2)
+    XCTAssertEqual(x2, 6)
+    XCTAssertEqual(x3, 12)
+  }
+
+  func testMacroCanReturnTupleForDestructuringDef() throws {
+    let e = try evaluator(
+      """
+      (defmacro multi (a b c)
+        (tuple (* a 2) (* a b) (* b c)))
+      (def (x1 x2 x3) (multi 1 2 3))
+      """)
+    guard case .float(let x1)? = e.definitions["x1"],
+      case .float(let x2)? = e.definitions["x2"],
+      case .float(let x3)? = e.definitions["x3"]
+    else {
+      return XCTFail("expected macro tuple outputs")
+    }
+    XCTAssertEqual(x1, 2)
+    XCTAssertEqual(x2, 2)
+    XCTAssertEqual(x3, 6)
+  }
+
+  func testTupleOperatorRejectsEmptyTuple() throws {
+    XCTAssertThrowsError(
+      try evaluator(
+        """
+        (def x (tuple))
+        """)
+    ) { error in
+      XCTAssertTrue(String(describing: error).contains("tuple requires at least 1 argument"))
+    }
+  }
+
   func testMacroScopedDestructuringDoesNotCollide() throws {
     let e = try evaluator(
       """
