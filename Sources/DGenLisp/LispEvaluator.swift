@@ -30,6 +30,9 @@ struct ParamInfo {
   let max: Float?
   let unit: String?
   let hidden: Bool
+  let group: String?
+  let env: String?
+  let role: UIEnvelopeRole?
   let generatedKind: String?
   let generatedFor: String?
   let modulationMode: ModulationMode?
@@ -95,6 +98,7 @@ class LispEvaluator {
     for node in nodes {
       let _ = try evaluateAST(node)
     }
+    try validateParamUIMetadata(params)
   }
 
   // MARK: - AST Evaluation
@@ -1288,6 +1292,9 @@ class LispEvaluator {
     let maxVal = Float(attrValue(attributes, "@max") ?? "")
     let unit = attrValue(attributes, "@unit")
     let hidden = parseBoolAttr(attributes, "@hidden")
+    let group = try parseUIMetadataSymbol(attrValue(attributes, "@group"), attribute: "@group", paramName: name)
+    let env = try parseUIMetadataSymbol(attrValue(attributes, "@env"), attribute: "@env", paramName: name)
+    let role = try parseUIEnvelopeRole(attrValue(attributes, "@role"), paramName: name)
     let generatedKind = attrValue(attributes, "@generated")
     let generatedFor = attrValue(attributes, "@generated-for")
     let modulationMode = attrValue(attributes, "@mod-mode").flatMap {
@@ -1309,6 +1316,9 @@ class LispEvaluator {
       max: maxVal,
       unit: unit,
       hidden: hidden,
+      group: group,
+      env: env,
+      role: role,
       generatedKind: generatedKind,
       generatedFor: generatedFor,
       modulationMode: modulationMode,

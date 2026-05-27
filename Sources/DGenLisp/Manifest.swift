@@ -19,6 +19,8 @@ struct PatchManifest: Codable {
     let voiceCellId: Int?
     let totalMemorySlots: Int
     let params: [ManifestParam]
+    let groups: [ManifestGroup]
+    let envelopes: [ManifestEnvelope]
     let inputs: [ManifestInput]
     let outputs: [ManifestOutput]
     let modulators: [ManifestModulator]
@@ -36,11 +38,98 @@ struct ManifestParam: Codable {
     let max: Float?
     let unit: String?
     let hidden: Bool?
+    let group: String?
+    let env: String?
+    let role: String?
 
     enum CodingKeys: String, CodingKey {
         case name, cellId, cellSpan
         case defaultValue = "default"
-        case min, max, unit, hidden
+        case min, max, unit, hidden, group, env, role
+    }
+}
+
+struct ManifestGroup: Codable {
+    let name: String
+}
+
+struct ManifestEnvelope: Codable {
+    let name: String
+    let group: String?
+    let roles: ManifestEnvelopeRoles
+
+    enum CodingKeys: String, CodingKey {
+        case name, group, roles
+    }
+
+    init(name: String, group: String?, roles: ManifestEnvelopeRoles) {
+        self.name = name
+        self.group = group
+        self.roles = roles
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        name = try container.decode(String.self, forKey: .name)
+        group = try container.decodeIfPresent(String.self, forKey: .group)
+        roles = try container.decode(ManifestEnvelopeRoles.self, forKey: .roles)
+    }
+
+    func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(name, forKey: .name)
+        if let group {
+            try container.encode(group, forKey: .group)
+        } else {
+            try container.encodeNil(forKey: .group)
+        }
+        try container.encode(roles, forKey: .roles)
+    }
+}
+
+struct ManifestEnvelopeRoles: Codable {
+    let attack: String?
+    let decay: String?
+    let sustain: String?
+    let release: String?
+
+    enum CodingKeys: String, CodingKey {
+        case attack, decay, sustain, release
+    }
+
+    init(attack: String?, decay: String?, sustain: String?, release: String?) {
+        self.attack = attack
+        self.decay = decay
+        self.sustain = sustain
+        self.release = release
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        attack = try container.decodeIfPresent(String.self, forKey: .attack)
+        decay = try container.decodeIfPresent(String.self, forKey: .decay)
+        sustain = try container.decodeIfPresent(String.self, forKey: .sustain)
+        release = try container.decodeIfPresent(String.self, forKey: .release)
+    }
+
+    func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try encodeNullable(attack, in: &container, forKey: .attack)
+        try encodeNullable(decay, in: &container, forKey: .decay)
+        try encodeNullable(sustain, in: &container, forKey: .sustain)
+        try encodeNullable(release, in: &container, forKey: .release)
+    }
+
+    private func encodeNullable(
+        _ value: String?,
+        in container: inout KeyedEncodingContainer<CodingKeys>,
+        forKey key: CodingKeys
+    ) throws {
+        if let value {
+            try container.encode(value, forKey: key)
+        } else {
+            try container.encodeNil(forKey: key)
+        }
     }
 }
 
@@ -126,9 +215,15 @@ func generateManifest(
             min: param.min,
             max: param.max,
             unit: param.unit,
-            hidden: param.hidden ? true : nil
+            hidden: param.hidden ? true : nil,
+            group: param.group,
+            env: param.env,
+            role: param.role?.rawValue
         )
     }
+
+    let manifestGroups = deriveManifestGroups(from: evaluator.params)
+    let manifestEnvelopes = deriveManifestEnvelopes(from: evaluator.params)
 
     let manifestInputs = evaluator.inputs.map { input in
         ManifestInput(channel: input.channel, name: input.name)
@@ -209,6 +304,8 @@ func generateManifest(
         voiceCellId: compilerResult.compilationResult.voiceCellId.flatMap { cellMappings[$0] ?? $0 },
         totalMemorySlots: compilerResult.compilationResult.totalMemorySlots,
         params: manifestParams,
+        groups: manifestGroups,
+        envelopes: manifestEnvelopes,
         inputs: manifestInputs,
         outputs: manifestOutputs,
         modulators: manifestModulators,
@@ -216,6 +313,55 @@ func generateManifest(
         tensors: manifestTensors,
         tensorInitData: manifestTensorInit
     )
+}
+
+private func deriveManifestGroups(from params: [ParamInfo]) -> [ManifestGroup] {
+    var seen = Set<String>()
+    var groups: [ManifestGroup] = []
+    for param in params {
+        guard let group = param.group, !seen.contains(group) else { continue }
+        seen.insert(group)
+        groups.append(ManifestGroup(name: group))
+    }
+    return groups
+}
+
+private func deriveManifestEnvelopes(from params: [ParamInfo]) -> [ManifestEnvelope] {
+    struct EnvelopeAccumulator {
+        var group: String?
+        var roles: [UIEnvelopeRole: String] = [:]
+    }
+
+    var order: [String] = []
+    var byName: [String: EnvelopeAccumulator] = [:]
+
+    for param in params {
+        guard let env = param.env else { continue }
+        if byName[env] == nil {
+            order.append(env)
+            byName[env] = EnvelopeAccumulator()
+        }
+        if let group = param.group {
+            byName[env]?.group = group
+        }
+        if let role = param.role {
+            byName[env]?.roles[role] = param.name
+        }
+    }
+
+    return order.compactMap { name in
+        guard let envelope = byName[name] else { return nil }
+        return ManifestEnvelope(
+            name: name,
+            group: envelope.group,
+            roles: ManifestEnvelopeRoles(
+                attack: envelope.roles[.attack],
+                decay: envelope.roles[.decay],
+                sustain: envelope.roles[.sustain],
+                release: envelope.roles[.release]
+            )
+        )
+    }
 }
 
 private func mapTensorMetadata(

@@ -92,15 +92,19 @@ Local `def` and `make-history` bindings inside macros are automatically scoped �
 #### param — host-controllable parameter
 
 ```lisp
-(param name @default value @min value @max value @unit string)
+(param name @default value @min value @max value @unit string
+       @group group-name @env env-name @role attack|decay|sustain|release)
 
 (param freq @default 440 @min 20 @max 20000 @unit Hz)
 (param gain @default 0.5 @min 0 @max 1)
 (param cutoff @default 2400 @min 60 @max 12000 @unit Hz @mod true @mod-mode additive)
+(param amp-attack @group amp @env amp-env @role attack @default 0.01)
 ```
 
 The name becomes a symbol you can use in expressions. Parameters appear in the manifest with their physical memory cell ID for host-side control.
 Modulatable params generate one hidden active flag plus one hidden depth param per declared modulator, and expose those cells through `modDestinations` metadata in the manifest.
+
+UI metadata attributes are optional and do not affect DSP behavior. `@group` places a param in a generated UI group. `@env` marks a param as part of an envelope, and requires a valid `@role`. Params in the same envelope cannot duplicate roles or declare conflicting groups.
 
 #### in — audio input channel
 
@@ -383,6 +387,17 @@ Floats are promoted automatically when combined with graph types. Signals and te
     "max": 20000,
     "unit": "Hz"
   }],
+  "groups": [{"name": "amp"}],
+  "envelopes": [{
+    "name": "amp-env",
+    "group": "amp",
+    "roles": {
+      "attack": "amp-attack",
+      "decay": "amp-decay",
+      "sustain": "amp-sustain",
+      "release": "amp-release"
+    }
+  }],
   "inputs": [{"channel": 0, "name": "signal"}],
   "outputs": [{"channel": 0, "name": "audio"}],
   "tensors": [{
@@ -398,6 +413,7 @@ Floats are promoted automatically when combined with graph types. Signals and te
 ```
 
 - `cellId` values are **physical** memory offsets (after remapping), ready for direct indexing into the memory buffer
+- `groups` and `envelopes` are derived from param UI metadata in first-reference order
 - `tensors` gives named metadata for tensor-backed assets and editable tensor slots
 - `tensorInitData` entries must be written to the memory buffer before the first `process()` call
 - `totalMemorySlots` is the required memory buffer size (in floats)
