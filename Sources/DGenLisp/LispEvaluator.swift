@@ -246,9 +246,53 @@ class LispEvaluator {
     return .none
   }
 
+  /// Parses trailing `@attr value` pairs starting at `startIndex` (after the name).
+  private func parseTrailingAttributes(
+    _ elements: [ASTNode], startIndex: Int, form: String
+  ) throws -> [(name: String, value: String)] {
+    var attrs: [(name: String, value: String)] = []
+    var i = startIndex
+    while i < elements.count {
+      guard case .atom(let key) = elements[i], key.hasPrefix("@") else {
+        throw LispError.parseError("\(form) expects attributes after the name")
+      }
+      if i + 1 < elements.count, case .atom(let attrValue) = elements[i + 1] {
+        attrs.append((key, attrValue))
+        i += 2
+      } else {
+        attrs.append((key, ""))
+        i += 1
+      }
+    }
+    return attrs
+  }
+
+  /// Creates a tensor history binding (optionally hop-gated) from parsed attributes.
+  private func makeTensorHistoryBinding(
+    name: String, attrs: [(name: String, value: String)], form: String
+  ) throws {
+    guard let shapeStr = attrValue(attrs, "@shape") else {
+      throw LispError.invalidArgument("\(form) requires @shape [d1,d2,...]")
+    }
+    let shape = parseShape(shapeStr)
+    let hop = attrValue(attrs, "@hop").flatMap { Int($0) }
+    let data = attrValue(attrs, "@data").map { parseFloatList($0) }
+    tensorHistoryBindings[name] = TensorHistory(shape: shape, hop: hop, data: data)
+  }
+
+  /// `(make-history name)` creates a scalar signal feedback cell.
+  /// `(make-history name @shape [...] [@hop N] [@data [...]])` creates a tensor
+  /// history (the `@shape` form); with `@hop` the feedback advances once per hop
+  /// (fs/hop) for STFT-style spectral state. Both attributes are optional; absent
+  /// `@shape` yields the scalar form. `read-history`/`write-history` work on either.
   private func evaluateMakeHistory(_ elements: [ASTNode]) throws -> EvalResult {
     guard elements.count >= 2, case .atom(let name) = elements[1] else {
       throw LispError.parseError("make-history requires a name: (make-history name)")
+    }
+    let attrs = try parseTrailingAttributes(elements, startIndex: 2, form: "make-history")
+    if attrValue(attrs, "@shape") != nil {
+      try makeTensorHistoryBinding(name: name, attrs: attrs, form: "make-history")
+      return .none
     }
     let history = Signal.history()
     historyBindings[name] = history
@@ -259,6 +303,9 @@ class LispEvaluator {
     guard elements.count >= 2, case .atom(let name) = elements[1] else {
       throw LispError.parseError("read-history requires a name")
     }
+    if let history = tensorHistoryBindings[name] {
+      return .signalTensor(history.read())
+    }
     guard let binding = historyBindings[name] else {
       throw LispError.historyNotFound(name)
     }
@@ -268,6 +315,9 @@ class LispEvaluator {
   private func evaluateWriteHistory(_ elements: [ASTNode]) throws -> EvalResult {
     guard elements.count >= 3, case .atom(let name) = elements[1] else {
       throw LispError.parseError("write-history requires name and value")
+    }
+    if let history = tensorHistoryBindings[name] {
+      return try writeTensorHistoryValue(history, valueNode: elements[2])
     }
     guard let binding = historyBindings[name] else {
       throw LispError.historyNotFound(name)
@@ -281,26 +331,8 @@ class LispEvaluator {
     guard elements.count >= 2, case .atom(let name) = elements[1] else {
       throw LispError.parseError("make-tensor-history requires a name")
     }
-    var attrs: [(name: String, value: String)] = []
-    var i = 2
-    while i < elements.count {
-      guard case .atom(let key) = elements[i], key.hasPrefix("@") else {
-        throw LispError.parseError("make-tensor-history expects attributes after the name")
-      }
-      if i + 1 < elements.count, case .atom(let attrValue) = elements[i + 1] {
-        attrs.append((key, attrValue))
-        i += 2
-      } else {
-        attrs.append((key, ""))
-        i += 1
-      }
-    }
-    guard let shapeStr = attrValue(attrs, "@shape") else {
-      throw LispError.invalidArgument("make-tensor-history requires @shape [d1,d2,...]")
-    }
-    let shape = parseShape(shapeStr)
-    let data = attrValue(attrs, "@data").map { parseFloatList($0) }
-    tensorHistoryBindings[name] = TensorHistory(shape: shape, data: data)
+    let attrs = try parseTrailingAttributes(elements, startIndex: 2, form: "make-tensor-history")
+    try makeTensorHistoryBinding(name: name, attrs: attrs, form: "make-tensor-history")
     return .none
   }
 
@@ -314,14 +346,10 @@ class LispEvaluator {
     return .signalTensor(history.read())
   }
 
-  private func evaluateWriteTensorHistory(_ elements: [ASTNode]) throws -> EvalResult {
-    guard elements.count >= 3, case .atom(let name) = elements[1] else {
-      throw LispError.parseError("write-tensor-history requires name and value")
-    }
-    guard let history = tensorHistoryBindings[name] else {
-      throw LispError.historyNotFound(name)
-    }
-    let value = try evaluateAST(elements[2])
+  private func writeTensorHistoryValue(
+    _ history: TensorHistory, valueNode: ASTNode
+  ) throws -> EvalResult {
+    let value = try evaluateAST(valueNode)
     switch value {
     case .tensor(let t):
       return .tensor(history.write(t))
@@ -330,6 +358,16 @@ class LispEvaluator {
     default:
       throw LispError.typeError("write-tensor-history: value must be tensor or signalTensor")
     }
+  }
+
+  private func evaluateWriteTensorHistory(_ elements: [ASTNode]) throws -> EvalResult {
+    guard elements.count >= 3, case .atom(let name) = elements[1] else {
+      throw LispError.parseError("write-tensor-history requires name and value")
+    }
+    guard let history = tensorHistoryBindings[name] else {
+      throw LispError.historyNotFound(name)
+    }
+    return try writeTensorHistoryValue(history, valueNode: elements[2])
   }
 
   // MARK: - Macro expansion
