@@ -366,6 +366,25 @@ public func findSequentialNodes(_ g: Graph, feedbackClusters: [[NodeID]], backen
     }
   }
 
+  // Hop-gated tensor history feedback must run sequentially across frames: the
+  // state at hop N depends on hop N-1. Element-parallelizing it across frames
+  // (ThreadCountScale → perFrameScaled) would split the read+update into a
+  // parallel kernel and the write-back into a separate sequential kernel, so
+  // every hop would read stale state. Marking read/write scalar keeps the whole
+  // feedback path in one sequential frame loop (matching the C tensor-history
+  // path). Gated on the explicit hop tag so per-sample history (membrane / FDTD)
+  // keeps its existing Metal SIMD-across-frames behavior.
+  g.nodes.values.forEach {
+    switch $0.op {
+    case .historyRead(let cellId), .historyWrite(let cellId):
+      if g.nodeHopRate[$0.id] != nil, g.cellToTensor[cellId] != nil {
+        scalar.insert($0.id)
+      }
+    default:
+      break
+    }
+  }
+
   // Use feedback loop detection to mark all nodes in feedback loops as scalar
   // This is the core reason for scalar execution - frame-to-frame state dependencies
   for loop in feedbackClusters {

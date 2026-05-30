@@ -493,6 +493,19 @@ private func firstHopTensorSuffixOffset(
     guard let node = graph.nodes[nodeId], !node.op.isViewOnly else { continue }
     guard case .tensor = node.shape else { continue }
 
+    // History feedback (read/update/write-back) is scheduled as one sequential
+    // cluster. It must NOT be split here: this boundary targets a hop FFT/spectral
+    // chain that follows a frame-rate tensor update, not self-contained history
+    // feedback. A hop-gated historyWrite would otherwise be sundered from its
+    // read+update, putting read and write-back in separate Metal kernels and
+    // breaking the cross-hop dependency (every hop would read stale state).
+    switch node.op {
+    case .historyRead, .historyWrite, .historyReadWrite:
+      continue
+    default:
+      break
+    }
+
     if graph.nodeHopRate[nodeId] != nil {
       if sawNonHopTensor { return offset }
     } else {

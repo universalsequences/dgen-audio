@@ -325,12 +325,16 @@ public class TensorHistory {
   /// Create a tensor history buffer
   /// - Parameters:
   ///   - shape: Shape of the tensor to store
+  ///   - hop: When set, the feedback advances once every `hop` frames (fs/hop)
+  ///     instead of once per frame. Leave `nil` for per-sample feedback (membrane
+  ///     / FDTD sims). Use the hop value for STFT-style per-bin spectral dynamics
+  ///     (per-bin compressor, spectral freeze, temporal blur) inside an FFT region.
   ///   - data: Optional initial data
-  public init(shape: Shape, data: [Float]? = nil) {
+  public init(shape: Shape, hop: Int? = nil, data: [Float]? = nil) {
     let graph = LazyGraphContext.current
     self.graph = graph
     self.shape = shape
-    self.buffer = graph.graph.tensorHistoryBuffer(shape: shape, data: data)
+    self.buffer = graph.graph.tensorHistoryBuffer(shape: shape, hop: hop, data: data)
   }
 
   /// Read the current state from the history buffer

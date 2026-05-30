@@ -364,7 +364,33 @@ public struct CompilationPipeline {
     if graphContainsIsolatedPasses(graph) {
       finalBlocks = isolateSpectralPasses(finalBlocks, graph)
     }
+    forceSequentialHopHistoryBlocks(&finalBlocks, graph: graph)
     return finalBlocks
+  }
+
+  /// A hop-gated tensor history feedback (read → update → write-back) carries a
+  /// cross-hop dependency: hop N reads the state hop N-1 wrote. Block fusion can
+  /// merge the parallel hop buffer-window read into the same block, flipping the
+  /// block's `frameOrder` to `.parallel`. On Metal that dispatches frameCount*scale
+  /// threads, so every hop reads stale state and the feedback never accumulates.
+  /// Force such blocks back to sequential — the `perFrameScaled` path then emits a
+  /// single-threaded loop over (frame, element), matching the (correct) per-sample
+  /// tensor-history kernel with an added hop gate.
+  private static func forceSequentialHopHistoryBlocks(_ blocks: inout [Block], graph: Graph) {
+    for i in blocks.indices where blocks[i].frameOrder == .parallel {
+      let hasHopHistory = blocks[i].nodes.contains { nodeId in
+        guard let node = graph.nodes[nodeId], graph.nodeHopRate[nodeId] != nil else { return false }
+        switch node.op {
+        case .historyRead(let c), .historyWrite(let c), .historyReadWrite(let c):
+          return graph.cellToTensor[c] != nil
+        default:
+          return false
+        }
+      }
+      if hasHopHistory {
+        blocks[i].frameOrder = .sequential
+      }
+    }
   }
 
   /// Checks whether the graph needs isolated-pass handling.

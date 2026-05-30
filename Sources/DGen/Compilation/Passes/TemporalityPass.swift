@@ -22,7 +22,11 @@ extension TemporalityPass {
     switch op {
     case .hopTensorNoise, .spectrumDelay, .spectrumDelayMod:
       return true
-    case .accum, .latch:
+    case .accum, .latch, .historyRead, .historyWrite, .historyReadWrite:
+      // Tensor history read/write, like tensor accum/latch, only need hop-rate
+      // scheduling when the caller explicitly tags them (TensorHistory(hop:)).
+      // Running the read/write block only on hop frames is equivalent to its
+      // frame-rate form with no-op work between hops — the state simply holds.
       guard graph.nodeHopRate[nodeId] != nil,
         let node = graph.nodes[nodeId],
         case .tensor = node.shape
