@@ -107,6 +107,64 @@ final class ModulationTests: XCTestCase {
         XCTAssertEqual(destination.depthLanes.map(\.slot), [1, 2])
     }
 
+    func testManifestIncludesModulationOutputsDeclaredOnOutForms() throws {
+        let source = """
+        (out (phasor 0.25) 2 @name macro-a @modulator 1)
+        (out (phasor 0.50) 3 @name macro-b @modulator 2)
+        (out (sin (* (phasor 440) twopi)) 1 @name audio)
+        """
+
+        let evaluator = LispEvaluator()
+        try evaluator.evaluate(nodes: parseSource(source))
+
+        let graph = LazyGraphContext.current
+        for output in evaluator.outputs {
+            graph.addOutput(output.signal, channel: output.channel)
+        }
+
+        let compilation = try graph.compileOnly(frameCount: 64, voiceCount: 1)
+        let compilerResult = CompilerResult(
+            dylibPath: "",
+            cSourcePath: "",
+            compilationResult: compilation,
+            cSource: ""
+        )
+        let options = CompilerOptions(
+            outputDir: ".",
+            name: "patch",
+            sampleRate: 48_000,
+            maxFrames: 64,
+            voiceCount: 1,
+            debug: false
+        )
+
+        let manifest = generateManifest(
+            compilerResult: compilerResult,
+            evaluator: evaluator,
+            options: options
+        )
+
+        XCTAssertEqual(manifest.outputs.map(\.channel), [1, 2, 0])
+        XCTAssertEqual(manifest.modOutputs.count, 2)
+        XCTAssertEqual(manifest.modOutputs.map(\.slot), [1, 2])
+        XCTAssertEqual(manifest.modOutputs.map(\.channel), [1, 2])
+        XCTAssertEqual(manifest.modOutputs.map(\.name), ["macro-a", "macro-b"])
+        XCTAssertEqual(manifest.modOutputs.map(\.range), ["unipolar", "unipolar"])
+    }
+
+    func testOutputModulatorSlotsMustBeUnique() throws {
+        let source = """
+        (out (phasor 0.25) 2 @name macro-a @modulator 1)
+        (out (phasor 0.50) 3 @name macro-b @modulator 1)
+        """
+
+        let evaluator = LispEvaluator()
+
+        XCTAssertThrowsError(try evaluator.evaluate(nodes: parseSource(source))) { error in
+            XCTAssertTrue("\(error)".contains("duplicate output @modulator slot 1"))
+        }
+    }
+
     func testManifestKeepsScalarParamCellSpanWhenBroadcastInSIMD() throws {
         let source = """
         (param gain @default 0.5 @min 0 @max 1)

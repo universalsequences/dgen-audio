@@ -105,14 +105,15 @@ extension IRBuilder {
 
   /// Return the current frame index, respecting frame-aware tensor block context.
   /// In frame-aware blocks, returns the pre-computed frame index from flat thread decomposition
-  /// (flat index / tensor size). In normal blocks, falls back to the raw thread index.
+  /// (flat index / tensor size). In normal blocks, falls back to the renderer's frame index.
   public func currentFrameIndex() -> Expr {
     // Use decomposed frame index when available (ThreadCountScale blocks)
     if let frameIdx = ctx.frameAwareTensorFrameIndex {
       return value(frameIdx, scalarType: .int)
     }
-    // Fall back to thread index for normal blocks
-    return threadIndex()
+    // Fall back to the renderer's frame index. In C tensor blocks this differs
+    // from threadIndex because tensor element loops run inside the outer frame loop.
+    return frameIndex()
   }
 
   /// Emit the frame index UOp. If `setFrameIndex` was called earlier in this kernel,

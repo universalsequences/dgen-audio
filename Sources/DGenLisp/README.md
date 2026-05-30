@@ -123,9 +123,11 @@ UI metadata attributes are optional and do not affect DSP behavior. `@group` pla
 (out expr channel @name string)
 
 (out (sin (* (phasor 440) twopi)) 1 @name audio)
+(out (phasor 0.25) 2 @name macro-a @modulator 1)
 ```
 
 At least one `out` is required. Channel numbers are 1-indexed.
+`@modulator <slot>` marks an output as a host-visible modulation output.
 
 ### Arithmetic
 
@@ -400,6 +402,12 @@ Floats are promoted automatically when combined with graph types. Signals and te
   }],
   "inputs": [{"channel": 0, "name": "signal"}],
   "outputs": [{"channel": 0, "name": "audio"}],
+  "modOutputs": [{
+    "slot": 1,
+    "channel": 1,
+    "name": "macro-a",
+    "range": "unipolar"
+  }],
   "tensors": [{
     "name": "waves",
     "cellOffset": 100,

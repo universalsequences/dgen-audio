@@ -24,6 +24,7 @@ struct PatchManifest: Codable {
     let inputs: [ManifestInput]
     let outputs: [ManifestOutput]
     let modulators: [ManifestModulator]
+    let modOutputs: [ManifestModOutput]
     let modDestinations: [ManifestModDestination]
     let tensors: [ManifestTensor]
     let tensorInitData: [ManifestTensorInit]
@@ -149,6 +150,13 @@ struct ManifestModulator: Codable {
     let name: String?
 }
 
+struct ManifestModOutput: Codable {
+    let slot: Int
+    let channel: Int
+    let name: String?
+    let range: String
+}
+
 struct ManifestModDestination: Codable {
     let name: String
     let paramCellId: Int
@@ -239,6 +247,17 @@ func generateManifest(
     }
     .sorted { $0.slot < $1.slot }
 
+    let manifestModOutputs = evaluator.outputs.compactMap { output -> ManifestModOutput? in
+        guard let slot = output.modulatorSlot else { return nil }
+        return ManifestModOutput(
+            slot: slot,
+            channel: output.channel,
+            name: output.name,
+            range: "unipolar"
+        )
+    }
+    .sorted { $0.slot < $1.slot }
+
     let paramsByName = Dictionary(uniqueKeysWithValues: evaluator.params.map { ($0.name, $0) })
     let manifestModDestinations = evaluator.params.compactMap { param -> ManifestModDestination? in
         guard let mode = param.modulationMode,
@@ -309,6 +328,7 @@ func generateManifest(
         inputs: manifestInputs,
         outputs: manifestOutputs,
         modulators: manifestModulators,
+        modOutputs: manifestModOutputs,
         modDestinations: manifestModDestinations,
         tensors: manifestTensors,
         tensorInitData: manifestTensorInit

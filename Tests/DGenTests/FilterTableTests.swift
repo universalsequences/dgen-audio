@@ -7,8 +7,8 @@ final class FilterTableTests: XCTestCase {
     func testFilterTableCoreUsesHopHeldTableFrame() throws {
         let N = 16
         let hop = 8
-        let framesPerRun = hop
-        let numRuns = 8
+        let framesPerRun = 64
+        let numRuns = 1
         let totalFrames = framesPerRun * numRuns
         let switchFrame = 32
         let g = Graph(sampleRate: 44100.0, maxFrameCount: framesPerRun)

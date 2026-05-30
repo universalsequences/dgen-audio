@@ -99,12 +99,14 @@ public class CRenderer: Renderer {
     // Add frameCount UOp that will render to function parameter
     scheduleItem.ops.append(UOp(op: .frameCount, value: .empty))
     let frameCountUOp = Lazy.variable(-1, nil)  // Special variable ID for frameCount
+    let scheduledRegions = HopIslandPass.buildRegions(for: uopBlocks)
 
     // Merge adjacent blocks of the same frameOrder into a single loop to reduce passes
     var currentFrameOrder: FrameOrder? = nil
     var currentTemporality: Temporality? = nil
     var currentDispatchMode: DispatchMode? = nil
     var currentVectorWidth: Int? = nil
+    var currentThreadScale: Int? = nil
     var hopCheckOpen = false  // Track if we have an open hop check conditional
     var loopOpen = false
 
@@ -116,7 +118,55 @@ public class CRenderer: Renderer {
       return dest
     }
 
-    for block in uopBlocks {
+    func emitThreadCountScaleChange(_ newScale: Int?) {
+      guard newScale != currentThreadScale else { return }
+      if let scale = newScale {
+        scheduleItem.ops.append(UOp(op: .setThreadCountScale(scale), value: .empty))
+      } else {
+        scheduleItem.ops.append(UOp(op: .setThreadCountScale(0), value: .empty))  // 0 means nil
+      }
+      currentThreadScale = newScale
+    }
+
+    func closeOpenScope() {
+      if hopCheckOpen {
+        scheduleItem.ops.append(UOp(op: .endHopCheck, value: .empty))
+        hopCheckOpen = false
+      }
+
+      if loopOpen {
+        scheduleItem.ops.append(UOp(op: .endLoop, value: .empty))
+        loopOpen = false
+      }
+    }
+
+    func appendHoistedCounterLoad(counterLazy: Lazy, from blocks: [BlockUOps]) {
+      guard case .variable(let vid, _) = counterLazy else { return }
+      for block in blocks {
+        for uop in block.ops {
+          if case .loadGlobal(let id) = uop.op, id == vid {
+            scheduleItem.ops.append(uop)
+            return
+          }
+        }
+      }
+    }
+
+    func appendBlockOps(_ block: BlockUOps) {
+      for uop in block.ops {
+        // Don't skip defineGlobal - it needs to run through emit to mark loadedGlobal
+        scheduleItem.ops.append(uop)
+      }
+    }
+
+    func resetCurrentBlockState() {
+      currentFrameOrder = nil
+      currentTemporality = nil
+      currentDispatchMode = nil
+      currentVectorWidth = nil
+    }
+
+    func appendNormalBlock(_ block: BlockUOps) {
       let needsNewLoop =
         currentFrameOrder != block.frameOrder
         || currentTemporality != block.temporality
@@ -124,28 +174,10 @@ public class CRenderer: Renderer {
         || currentVectorWidth != block.vectorWidth
 
       if needsNewLoop {
-        // Close previous hop check if open
-        if hopCheckOpen {
-          scheduleItem.ops.append(UOp(op: .endHopCheck, value: .empty))
-          hopCheckOpen = false
-        }
-
-        // Close previous loop if open
-        if loopOpen {
-          scheduleItem.ops.append(UOp(op: .endLoop, value: .empty))
-          loopOpen = false
-        }
+        closeOpenScope()
 
         // Emit setThreadCountScale UOp when scale changes so emit() can track it
-        let newScale = block.dispatchMode.threadCountScale
-        let oldScale = currentDispatchMode?.threadCountScale
-        if newScale != oldScale {
-          if let scale = newScale {
-            scheduleItem.ops.append(UOp(op: .setThreadCountScale(scale), value: .empty))
-          } else {
-            scheduleItem.ops.append(UOp(op: .setThreadCountScale(0), value: .empty))  // 0 means nil
-          }
-        }
+        emitThreadCountScaleChange(block.dispatchMode.threadCountScale)
 
         // Open new loop based on dispatch mode and temporality.
         // C is single-threaded, so all frame-based dispatch modes become loops.
@@ -161,14 +193,7 @@ public class CRenderer: Renderer {
             UOp(op: .beginLoop(frameCountUOp, block.vectorWidth), value: .empty)
           )
           // Hoist the counter's loadGlobal before beginHopCheck so the variable is declared
-          if case .variable(let vid, _) = counterLazy {
-            for uop in block.ops {
-              if case .loadGlobal(let id) = uop.op, id == vid {
-                scheduleItem.ops.append(uop)
-                break
-              }
-            }
-          }
+          appendHoistedCounterLoad(counterLazy: counterLazy, from: [block])
           scheduleItem.ops.append(UOp(op: .beginHopCheck(counterLazy), value: .empty))
           hopCheckOpen = true
           loopOpen = true
@@ -187,21 +212,50 @@ public class CRenderer: Renderer {
         currentVectorWidth = block.vectorWidth
       }
 
-      for uop in block.ops {
-        // Don't skip defineGlobal - it needs to run through emit to mark loadedGlobal
-        scheduleItem.ops.append(uop)
+      appendBlockOps(block)
+    }
+
+    func appendHopIsland(_ island: HopIsland) {
+      closeOpenScope()
+      emitThreadCountScaleChange(nil)
+      resetCurrentBlockState()
+
+      let islandBlocks = island.blockIndices.map { uopBlocks[$0] }
+      scheduleItem.ops.append(UOp(op: .beginLoop(frameCountUOp, 1), value: .empty))
+
+      for block in islandBlocks {
+        emitThreadCountScaleChange(block.dispatchMode.threadCountScale)
+        switch block.temporality {
+        case .hopBased(_, let counterNodeId):
+          guard let counterLazy = ctx.values[counterNodeId] else {
+            fatalError("Hop counter node \(counterNodeId) not found in ctx.values")
+          }
+          appendHoistedCounterLoad(counterLazy: counterLazy, from: [block])
+          scheduleItem.ops.append(UOp(op: .beginHopCheck(counterLazy), value: .empty))
+          appendBlockOps(block)
+          scheduleItem.ops.append(UOp(op: .endHopCheck, value: .empty))
+        case .frameBased:
+          appendBlockOps(block)
+        case .static_:
+          fatalError("Hop island cannot contain static blocks")
+        }
+      }
+
+      emitThreadCountScaleChange(nil)
+      scheduleItem.ops.append(UOp(op: .endLoop, value: .empty))
+      resetCurrentBlockState()
+    }
+
+    for region in scheduledRegions {
+      switch region {
+      case .block(let index):
+        appendNormalBlock(uopBlocks[index])
+      case .hopIsland(let island):
+        appendHopIsland(island)
       }
     }
 
-    // Close any open hop check
-    if hopCheckOpen {
-      scheduleItem.ops.append(UOp(op: .endHopCheck, value: .empty))
-    }
-
-    // Close any open loop
-    if loopOpen {
-      scheduleItem.ops.append(UOp(op: .endLoop, value: .empty))
-    }
+    closeOpenScope()
   }
 
   public override func render(

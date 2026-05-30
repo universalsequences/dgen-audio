@@ -47,6 +47,7 @@ struct OutputInfo {
   let channel: Int
   let signal: Signal
   let name: String?
+  let modulatorSlot: Int?
 }
 
 struct InputInfo {
@@ -1373,7 +1374,15 @@ class LispEvaluator {
     let channel = channelLisp - 1
 
     let name = attrValue(attributes, "@name")
-    outputs.append(OutputInfo(channel: channel, signal: signal, name: name))
+    let modulatorSlot = try parseOptionalPositiveIntAttribute(attributes, "@modulator")
+    if let modulatorSlot,
+      outputs.contains(where: { $0.modulatorSlot == modulatorSlot })
+    {
+      throw LispError.invalidArgument("duplicate output @modulator slot \(modulatorSlot)")
+    }
+    outputs.append(
+      OutputInfo(channel: channel, signal: signal, name: name, modulatorSlot: modulatorSlot)
+    )
 
     return .none
   }
@@ -2493,6 +2502,17 @@ class LispEvaluator {
 
   private func attrValue(_ attrs: [(name: String, value: String)], _ key: String) -> String? {
     attrs.first(where: { $0.name == key })?.value
+  }
+
+  private func parseOptionalPositiveIntAttribute(
+    _ attrs: [(name: String, value: String)],
+    _ key: String
+  ) throws -> Int? {
+    guard let rawValue = attrValue(attrs, key) else { return nil }
+    guard let value = Int(rawValue), value > 0 else {
+      throw LispError.invalidArgument("\(key) requires a positive integer")
+    }
+    return value
   }
 
   private func parseBoolAttr(_ attrs: [(name: String, value: String)], _ key: String) -> Bool {

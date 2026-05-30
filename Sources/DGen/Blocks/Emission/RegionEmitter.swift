@@ -53,6 +53,11 @@ private func emitRegion(
     } else {
       let elemVar = ctx.useVariable(src: nil)
       let elementCount = region.shape.reduce(1, *)
+      let savedFrame = ctx.frameAwareTensorFrameIndex
+      ctx.frameAwareTensorFrameIndex = nil
+      defer {
+        ctx.frameAwareTensorFrameIndex = savedFrame
+      }
 
       if !region.isConvOnly {
         let beginLoop = UOp(
