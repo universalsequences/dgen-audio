@@ -275,7 +275,7 @@ public func inferShape(op: LazyOp, inputs: [ValueShape], graph: Graph) throws ->
     .memoryRead, .memoryWrite, .memoryAccumulate, .memoryCellSum,
     .historyReadWrite,
     .param, .click, .noise,
-    .constant, .output, .input:
+    .constant, .hostSampleRate, .output, .input:
     return .scalar
   }
 }

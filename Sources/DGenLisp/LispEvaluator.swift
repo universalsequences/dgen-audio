@@ -62,6 +62,7 @@ struct TensorInfo {
   let kind: String
   let mutable: Bool
   let sourceFile: String?
+  let sourceSampleRate: Float?
   let data: [Float]?
 }
 
@@ -149,6 +150,10 @@ class LispEvaluator {
   // MARK: - Atom evaluation
 
   private func evaluateAtom(_ value: String) throws -> EvalResult {
+    if value.lowercased() == "samplerate" || value.lowercased() == "sample-rate" {
+      return .signal(Signal.hostSampleRate())
+    }
+
     if let result = definitions[value] {
       return result
     }
@@ -1513,6 +1518,7 @@ class LispEvaluator {
         kind: kind,
         mutable: false,
         sourceFile: file,
+        sourceSampleRate: loaded.sampleRate,
         data: samples
       ))
     return .tensor(tensor)
@@ -1771,6 +1777,7 @@ class LispEvaluator {
         kind: "wavetable",
         mutable: mutable,
         sourceFile: sourceFile,
+        sourceSampleRate: nil,
         data: data
       ))
     return .tensor(tensor)

@@ -171,6 +171,7 @@ public class CCompiledKernel: CompiledKernelRuntime {
   private var setParamValueFn: (@convention(c) (Int32, Float) -> Void)?
 
   public var voiceCellId: Int? = nil
+  private let defaultHostSampleRate: Float
 
   private static let clangPath = "/usr/bin/clang"
   private static let cachedCompileArgumentTemplate = [
@@ -213,10 +214,16 @@ public class CCompiledKernel: CompiledKernelRuntime {
     cachedCompileArgumentTemplate + ["-o", outputPath, sourcePath]
   }
 
-  public init(source: String, cellAllocations: CellAllocations, memorySize: Int = 1024) {
+  public init(
+    source: String,
+    cellAllocations: CellAllocations,
+    memorySize: Int = 1024,
+    defaultHostSampleRate: Float = 44_100.0
+  ) {
     self.source = source
     self.cellAllocations = cellAllocations
     self.memorySize = memorySize
+    self.defaultHostSampleRate = defaultHostSampleRate
   }
 
   public func compileAndLoad() throws {
@@ -322,12 +329,7 @@ public class CCompiledKernel: CompiledKernelRuntime {
 
     processFn = unsafeBitCast(
       processSymAddr!,
-      to: (@convention(c) (
-        UnsafePointer<UnsafeMutablePointer<Float>?>?,
-        UnsafePointer<UnsafeMutablePointer<Float>?>?, Int32, UnsafeMutableRawPointer?,
-        UnsafeMutableRawPointer?
-      ) -> Void)
-      .self)
+      to: (CProcessFunction).self)
 
     // CRITICAL: Log the function pointer after casting
     let functionPointer = unsafeBitCast(processFn!, to: UnsafeRawPointer.self)
@@ -503,11 +505,7 @@ public class CCompiledKernel: CompiledKernelRuntime {
 
     self.processFn = unsafeBitCast(
       processSymAddr,
-      to: (@convention(c) (
-        UnsafePointer<UnsafeMutablePointer<Float>?>?,
-        UnsafePointer<UnsafeMutablePointer<Float>?>?, Int32,
-        UnsafeMutableRawPointer?, UnsafeMutableRawPointer?
-      ) -> Void).self
+      to: (CProcessFunction).self
     )
 
     guard let paramSym = dlsym(handle, setParamValueSymbolName) else {
@@ -575,11 +573,7 @@ public class CCompiledKernel: CompiledKernelRuntime {
 
     self.processFn = unsafeBitCast(
       processSymAddr,
-      to: (@convention(c) (
-        UnsafePointer<UnsafeMutablePointer<Float>?>?,
-        UnsafePointer<UnsafeMutablePointer<Float>?>?, Int32,
-        UnsafeMutableRawPointer?, UnsafeMutableRawPointer?
-      ) -> Void).self
+      to: (CProcessFunction).self
     )
 
     self.setParamValueFn = unsafeBitCast(
@@ -755,6 +749,19 @@ public class CCompiledKernel: CompiledKernelRuntime {
     outputs: UnsafeMutablePointer<Float>, inputs: UnsafePointer<Float>,
     memory: UnsafeMutableRawPointer, frameCount: Int
   ) {
+    runWithMemory(
+      outputs: outputs,
+      inputs: inputs,
+      memory: memory,
+      frameCount: frameCount,
+      hostSampleRate: defaultHostSampleRate)
+  }
+
+  public func runWithMemory(
+    outputs: UnsafeMutablePointer<Float>, inputs: UnsafePointer<Float>,
+    memory: UnsafeMutableRawPointer, frameCount: Int,
+    hostSampleRate: Float
+  ) {
     guard let process = processFn else {
       print("⚠️ Process function not loaded")
       return
@@ -767,7 +774,13 @@ public class CCompiledKernel: CompiledKernelRuntime {
     // TODO - actually pass real buffers
     outputChannels.withUnsafeBufferPointer { outPtr in
       inputChannels.withUnsafeBufferPointer { inPtr in
-        process(inPtr.baseAddress, outPtr.baseAddress, Int32(frameCount), memory, memory)
+        process(
+          inPtr.baseAddress,
+          outPtr.baseAddress,
+          Int32(frameCount),
+          memory,
+          memory,
+          hostSampleRate)
       }
     }
   }

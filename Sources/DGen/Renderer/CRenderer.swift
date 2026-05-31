@@ -362,7 +362,7 @@ public class CRenderer: Renderer {
       """)
 
     code.append(
-      "void process(float * restrict const *in, float * restrict const *out, int nframes, void * restrict state, void * restrict buffers) {"
+      "void process(float * restrict const *in, float * restrict const *out, int nframes, void * restrict state, void * restrict buffers, float hostSampleRate) {"
     )
 
     // Use audiograph parameters directly - no mapping needed
@@ -496,6 +496,9 @@ public class CRenderer: Renderer {
     case .defineGlobal(let varId):
       // Declaration only; loadGlobal emits the SIMD variable when accessed
       return "/* t\(varId) declared globally */"
+    case .hostSampleRate:
+      let expr = uop.isSimd ? "vdupq_n_f32(hostSampleRate)" : "hostSampleRate"
+      return emitAssign(uop, expr, ctx)
 
     case .add(let a, let b):
       // Int-typed arithmetic inside a SIMD block is semantically scalar

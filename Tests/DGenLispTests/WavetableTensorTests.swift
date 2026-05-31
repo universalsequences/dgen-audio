@@ -66,12 +66,15 @@ final class WavetableTensorTests: XCTestCase {
             )
         )
 
+        XCTAssertEqual(manifest.version, 2)
+        XCTAssertEqual(manifest.processAbi, "dgen-c-v2-host-sample-rate")
         XCTAssertEqual(manifest.tensors.count, 1)
         XCTAssertEqual(manifest.tensors[0].name, "waves")
         XCTAssertEqual(manifest.tensors[0].shape, [2, 4])
         XCTAssertEqual(manifest.tensors[0].kind, "wavetable")
         XCTAssertEqual(manifest.tensors[0].mutable, false)
         XCTAssertEqual(manifest.tensors[0].sourceFile, "waves/tiny.json")
+        XCTAssertNil(manifest.tensors[0].sourceSampleRate)
         XCTAssertEqual(manifest.tensorInitData.count, 1)
         XCTAssertEqual(manifest.tensorInitData[0].data, [0.0, 0.25, 0.5, 0.75, 1.0, 0.5, 0.0, -0.5])
     }

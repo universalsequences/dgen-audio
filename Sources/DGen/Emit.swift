@@ -14,6 +14,9 @@ extension LazyOp {
     case .constant(let value):
       _ = ctx.useConstant(src: nodeId, value: value)
       return []
+    case .hostSampleRate:
+      let dest = ctx.useVariable(src: nodeId)
+      ops.append(UOp(op: .hostSampleRate, value: dest))
     case .tensorRef(_):
       // Register a placeholder value so that downstream ops can find this input
       // The actual tensor data is accessed via nodeToTensor lookup

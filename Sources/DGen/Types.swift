@@ -4,7 +4,7 @@ public typealias Shape = [Int]
 public typealias CProcessFunction = @convention(c) (
   UnsafePointer<UnsafeMutablePointer<Float>?>?,
   UnsafePointer<UnsafeMutablePointer<Float>?>?, Int32, UnsafeMutableRawPointer?,
-  UnsafeMutableRawPointer?
+  UnsafeMutableRawPointer?, Float
 ) -> Void
 
 public enum ValueShape: Equatable {

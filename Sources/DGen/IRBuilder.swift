@@ -36,6 +36,12 @@ public final class IRBuilder {
     return value(l, scalarType: .float)
   }
 
+  public func hostSampleRate() -> Expr {
+    let dest = ctx.useVariable(src: nodeId)
+    ops.append(UOp(op: .hostSampleRate, value: dest))
+    return value(dest, scalarType: .float)
+  }
+
   /// Alias for `int(_:)` with a more descriptive name for use in operator emit code.
   public func intConstant(_ v: Int) -> Expr {
     return int(v)

@@ -572,13 +572,13 @@ extension LazyOp {
 
     case .phasor(_):
       // d(phase)/d(freq) = frameIndex / sampleRate
-      let sampleRate = g.n(.constant(g.sampleRate), [])
+      let sampleRate = g.n(.hostSampleRate, [])
       return [g.n(.gradPhasor(node.id), [gradOutput, sampleRate])]
 
     case .deterministicPhasor:
       // d(phase)/d(freq) = frameIndex / sampleRate
       // Similar to phasor but stateless
-      let sampleRate = g.n(.constant(g.sampleRate), [])
+      let sampleRate = g.n(.hostSampleRate, [])
       return [g.n(.gradDeterministicPhasor, [gradOutput, sampleRate])]
 
     case .accum(_):
@@ -628,7 +628,7 @@ extension LazyOp {
 
     // MARK: I/O and Constants
 
-    case .constant(_):
+    case .constant(_), .hostSampleRate:
       return []  // No inputs
 
     case .input(_):

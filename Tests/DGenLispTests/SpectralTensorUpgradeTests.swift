@@ -415,13 +415,39 @@ final class SpectralTensorUpgradeTests: XCTestCase {
   // MARK: - Audio / IR Tensors
 
   func testAudioTensorLoadsWavManifestData() throws {
-    _ = try makeWav("tiny.wav", samples: [0.0, 0.5, -0.5, 1.0])
+    _ = try makeWav("tiny.wav", samples: [0.0, 0.5, -0.5, 1.0], sampleRate: 12_000)
     let e = try evaluator(
       """
       (def a (audio-tensor @file "tiny.wav"))
+      (out (peek a 0) 1 @name audio)
       """)
     XCTAssertEqual(try tensor(e, "a").shape, [4])
     XCTAssertEqual(e.tensors.last?.kind, "audio")
+
+    let graph = LazyGraphContext.current
+    for output in e.outputs {
+      graph.addOutput(output.signal, channel: output.channel)
+    }
+    let compilation = try graph.compileOnly(frameCount: 16, voiceCount: 1)
+    let manifest = generateManifest(
+      compilerResult: CompilerResult(
+        dylibPath: "",
+        cSourcePath: "",
+        compilationResult: compilation,
+        cSource: ""
+      ),
+      evaluator: e,
+      options: CompilerOptions(
+        outputDir: ".",
+        name: "patch",
+        sampleRate: 48_000,
+        maxFrames: 16,
+        voiceCount: 1,
+        debug: false
+      )
+    )
+
+    XCTAssertEqual(manifest.tensors.first?.sourceSampleRate, 12_000)
   }
 
   func testIRAliasUsesIRKind() throws {
@@ -532,6 +558,22 @@ final class SpectralTensorUpgradeTests: XCTestCase {
       """)
     XCTAssertEqual(try signalTensor(e, "clamped").shape, [2, 2])
     XCTAssertEqual(try signalTensor(e, "padded").shape, [4, 4])
+  }
+
+  func testSignalTensorPairwiseMinMaxSyntax() throws {
+    let e = try evaluator(
+      """
+      (make-tensor-history a @shape [2 2] @data [0.1 0.8 0.3 0.6])
+      (make-tensor-history b @shape [2 2] @data [0.2 0.7 0.4 0.5])
+      (def aa (read-tensor-history a))
+      (def bb (read-tensor-history b))
+      (def hi (max aa bb))
+      (def lo (min aa bb))
+      (out (sum (- hi lo)) 1)
+      """)
+    XCTAssertEqual(try signalTensor(e, "hi").shape, [2, 2])
+    XCTAssertEqual(try signalTensor(e, "lo").shape, [2, 2])
+    try compileOutputs(e, frames: 4)
   }
 
   // MARK: - Tensor History

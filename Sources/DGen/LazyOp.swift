@@ -318,6 +318,7 @@ public enum LazyOp {
   case spectrumDelay(CellID, CellID, CellID, Int, Int)  // ringCell, rowCell, outputCell, N, hops — N-bin spectrum from `hops` hops ago
   case spectrumDelayMod(CellID, CellID, CellID, Int, Int)  // ringCell, rowCell, outputCell, N, maxHops — fractional delay driven by a scalar `delay` input (0..maxHops)
   case constant(Float)
+  case hostSampleRate
   case output(Int)
   case input(Int)
   case tensorRef(TensorID)

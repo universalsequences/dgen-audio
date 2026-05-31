@@ -296,7 +296,7 @@ extension LazyOp {
 
         // Phasor accumulator logic with indexed state
         // Uses gswitch instead of if statements for SIMD compatibility
-        let sampleRate = b.constant(b.ctx.g.sampleRate)
+        let sampleRate = b.hostSampleRate()
         let incr = freq / sampleRate
         let zero = b.constant(0.0)
         let one = b.constant(1.0)
@@ -336,7 +336,7 @@ extension LazyOp {
       }
       // Use emitUnaryOp to handle both scalar and tensor cases
       try emitUnaryOp(b: b, g: g, node: node, inputs: inputs) { freq in
-        let sampleRate = b.constant(g.sampleRate)
+        let sampleRate = b.hostSampleRate()
         // Use currentFrameIndex which returns the correct frame index in both normal
         // and frame-aware tensor blocks
         let frameIdx = b.currentFrameIndex()

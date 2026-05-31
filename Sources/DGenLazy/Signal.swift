@@ -165,6 +165,16 @@ public class Signal: LazyValue {
     return Signal(nodeId: nodeId, graph: graph, requiresGrad: false)
   }
 
+  /// Current host sample rate in Hz.
+  ///
+  /// C-generated DGen kernels read this from the process function argument so
+  /// the same compiled DSP can run correctly at different host rates.
+  public static func hostSampleRate() -> Signal {
+    let graph = LazyGraphContext.current
+    let nodeId = graph.node(.hostSampleRate)
+    return Signal(nodeId: nodeId, graph: graph, requiresGrad: false)
+  }
+
   /// Create a phasor (ramp oscillator)
   /// - Parameters:
   ///   - freq: Frequency in Hz (can be Signal, Tensor, or Float)

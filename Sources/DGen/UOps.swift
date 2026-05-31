@@ -80,6 +80,7 @@ public enum Op {
   case output(ChannelNumber, Lazy)
   case input(ChannelNumber)
   case frameCount
+  case hostSampleRate
   case frameIndex
   case threadIndex
   case loadTape(Lazy, Lazy)

@@ -572,7 +572,7 @@ extension Graph {
 
     // Attack and release coefficient calculations
     let log001 = n(.log, n(.constant(0.01)))
-    let sampleRate = n(.constant(self.sampleRate))
+    let sampleRate = n(.hostSampleRate)
 
     let attackSamples = n(.mul, attack, sampleRate)
     let attackCoef = n(.exp, n(.div, log001, attackSamples))

@@ -70,7 +70,7 @@ private func classify(_ op: Op) -> OpClass {
   // Control flow / markers — 0 FLOPs
   case .beginIf, .endIf, .beginLoop, .endLoop, .beginRange, .endRange,
        .beginForLoop, .beginParallelRange, .endParallelRange,
-       .setThreadCountScale, .setFrameIndex, .frameCount, .frameIndex,
+       .setThreadCountScale, .setFrameIndex, .frameCount, .hostSampleRate, .frameIndex,
        .threadIndex, .output, .input, .defineGlobal, .defineConstant,
        .reshape, .transpose, .shrink, .pad, .expandView, .repeatView,
        .broadcastAccess, .sumAxisMarker, .maxAxisMarker, .meanAxisMarker,

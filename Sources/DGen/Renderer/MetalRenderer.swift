@@ -918,6 +918,8 @@ public class MetalRenderer: Renderer, UOpEmitter {
     let gi = { self.emitLazyTyped($0, ctx: ctx, asInt: uop.scalarType == .int) }
 
     switch uop.op {
+    case .hostSampleRate:
+      return emitAssign(uop, "\(ctx.g.sampleRate)", ctx)
     case .add(let a, let b): return emitAssign(uop, "\(gi(a)) + \(gi(b))", ctx)
     case .mul(let a, let b): return emitAssign(uop, "\(gi(a)) * \(gi(b))", ctx)
     case .sub(let a, let b): return emitAssign(uop, "\(gi(a)) - \(gi(b))", ctx)

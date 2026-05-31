@@ -131,6 +131,8 @@ extension UOp {
             opStr = "\(ANSI.green)input\(ANSI.reset)(\(a))"
         case .frameCount:
             opStr = "\(ANSI.magenta)frameCount\(ANSI.reset)"
+        case .hostSampleRate:
+            opStr = "\(ANSI.magenta)hostSampleRate\(ANSI.reset)"
         case let .loadTape(val, offset):
             opStr = "\(ANSI.magenta)loadTape\(ANSI.reset)(\(val), \(offset))"
         case let .mse(a, b):

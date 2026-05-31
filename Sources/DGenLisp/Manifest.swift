@@ -11,6 +11,7 @@ import Foundation
 
 struct PatchManifest: Codable {
     let version: Int
+    let processAbi: String
     let dylib: String
     let cSourcePath: String
     let sampleRate: Float
@@ -187,6 +188,7 @@ struct ManifestTensor: Codable {
     let kind: String
     let mutable: Bool
     let sourceFile: String?
+    let sourceSampleRate: Float?
 }
 
 // MARK: - Manifest generation
@@ -314,7 +316,8 @@ func generateManifest(
     )
 
     return PatchManifest(
-        version: 1,
+        version: 2,
+        processAbi: "dgen-c-v2-host-sample-rate",
         dylib: "\(options.name).dylib",
         cSourcePath: compilerResult.cSourcePath,
         sampleRate: options.sampleRate,
@@ -412,7 +415,8 @@ private func mapTensorMetadata(
             shape: info.shape,
             kind: info.kind,
             mutable: info.mutable,
-            sourceFile: info.sourceFile
+            sourceFile: info.sourceFile,
+            sourceSampleRate: info.sourceSampleRate
         )
     }
 }
