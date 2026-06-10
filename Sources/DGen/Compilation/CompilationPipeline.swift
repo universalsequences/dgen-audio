@@ -431,6 +431,15 @@ public struct CompilationPipeline {
       )
       context.hopBasedNodes = temporalityResult.hopBasedNodes
     }
+    if ProcessInfo.processInfo.environment["DGEN_DEBUG_TEMPORALITY"] != nil {
+      for (bi, block) in blocks.enumerated() {
+        let kinds = block.nodes.compactMap { nid in graph.nodes[nid].map { n in "\(nid):\(n.op)" } }
+        let frame = block.nodes.filter { temporalityResult.frameBasedNodes.contains($0) }
+        FileHandle.standardError.write(
+          "[temporality] block \(bi) \(block.temporality) frameNodes=\(frame) ops=\(kinds)\n"
+            .data(using: .utf8)!)
+      }
+    }
     return BlockTemporalityResult(
       frameBasedNodes: temporalityResult.frameBasedNodes,
       hopBasedNodes: temporalityResult.hopBasedNodes

@@ -107,6 +107,20 @@ public func inferShape(op: LazyOp, inputs: [ValueShape], graph: Graph) throws ->
   case .meanAxis(let axis):
     return try inferAxisReduceShape(opName: "meanAxis", axis: axis, inputs: inputs)
 
+  // Cumulative sum preserves shape (scan along an axis, no dimension removed).
+  case .cumsum(_):
+    guard let firstInput = inputs.first else {
+      throw DGenError.shapeInferenceFailed(op: "cumsum", reason: "missing input tensor")
+    }
+    return firstInput
+
+  case .gather:
+    guard inputs.count == 2, case .tensor = inputs[0], case .tensor(let indexShape) = inputs[1] else {
+      throw DGenError.shapeInferenceFailed(
+        op: "gather", reason: "requires source tensor and index tensor")
+    }
+    return .tensor(indexShape)
+
   case .reshape(let newShape):
     return .tensor(newShape)
 

@@ -467,7 +467,7 @@ extension LazyOp {
     case .gemmStaged, .gemmStagedChunkPartials:
       try emitGemmStaged(b: b, ctx: ctx, g: g, node: node, nodeId: nodeId, ops: &ops)
 
-    case .conv1d, .conv2d, .sum, .sumAxis, .sumMulAxis0, .gemmSmall, .maxAxis, .meanAxis, .reshape, .asStrided, .transpose, .shrink,
+    case .conv1d, .conv2d, .cumsum, .gather, .sum, .sumAxis, .sumMulAxis0, .gemmSmall, .maxAxis, .meanAxis, .reshape, .asStrided, .transpose, .shrink,
       .pad, .expandView, .repeatView, .peek, .expand, .expandAxis, .gradPhasor:
       try emitTensorOp(b: b, ctx: ctx, g: g, node: node, inputs: inputs, nodeId: nodeId, ops: &ops)
 

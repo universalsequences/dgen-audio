@@ -107,17 +107,18 @@ private func resetFrameAwareBlockContext(_ ctx: IRContext) {
 ///   - block: Block whose nodes are being inspected.
 ///   - g: Graph containing node and tensor metadata.
 private func markConvInputsAsOutbound(_ outboundCells: inout Set<CellID>, block: Block, g: Graph) {
-  // Mark conv2d/conv1d input tensors as outbound - they use memoryRead() directly
-  // instead of tload(), so the input MUST be in memory not just in registers.
+  // Mark conv2d/conv1d/cumsum/gather input tensors as outbound - they use memoryRead()
+  // directly instead of tload(), so the input MUST be in memory not just registers.
   for nodeId in block.nodes {
     guard let node = g.nodes[nodeId] else { continue }
     switch node.op {
-    case .conv2d, .conv1d:
-      if let inputId = node.inputs.first,
-        let tensorId = g.nodeToTensor[inputId],
-        let tensor = g.tensors[tensorId]
-      {
-        outboundCells.insert(tensor.cellId)
+    case .conv2d, .conv1d, .cumsum, .gather:
+      for inputId in node.inputs {
+        if let tensorId = g.nodeToTensor[inputId],
+          let tensor = g.tensors[tensorId]
+        {
+          outboundCells.insert(tensor.cellId)
+        }
       }
     default:
       break

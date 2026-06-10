@@ -334,6 +334,14 @@ public class Signal: LazyValue {
     let nodeId = graph.node(.latch(cellId), [value.nodeId, condition.nodeId])
     let needsGrad = value.requiresGrad || condition.requiresGrad
 
+    // Mirror Graph.latch (HigherOps+Latch.swift): a latch whose trigger is
+    // hop-rate only changes value on hop boundaries, so tag it hop-producing.
+    // Without this, downstream consumers of a scalar latch demote to
+    // per-frame execution even when the trigger comes from hop-hold.
+    if let hopRate = graph.graph.nodeHopRate[condition.nodeId] {
+      graph.graph.nodeHopRate[nodeId] = hopRate
+    }
+
     return Signal(nodeId: nodeId, graph: graph, requiresGrad: needsGrad, cellId: cellId)
   }
 

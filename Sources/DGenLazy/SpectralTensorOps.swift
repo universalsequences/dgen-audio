@@ -162,6 +162,18 @@ extension TensorOps {
       _view: nodeId, graph: graph, shape: shape,
       requiresGrad: requiresGrad || kernel.requiresGrad)
   }
+
+  /// Cumulative (prefix) sum along `axis` (default: last axis). Output shape
+  /// matches the input. O(N) sequential scan — the efficient primitive for wide
+  /// spectral smoothing (box filter via `cumsum[i+w] - cumsum[i-w]`) on the C
+  /// RT path. Inference-only (no backward pass yet).
+  public func cumsum(axis: Int = -1) -> Self {
+    let rank = shape.count
+    precondition(rank >= 1, "cumsum requires a tensor input")
+    let ax = ((axis % rank) + rank) % rank
+    let nodeId = graph.graph.n(.cumsum(ax), self.nodeId)
+    return Self(_view: nodeId, graph: graph, shape: shape, requiresGrad: requiresGrad)
+  }
 }
 
 // MARK: - Stateful Spectral Ops

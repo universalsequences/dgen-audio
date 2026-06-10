@@ -742,6 +742,15 @@ extension LazyOp {
       // For now, return nil (not yet supported in graph form)
       return node.inputs.map { _ in nil }
 
+    case .cumsum(_):
+      // Inference-only for now (backward would be a reverse-cumsum scan).
+      return node.inputs.map { _ in nil }
+
+    case .gather:
+      // Inference-only for now (backward would scatter-add into the source tensor;
+      // indices are intentionally non-differentiable).
+      return node.inputs.map { _ in nil }
+
     case .spectralLossFFT(
       let windowSize, let hop, _, let useLogMagnitude, let lossMode, let windowCell,
       let fft1Cell, let fft2Cell, let mag1Cell, let mag2Cell, _):

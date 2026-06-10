@@ -78,6 +78,13 @@ extension TensorOps {
     return Self(_view: nodeId, graph: graph, shape: targetShape, requiresGrad: requiresGrad)
   }
 
+  /// Indexed read from the flattened source tensor using a tensor of integer
+  /// indices. Output shape follows `indices`.
+  public func gather(_ indices: Tensor) -> Self {
+    let nodeId = graph.graph.n(.gather, [self.nodeId, indices.nodeId])
+    return Self(_view: nodeId, graph: graph, shape: indices.shape, requiresGrad: requiresGrad)
+  }
+
   /// Extract sliding windows (im2col) for convolution.
   /// Transforms [H, W] -> [outH, outW, kH, kW].
   public func windows(_ kernelShape: Shape) -> Self {

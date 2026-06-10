@@ -1255,6 +1255,11 @@ extension Graph {
   {
     let size = shape.reduce(1, *)
     let cellId = alloc(vectorWidth: size)
+    // History state must survive across frames AND process() calls — exclude it
+    // from buffer-reuse liveness, which only sees load/store/delay1/noise as
+    // persistent and would otherwise donate this region to transient tensors
+    // (state silently clobbered every block; feedback reads scratch).
+    persistentCells.insert(cellId)
     let tensorId = nextTensorId
     nextTensorId += 1
     tensors[tensorId] = Tensor(id: tensorId, shape: shape, cellId: cellId, data: data)
@@ -1267,6 +1272,7 @@ extension Graph {
     var counterNode: NodeID? = nil
     if let hop = hop {
       let counterCell = alloc(vectorWidth: 1)
+      persistentCells.insert(counterCell)
       let one = n(.constant(1.0))
       let zero = n(.constant(0.0))
       let hopConst = n(.constant(Float(hop)))

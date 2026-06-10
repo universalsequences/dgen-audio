@@ -340,6 +340,8 @@ public enum LazyOp {
   case gemmSmall(Int, Int, Int, Bool, Bool)  // M, N, K, transA, transB
   case maxAxis(Int)  // Reduce along axis keeping maximum
   case meanAxis(Int)  // Reduce along axis computing mean
+  case cumsum(Int)  // Cumulative (prefix) sum along an axis. Output shape == input shape.
+  case gather  // Indexed read: gather(source, indices). Output shape == indices shape.
   case reshape(Shape)  // Reshape tensor (metadata only, no data movement)
   case transpose([Int])  // Transpose/permute axes (metadata only)
   case shrink([(Int, Int)?])  // Shrink/slice tensor (metadata only, no data movement)
@@ -429,7 +431,7 @@ public enum LazyOp {
       .spectrumDelayMod,
       .gemm, .gemmStaged, .gemmChunkPartials, .gemmStagedChunkPartials,
       .gemmSmall,
-      .conv1d, .conv2d,
+      .conv1d, .conv2d, .cumsum, .gather,
       .tensorAccumulate, .chunkPartialsReduceToCell,
       .spectralLossFFT, .spectralLossFFTGradSpec, .spectralLossFFTGradIFFT,
       .spectralLossFFTGradInline, .spectralLossFFTGradRead, .spectralLossFFTGradRead2,

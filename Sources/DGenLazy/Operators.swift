@@ -506,6 +506,138 @@ public func <= (lhs: SignalTensor, rhs: Double) -> SignalTensor {
   return SignalTensor(nodeId: nodeId, graph: lhs.graph, shape: lhs.shape, requiresGrad: false)
 }
 
+/// Double > SignalTensor
+public func > (lhs: Double, rhs: SignalTensor) -> SignalTensor {
+  let lhsNode = rhs.graph.node(.constant(Float(lhs)))
+  let nodeId = rhs.graph.node(.gt, [lhsNode, rhs.nodeId])
+  return SignalTensor(nodeId: nodeId, graph: rhs.graph, shape: rhs.shape, requiresGrad: false)
+}
+
+/// Double >= SignalTensor
+public func >= (lhs: Double, rhs: SignalTensor) -> SignalTensor {
+  let lhsNode = rhs.graph.node(.constant(Float(lhs)))
+  let nodeId = rhs.graph.node(.gte, [lhsNode, rhs.nodeId])
+  return SignalTensor(nodeId: nodeId, graph: rhs.graph, shape: rhs.shape, requiresGrad: false)
+}
+
+/// Double < SignalTensor
+public func < (lhs: Double, rhs: SignalTensor) -> SignalTensor {
+  let lhsNode = rhs.graph.node(.constant(Float(lhs)))
+  let nodeId = rhs.graph.node(.lt, [lhsNode, rhs.nodeId])
+  return SignalTensor(nodeId: nodeId, graph: rhs.graph, shape: rhs.shape, requiresGrad: false)
+}
+
+/// Double <= SignalTensor
+public func <= (lhs: Double, rhs: SignalTensor) -> SignalTensor {
+  let lhsNode = rhs.graph.node(.constant(Float(lhs)))
+  let nodeId = rhs.graph.node(.lte, [lhsNode, rhs.nodeId])
+  return SignalTensor(nodeId: nodeId, graph: rhs.graph, shape: rhs.shape, requiresGrad: false)
+}
+
+/// SignalTensor > Signal
+public func > (lhs: SignalTensor, rhs: Signal) -> SignalTensor {
+  let nodeId = lhs.graph.node(.gt, [lhs.nodeId, rhs.nodeId])
+  return SignalTensor(nodeId: nodeId, graph: lhs.graph, shape: lhs.shape, requiresGrad: false)
+}
+
+/// Signal > SignalTensor
+public func > (lhs: Signal, rhs: SignalTensor) -> SignalTensor {
+  let nodeId = rhs.graph.node(.gt, [lhs.nodeId, rhs.nodeId])
+  return SignalTensor(nodeId: nodeId, graph: rhs.graph, shape: rhs.shape, requiresGrad: false)
+}
+
+/// SignalTensor >= Signal
+public func >= (lhs: SignalTensor, rhs: Signal) -> SignalTensor {
+  let nodeId = lhs.graph.node(.gte, [lhs.nodeId, rhs.nodeId])
+  return SignalTensor(nodeId: nodeId, graph: lhs.graph, shape: lhs.shape, requiresGrad: false)
+}
+
+/// Signal >= SignalTensor
+public func >= (lhs: Signal, rhs: SignalTensor) -> SignalTensor {
+  let nodeId = rhs.graph.node(.gte, [lhs.nodeId, rhs.nodeId])
+  return SignalTensor(nodeId: nodeId, graph: rhs.graph, shape: rhs.shape, requiresGrad: false)
+}
+
+/// SignalTensor < Signal
+public func < (lhs: SignalTensor, rhs: Signal) -> SignalTensor {
+  let nodeId = lhs.graph.node(.lt, [lhs.nodeId, rhs.nodeId])
+  return SignalTensor(nodeId: nodeId, graph: lhs.graph, shape: lhs.shape, requiresGrad: false)
+}
+
+/// Signal < SignalTensor
+public func < (lhs: Signal, rhs: SignalTensor) -> SignalTensor {
+  let nodeId = rhs.graph.node(.lt, [lhs.nodeId, rhs.nodeId])
+  return SignalTensor(nodeId: nodeId, graph: rhs.graph, shape: rhs.shape, requiresGrad: false)
+}
+
+/// SignalTensor <= Signal
+public func <= (lhs: SignalTensor, rhs: Signal) -> SignalTensor {
+  let nodeId = lhs.graph.node(.lte, [lhs.nodeId, rhs.nodeId])
+  return SignalTensor(nodeId: nodeId, graph: lhs.graph, shape: lhs.shape, requiresGrad: false)
+}
+
+/// Signal <= SignalTensor
+public func <= (lhs: Signal, rhs: SignalTensor) -> SignalTensor {
+  let nodeId = rhs.graph.node(.lte, [lhs.nodeId, rhs.nodeId])
+  return SignalTensor(nodeId: nodeId, graph: rhs.graph, shape: rhs.shape, requiresGrad: false)
+}
+
+/// SignalTensor > Tensor
+public func > (lhs: SignalTensor, rhs: Tensor) -> SignalTensor {
+  let nodeId = lhs.graph.node(.gt, [lhs.nodeId, rhs.nodeId])
+  let outShape = broadcastShape(lhs.shape, rhs.shape)
+  return SignalTensor(nodeId: nodeId, graph: lhs.graph, shape: outShape, requiresGrad: false)
+}
+
+/// Tensor > SignalTensor
+public func > (lhs: Tensor, rhs: SignalTensor) -> SignalTensor {
+  let nodeId = rhs.graph.node(.gt, [lhs.nodeId, rhs.nodeId])
+  let outShape = broadcastShape(lhs.shape, rhs.shape)
+  return SignalTensor(nodeId: nodeId, graph: rhs.graph, shape: outShape, requiresGrad: false)
+}
+
+/// SignalTensor >= Tensor
+public func >= (lhs: SignalTensor, rhs: Tensor) -> SignalTensor {
+  let nodeId = lhs.graph.node(.gte, [lhs.nodeId, rhs.nodeId])
+  let outShape = broadcastShape(lhs.shape, rhs.shape)
+  return SignalTensor(nodeId: nodeId, graph: lhs.graph, shape: outShape, requiresGrad: false)
+}
+
+/// Tensor >= SignalTensor
+public func >= (lhs: Tensor, rhs: SignalTensor) -> SignalTensor {
+  let nodeId = rhs.graph.node(.gte, [lhs.nodeId, rhs.nodeId])
+  let outShape = broadcastShape(lhs.shape, rhs.shape)
+  return SignalTensor(nodeId: nodeId, graph: rhs.graph, shape: outShape, requiresGrad: false)
+}
+
+/// SignalTensor < Tensor
+public func < (lhs: SignalTensor, rhs: Tensor) -> SignalTensor {
+  let nodeId = lhs.graph.node(.lt, [lhs.nodeId, rhs.nodeId])
+  let outShape = broadcastShape(lhs.shape, rhs.shape)
+  return SignalTensor(nodeId: nodeId, graph: lhs.graph, shape: outShape, requiresGrad: false)
+}
+
+/// Tensor < SignalTensor
+public func < (lhs: Tensor, rhs: SignalTensor) -> SignalTensor {
+  let nodeId = rhs.graph.node(.lt, [lhs.nodeId, rhs.nodeId])
+  let outShape = broadcastShape(lhs.shape, rhs.shape)
+  return SignalTensor(nodeId: nodeId, graph: rhs.graph, shape: outShape, requiresGrad: false)
+}
+
+/// SignalTensor <= Tensor
+public func <= (lhs: SignalTensor, rhs: Tensor) -> SignalTensor {
+  let nodeId = lhs.graph.node(.lte, [lhs.nodeId, rhs.nodeId])
+  let outShape = broadcastShape(lhs.shape, rhs.shape)
+  return SignalTensor(nodeId: nodeId, graph: lhs.graph, shape: outShape, requiresGrad: false)
+}
+
+/// Tensor <= SignalTensor
+public func <= (lhs: Tensor, rhs: SignalTensor) -> SignalTensor {
+  let nodeId = rhs.graph.node(.lte, [lhs.nodeId, rhs.nodeId])
+  let outShape = broadcastShape(lhs.shape, rhs.shape)
+  return SignalTensor(nodeId: nodeId, graph: rhs.graph, shape: outShape, requiresGrad: false)
+}
+
 // MARK: - Comparison Operators (Signal)
 // Returns 1.0 if true, 0.0 if false
 

@@ -172,6 +172,56 @@ public func log(_ x: SignalTensor) -> SignalTensor {
   return SignalTensor(nodeId: nodeId, graph: x.graph, shape: x.shape, requiresGrad: x.requiresGrad)
 }
 
+public func floor(_ x: SignalTensor) -> SignalTensor {
+  let nodeId = x.graph.node(.floor, [x.nodeId])
+  return SignalTensor(nodeId: nodeId, graph: x.graph, shape: x.shape, requiresGrad: x.requiresGrad)
+}
+
+public func ceil(_ x: SignalTensor) -> SignalTensor {
+  let nodeId = x.graph.node(.ceil, [x.nodeId])
+  return SignalTensor(nodeId: nodeId, graph: x.graph, shape: x.shape, requiresGrad: x.requiresGrad)
+}
+
+public func round(_ x: SignalTensor) -> SignalTensor {
+  let nodeId = x.graph.node(.round, [x.nodeId])
+  return SignalTensor(nodeId: nodeId, graph: x.graph, shape: x.shape, requiresGrad: x.requiresGrad)
+}
+
+// Element-wise modulo for SignalTensor (per-bin, per-frame). The `.mod` UOp is
+// already emitted element-wise, so this composes like the other unary ops.
+public func mod(_ a: SignalTensor, _ b: SignalTensor) -> SignalTensor {
+  let nodeId = a.graph.node(.mod, [a.nodeId, b.nodeId])
+  return SignalTensor(nodeId: nodeId, graph: a.graph, shape: a.shape, requiresGrad: a.requiresGrad)
+}
+
+public func mod(_ a: SignalTensor, _ b: Double) -> SignalTensor {
+  let bNode = a.graph.node(.constant(Float(b)))
+  let nodeId = a.graph.node(.mod, [a.nodeId, bNode])
+  return SignalTensor(nodeId: nodeId, graph: a.graph, shape: a.shape, requiresGrad: a.requiresGrad)
+}
+
+public func mod(_ a: SignalTensor, _ b: Signal) -> SignalTensor {
+  let nodeId = a.graph.node(.mod, [a.nodeId, b.nodeId])
+  return SignalTensor(nodeId: nodeId, graph: a.graph, shape: a.shape, requiresGrad: a.requiresGrad)
+}
+
+/// Gather with a per-frame (SignalTensor) index. Output is a SignalTensor whose
+/// shape follows the index. The gather emission reads both source and index
+/// through tensorRead, which is frame-aware, so a dynamic index works directly.
+public func gather(_ source: SignalTensor, _ indices: SignalTensor) -> SignalTensor {
+  let nodeId = source.graph.graph.n(.gather, [source.nodeId, indices.nodeId])
+  return SignalTensor(
+    _view: nodeId, graph: source.graph, shape: indices.shape,
+    requiresGrad: source.requiresGrad)
+}
+
+public func gather(_ source: Tensor, _ indices: SignalTensor) -> SignalTensor {
+  let nodeId = source.graph.graph.n(.gather, [source.nodeId, indices.nodeId])
+  return SignalTensor(
+    _view: nodeId, graph: source.graph, shape: indices.shape,
+    requiresGrad: source.requiresGrad)
+}
+
 // MARK: - Binary Math Functions
 
 public func pow(_ x: Tensor, _ y: Tensor) -> Tensor {

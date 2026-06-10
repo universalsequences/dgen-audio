@@ -640,6 +640,8 @@ class LispEvaluator {
       return try evalPeek(regularArgs)
     case "peek-row", "peekrow":
       return try evalPeekRow(regularArgs)
+    case "gather":
+      return try evalGather(regularArgs)
     case "sample":
       return try evalSample(regularArgs)
     case "to-signal", "tosignal":
@@ -676,6 +678,8 @@ class LispEvaluator {
       return try evalSumAxis(regularArgs, attributes: attributePairs)
     case "mean-axis", "meanaxis":
       return try evalMeanAxis(regularArgs, attributes: attributePairs)
+    case "cumsum", "cumulative-sum":
+      return try evalCumsum(regularArgs, attributes: attributePairs)
     case "softmax":
       return try evalSoftmax(regularArgs, attributes: attributePairs)
 
@@ -820,6 +824,8 @@ class LispEvaluator {
       case "-": return .signalTensor(a - b)
       case "*": return .signalTensor(a * b)
       case "/": return .signalTensor(a / b)
+      case "min": return .signalTensor(DGenLazy.min(a, b))
+      case "max": return .signalTensor(DGenLazy.max(a, b))
       default: throw LispError.unknownOperator(op)
       }
 
@@ -1027,6 +1033,9 @@ class LispEvaluator {
       case "sign": return .signalTensor(DGenLazy.sign(st))
       case "tanh": return .signalTensor(DGenLazy.tanh(st))
       case "relu": return .signalTensor(DGenLazy.relu(st))
+      case "floor": return .signalTensor(DGenLazy.floor(st))
+      case "ceil": return .signalTensor(DGenLazy.ceil(st))
+      case "round": return .signalTensor(DGenLazy.round(st))
       default: throw LispError.typeError("\(fn) not available for SignalTensor")
       }
 
@@ -1096,6 +1105,12 @@ class LispEvaluator {
       return .signal(DGenLazy.mod(x, y))
     case (.signal(let x), .float(let y)):
       return .signal(DGenLazy.mod(x, Double(y)))
+    case (.signalTensor(let x), .signalTensor(let y)):
+      return .signalTensor(DGenLazy.mod(x, y))
+    case (.signalTensor(let x), .signal(let y)):
+      return .signalTensor(DGenLazy.mod(x, y))
+    case (.signalTensor(let x), .float(let y)):
+      return .signalTensor(DGenLazy.mod(x, Double(y)))
     default:
       throw LispError.typeError("%: unsupported type combination")
     }
@@ -1176,6 +1191,62 @@ class LispEvaluator {
       case "eq": return .tensor(a.eq(b))
       default: throw LispError.unknownOperator(op)
       }
+    case (.signalTensor(let a), .signalTensor(let b)):
+      switch op {
+      case "gt": return .signalTensor(a > b)
+      case "lt": return .signalTensor(a < b)
+      case "gte": return .signalTensor(a >= b)
+      case "lte": return .signalTensor(a <= b)
+      default: throw LispError.unknownOperator(op)
+      }
+    case (.signalTensor(let a), .signal(let b)):
+      switch op {
+      case "gt": return .signalTensor(a > b)
+      case "lt": return .signalTensor(a < b)
+      case "gte": return .signalTensor(a >= b)
+      case "lte": return .signalTensor(a <= b)
+      default: throw LispError.unknownOperator(op)
+      }
+    case (.signal(let a), .signalTensor(let b)):
+      switch op {
+      case "gt": return .signalTensor(a > b)
+      case "lt": return .signalTensor(a < b)
+      case "gte": return .signalTensor(a >= b)
+      case "lte": return .signalTensor(a <= b)
+      default: throw LispError.unknownOperator(op)
+      }
+    case (.signalTensor(let a), .tensor(let b)):
+      switch op {
+      case "gt": return .signalTensor(a > b)
+      case "lt": return .signalTensor(a < b)
+      case "gte": return .signalTensor(a >= b)
+      case "lte": return .signalTensor(a <= b)
+      default: throw LispError.unknownOperator(op)
+      }
+    case (.tensor(let a), .signalTensor(let b)):
+      switch op {
+      case "gt": return .signalTensor(a > b)
+      case "lt": return .signalTensor(a < b)
+      case "gte": return .signalTensor(a >= b)
+      case "lte": return .signalTensor(a <= b)
+      default: throw LispError.unknownOperator(op)
+      }
+    case (.signalTensor(let a), .float(let b)):
+      switch op {
+      case "gt": return .signalTensor(a > Double(b))
+      case "lt": return .signalTensor(a < Double(b))
+      case "gte": return .signalTensor(a >= Double(b))
+      case "lte": return .signalTensor(a <= Double(b))
+      default: throw LispError.unknownOperator(op)
+      }
+    case (.float(let a), .signalTensor(let b)):
+      switch op {
+      case "gt": return .signalTensor(Double(a) > b)
+      case "lt": return .signalTensor(Double(a) < b)
+      case "gte": return .signalTensor(Double(a) >= b)
+      case "lte": return .signalTensor(Double(a) <= b)
+      default: throw LispError.unknownOperator(op)
+      }
     default:
       throw LispError.typeError("Comparison \(op): unsupported type combination")
     }
@@ -1236,9 +1307,19 @@ class LispEvaluator {
     guard args.count == 2 else {
       throw LispError.invalidArgument("latch requires 2 arguments (value, trigger)")
     }
-    let value = try requireSignal(evaluateAST(args[0]))
+    let value = try promoteToValue(evaluateAST(args[0]))
     let trigger = try requireSignal(evaluateAST(args[1]))
-    return .signal(Signal.latch(value, when: trigger))
+    switch value {
+    case .signal(let signal):
+      return .signal(Signal.latch(signal, when: trigger))
+    case .signalTensor(let tensor):
+      return .signalTensor(SignalTensor.latch(tensor, when: trigger))
+    case .tensor(let tensor):
+      let promoted = tensor + (trigger * 0)
+      return .signalTensor(SignalTensor.latch(promoted, when: trigger))
+    default:
+      throw LispError.typeError("latch: value must be signal, tensor, or signalTensor")
+    }
   }
 
   private func evalHopHold(_ args: [ASTNode]) throws -> EvalResult {
@@ -1798,6 +1879,25 @@ class LispEvaluator {
     }
   }
 
+  private func evalGather(_ args: [ASTNode]) throws -> EvalResult {
+    guard args.count == 2 else {
+      throw LispError.invalidArgument("gather requires 2 arguments (source, indices)")
+    }
+    let source = try evaluateAST(args[0])
+    let indexResult = try evaluateAST(args[1])
+    switch (source, indexResult) {
+    // Static index tensor.
+    case (.tensor(let t), .tensor(let idx)): return .tensor(t.gather(idx))
+    case (.signalTensor(let st), .tensor(let idx)): return .signalTensor(st.gather(idx))
+    // Dynamic, per-frame index (SignalTensor) -> frame-aware gather.
+    case (.signalTensor(let st), .signalTensor(let idx)):
+      return .signalTensor(DGenLazy.gather(st, idx))
+    case (.tensor(let t), .signalTensor(let idx)):
+      return .signalTensor(DGenLazy.gather(t, idx))
+    default: throw LispError.typeError("gather: source must be tensor/signalTensor, index must be tensor/signalTensor")
+    }
+  }
+
   private func evalSample(_ args: [ASTNode]) throws -> EvalResult {
     guard args.count == 2 else {
       throw LispError.invalidArgument("sample requires 2 arguments (tensor, index)")
@@ -2026,6 +2126,22 @@ class LispEvaluator {
     case .tensor(let t): return .tensor(t.sum(axis: axis))
     case .signalTensor(let st): return .signalTensor(st.sum(axis: axis))
     default: throw LispError.typeError("sum-axis: argument must be tensor or signalTensor")
+    }
+  }
+
+  private func evalCumsum(_ args: [ASTNode], attributes: [(name: String, value: String)]) throws
+    -> EvalResult
+  {
+    guard args.count == 1 else {
+      throw LispError.invalidArgument("cumsum requires 1 argument")
+    }
+    let val = try evaluateAST(args[0])
+    // Default to the last axis (the natural frequency-bin axis for spectral use).
+    let axis = Int(attrValue(attributes, "@axis") ?? "-1") ?? -1
+    switch val {
+    case .tensor(let t): return .tensor(t.cumsum(axis: axis))
+    case .signalTensor(let st): return .signalTensor(st.cumsum(axis: axis))
+    default: throw LispError.typeError("cumsum: argument must be tensor or signalTensor")
     }
   }
 
@@ -2367,13 +2483,22 @@ class LispEvaluator {
     guard args.count >= 1 else {
       throw LispError.invalidArgument("wrap requires at least 1 argument")
     }
-    let sig = try requireSignal(evaluateAST(args[0]))
+    let first = try evaluateAST(args[0])
     let minVal: Signal =
       args.count >= 2 ? try requireSignal(evaluateAST(args[1])) : Signal.constant(0)
     let maxVal: Signal =
       args.count >= 3 ? try requireSignal(evaluateAST(args[2])) : Signal.constant(1)
-
     let range = maxVal - minVal
+
+    // Per-frame wrap for a SignalTensor index/value: mod(x - min, range) + min,
+    // forced positive (mod is truncated) by adding one extra range before mod.
+    if case .signalTensor(let st) = first {
+      let shifted = st - minVal + range
+      let wrapped = DGenLazy.mod(shifted, range)
+      return .signalTensor(wrapped + minVal)
+    }
+
+    let sig = try requireSignal(first)
     // wrap: mod(sig - min, range) + min
     let shifted = sig - minVal
     let wrapped = DGenLazy.mod(shifted, range)

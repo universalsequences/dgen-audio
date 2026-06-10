@@ -781,11 +781,71 @@ private func blockHasPerElementComputeNode(_ block: Block, graph: Graph) -> Bool
 /// Scalar blocks are preserved unless a scalar prefix must be split out to protect stateful ops.
 /// Non-scalar blocks are grouped by tensor shape with explicit handling for conv/overlap/view
 /// semantics required by the emission backend.
+private func isAcceleratedFFTOp(_ op: LazyOp) -> Bool {
+  if case .acceleratedFFT = op { return true }
+  if case .acceleratedIFFT = op { return true }
+  return false
+}
+
+/// Splits a sequential block so each accelerated FFT/IFFT node sits alone in
+/// its own block (shape/tensorIndex cleared — the op self-iterates). Non-FFT
+/// runs keep the original block's properties and ordering.
+private func splitOutAcceleratedFFTNodes(_ block: Block, graph: Graph) -> [Block] {
+  guard block.nodes.count > 1 else { return [block] }
+  var result: [Block] = []
+  var run: [NodeID] = []
+  func flushRun() {
+    guard !run.isEmpty else { return }
+    var b = block
+    b.nodes = run
+    result.append(b)
+    run = []
+  }
+  for nodeId in block.nodes {
+    if let node = graph.nodes[nodeId], isAcceleratedFFTOp(node.op) {
+      flushRun()
+      var fftBlock = block
+      fftBlock.nodes = [nodeId]
+      fftBlock.shape = nil
+      fftBlock.tensorIndex = nil
+      result.append(fftBlock)
+    } else {
+      run.append(nodeId)
+    }
+  }
+  flushRun()
+  return result
+}
+
 func determineTensorBlocks(_ blocks: [Block], _ graph: Graph, _ ctx: IRContext) -> [Block] {
   var determined: [Block] = []
 
   for block in blocks {
     if block.frameOrder == .sequential {
+      // Accelerated FFT/IFFT nodes fused into a scalar block alongside
+      // frame-rate neighbors (overlapAdd output taps, waveshapers, ...) would
+      // inherit the block's frameBased temporality and run the transform once
+      // per FRAME instead of once per hop — catastrophically expensive. The
+      // parallel path already isolates self-iterating ops
+      // (groupRegularTensorBlock); do the same minimal isolation here so
+      // TemporalityPass can give the transform its own hop-rate block.
+      let parts = splitOutAcceleratedFFTNodes(block, graph: graph)
+      if parts.count > 1 {
+        for part in parts {
+          if part.nodes.count == 1, let node = graph.nodes[part.nodes[0]],
+            isAcceleratedFFTOp(node.op)
+          {
+            determined.append(part)
+          } else {
+            var split = splitScalarBlockForTensorGrouping(part, graph: graph, ctx: ctx)
+            for i in split.indices {
+              clearWastedTensorLoopMetadata(&split[i], graph: graph)
+            }
+            determined.append(contentsOf: split)
+          }
+        }
+        continue
+      }
       var split = splitScalarBlockForTensorGrouping(block, graph: graph, ctx: ctx)
       // Scalar blocks that happen to "own" a tensorRef (e.g. bufferView's write
       // block, [memoryWrite, tensorRef]) inherit the tensorRef's shape here.

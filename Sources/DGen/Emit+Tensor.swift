@@ -52,6 +52,86 @@ extension LazyOp {
         _ = b.memoryWrite(outCell, writeIdx, acc.value)
       }
 
+    case .cumsum(let axis):
+      guard case .tensor(let outShape) = node.shape,
+        let outCell = g.nodeToTensor[node.id].flatMap({ g.tensors[$0] })?.cellId,
+        let inTensor = g.nodeToTensor[node.inputs[0]].flatMap({ g.tensors[$0] })
+      else {
+        throw DGenError.tensorError(
+          op: "cumsum", reason: "requires materialized tensor input/output")
+      }
+
+      // Decompose the tensor into independent "rows" along `axis`. A row is a
+      // fixed combination of the non-axis coordinates; we scan sequentially
+      // along the axis accumulating a running sum. For a contiguous row-major
+      // layout, element (o, p, i) — outer index o, axis position p, inner index
+      // i — lives at flat index `o*(L*inner) + p*inner + i`.
+      let rank = outShape.count
+      let ax = ((axis % rank) + rank) % rank
+      let L = outShape[ax]
+      let inner = outShape[(ax + 1)...].reduce(1, *)
+      let total = outShape.reduce(1, *)
+      let numRows = total / L
+
+      // Frame-aware cells are laid out as frameIdx * total + elemIdx.
+      let inFrameOffset: Expr? = ctx.frameAwareTensorCells.contains(inTensor.cellId)
+        ? b.currentFrameIndex() * b.intConstant(total)
+        : nil
+      let outFrameOffset: Expr? = ctx.frameAwareTensorCells.contains(outCell)
+        ? b.currentFrameIndex() * b.intConstant(total)
+        : nil
+
+      b.parallelRange(numRows) { rowFlat in
+        let row = b.cast(rowFlat, to: .int)
+        let o = row / b.intConstant(inner)
+        let i = row % b.intConstant(inner)
+        let base = o * b.intConstant(L * inner) + i
+        let acc = b.float(0.0)
+
+        // Sequential scan along the axis — the running sum carries the
+        // cross-iteration dependency (cheap O(L) loop, RT-friendly in C).
+        b.loop(L) { p in
+          let idx = base + p * b.intConstant(inner)
+          let inIdx = inFrameOffset.map { $0 + idx } ?? idx
+          acc.accumulate(b.memoryRead(inTensor.cellId, inIdx))
+          let outIdx = outFrameOffset.map { $0 + idx } ?? idx
+          _ = b.memoryWrite(outCell, outIdx, acc.value)
+        }
+      }
+
+    case .gather:
+      guard node.inputs.count == 2,
+        case .tensor(let sourceShape) = g.nodes[node.inputs[0]]?.shape,
+        case .tensor(let indexShape) = g.nodes[node.inputs[1]]?.shape,
+        case .tensor(let outShape) = node.shape,
+        let outCell = g.nodeToTensor[node.id].flatMap({ g.tensors[$0] })?.cellId,
+        let sourceTensor = g.nodeToTensor[node.inputs[0]].flatMap({ g.tensors[$0] }),
+        let indexTensor = g.nodeToTensor[node.inputs[1]].flatMap({ g.tensors[$0] })
+      else {
+        throw DGenError.tensorError(
+          op: "gather", reason: "requires source tensor, index tensor, and materialized output")
+      }
+
+      let sourceCount = sourceShape.reduce(1, *)
+      let outCount = outShape.reduce(1, *)
+      let outFrameOffset: Expr? = ctx.frameAwareTensorCells.contains(outCell)
+        ? b.currentFrameIndex() * b.intConstant(outCount)
+        : nil
+
+      b.parallelRange(outCount) { flatIdx in
+        let outIdx = b.cast(flatIdx, to: .int)
+        let idxValue = b.tensorRead(indexTensor, flatIdx: outIdx, shape: indexShape)
+        let rawIndex = b.cast(idxValue, to: .int)
+        let loClamped = b.gswitch(rawIndex < b.intConstant(0), b.intConstant(0), rawIndex)
+        let clamped = b.gswitch(
+          loClamped >= b.intConstant(sourceCount),
+          b.intConstant(sourceCount - 1),
+          loClamped)
+        let value = b.tensorRead(sourceTensor, flatIdx: clamped, shape: sourceShape)
+        let writeIdx = outFrameOffset.map { $0 + outIdx } ?? outIdx
+        _ = b.memoryWrite(outCell, writeIdx, value)
+      }
+
     case .conv2d(let kernelShape):
       // If the Conv2DPass annotated this node and seeded a mask cell, emit the
       // SIMD-unrolled path. Falls through to the generic scalar emission otherwise.
