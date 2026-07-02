@@ -35,7 +35,10 @@ extension GraphPrepPasses {
       guard let readNodeId = historyReads[cellId] else { continue }
       if let writeInfo = historyWrites[cellId] {
         // Check if neither the read nor write node is in a feedback loop.
-        if !nodesInFeedback.contains(readNodeId) && !nodesInFeedback.contains(writeInfo.nodeId) {
+        // Skip writes that carry a reset (2nd input): historyReadWrite has no
+        // reset path, so fusing would silently drop the reset.
+        if writeInfo.inputs.count <= 1
+          && !nodesInFeedback.contains(readNodeId) && !nodesInFeedback.contains(writeInfo.nodeId) {
           // Replace the historyRead node with historyReadWrite using the write's inputs.
           if graph.nodes[readNodeId] != nil {
             let newNode = Node(

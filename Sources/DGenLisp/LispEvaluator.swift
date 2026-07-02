@@ -328,6 +328,12 @@ class LispEvaluator {
       throw LispError.historyNotFound(name)
     }
     let value = try requireSignal(evaluateAST(elements[2]))
+    // Optional 3rd arg is a reset signal: when high, the cell stores 0 so the
+    // next read returns 0 (used to clear feedback on a trigger).
+    if elements.count >= 4 {
+      let reset = try requireSignal(evaluateAST(elements[3]))
+      return .signal(Signal.historyWriteReset(read: binding.read, value: value, reset: reset))
+    }
     let result = binding.write(value)
     return .signal(result)
   }
@@ -661,7 +667,7 @@ class LispEvaluator {
     case "repeat":
       return try evalRepeat(regularArgs, attributes: attributePairs)
     case "conv2d":
-      return try evalConv2d(regularArgs)
+      return try evalConv2d(regularArgs, attributes: attributePairs)
     case "conv1d":
       return try evalConv1d(regularArgs)
     case "windows":
@@ -2011,15 +2017,22 @@ class LispEvaluator {
     }
   }
 
-  private func evalConv2d(_ args: [ASTNode]) throws -> EvalResult {
+  private func evalConv2d(_ args: [ASTNode], attributes: [(name: String, value: String)]) throws
+    -> EvalResult
+  {
     guard args.count == 2 else {
       throw LispError.invalidArgument("conv2d requires 2 arguments (input, kernel)")
     }
     let val = try evaluateAST(args[0])
     let kernel = try requireTensor(evaluateAST(args[1]))
+    // Default is "valid" (asStrided window path, shrinks output). `@padding same`
+    // emits the zero-padded fused graph op so output shape == input shape.
+    let same = (attrValue(attributes, "@padding")?.lowercased() == "same")
     switch val {
-    case .tensor(let t): return .tensor(t.conv2d(kernel))
-    case .signalTensor(let st): return .signalTensor(st.conv2d(kernel))
+    case .tensor(let t):
+      return .tensor(same ? t.conv2dSame(kernel) : t.conv2d(kernel))
+    case .signalTensor(let st):
+      return .signalTensor(same ? st.conv2dSame(kernel) : st.conv2d(kernel))
     default: throw LispError.typeError("conv2d: first argument must be tensor or signalTensor")
     }
   }

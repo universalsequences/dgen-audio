@@ -139,14 +139,22 @@ extension LazyOp {
         // Pass-through: output is same as input tensor
         ctx.values[nodeId] = .empty
       } else {
-        // Scalar write + pass-through
-        guard inputs.count == 1 else {
+        // Scalar write + pass-through. Optional 2nd input is a reset signal:
+        // when high, store 0 instead of the value (clears feedback on trigger).
+        guard inputs.count >= 1 else {
           throw DGenError.insufficientInputs(
             operator: "history write", expected: 1, actual: inputs.count)
         }
         let inputVal = b.value(inputs[0])
-        _ = b.store(cellId, inputVal)
-        // Pass-through: output the input value so downstream ops can use it
+        let storedVal: Expr
+        if inputs.count >= 2 {
+          let resetVal = b.value(inputs[1])
+          storedVal = b.gswitch(resetVal > b.constant(0.0), b.constant(0.0), inputVal)
+        } else {
+          storedVal = inputVal
+        }
+        _ = b.store(cellId, storedVal)
+        // Pass-through: output the (unreset) input value so downstream ops can use it
         b.use(val: inputVal)
       }
     case .param(let cellId):

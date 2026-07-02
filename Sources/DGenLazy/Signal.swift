@@ -277,6 +277,19 @@ public class Signal: LazyValue {
     return (read: readSignal, write: writeFunc)
   }
 
+  /// Write a scalar history cell with a `reset`: when `reset` is high, the cell
+  /// stores 0 (so the next read returns 0). The reset is handled inside the
+  /// historyWrite op so it does not introduce a separate node into the feedback
+  /// path, which would break feedback-delay analysis. `read` must be the read
+  /// signal returned by `history()` for the same cell.
+  public static func historyWriteReset(read: Signal, value: Signal, reset: Signal) -> Signal {
+    guard let cellId = read.memoryCellId else {
+      fatalError("historyWriteReset: read signal has no history cell")
+    }
+    let writeNode = read.graph.node(.historyWrite(cellId), [value.nodeId, reset.nodeId])
+    return Signal(nodeId: writeNode, graph: read.graph, requiresGrad: value.requiresGrad, cellId: cellId)
+  }
+
   /// Create an accumulator
   /// - Parameters:
   ///   - increment: Value to add each frame

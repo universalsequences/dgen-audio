@@ -20,6 +20,16 @@ private func containsSIMDBlockers(_ uops: [UOp], backend: Backend) -> Bool {
       return true
     case .beginIf, .endIf, .mutate, .declareVar:
       if case .c = backend { return true }
+    case .delay1:
+      // The SIMD delay1 lowering (vextq_f32 + a 4-lane carry cell) is only
+      // correct when EVERY process() call covers a multiple of 4 frames: the
+      // carry cell stores the previous 4-lane group, so a partial group
+      // (nframes % 4 != 0, or a maxFrames 1/2 build) writes garbage lanes
+      // into the carry and the next call reads them back as x[n-1]/x[n-2].
+      // nframes is a runtime host parameter, so this can never be proven
+      // safe — force scalar per-frame emission (matches Metal, which already
+      // schedules historyReadWrite scalar).
+      if case .c = backend { return true }
     case .reshape, .transpose, .shrink, .pad:
       // Metal handles these fine with per-thread execution
       if case .c = backend { return true }

@@ -4,16 +4,22 @@ import Foundation
 // Find all nodes that participate in feedback loops (not just minimal cycles)
 public func findFeedbackLoops(_ g: Graph) -> [[NodeID]] {
   // Build maps of history cells to their read/write nodes
-  // historyRead/historyWrite now handle both scalar and tensor cases
-  var cellReads: [Int: NodeID] = [:]
-  var cellWrites: [Int: NodeID] = [:]
+  // historyRead/historyWrite now handle both scalar and tensor cases.
+  // A cell can have MULTIPLE reads (e.g. the same tensor history read twice);
+  // every one of them closes the write -> read feedback edge, so track them
+  // all. Iterate node IDs sorted so the resulting clusters are deterministic
+  // (dictionary order used to pick an arbitrary "winning" read per cell,
+  // which made compilation of duplicate-read graphs nondeterministic).
+  var cellReads: [Int: [NodeID]] = [:]
+  var cellWrites: [Int: [NodeID]] = [:]
 
-  for (nodeId, node) in g.nodes {
+  for nodeId in g.nodes.keys.sorted() {
+    guard let node = g.nodes[nodeId] else { continue }
     switch node.op {
     case .historyRead(let cell):
-      cellReads[cell] = nodeId
+      cellReads[cell, default: []].append(nodeId)
     case .historyWrite(let cell):
-      cellWrites[cell] = nodeId
+      cellWrites[cell, default: []].append(nodeId)
     default:
       break
     }
@@ -42,9 +48,11 @@ public func findFeedbackLoops(_ g: Graph) -> [[NodeID]] {
 
       // Handle implicit historyWrite -> historyRead connection
       if let n = g.nodes[node] {
-        if case .historyWrite(let cellId) = n.op, let readNode = cellReads[cellId] {
-          if reached.insert(readNode).inserted {
-            queue.append(readNode)
+        if case .historyWrite(let cellId) = n.op {
+          for readNode in cellReads[cellId] ?? [] {
+            if reached.insert(readNode).inserted {
+              queue.append(readNode)
+            }
           }
         }
       }
@@ -70,9 +78,11 @@ public func findFeedbackLoops(_ g: Graph) -> [[NodeID]] {
 
       // Handle implicit historyRead -> historyWrite connection
       if let n = g.nodes[node] {
-        if case .historyRead(let cellId) = n.op, let writeNode = cellWrites[cellId] {
-          if reached.insert(writeNode).inserted {
-            queue.append(writeNode)
+        if case .historyRead(let cellId) = n.op {
+          for writeNode in cellWrites[cellId] ?? [] {
+            if reached.insert(writeNode).inserted {
+              queue.append(writeNode)
+            }
           }
         }
       }
@@ -84,15 +94,17 @@ public func findFeedbackLoops(_ g: Graph) -> [[NodeID]] {
   // Find feedback clusters - a cluster exists when any history write depends on any history read
   var clusters: [Set<NodeID>] = []
   var processedWrites = Set<NodeID>()
+  let allWriteNodes = Set(cellWrites.values.flatMap { $0 })
 
-  for (cellId, writeNode) in cellWrites {
+  for cellId in cellWrites.keys.sorted() {
+    for writeNode in cellWrites[cellId]!.sorted() {
     if processedWrites.contains(writeNode) { continue }
 
     // Find all nodes this write depends on
     let writeDeps = reachBackward(from: [writeNode])
 
     // Find all history reads (for this cell) that this write depends on
-    let dependentReads = writeDeps.intersection(Set([cellReads[cellId]!]))
+    let dependentReads = writeDeps.intersection(Set(cellReads[cellId] ?? []))
 
     if !dependentReads.isEmpty {
       // This write creates feedback - find all writes reachable from the reads it depends on
@@ -101,7 +113,6 @@ public func findFeedbackLoops(_ g: Graph) -> [[NodeID]] {
 
       // OPTIMIZATION: Precompute which nodes can reach writeNode (done once)
       let canReachWriteNode = reachBackward(from: [writeNode])
-      let allWriteNodes = Set(cellWrites.values)
 
       // Keep expanding until we find all connected reads and writes
       var changed = true
@@ -137,19 +148,26 @@ public func findFeedbackLoops(_ g: Graph) -> [[NodeID]] {
       // If a read is in the cluster, its corresponding write must also be included
       for readNode in allReadsInCluster {
         if let node = g.nodes[readNode] {
-          if case .historyRead(let cell) = node.op, let writeNode = cellWrites[cell] {
-            clusterNodes.insert(writeNode)
-            allWritesInCluster.insert(writeNode)
+          if case .historyRead(let cell) = node.op {
+            for writeNode in cellWrites[cell] ?? [] {
+              clusterNodes.insert(writeNode)
+              allWritesInCluster.insert(writeNode)
+            }
           }
         }
       }
 
-      // If a write is in the cluster, its corresponding read must also be included
+      // If a write is in the cluster, ALL reads of that cell must also be
+      // included — a read left out of the cluster can be scheduled in a
+      // different block, where it observes block-stale state instead of the
+      // previous frame's value.
       for writeNode in allWritesInCluster {
         if let node = g.nodes[writeNode] {
-          if case .historyWrite(let cell) = node.op, let readNode = cellReads[cell] {
-            clusterNodes.insert(readNode)
-            allReadsInCluster.insert(readNode)
+          if case .historyWrite(let cell) = node.op {
+            for readNode in cellReads[cell] ?? [] {
+              clusterNodes.insert(readNode)
+              allReadsInCluster.insert(readNode)
+            }
           }
         }
       }
@@ -174,6 +192,7 @@ public func findFeedbackLoops(_ g: Graph) -> [[NodeID]] {
       // TODO: Implement proper nested loop execution for tensor feedback clusters.
 
       clusters.append(clusterNodes)
+    }
     }
   }
 

@@ -158,6 +158,18 @@ extension LazyOp {
       let (kH, kW) = (kernelShape[0], kernelShape[1])
       let (padH, padW) = (kH / 2, kW / 2)
 
+      // Frame-aware cells store one slice per frame; fold the frame term into
+      // raw offsets (mirrors emitOptimizedConv2D — without this every frame
+      // convolves frame 0's slice).
+      let convInFrameSize = g.frameAwareCells[inTensor.cellId]?.tensorSize
+      let convOutFrameSize = g.frameAwareCells[outCell]?.tensorSize
+      let convFrameIdx: Expr? =
+        (convInFrameSize != nil || convOutFrameSize != nil) ? b.currentFrameIndex() : nil
+      func convWithFrameOffset(_ offset: Expr, frameSize: Int?) -> Expr {
+        guard let frameSize, let convFrameIdx else { return offset }
+        return b.cast(convFrameIdx * b.intConstant(frameSize) + offset, to: .int)
+      }
+
       b.parallelRange(outShape.reduce(1, *)) { flatIdx in
         let flatInt = b.cast(flatIdx, to: .int)
         let outY = flatInt / b.intConstant(inW)
@@ -177,7 +189,10 @@ extension LazyOp {
               inTensor, indices: [inY, inX])
             let safeIdx = b.gswitch(inBounds, rawIdx, b.intConstant(0))
             let inVal = b.gswitch(
-              inBounds, b.memoryRead(inTensor.cellId, safeIdx), b.constant(0))
+              inBounds,
+              b.memoryRead(
+                inTensor.cellId, convWithFrameOffset(safeIdx, frameSize: convInFrameSize)),
+              b.constant(0))
 
             let kMemIdx = b.tensorMemoryIndex(
               kTensor, indices: [ky, kx])
@@ -186,7 +201,8 @@ extension LazyOp {
             acc.accumulate(inVal * kVal)
           }
         }
-        _ = b.memoryWrite(outCell, flatInt, acc.value)
+        _ = b.memoryWrite(
+          outCell, convWithFrameOffset(flatInt, frameSize: convOutFrameSize), acc.value)
       }
 
     case .sum:

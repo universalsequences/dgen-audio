@@ -132,6 +132,22 @@ extension TensorOps {
       _view: nodeId, graph: graph, shape: [outH, outW],
       requiresGrad: requiresGrad || kernel.requiresGrad)
   }
+
+  /// 2D Convolution with zero-padded "same" output (output shape == input shape).
+  /// Emits the fused `.conv2d` graph op (SIMD-eligible via Conv2DPass) instead of
+  /// the asStrided window path used by `conv2d`, which shrinks to [H-kH+1, W-kW+1].
+  /// Padding is `kH/2`/`kW/2`, so use an odd-sized kernel for symmetric padding.
+  public func conv2dSame(_ kernel: Tensor) -> Self {
+    guard shape.count == 2, kernel.shape.count == 2 else {
+      fatalError("conv2dSame requires 2D input and 2D kernel tensor")
+    }
+    let kH = kernel.shape[0]
+    let kW = kernel.shape[1]
+    let nodeId = graph.node(.conv2d([kH, kW]), [self.nodeId, kernel.nodeId])
+    return Self(
+      _view: nodeId, graph: graph, shape: shape,
+      requiresGrad: requiresGrad || kernel.requiresGrad)
+  }
 }
 
 // MARK: - Conformances

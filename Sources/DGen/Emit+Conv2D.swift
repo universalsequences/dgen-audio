@@ -36,6 +36,20 @@ func emitOptimizedConv2D(
   let (padH, padW) = (kH / 2, kW / 2)
   let inCell = inTensor.cellId
   let kernelCell = kTensor.cellId
+
+  // Frame-aware cells store one tensor slice per frame at
+  // `cellBase + frameIdx * tensorSize + elem`. This gather builds raw offsets,
+  // so the frame term must be folded in explicitly — otherwise every frame of
+  // a multi-frame block convolves frame 0's slice. The non-affine offset also
+  // (correctly) disqualifies the loop from the NEON upgrade pass.
+  let inFrameSize = g.frameAwareCells[inCell]?.tensorSize
+  let outFrameSize = g.frameAwareCells[outCell]?.tensorSize
+  let frameIdx: Expr? =
+    (inFrameSize != nil || outFrameSize != nil) ? b.currentFrameIndex() : nil
+  func withFrameOffset(_ offset: Expr, frameSize: Int?) -> Expr {
+    guard let frameSize, let frameIdx else { return offset }
+    return b.cast(frameIdx * b.intConstant(frameSize) + offset, to: .int)
+  }
   // Fast path: kernel data baked at graph-build time → hoist each weight as a
   // preamble-broadcast constant. Runtime path: load and broadcast inside the loop.
   let kernelData = kTensor.data
@@ -81,15 +95,24 @@ func emitOptimizedConv2D(
             let tapRowOffset = inY * inW + outX_base + (kx - padW)
             let tapOffset =
               tapRowOffset == 0 ? t : (b.intConstant(tapRowOffset) + t)
-            var v = b.memoryRead(inCell, tapOffset)
+            var v = b.memoryRead(inCell, withFrameOffset(tapOffset, frameSize: inFrameSize))
 
-            // Edge masking: multiply by pre-baked 4-lane mask vector.
-            if useLeftMask && kx == 0 {
-              let mask = b.memoryRead(maskCellId, b.intConstant(leftMaskOffset))
+            // Edge masking: multiply by pre-baked 4-lane mask vector. The
+            // offset must include the lane var `t`: SIMD rendering loads the
+            // same 4 contiguous lanes either way, but if the loop stays
+            // scalar (e.g. frame-aware offsets disqualify the NEON upgrade),
+            // a constant offset would apply mask lane 0 to every element.
+            // A tap only reads out of bounds horizontally when it actually
+            // reaches past the pad: kx < padW (left) / kx > padW (right).
+            // `kx == 0` / `kx == kW-1` are only valid proxies for kW == 2·padW+1
+            // taps that reach; for a column kernel (kW == 1, padW == 0) both
+            // held at once and zeroed the edge columns.
+            if useLeftMask && kx < padW {
+              let mask = b.memoryRead(maskCellId, b.intConstant(leftMaskOffset) + t)
               v = v * mask
             }
-            if useRightMask && kx == kW - 1 {
-              let mask = b.memoryRead(maskCellId, b.intConstant(rightMaskOffset))
+            if useRightMask && kx > padW {
+              let mask = b.memoryRead(maskCellId, b.intConstant(rightMaskOffset) + t)
               v = v * mask
             }
 
@@ -114,7 +137,7 @@ func emitOptimizedConv2D(
 
         // If every (outY, ky) was OOB for this row, running can be nil — fall back to zero.
         let value = running ?? b.constant(0.0)
-        _ = b.memoryWrite(outCell, offset, value)
+        _ = b.memoryWrite(outCell, withFrameOffset(offset, frameSize: outFrameSize), value)
       }
     }
   }
