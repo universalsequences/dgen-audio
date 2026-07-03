@@ -489,6 +489,14 @@ public struct CompilationPipeline {
   ) throws -> [BlockUOps] {
     var uopBlocks = [BlockUOps]()
 
+    if ProcessInfo.processInfo.environment["DGEN_DEBUG_BLOCKS"] != nil {
+      for (i, block) in blocks.enumerated() {
+        let ops = block.nodes.map { "\($0):\(graph.nodes[$0].map { String(describing: $0.op) } ?? "?")" }
+        print(
+          "[Blocks] #\(i) frameOrder=\(block.frameOrder) shape=\(block.shape.map(String.init(describing:)) ?? "nil") tensorIndex=\(block.tensorIndex != nil) temporality=\(block.temporality) nodes=\(ops)"
+        )
+      }
+    }
     try timings.measure("emitBlockUOps") {
       for block in blocks {
         let emission = try emitBlockUOps(

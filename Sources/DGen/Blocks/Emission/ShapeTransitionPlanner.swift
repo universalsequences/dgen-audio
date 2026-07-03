@@ -628,5 +628,14 @@ func buildRegions(
       ))
   }
 
+  if ProcessInfo.processInfo.environment["DGEN_DEBUG_REGIONS"] != nil {
+    print("[Regions] block nodes=\(block.nodes)")
+    for (i, r) in regions.enumerated() {
+      let scalarOps = r.scalarNodes.map { "\($0):\(g.nodes[$0]?.op)" }
+      let tensorOps = r.tensorNodes.map { "\($0):\(g.nodes[$0]?.op)" }
+      print("[Regions]  #\(i) shape=\(r.shape) convOnly=\(r.isConvOnly) scalar=\(scalarOps) tensor=\(tensorOps)")
+    }
+  }
+
   return regions
 }

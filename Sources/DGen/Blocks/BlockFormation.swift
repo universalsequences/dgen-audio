@@ -527,6 +527,10 @@ private func scalarPrefixNeedsSplit(
   return block.nodes[0..<firstTensorOffset].contains { nodeId in
     guard let op = graph.nodes[nodeId]?.op else { return false }
     if op.isInherentlyScalar { return true }
+    // Tensor->scalar reduces (sum, …) emit their own internal element loop.
+    // Left in the prefix they'd be wrapped by the tensor body's parallelRange
+    // and re-run once per element (O(n²) per frame).
+    if isReductionOp(op) { return true }
     switch op {
     case .tensorRef, .seq:
       return false
