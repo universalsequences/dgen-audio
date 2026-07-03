@@ -58,11 +58,14 @@ func emitOptimizedConv2D(
   let leftMaskOffset = 0
   let rightMaskOffset = 8
 
-  // Column groups per row: outX_base ∈ {0, 4, 8, ..., inW-4}.
+  // Column groups per row: outX_base ∈ {0, 4, 8, ...} plus, when inW is not a
+  // multiple of 4, a final overlapped group at inW-4 (its low lanes recompute
+  // values an earlier group already wrote — identical results, benign).
   // A group's kx=0 tap reads lane 0 OOB iff outX_base == 0.
   // A group's kx=kW-1 tap reads lane 3 OOB iff outX_base == inW - 4.
   // For inW == 4, a single group is simultaneously left- and right-edge.
-  let groups = stride(from: 0, to: inW, by: 4).map { $0 }
+  var groups = stride(from: 0, to: inW - 3, by: 4).map { $0 }
+  if groups.last != inW - 4 { groups.append(inW - 4) }
 
   for outY_i in 0..<inH {
     for outX_base in groups {
@@ -89,6 +92,9 @@ func emitOptimizedConv2D(
           guard inY >= 0 && inY < inH else { continue }
 
           for kx in 0..<kW {
+            // Constant-kernel zero taps contribute nothing — skip them entirely
+            // (e.g. the 3x3 laplacian has 4 zero taps, a 1D-in-3x3 kernel 6).
+            if let data = kernelData, data[ky * kW + kx] == 0 { continue }
             // Per-tap offset within the input cell: inY*inW + outX_base + (kx-padW)
             // plus the lane offset t. We fold the constant portion into a separate
             // int Expr and add `t` to it.
