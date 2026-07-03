@@ -51,6 +51,8 @@ extension UOp {
             opStr = "\(ANSI.cyan)memoryAccumulate\(ANSI.reset)(\(base), \(offset), \(value))"
         case let .simdBroadcastLoad(base, offset):
             opStr = "\(ANSI.cyan)simdBroadcastLoad\(ANSI.reset)(\(base), \(offset))"
+        case let .broadcastScalar(src):
+            opStr = "\(ANSI.cyan)broadcastScalar\(ANSI.reset)(\(src))"
         case let .sin(a):
             opStr = "\(ANSI.green)sin\(ANSI.reset)(\(a))"
         case let .cos(a):

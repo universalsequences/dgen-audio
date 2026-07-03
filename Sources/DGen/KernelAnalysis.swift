@@ -49,7 +49,7 @@ private func classify(_ op: Op) -> OpClass {
 
   // Memory ops
   case .load, .store, .memoryRead, .memoryWrite, .memoryAccumulate,
-       .simdBroadcastLoad,
+       .simdBroadcastLoad, .broadcastScalar,
        .delay1, .loadGlobal, .loadTape,
        .simdgroupLoad, .simdgroupLoadScratch, .simdgroupStore,
        .threadgroupRead, .threadgroupWrite:

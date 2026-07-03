@@ -516,7 +516,8 @@ public struct CompilationPipeline {
             backend: backend,
             bodyFrameOrder: emission.frameOrder,
             bodyVectorWidth: emission.vectorWidth,
-            hasOwnFrameLoop: emission.hasOwnFrameLoop
+            hasOwnFrameLoop: emission.hasOwnFrameLoop,
+            context: context
           )
         )
       }

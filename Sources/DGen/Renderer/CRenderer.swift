@@ -738,6 +738,17 @@ public class CRenderer: Renderer {
         return emitAssign(uop, "memory[\(base) + \(safeOffset)]", ctx)
       }
 
+    case .broadcastScalar(let src):
+      // Loop-invariant scalar hoisted into a SIMD register for an element loop.
+      // The operand renders through the scalar path (t<id>, or t<id>[i] for
+      // frame-scoped globals), so the broadcast picks up the current frame's value.
+      let scalarExpr = emitScalarLazy(src, ctx: ctx)
+      if uop.isSimd {
+        return emitAssign(uop, "vdupq_n_f32(\(scalarExpr))", ctx)
+      } else {
+        return emitAssign(uop, scalarExpr, ctx)
+      }
+
     case .simdBroadcastLoad(let base, let offset):
       // Scalar load + broadcast to all lanes in SIMD context.
       // Used for runtime-variable lane-uniform values (e.g. dynamic kernel weights).

@@ -18,7 +18,8 @@ extension UOpBlockFinalization {
     backend: Backend,
     bodyFrameOrder: FrameOrder,
     bodyVectorWidth: Int,
-    hasOwnFrameLoop: Bool
+    hasOwnFrameLoop: Bool,
+    context: IRContext? = nil
   ) -> BlockUOps {
     let statefulTensorDecision = StatefulTensorParallelPolicy.decide(
       block: block,
@@ -43,6 +44,13 @@ extension UOpBlockFinalization {
 
     if backend == .c {
       upgradeElementLoopsToSIMD(&finalOps)
+      if let context {
+        upgradeRegionElementLoopsToSIMD(
+          &finalOps,
+          globalVarIds: Set(context.globals),
+          makeVar: { context.useVariable(src: nil, trackInValues: false) }
+        )
+      }
     }
 
     let dispatchMode = computeDispatchMode(
