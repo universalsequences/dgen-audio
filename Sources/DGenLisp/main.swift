@@ -135,6 +135,9 @@ func main() throws {
     DGenConfig.sampleRate = cli.sampleRate
     DGenConfig.maxFrameCount = cli.maxFrames
     DGenConfig.debug = cli.debug
+    if ProcessInfo.processInfo.environment["DGEN_NO_REUSE"] != nil {
+        DGenConfig.enableBufferReuse = false
+    }
 
     // Reset graph
     LazyGraphContext.reset()
