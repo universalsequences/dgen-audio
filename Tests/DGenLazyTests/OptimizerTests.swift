@@ -289,10 +289,12 @@ final class OptimizerTests: XCTestCase {
 
   func testSignalParamOnepoleSpectral() throws {
     DGenConfig.kernelOutputPath = "/tmp/signal_param_onepole_spectral.metal"
-    // Same as testSignalParamOnepole but with spectralLossFFT instead of MSE
+    // Same as testSignalParamOnepole but with spectralLossFFT instead of MSE.
+    // lr is small because spectral-loss gradients are unnormalized sums over
+    // bins and overlapping windows (magnitudes ~1e3-1e4 at this window size).
     let cutoff = Signal.param(0.5)
     let targetCutoff: Float = 0.2
-    let optimizer = SGD(params: [cutoff], lr: 0.05)
+    let optimizer = SGD(params: [cutoff], lr: 4e-6)
 
     func buildLearnable() -> Signal {
       let phase = Signal.phasor(440.0)

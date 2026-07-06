@@ -184,6 +184,57 @@ public func findFeedbackLoops(_ g: Graph) -> [[NodeID]] {
       let nodesOnFeedbackPaths = forwardFromReadsAll.intersection(backwardToWrites)
       clusterNodes.formUnion(nodesOnFeedbackPaths)
 
+      // Same-cell + path closure. Two invariants:
+      // (1) Every read and write of any history cell touched by the cluster
+      //     must execute in the same sequential frame loop. Reads can enter
+      //     the cluster via path analysis alone (e.g. biquad's x-history read
+      //     feeding the y recursion) while the cell's write dangles outside;
+      //     a write scheduled in a different kernel runs for ALL frames before
+      //     the cluster's loop, so every frame reads the final frame's state.
+      // (2) Any node on a path between cluster state ops (e.g. a consumer of
+      //     a pass-through historyWrite output that feeds the recursion) must
+      //     join the cluster, otherwise its group both depends on and is a
+      //     dependency of the cluster group — a scheduling cycle.
+      var closureChanged = true
+      while closureChanged {
+        closureChanged = false
+
+        for nodeId in Array(clusterNodes) {
+          guard let node = g.nodes[nodeId] else { continue }
+          let cell: Int?
+          switch node.op {
+          case .historyRead(let c), .historyWrite(let c):
+            cell = c
+          default:
+            cell = nil
+          }
+          guard let cell else { continue }
+          for other in (cellReads[cell] ?? []) + (cellWrites[cell] ?? []) {
+            if clusterNodes.insert(other).inserted { closureChanged = true }
+          }
+        }
+
+        var stateNodes = Set<NodeID>()
+        var stateWrites = Set<NodeID>()
+        for nodeId in clusterNodes {
+          guard let node = g.nodes[nodeId] else { continue }
+          switch node.op {
+          case .historyRead:
+            stateNodes.insert(nodeId)
+          case .historyWrite:
+            stateNodes.insert(nodeId)
+            stateWrites.insert(nodeId)
+          default:
+            break
+          }
+        }
+        let onStatePaths = reachForward(from: stateNodes)
+          .intersection(reachBackward(from: stateWrites))
+        let beforeCount = clusterNodes.count
+        clusterNodes.formUnion(onStatePaths)
+        if clusterNodes.count != beforeCount { closureChanged = true }
+      }
+
       // NOTE: For tensor feedback loops like Conv2D, nodes downstream of historyRead
       // but not on the path to historyWrite (like sumAxis -> output) also need
       // sequential execution. However, including ALL forward-reachable nodes is too
@@ -296,6 +347,17 @@ public func findSequentialNodes(_ g: Graph, feedbackClusters: [[NodeID]], backen
       scalar.insert($0.id)  // Ring-buffer write + row advance must happen sequentially on hop boundaries; the op emits its own scalar `if` gate
     case .spectrumDelayMod(_, _, _, _, _):
       scalar.insert($0.id)  // Same reasoning — plus the fractional interpolation reads two ring rows per element
+    case .historyRead(let cellId), .historyWrite(let cellId):
+      // Scalar (non-tensor) history cells hold per-frame state in a single
+      // slot. Emitting the read or write in a parallel per-frame kernel makes
+      // every thread race on that slot (e.g. biquad's x-history write when its
+      // input comes from a parallel block), producing nondeterministic output.
+      // Feedback-cluster detection only catches reads/writes that close a
+      // cycle; chain writes like historyWrite(cell, someParallelValue) escape
+      // it. Tensor history cells are handled separately below (hop gating).
+      if g.cellToTensor[cellId] == nil {
+        scalar.insert($0.id)
+      }
     default: break
     }
   }

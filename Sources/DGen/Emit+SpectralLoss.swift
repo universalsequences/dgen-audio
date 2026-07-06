@@ -313,8 +313,6 @@ extension LazyOp {
       let fftSize = windowSize * 2
       let numStages = Int(log2(Double(windowSize)))
       let imagOffset = windowSize
-      let numBins = windowSize / 2 + 1
-      let invNBins = b.constant(1.0 / Float(windowSize * numBins))
       let zero = b.constant(0.0)
       let one = b.constant(1.0)
       let hopCounter: Expr? = inputs.count > 4 ? b.value(inputs[4]) : nil
@@ -425,10 +423,13 @@ extension LazyOp {
             butterflySize *= 2
           }
 
-          // 4. Scale by 1/(N*numBins), multiply by window → write to device
+          // 4. Multiply by window → write to device.
+          // No 1/N scale: the unnormalized positive-twiddle IFFT of the gradient
+          // spectrum IS the exact transpose-DFT scatter Σ_k [gR·cos - gI·sin],
+          // so the result is already the true ∂L/∂x[n] (up to the window factor).
           b.loop(windowSize) { n in
             let nInt = b.cast(n, to: .int)
-            let realVal = b.scratchRead(scratchRe, nInt) * invNBins
+            let realVal = b.scratchRead(scratchRe, nInt)
             let w = b.memoryRead(windowCell, nInt)
             _ = b.memoryWrite(gradTimeCell, gradTimeBase + nInt, realVal * w)
           }
@@ -539,12 +540,9 @@ extension LazyOp {
           let gradImag2 = gradMag2 * imag2.value / safeMag2
 
           // Scatter gradient to time domain: ∂L/∂x[n] += gradReal * cos + gradImag * sin
-          // This is the transpose of the DFT with normalization
+          // This is the exact transpose of the DFT — no normalization. The DFT here
+          // is unnormalized, so its transpose scatter is the true ∂L/∂x[n].
           // Uses frame-indexed storage to avoid race conditions
-          //
-          // Normalization: 1/(windowSize * numBins) - less aggressive to allow learning
-          let normFactor = b.constant(1.0 / Float(windowSize * numBins))
-
           b.loop(windowSize) { n in
             let nFloat = b.cast(n, to: .float)
             let angle = b.constant(-2.0) * b.pi * k * nFloat / winSizeFloat
@@ -555,9 +553,9 @@ extension LazyOp {
             // Frame-indexed position (integer arithmetic)
             let idx = frameBase + b.cast(n, to: .int)
 
-            // Accumulate gradient (window backprop included, with normalization)
-            let grad1Contrib = (gradReal1 * c + gradImag1 * s) * w * normFactor
-            let grad2Contrib = (gradReal2 * c + gradImag2 * s) * w * normFactor
+            // Accumulate gradient (window backprop included)
+            let grad1Contrib = (gradReal1 * c + gradImag1 * s) * w
+            let grad2Contrib = (gradReal2 * c + gradImag2 * s) * w
             _ = b.memoryAccumulate(gradTime1Cell, idx, grad1Contrib)
             _ = b.memoryAccumulate(gradTime2Cell, idx, grad2Contrib)
           }
@@ -579,7 +577,6 @@ extension LazyOp {
 
       let frameIdx = b.frameIndex()
       let winSizeInt = b.intConstant(windowSize)
-      let winSizeFloat = b.constant(Float(windowSize))
       let p = frameIdx
 
       let gradSum = b.float(0.0)
@@ -638,10 +635,8 @@ extension LazyOp {
         }
       }
 
-      let numBinsFloat = b.constant(Float(windowSize / 2 + 1))
-      let normFactor = b.sqrt(numBinsFloat * winSizeFloat)
-      let normalizedGrad = gradSum.value / normFactor
-      b.use(val: normalizedGrad)
+      // The summed window contributions are the exact gradient — no normalization.
+      b.use(val: gradSum.value)
 
     case .spectralLossFFTGradRead2(let windowSize, let hop, let gradTime2Cell):
       // Read gradient for signal 2 from hop-compressed storage
@@ -654,7 +649,6 @@ extension LazyOp {
 
       let frameIdx = b.frameIndex()
       let winSizeInt = b.intConstant(windowSize)
-      let winSizeFloat = b.constant(Float(windowSize))
       let p = frameIdx
 
       let gradSum = b.float(0.0)
@@ -707,10 +701,8 @@ extension LazyOp {
         }
       }
 
-      let numBinsFloat2 = b.constant(Float(windowSize / 2 + 1))
-      let normFactor2 = b.sqrt(numBinsFloat2 * winSizeFloat)
-      let normalizedGrad2 = gradSum.value / normFactor2
-      b.use(val: normalizedGrad2)
+      // The summed window contributions are the exact gradient — no normalization.
+      b.use(val: gradSum.value)
 
     // MARK: - Batched Spectral Loss
 
@@ -1049,8 +1041,6 @@ extension LazyOp {
       let fftSize = windowSize * 2
       let numStages = Int(log2(Double(windowSize)))
       let imagOffset = windowSize
-      let numBins = windowSize / 2 + 1
-      let invNBins = b.constant(1.0 / Float(windowSize * numBins))
       let zero = b.constant(0.0)
       let one = b.constant(1.0)
       let hopCounter: Expr? = inputs.count > 4 ? b.value(inputs[4]) : nil
@@ -1158,10 +1148,12 @@ extension LazyOp {
             butterflySize *= 2
           }
 
-          // 4. Scale by 1/(N*numBins), multiply by window → write to device
+          // 4. Multiply by window → write to device.
+          // No 1/N scale: the unnormalized positive-twiddle IFFT is the exact
+          // transpose-DFT scatter, so the result is already the true ∂L/∂x[n].
           b.loop(windowSize) { n in
             let nInt = b.cast(n, to: .int)
-            let realVal = b.scratchRead(scratchRe, nInt) * invNBins
+            let realVal = b.scratchRead(scratchRe, nInt)
             let w = b.memoryRead(windowCell, nInt)
             _ = b.memoryWrite(gradTimeCell, gradTimeBase + nInt, realVal * w)
           }
@@ -1189,7 +1181,6 @@ extension LazyOp {
 
       let (frameIdx, batchIdx) = b.setupFlatThreading(tensorSize: batchSize)
       let winSizeInt = b.intConstant(windowSize)
-      let winSizeFloat = b.constant(Float(windowSize))
       let batchSizeInt = b.intConstant(batchSize)
       let p = frameIdx
       let batchIdx_int = b.cast(batchIdx, to: .int)
@@ -1245,12 +1236,10 @@ extension LazyOp {
         }
       }
 
-      let numBinsFloat = b.constant(Float(windowSize / 2 + 1))
-      let normFactor = b.sqrt(numBinsFloat * winSizeFloat)
-      let normalizedGrad = gradSum.value / normFactor
+      // The summed window contributions are the exact gradient — no normalization.
       // Write gradient to frame-aware output: memory[outputCell + frame * B + b]
       let writeIdx = frameIdx * batchSizeInt + batchIdx_int
-      _ = b.memoryWrite(outputCell, writeIdx, normalizedGrad)
+      _ = b.memoryWrite(outputCell, writeIdx, gradSum.value)
       b.use(val: b.constant(0.0))
 
     case .spectralLossFFTBatchedGradRead2(let windowSize, let batchSize, let hop,
@@ -1264,7 +1253,6 @@ extension LazyOp {
 
       let (frameIdx, batchIdx) = b.setupFlatThreading(tensorSize: batchSize)
       let winSizeInt = b.intConstant(windowSize)
-      let winSizeFloat = b.constant(Float(windowSize))
       let batchSizeInt = b.intConstant(batchSize)
       let p = frameIdx
       let batchIdx_int = b.cast(batchIdx, to: .int)
@@ -1320,11 +1308,9 @@ extension LazyOp {
         }
       }
 
-      let numBinsFloat2 = b.constant(Float(windowSize / 2 + 1))
-      let normFactor2 = b.sqrt(numBinsFloat2 * winSizeFloat)
-      let normalizedGrad2 = gradSum.value / normFactor2
+      // The summed window contributions are the exact gradient — no normalization.
       let writeIdx = frameIdx * batchSizeInt + batchIdx_int
-      _ = b.memoryWrite(outputCell, writeIdx, normalizedGrad2)
+      _ = b.memoryWrite(outputCell, writeIdx, gradSum.value)
       b.use(val: b.constant(0.0))
 
     default: break

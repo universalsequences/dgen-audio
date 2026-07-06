@@ -408,12 +408,14 @@ extension Graph {
     let history2Read = n(.historyRead(history2Cell))
     let history3Read = n(.historyRead(history3Cell))
 
-    // History writes and chaining
-    _ = n(.historyWrite(history0Cell), history1Read)
-
-    _ = n(.historyWrite(history2Cell), in1)
-
-    _ = n(.historyWrite(history3Cell), history2Read)
+    // History writes and chaining. Each write is pass-through (outputs its
+    // input) and its output feeds the filter arithmetic below, so that
+    // historyWrite.backward runs (consuming the BPTT carry cells) and the
+    // reverse-time loop activates. Dangling writes silently truncate the
+    // temporal gradient for cutoff/resonance/gain (docs/BIQUAD_BPTT_GRADIENT_BUG.md).
+    let y1PassThrough = n(.historyWrite(history0Cell), history1Read)  // = y[n-1]
+    let x0PassThrough = n(.historyWrite(history2Cell), in1)  // = x[n]
+    let x1PassThrough = n(.historyWrite(history3Cell), history2Read)  // = x[n-1]
 
     // Core filter computation following TypeScript exactly
     let param3 = mode
@@ -508,13 +510,13 @@ extension Graph {
       add4, add10, sub12, n(.constant(0)), n(.constant(0)), mult31, mult31, hs_b1_norm, ls_b1_norm)
     let b1_scaled = n(.mul, selector32, mult26)
     let b1 = n(.gswitch, isShelfMode, selector32, b1_scaled)
-    let mult34 = n(.mul, history2Read, b1)
+    let mult34 = n(.mul, x1PassThrough, b1)
     let not_sub35 = n(.sub, n(.constant(1)), div18)
     let selector36 = selector(
       add4, div11, div13, div18, mult20, n(.constant(1)), not_sub35, hs_b0_norm, ls_b0_norm)
     let b0_scaled = n(.mul, selector36, mult26)
     let b0 = n(.gswitch, isShelfMode, selector36, b0_scaled)
-    let mult38 = n(.mul, in1, b0)
+    let mult38 = n(.mul, x0PassThrough, b0)
 
     // Final computation - following TypeScript s() pattern
     let add39 = n(.add, n(.add, mult28, mult34), mult38)
@@ -537,14 +539,12 @@ extension Graph {
       a1_orig)
 
     let mult42 = n(.mul, history040, a2)
-    let mult44 = n(.mul, history1Read, a1)
+    let mult44 = n(.mul, y1PassThrough, a1)
     let add45 = n(.add, mult42, mult44)
     let sub46 = n(.sub, add39, add45)
 
-    // Write final result to history1
-    _ = n(.historyWrite(history1Cell), sub46)
-
-    return sub46
+    // Write final result to history1 (pass-through: returned value == sub46)
+    return n(.historyWrite(history1Cell), sub46)
   }
 
   private func amp2db(_ amp: NodeID) -> NodeID {

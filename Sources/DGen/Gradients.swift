@@ -21,6 +21,11 @@ extension Graph {
     }
     let carryCell = alloc()
     gradCarryCells[historyCellId] = carryCell
+    // Carry cells are read/written via memoryRead/memoryWrite across kernels,
+    // which the buffer-reuse liveness analysis does not track. Without this,
+    // remapVectorMemorySlots can alias a carry cell onto live gradient storage
+    // (e.g. a param's grad-accumulation cell or spectral gradTime cells).
+    persistentCells.insert(carryCell)
     return carryCell
   }
 
@@ -98,7 +103,14 @@ extension Graph {
 
     for nodeId in topologicalOrder(from: root) {
       guard let node = nodes[nodeId] else { continue }
-      let isTarget = targets.contains(nodeId)
+      // historyRead counts as a target: its accumulated gradient is the BPTT
+      // temporal carry. Without this, historyWrite nodes whose input is a
+      // historyRead (e.g. biquad's x/y state chaining) are pruned, their
+      // backward never consumes the carry cell, and the temporal gradient
+      // recursion silently truncates (docs/BIQUAD_BPTT_GRADIENT_BUG.md).
+      let isHistoryRead: Bool
+      if case .historyRead = node.op { isHistoryRead = true } else { isHistoryRead = false }
+      let isTarget = targets.contains(nodeId) || isHistoryRead
       let hasTargetDescendant = node.inputs.contains { onTargetPath[$0] == true }
       onTargetPath[nodeId] = isTarget || hasTargetDescendant
     }
@@ -387,15 +399,18 @@ extension LazyOp {
       return [zero, gradX, gradY]
 
     case .selector:
-      // selector(mode, options...) -> gradient flows to selected option only
+      // selector(mode, options...) -> gradient flows to selected option only.
+      // Forward is 1-indexed (see IRBuilder+Math.selector and the renderers):
+      // mode <= 0 yields 0, option k is selected when mode == k+1. So input i
+      // (option i-1) is selected when mode == i.
       guard node.inputs.count >= 2 else { return [] }
       let mode = node.inputs[0]
       let zero = g.n(.constant(0.0), [])
 
       var grads: [NodeID?] = [zero]  // mode has zero gradient
       for i in 1..<node.inputs.count {
-        let optionIndex = g.n(.constant(Float(i - 1)), [])
-        let isSelected = g.n(.eq, [mode, optionIndex])
+        let selectorValue = g.n(.constant(Float(i)), [])
+        let isSelected = g.n(.eq, [mode, selectorValue])
         let gradOption = g.n(.gswitch, [isSelected, gradOutput, zero])
         grads.append(gradOption)
       }

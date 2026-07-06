@@ -2,7 +2,10 @@
 
 Status (2026-07-06):
 - **Part A — carry-cell memory aliasing: FIXED** (one line in `Gradients.swift`)
-- **Part B — truncated temporal gradient through biquad state: OPEN, by design gap**
+- **Part B — truncated temporal gradient through biquad state: FIXED** (see
+  "Part B resolution" below — B1 pass-through rewiring plus four supporting
+  fixes it surfaced, including a pre-existing forward race and a selector
+  backward off-by-one)
 
 Discovered by the SynthID `--fdcheck` harness (`Examples/SynthID/FDCHECK_FINDING.md`).
 This document explains what actually happened, how to reproduce both parts, and
@@ -234,6 +237,83 @@ A debug assertion or compile-time warning: **if `gradCarryCells` is non-empty
 but no block passed `blockHasPassThroughHistoryWriteWithCarry`, the temporal
 gradient is being silently truncated.** Today that condition is exactly the
 biquad case and costs nothing to detect.
+
+## Part B resolution (2026-07-06)
+
+Option **B1** was implemented. Getting it correct required five changes; the
+investigation also uncovered a pre-existing forward-pass race and a
+gradient-routing bug unrelated to BPTT. Validation: MSE loss, trainable
+cutoff (log-space), 512 frames — autograd `126.89` vs FD `126.88` vs
+double-precision CPU adjoint `126.50` (`BPTTBiquadScratchTests`,
+`testMSELossFDComparison` / `testCPUReferenceGradient`).
+
+### 1. Biquad macro rewired to pass-through writes (`HigherOps.swift`)
+
+All four `historyWrite`s now feed their outputs into the filter arithmetic
+(`x[n]` tap via the x-write, `x[n-1]` tap via the chain write, `y[n-1]` tap
+via the y-chain write, and the returned output via the y-write). Forward
+values are unchanged (historyWrite is pass-through); backward now runs for
+every write, consuming the carry cells, and `wrapWithBPTTLoops` activates.
+
+### 2. `historyRead` counts as a gradient target (`Gradients.swift`)
+
+`reverseTopologicalOrder` prunes nodes not on a path to targets. Biquad's
+chain writes (`historyWrite(c0, historyRead(c1))`) have a historyRead as
+their only input, and historyRead has no inputs — so those writes were
+pruned, their backward never consumed the carry cells, and the temporal
+recursion silently truncated. historyReads are now treated as targets in the
+path analysis (their accumulated grad IS the BPTT carry).
+
+### 3. Pre-existing forward race: scalar history ops forced sequential (`FeedbackAnalysis.swift`)
+
+`historyWrite(xCell, in1)` has no read→write cycle, so feedback-cluster
+detection never made it sequential. When `in1` comes from a parallel block,
+the write was emitted in a **parallel per-frame kernel** — every thread
+racing on one state cell (`memory[k] = t[..+id]`), making biquad forward
+output **nondeterministic on Metal** (loss varied run to run). This predates
+the BPTT work. Scalar-cell historyRead/historyWrite are now marked scalar in
+`findSequentialNodes`, like accum/phasor/noise.
+
+### 4. Feedback clusters close over same-cell ops and state paths (`FeedbackAnalysis.swift`)
+
+Two closure invariants added to `findFeedbackLoops`: (a) every read/write of
+any history cell touched by a cluster joins the cluster (else the x-write
+lands in a *different* sequential kernel that runs all frames before the
+cluster's loop); (b) nodes on paths between cluster state ops join the
+cluster (else a consumer of a pass-through write output creates a group-level
+scheduling cycle → `insufficientInputs` at emission).
+
+### 5. HistoryFusionPass rewires pass-through consumers (`HistoryFusionPass.swift`)
+
+`combineHistoryOpsNotInFeedback` deletes the historyWrite node when fusing a
+read/write pair into `historyReadWrite`. With dangling writes that was safe;
+with pass-through consumers it left `mul` nodes with a missing input (the 18
+inference-test failures). Consumers of the removed write are now rewired to
+the write's input (same value — pass-through).
+
+### 6. Selector backward off-by-one (`Gradients.swift`) — the sign flip
+
+The forward `selector` is **1-indexed** (`mode <= 0` → 0, option k selected
+when `mode == k+1`; see `IRBuilder+Math.selector` and both renderers), but
+backward routed gradient to option i when `mode == i`. With biquad's
+`selector(mode+1, …)`, every coefficient's gradient flowed through the **next
+mode's branch**: for lowpass b0/b2 that branch is `(1+cos)/2` instead of
+`(1−cos)/2` — flipping the sign of the entire cutoff gradient
+(autograd was ≈ −FD to 1%). This bug affects any trainable parameter feeding
+a `selector`, independent of BPTT. Minimal repro:
+`testFullTopologyRBJFormulasGradient` (pass with formulas, fail once wrapped
+in `selector`).
+
+### Notes
+
+- The bisection tests in `BPTTBiquadScratchTests` (two-cell chain write, FIR
+  chain write, full topology with simple/RBJ coefficients, coefficient chain
+  only) each compare against inline double-precision CPU references and are
+  the fastest way to re-localize a future regression.
+- Spectral-loss case (`testLinearLossFDComparison`): outGain matches FD
+  exactly; cutoff autograd is now positive/finite but FD comparison there is
+  noise-limited (the loss is nearly flat in cutoff for that graph:
+  `l± ≈ 351.5±0.1` at eps 1e-2). Use the MSE tests for validation.
 
 ## Timeline / cross-references
 
