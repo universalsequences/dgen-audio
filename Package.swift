@@ -11,6 +11,7 @@ let package = Package(
         .executable(name: "HarmonicE2E", targets: ["HarmonicE2E"]),
         .executable(name: "BendingMetal", targets: ["BendingMetal"]),
         .executable(name: "TrainKick808", targets: ["TrainKick808"]),
+        .executable(name: "SynthID", targets: ["SynthID"]),
         .executable(name: "DGenLisp", targets: ["DGenLisp"]),
         .library(name: "DGen", targets: ["DGen"]),
         .library(name: "DGenLazy", targets: ["DGenLazy"]),
@@ -47,6 +48,12 @@ let package = Package(
             dependencies: ["DGenLazy", "DGen"],
             path: "Examples/TrainKick808",
             exclude: ["renders", "waveform_compare.py", "EXPERIMENTS.md"]
+        ),
+        .executableTarget(
+            name: "SynthID",
+            dependencies: ["DGenLazy", "DGen"],
+            path: "Examples/SynthID",
+            exclude: ["SPEC.md", "scripts", "targets"]
         ),
         .executableTarget(
             name: "DGenLisp",
