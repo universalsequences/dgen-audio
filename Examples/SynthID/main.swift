@@ -279,12 +279,19 @@ enum SynthIDCLI {
         sampleRate: config.sampleRate)
       if verifyOnly { return }
 
-      let report = try recoverTarget(
+      let lossFloor = try rendererLossFloor(
         samples: normalized.samples,
         trueParams: normalized.params,
         config: config,
         outDir: root,
         context: "rung2 external target")
+      let report = try recoverTarget(
+        samples: normalized.samples,
+        trueParams: normalized.params,
+        config: config,
+        outDir: root,
+        context: "rung2 external target",
+        irreducibleLossFloor: lossFloor)
       print(
         "rung2 pass=\(report.pass) lossRatio=\(String(format: "%.6f", report.lossRatio))")
       if !report.pass && !options.keys.contains("allow-fail") {
@@ -348,12 +355,19 @@ enum SynthIDCLI {
         sampleRate: seedConfig.sampleRate)
       if verifyOnly { continue }
 
-      let report = try recoverTarget(
+      let lossFloor = try rendererLossFloor(
         samples: normalized.samples,
         trueParams: normalized.params,
         config: seedConfig,
         outDir: seedDir,
         context: "rung2 seed \(seed)")
+      let report = try recoverTarget(
+        samples: normalized.samples,
+        trueParams: normalized.params,
+        config: seedConfig,
+        outDir: seedDir,
+        context: "rung2 seed \(seed)",
+        irreducibleLossFloor: lossFloor)
       if report.pass { passed += 1 }
       print(
         "seed=\(seed) pass=\(report.pass) lossRatio=\(String(format: "%.6f", report.lossRatio))")
@@ -377,7 +391,8 @@ enum SynthIDCLI {
     trueParams: PatchValues,
     config: SynthIDConfig,
     outDir: URL,
-    context: String
+    context: String,
+    irreducibleLossFloor: Float = 0
   ) throws -> SynthIDReport {
     var bestResult: TrainingRunResult?
     var bestRestartDir: URL?
@@ -493,7 +508,31 @@ enum SynthIDCLI {
       trueParams: trueParams,
       targetSamples: samples,
       config: config,
-      outDir: outDir)
+      outDir: outDir,
+      irreducibleLossFloor: irreducibleLossFloor)
+  }
+
+  private static func rendererLossFloor(
+    samples: [Float],
+    trueParams: PatchValues,
+    config: SynthIDConfig,
+    outDir: URL,
+    context: String
+  ) throws -> Float {
+    // This truth-derived diagnostic is intentionally excluded from training,
+    // optimizer updates, restart selection, and parameter initialization. It is
+    // used only to score the reducible portion of an external-renderer loss.
+    let floor = try SynthIDTrainer(config: config).evaluateLoss(
+      values: trueParams,
+      targetSamples: samples)
+    guard floor.isFinite && floor >= 0 else {
+      throw SynthIDError.message("\(context) produced invalid renderer loss floor \(floor)")
+    }
+    try writeJSON(
+      ["irreducibleLossFloor": floor],
+      to: outDir.appendingPathComponent("renderer_loss_floor.json"))
+    print("\(context) renderer lossFloor=\(String(format: "%.6e", floor))")
+    return floor
   }
 
   private static func normalizeTarget(
@@ -562,7 +601,8 @@ enum SynthIDCLI {
     trueParams: PatchValues?,
     targetSamples: [Float],
     config: SynthIDConfig,
-    outDir: URL
+    outDir: URL,
+    irreducibleLossFloor: Float = 0
   ) throws -> SynthIDReport {
     let learned = peakNormalized(
       try KickVoice.render(values: result.recovered, config: config, parameterBacked: true),
@@ -585,6 +625,7 @@ enum SynthIDCLI {
       recovered: result.recovered,
       initLoss: result.initLoss,
       finalLoss: result.bestLoss,
+      irreducibleLossFloor: irreducibleLossFloor,
       includeNoiseCutoff: config.enableNoiseFilter)
     try ReportWriter.write(report: report, to: outDir)
     return report

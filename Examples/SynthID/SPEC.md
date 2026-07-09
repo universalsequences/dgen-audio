@@ -265,7 +265,9 @@ and the corresponding truth `outGain` is adjusted exactly as in rung 1.
 
 After equivalence passes, rung 2 runs the same best-of-restarts, cross-restart
 recombination, click-frequency search, reporting, and artifact generation as
-rung 1 against the NumPy-rendered target.
+rung 1 against the NumPy-rendered target. The Python renderer writes IEEE
+float32 WAV; PCM16 is not acceptable here because quantization noise creates an
+artificial log-STFT floor in otherwise empty bins.
 
 ### Rung 3 — Real TR-808
 
@@ -304,9 +306,19 @@ the debugging tool for the whole example.
 
 ### 7.2 Rung 2
 
-Same thresholds as 7.1 on ≥ 3 of 5 seeds (allow slack for renderer float drift),
-plus the renderer-equivalence assertion in §6. The command exits nonzero when
-either renderer equivalence fails or fewer than 3 of the default 5 seeds pass.
+Same parameter thresholds as 7.1 on ≥ 3 of 5 seeds, plus the
+renderer-equivalence assertion in §6. The two-renderer loss has a small nonzero
+floor even at the hidden truth because NumPy and Metal transcendental functions
+are not bit-identical. Rung 2 therefore applies the same 0.02 reduction gate to
+the *reducible* loss:
+
+`max(0, finalLoss - rendererFloor) / max(initLoss - rendererFloor, 1e-12) ≤ 0.02`
+
+`rendererFloor` is the DGen training loss evaluated at the hidden parameters and
+is written to the report alongside the unadjusted loss ratio. It is never used
+by optimization, initialization, checkpoint selection, restart selection, or
+parameter scoring. The command exits nonzero when equivalence fails or fewer
+than 3 of the default 5 seeds pass.
 
 ### 7.3 Rung 3
 

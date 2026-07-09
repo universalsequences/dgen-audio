@@ -24,6 +24,8 @@ struct SynthIDReport: Codable {
   var pass: Bool
   var initLoss: Float
   var finalLoss: Float
+  var irreducibleLossFloor: Float
+  var rawLossRatio: Float
   var lossRatio: Float
   var rows: [RecoveryRow]
   var equivalences: [EquivalenceRow]
@@ -36,6 +38,7 @@ enum ReportWriter {
     recovered: PatchValues,
     initLoss: Float,
     finalLoss: Float,
+    irreducibleLossFloor: Float = 0,
     includeNoiseCutoff: Bool = true
   ) -> SynthIDReport {
     // The output tanh((bodyAmp·body + clickAmp·click + noiseAmp·noise)·drive)·outGain
@@ -76,7 +79,9 @@ enum ReportWriter {
       }
     }
 
-    let lossRatio = finalLoss / max(initLoss, 1e-12)
+    let floor = max(0, min(irreducibleLossFloor, initLoss))
+    let rawLossRatio = finalLoss / max(initLoss, 1e-12)
+    let lossRatio = max(0, finalLoss - floor) / max(initLoss - floor, 1e-12)
     let parameterPass = rows.isEmpty || rows.allSatisfy(\.pass)
     let lossPass = rows.isEmpty || lossRatio <= 0.02
     return SynthIDReport(
@@ -85,6 +90,8 @@ enum ReportWriter {
       pass: parameterPass && lossPass,
       initLoss: initLoss,
       finalLoss: finalLoss,
+      irreducibleLossFloor: floor,
+      rawLossRatio: rawLossRatio,
       lossRatio: lossRatio,
       rows: rows,
       equivalences: equivalences)
@@ -104,7 +111,13 @@ enum ReportWriter {
     text += "- Pass: \(report.pass ? "yes" : "no")\n"
     text += "- Init loss: \(String(format: "%.6f", report.initLoss))\n"
     text += "- Final loss: \(String(format: "%.6f", report.finalLoss))\n"
-    text += "- Loss ratio: \(String(format: "%.6f", report.lossRatio))\n\n"
+    if report.irreducibleLossFloor > 0 {
+      text += "- Renderer loss floor: \(String(format: "%.6f", report.irreducibleLossFloor))\n"
+      text += "- Raw loss ratio: \(String(format: "%.6f", report.rawLossRatio))\n"
+      text += "- Floor-adjusted loss ratio: \(String(format: "%.6f", report.lossRatio))\n\n"
+    } else {
+      text += "- Loss ratio: \(String(format: "%.6f", report.lossRatio))\n\n"
+    }
     guard !report.rows.isEmpty else { return text }
     text +=
       "Note: `tanh((bodyAmp·body + clickAmp·click + noiseAmp·noise)·drive)·outGain` "

@@ -8,7 +8,7 @@ phase convention. They do not use DGen or call back into the Swift executable.
 import argparse
 import json
 import math
-import wave
+import struct
 from pathlib import Path
 
 import numpy as np
@@ -114,13 +114,33 @@ def lowpass_biquad(x, cutoff, q, gain, sample_rate):
 
 def write_wav(path, samples, sample_rate):
     path = Path(path)
-    with wave.open(str(path), "wb") as f:
-        f.setnchannels(1)
-        f.setsampwidth(2)
-        f.setframerate(sample_rate)
-        clipped = np.clip(samples, -1.0, 1.0)
-        pcm = (clipped * 32767.0).astype("<i2")
-        f.writeframes(pcm.tobytes())
+    # Match AudioFile.save's IEEE float32 WAV output. PCM16 quantization is
+    # inaudible but creates a large log-STFT floor in otherwise empty bins,
+    # making the rung-2 loss-ratio gate impossible even at the true parameters.
+    payload = np.clip(samples, -1.0, 1.0).astype("<f4").tobytes()
+    channels = 1
+    bytes_per_sample = 4
+    byte_rate = int(sample_rate) * channels * bytes_per_sample
+    block_align = channels * bytes_per_sample
+    header = (
+        b"RIFF"
+        + struct.pack("<I", 36 + len(payload))
+        + b"WAVE"
+        + b"fmt "
+        + struct.pack(
+            "<IHHIIHH",
+            16,
+            3,  # IEEE float
+            channels,
+            int(sample_rate),
+            byte_rate,
+            block_align,
+            32,
+        )
+        + b"data"
+        + struct.pack("<I", len(payload))
+    )
+    path.write_bytes(header + payload)
 
 
 def main():

@@ -141,7 +141,7 @@ misses only the loss-ratio gate by 20% (0.0241 vs 0.02).
 
 1. Run the full Rung 2 recovery acceptance command. Its independent NumPy
    renderer and automated five-seed equivalence gate are implemented; all five
-   default seeds currently match DGen with max sample error about `5e-5`
+   default seeds currently match DGen with max sample error about `5e-6`
    (required: `< 1e-3`).
 2. Optional: rerun rung-1 acceptance with the noise filter enabled so
    `noiseCutoff` is included in the scored parameter table.
