@@ -12,9 +12,9 @@ enum KickVoice {
 
     // Closed-form phase of the exponential pitch sweep:
     //   ∫ (fEnd + (fStart - fEnd)·e^{pd·τ}) dτ = fEnd·t + (fStart - fEnd)/pd · (e^{pd·t} - 1)
-    // Built from the accum time ramp instead of statefulPhasor because gradPhasor
-    // applies the constant-frequency rule d(phase)/d(freq) = frameIdx/sr, which is
-    // wrong for swept frequency input (fdcheck: fStart autograd 12x low, fEnd 25% high).
+    // Closed form avoids phase-wrap discontinuities in the parameterization and
+    // remains equivalent to the stateful phasor now that its temporal adjoint is
+    // implemented as a reset-aware suffix scan.
     let sweepPhase =
       params.fEnd * t
       + (params.fStart - params.fEnd) / params.pitchDecay

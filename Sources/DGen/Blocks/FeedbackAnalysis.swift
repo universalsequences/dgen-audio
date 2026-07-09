@@ -339,6 +339,11 @@ public func findSequentialNodes(_ g: Graph, feedbackClusters: [[NodeID]], backen
       scalar.insert($0.id)  // Click reads/writes cell — needs sequential frame execution
     case .noise(_):
       scalar.insert($0.id)  // Noise PRNG reads/writes state cell — needs sequential frame execution
+    case .temporalGradStore, .temporalGradRead:
+      // These ops use explicit frame-indexed tape addressing. Metal maps that
+      // safely to one thread per frame; the C backend's frame-axis SIMD upgrade
+      // cannot represent their integer offsets lane-wise, so keep it scalar.
+      if backend == .c { scalar.insert($0.id) }
     case .tensorNoise(_, _, _):
       scalar.insert($0.id)  // Tensor noise shares a single PRNG state across N per-frame iterations — must stay scalar so the xorshift advances sequentially rather than being SIMD-vectorized 4-at-once
     case .hopTensorNoise(_, _, _):

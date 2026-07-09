@@ -406,7 +406,8 @@ public struct CompilationPipeline {
         .spectralLossFFTBatched, .spectralLossFFTBatchedReduce,
         .spectralLossFFTBatchedGradSpec, .spectralLossFFTBatchedGradIFFT,
         .spectralLossFFTBatchedGradRead, .spectralLossFFTBatchedGradRead2,
-        .sampleGradWrite, .selectRowGradWrite, .peekGradWrite:
+        .sampleGradWrite, .selectRowGradWrite, .peekGradWrite,
+        .temporalGradStore:
         return true
       default:
         return false

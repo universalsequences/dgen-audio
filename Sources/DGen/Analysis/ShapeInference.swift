@@ -195,6 +195,12 @@ public func inferShape(op: LazyOp, inputs: [ValueShape], graph: Graph) throws ->
   case .bufferViewGradStore(_, _), .bufferViewGradRead(_, _):
     return .scalar
 
+  case .temporalGradStore, .temporalGradScan:
+    return .scalar
+
+  case .temporalGradRead(_, let shape, _):
+    return shape.isEmpty ? .scalar : .tensor(shape)
+
   case .tensorNoise(_, _, let size):
     return .tensor([size])
 
@@ -219,7 +225,7 @@ public func inferShape(op: LazyOp, inputs: [ValueShape], graph: Graph) throws ->
     .pow, .mod, .min, .max, .atan2, .gt, .gte, .lt, .lte, .eq,
     .and, .or, .xor, .gswitch, .mix,
     .modulatedParam,
-    .phasor(_), .accum(_), .latch(_), .deterministicPhasor, .gradPhasor, .gradDeterministicPhasor:
+    .phasor(_), .accum(_), .latch(_), .deterministicPhasor, .gradDeterministicPhasor:
     let tensors = inputs.filter { x in
       if case .tensor(_) = x { return true }
       return false

@@ -29,6 +29,46 @@ func blockHasPassThroughHistoryWriteWithCarry(block: Block, g: Graph) -> Bool {
   }
 }
 
+/// Returns true when a block is the detached backward half of a BPTT graph.
+///
+/// Losses with their own kernel boundaries (notably FFT spectral loss) separate
+/// the forward history loop from the generated adjoint nodes. In that layout the
+/// backward block contains only gradient carry reads/writes and must execute from
+/// the last frame to the first. Running it in the normal forward scalar loop
+/// truncates the recurrence to a one-frame derivative.
+func blockIsDetachedBPTTBackward(block: Block, g: Graph) -> Bool {
+  guard let lastForwardId = g.lastForwardNodeId,
+    !g.gradCarryCells.isEmpty,
+    block.nodes.allSatisfy({ $0 > lastForwardId })
+  else {
+    return false
+  }
+
+  let carryCells = Set(g.gradCarryCells.values)
+  var readsCarry = false
+  var writesCarry = false
+  for nodeId in block.nodes {
+    guard let node = g.nodes[nodeId] else { continue }
+    switch node.op {
+    case .memoryRead(let cellId):
+      readsCarry = readsCarry || carryCells.contains(cellId)
+    case .memoryWrite(let cellId):
+      writesCarry = writesCarry || carryCells.contains(cellId)
+    default:
+      break
+    }
+  }
+  return readsCarry && writesCarry
+}
+
+/// Wraps a detached BPTT backward body in one reverse frame loop.
+func wrapDetachedBPTTBackwardLoop(_ bodyUops: [UOp]) -> [UOp] {
+  let frameCount = Lazy.variable(-1, nil)
+  return [UOp(op: .beginReverseLoop(frameCount), value: .empty)]
+    + bodyUops
+    + [UOp(op: .endLoop, value: .empty)]
+}
+
 /// Tuple alias for a carry-cell read value that must be reloaded per reverse iteration.
 private typealias CarryCellRead = (cellId: CellID, originalLazy: Lazy)
 

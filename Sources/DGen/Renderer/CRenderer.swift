@@ -793,6 +793,39 @@ public class CRenderer: Renderer {
         let cast = isIntTypedOffset(offset) ? "" : "(int)"
         return "memory[\(base) + \(cast)\(g(offset))] = \(g(value));"
       }
+    case .memoryAccumulate(let base, let offset, let value):
+      // C kernels execute schedule items serially, so a plain add is sufficient.
+      // In a frame-SIMD loop, a lane-uniform offset (the parameter-gradient
+      // case) requires a horizontal reduction; lane-varying offsets scatter-add.
+      if uop.isSimd {
+        let valueExpr = g(value)
+        let offsetType: EmittedType
+        if case .variable(let varId, _) = offset {
+          offsetType = varEmittedTypes[varId] ?? .float32x4
+        } else if case .constant = offset {
+          offsetType = .int_
+        } else {
+          offsetType = .float32x4
+        }
+
+        switch offsetType {
+        case .int_, .float_:
+          let scalarOffsetExpr = emitScalarLazy(offset, ctx: ctx)
+          return
+            "memory[\(base) + (int)\(scalarOffsetExpr)] += vaddvq_f32(\(valueExpr));"
+        case .float32x4:
+          let offsetExpr = g(offset)
+          return """
+            memory[\(base) + (int)vgetq_lane_f32(\(offsetExpr), 0)] += vgetq_lane_f32(\(valueExpr), 0);
+            memory[\(base) + (int)vgetq_lane_f32(\(offsetExpr), 1)] += vgetq_lane_f32(\(valueExpr), 1);
+            memory[\(base) + (int)vgetq_lane_f32(\(offsetExpr), 2)] += vgetq_lane_f32(\(valueExpr), 2);
+            memory[\(base) + (int)vgetq_lane_f32(\(offsetExpr), 3)] += vgetq_lane_f32(\(valueExpr), 3);
+            """.trimmingCharacters(in: .whitespacesAndNewlines)
+        }
+      } else {
+        let cast = isIntTypedOffset(offset) ? "" : "(int)"
+        return "memory[\(base) + \(cast)\(g(offset))] += \(g(value));"
+      }
     case .sin(let a):
       let expr = uop.isSimd ? "vsinf(\(g(a)))" : "sinf(\(g(a)))"
       return emitAssign(uop, expr, ctx)

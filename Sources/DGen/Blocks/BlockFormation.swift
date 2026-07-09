@@ -136,6 +136,7 @@ public func isolateSpectralPasses(_ blocks: [Block], _ g: Graph) -> [Block] {
         if case .sampleGradWrite = node.op { return true }
         if case .selectRowGradWrite = node.op { return true }
         if case .peekGradWrite = node.op { return true }
+        if case .temporalGradStore = node.op { return true }
         return false
       }()
 
@@ -172,6 +173,7 @@ public func isReductionOp(_ op: LazyOp) -> Bool {
   switch op {
   case .sum, .tensorAccumulate, .sampleGradReduce,
     .selectRowGradReduce, .peekGradReduce, .overlapAddGradGather, .bufferViewGradRead,
+    .temporalGradScan,
     .sumMulAxis0, .gemmSmall, .chunkPartialsReduceToCell:
     return true
   default:
@@ -182,7 +184,7 @@ public func isReductionOp(_ op: LazyOp) -> Bool {
 public func isGlobalReductionOp(_ op: LazyOp) -> Bool {
   switch op {
   case .sampleGradReduce, .selectRowGradReduce, .peekGradReduce,
-    .tensorAccumulate, .chunkPartialsReduceToCell:
+    .tensorAccumulate, .chunkPartialsReduceToCell, .temporalGradScan:
     return true
   default:
     return false

@@ -7,8 +7,8 @@ import DGen
 /// Scratch: dump kernels for the trainable-biquad gradient corruption repro.
 final class BPTTBiquadScratchTests: XCTestCase {
   /// FD vs autograd under LINEAR loss (FD-stable) with trainable biquad cutoff.
-  /// outGain should match; cutoff is expected to be a truncated gradient
-  /// (temporal recursion terms missing while biquad historyWrites are dangling).
+  /// Both outGain and cutoff must match even though spectral loss places the
+  /// upstream gradient in kernels between the forward filter and its adjoint.
   func testLinearLossFDComparison() throws {
     let frameCount = 2048
     let sampleRate: Float = 44100.0
@@ -52,6 +52,7 @@ final class BPTTBiquadScratchTests: XCTestCase {
     let autoOut = built.outGain.grad?.data ?? .nan
     let autoCut = built.cutoff.grad?.data ?? .nan
 
+    var stableCutoffFD: Float = .nan
     for eps in [Float(3e-3), 1e-2] {
       let fdOut =
         (try lossSum(cutoffZ: z0, outGainV: 0.7 + eps)
@@ -59,8 +60,14 @@ final class BPTTBiquadScratchTests: XCTestCase {
       let fdCut =
         (try lossSum(cutoffZ: z0 + eps, outGainV: 0.7)
           - lossSum(cutoffZ: z0 - eps, outGainV: 0.7)) / (2 * eps)
+      if eps == 1e-2 { stableCutoffFD = fdCut }
       print("[linfd] eps=\(eps) outGain fd=\(fdOut) auto=\(autoOut) | cutoff fd=\(fdCut) auto=\(autoCut)")
     }
+    XCTAssertEqual(
+      autoCut,
+      stableCutoffFD,
+      accuracy: max(abs(stableCutoffFD) * 0.05, 1e-5),
+      "Detached biquad adjoint must run in reverse frame order")
   }
 
   /// MSE (time-domain) loss keeps forward+backward in one scalar block, so

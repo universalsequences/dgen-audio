@@ -275,6 +275,13 @@ private func emitStandardBlockBodyUOps(
       ctx: ctx
     )
     hasOwnFrameLoop = true
+  } else if blockIsDetachedBPTTBackward(block: block, g: g) {
+    // Spectral and other multi-kernel losses materialize the upstream gradient
+    // before this backward-only block. The carry recurrence still has to run in
+    // reverse time even though its forward history writes live in an earlier
+    // kernel and cannot be wrapped together with this body.
+    bodyUops = wrapDetachedBPTTBackwardLoop(bodyUops)
+    hasOwnFrameLoop = true
   }
 
   return (uops: bodyUops, hasOwnFrameLoop: hasOwnFrameLoop)

@@ -307,6 +307,10 @@ extension LazyOp {
       .bufferViewGradStore, .bufferViewGradRead:
       try emitFFT(b: b, ctx: ctx, g: g, node: node, inputs: inputs, nodeId: nodeId)
 
+    case .temporalGradStore, .temporalGradScan, .temporalGradRead:
+      try emitTemporalGradient(
+        b: b, ctx: ctx, g: g, node: node, inputs: inputs, nodeId: nodeId)
+
     case .tensorNoise(let stateCell, let outputCell, let size):
       // Sequential loop over N elements, each advancing the shared xorshift
       // state and storing one independent random value into the current
@@ -468,7 +472,7 @@ extension LazyOp {
       try emitGemmStaged(b: b, ctx: ctx, g: g, node: node, nodeId: nodeId, ops: &ops)
 
     case .conv1d, .conv2d, .cumsum, .gather, .sum, .sumAxis, .sumMulAxis0, .gemmSmall, .maxAxis, .meanAxis, .reshape, .asStrided, .transpose, .shrink,
-      .pad, .expandView, .repeatView, .peek, .expand, .expandAxis, .gradPhasor:
+      .pad, .expandView, .repeatView, .peek, .expand, .expandAxis:
       try emitTensorOp(b: b, ctx: ctx, g: g, node: node, inputs: inputs, nodeId: nodeId, ops: &ops)
 
     case .memoryRead, .memoryWrite, .memoryAccumulate, .memoryCellSum, .tensorAccumulate,

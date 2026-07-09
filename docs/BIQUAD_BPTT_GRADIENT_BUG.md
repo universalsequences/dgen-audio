@@ -1,11 +1,11 @@
 # The Biquad "BPTT Bug": Gradient Carry-Cell Aliasing + Truncated IIR Gradients
 
-Status (2026-07-06):
+Status (updated 2026-07-09):
 - **Part A — carry-cell memory aliasing: FIXED** (one line in `Gradients.swift`)
 - **Part B — truncated temporal gradient through biquad state: FIXED** (see
   "Part B resolution" below — B1 pass-through rewiring plus four supporting
-  fixes it surfaced, including a pre-existing forward race and a selector
-  backward off-by-one)
+  fixes it surfaced, plus reverse scheduling for a detached backward block when
+  a multi-kernel loss separates it from the forward history loop)
 
 Discovered by the SynthID `--fdcheck` harness (`Examples/SynthID/FDCHECK_FINDING.md`).
 This document explains what actually happened, how to reproduce both parts, and
@@ -104,7 +104,7 @@ added to `Graph.persistentCells` at allocation time. Grep candidates when
 adding new gradient machinery: `alloc()` calls in Gradients.swift and
 GradientSetup.swift.
 
-## Part B (open): biquad parameter gradients are truncated in time
+## Part B (fixed): biquad parameter gradients were truncated in time
 
 With the aliasing fixed, other params' gradients are correct — but the
 gradient **for the biquad's own parameters** (cutoff/resonance/gain) only
@@ -211,7 +211,7 @@ More work, but self-contained, numerically standard, and doesn't stress the
 general BPTT machinery. Mirrors how `spectralLossFFT` implements its own
 backward instead of relying on generic autograd.
 
-### B3. Frequency-sampling surrogate filter for training
+### B3. Frequency-sampling surrogate filter for training (no longer required)
 
 For training use cases only: replace the time-domain biquad with a
 differentiable frequency-domain approximation (multiply the noise spectrum by
@@ -219,7 +219,8 @@ the biquad's magnitude response, which is a closed-form differentiable
 function of cutoff/resonance). DDSP does exactly this (FIR noise filtering via
 `buffer → conv2d`, already used in DDSPE2E/TrainKick808). Zero library work —
 this is the current **SynthID workaround**: `--no-noise-filter`, or model the
-noise tone with the existing FIR path.
+noise tone with the existing FIR path. The workaround is no longer required
+after detached carry blocks were changed to execute in reverse frame order.
 
 ### B4. Accept truncated gradients, but loudly
 
@@ -311,9 +312,8 @@ in `selector`).
   only) each compare against inline double-precision CPU references and are
   the fastest way to re-localize a future regression.
 - Spectral-loss case (`testLinearLossFDComparison`): outGain matches FD
-  exactly; cutoff autograd is now positive/finite but FD comparison there is
-  noise-limited (the loss is nearly flat in cutoff for that graph:
-  `l± ≈ 351.5±0.1` at eps 1e-2). Use the MSE tests for validation.
+  exactly and cutoff matches within 2% on the stable epsilon. The test now has
+  a permanent assertion guarding detached reverse-time scheduling.
 
 ## Timeline / cross-references
 

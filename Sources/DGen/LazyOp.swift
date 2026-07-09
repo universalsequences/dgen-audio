@@ -367,8 +367,16 @@ public enum LazyOp {
   case neg  // Unary negation: -x
   case expand(Shape)  // Broadcast scalar to tensor shape (sum backward)
   case expandAxis(Shape, Int)  // Broadcast along a specific axis (sumAxis backward)
-  case gradPhasor(NodeID)  // Gradient for phasor: needs frame index context
   case gradDeterministicPhasor  // Gradient for deterministic phasor
+  /// Stores a frame's upstream gradient and reset gate for a temporal reverse scan.
+  case temporalGradStore(
+    gradCell: CellID, resetCell: CellID, elementCount: Int)
+  /// Computes an exclusive, reset-aware suffix sum over stored frame gradients.
+  case temporalGradScan(
+    gradCell: CellID, resetCell: CellID, outputCell: CellID, elementCount: Int)
+  /// Reads one frame/element from a completed temporal gradient scan.
+  case temporalGradRead(
+    outputCell: CellID, shape: Shape, scaleBySampleRate: Bool)
 
   /// View-only ops: metadata transforms that emit no compute code.
   /// Used to skip these ops during shape transition detection, tensor block
@@ -424,6 +432,7 @@ public enum LazyOp {
       .phaseVocoderPitchShift,
       .overlapAdd, .overlapAddGradStore, .overlapAddGradGather,
       .bufferViewGradStore, .bufferViewGradRead,
+      .temporalGradStore, .temporalGradScan,
       .partitionedSpectralConvolve,
       .tensorNoise,
       .hopTensorNoise,

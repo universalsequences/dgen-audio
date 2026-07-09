@@ -146,6 +146,60 @@ extension Graph {
 
 // MARK: - LazyOp Backward Rules
 
+/// Builds the O(N) reverse scan used by stateful accumulator-style operators.
+///
+/// Both `phasor` and `accum` return the state *before* applying the current
+/// frame's increment. Therefore the increment gradient is the exclusive suffix
+/// sum of future output gradients. A reset at frame n discards increment n and
+/// cuts all contributions from frames after n, while output n still contributes
+/// to the state entering that frame.
+private func temporalIncrementGradient(
+  graph g: Graph,
+  node: Node,
+  gradOutput: NodeID,
+  scaleBySampleRate: Bool
+) -> NodeID {
+  let shape: Shape
+  switch node.shape ?? .scalar {
+  case .scalar:
+    shape = []
+  case .tensor(let tensorShape):
+    shape = tensorShape
+  }
+  let elementCount = max(1, shape.reduce(1, *))
+  let gradCell = g.alloc(vectorWidth: g.maxFrameCount * elementCount)
+  let resetCell = g.alloc(vectorWidth: g.maxFrameCount)
+  let outputCell = g.alloc(vectorWidth: g.maxFrameCount * elementCount)
+  // These tapes are read and written by separate kernels. Raw memory-cell
+  // dependencies are intentionally outside ordinary tensor liveness analysis,
+  // so keep buffer reuse from aliasing them onto other live gradient storage.
+  g.persistentCells.formUnion([gradCell, resetCell, outputCell])
+
+  let store = g.n(
+    .temporalGradStore(
+      gradCell: gradCell,
+      resetCell: resetCell,
+      elementCount: elementCount),
+    [gradOutput, node.inputs[1]])
+  g.addGradientSideEffect(store)
+
+  let scan = g.n(
+    .temporalGradScan(
+      gradCell: gradCell,
+      resetCell: resetCell,
+      outputCell: outputCell,
+      elementCount: elementCount),
+    [store])
+
+  return g.n(
+    .temporalGradRead(
+      outputCell: outputCell,
+      shape: shape,
+      scaleBySampleRate: scaleBySampleRate),
+    [scan],
+    shape: shape.isEmpty ? .scalar : .tensor(shape))
+}
+
 extension LazyOp {
 
   /// Returns gradient NodeIDs for each input (nil = no gradient / non-differentiable).
@@ -586,9 +640,13 @@ extension LazyOp {
     // MARK: Stateful Operations
 
     case .phasor(_):
-      // d(phase)/d(freq) = frameIndex / sampleRate
-      let sampleRate = g.n(.hostSampleRate, [])
-      return [g.n(.gradPhasor(node.id), [gradOutput, sampleRate])]
+      let gradFreq = temporalIncrementGradient(
+        graph: g,
+        node: node,
+        gradOutput: gradOutput,
+        scaleBySampleRate: true)
+      let zero = g.n(.constant(0.0), [])
+      return [gradFreq, zero]
 
     case .deterministicPhasor:
       // d(phase)/d(freq) = frameIndex / sampleRate
@@ -597,11 +655,14 @@ extension LazyOp {
       return [g.n(.gradDeterministicPhasor, [gradOutput, sampleRate])]
 
     case .accum(_):
-      // Accumulator gradient is complex due to temporal dependencies
-      // For now, pass gradient to increment input, zero to others
+      let gradIncrement = temporalIncrementGradient(
+        graph: g,
+        node: node,
+        gradOutput: gradOutput,
+        scaleBySampleRate: false)
       let zero = g.n(.constant(0.0), [])
       // inputs: [increment, reset, min, max]
-      return [gradOutput, zero, zero, zero]
+      return [gradIncrement, zero, zero, zero]
 
     case .latch(_):
       // Gradient flows through value when condition was true
@@ -1235,7 +1296,9 @@ extension LazyOp {
 
     // MARK: Non-differentiable compute ops
 
-    case .gradPhasor(_), .gradDeterministicPhasor, .gemm(_, _, _, _, _), .sumMulAxis0,
+    case .gradDeterministicPhasor,
+      .temporalGradStore, .temporalGradScan, .temporalGradRead,
+      .gemm(_, _, _, _, _), .sumMulAxis0,
       .gemmStaged(_, _, _, _, _, _, _, _),
       .gemmSmall(_, _, _, _, _),
       .gemmChunkPartials(_, _, _, _, _, _, _),
@@ -1389,5 +1452,4 @@ extension LazyOp {
 // case neg                           // Unary negation: -x
 // case expand(Shape)                 // Broadcast scalar to tensor shape
 // case expandAxis(Shape, Int)        // Broadcast along a specific axis
-// case gradPhasor(NodeID)            // Special gradient for phasor (needs frame index)
 // case gradDeterministicPhasor       // Special gradient for deterministic phasor

@@ -27,26 +27,28 @@ compares loss(tensor,tensor), loss(synth,synth), loss(synth,tensor). With the ol
 eps, two IDENTICAL synth graphs scored 2.56 against each other (waveform diff
 1e-5 from the transform round-trip).
 
-### 2. gradPhasor is wrong for swept frequency (WORKED AROUND — library bug open)
+### 2. Swept-frequency phasor gradient (FIXED — library)
 
-`Gradients.swift` case `.phasor` uses `d(phase)/d(freq) = frameIdx / sampleRate`
-(Emit+Tensor.swift `gradPhasor`). That rule is only correct for a CONSTANT
-frequency input. For time-varying freq, `phase[n] = Σ_{k≤n} f[k]/sr`, so the true
-per-sample gradient is a SUFFIX SUM: `∂L/∂f[k] = (1/sr)·Σ_{n≥k} gradPhase[n]`.
+The old `.phasor` gradient used
+`d(phase)/d(freq) = frameIdx / sampleRate`. That rule is only correct for a
+constant frequency shared across all frames. For a time-varying `freq[k]`, the
+correct per-sample derivative is a reset-aware exclusive suffix sum:
+`∂L/∂f[k] = (1/sr)·Σ_{n>k} gradPhase[n]` between reset boundaries.
 Measured effect on the pitch sweep: fStart autograd 12x too small, fEnd ~25% too
 large, pitchDecay 5x too small (fdcheck vs central differences).
 
-Workaround in Patch.swift: the body phase is now the closed-form integral of the
+The library now lowers `phasor` and `accum` increment gradients through a
+three-phase temporal adjoint: store the per-frame upstream gradient, perform an
+O(N) reset-aware exclusive suffix scan, then read the result per frame (with the
+phasor's `1/sampleRate` scale). Permanent finite-difference tests cover a swept
+phasor and an accumulator across a reset boundary.
+
+Patch.swift retains the equivalent closed-form integral of the
 pitch envelope built from the `accum` time ramp
 (`fEnd·t + (fStart-fEnd)/pd·(e^{pd·t}-1)`), and the click phase is `clickFreq·t`.
 All ops in those expressions have correct gradients; fdcheck for the pitch params
 now agrees in magnitude (residual ~20% is fd noise from L1 kinks — fd wobbles
 across eps while autograd is stable).
-
-Library follow-up (separate task): implement suffix-sum gradPhasor (needs a
-kernel boundary so gradOutput is materialized across frames; same pattern as
-`spectralLossFFTGradRead`). Note `accum`'s gradient has the same truncation
-(passes gradOutput through locally).
 
 ### 3. drive is exactly redundant (RESOLVED — spec updated intentionally)
 
@@ -61,14 +63,14 @@ SPEC.md §7.1 and Report.swift now score the products (bodyAmp·drive at 10%,
 clickAmp·drive and noiseAmp·drive at 20%) and list the factors unscored. This is
 the equivalence-class documentation the previous version of this file required.
 
-### 4. noiseCutoff gradient has the WRONG SIGN (OPEN — library bug)
+### 4. noiseCutoff gradient through spectral loss (FIXED — library)
 
-fdcheck at initial params, full config: fd = +0.498, autograd = -0.469. The
-biquad coefficient path (cutoff → coefficients → recursion) backpropagates with
-inverted sign, which explains noiseCutoff diverging from truth in every filtered
-run. `--no-noise-filter` remains the honest rung-1 configuration until this is
-fixed (see docs/BIQUAD_BPTT_GRADIENT_BUG.md for the related BPTT history).
-noiseAmp/noiseDecay gradients THROUGH the biquad are fine (fdcheck relErr ~1e-3).
+The coefficient formulas were not the remaining problem: they already matched
+finite differences under time-domain MSE. Spectral loss separated the forward
+filter and backward carry operations into different kernels, and the detached
+backward block was incorrectly scheduled from frame 0 → N-1. It now detects
+gradient carry reads/writes and runs N-1 → 0. The original SynthID filtered-noise
+repro now gives fd = 0.539601, autograd = 0.540170, relErr = 0.00105.
 
 ### 5. Learning rates were 10x below spec
 
@@ -137,11 +139,10 @@ misses only the loss-ratio gate by 20% (0.0241 vs 0.02).
 
 ## Remaining / follow-ups
 
-1. Library tasks to file: suffix-sum gradPhasor (+accum has the same
-   truncation), biquad cutoff gradient sign. Both have minimal repros via
-   `SynthID train --fdcheck`.
-2. Rung 2's numpy renderer must mirror the closed-form phase convention in
-   Patch.swift and omit the noise filter until the biquad gradient is fixed.
+1. Rung 2's numpy renderer must mirror the closed-form phase convention in
+   Patch.swift.
+2. Optional: rerun rung-1 acceptance with the noise filter enabled so
+   `noiseCutoff` is included in the scored parameter table.
 3. Optional: chase seed 2's last 20% of loss ratio (pure polish — all params
    already within tolerance).
 
@@ -151,6 +152,5 @@ misses only the loss-ratio gate by 20% (0.0241 vs 0.02).
   — not a tolerance loosening. Do not extend it to any non-degenerate parameter.
 - Do not select by a target-derived parameter score; training/selection stays on
   the audio loss.
-- Do not move to rung 2 until rung 1 passes the acceptance command (now including
-  `--no-noise-filter` until the biquad cutoff gradient is fixed; rung 2's numpy
-  renderer must then also omit the filter or the fix must land first).
+- Do not move to rung 2 until its independent NumPy renderer matches the
+  closed-form phase convention used by Patch.swift.

@@ -939,17 +939,6 @@ extension LazyOp {
         _ = b.memoryWrite(outTensor.cellId, b.cast(outIdx, to: .int), val)
       }
 
-    case .gradPhasor(_):
-      // Gradient for phasor: d(phase)/d(freq) = frameIndex / sampleRate
-      // inputs: [gradOutput, sampleRate]
-      // Use threadIndex() - the actual sample index, not decomposed frame index
-      guard inputs.count == 2 else { fatalError("gradPhasor requires 2 inputs") }
-      let gradOut = b.value(inputs[0])
-      let sampleRate = b.value(inputs[1])
-      let frameIdx = b.threadIndex()
-      let gradFreq = gradOut * frameIdx / sampleRate
-      b.use(val: gradFreq)
-
     default: break
     }
   }

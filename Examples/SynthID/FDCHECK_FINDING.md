@@ -1,12 +1,12 @@
 # SynthID fdcheck Finding
 
-## Status: RESOLVED (bug 1 fixed; bug 2 root-caused and partially fixed)
+## Status: RESOLVED
 
 > **Update 2026-07-06 (later same day):** Bug 2 was root-caused as gradient
 > carry-cell memory aliasing under buffer reuse — NOT a BPTT scheduling bug —
 > and fixed (one line: carry cells now registered in `persistentCells`).
-> A remaining, separate limitation is that biquad's own parameter gradients
-> are truncated in time. Full analysis, reproduction, and solution space:
+> The remaining biquad-parameter truncation was fixed on 2026-07-09 by running
+> detached gradient-carry blocks in reverse frame order. Full analysis:
 > `docs/BIQUAD_BPTT_GRADIENT_BUG.md`. The "Bug 2" section below is the
 > original isolation record.
 
@@ -46,7 +46,7 @@ Any code with learning rates tuned against the old scale needs retuning
 (`OptimizerTests.testSignalParamOnepoleSpectral` lr was recalibrated
 0.05 → 4e-6). SynthID LRs will need retuning downward similarly.
 
-## Bug 2 (OPEN): trainable param behind history feedback zeroes other gradients
+## Bug 2 (FIXED): trainable param behind history feedback zeroed other gradients
 
 `Signal.biquad` is a macro that expands into primitive ops plus four
 `historyRead`/`historyWrite` state cells. When any **gradient target sits
@@ -74,11 +74,11 @@ ampDecay 4.7% (at `--fd-eps 1e-2`), clickFreq 7% (at `--fd-eps 3e-3`, and FD
 converges toward autograd as eps shrinks — the frequency loss surface is
 oscillatory, so large eps leaves the linear regime).
 
-**Workaround for rung 1**: run with `--no-noise-filter` and drop `noiseCutoff`
-from the recovered-parameter table (exactly the fallback contemplated in
-SPEC.md §2). The exact-zero outGain gradient is a hard symptom to detect in
-training (Adam just stalls that param), so do not re-enable the filter until
-the BPTT/history interaction is fixed in the library.
+The carry-cell aliasing fix restored unrelated gradients. A second scheduling
+fix now handles the biquad's own parameters under multi-kernel losses: a
+backward-only block that reads and writes gradient carry cells executes in
+reverse frame order. The filtered SynthID cutoff check now matches finite
+differences to about 0.1% on the 2048-frame/256-window repro.
 
 ## Methodology issues in the original fdcheck runs
 
