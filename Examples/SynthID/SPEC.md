@@ -127,7 +127,7 @@ Notes:
 | --- | --- | --- | --- |
 | fStart | Hz | 80 – 180 | log |
 | fEnd | Hz | 35 – 60 | log |
-| pitchDecay | 1/s | -80 – -15 | raw (negative) |
+| pitchDecay | 1/s | -80 – -15 | log(-x) |
 | bodyAmp | lin | 0.5 – 1.0 | raw |
 | ampDecay | 1/s | -12 – -3 | raw |
 | clickFreq | Hz | 600 – 3000 | log |
@@ -180,6 +180,12 @@ Multi-resolution log-magnitude STFT only, via the existing
   for experimentation)
 - optionally add a linear-magnitude term (`useLogMagnitude: false`) at weight 0.1 —
   DDSP-paper parity — behind a flag, default on.
+- log-magnitude epsilon (spectral floor): `log(|X| + 1e-3)`, i.e. −60 dBFS for
+  peak-normalized signals (`--log-eps`). The floor defines what the loss gate in
+  §7.1 measures: audible spectral structure. Smaller epsilons make the loss
+  log-amplify inaudible noise-floor bins — at 1e-8 the loss at EXACT parameter
+  match is ~20% of init; even at 1e-4, parts-per-million pitch errors carry most
+  of the residual. Do not tighten the gate and loosen the floor independently.
 
 Explicitly banned: waveform MSE, first-difference/slope losses, zero-crossing
 metrics, band-energy "gates". Time-domain metrics may appear in *reports* for
@@ -265,11 +271,16 @@ For at least 4 of 5 seeds, best-of-3-restarts recovery must satisfy ALL of:
 
 - fStart, fEnd: within 3% relative error
 - pitchDecay, ampDecay: within 10% relative error
-- bodyAmp, outGain, drive: within 10% relative (amp/gain/drive trade off through
-  tanh; if identifiability is an issue, report the product `outGain·tanh-slope`
-  equivalence explicitly rather than loosening silently)
+- outGain: within 10% relative
+- bodyAmp·drive: within 10% relative; clickAmp·drive, noiseAmp·drive: within 20%
+  relative. The individual factors bodyAmp, clickAmp, noiseAmp, drive are NOT
+  scored: `tanh((bodyAmp·body + clickAmp·click + noiseAmp·noise)·drive)·outGain`
+  depends only on these products and outGain, so parameter sets with equal
+  products render bit-identical audio — the factors are unidentifiable in
+  principle (exact algebraic degeneracy, not a loss limitation). Reports list
+  the factors unscored for transparency.
 - clickFreq, noiseCutoff: within 10% relative
-- clickAmp, clickDecay, noiseAmp, noiseDecay: within 20% relative
+- clickDecay, noiseDecay: within 20% relative
 - final MR-STFT loss ≤ 0.02 × loss-at-init (two orders of magnitude reduction)
 
 If a specific parameter systematically fails, that is a *finding about the

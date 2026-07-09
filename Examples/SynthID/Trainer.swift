@@ -25,6 +25,7 @@ struct FDCheckResult: Codable {
   var epsilon: Float
   var baseNaturalValue: Float
   var baseTransformedValue: Float
+  var baseLoss: Float
   var lossMinus: Float
   var lossPlus: Float
   var finiteDifferenceGrad: Float
@@ -44,7 +45,8 @@ final class SynthIDTrainer {
     targetSamples rawTargetSamples: [Float],
     outDir: URL?,
     trueParams: PatchValues?,
-    restartIndex: Int = 0
+    restartIndex: Int = 0,
+    initialOverride: PatchValues? = nil
   ) throws -> TrainingRunResult {
     let resolvedConfig = config
     resolvedConfig.applyRuntime()
@@ -54,7 +56,8 @@ final class SynthIDTrainer {
       frames: resolvedConfig.frames)
     let pitchPoints = PitchTrack.extract(samples: targetSamples, sampleRate: resolvedConfig.sampleRate)
     let pitchFit = PitchTrack.fit(samples: targetSamples, sampleRate: resolvedConfig.sampleRate)
-    let initial = restartInitial(pitchFit: pitchFit, restartIndex: restartIndex)
+    let initial =
+      initialOverride ?? restartInitial(pitchFit: pitchFit, restartIndex: restartIndex)
 
     LazyGraphContext.reset()
     let targetTensor = Tensor(targetSamples)
@@ -67,15 +70,23 @@ final class SynthIDTrainer {
       params: params.trainableStorage(names: ["fStart", "fEnd", "pitchDecay"]),
       lr: resolvedConfig.pitchLR)
     let ampOpt = Adam(
-      params: params.trainableStorage(names: ["bodyAmp", "clickAmp", "noiseAmp", "outGain"]),
+      params: params.trainableStorage(names: ["bodyAmp", "clickAmp", "outGain"]),
       lr: resolvedConfig.ampLR)
     let decayOpt = Adam(
       params: params.trainableStorage(names: ["ampDecay", "clickDecay", "noiseDecay"]),
       lr: resolvedConfig.decayLR)
+    let noiseOpt = Adam(
+      params: params.trainableStorage(names: ["noiseAmp"]),
+      lr: resolvedConfig.noiseLR)
+    var toneNames = ["clickFreq", "drive"]
+    if resolvedConfig.enableNoiseFilter {
+      toneNames.append("noiseCutoff")
+    }
     let toneOpt = Adam(
-      params: params.trainableStorage(names: ["clickFreq", "noiseCutoff", "drive"]),
+      params: params.trainableStorage(names: toneNames),
       lr: resolvedConfig.toneLR)
-    let optimizers = [pitchOpt, ampOpt, decayOpt, toneOpt]
+    let optimizers = [pitchOpt, ampOpt, decayOpt, noiseOpt, toneOpt]
+    let baseLRs = optimizers.map(\.lr)
 
     func buildTarget() -> Signal {
       targetTensor.toSignal(maxFrames: resolvedConfig.frames)
@@ -157,11 +168,46 @@ final class SynthIDTrainer {
       }
 
       params.clipGradients(maxAbs: resolvedConfig.gradClip)
+      if resolvedConfig.cosineLRDecay {
+        // Adam's late-training oscillation floor scales with lr; anneal so the
+        // final epochs settle into the minimum instead of orbiting it.
+        let progress = Float(epoch) / Float(max(1, resolvedConfig.epochs - 1))
+        let scale = 0.05 + 0.95 * 0.5 * (1.0 + Foundation.cos(Float.pi * progress))
+        for (opt, base) in zip(optimizers, baseLRs) { opt.lr = base * scale }
+      }
       for opt in optimizers { opt.step() }
       for opt in optimizers { opt.zeroGrad() }
     }
 
     params.apply(natural: bestParams)
+
+    // Pitch refinement: the log-magnitude loss is far sharper in the pitch trio
+    // than in any other parameter (sub-1% pitch error can carry ~90% of the
+    // residual loss). Descend the 3-D pitch subspace alone from the best point;
+    // the other groups stay fixed so their basins cannot be disturbed.
+    if resolvedConfig.pitchRefineEpochs > 0 && !resolvedConfig.freezePitch {
+      let refineBase = resolvedConfig.pitchLR * 0.3
+      for epoch in 0..<resolvedConfig.pitchRefineEpochs {
+        let lossValues = try buildLoss().backward(frames: resolvedConfig.frames)
+        let epochLoss = lossValues.reduce(0, +)
+        losses.append(epochLoss)
+        if epochLoss < bestLoss {
+          bestLoss = epochLoss
+          bestEpoch = resolvedConfig.epochs + epoch
+          bestParams = params.naturalValues()
+        }
+        guard epochLoss.isFinite else { break }
+        params.clipGradients(maxAbs: resolvedConfig.gradClip)
+        let progress = Float(epoch) / Float(max(1, resolvedConfig.pitchRefineEpochs - 1))
+        pitchOpt.lr = refineBase * (0.02 + 0.98 * 0.5 * (1.0 + Foundation.cos(Float.pi * progress)))
+        pitchOpt.step()
+        for opt in optimizers { opt.zeroGrad() }
+        if resolvedConfig.logEvery > 0 && epoch % resolvedConfig.logEvery == 0 {
+          print("refine epoch=\(epoch) loss=\(String(format: "%.6f", epochLoss))")
+        }
+      }
+      params.apply(natural: bestParams)
+    }
 
     if let outDir {
       try writeCheckpoint(
@@ -216,6 +262,7 @@ final class SynthIDTrainer {
     plus[paramName] = spec.inverse(baseZ + eps)
     plus = plus.clamped()
 
+    let baseLoss = try lossFor(values: initial, targetSamples: targetSamples, config: resolvedConfig)
     let lossMinus = try lossFor(values: minus, targetSamples: targetSamples, config: resolvedConfig)
     let lossPlus = try lossFor(values: plus, targetSamples: targetSamples, config: resolvedConfig)
     let fdGrad = (lossPlus - lossMinus) / (2.0 * eps)
@@ -231,6 +278,7 @@ final class SynthIDTrainer {
       epsilon: eps,
       baseNaturalValue: initial[paramName],
       baseTransformedValue: baseZ,
+      baseLoss: baseLoss,
       lossMinus: lossMinus,
       lossPlus: lossPlus,
       finiteDifferenceGrad: fdGrad,
@@ -246,16 +294,33 @@ final class SynthIDTrainer {
 
   private func restartInitial(pitchFit: PitchFit, restartIndex: Int) -> PatchValues {
     var values = PatchValues.midpoint.withPitch(pitchFit)
-    guard restartIndex > 0 else { return values }
-    var rng = SplitMix64(seed: config.seed &+ UInt64(10_000 + restartIndex * 997))
-    for spec in KickParamSpecs.all {
-      if ["fStart", "fEnd", "pitchDecay"].contains(spec.name) { continue }
-      let span = spec.max - spec.min
-      let jitter = (rng.unit() - 0.5) * 0.30 * span
-      values[spec.name] = Swift.min(Swift.max(values[spec.name] + jitter, spec.min), spec.max)
+    // Window smearing makes the CPU contour fit see a slower, lower sweep, so
+    // it underestimates |pitchDecay| and fStart together (worst on fast
+    // sweeps). Bracket both coherently across the first three restarts, all
+    // with midpoint amps so best-of-N loss selection compares pitch basins on
+    // equal footing. fEnd stays anchored — the tail measurement is reliable.
+    // r1 (mild) and r3 (strong) both correct the fast-sweep underestimate;
+    // which lands depends on how fast the true sweep is, and best-of-N picks.
+    let pdScales: [Float] = [1.0, 1.45, 0.75, 1.45]
+    let fStartScales: [Float] = [1.0, 1.10, 0.92, 1.22]
+    if restartIndex < pdScales.count {
+      values.pitchDecay *= pdScales[restartIndex]
+      values.fStart *= fStartScales[restartIndex]
+    } else {
+      var rng = SplitMix64(seed: config.seed &+ UInt64(10_000 + restartIndex * 997))
+      for spec in KickParamSpecs.all {
+        if ["fStart", "fEnd", "pitchDecay"].contains(spec.name) { continue }
+        values[spec.name] = rng.uniform(spec.min, spec.max)
+      }
+      values.pitchDecay *= Foundation.exp(rng.uniform(-0.4, 0.4))
+      values.fStart *= Foundation.exp(rng.uniform(-0.1, 0.1))
+      if values.noiseAmp <= 0 { values.noiseAmp = 0.02 }
+      if values.clickAmp <= 0 { values.clickAmp = 0.05 }
     }
-    if values.noiseAmp <= 0 { values.noiseAmp = 0.02 }
-    if values.clickAmp <= 0 { values.clickAmp = 0.05 }
+    // Never initialize a param ON its trainable bound: projected Adam plus
+    // compensation by other params forms a sticky local minimum there
+    // (observed: fit pd = -15 exactly, recovery pinned at -15 all run).
+    values.pitchDecay = Swift.min(Swift.max(values.pitchDecay, -76), -17)
     return values.clamped()
   }
 
@@ -283,6 +348,17 @@ final class SynthIDTrainer {
       text += "\(epoch),\(loss)\n"
     }
     try text.write(to: url, atomically: true, encoding: .utf8)
+  }
+
+  /// Evaluate the training loss for explicit parameter values against a target
+  /// already normalized/padded the way `train` does it.
+  func evaluateLoss(values: PatchValues, targetSamples rawTargetSamples: [Float]) throws -> Float {
+    let resolvedConfig = config
+    resolvedConfig.applyRuntime()
+    let targetSamples = fitOrPad(
+      peakNormalized(rawTargetSamples, peak: resolvedConfig.peakNormalizeTo),
+      frames: resolvedConfig.frames)
+    return try lossFor(values: values, targetSamples: targetSamples, config: resolvedConfig)
   }
 
   private func lossFor(values: PatchValues, targetSamples: [Float], config: SynthIDConfig) throws

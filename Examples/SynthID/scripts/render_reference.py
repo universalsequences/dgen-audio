@@ -21,7 +21,7 @@ def render(params, frames=32768, sample_rate=44100):
     click_phase = phasor(np.full(frames, params["clickFreq"], dtype=np.float32), sample_rate)
     click = np.sin(2.0 * math.pi * click_phase) * np.exp(params["clickDecay"] * t) * params["clickAmp"]
 
-    noise = dgen_noise(frames)
+    noise = dgen_noise(frames) * 2.0 - 1.0
     noise = lowpass_biquad(noise, params["noiseCutoff"], 0.707, 1.0, sample_rate)
     noise_burst = noise * np.exp(params["noiseDecay"] * t) * params["noiseAmp"]
 

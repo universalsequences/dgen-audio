@@ -61,7 +61,10 @@ enum KickParamSpecs {
   static let all: [ParameterSpec] = [
     .init(name: "fStart", unit: "Hz", min: 80, max: 180, reparam: .log, tolerance: 0.03),
     .init(name: "fEnd", unit: "Hz", min: 35, max: 60, reparam: .log, tolerance: 0.03),
-    .init(name: "pitchDecay", unit: "1/s", min: -80, max: -15, reparam: .raw, tolerance: 0.10),
+    // logNegative, not raw: in the pitch group (small LR) a raw value at scale ~20
+    // can only travel ~0.4% over a run — pitchDecay froze at init and fStart
+    // equilibrated at a compensating wrong value (seed-7 plateau at fStart≈124).
+    .init(name: "pitchDecay", unit: "1/s", min: -80, max: -15, reparam: .logNegative, tolerance: 0.10),
     .init(name: "bodyAmp", unit: "lin", min: 0.5, max: 1.0, reparam: .raw, tolerance: 0.10),
     .init(name: "ampDecay", unit: "1/s", min: -12, max: -3, reparam: .raw, tolerance: 0.10),
     .init(name: "clickFreq", unit: "Hz", min: 600, max: 3000, reparam: .log, tolerance: 0.10),

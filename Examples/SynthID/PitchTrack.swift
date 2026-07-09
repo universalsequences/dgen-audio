@@ -14,11 +14,14 @@ struct PitchFit: Codable {
 }
 
 enum PitchTrack {
+  // Window must cover ~2 periods of minHz (44100/30 = 1470-sample lag needs
+  // >= 4096-sample windows); 1024 windows cannot correlate the 35-60 Hz fEnd
+  // band at all and latch onto spurious high-frequency peaks.
   static func extract(
     samples: [Float],
     sampleRate: Float,
-    windowSize: Int = 1024,
-    hop: Int = 256,
+    windowSize: Int = 4096,
+    hop: Int = 512,
     minHz: Float = 30,
     maxHz: Float = 300
   ) -> [PitchPoint] {
@@ -85,7 +88,40 @@ enum PitchTrack {
     return points
   }
 
-  static func fit(points: [PitchPoint]) -> PitchFit {
+  /// Estimate fEnd from the tail of the signal, where the body has settled to a
+  /// quasi-stationary sine at fEnd for hundreds of milliseconds. Long-window
+  /// autocorrelation there is far more reliable than any point of the swept
+  /// contour (sub-1% vs several %).
+  static func tailFEnd(
+    samples: [Float],
+    sampleRate: Float,
+    minHz: Float = 30,
+    maxHz: Float = 70
+  ) -> PitchPoint? {
+    let n = samples.count
+    let windowSize = Swift.min(16384, n / 2)
+    guard Float(windowSize) > 2.2 * sampleRate / minHz else { return nil }
+    let startAt = Swift.max(0, Int(Float(n) * 0.5))
+    let tail = Array(samples[startAt...])
+    let points = extract(
+      samples: tail,
+      sampleRate: sampleRate,
+      windowSize: windowSize,
+      hop: 2048,
+      minHz: minHz,
+      maxHz: maxHz)
+    guard !points.isEmpty else { return nil }
+    let sorted = points.map(\.hz).sorted()
+    let median = sorted[sorted.count / 2]
+    let confidence = points.map(\.confidence).max() ?? 0
+    return PitchPoint(time: Float(startAt) / sampleRate, hz: median, confidence: confidence)
+  }
+
+  static func fit(
+    points: [PitchPoint],
+    fEndRange: ClosedRange<Float>? = nil,
+    fEndStep: Float = 0.5
+  ) -> PitchFit {
     let candidates = points
       .filter { $0.time <= 0.25 && $0.hz >= 30 && $0.hz <= 300 && $0.confidence > 0.2 }
       .prefix(64)
@@ -107,7 +143,9 @@ enum PitchTrack {
     }
 
     var best = PitchFit(fStart: 120, fEnd: 45, pitchDecay: -35, error: .infinity)
-    let fEndSteps = stride(from: Float(35), through: Float(60), by: Float(0.5))
+    let fEndLo = Swift.max(Float(35), fEndRange?.lowerBound ?? 35)
+    let fEndHi = Swift.min(Float(60), fEndRange?.upperBound ?? 60)
+    let fEndSteps = stride(from: fEndLo, through: fEndHi, by: fEndStep)
     let decaySteps = stride(from: Float(-80), through: Float(-15), by: Float(1.0))
 
     for fEnd in fEndSteps {
@@ -142,30 +180,34 @@ enum PitchTrack {
   }
 
   static func fit(samples: [Float], sampleRate: Float) -> PitchFit {
-    let primary = fit(points: extract(samples: samples, sampleRate: sampleRate))
-    if primary.error.isFinite,
-      primary.error < 400,
-      primary.fStart > 80.1,
-      primary.fStart < 179.9,
-      primary.fEnd > 35.1,
-      primary.fEnd < 59.9,
-      primary.pitchDecay > -79.9,
-      primary.pitchDecay < -15.1
-    {
-      return primary
+    // Contour extraction favors time resolution for the fast early sweep
+    // (fStart/pitchDecay); 2048-sample windows only support >= ~50 Hz, which is
+    // fine because fEnd comes from the long-window tail anchor below.
+    let points = extract(
+      samples: samples,
+      sampleRate: sampleRate,
+      windowSize: 2048,
+      hop: 256,
+      minHz: 50,
+      maxHz: 300)
+    let tail = tailFEnd(samples: samples, sampleRate: sampleRate)
+    if let tail, tail.confidence > 0.5 {
+      // The tail anchor is accurate to ~0.1%; the swept-contour error metric is
+      // biased upward near fEnd (window smearing), so give it almost no say.
+      let anchored = fit(
+        points: points,
+        fEndRange: (tail.hz - 0.25)...(tail.hz + 0.25),
+        fEndStep: 0.1)
+      if anchored.error.isFinite {
+        return anchored
+      }
+      // No usable contour points: still trust the tail measurement for fEnd.
+      return PitchFit(
+        fStart: 120,
+        fEnd: Swift.min(Swift.max(tail.hz, 35), 60),
+        pitchDecay: -35,
+        error: .infinity)
     }
-
-    let lowFrequencyFallback = fit(
-      points: extract(
-        samples: samples,
-        sampleRate: sampleRate,
-        windowSize: 2048,
-        hop: 256,
-        minHz: 30,
-        maxHz: 300))
-    if lowFrequencyFallback.error < primary.error {
-      return lowFrequencyFallback
-    }
-    return primary
+    return fit(points: points)
   }
 }

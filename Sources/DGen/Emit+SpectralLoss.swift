@@ -35,7 +35,7 @@ extension LazyOp {
       let winSizeFloat = b.constant(Float(windowSize))
       let zero = b.constant(0.0)
       let one = b.constant(1.0)
-      let eps = b.constant(1e-8)
+      let logEps = b.constant(DGenSpectralConfig.logMagnitudeEpsilon)
       let frameIdx = b.frameIndex()
 
       // Hop-compressed index: with hop > 1, spectral cells are indexed by hop window, not frame
@@ -174,7 +174,7 @@ extension LazyOp {
           let mag2 = b.memoryRead(mag2Cell, magBaseOffset + kInt)
           let diff =
             useLogMagnitude
-            ? (b.log(mag1 + eps) - b.log(mag2 + eps))
+            ? (b.log(mag1 + logEps) - b.log(mag2 + logEps))
             : (mag1 - mag2)
           if lossMode == .l1 {
             loss.accumulate(b.abs(diff))
@@ -204,6 +204,7 @@ extension LazyOp {
       let imagOffset = windowSize
       let gradOutput = b.value(inputs[0])
       let hopCounter: Expr? = inputs.count > 3 ? b.value(inputs[3]) : nil
+      let logEps = b.constant(DGenSpectralConfig.logMagnitudeEpsilon)
       let eps = b.constant(1e-8)
       let frameIdx = b.frameIndex()
       let zero = b.constant(0.0)
@@ -234,9 +235,9 @@ extension LazyOp {
           let gradMag1: Expr
           let gradMag2: Expr
           if useLogMagnitude {
-            let logDiff = b.log(mag1 + eps) - b.log(mag2 + eps)
-            let invLogDenom1 = b.constant(1.0) / (mag1 + eps)
-            let invLogDenom2 = b.constant(1.0) / (mag2 + eps)
+            let logDiff = b.log(mag1 + logEps) - b.log(mag2 + logEps)
+            let invLogDenom1 = b.constant(1.0) / (mag1 + logEps)
+            let invLogDenom2 = b.constant(1.0) / (mag2 + logEps)
             let logScale =
               lossMode == .l1
               ? b.sign(logDiff)
@@ -738,7 +739,7 @@ extension LazyOp {
       let winSizeFloat = b.constant(Float(windowSize))
       let zero = b.constant(0.0)
       let one = b.constant(1.0)
-      let eps = b.constant(1e-8)
+      let logEps = b.constant(DGenSpectralConfig.logMagnitudeEpsilon)
       let (frameIdx, batchIdx) = b.setupFlatThreading(tensorSize: batchSize)
       let batchIdx_int = b.cast(batchIdx, to: .int)
       let frameCount = b.frameCount()
@@ -887,7 +888,7 @@ extension LazyOp {
           let mag2 = b.memoryRead(mag2Cell, magBaseOffset + kInt)
           let diff =
             useLogMagnitude
-            ? (b.log(mag1 + eps) - b.log(mag2 + eps))
+            ? (b.log(mag1 + logEps) - b.log(mag2 + logEps))
             : (mag1 - mag2)
           if lossMode == .l1 {
             batchLoss.accumulate(b.abs(diff))
@@ -941,6 +942,7 @@ extension LazyOp {
       let imagOffset = windowSize
       let gradOutput = b.value(inputs[0])
       let hopCounter: Expr? = inputs.count > 3 ? b.value(inputs[3]) : nil
+      let logEps = b.constant(DGenSpectralConfig.logMagnitudeEpsilon)
       let eps = b.constant(1e-8)
       let (frameIdx, batchIdx) = b.setupFlatThreading(tensorSize: batchSize)
       let batchIdx_int = b.cast(batchIdx, to: .int)
@@ -973,9 +975,9 @@ extension LazyOp {
           let gradMag1: Expr
           let gradMag2: Expr
           if useLogMagnitude {
-            let logDiff = b.log(mag1 + eps) - b.log(mag2 + eps)
-            let invLogDenom1 = b.constant(1.0) / (mag1 + eps)
-            let invLogDenom2 = b.constant(1.0) / (mag2 + eps)
+            let logDiff = b.log(mag1 + logEps) - b.log(mag2 + logEps)
+            let invLogDenom1 = b.constant(1.0) / (mag1 + logEps)
+            let invLogDenom2 = b.constant(1.0) / (mag2 + logEps)
             let logScale =
               lossMode == .l1
               ? b.sign(logDiff)

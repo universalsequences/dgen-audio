@@ -10,14 +10,23 @@ enum KickVoice {
       min: 0.0,
       max: Float(config.frames + 1) / config.sampleRate)
 
-    let pitchEnv = params.fEnd + (params.fStart - params.fEnd) * DGenLazy.exp(params.pitchDecay * t)
-    let bodyPhase = Signal.statefulPhasor(pitchEnv) * (2.0 * Float.pi)
-    let body = DGenLazy.sin(bodyPhase) * DGenLazy.exp(params.ampDecay * t) * params.bodyAmp
+    // Closed-form phase of the exponential pitch sweep:
+    //   ∫ (fEnd + (fStart - fEnd)·e^{pd·τ}) dτ = fEnd·t + (fStart - fEnd)/pd · (e^{pd·t} - 1)
+    // Built from the accum time ramp instead of statefulPhasor because gradPhasor
+    // applies the constant-frequency rule d(phase)/d(freq) = frameIdx/sr, which is
+    // wrong for swept frequency input (fdcheck: fStart autograd 12x low, fEnd 25% high).
+    let sweepPhase =
+      params.fEnd * t
+      + (params.fStart - params.fEnd) / params.pitchDecay
+        * (DGenLazy.exp(params.pitchDecay * t) - 1.0)
+    let body =
+      DGenLazy.sin(sweepPhase * (2.0 * Float.pi)) * DGenLazy.exp(params.ampDecay * t)
+      * params.bodyAmp
 
-    let clickPhase = Signal.statefulPhasor(params.clickFreq) * (2.0 * Float.pi)
+    let clickPhase = params.clickFreq * t * (2.0 * Float.pi)
     let click = DGenLazy.sin(clickPhase) * DGenLazy.exp(params.clickDecay * t) * params.clickAmp
 
-    var noise = Signal.noise()
+    var noise = Signal.noise() * 2.0 - 1.0
     if config.enableNoiseFilter {
       noise = noise.biquad(
         cutoff: params.noiseCutoff,
