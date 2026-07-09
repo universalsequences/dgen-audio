@@ -84,7 +84,7 @@ enum SynthIDCLI {
       targetSamples: samples,
       outDir: outDir,
       trueParams: trueParams)
-    try renderLearnedAndReport(
+    _ = try renderLearnedAndReport(
       result: result,
       trueParams: trueParams,
       targetSamples: samples,
@@ -113,155 +113,32 @@ enum SynthIDCLI {
       var seedConfig = config
       seedConfig.seed = UInt64(seed)
       let sampledParams = PatchValues.sample(seed: UInt64(seed))
-      var trueParams = sampledParams
       try writeJSON(sampledParams, to: seedDir.appendingPathComponent("sampled_params.json"))
 
       let rawTarget = try KickVoice.render(
         values: sampledParams,
         config: seedConfig,
         parameterBacked: true)
-      let normalizationScale = peakNormalizationScale(rawTarget, peak: seedConfig.peakNormalizeTo)
-      let normalizedOutGain = trueParams.outGain * normalizationScale
-      let outGainSpec = KickParamSpecs.byName["outGain"]!
-      guard normalizedOutGain >= outGainSpec.min && normalizedOutGain <= outGainSpec.max else {
-        throw SynthIDError.message(
-          "rung1 seed \(seed) normalization would set outGain=\(normalizedOutGain), outside \(outGainSpec.min)...\(outGainSpec.max)")
-      }
-      trueParams.outGain = normalizedOutGain
-      try writeJSON(trueParams, to: seedDir.appendingPathComponent("true_params.json"))
-
-      let target = rawTarget.map { $0 * normalizationScale }
+      let normalized = try normalizeTarget(
+        rawTarget,
+        params: sampledParams,
+        config: seedConfig,
+        context: "rung1 seed \(seed)")
+      try writeJSON(normalized.params, to: seedDir.appendingPathComponent("true_params.json"))
       try AudioFile.save(
         url: seedDir.appendingPathComponent("target.wav"),
-        samples: target,
+        samples: normalized.samples,
         sampleRate: seedConfig.sampleRate)
 
-      var bestResult: TrainingRunResult?
-      var bestRestartDir: URL?
-      var allResults: [TrainingRunResult] = []
-      for restart in 0..<max(1, seedConfig.restarts) {
-        let restartDir = seedDir.appendingPathComponent("restart-\(restart)")
-        let result = try SynthIDTrainer(config: seedConfig).train(
-          targetSamples: target,
-          outDir: restartDir,
-          trueParams: trueParams,
-          restartIndex: restart)
-        allResults.append(result)
-        if bestResult == nil || result.bestLoss < bestResult!.bestLoss {
-          bestResult = result
-          bestRestartDir = restartDir
-        }
-      }
-      guard var result = bestResult else {
-        throw SynthIDError.message("no rung1 result for seed \(seed)")
-      }
-
-      // Cross-restart recombination: restarts often solve different subspaces
-      // (one nails pitch, another nails the click). Greedily stitch subspaces
-      // across restarts, keeping any swap that lowers the audio loss, then
-      // fine-tune the stitched candidate. Selection is by audio loss only.
-      if allResults.count > 1 {
-        let trainer = SynthIDTrainer(config: seedConfig)
-        let subspaces: [[String]] = [
-          ["clickFreq", "clickAmp", "clickDecay"],
-          ["fStart", "fEnd", "pitchDecay"],
-          ["noiseAmp", "noiseDecay"],
-          ["bodyAmp", "drive", "outGain"],
-        ]
-        var stitched = result.recovered
-        var stitchedLoss = try trainer.evaluateLoss(values: stitched, targetSamples: target)
-        var improved = false
-        for donor in allResults {
-          for subspace in subspaces {
-            var candidate = stitched
-            for name in subspace { candidate[name] = donor.recovered[name] }
-            let loss = try trainer.evaluateLoss(values: candidate, targetSamples: target)
-            if loss < stitchedLoss {
-              stitched = candidate
-              stitchedLoss = loss
-              improved = true
-            }
-          }
-        }
-        // clickFreq line search: the click is a milliseconds-long broadband
-        // burst, so its loss landscape is rippled and gradient descent stalls
-        // in side lobes (observed: every restart stuck at ~1550 Hz vs true
-        // 2127 Hz). A coarse global search on this one axis, judged by the
-        // same audio loss, then fine-tuned below, is restart-style mitigation.
-        let cfSpec = KickParamSpecs.byName["clickFreq"]!
-        let cfSteps = 24
-        for i in 0...cfSteps {
-          let t = Float(i) / Float(cfSteps)
-          let cf = cfSpec.min * Foundation.exp(t * Foundation.log(cfSpec.max / cfSpec.min))
-          var candidate = stitched
-          candidate.clickFreq = cf
-          let loss = try trainer.evaluateLoss(values: candidate, targetSamples: target)
-          if loss < stitchedLoss {
-            stitched = candidate
-            stitchedLoss = loss
-            improved = true
-          }
-        }
-        if improved {
-          var tuneConfig = seedConfig
-          tuneConfig.epochs = max(200, seedConfig.epochs / 3)
-          let stitchDir = seedDir.appendingPathComponent("restart-stitch")
-          let tuned = try SynthIDTrainer(config: tuneConfig).train(
-            targetSamples: target,
-            outDir: stitchDir,
-            trueParams: trueParams,
-            initialOverride: stitched)
-          print(
-            "  stitch: base=\(String(format: "%.5f", result.bestLoss)) stitched=\(String(format: "%.5f", stitchedLoss)) tuned=\(String(format: "%.5f", tuned.bestLoss))"
-          )
-          if tuned.bestLoss < result.bestLoss {
-            // Keep the original restart's init loss so the §7.1 ratio still
-            // compares against a genuine cold start, not the stitched warm start.
-            result = TrainingRunResult(
-              recovered: tuned.recovered,
-              initial: result.initial,
-              pitchFit: result.pitchFit,
-              initLoss: result.initLoss,
-              bestLoss: tuned.bestLoss,
-              bestEpoch: tuned.bestEpoch,
-              losses: result.losses + tuned.losses)
-            bestRestartDir = stitchDir
-          }
-        }
-      }
-      if let bestRestartDir {
-        try copyIfPresent(
-          from: bestRestartDir.appendingPathComponent("checkpoint.json"),
-          to: seedDir.appendingPathComponent("checkpoint.json"))
-        try copyIfPresent(
-          from: bestRestartDir.appendingPathComponent("loss_curve.csv"),
-          to: seedDir.appendingPathComponent("loss_curve.csv"))
-        try copyIfPresent(
-          from: bestRestartDir.appendingPathComponent("initial_params.json"),
-          to: seedDir.appendingPathComponent("initial_params.json"))
-        try copyIfPresent(
-          from: bestRestartDir.appendingPathComponent("pitch_fit.json"),
-          to: seedDir.appendingPathComponent("pitch_fit.json"))
-        try copyIfPresent(
-          from: bestRestartDir.appendingPathComponent("pitch_points.json"),
-          to: seedDir.appendingPathComponent("pitch_points.json"))
-      }
-      try writeJSON(result.recovered, to: seedDir.appendingPathComponent("recovered_params.json"))
-      try renderLearnedAndReport(
-        result: result,
-        trueParams: trueParams,
-        targetSamples: target,
+      let report = try recoverTarget(
+        samples: normalized.samples,
+        trueParams: normalized.params,
         config: seedConfig,
-        outDir: seedDir)
-      let report = ReportWriter.make(
-        rung: 1,
-        trueParams: trueParams,
-        recovered: result.recovered,
-        initLoss: result.initLoss,
-        finalLoss: result.bestLoss,
-        includeNoiseCutoff: seedConfig.enableNoiseFilter)
+        outDir: seedDir,
+        context: "rung1 seed \(seed)")
       if report.pass { passed += 1 }
-      print("seed=\(seed) pass=\(report.pass) bestLoss=\(String(format: "%.6f", result.bestLoss))")
+      print(
+        "seed=\(seed) pass=\(report.pass) lossRatio=\(String(format: "%.6f", report.lossRatio))")
     }
 
     let requiredPasses = seeds.count >= 5 ? 4 : seeds.count
@@ -358,12 +235,320 @@ enum SynthIDCLI {
   }
 
   private static func rung2(options: [String: String]) throws {
-    guard options["params"] != nil else {
-      throw SynthIDError.message("rung2 requires --params <json> with external renderer truth")
+    guard let outPath = options["out"] else {
+      throw SynthIDError.message("rung2 requires --out <dir>")
     }
-    var withRung = options
-    withRung["rung"] = "2"
-    try train(options: withRung)
+    var config = try loadConfig(url: options["config"].map { URL(fileURLWithPath: $0) })
+    try config.applyCLI(options)
+    config.rung = 2
+    config.applyRuntime()
+
+    let root = URL(fileURLWithPath: outPath)
+    try ensureDirectory(root)
+    let verifyOnly = options.keys.contains("verify-only")
+    let manualTarget = options["target"].map { URL(fileURLWithPath: $0) }
+    let manualParams = options["params"].map { URL(fileURLWithPath: $0) }
+    guard (manualTarget == nil) == (manualParams == nil) else {
+      throw SynthIDError.message("rung2 requires --target and --params together")
+    }
+
+    if let targetURL = manualTarget, let paramsURL = manualParams {
+      let sampledParams = try loadPatchValues(from: paramsURL)
+      let (referenceSamples, sampleRate) = try AudioFile.load(url: targetURL)
+      try requireSampleRate(sampleRate, config: config, context: "rung2 external target")
+      try writeJSON(sampledParams, to: root.appendingPathComponent("sampled_params.json"))
+      try AudioFile.save(
+        url: root.appendingPathComponent("reference_raw.wav"),
+        samples: referenceSamples,
+        sampleRate: config.sampleRate)
+      try verifyReferenceRenderer(
+        params: sampledParams,
+        referenceSamples: referenceSamples,
+        config: config,
+        outDir: root,
+        context: "rung2 external target")
+      let normalized = try normalizeTarget(
+        referenceSamples,
+        params: sampledParams,
+        config: config,
+        context: "rung2 external target")
+      try writeJSON(normalized.params, to: root.appendingPathComponent("true_params.json"))
+      try AudioFile.save(
+        url: root.appendingPathComponent("target.wav"),
+        samples: normalized.samples,
+        sampleRate: config.sampleRate)
+      if verifyOnly { return }
+
+      let report = try recoverTarget(
+        samples: normalized.samples,
+        trueParams: normalized.params,
+        config: config,
+        outDir: root,
+        context: "rung2 external target")
+      print(
+        "rung2 pass=\(report.pass) lossRatio=\(String(format: "%.6f", report.lossRatio))")
+      if !report.pass && !options.keys.contains("allow-fail") {
+        throw SynthIDError.message("rung2 external target failed recovery acceptance")
+      }
+      return
+    }
+
+    let seeds: [Int]
+    if let rawSeeds = options["seeds"] {
+      seeds = try parseIntList(rawSeeds, "--seeds")
+    } else if options["seed"] != nil {
+      seeds = [Int(config.seed)]
+    } else {
+      seeds = [1, 2, 3, 4, 5]
+    }
+    guard !seeds.isEmpty else {
+      throw SynthIDError.message("rung2 requires at least one seed")
+    }
+    let rendererURL = options["renderer"].map { URL(fileURLWithPath: $0) }
+    let python = options["python"] ?? "python3"
+
+    var passed = 0
+    for seed in seeds {
+      let seedDir = seeds.count == 1 ? root : root.appendingPathComponent("seed-\(seed)")
+      try ensureDirectory(seedDir)
+      var seedConfig = config
+      seedConfig.seed = UInt64(seed)
+      let sampledParams = PatchValues.sample(seed: UInt64(seed))
+      let sampledParamsURL = seedDir.appendingPathComponent("sampled_params.json")
+      let referenceURL = seedDir.appendingPathComponent("reference_raw.wav")
+      try writeJSON(sampledParams, to: sampledParamsURL)
+
+      try ReferenceRenderer.render(
+        paramsURL: sampledParamsURL,
+        outputURL: referenceURL,
+        config: seedConfig,
+        scriptURL: rendererURL,
+        python: python)
+      let (referenceSamples, sampleRate) = try AudioFile.load(url: referenceURL)
+      try requireSampleRate(
+        sampleRate,
+        config: seedConfig,
+        context: "rung2 seed \(seed)")
+      try verifyReferenceRenderer(
+        params: sampledParams,
+        referenceSamples: referenceSamples,
+        config: seedConfig,
+        outDir: seedDir,
+        context: "rung2 seed \(seed)")
+
+      let normalized = try normalizeTarget(
+        referenceSamples,
+        params: sampledParams,
+        config: seedConfig,
+        context: "rung2 seed \(seed)")
+      try writeJSON(normalized.params, to: seedDir.appendingPathComponent("true_params.json"))
+      try AudioFile.save(
+        url: seedDir.appendingPathComponent("target.wav"),
+        samples: normalized.samples,
+        sampleRate: seedConfig.sampleRate)
+      if verifyOnly { continue }
+
+      let report = try recoverTarget(
+        samples: normalized.samples,
+        trueParams: normalized.params,
+        config: seedConfig,
+        outDir: seedDir,
+        context: "rung2 seed \(seed)")
+      if report.pass { passed += 1 }
+      print(
+        "seed=\(seed) pass=\(report.pass) lossRatio=\(String(format: "%.6f", report.lossRatio))")
+    }
+
+    if verifyOnly {
+      print("rung2 renderer equivalence passed for \(seeds.count)/\(seeds.count) seeds")
+      return
+    }
+    let requiredPasses = seeds.count >= 5
+      ? Int(Foundation.ceil(Double(seeds.count) * 0.6))
+      : seeds.count
+    if passed < requiredPasses && !options.keys.contains("allow-fail") {
+      throw SynthIDError.message(
+        "rung2 failed: \(passed)/\(seeds.count) seeds passed; required \(requiredPasses)")
+    }
+  }
+
+  private static func recoverTarget(
+    samples: [Float],
+    trueParams: PatchValues,
+    config: SynthIDConfig,
+    outDir: URL,
+    context: String
+  ) throws -> SynthIDReport {
+    var bestResult: TrainingRunResult?
+    var bestRestartDir: URL?
+    var allResults: [TrainingRunResult] = []
+    for restart in 0..<max(1, config.restarts) {
+      let restartDir = outDir.appendingPathComponent("restart-\(restart)")
+      let result = try SynthIDTrainer(config: config).train(
+        targetSamples: samples,
+        outDir: restartDir,
+        trueParams: trueParams,
+        restartIndex: restart)
+      allResults.append(result)
+      if bestResult == nil || result.bestLoss < bestResult!.bestLoss {
+        bestResult = result
+        bestRestartDir = restartDir
+      }
+    }
+    guard var result = bestResult else {
+      throw SynthIDError.message("no recovery result for \(context)")
+    }
+
+    // Restarts often solve different subspaces. Greedily stitch them while
+    // selecting exclusively by the same audio loss, then fine-tune the result.
+    if allResults.count > 1 {
+      let trainer = SynthIDTrainer(config: config)
+      var noiseSubspace = ["noiseAmp", "noiseDecay"]
+      if config.enableNoiseFilter { noiseSubspace.append("noiseCutoff") }
+      let subspaces: [[String]] = [
+        ["clickFreq", "clickAmp", "clickDecay"],
+        ["fStart", "fEnd", "pitchDecay"],
+        noiseSubspace,
+        ["bodyAmp", "drive", "outGain"],
+      ]
+      var stitched = result.recovered
+      var stitchedLoss = try trainer.evaluateLoss(values: stitched, targetSamples: samples)
+      var improved = false
+      for donor in allResults {
+        for subspace in subspaces {
+          var candidate = stitched
+          for name in subspace { candidate[name] = donor.recovered[name] }
+          let loss = try trainer.evaluateLoss(values: candidate, targetSamples: samples)
+          if loss < stitchedLoss {
+            stitched = candidate
+            stitchedLoss = loss
+            improved = true
+          }
+        }
+      }
+
+      // The millisecond click has a rippled frequency landscape. A coarse
+      // audio-loss-only search provides the same honest basin selection used by
+      // multiple random restarts, then gradient descent performs local tuning.
+      let clickFrequencySpec = KickParamSpecs.byName["clickFreq"]!
+      let clickFrequencySteps = 24
+      for index in 0...clickFrequencySteps {
+        let position = Float(index) / Float(clickFrequencySteps)
+        let frequency = clickFrequencySpec.min
+          * Foundation.exp(
+            position * Foundation.log(clickFrequencySpec.max / clickFrequencySpec.min))
+        var candidate = stitched
+        candidate.clickFreq = frequency
+        let loss = try trainer.evaluateLoss(values: candidate, targetSamples: samples)
+        if loss < stitchedLoss {
+          stitched = candidate
+          stitchedLoss = loss
+          improved = true
+        }
+      }
+
+      if improved {
+        var tuneConfig = config
+        tuneConfig.epochs = max(200, config.epochs / 3)
+        let stitchDir = outDir.appendingPathComponent("restart-stitch")
+        let tuned = try SynthIDTrainer(config: tuneConfig).train(
+          targetSamples: samples,
+          outDir: stitchDir,
+          trueParams: trueParams,
+          initialOverride: stitched)
+        print(
+          "  stitch: base=\(String(format: "%.5f", result.bestLoss)) stitched=\(String(format: "%.5f", stitchedLoss)) tuned=\(String(format: "%.5f", tuned.bestLoss))"
+        )
+        if tuned.bestLoss < result.bestLoss {
+          // Keep the cold-start loss for the acceptance ratio.
+          result = TrainingRunResult(
+            recovered: tuned.recovered,
+            initial: result.initial,
+            pitchFit: result.pitchFit,
+            initLoss: result.initLoss,
+            bestLoss: tuned.bestLoss,
+            bestEpoch: tuned.bestEpoch,
+            losses: result.losses + tuned.losses)
+          bestRestartDir = stitchDir
+        }
+      }
+    }
+
+    if let bestRestartDir {
+      for filename in [
+        "checkpoint.json",
+        "loss_curve.csv",
+        "initial_params.json",
+        "pitch_fit.json",
+        "pitch_points.json",
+      ] {
+        try copyIfPresent(
+          from: bestRestartDir.appendingPathComponent(filename),
+          to: outDir.appendingPathComponent(filename))
+      }
+    }
+    try writeJSON(result.recovered, to: outDir.appendingPathComponent("recovered_params.json"))
+    return try renderLearnedAndReport(
+      result: result,
+      trueParams: trueParams,
+      targetSamples: samples,
+      config: config,
+      outDir: outDir)
+  }
+
+  private static func normalizeTarget(
+    _ rawSamples: [Float],
+    params: PatchValues,
+    config: SynthIDConfig,
+    context: String
+  ) throws -> (samples: [Float], params: PatchValues) {
+    let fitted = fitOrPad(rawSamples, frames: config.frames)
+    let scale = peakNormalizationScale(fitted, peak: config.peakNormalizeTo)
+    var normalizedParams = params
+    let normalizedOutGain = params.outGain * scale
+    guard let outGainSpec = KickParamSpecs.byName["outGain"],
+      normalizedOutGain >= outGainSpec.min,
+      normalizedOutGain <= outGainSpec.max
+    else {
+      let bounds = KickParamSpecs.byName["outGain"].map { "\($0.min)...\($0.max)" } ?? "unknown"
+      throw SynthIDError.message(
+        "\(context) normalization would set outGain=\(normalizedOutGain), outside \(bounds)")
+    }
+    normalizedParams.outGain = normalizedOutGain
+    return (fitted.map { $0 * scale }, normalizedParams)
+  }
+
+  private static func verifyReferenceRenderer(
+    params: PatchValues,
+    referenceSamples: [Float],
+    config: SynthIDConfig,
+    outDir: URL,
+    context: String
+  ) throws {
+    let equivalence = try ReferenceRenderer.verify(
+      params: params,
+      referenceSamples: referenceSamples,
+      config: config)
+    try writeJSON(equivalence, to: outDir.appendingPathComponent("renderer_equivalence.json"))
+    print(
+      "\(context) renderer maxAbs=\(String(format: "%.6e", equivalence.maxAbsoluteError)) threshold=\(String(format: "%.1e", equivalence.threshold)) pass=\(equivalence.pass)"
+    )
+    guard equivalence.pass else {
+      let first = equivalence.firstFailingFrame.map(String.init) ?? "unknown"
+      throw SynthIDError.message(
+        "\(context) renderer equivalence failed: maxAbs=\(equivalence.maxAbsoluteError), first failing frame=\(first), threshold=\(equivalence.threshold)")
+    }
+  }
+
+  private static func requireSampleRate(
+    _ sampleRate: Float,
+    config: SynthIDConfig,
+    context: String
+  ) throws {
+    guard abs(sampleRate - config.sampleRate) <= 0.5 else {
+      throw SynthIDError.message(
+        "\(context) sampleRate=\(sampleRate), expected \(config.sampleRate); no resampling is applied")
+    }
   }
 
   private static func rung3(options: [String: String]) throws {
@@ -378,7 +563,7 @@ enum SynthIDCLI {
     targetSamples: [Float],
     config: SynthIDConfig,
     outDir: URL
-  ) throws {
+  ) throws -> SynthIDReport {
     let learned = peakNormalized(
       try KickVoice.render(values: result.recovered, config: config, parameterBacked: true),
       peak: config.peakNormalizeTo)
@@ -402,6 +587,7 @@ enum SynthIDCLI {
       finalLoss: result.bestLoss,
       includeNoiseCutoff: config.enableNoiseFilter)
     try ReportWriter.write(report: report, to: outDir)
+    return report
   }
 
   private static func parseOptions(_ args: [String]) throws -> [String: String] {
@@ -415,6 +601,7 @@ enum SynthIDCLI {
       let key = String(arg.dropFirst(2))
       let flags: Set<String> = [
         "freeze-pitch", "no-linear-mag", "no-noise-filter", "allow-fail", "no-lr-decay",
+        "verify-only",
       ]
       if flags.contains(key) {
         options[key] = "true"
@@ -447,12 +634,14 @@ enum SynthIDCLI {
       swift run SynthID train  --target <wav> --out <dir> [--rung 1|2|3] [--params <truth.json>]
       swift run SynthID train  --target <wav> --out <dir> --fdcheck <param> [--params <point.json>]
       swift run SynthID rung1  --seed <N> --out <dir> [--epochs N] [--restarts N]
-      swift run SynthID rung2  --target <wav-from-numpy> --params <json> --out <dir>
+      swift run SynthID rung2  --out <dir> [--seeds 1,2,3,4,5] [--verify-only]
+      swift run SynthID rung2  --target <wav-from-numpy> --params <json> --out <dir> [--verify-only]
       swift run SynthID rung3  --target <real-808-wav> --out <dir>
 
       Common flags: --frames N --windows a,b,c --no-linear-mag --linear-mag-weight W
                     --pitch-lr LR --amp-lr LR --decay-lr LR --tone-lr LR --noise-lr LR
                     --no-noise-filter --fd-eps EPS --backend metal|cpu
+      Rung 2 flags: --renderer <render_reference.py> --python <python3>
       """
     )
   }

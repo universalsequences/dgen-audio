@@ -1,5 +1,9 @@
 #!/usr/bin/env python3
-"""Reference numpy renderer for SynthID rung 2."""
+"""Independent NumPy renderer for SynthID rung 2.
+
+The body and click phase formulas intentionally mirror Patch.swift's closed-form
+phase convention. They do not use DGen or call back into the Swift executable.
+"""
 
 import argparse
 import json
@@ -10,31 +14,65 @@ from pathlib import Path
 import numpy as np
 
 
-def render(params, frames=32768, sample_rate=44100):
-    t = np.arange(frames, dtype=np.float32) / float(sample_rate)
-    f_start = params["fStart"]
-    f_end = params["fEnd"]
-    pitch = f_end + (f_start - f_end) * np.exp(params["pitchDecay"] * t)
-    phase = phasor(pitch, sample_rate)
-    body = np.sin(2.0 * math.pi * phase) * np.exp(params["ampDecay"] * t) * params["bodyAmp"]
+def render(params, frames=32768, sample_rate=44100, enable_noise_filter=True):
+    # Keep the signal path in float32 so the equivalence check measures the
+    # independent formulas rather than avoidable float64-vs-float32 drift.
+    sample_rate = np.float32(sample_rate)
+    t = dgen_time_ramp(frames, sample_rate)
+    f_start = np.float32(params["fStart"])
+    f_end = np.float32(params["fEnd"])
+    pitch_decay = np.float32(params["pitchDecay"])
+    two_pi = np.float32(2.0 * math.pi)
 
-    click_phase = phasor(np.full(frames, params["clickFreq"], dtype=np.float32), sample_rate)
-    click = np.sin(2.0 * math.pi * click_phase) * np.exp(params["clickDecay"] * t) * params["clickAmp"]
+    # Patch.swift outputs the accumulator's pre-update float32 state (nominally
+    # t[n] = n / sr) and evaluates the exact pitch-envelope integral there.
+    sweep_phase = (
+        f_end * t
+        + (f_start - f_end)
+        / pitch_decay
+        * (np.exp(pitch_decay * t) - np.float32(1.0))
+    )
+    body = (
+        np.sin(two_pi * sweep_phase)
+        * np.exp(np.float32(params["ampDecay"]) * t)
+        * np.float32(params["bodyAmp"])
+    )
+
+    click_phase = np.float32(params["clickFreq"]) * t
+    click = (
+        np.sin(two_pi * click_phase)
+        * np.exp(np.float32(params["clickDecay"]) * t)
+        * np.float32(params["clickAmp"])
+    )
 
     noise = dgen_noise(frames) * 2.0 - 1.0
-    noise = lowpass_biquad(noise, params["noiseCutoff"], 0.707, 1.0, sample_rate)
-    noise_burst = noise * np.exp(params["noiseDecay"] * t) * params["noiseAmp"]
+    if enable_noise_filter:
+        noise = lowpass_biquad(
+            noise, params["noiseCutoff"], 0.707, 1.0, float(sample_rate)
+        )
+    noise_burst = (
+        noise
+        * np.exp(np.float32(params["noiseDecay"]) * t)
+        * np.float32(params["noiseAmp"])
+    )
 
-    return np.tanh((body + click + noise_burst) * params["drive"]) * params["outGain"]
+    return (
+        np.tanh(
+            (body + click + noise_burst) * np.float32(params["drive"])
+        )
+        * np.float32(params["outGain"])
+    ).astype(np.float32)
 
 
-def phasor(freq, sample_rate):
-    phase = np.zeros_like(freq, dtype=np.float32)
-    state = 0.0
-    for i, f in enumerate(freq):
-        phase[i] = state
-        state = (state + float(f) / float(sample_rate)) % 1.0
-    return phase
+def dgen_time_ramp(frames, sample_rate):
+    """Match Signal.accum(1 / sampleRate)'s pre-update float32 state."""
+    values = np.zeros(frames, dtype=np.float32)
+    increment = np.float32(np.float32(1.0) / np.float32(sample_rate))
+    state = np.float32(0.0)
+    for i in range(frames):
+        values[i] = state
+        state = np.float32(state + increment)
+    return values
 
 
 def dgen_noise(frames):
@@ -91,6 +129,7 @@ def main():
     parser.add_argument("--out", required=True)
     parser.add_argument("--frames", type=int, default=32768)
     parser.add_argument("--sample-rate", type=int, default=44100)
+    parser.add_argument("--no-noise-filter", action="store_true")
     args = parser.parse_args()
 
     with open(args.params) as f:
@@ -98,7 +137,16 @@ def main():
         if "params" in params and isinstance(params["params"], dict):
             params = params["params"]
 
-    write_wav(args.out, render(params, args.frames, args.sample_rate), args.sample_rate)
+    write_wav(
+        args.out,
+        render(
+            params,
+            args.frames,
+            args.sample_rate,
+            enable_noise_filter=not args.no_noise_filter,
+        ),
+        args.sample_rate,
+    )
 
 
 if __name__ == "__main__":

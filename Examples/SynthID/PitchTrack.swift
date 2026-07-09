@@ -10,7 +10,9 @@ struct PitchFit: Codable {
   var fStart: Float
   var fEnd: Float
   var pitchDecay: Float
-  var error: Float
+  /// Mean-square contour fit error, or nil when the signal has too few usable
+  /// pitch points. Optional keeps fallback diagnostics JSON-encodable.
+  var error: Float?
 }
 
 enum PitchTrack {
@@ -139,10 +141,11 @@ enum PitchTrack {
     let usable = monotonic.count >= 3 ? monotonic : Array(candidates)
 
     guard usable.count >= 3 else {
-      return PitchFit(fStart: 120, fEnd: 45, pitchDecay: -35, error: .infinity)
+      return PitchFit(fStart: 120, fEnd: 45, pitchDecay: -35, error: nil)
     }
 
-    var best = PitchFit(fStart: 120, fEnd: 45, pitchDecay: -35, error: .infinity)
+    var best = PitchFit(fStart: 120, fEnd: 45, pitchDecay: -35, error: nil)
+    var bestError = Float.infinity
     let fEndLo = Swift.max(Float(35), fEndRange?.lowerBound ?? 35)
     let fEndHi = Swift.min(Float(60), fEndRange?.upperBound ?? 60)
     let fEndSteps = stride(from: fEndLo, through: fEndHi, by: fEndStep)
@@ -171,7 +174,8 @@ enum PitchTrack {
           weightSum += w
         }
         error /= max(weightSum, 1e-9)
-        if error < best.error {
+        if error < bestError {
+          bestError = error
           best = PitchFit(fStart: fStart, fEnd: fEnd, pitchDecay: decay, error: error)
         }
       }
@@ -198,7 +202,7 @@ enum PitchTrack {
         points: points,
         fEndRange: (tail.hz - 0.25)...(tail.hz + 0.25),
         fEndStep: 0.1)
-      if anchored.error.isFinite {
+      if anchored.error?.isFinite == true {
         return anchored
       }
       // No usable contour points: still trust the tail measurement for fEnd.
@@ -206,7 +210,7 @@ enum PitchTrack {
         fStart: 120,
         fEnd: Swift.min(Swift.max(tail.hz, 35), 60),
         pitchDecay: -35,
-        error: .infinity)
+        error: nil)
     }
     return fit(points: points)
   }

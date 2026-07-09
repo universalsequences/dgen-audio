@@ -73,7 +73,8 @@ CLI subcommands:
 swift run SynthID render   --params <json> --out <wav> [--frames N]      # render a patch
 swift run SynthID train    --target <wav> --out <dir> [--rung 1|2|3] [--seed N] [flags]
 swift run SynthID rung1    --seed <N> --out <dir>     # end-to-end: sample hidden params, render, recover, report
-swift run SynthID rung2    --target <wav-from-numpy> --params <json> --out <dir>
+swift run SynthID rung2    --out <dir> [--seeds 1,2,3,4,5]
+swift run SynthID rung2    --target <wav-from-numpy> --params <json> --out <dir>  # single external target
 swift run SynthID rung3    --target <real-808-wav> --out <dir>
 ```
 
@@ -248,11 +249,23 @@ minima; restarts are the honest mitigation (not target-seeded inits).
 
 ### Rung 2 — External renderer
 
-`scripts/render_reference.py`: ~60 lines of numpy implementing the §2 math exactly
-(document the phasor accumulation convention and tanh placement so it matches
-sample-for-sample up to float noise; verify by rendering the same params both ways
-and asserting max abs sample difference < 1e-3 before any training claims).
-Then run the same recovery as rung 1 against the numpy-rendered target.
+`scripts/render_reference.py` implements the §2 math independently in NumPy. It
+uses the same pre-update float32 `accum(1/sampleRate)` time convention as
+`Patch.swift`, evaluates the closed-form body phase and click phase at that time,
+then reproduces DGen's deterministic noise, low-pass biquad, tanh placement, and
+output gain.
+
+`rung2` samples each seed's hidden parameters, invokes the Python renderer, and
+hard-gates training on max absolute sample error `< 1e-3` against an independent
+DGen render of the same parameters. `--verify-only` runs just this inexpensive
+gate. With no `--seed` or `--seeds`, the command runs the five-seed acceptance set;
+the explicit `--target/--params` form remains available for one externally
+prepared target. Targets are normalized only after equivalence is established,
+and the corresponding truth `outGain` is adjusted exactly as in rung 1.
+
+After equivalence passes, rung 2 runs the same best-of-restarts, cross-restart
+recombination, click-frequency search, reporting, and artifact generation as
+rung 1 against the NumPy-rendered target.
 
 ### Rung 3 — Real TR-808
 
@@ -292,7 +305,8 @@ the debugging tool for the whole example.
 ### 7.2 Rung 2
 
 Same thresholds as 7.1 on ≥ 3 of 5 seeds (allow slack for renderer float drift),
-plus the renderer-equivalence assertion in §6.
+plus the renderer-equivalence assertion in §6. The command exits nonzero when
+either renderer equivalence fails or fewer than 3 of the default 5 seeds pass.
 
 ### 7.3 Rung 3
 

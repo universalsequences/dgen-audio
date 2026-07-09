@@ -139,8 +139,10 @@ misses only the loss-ratio gate by 20% (0.0241 vs 0.02).
 
 ## Remaining / follow-ups
 
-1. Rung 2's numpy renderer must mirror the closed-form phase convention in
-   Patch.swift.
+1. Run the full Rung 2 recovery acceptance command. Its independent NumPy
+   renderer and automated five-seed equivalence gate are implemented; all five
+   default seeds currently match DGen with max sample error about `5e-5`
+   (required: `< 1e-3`).
 2. Optional: rerun rung-1 acceptance with the noise filter enabled so
    `noiseCutoff` is included in the scored parameter table.
 3. Optional: chase seed 2's last 20% of loss ratio (pure polish — all params
@@ -152,5 +154,6 @@ misses only the loss-ratio gate by 20% (0.0241 vs 0.02).
   — not a tolerance loosening. Do not extend it to any non-degenerate parameter.
 - Do not select by a target-derived parameter score; training/selection stays on
   the audio loss.
-- Do not move to rung 2 until its independent NumPy renderer matches the
-  closed-form phase convention used by Patch.swift.
+- Do not claim Rung 2 complete until at least 3 of its 5 externally rendered
+  targets pass the full recovery gate. Renderer equivalence alone is only the
+  entry check.
