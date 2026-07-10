@@ -105,16 +105,23 @@ These experiments were evaluated and deliberately not retained in the voice:
   closer to the target, but the absolute learned distance also lost to the
   retained baseline (`0.017713` versus `0.017543`), so the term was removed.
   Full artifacts are in `/tmp/synthid-rung3-pitch-curve-full`.
+- A zero-default initial body-phase offset had only `0.000066` absolute distance
+  headroom in an independent grid: the best offset was approximately `-1°`
+  (`0.017477`, or `69.06%`, versus the retained `0.017543`). The matched pilot
+  then regressed to `59.68%` versus `61.01%` control, with learned distance
+  worsening from `0.020554` to `0.021251`. Training moved the phase to about
+  `+4.8°`, opposite the grid optimum; local finite differences were dominated
+  by multi-window L1 cusps. The parameter was removed and no full run was made.
+  Pilot artifacts are in `/tmp/synthid-rung3-body-phase-pilot`.
 
 ## Status and next model step
 
 The Rung 3 harness and corrected independent evaluator are implemented. Rung 3
 itself is **not complete** because the corrected score remains below 80%.
 
-The next model experiment should test a zero-default initial body-phase offset.
-The target's RMS envelope and recovered pitch endpoint are already close, while
-the synthesized body is forced to start at sine phase zero after threshold-based
-onset alignment. A generic phase offset can address finite-window leakage without
-adding target-specific data or changing the pitch contour. Validate it first
-with an independent phase grid, then the matched short pilot and finite
-differences; do not run the full schedule unless both diagnostics improve.
+Before adding another voice parameter, extend the independent comparator with a
+time-by-frequency residual breakdown. Pitch curvature, fixed second harmonic,
+body asymmetry, phase, and loss rescaling have now all failed full or pilot
+validation. The next candidate should be selected from a measured residual band
+and time interval—not another whole-sound parameter guess—and should still pass
+a cheap independent headroom check before implementation.
