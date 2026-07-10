@@ -70,12 +70,16 @@ def mrstft(a, b, windows=WINDOWS, epsilon=LOG_EPSILON):
     for win in windows:
         hop = max(1, win // 4)
         window = np.hanning(win).astype(np.float32)
+        # Convert raw FFT magnitudes to sinusoid amplitude. Without coherent-gain
+        # normalization, a fixed epsilon moves by 18 dB between 256- and 2048-bin
+        # windows and the documented -60 dBFS floor is not actually a dBFS floor.
+        magnitude_scale = max(float(window.sum()) / 2.0, 1e-12)
         values = []
         for start in range(0, len(a) - win + 1, hop):
-            aa = np.fft.rfft(a[start:start + win] * window)
-            bb = np.fft.rfft(b[start:start + win] * window)
+            aa = np.abs(np.fft.rfft(a[start:start + win] * window)) / magnitude_scale
+            bb = np.abs(np.fft.rfft(b[start:start + win] * window)) / magnitude_scale
             delta = np.abs(
-                np.log(np.abs(aa) + epsilon) - np.log(np.abs(bb) + epsilon))
+                np.log(aa + epsilon) - np.log(bb + epsilon))
             values.append(float(np.mean(delta)))
         total += float(np.mean(values))
     return total
@@ -173,6 +177,7 @@ def main():
         "improvement": improvement,
         "requiredImprovement": args.required_improvement,
         "logEpsilon": LOG_EPSILON,
+        "magnitudeNormalization": "hann coherent gain (sum(window) / 2)",
         "windows": list(WINDOWS),
         "pass": improvement >= args.required_improvement,
     }

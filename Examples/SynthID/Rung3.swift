@@ -22,6 +22,7 @@ struct Rung3Comparison: Codable {
   var improvement: Float
   var requiredImprovement: Float
   var logEpsilon: Float?
+  var magnitudeNormalization: String?
   var windows: [Int]?
   var pass: Bool
 }

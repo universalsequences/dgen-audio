@@ -133,6 +133,9 @@ enum ReportWriter {
       if let epsilon = comparison.logEpsilon {
         text += "- Log-magnitude epsilon: \(fmt(epsilon))\n"
       }
+      if let normalization = comparison.magnitudeNormalization {
+        text += "- Magnitude normalization: \(normalization)\n"
+      }
       if let windows = comparison.windows {
         text += "- FFT windows: \(windows.map(String.init).joined(separator: ", "))\n"
       }

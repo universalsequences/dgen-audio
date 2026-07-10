@@ -625,6 +625,16 @@ enum SynthIDCLI {
       "rung3 prepared sourceRate=\(Int(sourceRate.rounded())) targetRate=\(Int(config.sampleRate.rounded())) onset=\(String(format: "%.6f", prepared.report.onsetSeconds))s sourceFrames=\(sourceSamples.count) outputFrames=\(prepared.samples.count) cropped=\(prepared.report.cropped) padded=\(prepared.report.padded)"
     )
     if options.keys.contains("prepare-only") { return }
+    if let paramName = options["fdcheck"] {
+      let result = try SynthIDTrainer(config: config).fdcheck(
+        paramName: paramName,
+        targetSamples: prepared.samples,
+        outDir: outDir)
+      print(
+        "fdcheck param=\(result.paramName) baseLoss=\(String(format: "%.6e", result.baseLoss)) fd=\(String(format: "%.6e", result.finiteDifferenceGrad)) autograd=\(String(format: "%.6e", result.autogradGrad)) relErr=\(String(format: "%.6e", result.relativeError))"
+      )
+      return
+    }
 
     var report = try recoverTarget(
       samples: prepared.samples,
@@ -755,6 +765,7 @@ enum SynthIDCLI {
                     --no-noise-filter --fd-eps EPS --backend metal|cpu
       Rung 2 flags: --renderer <render_reference.py> --python <python3>
       Rung 3 flags: --onset-threshold-db DB --compare-script <compare.py> --python <python3>
+                    --fdcheck <param>
       """
     )
   }
