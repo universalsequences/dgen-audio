@@ -27,6 +27,9 @@ struct SynthIDReport: Codable {
   var irreducibleLossFloor: Float
   var rawLossRatio: Float
   var lossRatio: Float
+  var recoveredParams: PatchValues?
+  var rung3Comparison: Rung3Comparison?
+  var residualMismatch: String?
   var rows: [RecoveryRow]
   var equivalences: [EquivalenceRow]
 }
@@ -93,6 +96,9 @@ enum ReportWriter {
       irreducibleLossFloor: floor,
       rawLossRatio: rawLossRatio,
       lossRatio: lossRatio,
+      recoveredParams: recovered,
+      rung3Comparison: nil,
+      residualMismatch: nil,
       rows: rows,
       equivalences: equivalences)
   }
@@ -118,7 +124,35 @@ enum ReportWriter {
     } else {
       text += "- Loss ratio: \(String(format: "%.6f", report.lossRatio))\n\n"
     }
-    guard !report.rows.isEmpty else { return text }
+    if let comparison = report.rung3Comparison {
+      text += "## Independent Rung 3 Comparison\n\n"
+      text += "- Initialization MR-STFT distance: \(String(format: "%.6f", comparison.initialDistance))\n"
+      text += "- Learned MR-STFT distance: \(String(format: "%.6f", comparison.learnedDistance))\n"
+      text += "- Improvement: \(pct(comparison.improvement))\n"
+      text += "- Required improvement: \(pct(comparison.requiredImprovement))\n"
+      if let epsilon = comparison.logEpsilon {
+        text += "- Log-magnitude epsilon: \(fmt(epsilon))\n"
+      }
+      if let windows = comparison.windows {
+        text += "- FFT windows: \(windows.map(String.init).joined(separator: ", "))\n"
+      }
+      text += "- Result: \(comparison.pass ? "pass" : "fail")\n\n"
+    }
+    guard !report.rows.isEmpty else {
+      if let recovered = report.recoveredParams {
+        text += "## Recovered Patch\n\n"
+        text += "| Parameter | Value | Unit |\n"
+        text += "| --- | ---: | --- |\n"
+        for spec in KickParamSpecs.all {
+          text += "| \(spec.name) | \(fmt(recovered[spec.name])) | \(spec.unit) |\n"
+        }
+        text += "\n"
+      }
+      if let residual = report.residualMismatch, !residual.isEmpty {
+        text += "## Residual Mismatch\n\n\(residual)\n"
+      }
+      return text
+    }
     text +=
       "Note: `tanh((bodyAmp·body + clickAmp·click + noiseAmp·noise)·drive)·outGain` "
       + "depends only on the products `amp·drive` and `outGain`; parameter sets with equal "

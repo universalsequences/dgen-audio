@@ -53,7 +53,7 @@ let package = Package(
             name: "SynthID",
             dependencies: ["DGenLazy", "DGen"],
             path: "Examples/SynthID",
-            exclude: ["SPEC.md", "FDCHECK_FINDING.md", "RUNG1_REMAINING.md", "scripts", "targets"]
+            exclude: ["SPEC.md", "FDCHECK_FINDING.md", "RUNG1_REMAINING.md", "RUNG2_STATUS.md", "RUNG3_STATUS.md", "scripts", "targets"]
         ),
         .executableTarget(
             name: "DGenLisp",

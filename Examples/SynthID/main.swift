@@ -388,7 +388,7 @@ enum SynthIDCLI {
 
   private static func recoverTarget(
     samples: [Float],
-    trueParams: PatchValues,
+    trueParams: PatchValues?,
     config: SynthIDConfig,
     outDir: URL,
     context: String,
@@ -493,7 +493,6 @@ enum SynthIDCLI {
       for filename in [
         "checkpoint.json",
         "loss_curve.csv",
-        "initial_params.json",
         "pitch_fit.json",
         "pitch_points.json",
       ] {
@@ -502,6 +501,10 @@ enum SynthIDCLI {
           to: outDir.appendingPathComponent(filename))
       }
     }
+    // A stitched run starts from donor-combined parameters, but acceptance is
+    // measured from the selected cold start. Keep the root initialization and
+    // its audio aligned with result.initLoss.
+    try writeJSON(result.initial, to: outDir.appendingPathComponent("initial_params.json"))
     try writeJSON(result.recovered, to: outDir.appendingPathComponent("recovered_params.json"))
     return try renderLearnedAndReport(
       result: result,
@@ -591,9 +594,66 @@ enum SynthIDCLI {
   }
 
   private static func rung3(options: [String: String]) throws {
-    var withRung = options
-    withRung["rung"] = "3"
-    try train(options: withRung)
+    guard let targetPath = options["target"], let outPath = options["out"] else {
+      throw SynthIDError.message("rung3 requires --target <real-808-wav> and --out <dir>")
+    }
+    var config = try loadConfig(url: options["config"].map { URL(fileURLWithPath: $0) })
+    try config.applyCLI(options)
+    config.rung = 3
+    config.applyRuntime()
+
+    let targetURL = URL(fileURLWithPath: targetPath)
+    let outDir = URL(fileURLWithPath: outPath)
+    try ensureDirectory(outDir)
+    let (sourceSamples, sourceRate) = try AudioFile.load(url: targetURL)
+    let onsetThresholdDB = try options["onset-threshold-db"]
+      .map { try parseFloat($0, "--onset-threshold-db") } ?? -40
+    let prepared = try Rung3TargetPreprocessor.prepare(
+      samples: sourceSamples,
+      sourceRate: sourceRate,
+      sourcePath: targetURL.standardizedFileURL.path,
+      config: config,
+      onsetThresholdDB: onsetThresholdDB)
+    try copyIfPresent(from: targetURL, to: outDir.appendingPathComponent("source.wav"))
+    try writeJSON(prepared.report, to: outDir.appendingPathComponent("preprocessing.json"))
+    let preparedTargetURL = outDir.appendingPathComponent("target.wav")
+    try AudioFile.save(
+      url: preparedTargetURL,
+      samples: prepared.samples,
+      sampleRate: config.sampleRate)
+    print(
+      "rung3 prepared sourceRate=\(Int(sourceRate.rounded())) targetRate=\(Int(config.sampleRate.rounded())) onset=\(String(format: "%.6f", prepared.report.onsetSeconds))s sourceFrames=\(sourceSamples.count) outputFrames=\(prepared.samples.count) cropped=\(prepared.report.cropped) padded=\(prepared.report.padded)"
+    )
+    if options.keys.contains("prepare-only") { return }
+
+    var report = try recoverTarget(
+      samples: prepared.samples,
+      trueParams: nil,
+      config: config,
+      outDir: outDir,
+      context: "rung3 real target")
+    let comparison = try Rung3Comparator.run(
+      targetURL: preparedTargetURL,
+      initialURL: outDir.appendingPathComponent("initial.wav"),
+      learnedURL: outDir.appendingPathComponent("learned.wav"),
+      outputImageURL: outDir.appendingPathComponent("compare.png"),
+      outputJSONURL: outDir.appendingPathComponent("compare.json"),
+      scriptURL: options["compare-script"].map { URL(fileURLWithPath: $0) },
+      python: options["python"] ?? "python3")
+    report.rung3Comparison = comparison
+    report.pass = comparison.pass
+    report.residualMismatch =
+      "The learned patch is constrained to the fixed body, click, and filtered-noise voice. "
+      + "Any remaining difference in `compare.png` or `ab.wav`—especially attack/beater "
+      + "texture and the late decay—is treated as model mismatch rather than hidden lookup data."
+    try ReportWriter.write(report: report, to: outDir)
+    print(
+      "rung3 pass=\(report.pass) improvement=\(String(format: "%.2f%%", comparison.improvement * 100))"
+    )
+    if !report.pass && !options.keys.contains("allow-fail") {
+      throw SynthIDError.message(
+        "rung3 failed: independent MR-STFT improvement \(comparison.improvement), required \(comparison.requiredImprovement)")
+    }
   }
 
   private static func renderLearnedAndReport(
@@ -604,6 +664,15 @@ enum SynthIDCLI {
     outDir: URL,
     irreducibleLossFloor: Float = 0
   ) throws -> SynthIDReport {
+    if config.rung == 3 {
+      let initial = peakNormalized(
+        try KickVoice.render(values: result.initial, config: config, parameterBacked: true),
+        peak: config.peakNormalizeTo)
+      try AudioFile.save(
+        url: outDir.appendingPathComponent("initial.wav"),
+        samples: initial,
+        sampleRate: config.sampleRate)
+    }
     let learned = peakNormalized(
       try KickVoice.render(values: result.recovered, config: config, parameterBacked: true),
       peak: config.peakNormalizeTo)
@@ -616,7 +685,9 @@ enum SynthIDCLI {
       peakNormalized(targetSamples, peak: config.peakNormalizeTo),
       frames: config.frames)
     let silence = [Float](repeating: 0, count: Int(config.sampleRate * 0.5))
-    let ab = normalizedTarget + silence + fitOrPad(learned, frames: config.frames)
+    let abFrames = config.rung == 3 ? Int(config.sampleRate.rounded()) : config.frames
+    let ab = fitOrPad(normalizedTarget, frames: abFrames) + silence
+      + fitOrPad(learned, frames: abFrames)
     try AudioFile.save(url: outDir.appendingPathComponent("ab.wav"), samples: ab, sampleRate: config.sampleRate)
 
     let report = ReportWriter.make(
@@ -642,7 +713,7 @@ enum SynthIDCLI {
       let key = String(arg.dropFirst(2))
       let flags: Set<String> = [
         "freeze-pitch", "no-linear-mag", "no-noise-filter", "allow-fail", "no-lr-decay",
-        "verify-only",
+        "verify-only", "prepare-only",
       ]
       if flags.contains(key) {
         options[key] = "true"
@@ -677,12 +748,13 @@ enum SynthIDCLI {
       swift run SynthID rung1  --seed <N> --out <dir> [--epochs N] [--restarts N]
       swift run SynthID rung2  --out <dir> [--seeds 1,2,3,4,5] [--verify-only]
       swift run SynthID rung2  --target <wav-from-numpy> --params <json> --out <dir> [--verify-only]
-      swift run SynthID rung3  --target <real-808-wav> --out <dir>
+      swift run SynthID rung3  --target <real-808-wav> --out <dir> [--prepare-only]
 
       Common flags: --frames N --windows a,b,c --no-linear-mag --linear-mag-weight W
                     --pitch-lr LR --amp-lr LR --decay-lr LR --tone-lr LR --noise-lr LR
                     --no-noise-filter --fd-eps EPS --backend metal|cpu
       Rung 2 flags: --renderer <render_reference.py> --python <python3>
+      Rung 3 flags: --onset-threshold-db DB --compare-script <compare.py> --python <python3>
       """
     )
   }
