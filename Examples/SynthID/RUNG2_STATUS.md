@@ -44,12 +44,32 @@ Every scored parameter passed. Representative relative errors:
 The individual amplitude and drive factors remain intentionally unscored because
 only their products are identifiable.
 
-## Remaining hard gate
+## Five-seed acceptance passed (2026-07-09/10)
 
-Run the default five-seed command and pass at least three seeds:
+Command:
 
 ```bash
 swift run SynthID rung2 --out /tmp/synthid-rung2-acceptance
 ```
 
-Do not claim Rung 2 complete until that command exits successfully.
+The command exited successfully. Four of five seeds passed, exceeding the
+required three-seed threshold.
+
+| Seed | Result | Initial loss | Final loss | Renderer floor | Floor-adjusted ratio |
+| ---: | --- | ---: | ---: | ---: | ---: |
+| 1 | pass | 0.627485 | 0.021498 | 0.021327 | 0.000283 |
+| 2 | fail | 0.650968 | 0.072777 | 0.014787 | 0.091153 |
+| 3 | pass | 0.957651 | 0.007624 | 0.007106 | 0.000545 |
+| 4 | pass | 1.464444 | 0.019768 | 0.019587 | 0.000125 |
+| 5 | pass | 0.868312 | 0.012137 | 0.005621 | 0.007552 |
+
+All five external-renderer equivalence checks passed. The worst maximum absolute
+sample error was `5.11855e-6`, well below the required `1e-3` threshold.
+
+Every scored parameter passed on seeds 1, 3, 4, and 5. Seed 2 missed the loss
+ratio gate and recovered `fStart` with `5.27%` relative error against the `3%`
+tolerance; its remaining scored parameters passed.
+
+## Status
+
+Rung 2 is complete. The next implementation milestone is Rung 3.
