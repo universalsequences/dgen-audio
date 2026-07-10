@@ -98,14 +98,23 @@ These experiments were evaluated and deliberately not retained in the voice:
   passed gradient tests, so this was an optimization-result failure rather than
   an autograd implementation failure. Full artifacts are in
   `/tmp/synthid-rung3-808-normalized-full`.
+- A zero-default second-exponential pitch-curvature term cleared the short-pilot
+  gate (`64.65%` versus `61.01%`) and passed finite differences away from the
+  zero-point L1 cusp (`1.79%` relative gradient error). The full five-restart
+  run nevertheless scored only `59.30%`. Its selected cold start was already
+  closer to the target, but the absolute learned distance also lost to the
+  retained baseline (`0.017713` versus `0.017543`), so the term was removed.
+  Full artifacts are in `/tmp/synthid-rung3-pitch-curve-full`.
 
 ## Status and next model step
 
 The Rung 3 harness and corrected independent evaluator are implemented. Rung 3
 itself is **not complete** because the corrected score remains below 80%.
 
-The next model experiment should add one generic, smooth degree of freedom to
-the pitch trajectory—for example, a zero-default second exponential pitch term—
-while preserving the exact Rung 1/2 signal path at zero. Validate it first with
-the matched short pilot and finite differences. Do not spend another full
-five-restart run unless that pilot materially exceeds the `61.01%` baseline.
+The next model experiment should test a zero-default initial body-phase offset.
+The target's RMS envelope and recovered pitch endpoint are already close, while
+the synthesized body is forced to start at sine phase zero after threshold-based
+onset alignment. A generic phase offset can address finite-window leakage without
+adding target-specific data or changing the pitch contour. Validate it first
+with an independent phase grid, then the matched short pilot and finite
+differences; do not run the full schedule unless both diagnostics improve.
