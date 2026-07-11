@@ -68,13 +68,14 @@ enum KickParamSpecs {
     .init(name: "bodyAmp", unit: "lin", min: 0.5, max: 1.0, reparam: .raw, tolerance: 0.10),
     .init(name: "ampDecay", unit: "1/s", min: -12, max: -3, reparam: .raw, tolerance: 0.10),
     .init(name: "clickFreq", unit: "Hz", min: 600, max: 3000, reparam: .log, tolerance: 0.10),
-    .init(name: "clickAmp", unit: "lin", min: 0.05, max: 0.6, reparam: .raw, tolerance: 0.20),
-    .init(name: "clickDecay", unit: "1/s", min: -900, max: -200, reparam: .logNegative, tolerance: 0.20),
-    .init(name: "noiseCutoff", unit: "Hz", min: 1000, max: 8000, reparam: .log, tolerance: 0.10),
+    .init(name: "clickAmp", unit: "lin", min: 0.05, max: 1.5, reparam: .raw, tolerance: 0.20),
+    .init(name: "clickDecay", unit: "1/s", min: -1600, max: -200, reparam: .logNegative, tolerance: 0.20),
+    .init(name: "noiseCutoff", unit: "Hz", min: 1000, max: 20000, reparam: .log, tolerance: 0.10),
     .init(name: "noiseAmp", unit: "lin", min: 0.0, max: 0.3, reparam: .raw, tolerance: 0.20),
-    .init(name: "noiseDecay", unit: "1/s", min: -400, max: -60, reparam: .logNegative, tolerance: 0.20),
+    .init(name: "noiseDecay", unit: "1/s", min: -400, max: -0.001, reparam: .logNegative, tolerance: 0.20),
     .init(name: "drive", unit: "lin", min: 1.0, max: 3.0, reparam: .raw, tolerance: 0.10),
     .init(name: "outGain", unit: "lin", min: 0.4, max: 1.0, reparam: .raw, tolerance: 0.10),
+    .init(name: "bodyAsymmetry", unit: "lin", min: -0.5, max: 0.5, reparam: .raw, tolerance: 0.20),
   ]
 
   static let byName: [String: ParameterSpec] =
@@ -95,12 +96,46 @@ struct PatchValues: Codable, Equatable {
   var noiseDecay: Float
   var drive: Float
   var outGain: Float
+  var bodyAsymmetry: Float
+
+  private enum CodingKeys: String, CodingKey {
+    case fStart, fEnd, pitchDecay, bodyAmp, ampDecay
+    case clickFreq, clickAmp, clickDecay
+    case noiseCutoff, noiseAmp, noiseDecay
+    case drive, outGain, bodyAsymmetry
+  }
+
+  init(from decoder: Decoder) throws {
+    let values = try decoder.container(keyedBy: CodingKeys.self)
+    self.init(
+      fStart: try values.decode(Float.self, forKey: .fStart),
+      fEnd: try values.decode(Float.self, forKey: .fEnd),
+      pitchDecay: try values.decode(Float.self, forKey: .pitchDecay),
+      bodyAmp: try values.decode(Float.self, forKey: .bodyAmp),
+      ampDecay: try values.decode(Float.self, forKey: .ampDecay),
+      clickFreq: try values.decode(Float.self, forKey: .clickFreq),
+      clickAmp: try values.decode(Float.self, forKey: .clickAmp),
+      clickDecay: try values.decode(Float.self, forKey: .clickDecay),
+      noiseCutoff: try values.decode(Float.self, forKey: .noiseCutoff),
+      noiseAmp: try values.decode(Float.self, forKey: .noiseAmp),
+      noiseDecay: try values.decode(Float.self, forKey: .noiseDecay),
+      drive: try values.decode(Float.self, forKey: .drive),
+      outGain: try values.decode(Float.self, forKey: .outGain),
+      bodyAsymmetry: try values.decodeIfPresent(Float.self, forKey: .bodyAsymmetry) ?? 0)
+  }
 
   static var midpoint: PatchValues {
     var values = [String: Float]()
     for spec in KickParamSpecs.all {
       values[spec.name] = spec.midpoint
     }
+    // Preserve the original Rung 1/2 generic initialization while allowing
+    // wider real-target bounds during optimization.
+    values["clickAmp"] = 0.325
+    values["clickDecay"] = -Foundation.sqrt(900 * 200)
+    values["noiseCutoff"] = Foundation.sqrt(1000 * 8000)
+    values["noiseDecay"] = -Foundation.sqrt(400 * 60)
+    values["bodyAsymmetry"] = 0
     return PatchValues(values)
   }
 
@@ -117,7 +152,8 @@ struct PatchValues: Codable, Equatable {
     noiseAmp: Float,
     noiseDecay: Float,
     drive: Float,
-    outGain: Float
+    outGain: Float,
+    bodyAsymmetry: Float = 0
   ) {
     self.fStart = fStart
     self.fEnd = fEnd
@@ -132,6 +168,7 @@ struct PatchValues: Codable, Equatable {
     self.noiseDecay = noiseDecay
     self.drive = drive
     self.outGain = outGain
+    self.bodyAsymmetry = bodyAsymmetry
   }
 
   init(_ dictionary: [String: Float]) {
@@ -148,7 +185,8 @@ struct PatchValues: Codable, Equatable {
       noiseAmp: dictionary["noiseAmp"] ?? 0.08,
       noiseDecay: dictionary["noiseDecay"] ?? -140,
       drive: dictionary["drive"] ?? 1.5,
-      outGain: dictionary["outGain"] ?? 0.7)
+      outGain: dictionary["outGain"] ?? 0.7,
+      bodyAsymmetry: dictionary["bodyAsymmetry"] ?? 0)
   }
 
   subscript(name: String) -> Float {
@@ -167,6 +205,7 @@ struct PatchValues: Codable, Equatable {
       case "noiseDecay": return noiseDecay
       case "drive": return drive
       case "outGain": return outGain
+      case "bodyAsymmetry": return bodyAsymmetry
       default: return .nan
       }
     }
@@ -185,6 +224,7 @@ struct PatchValues: Codable, Equatable {
       case "noiseDecay": noiseDecay = newValue
       case "drive": drive = newValue
       case "outGain": outGain = newValue
+      case "bodyAsymmetry": bodyAsymmetry = newValue
       default: break
       }
     }
@@ -213,8 +253,16 @@ struct PatchValues: Codable, Equatable {
   static func sample(seed: UInt64) -> PatchValues {
     var rng = SplitMix64(seed: seed)
     var values = [String: Float]()
+    let rung12Ranges: [String: (Float, Float)] = [
+      "clickAmp": (0.05, 0.6),
+      "clickDecay": (-900, -200),
+      "noiseCutoff": (1000, 8000),
+      "noiseDecay": (-400, -60),
+      "bodyAsymmetry": (0, 0),
+    ]
     for spec in KickParamSpecs.all {
-      values[spec.name] = rng.uniform(spec.min, spec.max)
+      let bounds = rung12Ranges[spec.name] ?? (spec.min, spec.max)
+      values[spec.name] = rng.uniform(bounds.0, bounds.1)
     }
     if (values["noiseAmp"] ?? 0) < 0.02 {
       values["noiseAmp"] = 0.02
@@ -237,6 +285,7 @@ struct KickVoiceSignals {
   var noiseDecay: Signal
   var drive: Signal
   var outGain: Signal
+  var bodyAsymmetry: Signal
 }
 
 final class TrainableKickParams {
@@ -244,11 +293,17 @@ final class TrainableKickParams {
   private var trainableNames = Set<String>()
   private var frozenNaturalValues: PatchValues
 
-  init(initial: PatchValues, trainable: Bool, freezePitch: Bool = false) {
+  init(
+    initial: PatchValues,
+    trainable: Bool,
+    freezePitch: Bool = false,
+    freezeBodyAsymmetry: Bool = false
+  ) {
     frozenNaturalValues = initial.clamped()
     for spec in KickParamSpecs.all {
       let shouldTrain =
         trainable && !(freezePitch && ["fStart", "fEnd", "pitchDecay"].contains(spec.name))
+          && !(freezeBodyAsymmetry && spec.name == "bodyAsymmetry")
       let transformed = spec.transform(initial[spec.name])
       if shouldTrain {
         let bounds = spec.transformedBounds
@@ -274,7 +329,8 @@ final class TrainableKickParams {
       noiseAmp: naturalSignal("noiseAmp"),
       noiseDecay: naturalSignal("noiseDecay"),
       drive: naturalSignal("drive"),
-      outGain: naturalSignal("outGain"))
+      outGain: naturalSignal("outGain"),
+      bodyAsymmetry: naturalSignal("bodyAsymmetry"))
   }
 
   var transformedParams: [String: Signal] { storage }

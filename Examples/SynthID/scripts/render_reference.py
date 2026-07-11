@@ -37,6 +37,14 @@ def render(params, frames=32768, sample_rate=44100, enable_noise_filter=True):
         * np.exp(np.float32(params["ampDecay"]) * t)
         * np.float32(params["bodyAmp"])
     )
+    body_asymmetry = np.float32(params.get("bodyAsymmetry", 0.0))
+    even_harmonic = (
+        body_asymmetry
+        * np.sin(np.float32(2.0) * two_pi * sweep_phase - np.float32(0.62))
+        * np.exp(np.float32(params["ampDecay"]) * t)
+        * np.float32(params["bodyAmp"])
+        * np.exp(np.float32(-17.0) * t)
+    )
 
     click_phase = np.float32(params["clickFreq"]) * t
     click = (
@@ -58,7 +66,8 @@ def render(params, frames=32768, sample_rate=44100, enable_noise_filter=True):
 
     return (
         np.tanh(
-            (body + click + noise_burst) * np.float32(params["drive"])
+            (body + even_harmonic + click + noise_burst)
+            * np.float32(params["drive"])
         )
         * np.float32(params["outGain"])
     ).astype(np.float32)

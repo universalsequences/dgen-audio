@@ -64,13 +64,15 @@ final class SynthIDTrainer {
     let params = TrainableKickParams(
       initial: initial,
       trainable: true,
-      freezePitch: resolvedConfig.freezePitch)
+      freezePitch: resolvedConfig.freezePitch,
+      freezeBodyAsymmetry: resolvedConfig.rung != 3)
 
     let pitchOpt = Adam(
       params: params.trainableStorage(names: ["fStart", "fEnd", "pitchDecay"]),
       lr: resolvedConfig.pitchLR)
     let ampOpt = Adam(
-      params: params.trainableStorage(names: ["bodyAmp", "clickAmp", "outGain"]),
+      params: params.trainableStorage(
+        names: ["bodyAmp", "clickAmp", "outGain", "bodyAsymmetry"]),
       lr: resolvedConfig.ampLR)
     let decayOpt = Adam(
       params: params.trainableStorage(names: ["ampDecay", "clickDecay", "noiseDecay"]),
@@ -316,6 +318,15 @@ final class SynthIDTrainer {
       values.fStart *= Foundation.exp(rng.uniform(-0.1, 0.1))
       if values.noiseAmp <= 0 { values.noiseAmp = 0.02 }
       if values.clickAmp <= 0 { values.clickAmp = 0.05 }
+    }
+    if config.rung == 3 && restartIndex == 4 {
+      // A dedicated, target-independent capture-floor hypothesis. PCM targets
+      // can contain persistent broadband energy that the original -60/s noise
+      // bound made structurally unreachable.
+      values.noiseAmp = 0.0001
+      values.noiseDecay = -0.1
+      values.noiseCutoff = 10_000
+      values.bodyAsymmetry = 0
     }
     // Never initialize a param ON its trainable bound: projected Adam plus
     // compensation by other params forms a sticky local minimum there

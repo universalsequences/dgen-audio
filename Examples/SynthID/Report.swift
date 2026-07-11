@@ -49,7 +49,9 @@ enum ReportWriter {
     // the same products renders bit-identical audio, so the individual factors are
     // not identifiable from the target and are reported unscored. The scored rows
     // for the degenerate directions are the products, at the factor's tolerance.
-    let degenerate: Set<String> = ["bodyAmp", "clickAmp", "noiseAmp", "drive"]
+    let degenerate: Set<String> = [
+      "bodyAmp", "clickAmp", "noiseAmp", "drive", "bodyAsymmetry",
+    ]
     var rows: [RecoveryRow] = []
     var equivalences: [EquivalenceRow] = []
     if let trueParams {
@@ -80,6 +82,11 @@ enum ReportWriter {
             trueValue: trueParams[name],
             recoveredValue: recovered[name]))
       }
+      equivalences.append(
+        makeEquivalence(
+          name: "bodyAsymmetry (Rung 3 extension; unscored)",
+          trueValue: trueParams.bodyAsymmetry,
+          recoveredValue: recovered.bodyAsymmetry))
     }
 
     let floor = max(0, min(irreducibleLossFloor, initLoss))
@@ -138,6 +145,9 @@ enum ReportWriter {
       }
       if let windows = comparison.windows {
         text += "- FFT windows: \(windows.map(String.init).joined(separator: ", "))\n"
+      }
+      if let highpassHz = comparison.highpassHz, highpassHz > 0 {
+        text += "- Capture high-pass: \(fmt(highpassHz)) Hz (zero-phase comparator policy)\n"
       }
       text += "- Result: \(comparison.pass ? "pass" : "fail")\n\n"
     }

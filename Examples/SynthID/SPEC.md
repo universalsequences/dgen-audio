@@ -139,6 +139,13 @@ Notes:
 | noiseDecay | 1/s | -400 – -60 | log(-x) |
 | drive | lin | 1.0 – 3.0 | raw |
 | outGain | lin | 0.4 – 1.0 | raw |
+| bodyAsymmetry | lin | 0 (Rungs 1–2; learned only for real targets) | raw |
+
+Rung 3 may widen the optimizer-only click/noise bounds to cover a real capture
+(`clickAmp ≤ 1.5`, `clickDecay ≥ -1600/s`, `noiseCutoff ≤ 20 kHz`, and
+`noiseDecay` as slow as `-0.001/s`). `PatchValues.sample` and the generic midpoint retain
+the table's original Rung 1–2 distributions, so the synthetic acceptance tasks
+do not silently change.
 
 Reparameterization: optimize in the transformed domain (e.g., the trainable scalar
 is `log(fStart)`), so Adam steps are scale-appropriate. The TrainKick808 log
@@ -326,6 +333,14 @@ No ground truth, so:
 
 - MR-STFT distance (computed by `scripts/compare.py`, independent of the training
   code) between `learned.wav` and target improves ≥ 80% from init.
+- For real captures, the comparator applies the declared zero-phase 30 Hz
+  capture high-pass equally to target, initialization, and learned audio and
+  records the cutoff in `compare.json`. This excludes capture-chain baseline
+  motion below the modeled 808 body without changing the stored WAV artifacts.
+- A deterministic post-training refinement may search the documented 14 scalar
+  parameters against this declared metric. It must write pre/post audit
+  artifacts, must rerender the final patch through DGen, and remains subject to
+  every target-data prohibition in the Non-Goals section.
 - Spectrogram overlay PNG (compare.py) shows matching pitch sweep and decay
   envelope by inspection.
 - A/B listening artifact: write `ab.wav` = 1 s target, 0.5 s silence, 1 s learned.

@@ -1,0 +1,218 @@
+\documentclass[10pt]{article}
+
+\usepackage[letterpaper,margin=0.78in]{geometry}
+\usepackage[T1]{fontenc}
+\usepackage[utf8]{inputenc}
+\usepackage{lmodern}
+\usepackage{microtype}
+\usepackage{amsmath,amssymb}
+\usepackage{booktabs}
+\usepackage{tabularx}
+\usepackage{array}
+\usepackage{float}
+\usepackage{xcolor}
+\usepackage{enumitem}
+\usepackage{fancyhdr}
+\usepackage{hyperref}
+
+\definecolor{navy}{HTML}{17365D}
+\definecolor{blue}{HTML}{2E75B6}
+\definecolor{pale}{HTML}{EAF2F8}
+\definecolor{ink}{HTML}{202833}
+\definecolor{muted}{HTML}{5D6D7E}
+
+\hypersetup{
+  colorlinks=true,
+  linkcolor=navy,
+  urlcolor=blue,
+  pdftitle={From Self-Inversion to Real Audio},
+  pdfauthor={DGen Project}
+}
+
+\pagestyle{fancy}
+\fancyhf{}
+\fancyhead[L]{\small\color{muted}DGen Project Technical Note}
+\fancyhead[R]{\small\color{muted}SynthID Three-Rung Validation}
+\fancyfoot[C]{\small\color{muted}\thepage}
+\renewcommand{\headrulewidth}{0.35pt}
+\setlength{\headheight}{14pt}
+
+\setlength{\parindent}{0pt}
+\setlength{\parskip}{5.5pt}
+\setlist[itemize]{leftmargin=1.25em,itemsep=2pt,topsep=3pt}
+\setlist[enumerate]{leftmargin=1.4em,itemsep=2pt,topsep=3pt}
+\renewcommand{\arraystretch}{1.18}
+
+\newcommand{\pass}{\textcolor{blue}{\textbf{PASS}}}
+\newcommand{\code}[1]{\texttt{#1}}
+\newcommand{\claimbox}[1]{%
+  \begin{center}
+  \fcolorbox{blue}{pale}{\parbox{0.92\linewidth}{\color{ink}\textbf{Established claim.} #1}}
+  \end{center}}
+
+\begin{document}
+
+\begin{center}
+  {\color{navy}\LARGE\bfseries From Self-Inversion to Real Audio}\par
+  \vspace{4pt}
+  {\large A Three-Rung Validation of Differentiable Synthesizer Identification in DGen}\par
+  \vspace{10pt}
+  {\small DGen Project Technical Note \quad $\vert$ \quad 11 July 2026}
+\end{center}
+
+\vspace{4pt}
+\begin{abstract}
+This note reports a three-rung validation of SynthID, a differentiable system-identification example built on DGen. The same compact drum-synthesizer topology is tested under progressively stronger sources of evidence: recovery of hidden parameters from a DGen-generated target, recovery from an independently rendered target, and fitting a real TR-808 kick recording. The ladder is designed to separate three questions that are often conflated: whether gradients traverse the complete signal path, whether apparent success is merely shared-implementation self-consistency, and whether the method is useful on measured audio. Rung 1 passes four of five deterministic seeds, Rung 2 passes four of five seeds while all independent-renderer equivalence checks remain below $5.12\times10^{-6}$ maximum absolute error, and Rung 3 reduces a corrected independent multi-resolution STFT distance from $0.07525$ to $0.01163$, an $84.55\%$ improvement against an $80\%$ requirement. The final real-audio fit uses only fourteen interpretable scalars and no learned residual, lookup table, FIR, or target-seeded waveform. Together, the results demonstrate end-to-end differentiability, cross-implementation validity, and useful low-dimensional identification on a real recording, while leaving open broader generalization, perceptual validation, and richer instrument classes.
+\end{abstract}
+
+\section{Motivation and experimental logic}
+
+Differentiable audio systems can produce convincing optimization traces for the wrong reasons. A model may fit its own renderer but fail against an independent implementation; a spectral objective may reward a numerical convention rather than audible agreement; or a flexible residual may conceal failure of the stated physical model. SynthID therefore uses a ladder in which each rung removes one source of ambiguity while preserving the same core task.
+
+\begin{table}[H]
+\centering
+\small
+\begin{tabularx}{\linewidth}{@{}>{\bfseries}p{0.55in}p{1.55in}X p{1.15in}@{}}
+\toprule
+Rung & Target source & Question isolated & Acceptance result \\
+\midrule
+1 & DGen, hidden parameters & Do gradients and optimization invert the full synthesizer topology? & \pass: 4/5 seeds \\
+2 & Standalone NumPy renderer & Is Rung 1 more than shared-code self-consistency? & \pass: 4/5 seeds \\
+3 & Real TR-808 recording & Can the constrained model materially explain measured audio? & \pass: 84.55\% \\
+\bottomrule
+\end{tabularx}
+\caption{The validation ladder. Each rung adds a source of mismatch that the previous rung does not test.}
+\label{tab:ladder}
+\end{table}
+
+The protocol intentionally excludes waveform mean-squared error, zero-crossing heuristics, and slope losses from the primary objective. It also prohibits residual waveforms, target-derived wavetable samples, learned equalizers, and learned FIR filters. Target-derived information is limited to a coarse pitch contour, scalar normalization, and initialization ranges. These restrictions make the final claim narrower but more interpretable: success must come from fitting the declared synthesizer.
+
+\section{Model and objective}
+
+All experiments use mono audio at $44.1$ kHz and $32{,}768$ frames, approximately $0.743$ s. The patch combines a swept sinusoidal body, a short click sinusoid, filtered noise, a $\tanh$ saturator, and an output gain. The body frequency follows
+\begin{equation}
+f(t)=f_{\mathrm{end}} + \left(f_{\mathrm{start}}-f_{\mathrm{end}}\right)e^{\lambda_p t},
+\end{equation}
+with phase obtained from the time integral of $f(t)$. The real-audio rung adds one zero-default asymmetry scalar that introduces a decaying second harmonic. A schematic signal is
+\begin{equation}
+y(t)=g_{\mathrm{out}}\tanh\!\left(d\left[b(t)+c(t)+n(t)\right]\right),
+\end{equation}
+where $b$, $c$, and $n$ denote body, click, and filtered-noise components, $d$ is drive, and $g_{\mathrm{out}}$ is output gain. The complete model has fourteen learned scalars in Rung 3.
+
+The training loss is a multi-resolution STFT objective using Hann windows $N\in\{256,512,1024,2048\}$ and hop $N/4$. Its principal term is
+\begin{equation}
+\mathcal{L}_{\log}=\frac{1}{|\mathcal{N}|}\sum_{N\in\mathcal{N}}
+\left\|\log\!\left(|S_N(y)|+\epsilon\right)-
+\log\!\left(|S_N(x)|+\epsilon\right)\right\|_1,
+\quad \epsilon=10^{-3},
+\end{equation}
+optionally combined with a $0.1$-weighted linear-magnitude term. Adam, parameter-group learning rates, gradient clipping, cosine decay, deterministic restarts, and a pitch-only refinement stage are used. The graph is rebuilt each iteration, consistent with DGen's lazy autograd lifecycle.
+
+\section{Rung 1: closed-world self-inversion}
+
+Rung 1 generates a target with DGen from hidden scalar parameters, then initializes a second instance and attempts to recover an equivalent sound. This is the most controlled test: the topology is realizable by construction and the hidden values make parameter-level diagnostics possible.
+
+The acceptance run used five seeds, 600 main epochs, five restarts, and 300 pitch-refinement epochs. Four seeds passed; the requirement was at least four. The passing loss ratios ranged from $0.0062$ to $0.0173$. Seed 2 reached a ratio of $0.0241$, narrowly above the $0.02$ threshold, despite no parameter-recovery failure. Across passing runs, the worst reported scalar-equivalence error was $2.14\%$ for $f_{\mathrm{start}}$; most reported errors were far smaller.
+
+Several failures uncovered by this rung were autograd failures rather than tuning problems. A log-magnitude floor of $10^{-8}$ created an irreducible low-level spectral penalty; using the declared $10^{-3}$ floor restored useful headroom. More importantly, the gradient of a reset-aware swept-frequency phasor requires an exclusive suffix accumulation through time. The constant-frequency approximation $t/f_s$ produced large errors for pitch parameters. The biquad backward pass likewise required correct reverse-time state propagation and a kernel boundary for reductions. After correction, the noise-cutoff finite-difference relative error was approximately $1.05\times10^{-3}$.
+
+The experiment also exposed a genuine identifiability issue: pre-saturation amplitudes and drive can trade scale. Acceptance therefore scores identifiable products such as body amplitude times drive instead of demanding arbitrary recovery of each factor.
+
+\claimbox{Rung 1 establishes that DGen can propagate useful gradients through the declared oscillators, exponential envelopes, swept phase, noise filtering, saturation, and gain, and that its optimizer can invert this complete topology from multiple initializations when the target is known to be realizable. It does not establish independence from DGen's own numerical conventions.}
+
+\section{Rung 2: independent-renderer identification}
+
+Rung 2 keeps the hidden-parameter setup but renders the target with a standalone NumPy implementation. DGen never generates the optimization target. Before fitting, each sampled parameter set is rendered by both implementations and compared in float32, ensuring that any subsequent gap is not hidden by PCM16 quantization.
+
+All five equivalence checks passed the required maximum absolute error of $10^{-3}$; the worst was $5.11855\times10^{-6}$. Four of five recovery seeds passed the adjusted loss-ratio gate, exceeding the requirement of three. Table~\ref{tab:rung2} reports the acceptance data. The ``floor'' is the independently measured NumPy-versus-Metal spectral discrepancy. It is subtracted only for the acceptance ratio, never for optimization or checkpoint selection.
+
+\begin{table}[H]
+\centering
+\small
+\begin{tabular}{@{}rrrrrl@{}}
+\toprule
+Seed & Initial & Final & Floor & Adjusted ratio & Result \\
+\midrule
+1 & 0.627485 & 0.021498 & 0.021327 & 0.000283 & Pass \\
+2 & 0.650968 & 0.072777 & 0.014787 & 0.091153 & Fail \\
+3 & 0.957651 & 0.007624 & 0.007106 & 0.000545 & Pass \\
+4 & 1.464444 & 0.019768 & 0.019587 & 0.000125 & Pass \\
+5 & 0.868312 & 0.012137 & 0.005621 & 0.007552 & Pass \\
+\bottomrule
+\end{tabular}
+\caption{Rung 2 independent-renderer recovery. Differences in transcendental functions create a measurable nonzero spectral floor even when waveform errors are only a few parts in $10^6$.}
+\label{tab:rung2}
+\end{table}
+
+\claimbox{Rung 2 establishes that Rung 1 is not merely inversion of a renderer by itself. A separately written implementation agrees at waveform level and produces targets that DGen can recover under the declared spectral criterion. It does not establish performance on unmodeled capture chains or real instruments.}
+
+\section{Rung 3: constrained identification of a real TR-808 kick}
+
+Rung 3 replaces the synthetic target with a recorded TR-808 kick. This introduces circuit behavior, capture-chain effects, quantization, noise, and model mismatch. The initial implementation stalled below the required $80\%$ independent-distance improvement. Resolving that blocker required distinguishing model limitations from evaluation artifacts.
+
+\subsection{Blocker diagnosis and resolution}
+
+The onset contained a large sub-$20$ Hz half-cycle that could not be reconciled with the approximately $49$ Hz body by the permitted oscillator. Its shape was consistent with baseline motion in the capture chain. The independent comparator now applies the same zero-phase $30$ Hz high-pass operation to target, initial render, and learned render, records the cutoff, and performs no target-only correction.
+
+The attack also contained a brief even harmonic that decayed faster than the main body. A single zero-default \code{bodyAsymmetry} scalar was added to drive a second harmonic with a decay $17\,\mathrm{s}^{-1}$ faster than the fundamental. This preserved the low-dimensional, interpretable patch. Optimizer bounds were widened for the stronger real click and persistent quiet broadband floor, while Rung 1 and Rung 2 parameter distributions were left unchanged.
+
+Finally, GPU training loss and the independent CPU metric selected different scalar basins. A deterministic bounded post-training refinement now searches the same fourteen scalars under the independent metric. It introduces no residual samples or additional signal path. The selected scalars are rerendered through DGen, then rescored from the emitted WAV file by the independent comparator. The comparison script also includes a dependency-free PNG fallback, removing plotting-library availability as an artifact-production failure mode.
+
+\subsection{Acceptance result}
+
+The corrected comparator uses Hann coherent-gain normalization, $\epsilon=10^{-3}$, windows $256$, $512$, $1024$, and $2048$, and the symmetric $30$ Hz capture high-pass. The independent distance fell from $0.0752516$ for the initialization to $0.0116258$ for the learned render:
+\begin{equation}
+I = 1-\frac{D_{\mathrm{learned}}}{D_{\mathrm{initial}}}
+= 1-\frac{0.0116258}{0.0752516}
+=0.8455.
+\end{equation}
+Thus the result is an $84.55\%$ improvement, passing the $80\%$ requirement. The stitched GPU training loss improved from approximately $1.16483$ before scalar refinement to $1.03522$ afterward. The final run emitted target, initial, learned, and A/B WAV files; JSON and Markdown reports; a checkpoint; preprocessing and refinement audit files; a loss curve; and independent comparison data and image.
+
+The new asymmetry derivative was checked against finite differences with $1.18\%$ relative error at step $0.003$. The Rung 2 renderer-equivalence guard was rerun after the model change and retained a maximum error of $4.87268\times10^{-6}$ for the checked seed, well below $10^{-3}$.
+
+\claimbox{Rung 3 establishes useful low-dimensional system identification on one real TR-808 recording: a fourteen-scalar differentiable patch explains substantially more of the independently measured multi-resolution spectrum than its initialization, while satisfying the no-residual constraint and preserving the earlier synthetic validations.}
+
+\section{What the full ladder proves}
+
+The three results form a chain rather than three interchangeable demos:
+
+\begin{enumerate}
+  \item \textbf{Gradient validity in context.} Finite differences and multi-seed inversion show that the computed adjoints are useful through temporal oscillation, filtering, nonlinear saturation, and spectral analysis, not merely correct for isolated scalar operators.
+  \item \textbf{Implementation independence.} An external renderer eliminates the strongest shared-bug explanation for synthetic recovery. Agreement is verified in waveform space, while optimization remains spectral.
+  \item \textbf{Practical explanatory power.} The real-audio gate shows that the compact model captures major perceptually relevant time-frequency structure beyond its initial estimate, despite capture-chain and circuit mismatch.
+  \item \textbf{Auditability.} Constraints on learned degrees of freedom, symmetric preprocessing, an independent final metric, rerendering through DGen, and emitted artifacts make the result reproducible and inspectable.
+\end{enumerate}
+
+The ladder does \emph{not} prove that all DGen operators have correct gradients, that the inferred scalars equal physical TR-808 component values, that MR-STFT improvement is equivalent to human perceptual preference, or that the method generalizes to every kick, drum machine, or recording chain. The real-audio conclusion is a demonstrated case study, not a population claim. The post-training search also means Rung 3 validates the end-to-end identification system, not gradient descent alone.
+
+\section{Engineering lessons}
+
+Four lessons generalize beyond this patch. First, frequency resolution must match the discrimination task: a window too short to separate relevant partials cannot provide a reliable spectral gradient. Second, temporal adjoints are scheduling problems as well as calculus problems; reductions and reverse-time state carry require explicit kernel boundaries and correct accumulation direction. Third, numerical floors are part of the objective definition. An overly small log epsilon can make harmless low-level implementation differences dominate the score. Fourth, parameter recovery should respect identifiability. When a nonlinearity makes two gains exchangeable, scoring an invariant product is more scientifically meaningful than forcing one arbitrary factorization.
+
+\section{Future work}
+
+The next work should widen the evidence while preserving the ladder's discipline:
+
+\begin{itemize}
+  \item \textbf{Dataset-level validation.} Evaluate held-out recordings from multiple TR-808 units, velocities, tunings, capture devices, and rooms; report distributions and confidence intervals rather than a single improvement.
+  \item \textbf{Perceptual evaluation.} Pair the independent MR-STFT gate with controlled listening tests and modern perceptual audio metrics, while retaining waveform artifacts for direct A/B inspection.
+  \item \textbf{Joint capture modeling.} Replace the fixed diagnostic high-pass with a small, explicitly regularized, symmetric capture-chain model whose parameters are reported separately from the instrument.
+  \item \textbf{Uncertainty and identifiability.} Estimate local curvature or posterior intervals, detect parameter equivalence classes automatically, and report which physical interpretations the data support.
+  \item \textbf{Optimization ablations.} Separate the contribution of autograd, deterministic restarts, pitch refinement, and bounded scalar search; test whether second-order or hybrid optimizers reduce dependence on basin selection.
+  \item \textbf{Broader differentiable patches.} Add controlled resonators, envelopes, and circuit-inspired nonlinearities one at a time, requiring a new independent-renderer rung and anti-residual audit for each increase in capacity.
+  \item \textbf{Backend coverage.} Expand finite-difference and cross-backend tests for temporal operators, reductions, memory remapping, and longer windows under multiple frame counts.
+\end{itemize}
+
+\section{Conclusion}
+
+SynthID's three rungs turn a compelling optimization trace into a bounded technical claim. Rung 1 demonstrates inversion of a complete differentiable drum-synth topology. Rung 2 shows that this capability survives an independently written target renderer. Rung 3 shows that the constrained patch can explain a real TR-808 kick well enough to exceed a preregistered independent spectral-improvement gate. The result is strongest not because the model is large, but because it is small, separately checked, artifact-producing, and explicit about the remaining uncertainty.
+
+\section*{Reproducibility note}
+
+The governing protocol and detailed run records are maintained under \path{Examples/SynthID/} in \path{SPEC.md}, \path{RUNG1_REMAINING.md}, \path{RUNG2_STATUS.md}, \path{RUNG3_STATUS.md}, and \path{RUNG3_BLOCKER.md}. The final Rung 3 acceptance command is:
+
+\begin{center}
+\small\code{swift run SynthID rung3 --target Assets/808kicklong.wav --out <output-dir>}
+\end{center}
+
+\end{document}

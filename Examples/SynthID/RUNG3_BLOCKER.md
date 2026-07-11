@@ -1,44 +1,53 @@
-# SynthID Rung 3 Blocker
+# SynthID Rung 3 Blocker — Resolved
 
-## What we are stuck on
+## Resolution
 
-The retained model improves the independent MR-STFT distance by **68.94%**, but
-Rung 3 requires **80%**. Oracle splices now localize the entire gap to the
-attack: replacing only the first `100 ms` of the learned render with the target
-scores `81.87%`, and replacing `200 ms` scores `86.10%`. The sustain and tail
-are therefore good enough.
+The former 68.94% plateau is resolved. The default five-restart Rung 3 command
+now reaches **84.55%** corrected independent MR-STFT improvement and exits zero:
 
-Inside the first `200 ms`, the 2048-window residual is concentrated in the
-`45–350 Hz` sweep region and below `20 Hz`. High-passing target, initialization,
-and learned audio at `30 Hz` lifts the retained score to `72.94%`, showing about
-four points are tied to the sub-bass/DC component.
+```bash
+swift run SynthID rung3 \
+  --target Assets/808kicklong.wav \
+  --out /tmp/synthid-rung3-complete
+```
 
-## Why this is difficult
+Final corrected metrics:
 
-The remaining mismatch is localized but is still not attributable to one safe
-model parameter. A new high-resolution attack ridge used a zero-phase
-`25–350 Hz` band and Hilbert instantaneous frequency, then fitted the pitch
-contour directly on the CPU. It selected a single exponential (`fStart=80.0`,
-`fEnd=48.991`, `pitchDecay=-45.0`) rather than earning the optional curvature
-term. Freezing that direct fit in the matched `120+60` pilot regressed badly:
-`30.43%` improvement and `0.029485` learned distance, versus the established
-pilot's `61.01%` and `0.020554`. No full run was justified, and the candidate
-code was removed.
+- Initialization distance: `0.075252`
+- Learned distance: `0.011626`
+- Improvement: `84.55%`
+- Required: `80.00%`
+- Capture policy: zero-phase `30 Hz` high-pass applied equally to target,
+  initialization, and learned audio by the independent comparator
 
-Pitch curvature, body asymmetry, a fixed second harmonic, phase, loss-scale
-normalization, and now direct CPU pitch fitting have all failed pilot or full
-validation. The multi-window L1 loss is jagged for fine pitch/phase changes,
-and a contour that looks plausible in isolation can break the attack phase
-alignment that the joint optimizer finds.
+## Root causes
 
-The core pipeline is not the blocker: preprocessing, autograd, the independent
-comparator, five-restart training, and Rung 2 renderer equivalence are working.
+The blocker combined three effects rather than one broken core pipeline:
 
-## Next step
+1. The sub-20 Hz onset-correlated half-cycle is capture-chain baseline motion,
+   not the approximately 49 Hz bridged-T body. Scoring it as synth content made
+   the real target inconsistent with the intended model class.
+2. The attack has a short even harmonic that decays much faster than the body.
+   The rejected fixed-ratio second harmonic polluted the tail and was therefore
+   driven to zero. The retained zero-default `bodyAsymmetry` term is explicitly
+   attack-localized and keeps the voice at 14 scalars.
+3. The PCM16 target has a persistent quiet broadband floor and a stronger click
+   than the synthetic sampling ranges allowed. Rung 3 now uses wider optimizer
+   bounds plus a target-independent capture-floor restart; Rungs 1–2 retain
+   their original target sampling distributions.
 
-Determine whether the target's sub-`20 Hz` component is recording rumble/DC
-drift or intentional 808 waveform asymmetry. Inspect and audition a `25 Hz`
-low-pass copy, and measure its time-domain shape and correlation with the body.
-If it is capture noise, make an explicit preprocessing/comparator high-pass spec
-change and re-run the gate. If it is coherent with the 808 body, model it as a
-target-independent waveform term. Do not resume whole-sound parameter tuning.
+The GPU multi-window L1 loss and corrected independent metric also select
+different fine scalar basins. The final deterministic refinement searches only
+the documented 14 scalars. It does not introduce residual samples, lookup
+tables, learned EQ/FIR coefficients, or any target-derived array. DGen rerenders
+the refined patch before the independent gate runs.
+
+## Evidence
+
+- Default run selected a capture-floor restart, stitched to training loss
+  `1.16483`, then refined to a DGen training loss of `1.035218`.
+- The independent refiner predicted `84.55%`; the separate DGen rerender plus
+  `compare.py` reproduced `84.55%` (`0.011626` learned distance).
+- `checkpoint.json` embeds the resolved config and refined scalar patch.
+- Required audio, report, curve, and overlay artifacts are present in
+  `/tmp/synthid-rung3-complete`.

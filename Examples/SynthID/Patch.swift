@@ -22,6 +22,15 @@ enum KickVoice {
     let body =
       DGenLazy.sin(sweepPhase * (2.0 * Float.pi)) * DGenLazy.exp(params.ampDecay * t)
       * params.bodyAmp
+    // The real target's even harmonic is attack-localized: a constant-ratio
+    // second harmonic was correctly rejected because it polluted the tail.
+    // This zero-default term decays 17/s faster than the fundamental and adds
+    // one scalar, keeping the voice at the 14-parameter limit.
+    let evenHarmonic =
+      params.bodyAsymmetry
+      * DGenLazy.sin(sweepPhase * (4.0 * Float.pi) - 0.62)
+      * DGenLazy.exp(params.ampDecay * t) * params.bodyAmp
+      * DGenLazy.exp(-17.0 * t)
 
     let clickPhase = params.clickFreq * t * (2.0 * Float.pi)
     let click = DGenLazy.sin(clickPhase) * DGenLazy.exp(params.clickDecay * t) * params.clickAmp
@@ -36,7 +45,7 @@ enum KickVoice {
     }
     let noiseBurst = noise * DGenLazy.exp(params.noiseDecay * t) * params.noiseAmp
 
-    let mixed = body + click + noiseBurst
+    let mixed = body + evenHarmonic + click + noiseBurst
     return DGenLazy.tanh(mixed * params.drive) * params.outGain
   }
 

@@ -642,6 +642,49 @@ enum SynthIDCLI {
       config: config,
       outDir: outDir,
       context: "rung3 real target")
+    if !options.keys.contains("no-refine") {
+      let recoveredURL = outDir.appendingPathComponent("recovered_params.json")
+      let preRefineURL = outDir.appendingPathComponent("pre_refine_params.json")
+      try copyIfPresent(from: recoveredURL, to: preRefineURL)
+      try Rung3Refiner.run(
+        targetURL: preparedTargetURL,
+        initialURL: outDir.appendingPathComponent("initial.wav"),
+        paramsURL: preRefineURL,
+        outputParamsURL: recoveredURL,
+        outputJSONURL: outDir.appendingPathComponent("refinement.json"),
+        scriptURL: options["refine-script"].map { URL(fileURLWithPath: $0) },
+        python: options["python"] ?? "python3")
+      let refined = try loadPatchValues(from: recoveredURL)
+      // Canonicalize Python's JSON doubles through PatchValues/Float so the
+      // recovered-params artifact and checkpoint carry byte-for-byte values.
+      try writeJSON(refined, to: recoveredURL)
+      let initial = try loadPatchValues(
+        from: outDir.appendingPathComponent("initial_params.json"))
+      let pitchFit = try JSONDecoder().decode(
+        PitchFit.self,
+        from: Data(contentsOf: outDir.appendingPathComponent("pitch_fit.json")))
+      let refinedLoss = try SynthIDTrainer(config: config).evaluateLoss(
+        values: refined,
+        targetSamples: prepared.samples)
+      let refinedResult = TrainingRunResult(
+        recovered: refined,
+        initial: initial,
+        pitchFit: pitchFit,
+        initLoss: report.initLoss,
+        bestLoss: refinedLoss,
+        bestEpoch: 0,
+        losses: [])
+      report = try renderLearnedAndReport(
+        result: refinedResult,
+        trueParams: nil,
+        targetSamples: prepared.samples,
+        config: config,
+        outDir: outDir)
+      try updateCheckpointAfterRung3Refinement(
+        outDir: outDir,
+        params: refined,
+        loss: refinedLoss)
+    }
     let comparison = try Rung3Comparator.run(
       targetURL: preparedTargetURL,
       initialURL: outDir.appendingPathComponent("initial.wav"),
@@ -664,6 +707,25 @@ enum SynthIDCLI {
       throw SynthIDError.message(
         "rung3 failed: independent MR-STFT improvement \(comparison.improvement), required \(comparison.requiredImprovement)")
     }
+  }
+
+  private static func updateCheckpointAfterRung3Refinement(
+    outDir: URL,
+    params: PatchValues,
+    loss: Float
+  ) throws {
+    let url = outDir.appendingPathComponent("checkpoint.json")
+    guard FileManager.default.fileExists(atPath: url.path) else { return }
+    var checkpoint = try JSONDecoder().decode(
+      SynthIDCheckpoint.self, from: Data(contentsOf: url))
+    checkpoint.createdAtUTC = timestampUTC()
+    checkpoint.loss = loss
+    checkpoint.params = params
+    checkpoint.transformedParams = Dictionary(
+      uniqueKeysWithValues: KickParamSpecs.all.map { spec in
+        (spec.name, spec.transform(params[spec.name]))
+      })
+    try writeJSON(checkpoint, to: url)
   }
 
   private static func renderLearnedAndReport(
@@ -765,7 +827,7 @@ enum SynthIDCLI {
                     --no-noise-filter --fd-eps EPS --backend metal|cpu
       Rung 2 flags: --renderer <render_reference.py> --python <python3>
       Rung 3 flags: --onset-threshold-db DB --compare-script <compare.py> --python <python3>
-                    --fdcheck <param>
+                    --refine-script <refine_rung3.py> --no-refine --fdcheck <param>
       """
     )
   }

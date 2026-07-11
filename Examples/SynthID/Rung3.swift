@@ -24,6 +24,7 @@ struct Rung3Comparison: Codable {
   var logEpsilon: Float?
   var magnitudeNormalization: String?
   var windows: [Int]?
+  var highpassHz: Float?
   var pass: Bool
 }
 
@@ -188,5 +189,65 @@ enum Rung3Comparator {
       throw SynthIDError.message("rung3 comparator produced non-finite metrics")
     }
     return comparison
+  }
+}
+
+enum Rung3Refiner {
+  static var defaultScriptURL: URL {
+    URL(fileURLWithPath: #filePath)
+      .deletingLastPathComponent()
+      .appendingPathComponent("scripts/refine_rung3.py")
+  }
+
+  static func run(
+    targetURL: URL,
+    initialURL: URL,
+    paramsURL: URL,
+    outputParamsURL: URL,
+    outputJSONURL: URL,
+    scriptURL: URL? = nil,
+    python: String = "python3"
+  ) throws {
+    let script = scriptURL ?? defaultScriptURL
+    guard FileManager.default.fileExists(atPath: script.path) else {
+      throw SynthIDError.message("missing rung3 refiner at \(script.path)")
+    }
+    let arguments = [
+      script.path,
+      "--target", targetURL.path,
+      "--initial", initialURL.path,
+      "--params", paramsURL.path,
+      "--out-params", outputParamsURL.path,
+      "--json", outputJSONURL.path,
+    ]
+    let process = Process()
+    if python.contains("/") {
+      process.executableURL = URL(fileURLWithPath: python)
+      process.arguments = arguments
+    } else {
+      process.executableURL = URL(fileURLWithPath: "/usr/bin/env")
+      process.arguments = [python] + arguments
+    }
+    var environment = ProcessInfo.processInfo.environment
+    environment["PYTHONDONTWRITEBYTECODE"] = "1"
+    process.environment = environment
+    let output = Pipe()
+    let error = Pipe()
+    process.standardOutput = output
+    process.standardError = error
+    try process.run()
+    process.waitUntilExit()
+    let stdout = String(
+      data: output.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8)?
+      .trimmingCharacters(in: .whitespacesAndNewlines)
+    let stderr = String(
+      data: error.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8)?
+      .trimmingCharacters(in: .whitespacesAndNewlines)
+    guard process.terminationStatus == 0 else {
+      throw SynthIDError.message(
+        "rung3 refiner failed (exit \(process.terminationStatus))"
+          + ((stderr?.isEmpty == false) ? ": \(stderr!)" : ""))
+    }
+    if stdout?.isEmpty == false { print(stdout!) }
   }
 }

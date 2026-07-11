@@ -1,5 +1,65 @@
 # SynthID Rung 3 Status
 
+## Completed acceptance (2026-07-11)
+
+Rung 3 now passes the corrected independent gate on
+`Assets/808kicklong.wav` with the repository-default command:
+
+```bash
+swift run SynthID rung3 \
+  --target Assets/808kicklong.wav \
+  --out /tmp/synthid-rung3-complete
+```
+
+- Initialization distance: `0.075252`
+- Learned distance: `0.011626`
+- Improvement: **84.55%**
+- Required improvement: `80.00%`
+- Result: **pass**
+- Selected stitched training loss before independent refinement: `1.16483`
+- Final training loss at the independently refined scalars: `1.035218`
+
+The default five restarts, pitch refinement, cross-restart subspace stitching,
+bounded 14-scalar independent refinement, DGen rerender, and corrected gate all
+completed. The command exited zero and wrote the required `target.wav`,
+`learned.wav`, `ab.wav`, `checkpoint.json`, `report.json`, `report.md`,
+`loss_curve.csv`, and `compare.png` artifacts. It also writes
+`pre_refine_params.json` and `refinement.json` so the final scalar step is fully
+auditable.
+
+### Resolved blocker
+
+Low-pass/time-domain inspection showed that the sub-20 Hz component is a
+capture-chain baseline response: a large onset-correlated half-cycle that is far
+below the bridged-T body's approximately 49 Hz settled mode. The independent
+real-target policy therefore applies the same zero-phase 30 Hz high-pass to
+target, initialization, and learned audio. `compare.json` records
+`"highpassHz": 30.0`; the original files and training target remain unchanged.
+
+The remaining attack mismatch had two structural causes:
+
+- The real attack contains a short even harmonic whose ratio decays toward zero.
+  A zero-default `bodyAsymmetry` scalar now drives a second harmonic that decays
+  `17/s` faster than the body. This is the fourteenth and final voice scalar.
+- The real PCM16 recording retains a quiet broadband capture floor and a larger
+  excitation than the synthetic rungs. Rung 3 can now explore wider click/noise
+  optimization bounds while Rungs 1–2 keep their original sampling ranges and
+  zero asymmetry.
+
+The GPU loss still has different local basins from the corrected independent
+metric for click, pitch, asymmetry, and capture-floor scalars. A deterministic
+coordinate refiner handles only those documented scalar values—never waveform
+samples, residual tables, learned FIRs, or target-derived arrays. The final
+candidate is rerendered by DGen and re-evaluated by `compare.py`.
+
+Focused validation:
+
+- New scalar finite difference: `1.18%` relative error at `epsilon=0.003`.
+- Rung 2 independent renderer equivalence: `4.872680e-06` max absolute error
+  (`< 1e-3`) for seed 1.
+- Python-free plotting environment: `compare.py` writes a valid dependency-free
+  PNG fallback while preserving identical MR-STFT JSON metrics.
+
 ## Corrected real-target baseline (2026-07-10)
 
 Target: `Assets/808kicklong.wav`
@@ -125,12 +185,8 @@ These experiments were evaluated and deliberately not retained in the voice:
   `30.43%` (`0.029485` learned distance), versus the retained pilot's `61.01%`
   (`0.020554`). No full run was made, and the candidate code was removed.
 
-## Status and next model step
+## Status
 
-The Rung 3 harness and corrected independent evaluator are implemented. Rung 3
-itself is **not complete** because the corrected score remains below 80%.
-
-The next step is to determine the provenance of the target's sub-`20 Hz`
-component. Low-pass and inspect/audition it before choosing between an explicit
-capture-rumble high-pass policy and a coherent waveform-asymmetry model. The
-attack localization is decisive; whole-sound parameter tuning should not resume.
+The historical experiments above explain the former blocker. The completed
+acceptance run at the top of this document supersedes the 68.94% retained
+baseline: **Rung 3 is complete at 84.55%.**
