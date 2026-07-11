@@ -113,15 +113,24 @@ These experiments were evaluated and deliberately not retained in the voice:
   `+4.8°`, opposite the grid optimum; local finite differences were dominated
   by multi-window L1 cusps. The parameter was removed and no full run was made.
   Pilot artifacts are in `/tmp/synthid-rung3-body-phase-pilot`.
+- Residual oracle splices localized all missing gate headroom to the first
+  `100–200 ms`: a `100 ms` target attack splice scored `81.87%`, and `200 ms`
+  scored `86.10%`. At the 2048 window the attack residual is concentrated in
+  the `45–350 Hz` sweep and below `20 Hz`; high-passing all comparator inputs at
+  `30 Hz` raises the retained score from `68.94%` to `72.94%`.
+- A high-resolution CPU attack-ridge fit was then tested outside the training
+  loss. A zero-phase `25–350 Hz` band plus Hilbert instantaneous frequency chose
+  a single exponential (`80.0 → 48.991 Hz`, decay `-45.0`) rather than the
+  optional curvature term. Freezing it regressed the matched `120+60` pilot to
+  `30.43%` (`0.029485` learned distance), versus the retained pilot's `61.01%`
+  (`0.020554`). No full run was made, and the candidate code was removed.
 
 ## Status and next model step
 
 The Rung 3 harness and corrected independent evaluator are implemented. Rung 3
 itself is **not complete** because the corrected score remains below 80%.
 
-Before adding another voice parameter, extend the independent comparator with a
-time-by-frequency residual breakdown. Pitch curvature, fixed second harmonic,
-body asymmetry, phase, and loss rescaling have now all failed full or pilot
-validation. The next candidate should be selected from a measured residual band
-and time interval—not another whole-sound parameter guess—and should still pass
-a cheap independent headroom check before implementation.
+The next step is to determine the provenance of the target's sub-`20 Hz`
+component. Low-pass and inspect/audition it before choosing between an explicit
+capture-rumble high-pass policy and a coherent waveform-asymmetry model. The
+attack localization is decisive; whole-sound parameter tuning should not resume.
