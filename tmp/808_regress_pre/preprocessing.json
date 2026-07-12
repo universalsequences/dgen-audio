@@ -1,0 +1,15 @@
+{
+  "cropped" : true,
+  "normalizationScale" : 0.9007575,
+  "onsetFrame" : 3,
+  "onsetSeconds" : 9.2307695e-05,
+  "onsetThresholdDB" : -40,
+  "outputFrames" : 32768,
+  "padded" : false,
+  "resampledFrames" : 51232,
+  "sourceDurationSeconds" : 1.1618154,
+  "sourceFrames" : 37759,
+  "sourcePath" : "\/Users\/alecresende\/code\/swift\/dgen\/Assets\/808kicklong.wav",
+  "sourceSampleRate" : 32500,
+  "targetSampleRate" : 44100
+}

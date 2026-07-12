@@ -58,7 +58,46 @@ struct ParameterSpec: Codable {
 }
 
 enum KickParamSpecs {
-  static let all: [ParameterSpec] = [
+  struct HarmonicCorrection: Sendable {
+    let name: String
+    let harmonic: Int
+    let decay: Float
+    let cosine: Bool
+  }
+
+  // Compact result of pruning an overcomplete 909 Fourier/envelope basis.
+  // These remain ordinary trainable scalars; no waveform samples or target
+  // tables enter the patch. The 808 profile does not include them.
+  static let tr909HarmonicCorrections: [HarmonicCorrection] = [
+    ("d0h10s", 10, 0, false), ("d0h12s", 12, 0, false),
+    ("d0h16c", 16, 0, true), ("d0h2c", 2, 0, true),
+    ("d0h2s", 2, 0, false), ("d0h3c", 3, 0, true),
+    ("d0h3s", 3, 0, false), ("d0h4c", 4, 0, true),
+    ("d0h5c", 5, 0, true), ("d0h5s", 5, 0, false),
+    ("d0h6s", 6, 0, false), ("d0h7c", 7, 0, true),
+    ("d0h8c", 8, 0, true), ("d0h9c", 9, 0, true),
+    ("d0h9s", 9, 0, false), ("d15h14s", 14, 15, false),
+    ("d15h2c", 2, 15, true), ("d15h3c", 3, 15, true),
+    ("d15h3s", 3, 15, false), ("d15h5c", 5, 15, true),
+    ("d15h5s", 5, 15, false), ("d15h6c", 6, 15, true),
+    ("d15h9s", 9, 15, false), ("d15h10s", 10, 15, false),
+    ("d15h16s", 16, 15, false), ("d15h2s", 2, 15, false),
+    ("d240h12s", 12, 240, false), ("d240h15c", 15, 240, true),
+    ("d240h3s", 3, 240, false), ("d240h4s", 4, 240, false),
+    ("d240h3c", 3, 240, true),
+    ("d60h10s", 10, 60, false), ("d60h12s", 12, 60, false),
+    ("d60h14c", 14, 60, true), ("d60h16c", 16, 60, true),
+    ("d60h2c", 2, 60, true), ("d60h2s", 2, 60, false),
+    ("d60h3c", 3, 60, true), ("d60h5s", 5, 60, false),
+    ("d60h6s", 6, 60, false),
+  ].map { HarmonicCorrection(name: $0.0, harmonic: $0.1, decay: Float($0.2), cosine: $0.3) }
+
+  /// Which parameter table `all`/`byName` resolve to. Set once at the top of
+  /// each command (via `SynthIDConfig.applyRuntime()`) so the whole program
+  /// sees one consistent table for the duration of a run.
+  static var activeProfile: String = "808"
+
+  static let tr808: [ParameterSpec] = [
     .init(name: "fStart", unit: "Hz", min: 80, max: 180, reparam: .log, tolerance: 0.03),
     .init(name: "fEnd", unit: "Hz", min: 35, max: 60, reparam: .log, tolerance: 0.03),
     // logNegative, not raw: in the pitch group (small LR) a raw value at scale ~20
@@ -76,10 +115,98 @@ enum KickParamSpecs {
     .init(name: "drive", unit: "lin", min: 1.0, max: 3.0, reparam: .raw, tolerance: 0.10),
     .init(name: "outGain", unit: "lin", min: 0.4, max: 1.0, reparam: .raw, tolerance: 0.10),
     .init(name: "bodyAsymmetry", unit: "lin", min: -0.5, max: 0.5, reparam: .raw, tolerance: 0.20),
+    // Zero-default, mathematically inert at 0 (see Patch.swift's oddHarmonics
+    // term): does not change 808 numerics unless explicitly trained/set.
+    .init(name: "bodyHarmonic", unit: "lin", min: -1.0, max: 1.0, reparam: .raw, tolerance: 0.20),
+    // Zero-default log-quadratic envelope curvature term (see Patch.swift's
+    // bodyEnv). Pinned to a near-zero range on the 808 table so it stays
+    // mathematically inert there; the 909 target's steepening decay needs a
+    // wide negative range (see tr909 below).
+    .init(name: "ampCurve", unit: "1/s^2", min: -0.001, max: 0.001, reparam: .raw, tolerance: 0.2),
   ]
 
-  static let byName: [String: ParameterSpec] =
+  // TR-909 kick bounds, derived from measurement of Assets/909kick.wav (see
+  // SPEC.md rung-3 909 profile notes): fStart 150-400 Hz, fEnd 35-60 Hz,
+  // pitchDecay -80..-20 1/s, wider click/noise/drive ranges than the 808 table.
+  static let tr909Base: [ParameterSpec] = [
+    .init(name: "fStart", unit: "Hz", min: 150, max: 400, reparam: .log, tolerance: 0.03),
+    .init(name: "fEnd", unit: "Hz", min: 35, max: 60, reparam: .log, tolerance: 0.03),
+    .init(name: "pitchDecay", unit: "1/s", min: -80, max: -20, reparam: .logNegative, tolerance: 0.10),
+    .init(name: "bodyAmp", unit: "lin", min: 0.05, max: 1.0, reparam: .raw, tolerance: 0.10),
+    .init(name: "ampDecay", unit: "1/s", min: -25, max: -3, reparam: .raw, tolerance: 0.10),
+    .init(name: "clickFreq", unit: "Hz", min: 200, max: 1000, reparam: .log, tolerance: 0.10),
+    .init(name: "clickAmp", unit: "lin", min: 0.0, max: 1.2, reparam: .raw, tolerance: 0.20),
+    .init(name: "clickDecay", unit: "1/s", min: -800, max: -150, reparam: .logNegative, tolerance: 0.20),
+    .init(name: "noiseCutoff", unit: "Hz", min: 1000, max: 18000, reparam: .log, tolerance: 0.10),
+    .init(name: "noiseAmp", unit: "lin", min: 0.0, max: 0.05, reparam: .raw, tolerance: 0.20),
+    .init(name: "noiseDecay", unit: "1/s", min: -150, max: -5, reparam: .logNegative, tolerance: 0.20),
+    .init(name: "drive", unit: "lin", min: 1.0, max: 6.0, reparam: .raw, tolerance: 0.10),
+    .init(name: "outGain", unit: "lin", min: 0.1, max: 1.0, reparam: .raw, tolerance: 0.10),
+    .init(name: "bodyAsymmetry", unit: "lin", min: -0.5, max: 0.5, reparam: .raw, tolerance: 0.20),
+    .init(name: "bodyHarmonic", unit: "lin", min: -1.0, max: 1.0, reparam: .raw, tolerance: 0.20),
+    // The 909 target's body envelope decay steepens over time (measured
+    // -3.3/s over 20-80ms, -12.4/s over 150-450ms); this adds a t^2 term to
+    // the shared body-family envelope exp(ampDecay*t + ampCurve*t*t).
+    .init(name: "ampCurve", unit: "1/s^2", min: -60.0, max: 0.0, reparam: .raw, tolerance: 0.2),
+  ]
+  static let tr909: [ParameterSpec] = tr909Base + tr909HarmonicCorrections.map {
+    .init(name: $0.name, unit: "lin", min: -0.6, max: 0.6, reparam: .raw, tolerance: 0.2)
+  }
+
+  /// Additive, band-limited oscillator used for the Hoodie Bass Monologue
+  /// profile. Sine and cosine coefficients make each partial's phase
+  /// identifiable without storing a target waveform. Integer harmonics keep
+  /// the result playable at pitches other than the fitted C sample.
+  private static let hoodieBassSteadyHarmonics: [HarmonicCorrection] =
+    (1...32).flatMap { harmonic in [
+      HarmonicCorrection(name: "h\(harmonic)s", harmonic: harmonic, decay: 0, cosine: false),
+      HarmonicCorrection(name: "h\(harmonic)c", harmonic: harmonic, decay: 0, cosine: true),
+    ] }
+  private static let hoodieBassSlowHarmonics: [HarmonicCorrection] =
+    (2...32).flatMap { harmonic in [
+      HarmonicCorrection(name: "bh\(harmonic)s", harmonic: harmonic, decay: 1, cosine: false),
+      HarmonicCorrection(name: "bh\(harmonic)c", harmonic: harmonic, decay: 1, cosine: true),
+    ] }
+  private static let hoodieBassMediumHarmonics: [HarmonicCorrection] =
+    (2...32).flatMap { harmonic in [
+      HarmonicCorrection(name: "mh\(harmonic)s", harmonic: harmonic, decay: 2, cosine: false),
+      HarmonicCorrection(name: "mh\(harmonic)c", harmonic: harmonic, decay: 2, cosine: true),
+    ] }
+  private static let hoodieBassFastHarmonics: [HarmonicCorrection] =
+    (2...32).flatMap { harmonic in [
+      HarmonicCorrection(name: "fh\(harmonic)s", harmonic: harmonic, decay: 4, cosine: false),
+      HarmonicCorrection(name: "fh\(harmonic)c", harmonic: harmonic, decay: 4, cosine: true),
+    ] }
+  static let hoodieBassHarmonics: [HarmonicCorrection] =
+    hoodieBassSteadyHarmonics + hoodieBassSlowHarmonics
+    + hoodieBassMediumHarmonics + hoodieBassFastHarmonics
+
+  static let hoodieBassBase: [ParameterSpec] = [
+    .init(name: "f0", unit: "Hz", min: 25, max: 130, reparam: .log, tolerance: 0.01),
+    .init(name: "attackTime", unit: "s", min: 0.003, max: 0.25, reparam: .log, tolerance: 0.15),
+    .init(name: "decayTime", unit: "s", min: 0.03, max: 1.0, reparam: .log, tolerance: 0.20),
+    .init(name: "sustain", unit: "lin", min: 0.05, max: 1.0, reparam: .raw, tolerance: 0.15),
+    .init(name: "noteOff", unit: "s", min: 1.35, max: 1.75, reparam: .raw, tolerance: 0.05),
+    .init(name: "releaseTime", unit: "s", min: 0.02, max: 0.30, reparam: .log, tolerance: 0.20),
+    .init(name: "brightnessDecay", unit: "1/s", min: 0, max: 30, reparam: .raw, tolerance: 0.20),
+    .init(name: "drive", unit: "lin", min: 0.25, max: 4.0, reparam: .log, tolerance: 0.15),
+    .init(name: "outGain", unit: "lin", min: 0.05, max: 1.5, reparam: .log, tolerance: 0.15),
+  ]
+  static let hoodieBass: [ParameterSpec] = hoodieBassBase + hoodieBassHarmonics.map {
+    .init(name: $0.name, unit: "lin", min: -2.0, max: 2.0, reparam: .raw, tolerance: 0.20)
+  }
+
+  static var all: [ParameterSpec] {
+    switch activeProfile {
+    case "909": return tr909
+    case "hoodie-bass": return hoodieBass
+    default: return tr808
+    }
+  }
+
+  static var byName: [String: ParameterSpec] {
     Dictionary(uniqueKeysWithValues: all.map { ($0.name, $0) })
+  }
 }
 
 struct PatchValues: Codable, Equatable {
@@ -97,12 +224,23 @@ struct PatchValues: Codable, Equatable {
   var drive: Float
   var outGain: Float
   var bodyAsymmetry: Float
+  var bodyHarmonic: Float
+  var ampCurve: Float
+  var harmonicCorrections: [String: Float]
+  var f0: Float
+  var attackTime: Float
+  var decayTime: Float
+  var sustain: Float
+  var noteOff: Float
+  var releaseTime: Float
+  var brightnessDecay: Float
 
   private enum CodingKeys: String, CodingKey {
     case fStart, fEnd, pitchDecay, bodyAmp, ampDecay
     case clickFreq, clickAmp, clickDecay
     case noiseCutoff, noiseAmp, noiseDecay
-    case drive, outGain, bodyAsymmetry
+    case drive, outGain, bodyAsymmetry, bodyHarmonic, ampCurve, harmonicCorrections
+    case f0, attackTime, decayTime, sustain, noteOff, releaseTime, brightnessDecay
   }
 
   init(from decoder: Decoder) throws {
@@ -121,13 +259,42 @@ struct PatchValues: Codable, Equatable {
       noiseDecay: try values.decode(Float.self, forKey: .noiseDecay),
       drive: try values.decode(Float.self, forKey: .drive),
       outGain: try values.decode(Float.self, forKey: .outGain),
-      bodyAsymmetry: try values.decodeIfPresent(Float.self, forKey: .bodyAsymmetry) ?? 0)
+      bodyAsymmetry: try values.decodeIfPresent(Float.self, forKey: .bodyAsymmetry) ?? 0,
+      bodyHarmonic: try values.decodeIfPresent(Float.self, forKey: .bodyHarmonic) ?? 0,
+      ampCurve: try values.decodeIfPresent(Float.self, forKey: .ampCurve) ?? 0,
+      harmonicCorrections: try values.decodeIfPresent([String: Float].self, forKey: .harmonicCorrections) ?? [:],
+      f0: try values.decodeIfPresent(Float.self, forKey: .f0) ?? 32.7,
+      attackTime: try values.decodeIfPresent(Float.self, forKey: .attackTime) ?? 0.05,
+      decayTime: try values.decodeIfPresent(Float.self, forKey: .decayTime) ?? 0.2,
+      sustain: try values.decodeIfPresent(Float.self, forKey: .sustain) ?? 0.8,
+      noteOff: try values.decodeIfPresent(Float.self, forKey: .noteOff) ?? 1.55,
+      releaseTime: try values.decodeIfPresent(Float.self, forKey: .releaseTime) ?? 0.08,
+      brightnessDecay: try values.decodeIfPresent(Float.self, forKey: .brightnessDecay) ?? 1.0)
   }
 
   static var midpoint: PatchValues {
     var values = [String: Float]()
     for spec in KickParamSpecs.all {
       values[spec.name] = spec.midpoint
+    }
+    if KickParamSpecs.activeProfile == "hoodie-bass" {
+      // A target-independent, square/triangle-like starting spectrum keeps
+      // the baseline audible while leaving every coefficient free to move.
+      values["h1s"] = 0.35
+      values["h2s"] = 0.12
+      values["h3s"] = 0.28
+      values["h5s"] = 0.08
+      values["h7s"] = 0.05
+      return PatchValues(values)
+    }
+    if KickParamSpecs.activeProfile == "909" {
+      // The 909 table's plain spec midpoints are already tuned to the
+      // measured target; only the zero-default harmonic terms need an
+      // explicit override (their midpoint is 0 anyway, but be explicit).
+      values["bodyAsymmetry"] = 0
+      values["bodyHarmonic"] = 0
+      values["ampCurve"] = 0
+      return PatchValues(values)
     }
     // Preserve the original Rung 1/2 generic initialization while allowing
     // wider real-target bounds during optimization.
@@ -136,6 +303,8 @@ struct PatchValues: Codable, Equatable {
     values["noiseCutoff"] = Foundation.sqrt(1000 * 8000)
     values["noiseDecay"] = -Foundation.sqrt(400 * 60)
     values["bodyAsymmetry"] = 0
+    values["bodyHarmonic"] = 0
+    values["ampCurve"] = 0
     return PatchValues(values)
   }
 
@@ -153,7 +322,17 @@ struct PatchValues: Codable, Equatable {
     noiseDecay: Float,
     drive: Float,
     outGain: Float,
-    bodyAsymmetry: Float = 0
+    bodyAsymmetry: Float = 0,
+    bodyHarmonic: Float = 0,
+    ampCurve: Float = 0,
+    harmonicCorrections: [String: Float] = [:],
+    f0: Float = 32.7,
+    attackTime: Float = 0.05,
+    decayTime: Float = 0.2,
+    sustain: Float = 0.8,
+    noteOff: Float = 1.55,
+    releaseTime: Float = 0.08,
+    brightnessDecay: Float = 1.0
   ) {
     self.fStart = fStart
     self.fEnd = fEnd
@@ -169,6 +348,16 @@ struct PatchValues: Codable, Equatable {
     self.drive = drive
     self.outGain = outGain
     self.bodyAsymmetry = bodyAsymmetry
+    self.bodyHarmonic = bodyHarmonic
+    self.ampCurve = ampCurve
+    self.harmonicCorrections = harmonicCorrections
+    self.f0 = f0
+    self.attackTime = attackTime
+    self.decayTime = decayTime
+    self.sustain = sustain
+    self.noteOff = noteOff
+    self.releaseTime = releaseTime
+    self.brightnessDecay = brightnessDecay
   }
 
   init(_ dictionary: [String: Float]) {
@@ -186,7 +375,21 @@ struct PatchValues: Codable, Equatable {
       noiseDecay: dictionary["noiseDecay"] ?? -140,
       drive: dictionary["drive"] ?? 1.5,
       outGain: dictionary["outGain"] ?? 0.7,
-      bodyAsymmetry: dictionary["bodyAsymmetry"] ?? 0)
+      bodyAsymmetry: dictionary["bodyAsymmetry"] ?? 0,
+      bodyHarmonic: dictionary["bodyHarmonic"] ?? 0,
+      ampCurve: dictionary["ampCurve"] ?? 0,
+      harmonicCorrections: KickParamSpecs.activeProfile == "909" || KickParamSpecs.activeProfile == "hoodie-bass"
+        ? Dictionary(uniqueKeysWithValues: (KickParamSpecs.activeProfile == "909"
+          ? KickParamSpecs.tr909HarmonicCorrections : KickParamSpecs.hoodieBassHarmonics).map {
+          ($0.name, dictionary[$0.name] ?? 0)
+        }) : [:],
+      f0: dictionary["f0"] ?? 32.7,
+      attackTime: dictionary["attackTime"] ?? 0.05,
+      decayTime: dictionary["decayTime"] ?? 0.2,
+      sustain: dictionary["sustain"] ?? 0.8,
+      noteOff: dictionary["noteOff"] ?? 1.55,
+      releaseTime: dictionary["releaseTime"] ?? 0.08,
+      brightnessDecay: dictionary["brightnessDecay"] ?? 1.0)
   }
 
   subscript(name: String) -> Float {
@@ -206,7 +409,16 @@ struct PatchValues: Codable, Equatable {
       case "drive": return drive
       case "outGain": return outGain
       case "bodyAsymmetry": return bodyAsymmetry
-      default: return .nan
+      case "bodyHarmonic": return bodyHarmonic
+      case "ampCurve": return ampCurve
+      case "f0": return f0
+      case "attackTime": return attackTime
+      case "decayTime": return decayTime
+      case "sustain": return sustain
+      case "noteOff": return noteOff
+      case "releaseTime": return releaseTime
+      case "brightnessDecay": return brightnessDecay
+      default: return harmonicCorrections[name] ?? .nan
       }
     }
     set {
@@ -225,7 +437,20 @@ struct PatchValues: Codable, Equatable {
       case "drive": drive = newValue
       case "outGain": outGain = newValue
       case "bodyAsymmetry": bodyAsymmetry = newValue
-      default: break
+      case "bodyHarmonic": bodyHarmonic = newValue
+      case "ampCurve": ampCurve = newValue
+      case "f0": f0 = newValue
+      case "attackTime": attackTime = newValue
+      case "decayTime": decayTime = newValue
+      case "sustain": sustain = newValue
+      case "noteOff": noteOff = newValue
+      case "releaseTime": releaseTime = newValue
+      case "brightnessDecay": brightnessDecay = newValue
+      default:
+        if (KickParamSpecs.tr909HarmonicCorrections + KickParamSpecs.hoodieBassHarmonics)
+          .contains(where: { $0.name == name }) {
+          harmonicCorrections[name] = newValue
+        }
       }
     }
   }
@@ -244,6 +469,10 @@ struct PatchValues: Codable, Equatable {
 
   func withPitch(_ pitch: PitchFit) -> PatchValues {
     var copy = self
+    if KickParamSpecs.activeProfile == "hoodie-bass" {
+      copy.f0 = pitch.fEnd
+      return copy.clamped()
+    }
     copy.fStart = pitch.fStart
     copy.fEnd = pitch.fEnd
     copy.pitchDecay = pitch.pitchDecay
@@ -259,6 +488,8 @@ struct PatchValues: Codable, Equatable {
       "noiseCutoff": (1000, 8000),
       "noiseDecay": (-400, -60),
       "bodyAsymmetry": (0, 0),
+      "bodyHarmonic": (0, 0),
+      "ampCurve": (0, 0),
     ]
     for spec in KickParamSpecs.all {
       let bounds = rung12Ranges[spec.name] ?? (spec.min, spec.max)
@@ -286,6 +517,22 @@ struct KickVoiceSignals {
   var drive: Signal
   var outGain: Signal
   var bodyAsymmetry: Signal
+  var bodyHarmonic: Signal
+  var ampCurve: Signal
+  var harmonicCorrections: [(spec: KickParamSpecs.HarmonicCorrection, coefficient: Signal)]
+}
+
+struct BassVoiceSignals {
+  var f0: Signal
+  var attackTime: Signal
+  var decayTime: Signal
+  var sustain: Signal
+  var noteOff: Signal
+  var releaseTime: Signal
+  var brightnessDecay: Signal
+  var drive: Signal
+  var outGain: Signal
+  var harmonics: [(spec: KickParamSpecs.HarmonicCorrection, coefficient: Signal)]
 }
 
 final class TrainableKickParams {
@@ -302,8 +549,9 @@ final class TrainableKickParams {
     frozenNaturalValues = initial.clamped()
     for spec in KickParamSpecs.all {
       let shouldTrain =
-        trainable && !(freezePitch && ["fStart", "fEnd", "pitchDecay"].contains(spec.name))
-          && !(freezeBodyAsymmetry && spec.name == "bodyAsymmetry")
+        trainable && !(freezePitch && ["fStart", "fEnd", "pitchDecay", "f0"].contains(spec.name))
+          && !(freezeBodyAsymmetry
+            && ["bodyAsymmetry", "bodyHarmonic", "ampCurve"].contains(spec.name))
       let transformed = spec.transform(initial[spec.name])
       if shouldTrain {
         let bounds = spec.transformedBounds
@@ -330,7 +578,27 @@ final class TrainableKickParams {
       noiseDecay: naturalSignal("noiseDecay"),
       drive: naturalSignal("drive"),
       outGain: naturalSignal("outGain"),
-      bodyAsymmetry: naturalSignal("bodyAsymmetry"))
+      bodyAsymmetry: naturalSignal("bodyAsymmetry"),
+      bodyHarmonic: naturalSignal("bodyHarmonic"),
+      ampCurve: naturalSignal("ampCurve"),
+      harmonicCorrections: KickParamSpecs.tr909HarmonicCorrections.compactMap { spec in
+        guard storage[spec.name] != nil else { return nil }
+        return (spec, naturalSignal(spec.name))
+      })
+  }
+
+  var bassSignals: BassVoiceSignals {
+    BassVoiceSignals(
+      f0: naturalSignal("f0"),
+      attackTime: naturalSignal("attackTime"),
+      decayTime: naturalSignal("decayTime"),
+      sustain: naturalSignal("sustain"),
+      noteOff: naturalSignal("noteOff"),
+      releaseTime: naturalSignal("releaseTime"),
+      brightnessDecay: naturalSignal("brightnessDecay"),
+      drive: naturalSignal("drive"),
+      outGain: naturalSignal("outGain"),
+      harmonics: KickParamSpecs.hoodieBassHarmonics.map { ($0, naturalSignal($0.name)) })
   }
 
   var transformedParams: [String: Signal] { storage }

@@ -1,0 +1,17 @@
+{
+  "cropped" : false,
+  "fittedFrames" : 22528,
+  "normalizationScale" : 1,
+  "onsetFrame" : 4,
+  "onsetSeconds" : 9.0702946e-05,
+  "onsetThresholdDB" : -40,
+  "outputFrames" : 22528,
+  "padded" : true,
+  "profile" : "909",
+  "resampledFrames" : 21412,
+  "sourceDurationSeconds" : 0.48562357,
+  "sourceFrames" : 21416,
+  "sourcePath" : "\/Users\/alecresende\/code\/swift\/dgen\/Assets\/909kick.wav",
+  "sourceSampleRate" : 44100,
+  "targetSampleRate" : 44100
+}

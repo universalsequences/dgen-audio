@@ -89,8 +89,10 @@ pass criteria in §7.1 hold.
 
 A single synth topology used for all three rungs, modeled on the TR-808 kick voice
 (bridged-T resonator ≈ exponentially decaying, pitch-swept sine + click transient +
-tone-shaped noise). Keep it to **10–14 scalar parameters**. No tensors of
-hundreds of points; expressiveness comes from structure, not tables.
+tone-shaped noise). The base voice uses a compact scalar parameter set. The 909
+profile may additionally use a pruned bank of scalar Fourier/envelope corrections
+at documented harmonic numbers and fixed decay rates. No tensors of hundreds of
+points; expressiveness comes from structure, not waveform or residual tables.
 
 Signal graph (all built with DGenLazy `Signal` ops; see `Examples/TrainKick808/main.swift`
 for API patterns):
@@ -337,7 +339,7 @@ No ground truth, so:
   capture high-pass equally to target, initialization, and learned audio and
   records the cutoff in `compare.json`. This excludes capture-chain baseline
   motion below the modeled 808 body without changing the stored WAV artifacts.
-- A deterministic post-training refinement may search the documented 14 scalar
+- A deterministic post-training refinement may search the documented scalar
   parameters against this declared metric. It must write pre/post audit
   artifacts, must rerender the final patch through DGen, and remains subject to
   every target-data prohibition in the Non-Goals section.

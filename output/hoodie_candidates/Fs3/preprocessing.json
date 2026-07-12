@@ -1,0 +1,17 @@
+{
+  "cropped" : false,
+  "fittedFrames" : 16384,
+  "normalizationScale" : 1,
+  "onsetFrame" : 606,
+  "onsetSeconds" : 0.013741497,
+  "onsetThresholdDB" : -40,
+  "outputFrames" : 16384,
+  "padded" : true,
+  "profile" : "hoodie-bass",
+  "resampledFrames" : 15865,
+  "sourceDurationSeconds" : 1.996916,
+  "sourceFrames" : 88064,
+  "sourcePath" : "\/Users\/alecresende\/code\/learning\/anthropic\/eseq\/crates\/sequencer\/samples\/637f025b1c617f76ac69bfec67af97cec05ecba3f8b733634c4475b96e415098.wav",
+  "sourceSampleRate" : 44100,
+  "targetSampleRate" : 8000
+}

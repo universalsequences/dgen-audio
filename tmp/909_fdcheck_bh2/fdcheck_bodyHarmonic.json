@@ -1,0 +1,13 @@
+{
+  "absoluteError" : 0.003867221,
+  "autogradGrad" : 0.0017214537,
+  "baseLoss" : 2.1006694,
+  "baseNaturalValue" : 0,
+  "baseTransformedValue" : 0,
+  "epsilon" : 0.01,
+  "finiteDifferenceGrad" : -0.0021457672,
+  "lossMinus" : 2.1004431,
+  "lossPlus" : 2.1004002,
+  "paramName" : "bodyHarmonic",
+  "relativeError" : 1.8022556
+}

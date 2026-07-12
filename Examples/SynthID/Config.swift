@@ -53,6 +53,7 @@ struct SynthIDConfig: Codable {
   var enableNoiseFilter: Bool = true
   var seed: UInt64 = 1
   var rung: Int = 1
+  var profile: String = "808"
 
   static var `default`: SynthIDConfig { SynthIDConfig() }
 
@@ -100,6 +101,27 @@ struct SynthIDConfig: Codable {
       default: throw SynthIDError.message("unknown --backend \(value); expected metal or cpu")
       }
     }
+    if let value = options["profile"] {
+      guard ["808", "909", "hoodie-bass"].contains(value) else {
+        throw SynthIDError.message("unknown --profile \(value); expected 808, 909, or hoodie-bass")
+      }
+      profile = value
+      if value == "hoodie-bass" {
+        // The identified voice is band-limited to 32 partials. An 8 kHz
+        // analysis rate preserves that basis through the tagged set's highest
+        // measured 116.75 Hz note while giving a 2048-point STFT 3.9 Hz
+        // resolution. 4096+ windows at 44.1 kHz exceed the Metal FFT threadgroup
+        // memory limit and provide no additional audible information here.
+        if options["sample-rate"] == nil { sampleRate = 8_000 }
+        if options["frames"] == nil { frames = 16_384 }
+        if options["windows"] == nil { spectralWindows = [256, 512, 1024, 2048] }
+        // The steady-note CPU estimate is more reliable than the current
+        // spectral-loss f0 adjoint (documented by the profile's fdcheck).
+        // Freeze only f0; all timbre and envelope parameters remain trained.
+        freezePitch = true
+        if options["pitch-refine-epochs"] == nil { pitchRefineEpochs = 0 }
+      }
+    }
   }
 
   func applyRuntime() {
@@ -107,6 +129,7 @@ struct SynthIDConfig: Codable {
     DGenConfig.defaultFrameCount = frames
     DGenConfig.maxFrameCount = max(DGenConfig.maxFrameCount, frames)
     DGenSpectralConfig.logMagnitudeEpsilon = spectralLogEpsilon
+    KickParamSpecs.activeProfile = profile
   }
 }
 

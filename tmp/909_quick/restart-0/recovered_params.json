@@ -1,0 +1,17 @@
+{
+  "ampDecay" : -14,
+  "bodyAmp" : 0.525,
+  "bodyAsymmetry" : 0,
+  "bodyHarmonic" : 0,
+  "clickAmp" : 0.25,
+  "clickDecay" : -346.41028,
+  "clickFreq" : 447.21362,
+  "drive" : 2.5,
+  "fEnd" : 47.405518,
+  "fStart" : 267.18878,
+  "noiseAmp" : 0.025,
+  "noiseCutoff" : 2828.428,
+  "noiseDecay" : -54.77226,
+  "outGain" : 0.55,
+  "pitchDecay" : -46
+}

@@ -54,8 +54,25 @@ final class SynthIDTrainer {
     let targetSamples = fitOrPad(
       peakNormalized(rawTargetSamples, peak: resolvedConfig.peakNormalizeTo),
       frames: resolvedConfig.frames)
+    let pitchSearchProfile: PitchSearchProfile =
+      resolvedConfig.profile == "909" ? .tr909 : .tr808
     let pitchPoints = PitchTrack.extract(samples: targetSamples, sampleRate: resolvedConfig.sampleRate)
-    let pitchFit = PitchTrack.fit(samples: targetSamples, sampleRate: resolvedConfig.sampleRate)
+    let pitchFit: PitchFit
+    if resolvedConfig.profile == "hoodie-bass" {
+      let steady = PitchTrack.extract(
+        samples: targetSamples,
+        sampleRate: resolvedConfig.sampleRate,
+        windowSize: 8192,
+        hop: 1024,
+        minHz: 25,
+        maxHz: 160).filter { $0.time > 0.2 && $0.time < 1.4 }
+      let sorted = steady.map(\.hz).sorted()
+      let f0 = sorted.isEmpty ? 32.7 : sorted[sorted.count / 2]
+      pitchFit = PitchFit(fStart: f0, fEnd: f0, pitchDecay: -1, error: nil)
+    } else {
+      pitchFit = PitchTrack.fit(
+        samples: targetSamples, sampleRate: resolvedConfig.sampleRate, profile: pitchSearchProfile)
+    }
     let initial =
       initialOverride ?? restartInitial(pitchFit: pitchFit, restartIndex: restartIndex)
 
@@ -67,21 +84,29 @@ final class SynthIDTrainer {
       freezePitch: resolvedConfig.freezePitch,
       freezeBodyAsymmetry: resolvedConfig.rung != 3)
 
+    let isBass = resolvedConfig.profile == "hoodie-bass"
     let pitchOpt = Adam(
-      params: params.trainableStorage(names: ["fStart", "fEnd", "pitchDecay"]),
+      params: params.trainableStorage(names: isBass ? ["f0"] : ["fStart", "fEnd", "pitchDecay"]),
       lr: resolvedConfig.pitchLR)
+    let harmonicNames = resolvedConfig.profile == "909"
+      ? KickParamSpecs.tr909HarmonicCorrections.map(\.name)
+      : (isBass ? KickParamSpecs.hoodieBassHarmonics.map(\.name) : [])
     let ampOpt = Adam(
       params: params.trainableStorage(
-        names: ["bodyAmp", "clickAmp", "outGain", "bodyAsymmetry"]),
+        names: (isBass ? ["sustain", "outGain"]
+          : ["bodyAmp", "clickAmp", "outGain", "bodyAsymmetry", "bodyHarmonic"])
+          + harmonicNames),
       lr: resolvedConfig.ampLR)
     let decayOpt = Adam(
-      params: params.trainableStorage(names: ["ampDecay", "clickDecay", "noiseDecay"]),
+      params: params.trainableStorage(names: isBass
+        ? ["attackTime", "decayTime", "noteOff", "releaseTime", "brightnessDecay"]
+        : ["ampDecay", "clickDecay", "noiseDecay", "ampCurve"]),
       lr: resolvedConfig.decayLR)
     let noiseOpt = Adam(
       params: params.trainableStorage(names: ["noiseAmp"]),
       lr: resolvedConfig.noiseLR)
-    var toneNames = ["clickFreq", "drive"]
-    if resolvedConfig.enableNoiseFilter {
+    var toneNames = isBass ? ["drive"] : ["clickFreq", "drive"]
+    if resolvedConfig.enableNoiseFilter && !isBass {
       toneNames.append("noiseCutoff")
     }
     let toneOpt = Adam(
@@ -95,7 +120,7 @@ final class SynthIDTrainer {
     }
 
     func buildLoss() -> Signal {
-      let synth = KickVoice.build(params: params.signals, config: resolvedConfig)
+      let synth = KickVoice.build(params: params, config: resolvedConfig)
       return SynthIDLosses.multiResolutionSpectralLoss(
         synth: synth,
         target: buildTarget(),
@@ -251,7 +276,10 @@ final class SynthIDTrainer {
     let initial =
       explicitInitial
       ?? restartInitial(
-        pitchFit: PitchTrack.fit(samples: targetSamples, sampleRate: resolvedConfig.sampleRate),
+        pitchFit: PitchTrack.fit(
+          samples: targetSamples,
+          sampleRate: resolvedConfig.sampleRate,
+          profile: resolvedConfig.profile == "909" ? .tr909 : .tr808),
         restartIndex: 0)
     let baseZ = spec.transform(initial[paramName])
     let eps = resolvedConfig.fdEpsilon
@@ -294,8 +322,25 @@ final class SynthIDTrainer {
     return result
   }
 
-  private func restartInitial(pitchFit: PitchFit, restartIndex: Int) -> PatchValues {
+  // Internal (not private) so `recoverTarget` in main.swift can rebuild the
+  // deterministic restart-0 reference initialization regardless of which
+  // restart's own cold start actually won selection (rung 3 FIX 1).
+  func restartInitial(pitchFit: PitchFit, restartIndex: Int) -> PatchValues {
     var values = PatchValues.midpoint.withPitch(pitchFit)
+    if config.profile == "hoodie-bass" {
+      let brightnessScales: [Float] = [1.0, 0.55, 1.65, 1.0]
+      let attackScales: [Float] = [1.0, 0.6, 1.5, 1.0]
+      if restartIndex < brightnessScales.count {
+        values.brightnessDecay *= brightnessScales[restartIndex]
+        values.attackTime *= attackScales[restartIndex]
+        if restartIndex == 3 {
+          for spec in KickParamSpecs.hoodieBassHarmonics where spec.cosine {
+            values[spec.name] = 0.03 / Float(spec.harmonic)
+          }
+        }
+      }
+      return values.clamped()
+    }
     // Window smearing makes the CPU contour fit see a slower, lower sweep, so
     // it underestimates |pitchDecay| and fStart together (worst on fast
     // sweeps). Bracket both coherently across the first three restarts, all
@@ -303,11 +348,34 @@ final class SynthIDTrainer {
     // equal footing. fEnd stays anchored — the tail measurement is reliable.
     // r1 (mild) and r3 (strong) both correct the fast-sweep underestimate;
     // which lands depends on how fast the true sweep is, and best-of-N picks.
-    let pdScales: [Float] = [1.0, 1.45, 0.75, 1.45]
-    let fStartScales: [Float] = [1.0, 1.10, 0.92, 1.22]
+    //
+    // The 909 profile's raw CPU pitch fit already tracks the measured sweep
+    // well (see rung-3 909 diagnosis), so the 808 brackets are too aggressive
+    // there and bias restart selection toward inflated cold starts. Use
+    // gentler brackets centered on the raw fit, and since restarts 0 and 3
+    // then coincide in pitch space, give restart 3 diversity through
+    // non-pitch params instead (click amp/decay bracketed around the spec
+    // midpoint).
+    let pdScales: [Float]
+    let fStartScales: [Float]
+    if config.profile == "909" {
+      pdScales = [1.00, 1.15, 0.85, 1.00]
+      fStartScales = [1.00, 1.06, 0.94, 1.00]
+    } else {
+      pdScales = [1.0, 1.45, 0.75, 1.45]
+      fStartScales = [1.0, 1.10, 0.92, 1.22]
+    }
     if restartIndex < pdScales.count {
       values.pitchDecay *= pdScales[restartIndex]
       values.fStart *= fStartScales[restartIndex]
+      if config.profile == "909" && restartIndex == 3 {
+        if let clickAmpSpec = KickParamSpecs.byName["clickAmp"] {
+          values.clickAmp = clickAmpSpec.midpoint * 0.5
+        }
+        if let clickDecaySpec = KickParamSpecs.byName["clickDecay"] {
+          values.clickDecay = clickDecaySpec.midpoint * 1.5
+        }
+      }
     } else {
       var rng = SplitMix64(seed: config.seed &+ UInt64(10_000 + restartIndex * 997))
       for spec in KickParamSpecs.all {
@@ -319,10 +387,12 @@ final class SynthIDTrainer {
       if values.noiseAmp <= 0 { values.noiseAmp = 0.02 }
       if values.clickAmp <= 0 { values.clickAmp = 0.05 }
     }
-    if config.rung == 3 && restartIndex == 4 {
+    if config.rung == 3 && restartIndex == 4 && config.profile != "909" {
       // A dedicated, target-independent capture-floor hypothesis. PCM targets
       // can contain persistent broadband energy that the original -60/s noise
-      // bound made structurally unreachable.
+      // bound made structurally unreachable. The 909 recording's noise floor
+      // is dead (measured), so this restart would be wasted there — fall
+      // through to a plain midpoint restart instead.
       values.noiseAmp = 0.0001
       values.noiseDecay = -0.1
       values.noiseCutoff = 10_000
@@ -379,7 +449,7 @@ final class SynthIDTrainer {
     let targetTensor = Tensor(targetSamples)
     let params = TrainableKickParams(initial: values, trainable: true, freezePitch: false)
     let loss = SynthIDLosses.multiResolutionSpectralLoss(
-      synth: KickVoice.build(params: params.signals, config: config),
+      synth: KickVoice.build(params: params, config: config),
       target: targetTensor.toSignal(maxFrames: config.frames),
       config: config)
     return try loss.backward(frames: config.frames).reduce(0, +)
@@ -395,7 +465,7 @@ final class SynthIDTrainer {
     let targetTensor = Tensor(targetSamples)
     let params = TrainableKickParams(initial: values, trainable: true, freezePitch: false)
     let loss = SynthIDLosses.multiResolutionSpectralLoss(
-      synth: KickVoice.build(params: params.signals, config: config),
+      synth: KickVoice.build(params: params, config: config),
       target: targetTensor.toSignal(maxFrames: config.frames),
       config: config)
     _ = try loss.backward(frames: config.frames)

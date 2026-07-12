@@ -181,8 +181,8 @@ enum SynthIDCLI {
       let p1 = TrainableKickParams(initial: values, trainable: true, freezePitch: false)
       let p2 = TrainableKickParams(initial: values, trainable: false, freezePitch: false)
       return (
-        KickVoice.build(params: p1.signals, config: config),
-        KickVoice.build(params: p2.signals, config: config)
+        KickVoice.build(params: p1, config: config),
+        KickVoice.build(params: p2, config: config)
       )
     }
     print("loss(synth, synth)    = \(synthSynth)")
@@ -191,8 +191,8 @@ enum SynthIDCLI {
       let p1 = TrainableKickParams(initial: values, trainable: true, freezePitch: false)
       let p2 = TrainableKickParams(initial: values, trainable: true, freezePitch: false)
       return (
-        KickVoice.build(params: p1.signals, config: config),
-        KickVoice.build(params: p2.signals, config: config)
+        KickVoice.build(params: p1, config: config),
+        KickVoice.build(params: p2, config: config)
       )
     }
     print("loss(synthT, synthT)  = \(synthSynthBothTrainable)")
@@ -201,8 +201,8 @@ enum SynthIDCLI {
     let dp1 = TrainableKickParams(initial: values, trainable: true, freezePitch: false)
     let dp2 = TrainableKickParams(initial: values, trainable: false, freezePitch: false)
     let diff =
-      KickVoice.build(params: dp1.signals, config: config)
-      - KickVoice.build(params: dp2.signals, config: config)
+      KickVoice.build(params: dp1, config: config)
+      - KickVoice.build(params: dp2, config: config)
     let diffValues = try diff.realize(frames: config.frames)
     let maxAbs = diffValues.map { abs($0) }.max() ?? 0
     let firstBig = diffValues.firstIndex { abs($0) > 1e-5 } ?? -1
@@ -217,7 +217,7 @@ enum SynthIDCLI {
       let p = TrainableKickParams(initial: values, trainable: true, freezePitch: false)
       let t = Tensor(target)
       return (
-        KickVoice.build(params: p.signals, config: config),
+        KickVoice.build(params: p, config: config),
         t.toSignal(maxFrames: config.frames)
       )
     }
@@ -228,7 +228,7 @@ enum SynthIDCLI {
       let t = Tensor(target)
       return (
         t.toSignal(maxFrames: config.frames),
-        KickVoice.build(params: p.signals, config: config)
+        KickVoice.build(params: p, config: config)
       )
     }
     print("loss(tensor, synth)   = \(tensorSynth)")
@@ -392,11 +392,14 @@ enum SynthIDCLI {
     config: SynthIDConfig,
     outDir: URL,
     context: String,
-    irreducibleLossFloor: Float = 0
+    irreducibleLossFloor: Float = 0,
+    python: String = "python3",
+    scoreScriptURL: URL? = nil
   ) throws -> SynthIDReport {
     var bestResult: TrainingRunResult?
     var bestRestartDir: URL?
     var allResults: [TrainingRunResult] = []
+    var restartDirs: [URL] = []
     for restart in 0..<max(1, config.restarts) {
       let restartDir = outDir.appendingPathComponent("restart-\(restart)")
       let result = try SynthIDTrainer(config: config).train(
@@ -405,6 +408,7 @@ enum SynthIDCLI {
         trueParams: trueParams,
         restartIndex: restart)
       allResults.append(result)
+      restartDirs.append(restartDir)
       if bestResult == nil || result.bestLoss < bestResult!.bestLoss {
         bestResult = result
         bestRestartDir = restartDir
@@ -414,18 +418,80 @@ enum SynthIDCLI {
       throw SynthIDError.message("no recovery result for \(context)")
     }
 
+    // FIX 2: restart selection by the independent CPU metric (rung 3 only).
+    // GPU training loss and the independent MR-STFT metric can disagree on
+    // which restart's basin is best; rescore each restart's own learned
+    // params with the independent metric and let that pick the winner
+    // instead. Falls back to the GPU-loss winner already selected above (with
+    // a logged warning) if the python subprocess path fails for any reason.
+    if config.rung == 3 {
+      let targetURL = outDir.appendingPathComponent("target.wav")
+      do {
+        var table: [(index: Int, gpuLoss: Float, cpuDistance: Float)] = []
+        var cpuBest: (result: TrainingRunResult, dir: URL, index: Int, distance: Float)?
+        for (index, candidate) in allResults.enumerated() {
+          let paramsURL = restartDirs[index].appendingPathComponent("recovered_params.json")
+          let distance = try Rung3IndependentScorer.score(
+            targetURL: targetURL,
+            paramsURL: paramsURL,
+            frames: config.frames,
+            sampleRate: config.sampleRate,
+            profile: config.profile,
+            scriptURL: scoreScriptURL,
+            python: python)
+          table.append((index, candidate.bestLoss, distance))
+          if cpuBest == nil || distance < cpuBest!.distance {
+            cpuBest = (candidate, restartDirs[index], index, distance)
+          }
+        }
+        print("\(context) restart selection (independent CPU metric):")
+        print("  restart  gpuLoss     cpuDistance")
+        for entry in table {
+          print(
+            String(
+              format: "  %7d  %9.5f  %11.6f", entry.index, entry.gpuLoss, entry.cpuDistance))
+        }
+        if let cpuBest {
+          print(
+            "  selected restart \(cpuBest.index) by independent CPU metric"
+              + " (gpu-loss winner was \(String(format: "%.5f", bestResult!.bestLoss)))")
+          result = cpuBest.result
+          bestRestartDir = cpuBest.dir
+        }
+      } catch {
+        print(
+          "warning: \(context) independent CPU rescoring failed (\(error)); "
+            + "falling back to GPU-loss restart selection")
+      }
+    }
+
     // Restarts often solve different subspaces. Greedily stitch them while
     // selecting exclusively by the same audio loss, then fine-tune the result.
     if allResults.count > 1 {
       let trainer = SynthIDTrainer(config: config)
+      let isBass = config.profile == "hoodie-bass"
       var noiseSubspace = ["noiseAmp", "noiseDecay"]
       if config.enableNoiseFilter { noiseSubspace.append("noiseCutoff") }
-      let subspaces: [[String]] = [
-        ["clickFreq", "clickAmp", "clickDecay"],
-        ["fStart", "fEnd", "pitchDecay"],
-        noiseSubspace,
-        ["bodyAmp", "drive", "outGain"],
-      ]
+      var ampSubspace = ["bodyAmp", "drive", "outGain"]
+      if config.profile == "909" {
+        ampSubspace.append("bodyHarmonic")
+        ampSubspace.append(contentsOf: KickParamSpecs.tr909HarmonicCorrections.map(\.name))
+      }
+      let subspaces: [[String]] = isBass
+        ? [
+          ["f0"],
+          ["attackTime", "decayTime", "sustain", "noteOff", "releaseTime"],
+          ["brightnessDecay"]
+            + KickParamSpecs.hoodieBassHarmonics.filter { $0.decay > 0 }.map(\.name),
+          ["drive", "outGain"]
+            + KickParamSpecs.hoodieBassHarmonics.filter { $0.decay == 0 }.map(\.name),
+        ]
+        : [
+          ["clickFreq", "clickAmp", "clickDecay"],
+          ["fStart", "fEnd", "pitchDecay"],
+          noiseSubspace,
+          ampSubspace,
+        ]
       var stitched = result.recovered
       var stitchedLoss = try trainer.evaluateLoss(values: stitched, targetSamples: samples)
       var improved = false
@@ -445,20 +511,22 @@ enum SynthIDCLI {
       // The millisecond click has a rippled frequency landscape. A coarse
       // audio-loss-only search provides the same honest basin selection used by
       // multiple random restarts, then gradient descent performs local tuning.
-      let clickFrequencySpec = KickParamSpecs.byName["clickFreq"]!
-      let clickFrequencySteps = 24
-      for index in 0...clickFrequencySteps {
-        let position = Float(index) / Float(clickFrequencySteps)
-        let frequency = clickFrequencySpec.min
-          * Foundation.exp(
-            position * Foundation.log(clickFrequencySpec.max / clickFrequencySpec.min))
-        var candidate = stitched
-        candidate.clickFreq = frequency
-        let loss = try trainer.evaluateLoss(values: candidate, targetSamples: samples)
-        if loss < stitchedLoss {
-          stitched = candidate
-          stitchedLoss = loss
-          improved = true
+      if !isBass {
+        let clickFrequencySpec = KickParamSpecs.byName["clickFreq"]!
+        let clickFrequencySteps = 24
+        for index in 0...clickFrequencySteps {
+          let position = Float(index) / Float(clickFrequencySteps)
+          let frequency = clickFrequencySpec.min
+            * Foundation.exp(
+              position * Foundation.log(clickFrequencySpec.max / clickFrequencySpec.min))
+          var candidate = stitched
+          candidate.clickFreq = frequency
+          let loss = try trainer.evaluateLoss(values: candidate, targetSamples: samples)
+          if loss < stitchedLoss {
+            stitched = candidate
+            stitchedLoss = loss
+            improved = true
+          }
         }
       }
 
@@ -500,6 +568,18 @@ enum SynthIDCLI {
           from: bestRestartDir.appendingPathComponent(filename),
           to: outDir.appendingPathComponent(filename))
       }
+    }
+    // FIX 1: the emitted initial.wav/initial_params.json (and hence
+    // compare.py's --initial, i.e. the reported improvement gate) must always
+    // be the deterministic restart-0 reference initialization, regardless of
+    // which restart actually won selection. Pinning the gate to a winning
+    // restart's own cold start lets an aggressive bracket inflate the
+    // relative-improvement metric by starting from a worse baseline. The
+    // winner's own cold start is preserved separately for debugging.
+    if config.rung == 3 {
+      try writeJSON(result.initial, to: outDir.appendingPathComponent("winner_initial_params.json"))
+      result.initial = SynthIDTrainer(config: config).restartInitial(
+        pitchFit: result.pitchFit, restartIndex: 0)
     }
     // A stitched run starts from donor-combined parameters, but acceptance is
     // measured from the selected cold start. Keep the root initialization and
@@ -600,7 +680,10 @@ enum SynthIDCLI {
     var config = try loadConfig(url: options["config"].map { URL(fileURLWithPath: $0) })
     try config.applyCLI(options)
     config.rung = 3
-    config.applyRuntime()
+    // Note: config.applyRuntime() is deferred until after the target-length
+    // fit decision below (FIX 2), since it sets DGenConfig.defaultFrameCount
+    // from config.frames and every downstream render/train call must see the
+    // final (possibly shrunk) frame count.
 
     let targetURL = URL(fileURLWithPath: targetPath)
     let outDir = URL(fileURLWithPath: outPath)
@@ -614,6 +697,11 @@ enum SynthIDCLI {
       sourcePath: targetURL.standardizedFileURL.path,
       config: config,
       onsetThresholdDB: onsetThresholdDB)
+    if prepared.report.fittedFrames != config.frames {
+      print("fit length: \(config.frames) -> \(prepared.report.fittedFrames) frames")
+      config.frames = prepared.report.fittedFrames
+    }
+    config.applyRuntime()
     try copyIfPresent(from: targetURL, to: outDir.appendingPathComponent("source.wav"))
     try writeJSON(prepared.report, to: outDir.appendingPathComponent("preprocessing.json"))
     let preparedTargetURL = outDir.appendingPathComponent("target.wav")
@@ -641,7 +729,9 @@ enum SynthIDCLI {
       trueParams: nil,
       config: config,
       outDir: outDir,
-      context: "rung3 real target")
+      context: "rung3 real target",
+      python: options["python"] ?? "python3",
+      scoreScriptURL: options["score-script"].map { URL(fileURLWithPath: $0) })
     if !options.keys.contains("no-refine") {
       let recoveredURL = outDir.appendingPathComponent("recovered_params.json")
       let preRefineURL = outDir.appendingPathComponent("pre_refine_params.json")
@@ -652,6 +742,7 @@ enum SynthIDCLI {
         paramsURL: preRefineURL,
         outputParamsURL: recoveredURL,
         outputJSONURL: outDir.appendingPathComponent("refinement.json"),
+        profile: config.profile,
         scriptURL: options["refine-script"].map { URL(fileURLWithPath: $0) },
         python: options["python"] ?? "python3")
       let refined = try loadPatchValues(from: recoveredURL)
@@ -695,10 +786,9 @@ enum SynthIDCLI {
       python: options["python"] ?? "python3")
     report.rung3Comparison = comparison
     report.pass = comparison.pass
-    report.residualMismatch =
-      "The learned patch is constrained to the fixed body, click, and filtered-noise voice. "
-      + "Any remaining difference in `compare.png` or `ab.wav`—especially attack/beater "
-      + "texture and the late decay—is treated as model mismatch rather than hidden lookup data."
+    report.residualMismatch = config.profile == "hoodie-bass"
+      ? "The learned patch is constrained to an integer-locked steady plus attack-decay Fourier basis and a smooth amplitude envelope. Remaining capture noise, filter motion outside that basis, and release-shape differences are model mismatch rather than hidden lookup data."
+      : "The learned patch is constrained to the fixed body, click, and filtered-noise voice. Any remaining difference in `compare.png` or `ab.wav`—especially attack/beater texture and the late decay—is treated as model mismatch rather than hidden lookup data."
     try ReportWriter.write(report: report, to: outDir)
     print(
       "rung3 pass=\(report.pass) improvement=\(String(format: "%.2f%%", comparison.improvement * 100))"
@@ -825,9 +915,11 @@ enum SynthIDCLI {
       Common flags: --frames N --windows a,b,c --no-linear-mag --linear-mag-weight W
                     --pitch-lr LR --amp-lr LR --decay-lr LR --tone-lr LR --noise-lr LR
                     --no-noise-filter --fd-eps EPS --backend metal|cpu
+                    --profile 808|909 (kick voice parameter table; default 808)
       Rung 2 flags: --renderer <render_reference.py> --python <python3>
       Rung 3 flags: --onset-threshold-db DB --compare-script <compare.py> --python <python3>
-                    --refine-script <refine_rung3.py> --no-refine --fdcheck <param>
+                    --refine-script <refine_rung3.py> --score-script <score_params.py>
+                    --no-refine --fdcheck <param>
       """
     )
   }

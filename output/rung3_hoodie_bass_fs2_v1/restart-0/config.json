@@ -1,0 +1,36 @@
+{
+  "ampLR" : 0.03,
+  "checkpointEvery" : 75,
+  "cosineLRDecay" : true,
+  "decayLR" : 0.03,
+  "enableNoiseFilter" : true,
+  "epochs" : 300,
+  "fdEpsilon" : 0.01,
+  "frames" : 16384,
+  "freezePitch" : true,
+  "gradClip" : 1,
+  "includeLinearMagnitude" : true,
+  "linearMagnitudeWeight" : 0.1,
+  "logEvery" : 0,
+  "noiseLR" : 0.01,
+  "peakNormalizeTo" : 0.9,
+  "pitchLR" : 0.001,
+  "pitchRefineEpochs" : 0,
+  "profile" : "hoodie-bass",
+  "restarts" : 1,
+  "rung" : 3,
+  "sampleRate" : 8000,
+  "seed" : 1,
+  "spectralLogEpsilon" : 0.001,
+  "spectralWindows" : [
+    256,
+    512,
+    1024,
+    2048
+  ],
+  "toneLR" : 0.01,
+  "useHannWindow" : true,
+  "windowWeights" : [
+
+  ]
+}

@@ -124,6 +124,7 @@ enum ReferenceRenderer {
       "--out", outputURL.path,
       "--frames", String(config.frames),
       "--sample-rate", String(Int(config.sampleRate.rounded())),
+      "--profile", config.profile,
     ]
     if !config.enableNoiseFilter {
       arguments.append("--no-noise-filter")

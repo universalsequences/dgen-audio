@@ -15,6 +15,44 @@ struct PitchFit: Codable {
   var error: Float?
 }
 
+/// Profile-dependent search ranges for pitch contour extraction/fitting.
+/// `.tr808` matches every literal that was previously hardcoded in this file
+/// exactly, so passing it explicitly (or relying on the default parameter)
+/// changes nothing about 808 behavior.
+struct PitchSearchProfile {
+  var contourMinHz: Float
+  var contourMaxHz: Float
+  var tailMinHz: Float
+  var tailMaxHz: Float
+  var candidateMaxHz: Float
+  var highRidgeHz: Float
+  var fEndRange: ClosedRange<Float>
+  var pitchDecayRange: ClosedRange<Float>
+  /// Bounds the fStart amplitude search in `fit(points:)`. Not part of the
+  /// original design's field list, but required for correctness: without a
+  /// profile-aware cap here, the 808-derived 80...180 Hz literal silently
+  /// clips the 909 fit (measured fStart ~= 247 Hz) at 180 Hz.
+  var fStartRange: ClosedRange<Float>
+
+  static let tr808 = PitchSearchProfile(
+    contourMinHz: 50, contourMaxHz: 300,
+    tailMinHz: 30, tailMaxHz: 70,
+    candidateMaxHz: 300,
+    highRidgeHz: 250,
+    fEndRange: 35...60,
+    pitchDecayRange: -80...(-15),
+    fStartRange: 80...180)
+
+  static let tr909 = PitchSearchProfile(
+    contourMinHz: 50, contourMaxHz: 450,
+    tailMinHz: 30, tailMaxHz: 70,
+    candidateMaxHz: 450,
+    highRidgeHz: 420,
+    fEndRange: 35...60,
+    pitchDecayRange: -80...(-20),
+    fStartRange: 150...400)
+}
+
 enum PitchTrack {
   // Window must cover ~2 periods of minHz (44100/30 = 1470-sample lag needs
   // >= 4096-sample windows); 1024 windows cannot correlate the 35-60 Hz fEnd
@@ -122,16 +160,17 @@ enum PitchTrack {
   static func fit(
     points: [PitchPoint],
     fEndRange: ClosedRange<Float>? = nil,
-    fEndStep: Float = 0.5
+    fEndStep: Float = 0.5,
+    profile: PitchSearchProfile = .tr808
   ) -> PitchFit {
     let candidates = points
-      .filter { $0.time <= 0.25 && $0.hz >= 30 && $0.hz <= 300 && $0.confidence > 0.2 }
+      .filter { $0.time <= 0.25 && $0.hz >= 30 && $0.hz <= profile.candidateMaxHz && $0.confidence > 0.2 }
       .prefix(64)
     var monotonic: [PitchPoint] = []
     for point in candidates {
       if let previous = monotonic.last {
         let largeUpwardJump = point.hz > previous.hz * 1.12
-        let highRidgeAfterBody = point.hz > 250 && previous.hz < 180
+        let highRidgeAfterBody = point.hz > profile.highRidgeHz && previous.hz < 180
         if largeUpwardJump || highRidgeAfterBody {
           continue
         }
@@ -146,10 +185,11 @@ enum PitchTrack {
 
     var best = PitchFit(fStart: 120, fEnd: 45, pitchDecay: -35, error: nil)
     var bestError = Float.infinity
-    let fEndLo = Swift.max(Float(35), fEndRange?.lowerBound ?? 35)
-    let fEndHi = Swift.min(Float(60), fEndRange?.upperBound ?? 60)
+    let fEndLo = Swift.max(profile.fEndRange.lowerBound, fEndRange?.lowerBound ?? profile.fEndRange.lowerBound)
+    let fEndHi = Swift.min(profile.fEndRange.upperBound, fEndRange?.upperBound ?? profile.fEndRange.upperBound)
     let fEndSteps = stride(from: fEndLo, through: fEndHi, by: fEndStep)
-    let decaySteps = stride(from: Float(-80), through: Float(-15), by: Float(1.0))
+    let decaySteps = stride(
+      from: profile.pitchDecayRange.lowerBound, through: profile.pitchDecayRange.upperBound, by: Float(1.0))
 
     for fEnd in fEndSteps {
       for decay in decaySteps {
@@ -162,7 +202,9 @@ enum PitchTrack {
           den += w * e * e
         }
         guard den > 1e-9 else { continue }
-        let amplitude = Swift.min(Swift.max(num / den, 80 - fEnd), 180 - fEnd)
+        let amplitude = Swift.min(
+          Swift.max(num / den, profile.fStartRange.lowerBound - fEnd),
+          profile.fStartRange.upperBound - fEnd)
         let fStart = fEnd + amplitude
         var error: Float = 0
         var weightSum: Float = 0
@@ -183,7 +225,11 @@ enum PitchTrack {
     return best
   }
 
-  static func fit(samples: [Float], sampleRate: Float) -> PitchFit {
+  static func fit(
+    samples: [Float],
+    sampleRate: Float,
+    profile: PitchSearchProfile = .tr808
+  ) -> PitchFit {
     // Contour extraction favors time resolution for the fast early sweep
     // (fStart/pitchDecay); 2048-sample windows only support >= ~50 Hz, which is
     // fine because fEnd comes from the long-window tail anchor below.
@@ -192,16 +238,21 @@ enum PitchTrack {
       sampleRate: sampleRate,
       windowSize: 2048,
       hop: 256,
-      minHz: 50,
-      maxHz: 300)
-    let tail = tailFEnd(samples: samples, sampleRate: sampleRate)
+      minHz: profile.contourMinHz,
+      maxHz: profile.contourMaxHz)
+    let tail = tailFEnd(
+      samples: samples,
+      sampleRate: sampleRate,
+      minHz: profile.tailMinHz,
+      maxHz: profile.tailMaxHz)
     if let tail, tail.confidence > 0.5 {
       // The tail anchor is accurate to ~0.1%; the swept-contour error metric is
       // biased upward near fEnd (window smearing), so give it almost no say.
       let anchored = fit(
         points: points,
         fEndRange: (tail.hz - 0.25)...(tail.hz + 0.25),
-        fEndStep: 0.1)
+        fEndStep: 0.1,
+        profile: profile)
       if anchored.error?.isFinite == true {
         return anchored
       }
@@ -212,6 +263,6 @@ enum PitchTrack {
         pitchDecay: -35,
         error: nil)
     }
-    return fit(points: points)
+    return fit(points: points, profile: profile)
   }
 }
