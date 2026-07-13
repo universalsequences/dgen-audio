@@ -357,6 +357,9 @@ enum SynthIDCLI {
     let verifyOnly = options.keys.contains("verify-only")
     let manualTarget = options["target"].map { URL(fileURLWithPath: $0) }
     let manualParams = options["params"].map { URL(fileURLWithPath: $0) }
+    let rendererURL = options["renderer"].map { URL(fileURLWithPath: $0) }
+    let comparatorURL = options["polyblep-comparator"].map { URL(fileURLWithPath: $0) }
+    let python = options["python"] ?? "python3"
     guard (manualTarget == nil) == (manualParams == nil) else {
       throw SynthIDError.message("rung2 requires --target and --params together")
     }
@@ -376,6 +379,17 @@ enum SynthIDCLI {
         config: config,
         outDir: root,
         context: "rung2 external target")
+      if config.profile == "subtractive-bass" {
+        try verifyPolyblepEquivalence(
+          params: sampledParams,
+          paramsURL: paramsURL,
+          config: config,
+          outDir: root,
+          context: "rung2 external target",
+          rendererURL: rendererURL,
+          comparatorURL: comparatorURL,
+          python: python)
+      }
       let normalized = try normalizeTarget(
         referenceSamples,
         params: sampledParams,
@@ -420,9 +434,6 @@ enum SynthIDCLI {
     guard !seeds.isEmpty else {
       throw SynthIDError.message("rung2 requires at least one seed")
     }
-    let rendererURL = options["renderer"].map { URL(fileURLWithPath: $0) }
-    let python = options["python"] ?? "python3"
-
     var passed = 0
     for seed in seeds {
       let seedDir = seeds.count == 1 ? root : root.appendingPathComponent("seed-\(seed)")
@@ -451,6 +462,17 @@ enum SynthIDCLI {
         config: seedConfig,
         outDir: seedDir,
         context: "rung2 seed \(seed)")
+      if seedConfig.profile == "subtractive-bass" {
+        try verifyPolyblepEquivalence(
+          params: sampledParams,
+          paramsURL: sampledParamsURL,
+          config: seedConfig,
+          outDir: seedDir,
+          context: "rung2 seed \(seed)",
+          rendererURL: rendererURL,
+          comparatorURL: comparatorURL,
+          python: python)
+      }
 
       let normalized = try normalizeTarget(
         referenceSamples,
@@ -945,6 +967,55 @@ enum SynthIDCLI {
     }
   }
 
+  private static func verifyPolyblepEquivalence(
+    params: PatchValues,
+    paramsURL: URL,
+    config: SynthIDConfig,
+    outDir: URL,
+    context: String,
+    rendererURL: URL?,
+    comparatorURL: URL?,
+    python: String
+  ) throws {
+    let deploymentURL = outDir.appendingPathComponent("deployment_polyblep_oscillator.wav")
+    let trainingURL = outDir.appendingPathComponent("training_polyblep_oscillator.wav")
+    try ReferenceRenderer.render(
+      paramsURL: paramsURL,
+      outputURL: deploymentURL,
+      config: config,
+      scriptURL: rendererURL,
+      python: python,
+      oscillatorOnly: true)
+    let (deploymentSamples, sampleRate) = try AudioFile.load(url: deploymentURL)
+    try requireSampleRate(sampleRate, config: config, context: "\(context) deployment oscillator")
+
+    let trainingSamples = try SubtractiveBassVoice.renderOscillator(values: params, config: config)
+    try AudioFile.save(
+      url: trainingURL, samples: trainingSamples, sampleRate: config.sampleRate)
+    let timeReport = try ReferenceRenderer.verifyOscillator(
+      trainingSamples: trainingSamples,
+      referenceSamples: deploymentSamples,
+      config: config)
+    try writeJSON(timeReport, to: outDir.appendingPathComponent("oscillator_equivalence.json"))
+
+    let spectralReport = try ReferenceRenderer.comparePolyblep(
+      trainingURL: trainingURL,
+      deploymentURL: deploymentURL,
+      reportURL: outDir.appendingPathComponent("polyblep_equivalence.json"),
+      scriptURL: comparatorURL,
+      python: python)
+    print(
+      "\(context) PolyBLEP maxAbs=\(String(format: "%.6e", timeReport.maxAbsoluteError))"
+        + " MRSTFT=\(String(format: "%.6e", spectralReport.distance))"
+        + " threshold=\(String(format: "%.6e", spectralReport.threshold))"
+        + " pass=\(timeReport.pass && spectralReport.pass)")
+    guard timeReport.pass && spectralReport.pass else {
+      throw SynthIDError.message(
+        "\(context) PolyBLEP equivalence failed: maxAbs=\(timeReport.maxAbsoluteError),"
+          + " MRSTFT=\(spectralReport.distance), threshold=\(spectralReport.threshold)")
+    }
+  }
+
   private static func requireSampleRate(
     _ sampleRate: Float,
     config: SynthIDConfig,
@@ -1207,7 +1278,8 @@ enum SynthIDCLI {
                     --fdcheck-directional --direction-eps EPS
                     --backend metal|cpu
                     --profile 808|909|hoodie-bass|subtractive-bass
-      Rung 2 flags: --renderer <render_reference.py> --python <python3>
+      Rung 2 flags: --renderer <render_reference.py> --polyblep-comparator <compare_polyblep.py>
+                    --python <python3>
       Rung 3 flags: --onset-threshold-db DB --compare-script <compare.py> --python <python3>
                     --refine-script <refine_rung3.py> --score-script <score_params.py>
                     --no-refine --fdcheck <param>

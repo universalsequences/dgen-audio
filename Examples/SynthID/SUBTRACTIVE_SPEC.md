@@ -1,6 +1,6 @@
 # SynthID Subtractive Fitting Path — Spec & Experiment Plan
 
-**Status: E0 and E1 validated.** E2 and later experiments remain unrun.
+**Status: E0–E2 gates pass; post-gate E1 policy audit fails.** E3 is deferred.
 
 ## Thesis
 
@@ -223,17 +223,32 @@ match, majority of seeds.
 > production `pw` basin placement, smooth log-L2 refinement, and a gated smooth
 > coordinate-basin rescue while always scoring with the unchanged production
 > loss. The amplitude ridge is scored through effective output-envelope levels
-> and scale-free envelope ratios. See `E1_FINDING.md`. E2 was not started.
+> and scale-free envelope ratios, including a 75 ms decay-transient probe. See
+> `E1_FINDING.md`.
+>
+> **Fresh-seed readiness audit: FAIL (0/2).** The unchanged integrated policy
+> obtains production-loss ratios of 54.32% and 19.22% on untouched seeds 6 and
+> 7 (gate 2%), despite automatically running both rescue stages. This does not
+> alter the declared 3/5 E1 result, but it blocks E3 until a target-independent
+> basin-retention policy is frozen and passes new untouched seeds.
 
 ### E2 — Rung 2 independent renderer + polyblep equivalence (days)
 
-1. NumPy reference renderer for the voice (naive or additive-eval oscillator,
-   whichever E1 settled on): max abs error ≤ 1e-3 vs Swift, as usual.
+1. NumPy reference renderer for the complete voice, including the direct
+   PolyBLEP oscillator selected by E1: max abs error ≤ 1e-3 vs Swift, as usual.
 2. **New**: polyblep equivalence — render the same params through the eseq
    polyblep macros; gate on log-mag MR-STFT distance between training-osc and
    polyblep renders being ≪ the fit residual (proposed: < 5% of the E3
    learned distance). This is what licenses "the recovered knobs mean the
    same thing at deployment."
+
+> **Final E2 result: PASS (5/5 seeds).** The worst independent NumPy-vs-DGen
+> complete-voice maximum absolute error is `3.053658e-4` (gate `< 1e-3`).
+> Oscillator-only maximum absolute errors are at most `7.450581e-8`; independent
+> log-magnitude MR-STFT distances are `1.59e-7–1.78e-7` against the threshold
+> `0.00308`, frozen as 5% of the E3 additive distance before execution. See
+> `E2_FINDING.md`. E2 removes the deployment-equivalence blocker, but the
+> fresh-seed optimizer-policy audit above still prevents E3 from starting.
 
 ### E3 — Rung 3 on hoodie bass G#2 (the headline experiment)
 

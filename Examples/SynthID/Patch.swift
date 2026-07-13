@@ -142,6 +142,31 @@ enum SubtractiveBassVoice {
       - polyblep(fallingPhase, frequency: frequency, sampleRate: sampleRate)
   }
 
+  static func buildOscillator(
+    params: SubtractiveBassVoiceSignals, config: SynthIDConfig
+  ) -> Signal {
+    let sr = Signal.constant(config.sampleRate)
+    let frequency = Signal.constant(110.0)
+    let phase = Signal.statefulPhasor(frequency)
+    let saw = polyblepSaw(phase, frequency: frequency, sampleRate: sr)
+    let pulse = polyblepPulse(
+      phase, width: params.pw, frequency: frequency, sampleRate: sr)
+    return (1.0 - params.shape) * saw + params.shape * pulse
+  }
+
+  static func renderOscillator(
+    values: PatchValues, config: SynthIDConfig
+  ) throws -> [Float] {
+    config.applyRuntime()
+    LazyGraphContext.reset()
+    let params = TrainableKickParams(
+      initial: values,
+      trainable: false,
+      freezePitch: false)
+    return try buildOscillator(params: params.subtractiveBassSignals, config: config)
+      .realize(frames: config.frames)
+  }
+
   static func build(params: SubtractiveBassVoiceSignals, config: SynthIDConfig) -> Signal {
     let sr = Signal.constant(config.sampleRate)
     let t = Signal.accum(
@@ -152,12 +177,7 @@ enum SubtractiveBassVoice {
 
     // f0 and note-off remain fixed for the first subtractive topology; E1
     // trains the complete oscillator/filter/VCA/output patch sheet.
-    let frequency = Signal.constant(110.0)
-    let phase = Signal.statefulPhasor(frequency)
-    let saw = polyblepSaw(phase, frequency: frequency, sampleRate: sr)
-    let pulse = polyblepPulse(
-      phase, width: params.pw, frequency: frequency, sampleRate: sr)
-    let oscillator = (1.0 - params.shape) * saw + params.shape * pulse
+    let oscillator = buildOscillator(params: params, config: config)
 
     let cutoff = params.fBase + params.fAmt * DGenLazy.exp(-t / params.fDecay)
     // Reuse the existing diagnostic filter bypass so fdcheck failures can be

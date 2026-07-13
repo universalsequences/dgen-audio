@@ -4,7 +4,7 @@
 
 Completed 2026-07-13. E0 remains PASS at commit `229258f`. E1 recovers
 the complete 12-control subtractive voice on three of five deterministic
-self-inversion seeds. E2 was not started.
+self-inversion seeds. E2 was subsequently run and is documented separately.
 
 ## Gate verdict
 
@@ -15,9 +15,9 @@ and a majority of five seeds.
 | Seed | Initial loss | Final production loss | Ratio | Max invariant error | Verdict |
 |---:|---:|---:|---:|---:|:---:|
 | 1 | 10.403641 | 0.062538 | 0.6011% | 1.11% | PASS |
-| 2 | 11.900508 | 0.038825 | 0.3262% | 1.13% | PASS |
+| 2 | 11.900508 | 0.038825 | 0.3262% | 1.74% | PASS |
 | 3 | 7.199862 | 0.025997 | 0.3611% | 2.24% | PASS |
-| 4 | 4.295578 | 1.088307 | 25.3355% | 17.94% | FAIL |
+| 4 | 4.295578 | 1.088307 | 25.3355% | 19.60% | FAIL |
 | 5 | 2.650579 | 0.515013 | 19.4302% | 40.42% | FAIL |
 
 **Verdict: PASS (3/5).** The passing seeds are comfortably inside both
@@ -28,6 +28,65 @@ refinement objective, is the audible-match acceptance measurement.
 Seeds 4 and 5 are conservatively recorded at their completed pre-rescue
 checkpoints. The corrected policy would trigger its additional basin rescue
 for them, but a fourth pass is not needed to establish the declared majority.
+
+## Independent integrated-policy validation
+
+After the original finding was written, the canonical one-command policy was
+run unattended on seed 3 in a separate validation. It automatically created
+both `restart-smooth-basin-rescue` and `restart-smooth-basin-settle`, finished
+at a 0.28% production-loss ratio, and recovered `shape=0.229515`,
+`pw=0.631810` against hidden values
+`0.22942`, `0.63179`. An independent NumPy MR-STFT measurement on that fresh
+render was `0.0099`. Re-sampling the hidden parameters was byte-identical.
+
+The same independent comparator measured `0.013–0.030` for the original
+passing seeds and `0.226–0.506` for the failing checkpoints, a 17–40× split.
+These values are recorded as an independent reproduction; the fresh
+`output/e1_subtractive_final_policy` directory was not copied into this
+worktree.
+
+## Untouched-seed policy audit: FAIL (0/2)
+
+Before E3, the frozen canonical command was run without modification on fresh
+seeds 6 and 7. Both automatically invoked the smooth basin rescue and settle;
+both failed decisively.
+
+| Seed | Initial loss | Final production loss | Ratio | Max invariant error | Independent MR-STFT | Verdict |
+|---:|---:|---:|---:|---:|---:|:---:|
+| 6 | 2.502263 | 1.359184 | 54.3182% | 405.35% | 0.126350 | FAIL |
+| 7 | 19.828098 | 3.810113 | 19.2157% | 222.35% | 0.477492 | FAIL |
+
+This does not retroactively change the predeclared five-seed E1 gate, which
+remains PASS (3/5). It does falsify the stronger claim that the current rescue
+policy is ready to generalize beyond the seeds used to develop it, so E3 is
+deferred.
+
+The failures localize to coupled filter-basin selection:
+
+- Seed 6's hidden filter envelope is an extreme dark corner
+  (`fBase=86.44 Hz`, `fEnv(0)=93.63 Hz`). Every cold restart and both rescue
+  stages remain above `fBase=265 Hz`; the final cutoff endpoints miss by 208%
+  and 405%.
+- Seed 7 is not a low-cutoff corner. One cold restart begins near its hidden
+  `fBase=2347.84 Hz` but coupled optimization makes that restart worse, so
+  restart selection chooses a low-cutoff solution. Smooth coordinate rescue
+  also selects that basin; the final `fBase=613.95 Hz` and `res=3.61` miss the
+  hidden `res=1.12`.
+
+The direct gradients, E0 chain-rule checks, and E2 deployment equivalence all
+remain valid. The next policy experiment should use seeds 6/7 only for
+diagnosis, freeze a target-independent basin-retention change, then gate it on
+new untouched seeds rather than promoting a seed-6/7-specific rescue.
+
+Exact audit command:
+
+```sh
+.build/release/SynthID rung1 \
+  --profile subtractive-bass --seeds 6,7 \
+  --out output/e1_subtractive_fresh_seeds_6_7 \
+  --epochs 600 --restarts 3 \
+  --log-every 600 --checkpoint-every 300 --allow-fail
+```
 
 ## What was implemented
 
@@ -102,12 +161,16 @@ The finalized scored invariants are:
 - `fEnv(0) = fBase + fAmt`;
 - `fEnv(infinity) = fBase`;
 - `res`;
-- `aEnv(t) * drive * outGain` at 10 ms, 300 ms, and 700 ms;
-- `aEnv(300ms)/aEnv(10ms)` and `aEnv(700ms)/aEnv(300ms)`.
+- `aEnv(t) * drive * outGain` at 10 ms, 75 ms, 300 ms, and 700 ms;
+- `aEnv(75ms)/aEnv(10ms)`, `aEnv(300ms)/aEnv(10ms)`, and
+  `aEnv(700ms)/aEnv(300ms)`.
 
-This scores absolute output-envelope level and scale-free envelope shape while
-leaving individual ridge factors as diagnostics. On passing seeds, every row
-is within 2.24%.
+The 75 ms samples cover the decay transient that the original 10/300/700 ms
+set skipped. This scores absolute output-envelope level and scale-free
+envelope shape while leaving individual ridge factors as diagnostics. It does
+not change the five-seed verdict: the new absolute 75 ms errors are 0.12%,
+0.58%, 0.16%, 19.60%, and 40.09%; the passing seeds remain within 2.24% on
+every scored row.
 
 Seed 3's individual `fDecay` reaches its upper bound while `fAmt` is small.
 That is the expected weak-depth filter-EG compensation: both cutoff endpoints,
@@ -170,4 +233,7 @@ hidden truth for invariant reporting, and the selected cold initialization.
 
 ## Ladder status
 
-E1 is complete and PASS. E2 is unblocked but was not started in this work.
+The formal E1 gate is complete and PASS, while the post-gate fresh-seed policy
+audit is FAIL (0/2). See `E2_FINDING.md` for the independent renderer and
+deployment-equivalence PASS. E3 must not start until policy generalization is
+re-established on new untouched seeds.

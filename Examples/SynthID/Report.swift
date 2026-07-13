@@ -86,6 +86,10 @@ enum ReportWriter {
             trueValue: effectiveOutputEnvelope(trueParams, at: 0.01),
             recoveredValue: effectiveOutputEnvelope(recovered, at: 0.01), tolerance: 0.10),
           makeRow(
+            name: "effective output envelope (75ms)", unit: "lin",
+            trueValue: effectiveOutputEnvelope(trueParams, at: 0.075),
+            recoveredValue: effectiveOutputEnvelope(recovered, at: 0.075), tolerance: 0.10),
+          makeRow(
             name: "effective output envelope (300ms)", unit: "lin",
             trueValue: effectiveOutputEnvelope(trueParams, at: 0.3),
             recoveredValue: effectiveOutputEnvelope(recovered, at: 0.3), tolerance: 0.10),
@@ -93,6 +97,11 @@ enum ReportWriter {
             name: "effective output envelope (700ms)", unit: "lin",
             trueValue: effectiveOutputEnvelope(trueParams, at: 0.7),
             recoveredValue: effectiveOutputEnvelope(recovered, at: 0.7), tolerance: 0.10),
+          makeRow(
+            name: "aEnv(75ms)/aEnv(10ms)", unit: "ratio",
+            trueValue: envelopeRatio(trueParams, numerator: 0.075, denominator: 0.01),
+            recoveredValue: envelopeRatio(recovered, numerator: 0.075, denominator: 0.01),
+            tolerance: 0.10),
           makeRow(
             name: "aEnv(300ms)/aEnv(10ms)", unit: "ratio",
             trueValue: envelopeRatio(trueParams, numerator: 0.3, denominator: 0.01),

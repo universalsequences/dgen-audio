@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Independent NumPy renderer for SynthID rung 2.
 
-The body and click phase formulas intentionally mirror Patch.swift's closed-form
-phase convention. They do not use DGen or call back into the Swift executable.
+The profile formulas intentionally mirror their deployment math and phase
+conventions. They do not use DGen or call back into the Swift executable.
 """
 
 import argparse
@@ -57,11 +57,16 @@ HOODIE_BASS_HARMONICS = [
 ]
 
 
-def render(params, frames=32768, sample_rate=44100, enable_noise_filter=True, profile=None):
+def render(
+        params, frames=32768, sample_rate=44100, enable_noise_filter=True,
+        profile=None, oscillator_only=False):
     # Keep the signal path in float32 so the equivalence check measures the
     # independent formulas rather than avoidable float64-vs-float32 drift.
     sample_rate = np.float32(sample_rate)
     t = dgen_time_ramp(frames, sample_rate)
+    if profile == "subtractive-bass":
+        return render_subtractive_bass(
+            params, t, sample_rate, enable_noise_filter, oscillator_only)
     if profile == "hoodie-bass":
         return render_hoodie_bass(params, t)
     f_start = np.float32(params["fStart"])
@@ -172,6 +177,100 @@ def render_hoodie_bass(params, t):
     return (shaped * np.float32(params["outGain"])).astype(np.float32)
 
 
+def render_subtractive_bass(
+        params, t, sample_rate, enable_filter=True, oscillator_only=False):
+    """Independent float32 transcription of the deployment PolyBLEP voice."""
+    frequency = np.float32(110.0)
+    phase = dgen_phasor(len(t), frequency, sample_rate)
+    dt = np.clip(frequency / sample_rate, np.float32(0.000001), np.float32(0.5))
+
+    saw = phase * np.float32(2.0) - np.float32(1.0) - polyblep(phase, dt)
+    width = np.clip(
+        np.float32(params["pw"]), np.float32(0.01), np.float32(0.99))
+    falling_phase = np.mod(phase - width, np.float32(1.0)).astype(np.float32)
+    raw_pulse = (phase < width).astype(np.float32) * np.float32(2.0) - np.float32(1.0)
+    pulse = raw_pulse + polyblep(phase, dt) - polyblep(falling_phase, dt)
+    shape = np.float32(params["shape"])
+    oscillator = ((np.float32(1.0) - shape) * saw + shape * pulse).astype(np.float32)
+    if oscillator_only:
+        return oscillator
+
+    cutoff = (
+        np.float32(params["fBase"])
+        + np.float32(params["fAmt"])
+        * np.exp(-t / np.float32(params["fDecay"])))
+    filtered = time_varying_lowpass_biquad(
+        oscillator, cutoff, np.float32(params["res"])) if enable_filter else oscillator
+
+    attack = np.float32(1.0) - np.exp(-t / np.float32(params["attackTime"]))
+    sustain = np.float32(params["sustain"])
+    decay = sustain + (np.float32(1.0) - sustain) * np.exp(
+        -t / np.float32(params["decayTime"]))
+    release = np.float32(1.0) / (
+        np.float32(1.0)
+        + np.exp((t - np.float32(0.6)) / np.float32(params["releaseTime"])))
+    driven = filtered * attack * decay * release * np.float32(params["drive"])
+    shaped = driven / (np.float32(1.0) + np.abs(driven))
+    return (shaped * np.float32(params["outGain"])).astype(np.float32)
+
+
+def polyblep(phase, dt):
+    """The eseq macro, including its strict lt/gt multiplicative gates."""
+    left_x = phase / dt
+    left = (
+        np.float32(2.0) * left_x - left_x * left_x - np.float32(1.0))
+    right_x = (phase - np.float32(1.0)) / dt
+    right = right_x * right_x + np.float32(2.0) * right_x + np.float32(1.0)
+    return (
+        (phase < dt).astype(np.float32) * left
+        + (phase > (np.float32(1.0) - dt)).astype(np.float32) * right).astype(np.float32)
+
+
+@functools.lru_cache(maxsize=16)
+def dgen_phasor(frames, frequency, sample_rate):
+    """Match statefulPhasor's pre-update float32 accumulator output."""
+    values = np.zeros(frames, dtype=np.float32)
+    increment = np.float32(np.float32(frequency) / np.float32(sample_rate))
+    state = np.float32(0.0)
+    for i in range(frames):
+        values[i] = state
+        state = np.float32(state + increment)
+        if state >= np.float32(1.0):
+            state = np.float32(state - np.float32(1.0))
+    return values
+
+
+def time_varying_lowpass_biquad(x, cutoff, q):
+    """Match DGen HigherOps' per-frame mode-0 coefficient graph."""
+    y = np.zeros_like(x, dtype=np.float32)
+    x1 = np.float32(0.0)
+    x2 = np.float32(0.0)
+    y1 = np.float32(0.0)
+    y2 = np.float32(0.0)
+    angular_scale = np.float32(0.00014247585730565955)
+    one = np.float32(1.0)
+    two = np.float32(2.0)
+    half = np.float32(0.5)
+    q = np.abs(np.float32(q))
+    for i in range(len(x)):
+        w0 = np.abs(np.float32(cutoff[i])) * angular_scale
+        cos_w0 = np.cos(w0, dtype=np.float32)
+        sin_w0 = np.sin(w0, dtype=np.float32)
+        alpha = sin_w0 * half / q
+        a0 = one + alpha
+        b0 = ((one - cos_w0) * half) / a0
+        b1 = (one - cos_w0) / a0
+        b2 = b0
+        a1 = (-two * cos_w0) / a0
+        a2 = (one - alpha) / a0
+        out = np.float32(
+            b0 * np.float32(x[i]) + b1 * x1 + b2 * x2 - a1 * y1 - a2 * y2)
+        y[i] = out
+        x2, x1 = x1, np.float32(x[i])
+        y2, y1 = y1, out
+    return y
+
+
 @functools.lru_cache(maxsize=16)
 def dgen_time_ramp(frames, sample_rate):
     """Match Signal.accum(1 / sampleRate)'s pre-update float32 state."""
@@ -266,7 +365,10 @@ def main():
     parser.add_argument("--frames", type=int, default=32768)
     parser.add_argument("--sample-rate", type=int, default=44100)
     parser.add_argument("--no-noise-filter", action="store_true")
-    parser.add_argument("--profile", choices=["808", "909", "hoodie-bass"], default=None)
+    parser.add_argument(
+        "--profile", choices=["808", "909", "hoodie-bass", "subtractive-bass"],
+        default=None)
+    parser.add_argument("--oscillator-only", action="store_true")
     args = parser.parse_args()
 
     with open(args.params) as f:
@@ -282,6 +384,7 @@ def main():
             args.sample_rate,
             enable_noise_filter=not args.no_noise_filter,
             profile=args.profile,
+            oscillator_only=args.oscillator_only,
         ),
         args.sample_rate,
     )
