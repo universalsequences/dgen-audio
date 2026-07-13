@@ -231,6 +231,14 @@ match, majority of seeds.
 > 7 (gate 2%), despite automatically running both rescue stages. This does not
 > alter the declared 3/5 E1 result, but it blocks E3 until a target-independent
 > basin-retention policy is frozen and passes new untouched seeds.
+>
+> **Follow-up basin-policy experiment: BLOCKED.** A deterministic full-parameter
+> population search plus smooth and production refinement improved development
+> seed 6 to 13.09%, but did not clear the 2% gate. Structured anchors, block
+> coordinate continuation, joint oscillator grids, additional restarts, and a
+> retained high-filter seed-7 basin also failed. The attempted policy was not
+> promoted; seeds 8/9 remain sealed and E3 remains unrun. See
+> `E1_POLICY_AUDIT_FINDING.md`.
 
 ### E2 — Rung 2 independent renderer + polyblep equivalence (days)
 

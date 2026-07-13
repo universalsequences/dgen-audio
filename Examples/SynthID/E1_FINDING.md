@@ -76,7 +76,10 @@ The failures localize to coupled filter-basin selection:
 The direct gradients, E0 chain-rule checks, and E2 deployment equivalence all
 remain valid. The next policy experiment should use seeds 6/7 only for
 diagnosis, freeze a target-independent basin-retention change, then gate it on
-new untouched seeds rather than promoting a seed-6/7-specific rescue.
+new untouched seeds rather than promoting a seed-6/7-specific rescue. That
+experiment has now been attempted and rejected: its best seed-6 ratio was
+13.09%, seeds 8/9 remain sealed, and E3 remains blocked. See
+`E1_POLICY_AUDIT_FINDING.md` for the full negative-result table and root cause.
 
 Exact audit command:
 
@@ -234,6 +237,7 @@ hidden truth for invariant reporting, and the selected cold initialization.
 ## Ladder status
 
 The formal E1 gate is complete and PASS, while the post-gate fresh-seed policy
-audit is FAIL (0/2). See `E2_FINDING.md` for the independent renderer and
-deployment-equivalence PASS. E3 must not start until policy generalization is
-re-established on new untouched seeds.
+audit is FAIL (0/2). A subsequent target-independent basin-policy experiment
+also failed its development gate on seed 6 (13.09% versus 2%), so untouched
+seeds 8/9 were not run. See `E1_POLICY_AUDIT_FINDING.md` and `E2_FINDING.md`.
+E3 must not start until policy generalization is re-established.

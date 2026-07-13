@@ -105,6 +105,9 @@ enum SynthIDCLI {
       targetSamples: samples,
       outDir: outDir,
       trueParams: trueParams,
+      restartIndex: try options["restart-index"].map {
+        try parseInt($0, "--restart-index")
+      } ?? 0,
       initialOverride: initialOverride)
     _ = try renderLearnedAndReport(
       result: result,
@@ -323,24 +326,98 @@ enum SynthIDCLI {
     let radius = try options["radius"].map { try parseFloat($0, "--radius") } ?? 5e-4
     let points = try options["points"].map { try parseInt($0, "--points") } ?? 201
     guard points >= 3 else { throw SynthIDError.message("loss-sweep --points must be >= 3") }
+    let secondParamName = options["param2"]
+    let secondSpec = try secondParamName.map { name in
+      guard name != paramName else {
+        throw SynthIDError.message("loss-sweep parameters must be distinct")
+      }
+      guard let spec = KickParamSpecs.byName[name] else {
+        throw SynthIDError.message("unknown loss-sweep parameter \(name)")
+      }
+      return spec
+    }
+    let secondRadius = try options["radius2"].map { try parseFloat($0, "--radius2") }
+      ?? radius
+    let secondPoints = try options["points2"].map { try parseInt($0, "--points2") }
+      ?? points
+    guard secondPoints >= 3 else {
+      throw SynthIDError.message("loss-sweep --points2 must be >= 3")
+    }
+    let thirdParamName = options["param3"]
+    let thirdSpec = try thirdParamName.map { name in
+      guard name != paramName, name != secondParamName else {
+        throw SynthIDError.message("loss-sweep parameters must be distinct")
+      }
+      guard let spec = KickParamSpecs.byName[name] else {
+        throw SynthIDError.message("unknown loss-sweep parameter \(name)")
+      }
+      return spec
+    }
+    guard thirdSpec == nil || secondSpec != nil else {
+      throw SynthIDError.message("loss-sweep --param3 requires --param2")
+    }
+    let thirdRadius = try options["radius3"].map { try parseFloat($0, "--radius3") }
+      ?? secondRadius
+    let thirdPoints = try options["points3"].map { try parseInt($0, "--points3") }
+      ?? secondPoints
+    guard thirdPoints >= 3 else {
+      throw SynthIDError.message("loss-sweep --points3 must be >= 3")
+    }
 
     let (samples, _) = try AudioFile.load(url: URL(fileURLWithPath: targetPath))
     let center = try loadPatchValues(from: URL(fileURLWithPath: paramsPath))
     let centerZ = spec.transform(center[paramName])
     let trainer = SynthIDTrainer(config: config)
-    var csv = "delta,transformedValue,naturalValue,loss\n"
+    let csvHeader: String
+    if thirdSpec != nil {
+      csvHeader = "delta,transformedValue,naturalValue,delta2,transformedValue2,naturalValue2,"
+        + "delta3,transformedValue3,naturalValue3,loss\n"
+    } else if secondSpec != nil {
+      csvHeader = "delta,transformedValue,naturalValue,delta2,transformedValue2,naturalValue2,loss\n"
+    } else {
+      csvHeader = "delta,transformedValue,naturalValue,loss\n"
+    }
+    var csv = csvHeader
     for index in 0..<points {
       let fraction = Float(index) / Float(points - 1)
       let delta = -radius + 2.0 * radius * fraction
       var values = center
       values[paramName] = spec.inverse(centerZ + delta)
-      let loss = try trainer.evaluateLoss(values: values, targetSamples: samples)
-      csv += "\(delta),\(centerZ + delta),\(values[paramName]),\(loss)\n"
+      if let secondSpec, let secondParamName {
+        let secondCenterZ = secondSpec.transform(center[secondParamName])
+        for secondIndex in 0..<secondPoints {
+          let secondFraction = Float(secondIndex) / Float(secondPoints - 1)
+          let secondDelta = -secondRadius + 2.0 * secondRadius * secondFraction
+          values[secondParamName] = secondSpec.inverse(secondCenterZ + secondDelta)
+          if let thirdSpec, let thirdParamName {
+            let thirdCenterZ = thirdSpec.transform(center[thirdParamName])
+            for thirdIndex in 0..<thirdPoints {
+              let thirdFraction = Float(thirdIndex) / Float(thirdPoints - 1)
+              let thirdDelta = -thirdRadius + 2.0 * thirdRadius * thirdFraction
+              values[thirdParamName] = thirdSpec.inverse(thirdCenterZ + thirdDelta)
+              let loss = try trainer.evaluateLoss(values: values, targetSamples: samples)
+              csv += "\(delta),\(centerZ + delta),\(values[paramName]),\(secondDelta),"
+                + "\(secondCenterZ + secondDelta),\(values[secondParamName]),\(thirdDelta),"
+                + "\(thirdCenterZ + thirdDelta),\(values[thirdParamName]),\(loss)\n"
+            }
+          } else {
+            let loss = try trainer.evaluateLoss(values: values, targetSamples: samples)
+            csv += "\(delta),\(centerZ + delta),\(values[paramName]),\(secondDelta),"
+              + "\(secondCenterZ + secondDelta),\(values[secondParamName]),\(loss)\n"
+          }
+        }
+      } else {
+        let loss = try trainer.evaluateLoss(values: values, targetSamples: samples)
+        csv += "\(delta),\(centerZ + delta),\(values[paramName]),\(loss)\n"
+      }
     }
     let out = URL(fileURLWithPath: outPath)
     try ensureDirectory(out.deletingLastPathComponent())
     try csv.write(to: out, atomically: true, encoding: .utf8)
-    print("wrote=\(out.path) points=\(points) radius=\(radius)")
+    print(
+      "wrote=\(out.path) points=\(points) radius=\(radius)"
+        + (secondSpec == nil ? "" : " points2=\(secondPoints) radius2=\(secondRadius)")
+        + (thirdSpec == nil ? "" : " points3=\(thirdPoints) radius3=\(thirdRadius)"))
   }
 
   private static func rung2(options: [String: String]) throws {
@@ -1261,11 +1338,12 @@ enum SynthIDCLI {
 
       swift run SynthID render --params <json> --out <wav> [--frames N]
       swift run SynthID train  --target <wav> --out <dir> [--rung 1|2|3] [--params <truth.json>]
-      swift run SynthID train  --target <wav> --out <dir> --initial-params <params.json>
+      swift run SynthID train  --target <wav> --out <dir> [--initial-params <params.json> | --restart-index N]
       swift run SynthID train  --target <wav> --out <dir> --smooth-training-loss
       swift run SynthID score  --target <wav> --params <recovered.json> --true-params <truth.json> --initial-params <initial.json> --out <dir>
       swift run SynthID train  --target <wav> --out <dir> --fdcheck <param> [--params <point.json>]
       swift run SynthID loss-sweep --target <wav> --params <json> --param <name> --out <csv>
+        [--param2 <name> --radius2 R --points2 N] [--param3 <name> --radius3 R --points3 N]
       swift run SynthID rung1  --seed <N> --out <dir> [--epochs N] [--restarts N]
       swift run SynthID rung2  --out <dir> [--seeds 1,2,3,4,5] [--verify-only]
       swift run SynthID rung2  --target <wav-from-numpy> --params <json> --out <dir> [--verify-only]
