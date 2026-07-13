@@ -63,34 +63,34 @@ drive at runtime:
      (* -1.0 (polyblep falling_phase freq))))
 ```
 
-Training-side and deployment-side oscillators do **not** need to be
-sample-identical. The BLEP term is an anti-aliasing correction confined to a
-2-sample transition band; its effect on the log-magnitude MR-STFT at bass
-fundamentals is small. The equivalence gate is spectral (rung-2 style, see
-E2), not max-abs-error on samples.
+The training graph directly transcribes these deployment macros. With `f0`
+frozen from the CPU pitch fit, `dt` is constant; `shape` and `pw` differentiate
+through ordinary arithmetic, wrap, and the PolyBLEP quadratics. Training and
+deployment therefore use the same oscillator topology rather than relying on
+a spectral stand-in.
 
 ## Training-side oscillator
 
-`phasor` is a 0–1 ramp. Therefore, with no new ops:
+`phasor` is a 0–1 ramp. The training graph builds `polyblep_saw` and
+`polyblep_pulse` exactly as above, with no new ops or custom adjoint:
 
 ```text
-saw(φ)        = 2·φ − 1                                    # naive saw
-pulse(φ, pw)  = saw(φ) − saw(wrap(φ − pw))                 # phase-offset pair
-osc(φ)        = (1 − shape)·saw(φ) + shape·pulse(φ, pw)    # differentiable blend
+osc(φ) = (1 − shape)·polyblep_saw(φ, f0)
+       + shape·polyblep_pulse(φ, pw, f0)
 ```
 
-The step discontinuities are measure-zero; autograd through them is fine in
-practice (the loss is phase-blind log-mag STFT — it sees harmonic amplitudes,
-which are smooth in `shape` and `pw`). Aliasing is the only concern:
+The raw pulse step and the falling-edge BLEP correction have equal and
+opposite jumps, so their sum is continuous as `pw` moves. Zero gradients
+through the `lt`/`gt` gates are correct: gate boundaries either have a zero
+polynomial payload or have discontinuity terms that cancel in the complete
+pulse. The remaining `pw` gradient flows through
+`fallingPhase = wrap(phase − pw, 0, 1)` into the smooth quadratics, where
+DGen's existing `d wrap / d input = 1` adjoint is the required derivative
+almost everywhere.
 
-- At bass/pluck fundamentals (30–200 Hz) at the analysis rate, aliased images
-  of audible harmonics are weak and mostly above the loss's useful band.
-- **Fallback if aliasing biases the fit** (E1 will tell): evaluate the same
-  waveforms additively during training — closed-form harmonic weights
-  (saw: 1/n; pulse: sin(πn·pw)/n), same scalar params, gradients for free,
-  zero aliasing. This changes the training renderer only; deployment stays
-  polyblep. This fallback is rule-legal (parametric family, no free
-  per-harmonic coefficients — the shape/pw scalars generate the weights).
+This claim remains subject to E0 fdcheck. If it fails, the rule-legal fallback
+is additive evaluation with closed-form harmonic weights (saw: `1/n`; pulse:
+`sin(πn·pw)/n`) and the same scalar controls.
 
 ## Voice topology (profile: `subtractive-bass`)
 
@@ -148,12 +148,64 @@ stops the ladder and files the finding.
    per-frame. This is the one gradient path *never* exercised by any previous
    rung (the kick's noiseCutoff was constant). fdcheck fBase, fAmt, fDecay
    through the full voice at the real window config.
-2. Naive-osc params: shape, pw through the STFT loss.
+2. PolyBLEP oscillator params: shape, pw through the STFT loss.
 3. res, and re-confirm constant cutoff (regression check on bbb3769).
 
 **Gate**: relative error < 1e-2 on every trained param (same bar as the
-hoodie-bass fdchecks). A failure here is a library bug to fix first, not a
-tuning problem.
+hoodie-bass fdchecks), evaluated under a smooth probe objective: multi-window
+log-magnitude L2 with the same Hann windows, hops, weights, and log epsilon as
+training. This changes only the production loss's intentional binwise L1 kink;
+the complete `log(magnitude(STFT(x)) + epsilon)` adjoint remains exercised.
+Use the following fixed epsilon-convergence protocol in transformed parameter
+space:
+
+1. Sweep `fdEpsilon` over
+   `[1e-4, 1.5e-4, 2e-4, 3e-4, 5e-4, 1e-3, 2e-3, 3e-3, 5e-3, 1e-2, 3e-2, 1e-1]`.
+2. A parameter passes only if two adjacent epsilon values both have relative
+   error < 1e-2 and their finite-difference gradients agree with each other to
+   < 1e-2 relative error.
+3. Use the first passing adjacent pair in ascending epsilon order. Do not add,
+   remove, or retune epsilon values after seeing a parameter's result.
+4. A parameter fails if no adjacent pair passes. Stop E0 at that parameter;
+   later parameters and experiments remain unrun.
+
+The transformed-coordinate sweep remains the gate for filter parameters. For
+waveform-composition parameters (`shape`, `pw`), an actual-voice isolation on
+2026-07-12 established that it is not a valid numerical instrument: the
+independent float64 objective has enough local curvature that `1e-4` is already
+outside its linear neighborhood, while smaller float32 loss differences are
+cancellation-limited. The waveform-parameter gate is therefore frozen as the
+mathematically equivalent chain-rule decomposition:
+
+1. Full-voice time-domain MSE fdcheck must satisfy the same fixed-grid,
+   adjacent-pair, and `1e-2` criteria. This checks `d(signal)/d(param)`.
+2. Render the actual centered voice tangent in transformed coordinates with
+   fixed `directionEpsilon=1e-4`, then check the smooth spectral objective on
+   `x + alpha*v`. Full-voice Metal autograd, directional Metal autograd, and an
+   independent NumPy float64 analytic directional derivative must agree pairwise
+   to relative error `< 1e-2`.
+3. The NumPy float64 central differences at `1e-6` and `2e-6` must each agree
+   with its analytic derivative and with each other to `< 1e-2`.
+
+This changes the measurement, not the error bar. For `pw`, PolyBLEP's
+piecewise-polynomial derivative can have kinks near the transition width
+`dt = f0/sampleRate`; failure of either chain-rule component is still a hard
+stop and cannot be excused by proximity to `dt`.
+
+The production log-L1 loss is separately swept along `shape` to document its
+local slope breaks, but that intentionally non-smooth objective is supporting
+evidence rather than the fdcheck gate. The smooth-probe protocol is frozen for
+E0; a failure under it is a library bug to fix first, not a tuning problem.
+
+> **2026-07-12 protocol correction:** an actual-voice directional isolation and
+> independent float64 reference showed that the `shape` adjoint is correct and
+> the end-to-end float32 central difference is ill-conditioned. The chain-rule
+> gate above replaces that instrument once for both waveform parameters. See
+> `E0_FINDING.md` for the signed residual and reference tables.
+>
+> **Final E0 result: PASS.** `fBase`, `fAmt`, `fDecay`, `shape`, `pw`, `res`,
+> and the bbb3769 constant-cutoff regression all pass their authoritative
+> `< 1e-2` checks. No training run was performed and E1 was not started.
 
 ### E1 — Rung 1 self-inversion (synthetic, days)
 

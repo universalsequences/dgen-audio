@@ -828,7 +828,8 @@ extension LazyOp {
       return node.inputs.map { _ in nil }
 
     case .spectralLossFFT(
-      let windowSize, let hop, _, let useLogMagnitude, let lossMode, let windowCell,
+      let windowSize, let hop, _, let useLogMagnitude, let useSmoothLogMagnitude, let lossMode,
+      let windowCell,
       let fft1Cell, let fft2Cell, let mag1Cell, let mag2Cell, _):
       // FFT-based spectral loss backward pass using O(N log N) IFFT
       // Reads the forward pass's per-frame FFT/magnitude cells directly,
@@ -861,6 +862,7 @@ extension LazyOp {
           windowSize: windowSize,
           hop: hop,
           useLogMagnitude: useLogMagnitude,
+          useSmoothLogMagnitude: useSmoothLogMagnitude,
           lossMode: lossMode,
           fft1Cell: fft1Cell,
           fft2Cell: fft2Cell,
@@ -913,7 +915,7 @@ extension LazyOp {
       for _ in 2..<node.inputs.count { result.append(nil) }
       return result
 
-    case .spectralLossFFTGradSpec(_, _, _, _, _, _, _, _, _, _):
+    case .spectralLossFFTGradSpec(_, _, _, _, _, _, _, _, _, _, _):
       // Gradient ops don't need their own gradients
       return node.inputs.map { _ in nil }
 

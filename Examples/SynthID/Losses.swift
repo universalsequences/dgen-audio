@@ -3,6 +3,30 @@ import DGenLazy
 import Foundation
 
 enum SynthIDLosses {
+  /// Smooth E0 probe: keep the production log-magnitude path and real windows,
+  /// changing only the intentional binwise L1 kink to L2.
+  static func fdcheckLogMagnitudeL2Loss(
+    synth: Signal,
+    target: Signal,
+    config: SynthIDConfig
+  ) -> Signal {
+    var total = Signal.constant(0.0)
+    for (index, window) in config.spectralWindows.enumerated() {
+      let weight = index < config.windowWeights.count ? config.windowWeights[index] : 1.0
+      total = total + spectralLossFFT(
+        synth,
+        target,
+        windowSize: window,
+        useHannWindow: config.useHannWindow,
+        useLogMagnitude: true,
+        useSmoothLogMagnitude: true,
+        lossMode: .l2,
+        hop: max(1, window / 4),
+        normalize: true) * weight
+    }
+    return total
+  }
+
   static func multiResolutionSpectralLoss(
     synth: Signal,
     target: Signal,

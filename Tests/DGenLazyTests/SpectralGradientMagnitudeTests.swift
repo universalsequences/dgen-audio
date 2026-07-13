@@ -1,3 +1,4 @@
+import DGen
 import XCTest
 
 @testable import DGenLazy
@@ -14,18 +15,21 @@ final class SpectralGradientMagnitudeTests: XCTestCase {
   private var savedSampleRate: Float = 0
   private var savedMaxFrameCount: Int = 0
   private var savedBackend = DGenConfig.backend
+  private var savedLogMagnitudeEpsilon: Float = 0
 
   override func setUp() {
     super.setUp()
     savedSampleRate = DGenConfig.sampleRate
     savedMaxFrameCount = DGenConfig.maxFrameCount
     savedBackend = DGenConfig.backend
+    savedLogMagnitudeEpsilon = DGenSpectralConfig.logMagnitudeEpsilon
   }
 
   override func tearDown() {
     DGenConfig.sampleRate = savedSampleRate
     DGenConfig.maxFrameCount = savedMaxFrameCount
     DGenConfig.backend = savedBackend
+    DGenSpectralConfig.logMagnitudeEpsilon = savedLogMagnitudeEpsilon
     super.tearDown()
   }
 
@@ -40,6 +44,7 @@ final class SpectralGradientMagnitudeTests: XCTestCase {
   private enum LossKind {
     case spectralLinear
     case spectralLogL1Hop
+    case spectralSmoothLogL2
     case mse
   }
 
@@ -54,6 +59,11 @@ final class SpectralGradientMagnitudeTests: XCTestCase {
       return spectralLossFFT(
         student, teacher, windowSize: windowSize,
         useLogMagnitude: true, lossMode: .l1, hop: windowSize / 4, normalize: true)
+    case .spectralSmoothLogL2:
+      return spectralLossFFT(
+        student, teacher, windowSize: windowSize,
+        useLogMagnitude: true, useSmoothLogMagnitude: true,
+        lossMode: .l2, hop: windowSize / 4, normalize: true)
     case .mse:
       let diff = student - teacher
       return diff * diff
@@ -105,6 +115,12 @@ final class SpectralGradientMagnitudeTests: XCTestCase {
     // L1 |.| kinks make FD slightly noisier; allow a looser tolerance.
     try assertMagnitudeAgreement(
       kind: .spectralLogL1Hop, tolerance: 0.05, "spectral-log-l1-hop16-norm")
+  }
+
+  func testSpectralSmoothLogL2GradMagnitude() throws {
+    DGenSpectralConfig.logMagnitudeEpsilon = 1e-3
+    try assertMagnitudeAgreement(
+      kind: .spectralSmoothLogL2, tolerance: 0.02, "spectral-smooth-log-l2-hop16-norm")
   }
 
   func testSpectralGradMagnitudeAcrossWindowSizes() throws {

@@ -874,6 +874,7 @@ extension SignalTensor {
 ///   - windowSize: FFT window size (must be power of 2)
 ///   - useHannWindow: Whether to apply Hann window before FFT (default: true)
 ///   - useLogMagnitude: Compare log-magnitudes `log(|X|+eps)` instead of magnitudes (default: false)
+///   - useSmoothLogMagnitude: Use `0.5*log(re²+im²+eps²)` (requires log magnitude)
 ///   - lossMode: `l2` for squared difference, `l1` for absolute difference
 ///   - hop: Compute spectral terms every `hop` frames (default: 1)
 /// - Returns: Scalar loss signal (per frame)
@@ -883,6 +884,7 @@ public func spectralLossFFT(
   windowSize: Int,
   useHannWindow: Bool = true,
   useLogMagnitude: Bool = false,
+  useSmoothLogMagnitude: Bool = false,
   lossMode: SpectralLossMode = .l2,
   hop: Int = 1,
   normalize: Bool = false
@@ -893,6 +895,7 @@ public func spectralLossFFT(
     windowSize: windowSize,
     useHannWindow: useHannWindow,
     useLogMagnitude: useLogMagnitude,
+    useSmoothLogMagnitude: useSmoothLogMagnitude,
     lossMode: lossMode,
     hop: hop
   )

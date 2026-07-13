@@ -6,6 +6,9 @@ enum KickVoice {
     if config.profile == "hoodie-bass" {
       return BassVoice.build(params: params.bassSignals, config: config)
     }
+    if config.profile == "subtractive-bass" {
+      return SubtractiveBassVoice.build(params: params.subtractiveBassSignals, config: config)
+    }
     return build(params: params.signals, config: config)
   }
 
@@ -109,6 +112,70 @@ enum KickVoice {
   static func renderToWav(values: PatchValues, config: SynthIDConfig, out: URL) throws {
     let samples = try render(values: values, config: config)
     try AudioFile.save(url: out, samples: samples, sampleRate: config.sampleRate)
+  }
+}
+
+enum SubtractiveBassVoice {
+  private static func polyblep(_ phase: Signal, frequency: Signal, sampleRate: Signal) -> Signal {
+    let dt = (frequency / sampleRate).clip(0.000001, 0.5)
+    let leftX = phase / dt
+    let left = 2.0 * leftX - leftX * leftX - 1.0
+    let rightX = (phase - 1.0) / dt
+    let right = rightX * rightX + 2.0 * rightX + 1.0
+    return (phase < dt) * left + (phase > (1.0 - dt)) * right
+  }
+
+  private static func polyblepSaw(
+    _ phase: Signal, frequency: Signal, sampleRate: Signal
+  ) -> Signal {
+    (phase * 2.0 - 1.0) - polyblep(phase, frequency: frequency, sampleRate: sampleRate)
+  }
+
+  private static func polyblepPulse(
+    _ phase: Signal, width: Signal, frequency: Signal, sampleRate: Signal
+  ) -> Signal {
+    let clippedWidth = width.clip(0.01, 0.99)
+    let fallingPhase = mod(phase - clippedWidth, 1.0)
+    let rawPulse = (phase < clippedWidth) * 2.0 - 1.0
+    return rawPulse
+      + polyblep(phase, frequency: frequency, sampleRate: sampleRate)
+      - polyblep(fallingPhase, frequency: frequency, sampleRate: sampleRate)
+  }
+
+  static func build(params: SubtractiveBassVoiceSignals, config: SynthIDConfig) -> Signal {
+    let sr = Signal.constant(config.sampleRate)
+    let t = Signal.accum(
+      Signal.constant(1.0) / sr,
+      reset: 0.0,
+      min: 0.0,
+      max: Float(config.frames + 1) / config.sampleRate + 1.0)
+
+    // E0 freezes f0 and the VCA/output controls so only the new oscillator and
+    // time-varying-filter paths participate in the prerequisite checks.
+    let frequency = Signal.constant(110.0)
+    let phase = Signal.statefulPhasor(frequency)
+    let saw = polyblepSaw(phase, frequency: frequency, sampleRate: sr)
+    let pulse = polyblepPulse(
+      phase, width: params.pw, frequency: frequency, sampleRate: sr)
+    let oscillator = (1.0 - params.shape) * saw + params.shape * pulse
+
+    let cutoff = params.fBase + params.fAmt * DGenLazy.exp(-t / params.fDecay)
+    // Reuse the existing diagnostic filter bypass so fdcheck failures can be
+    // isolated to the oscillator/STFT path versus the biquad input adjoint.
+    let filtered = config.enableNoiseFilter
+      ? oscillator.biquad(
+        cutoff: cutoff,
+        resonance: params.res,
+        gain: Signal.constant(1.0),
+        mode: Signal.constant(0.0))
+      : oscillator
+
+    let attack = 1.0 - DGenLazy.exp(-t / 0.005)
+    let decay = 0.7 + 0.3 * DGenLazy.exp(-t / 0.2)
+    let release = 1.0 / (1.0 + DGenLazy.exp((t - 0.6) / 0.08))
+    let driven = filtered * attack * decay * release
+    let shaped = driven / (1.0 + DGenLazy.abs(driven))
+    return shaped * 0.5
   }
 }
 

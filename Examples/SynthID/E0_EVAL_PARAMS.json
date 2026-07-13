@@ -1,0 +1,21 @@
+{
+  "ampDecay": -7,
+  "bodyAmp": 0.75,
+  "clickAmp": 0.2,
+  "clickDecay": -400,
+  "clickFreq": 1400,
+  "drive": 1.5,
+  "fEnd": 45,
+  "fStart": 120,
+  "noiseAmp": 0.08,
+  "noiseCutoff": 2800,
+  "noiseDecay": -140,
+  "outGain": 0.7,
+  "pitchDecay": -35,
+  "shape": 0.35,
+  "pw": 0.6,
+  "fBase": 350,
+  "fAmt": 2500,
+  "fDecay": 0.08,
+  "res": 1.2
+}

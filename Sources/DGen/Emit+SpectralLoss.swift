@@ -4,7 +4,7 @@ extension LazyOp {
   func emitSpectralLoss(b: IRBuilder, ctx: IRContext, g: Graph, node: Node, inputs: [Lazy]) throws {
     switch self {
     case .spectralLossFFT(
-      let windowSize, let hop, _, let useLogMagnitude, let lossMode, _,
+      let windowSize, let hop, _, let useLogMagnitude, let useSmoothLogMagnitude, let lossMode, _,
       let fft1Cell, let fft2Cell, let mag1Cell, let mag2Cell, _):
       // FFT-based spectral loss: forward pass (SIMD-parallel across frames)
       // Uses threadgroup shared memory for butterfly stages (~25-50x faster than device).
@@ -158,7 +158,10 @@ extension LazyOp {
             let kInt = b.cast(k, to: .int)
             let re = b.scratchRead(scratchRe, kInt)
             let im = b.scratchRead(scratchIm, kInt)
-            let mag = b.sqrt(re * re + im * im)
+            let power = re * re + im * im
+            let mag = useSmoothLogMagnitude
+              ? b.sqrt(power + logEps * logEps)
+              : b.sqrt(power)
             _ = b.memoryWrite(magCell, magBaseOffset + kInt, mag)
           }
         }
@@ -172,10 +175,14 @@ extension LazyOp {
           let kInt = b.cast(k, to: .int)
           let mag1 = b.memoryRead(mag1Cell, magBaseOffset + kInt)
           let mag2 = b.memoryRead(mag2Cell, magBaseOffset + kInt)
-          let diff =
-            useLogMagnitude
-            ? (b.log(mag1 + logEps) - b.log(mag2 + logEps))
-            : (mag1 - mag2)
+          let diff: Expr
+          if useSmoothLogMagnitude {
+            diff = b.log(mag1) - b.log(mag2)
+          } else if useLogMagnitude {
+            diff = b.log(mag1 + logEps) - b.log(mag2 + logEps)
+          } else {
+            diff = mag1 - mag2
+          }
           if lossMode == .l1 {
             loss.accumulate(b.abs(diff))
           } else {
@@ -187,8 +194,8 @@ extension LazyOp {
       b.use(val: loss.value)
 
     case .spectralLossFFTGradSpec(
-      let windowSize, let hop, let useLogMagnitude, let lossMode, let fft1Cell, let fft2Cell,
-      let mag1Cell, let mag2Cell, let gradSpec1Cell, let gradSpec2Cell):
+      let windowSize, let hop, let useLogMagnitude, let useSmoothLogMagnitude, let lossMode,
+      let fft1Cell, let fft2Cell, let mag1Cell, let mag2Cell, let gradSpec1Cell, let gradSpec2Cell):
       // Compute gradient w.r.t. complex spectrum (hop-window-aware)
       // Reads from forward pass's per-hop-window FFT/magnitude cells
       // ∂L/∂X.real = ∂L/∂mag * (real / mag)
@@ -235,9 +242,11 @@ extension LazyOp {
           let gradMag1: Expr
           let gradMag2: Expr
           if useLogMagnitude {
-            let logDiff = b.log(mag1 + logEps) - b.log(mag2 + logEps)
-            let invLogDenom1 = b.constant(1.0) / (mag1 + logEps)
-            let invLogDenom2 = b.constant(1.0) / (mag2 + logEps)
+            let logDenom1 = useSmoothLogMagnitude ? mag1 : (mag1 + logEps)
+            let logDenom2 = useSmoothLogMagnitude ? mag2 : (mag2 + logEps)
+            let logDiff = b.log(logDenom1) - b.log(logDenom2)
+            let invLogDenom1 = b.constant(1.0) / logDenom1
+            let invLogDenom2 = b.constant(1.0) / logDenom2
             let logScale =
               lossMode == .l1
               ? b.sign(logDiff)
@@ -255,8 +264,8 @@ extension LazyOp {
           }
 
           // Handle division by zero with epsilon
-          let safeMag1 = b.max(mag1, eps)
-          let safeMag2 = b.max(mag2, eps)
+          let safeMag1 = useSmoothLogMagnitude ? mag1 : b.max(mag1, eps)
+          let safeMag2 = useSmoothLogMagnitude ? mag2 : b.max(mag2, eps)
 
           // ∂L/∂X = gradMag * (X / |X|) = gradMag * (real/mag, imag/mag)
           let gradReal1 = gradMag1 * real1 / safeMag1

@@ -21,6 +21,8 @@ enum SynthIDCLI {
       try rung1(options: parsed)
     case "probe":
       try probe(options: parsed)
+    case "loss-sweep":
+      try lossSweep(options: parsed)
     case "rung2":
       try rung2(options: parsed)
     case "rung3":
@@ -69,6 +71,20 @@ enum SynthIDCLI {
       sampleRate: config.sampleRate)
 
     if let paramName = options["fdcheck"] {
+      if config.fdcheckDirectional == true {
+        guard let trueParams else {
+          throw SynthIDError.message("directional fdcheck requires --params <point.json>")
+        }
+        let result = try SynthIDTrainer(config: config).directionalFDCheck(
+          paramName: paramName,
+          targetSamples: samples,
+          initial: trueParams,
+          outDir: outDir)
+        print(
+          "directional-fdcheck param=\(result.paramName) fd=\(String(format: "%.6e", result.finiteDifferenceGrad)) directionalAutograd=\(String(format: "%.6e", result.directionalAutogradGrad)) fullVoiceAutograd=\(String(format: "%.6e", result.fullVoiceAutogradGrad)) relErr=\(String(format: "%.6e", result.relativeError)) chainRuleRelErr=\(String(format: "%.6e", result.chainRuleRelativeError))"
+        )
+        return
+      }
       let result = try SynthIDTrainer(config: config).fdcheck(
         paramName: paramName,
         targetSamples: samples,
@@ -232,6 +248,45 @@ enum SynthIDCLI {
       )
     }
     print("loss(tensor, synth)   = \(tensorSynth)")
+  }
+
+  private static func lossSweep(options: [String: String]) throws {
+    guard
+      let targetPath = options["target"],
+      let paramsPath = options["params"],
+      let paramName = options["param"],
+      let outPath = options["out"]
+    else {
+      throw SynthIDError.message(
+        "loss-sweep requires --target, --params, --param, and --out")
+    }
+    var config = try loadConfig(url: options["config"].map { URL(fileURLWithPath: $0) })
+    try config.applyCLI(options)
+    config.applyRuntime()
+    guard let spec = KickParamSpecs.byName[paramName] else {
+      throw SynthIDError.message("unknown loss-sweep parameter \(paramName)")
+    }
+    let radius = try options["radius"].map { try parseFloat($0, "--radius") } ?? 5e-4
+    let points = try options["points"].map { try parseInt($0, "--points") } ?? 201
+    guard points >= 3 else { throw SynthIDError.message("loss-sweep --points must be >= 3") }
+
+    let (samples, _) = try AudioFile.load(url: URL(fileURLWithPath: targetPath))
+    let center = try loadPatchValues(from: URL(fileURLWithPath: paramsPath))
+    let centerZ = spec.transform(center[paramName])
+    let trainer = SynthIDTrainer(config: config)
+    var csv = "delta,transformedValue,naturalValue,loss\n"
+    for index in 0..<points {
+      let fraction = Float(index) / Float(points - 1)
+      let delta = -radius + 2.0 * radius * fraction
+      var values = center
+      values[paramName] = spec.inverse(centerZ + delta)
+      let loss = try trainer.evaluateLoss(values: values, targetSamples: samples)
+      csv += "\(delta),\(centerZ + delta),\(values[paramName]),\(loss)\n"
+    }
+    let out = URL(fileURLWithPath: outPath)
+    try ensureDirectory(out.deletingLastPathComponent())
+    try csv.write(to: out, atomically: true, encoding: .utf8)
+    print("wrote=\(out.path) points=\(points) radius=\(radius)")
   }
 
   private static func rung2(options: [String: String]) throws {
@@ -875,7 +930,8 @@ enum SynthIDCLI {
       let key = String(arg.dropFirst(2))
       let flags: Set<String> = [
         "freeze-pitch", "no-linear-mag", "no-noise-filter", "allow-fail", "no-lr-decay",
-        "verify-only", "prepare-only",
+        "verify-only", "prepare-only", "fdcheck-log-l2", "fdcheck-time-mse",
+        "fdcheck-directional",
       ]
       if flags.contains(key) {
         options[key] = "true"
@@ -907,6 +963,7 @@ enum SynthIDCLI {
       swift run SynthID render --params <json> --out <wav> [--frames N]
       swift run SynthID train  --target <wav> --out <dir> [--rung 1|2|3] [--params <truth.json>]
       swift run SynthID train  --target <wav> --out <dir> --fdcheck <param> [--params <point.json>]
+      swift run SynthID loss-sweep --target <wav> --params <json> --param <name> --out <csv>
       swift run SynthID rung1  --seed <N> --out <dir> [--epochs N] [--restarts N]
       swift run SynthID rung2  --out <dir> [--seeds 1,2,3,4,5] [--verify-only]
       swift run SynthID rung2  --target <wav-from-numpy> --params <json> --out <dir> [--verify-only]
@@ -914,8 +971,10 @@ enum SynthIDCLI {
 
       Common flags: --frames N --windows a,b,c --no-linear-mag --linear-mag-weight W
                     --pitch-lr LR --amp-lr LR --decay-lr LR --tone-lr LR --noise-lr LR
-                    --no-noise-filter --fd-eps EPS --backend metal|cpu
-                    --profile 808|909 (kick voice parameter table; default 808)
+                    --no-noise-filter --fd-eps EPS --fdcheck-log-l2 --fdcheck-time-mse
+                    --fdcheck-directional --direction-eps EPS
+                    --backend metal|cpu
+                    --profile 808|909|hoodie-bass|subtractive-bass
       Rung 2 flags: --renderer <render_reference.py> --python <python3>
       Rung 3 flags: --onset-threshold-db DB --compare-script <compare.py> --python <python3>
                     --refine-script <refine_rung3.py> --score-script <score_params.py>

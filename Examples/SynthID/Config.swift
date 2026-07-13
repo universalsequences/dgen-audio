@@ -39,6 +39,10 @@ struct SynthIDConfig: Codable {
   var checkpointEvery: Int = 50
   var gradClip: Float = 1.0
   var fdEpsilon: Float = 1e-2
+  var fdcheckLogMagnitudeL2: Bool? = nil
+  var fdcheckTimeMSE: Bool? = nil
+  var fdcheckDirectional: Bool? = nil
+  var directionEpsilon: Float = 1e-4
 
   // Spec §5 values. All pitch params are log-reparameterized, so pitchLR is a
   // relative step size; 1e-3 x 400 epochs allows up to ~40% travel when needed.
@@ -73,6 +77,9 @@ struct SynthIDConfig: Codable {
     if let value = options["rung"] { rung = try parseInt(value, "--rung") }
     if let value = options["grad-clip"] { gradClip = try parseFloat(value, "--grad-clip") }
     if let value = options["fd-eps"] { fdEpsilon = try parseFloat(value, "--fd-eps") }
+    if let value = options["direction-eps"] {
+      directionEpsilon = try parseFloat(value, "--direction-eps")
+    }
     if let value = options["linear-mag-weight"] {
       linearMagnitudeWeight = try parseFloat(value, "--linear-mag-weight")
     }
@@ -94,6 +101,9 @@ struct SynthIDConfig: Codable {
     if options.keys.contains("no-lr-decay") { cosineLRDecay = false }
     if options.keys.contains("no-linear-mag") { includeLinearMagnitude = false }
     if options.keys.contains("no-noise-filter") { enableNoiseFilter = false }
+    if options.keys.contains("fdcheck-log-l2") { fdcheckLogMagnitudeL2 = true }
+    if options.keys.contains("fdcheck-time-mse") { fdcheckTimeMSE = true }
+    if options.keys.contains("fdcheck-directional") { fdcheckDirectional = true }
     if let value = options["backend"] {
       switch value {
       case "metal": DGenConfig.backend = .metal
@@ -102,8 +112,9 @@ struct SynthIDConfig: Codable {
       }
     }
     if let value = options["profile"] {
-      guard ["808", "909", "hoodie-bass"].contains(value) else {
-        throw SynthIDError.message("unknown --profile \(value); expected 808, 909, or hoodie-bass")
+      guard ["808", "909", "hoodie-bass", "subtractive-bass"].contains(value) else {
+        throw SynthIDError.message(
+          "unknown --profile \(value); expected 808, 909, hoodie-bass, or subtractive-bass")
       }
       profile = value
       if value == "hoodie-bass" {

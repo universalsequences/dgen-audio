@@ -4,6 +4,7 @@ import Foundation
 enum Reparameterization: String, Codable {
   case raw
   case log
+  case logOnePlus = "log(1+x)"
   case logNegative = "log(-x)"
 }
 
@@ -21,6 +22,8 @@ struct ParameterSpec: Codable {
       return natural
     case .log:
       return Foundation.log(Swift.max(natural, 1e-20))
+    case .logOnePlus:
+      return Foundation.log1p(Swift.max(natural, 0))
     case .logNegative:
       return Foundation.log(Swift.max(-natural, 1e-20))
     }
@@ -32,6 +35,8 @@ struct ParameterSpec: Codable {
       return transformed
     case .log:
       return Foundation.exp(transformed)
+    case .logOnePlus:
+      return Foundation.expm1(transformed)
     case .logNegative:
       return -Foundation.exp(transformed)
     }
@@ -49,6 +54,8 @@ struct ParameterSpec: Codable {
       return (min + max) * 0.5
     case .log:
       return Foundation.exp((Foundation.log(min) + Foundation.log(max)) * 0.5)
+    case .logOnePlus:
+      return Foundation.expm1((Foundation.log1p(min) + Foundation.log1p(max)) * 0.5)
     case .logNegative:
       let lo = Foundation.log(-min)
       let hi = Foundation.log(-max)
@@ -196,10 +203,22 @@ enum KickParamSpecs {
     .init(name: $0.name, unit: "lin", min: -2.0, max: 2.0, reparam: .raw, tolerance: 0.20)
   }
 
+  // E0-only subtractive voice surface. Pitch, VCA, drive, and gain remain
+  // fixed until the filter/oscillator gradient prerequisites have passed.
+  static let subtractiveBass: [ParameterSpec] = [
+    .init(name: "shape", unit: "lin", min: 0, max: 1, reparam: .raw, tolerance: 0.01),
+    .init(name: "pw", unit: "lin", min: 0.03, max: 0.97, reparam: .raw, tolerance: 0.01),
+    .init(name: "fBase", unit: "Hz", min: 30, max: 8000, reparam: .log, tolerance: 0.01),
+    .init(name: "fAmt", unit: "Hz", min: 0, max: 12000, reparam: .logOnePlus, tolerance: 0.01),
+    .init(name: "fDecay", unit: "s", min: 0.005, max: 2, reparam: .log, tolerance: 0.01),
+    .init(name: "res", unit: "Q", min: 0.5, max: 6, reparam: .log, tolerance: 0.01),
+  ]
+
   static var all: [ParameterSpec] {
     switch activeProfile {
     case "909": return tr909
     case "hoodie-bass": return hoodieBass
+    case "subtractive-bass": return subtractiveBass
     default: return tr808
     }
   }
@@ -234,6 +253,12 @@ struct PatchValues: Codable, Equatable {
   var noteOff: Float
   var releaseTime: Float
   var brightnessDecay: Float
+  var shape: Float
+  var pw: Float
+  var fBase: Float
+  var fAmt: Float
+  var fDecay: Float
+  var res: Float
 
   private enum CodingKeys: String, CodingKey {
     case fStart, fEnd, pitchDecay, bodyAmp, ampDecay
@@ -241,6 +266,7 @@ struct PatchValues: Codable, Equatable {
     case noiseCutoff, noiseAmp, noiseDecay
     case drive, outGain, bodyAsymmetry, bodyHarmonic, ampCurve, harmonicCorrections
     case f0, attackTime, decayTime, sustain, noteOff, releaseTime, brightnessDecay
+    case shape, pw, fBase, fAmt, fDecay, res
   }
 
   init(from decoder: Decoder) throws {
@@ -269,7 +295,13 @@ struct PatchValues: Codable, Equatable {
       sustain: try values.decodeIfPresent(Float.self, forKey: .sustain) ?? 0.8,
       noteOff: try values.decodeIfPresent(Float.self, forKey: .noteOff) ?? 1.55,
       releaseTime: try values.decodeIfPresent(Float.self, forKey: .releaseTime) ?? 0.08,
-      brightnessDecay: try values.decodeIfPresent(Float.self, forKey: .brightnessDecay) ?? 1.0)
+      brightnessDecay: try values.decodeIfPresent(Float.self, forKey: .brightnessDecay) ?? 1.0,
+      shape: try values.decodeIfPresent(Float.self, forKey: .shape) ?? 0.5,
+      pw: try values.decodeIfPresent(Float.self, forKey: .pw) ?? 0.5,
+      fBase: try values.decodeIfPresent(Float.self, forKey: .fBase) ?? 490,
+      fAmt: try values.decodeIfPresent(Float.self, forKey: .fAmt) ?? 108.55,
+      fDecay: try values.decodeIfPresent(Float.self, forKey: .fDecay) ?? 0.1,
+      res: try values.decodeIfPresent(Float.self, forKey: .res) ?? 1.73)
   }
 
   static var midpoint: PatchValues {
@@ -332,7 +364,13 @@ struct PatchValues: Codable, Equatable {
     sustain: Float = 0.8,
     noteOff: Float = 1.55,
     releaseTime: Float = 0.08,
-    brightnessDecay: Float = 1.0
+    brightnessDecay: Float = 1.0,
+    shape: Float = 0.5,
+    pw: Float = 0.5,
+    fBase: Float = 490,
+    fAmt: Float = 108.55,
+    fDecay: Float = 0.1,
+    res: Float = 1.73
   ) {
     self.fStart = fStart
     self.fEnd = fEnd
@@ -358,6 +396,12 @@ struct PatchValues: Codable, Equatable {
     self.noteOff = noteOff
     self.releaseTime = releaseTime
     self.brightnessDecay = brightnessDecay
+    self.shape = shape
+    self.pw = pw
+    self.fBase = fBase
+    self.fAmt = fAmt
+    self.fDecay = fDecay
+    self.res = res
   }
 
   init(_ dictionary: [String: Float]) {
@@ -389,7 +433,13 @@ struct PatchValues: Codable, Equatable {
       sustain: dictionary["sustain"] ?? 0.8,
       noteOff: dictionary["noteOff"] ?? 1.55,
       releaseTime: dictionary["releaseTime"] ?? 0.08,
-      brightnessDecay: dictionary["brightnessDecay"] ?? 1.0)
+      brightnessDecay: dictionary["brightnessDecay"] ?? 1.0,
+      shape: dictionary["shape"] ?? 0.5,
+      pw: dictionary["pw"] ?? 0.5,
+      fBase: dictionary["fBase"] ?? 490,
+      fAmt: dictionary["fAmt"] ?? 108.55,
+      fDecay: dictionary["fDecay"] ?? 0.1,
+      res: dictionary["res"] ?? 1.73)
   }
 
   subscript(name: String) -> Float {
@@ -418,6 +468,12 @@ struct PatchValues: Codable, Equatable {
       case "noteOff": return noteOff
       case "releaseTime": return releaseTime
       case "brightnessDecay": return brightnessDecay
+      case "shape": return shape
+      case "pw": return pw
+      case "fBase": return fBase
+      case "fAmt": return fAmt
+      case "fDecay": return fDecay
+      case "res": return res
       default: return harmonicCorrections[name] ?? .nan
       }
     }
@@ -446,6 +502,12 @@ struct PatchValues: Codable, Equatable {
       case "noteOff": noteOff = newValue
       case "releaseTime": releaseTime = newValue
       case "brightnessDecay": brightnessDecay = newValue
+      case "shape": shape = newValue
+      case "pw": pw = newValue
+      case "fBase": fBase = newValue
+      case "fAmt": fAmt = newValue
+      case "fDecay": fDecay = newValue
+      case "res": res = newValue
       default:
         if (KickParamSpecs.tr909HarmonicCorrections + KickParamSpecs.hoodieBassHarmonics)
           .contains(where: { $0.name == name }) {
@@ -535,6 +597,15 @@ struct BassVoiceSignals {
   var harmonics: [(spec: KickParamSpecs.HarmonicCorrection, coefficient: Signal)]
 }
 
+struct SubtractiveBassVoiceSignals {
+  var shape: Signal
+  var pw: Signal
+  var fBase: Signal
+  var fAmt: Signal
+  var fDecay: Signal
+  var res: Signal
+}
+
 final class TrainableKickParams {
   private var storage: [String: Signal] = [:]
   private var trainableNames = Set<String>()
@@ -601,6 +672,16 @@ final class TrainableKickParams {
       harmonics: KickParamSpecs.hoodieBassHarmonics.map { ($0, naturalSignal($0.name)) })
   }
 
+  var subtractiveBassSignals: SubtractiveBassVoiceSignals {
+    SubtractiveBassVoiceSignals(
+      shape: naturalSignal("shape"),
+      pw: naturalSignal("pw"),
+      fBase: naturalSignal("fBase"),
+      fAmt: naturalSignal("fAmt"),
+      fDecay: naturalSignal("fDecay"),
+      res: naturalSignal("res"))
+  }
+
   var transformedParams: [String: Signal] { storage }
 
   func trainableStorage(names: [String]) -> [Signal] {
@@ -647,6 +728,8 @@ final class TrainableKickParams {
       return raw
     case .log:
       return DGenLazy.exp(raw)
+    case .logOnePlus:
+      return DGenLazy.exp(raw) - 1.0
     case .logNegative:
       return -DGenLazy.exp(raw)
     }

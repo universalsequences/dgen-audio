@@ -34,6 +34,21 @@ struct FDCheckResult: Codable {
   var relativeError: Float
 }
 
+struct DirectionalFDCheckResult: Codable {
+  var paramName: String
+  var directionEpsilon: Float
+  var epsilon: Float
+  var baseLoss: Float
+  var lossMinus: Float
+  var lossPlus: Float
+  var finiteDifferenceGrad: Float
+  var directionalAutogradGrad: Float
+  var fullVoiceAutogradGrad: Float
+  var absoluteError: Float
+  var relativeError: Float
+  var chainRuleRelativeError: Float
+}
+
 final class SynthIDTrainer {
   let config: SynthIDConfig
 
@@ -292,15 +307,25 @@ final class SynthIDTrainer {
     plus[paramName] = spec.inverse(baseZ + eps)
     plus = plus.clamped()
 
-    let baseLoss = try lossFor(values: initial, targetSamples: targetSamples, config: resolvedConfig)
-    let lossMinus = try lossFor(values: minus, targetSamples: targetSamples, config: resolvedConfig)
-    let lossPlus = try lossFor(values: plus, targetSamples: targetSamples, config: resolvedConfig)
+    let smoothProbe = resolvedConfig.fdcheckLogMagnitudeL2 == true
+    let timeProbe = resolvedConfig.fdcheckTimeMSE == true
+    let baseLoss = try lossFor(
+      values: initial, targetSamples: targetSamples, config: resolvedConfig,
+      smoothProbe: smoothProbe, timeProbe: timeProbe)
+    let lossMinus = try lossFor(
+      values: minus, targetSamples: targetSamples, config: resolvedConfig,
+      smoothProbe: smoothProbe, timeProbe: timeProbe)
+    let lossPlus = try lossFor(
+      values: plus, targetSamples: targetSamples, config: resolvedConfig,
+      smoothProbe: smoothProbe, timeProbe: timeProbe)
     let fdGrad = (lossPlus - lossMinus) / (2.0 * eps)
     let autograd = try autogradGradient(
       paramName: paramName,
       values: initial,
       targetSamples: targetSamples,
-      config: resolvedConfig)
+      config: resolvedConfig,
+      smoothProbe: smoothProbe,
+      timeProbe: timeProbe)
     let absErr = abs(fdGrad - autograd)
     let relErr = absErr / max(abs(fdGrad), abs(autograd), 1e-12)
     let result = FDCheckResult(
@@ -320,6 +345,115 @@ final class SynthIDTrainer {
       try writeJSON(result, to: outDir.appendingPathComponent("fdcheck_\(paramName).json"))
     }
     return result
+  }
+
+  /// Isolate the spectral-loss input adjoint along the actual rendered voice's
+  /// parameter tangent. The synth is used only to render x and
+  /// v = d(x)/d(z); the checked graph is x + alpha*v -> spectral loss.
+  func directionalFDCheck(
+    paramName: String,
+    targetSamples rawTargetSamples: [Float],
+    initial: PatchValues,
+    outDir: URL? = nil
+  ) throws -> DirectionalFDCheckResult {
+    let resolvedConfig = config
+    resolvedConfig.applyRuntime()
+    guard resolvedConfig.fdcheckLogMagnitudeL2 == true else {
+      throw SynthIDError.message("directional fdcheck requires --fdcheck-log-l2")
+    }
+    guard let spec = KickParamSpecs.byName[paramName] else {
+      throw SynthIDError.message("unknown fdcheck parameter \(paramName)")
+    }
+
+    let targetSamples = fitOrPad(
+      peakNormalized(rawTargetSamples, peak: resolvedConfig.peakNormalizeTo),
+      frames: resolvedConfig.frames)
+    let baseZ = spec.transform(initial[paramName])
+    let directionEps = resolvedConfig.directionEpsilon
+    guard directionEps > 0 else {
+      throw SynthIDError.message("--direction-eps must be positive")
+    }
+
+    var directionMinus = initial
+    directionMinus[paramName] = spec.inverse(baseZ - directionEps)
+    directionMinus = directionMinus.clamped()
+    var directionPlus = initial
+    directionPlus[paramName] = spec.inverse(baseZ + directionEps)
+    directionPlus = directionPlus.clamped()
+
+    let baseSignal = try KickVoice.render(values: initial, config: resolvedConfig)
+    let minusSignal = try KickVoice.render(values: directionMinus, config: resolvedConfig)
+    let plusSignal = try KickVoice.render(values: directionPlus, config: resolvedConfig)
+    let tangent = zip(plusSignal, minusSignal).map { ($0 - $1) / (2 * directionEps) }
+
+    func directionalLoss(alphaValue: Float, backward: Bool) throws -> (Float, Float?) {
+      // Tensor-after-reset is essential: these three tensor node IDs must
+      // belong to the graph that consumes them.
+      LazyGraphContext.reset()
+      let baseTensor = Tensor(baseSignal)
+      let tangentTensor = Tensor(tangent)
+      let targetTensor = Tensor(targetSamples)
+      let alpha = Signal.param(alphaValue)
+      let student = baseTensor.toSignal(maxFrames: resolvedConfig.frames)
+        + tangentTensor.toSignal(maxFrames: resolvedConfig.frames) * alpha
+      let target = targetTensor.toSignal(maxFrames: resolvedConfig.frames)
+      let loss = SynthIDLosses.fdcheckLogMagnitudeL2Loss(
+        synth: student, target: target, config: resolvedConfig)
+      if backward {
+        let value = try loss.backward(frames: resolvedConfig.frames).reduce(0, +)
+        return (value, alpha.grad?.data)
+      }
+      return (try loss.realize(frames: resolvedConfig.frames).reduce(0, +), nil)
+    }
+
+    let eps = resolvedConfig.fdEpsilon
+    let (baseLoss, directionalAutograd) = try directionalLoss(alphaValue: 0, backward: true)
+    guard let directionalAutograd else {
+      throw SynthIDError.message("directional fdcheck could not read alpha gradient")
+    }
+    let (lossMinus, _) = try directionalLoss(alphaValue: -eps, backward: false)
+    let (lossPlus, _) = try directionalLoss(alphaValue: eps, backward: false)
+    let fdGrad = (lossPlus - lossMinus) / (2 * eps)
+    let fullVoiceAutograd = try autogradGradient(
+      paramName: paramName,
+      values: initial,
+      targetSamples: targetSamples,
+      config: resolvedConfig,
+      smoothProbe: true)
+    let absErr = abs(fdGrad - directionalAutograd)
+    let relErr = absErr / max(abs(fdGrad), abs(directionalAutograd), 1e-12)
+    let chainRuleRelErr = abs(directionalAutograd - fullVoiceAutograd)
+      / max(abs(directionalAutograd), abs(fullVoiceAutograd), 1e-12)
+    let result = DirectionalFDCheckResult(
+      paramName: paramName,
+      directionEpsilon: directionEps,
+      epsilon: eps,
+      baseLoss: baseLoss,
+      lossMinus: lossMinus,
+      lossPlus: lossPlus,
+      finiteDifferenceGrad: fdGrad,
+      directionalAutogradGrad: directionalAutograd,
+      fullVoiceAutogradGrad: fullVoiceAutograd,
+      absoluteError: absErr,
+      relativeError: relErr,
+      chainRuleRelativeError: chainRuleRelErr)
+
+    if let outDir {
+      try ensureDirectory(outDir)
+      try writeJSON(
+        result, to: outDir.appendingPathComponent("directional_fdcheck_\(paramName).json"))
+      try writeFloat32(baseSignal, to: outDir.appendingPathComponent("base_signal.f32"))
+      try writeFloat32(tangent, to: outDir.appendingPathComponent("\(paramName)_tangent.f32"))
+      try writeFloat32(targetSamples, to: outDir.appendingPathComponent("target_signal.f32"))
+    }
+    return result
+  }
+
+  private func writeFloat32(_ values: [Float], to url: URL) throws {
+    let data = values.withUnsafeBufferPointer { buffer in
+      Data(bytes: buffer.baseAddress!, count: buffer.count * MemoryLayout<Float>.stride)
+    }
+    try data.write(to: url, options: .atomic)
   }
 
   // Internal (not private) so `recoverTarget` in main.swift can rebuild the
@@ -442,32 +576,49 @@ final class SynthIDTrainer {
     return try lossFor(values: values, targetSamples: targetSamples, config: resolvedConfig)
   }
 
-  private func lossFor(values: PatchValues, targetSamples: [Float], config: SynthIDConfig) throws
+  private func lossFor(
+    values: PatchValues,
+    targetSamples: [Float],
+    config: SynthIDConfig,
+    smoothProbe: Bool = false,
+    timeProbe: Bool = false
+  ) throws
     -> Float
   {
     LazyGraphContext.reset()
     let targetTensor = Tensor(targetSamples)
     let params = TrainableKickParams(initial: values, trainable: true, freezePitch: false)
-    let loss = SynthIDLosses.multiResolutionSpectralLoss(
-      synth: KickVoice.build(params: params, config: config),
-      target: targetTensor.toSignal(maxFrames: config.frames),
-      config: config)
-    return try loss.backward(frames: config.frames).reduce(0, +)
+    let synth = KickVoice.build(params: params, config: config)
+    let target = targetTensor.toSignal(maxFrames: config.frames)
+    let loss = timeProbe
+      ? mse(synth, target)
+      : (smoothProbe
+        ? SynthIDLosses.fdcheckLogMagnitudeL2Loss(synth: synth, target: target, config: config)
+        : SynthIDLosses.multiResolutionSpectralLoss(synth: synth, target: target, config: config))
+    // Finite-difference/evaluation loss reads must be forward-only. Running
+    // backward here adds gradient side effects to the supposedly independent
+    // numerical measurement and can perturb memory scheduling/allocation.
+    return try loss.realize(frames: config.frames).reduce(0, +)
   }
 
   private func autogradGradient(
     paramName: String,
     values: PatchValues,
     targetSamples: [Float],
-    config: SynthIDConfig
+    config: SynthIDConfig,
+    smoothProbe: Bool = false,
+    timeProbe: Bool = false
   ) throws -> Float {
     LazyGraphContext.reset()
     let targetTensor = Tensor(targetSamples)
     let params = TrainableKickParams(initial: values, trainable: true, freezePitch: false)
-    let loss = SynthIDLosses.multiResolutionSpectralLoss(
-      synth: KickVoice.build(params: params, config: config),
-      target: targetTensor.toSignal(maxFrames: config.frames),
-      config: config)
+    let synth = KickVoice.build(params: params, config: config)
+    let target = targetTensor.toSignal(maxFrames: config.frames)
+    let loss = timeProbe
+      ? mse(synth, target)
+      : (smoothProbe
+        ? SynthIDLosses.fdcheckLogMagnitudeL2Loss(synth: synth, target: target, config: config)
+        : SynthIDLosses.multiResolutionSpectralLoss(synth: synth, target: target, config: config))
     _ = try loss.backward(frames: config.frames)
     guard let grad = params.transformedParams[paramName]?.grad?.data else {
       throw SynthIDError.message("fdcheck could not read autograd gradient for \(paramName)")

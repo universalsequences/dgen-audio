@@ -52,6 +52,7 @@ extension Graph {
     windowSize: Int,
     useHannWindow: Bool = true,
     useLogMagnitude: Bool = false,
+    useSmoothLogMagnitude: Bool = false,
     lossMode: SpectralLossMode = .l2,
     hop: Int = 1
   ) -> NodeID {
@@ -59,6 +60,9 @@ extension Graph {
       windowSize > 0 && (windowSize & (windowSize - 1)) == 0,
       "windowSize must be a power of 2")
     precondition(hop >= 1, "hop must be >= 1")
+    precondition(
+      !useSmoothLogMagnitude || useLogMagnitude,
+      "useSmoothLogMagnitude requires useLogMagnitude")
 
     let numBins = windowSize / 2 + 1
     let numStages = Int(log2(Double(windowSize)))
@@ -133,6 +137,7 @@ extension Graph {
         hop: hop,
         useHann: useHannWindow,
         useLogMagnitude: useLogMagnitude,
+        useSmoothLogMagnitude: useSmoothLogMagnitude,
         lossMode: lossMode,
         windowCell: windowCell,
         fft1Cell: fft1Cell,
