@@ -32,6 +32,9 @@ enum SynthIDLosses {
     target: Signal,
     config: SynthIDConfig
   ) -> Signal {
+    if config.useSmoothTrainingLoss {
+      return fdcheckLogMagnitudeL2Loss(synth: synth, target: target, config: config)
+    }
     var total = Signal.constant(0.0)
     for (index, window) in config.spectralWindows.enumerated() {
       let weight =

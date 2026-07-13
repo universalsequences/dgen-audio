@@ -49,6 +49,19 @@ struct DirectionalFDCheckResult: Codable {
   var chainRuleRelativeError: Float
 }
 
+struct CoordinateSearchStep: Codable {
+  var pass: Int
+  var parameter: String
+  var naturalValue: Float
+  var loss: Float
+}
+
+struct CoordinateSearchResult: Codable {
+  var params: PatchValues
+  var loss: Float
+  var steps: [CoordinateSearchStep]
+}
+
 final class SynthIDTrainer {
   let config: SynthIDConfig
 
@@ -73,7 +86,9 @@ final class SynthIDTrainer {
       resolvedConfig.profile == "909" ? .tr909 : .tr808
     let pitchPoints = PitchTrack.extract(samples: targetSamples, sampleRate: resolvedConfig.sampleRate)
     let pitchFit: PitchFit
-    if resolvedConfig.profile == "hoodie-bass" {
+    if resolvedConfig.profile == "subtractive-bass" {
+      pitchFit = PitchFit(fStart: 110, fEnd: 110, pitchDecay: -1, error: nil)
+    } else if resolvedConfig.profile == "hoodie-bass" {
       let steady = PitchTrack.extract(
         samples: targetSamples,
         sampleRate: resolvedConfig.sampleRate,
@@ -88,8 +103,21 @@ final class SynthIDTrainer {
       pitchFit = PitchTrack.fit(
         samples: targetSamples, sampleRate: resolvedConfig.sampleRate, profile: pitchSearchProfile)
     }
-    let initial =
+    var initial =
       initialOverride ?? restartInitial(pitchFit: pitchFit, restartIndex: restartIndex)
+
+    if resolvedConfig.useSmoothBasinSearch {
+      guard resolvedConfig.useSmoothTrainingLoss else {
+        throw SynthIDError.message("--smooth-basin-search requires --smooth-training-loss")
+      }
+      let searched = try smoothCoordinateSearch(initial: initial, targetSamples: targetSamples)
+      initial = searched.params
+      if let outDir {
+        try ensureDirectory(outDir)
+        try writeJSON(searched, to: outDir.appendingPathComponent("smooth_basin_search.json"))
+      }
+      print("  smooth basin: loss=\(String(format: "%.6f", searched.loss))")
+    }
 
     LazyGraphContext.reset()
     let targetTensor = Tensor(targetSamples)
@@ -97,37 +125,51 @@ final class SynthIDTrainer {
       initial: initial,
       trainable: true,
       freezePitch: resolvedConfig.freezePitch,
-      freezeBodyAsymmetry: resolvedConfig.rung != 3)
+      freezeBodyAsymmetry: resolvedConfig.rung != 3,
+      frozenNames: Set(resolvedConfig.frozenParams))
 
     let isBass = resolvedConfig.profile == "hoodie-bass"
+    let isSubtractive = resolvedConfig.profile == "subtractive-bass"
     let pitchOpt = Adam(
-      params: params.trainableStorage(names: isBass ? ["f0"] : ["fStart", "fEnd", "pitchDecay"]),
+      params: params.trainableStorage(
+        names: isSubtractive ? [] : (isBass ? ["f0"] : ["fStart", "fEnd", "pitchDecay"])),
       lr: resolvedConfig.pitchLR)
     let harmonicNames = resolvedConfig.profile == "909"
       ? KickParamSpecs.tr909HarmonicCorrections.map(\.name)
       : (isBass ? KickParamSpecs.hoodieBassHarmonics.map(\.name) : [])
     let ampOpt = Adam(
       params: params.trainableStorage(
-        names: (isBass ? ["sustain", "outGain"]
-          : ["bodyAmp", "clickAmp", "outGain", "bodyAsymmetry", "bodyHarmonic"])
+        names: (isSubtractive ? ["sustain", "outGain"]
+          : (isBass ? ["sustain", "outGain"]
+            : ["bodyAmp", "clickAmp", "outGain", "bodyAsymmetry", "bodyHarmonic"]))
           + harmonicNames),
-      lr: resolvedConfig.ampLR)
+      lr: isSubtractive ? resolvedConfig.ampLR * 0.1 : resolvedConfig.ampLR)
     let decayOpt = Adam(
-      params: params.trainableStorage(names: isBass
-        ? ["attackTime", "decayTime", "noteOff", "releaseTime", "brightnessDecay"]
-        : ["ampDecay", "clickDecay", "noiseDecay", "ampCurve"]),
-      lr: resolvedConfig.decayLR)
+      params: params.trainableStorage(names: isSubtractive
+        ? ["attackTime", "decayTime", "releaseTime", "fDecay"]
+        : (isBass
+          ? ["attackTime", "decayTime", "noteOff", "releaseTime", "brightnessDecay"]
+          : ["ampDecay", "clickDecay", "noiseDecay", "ampCurve"])),
+      lr: isSubtractive ? resolvedConfig.decayLR / 3.0 : resolvedConfig.decayLR)
     let noiseOpt = Adam(
-      params: params.trainableStorage(names: ["noiseAmp"]),
+      params: params.trainableStorage(names: isSubtractive ? [] : ["noiseAmp"]),
       lr: resolvedConfig.noiseLR)
-    var toneNames = isBass ? ["drive"] : ["clickFreq", "drive"]
-    if resolvedConfig.enableNoiseFilter && !isBass {
+    var toneNames = isSubtractive
+      ? ["fBase", "fAmt", "res", "drive"]
+      : (isBass ? ["drive"] : ["clickFreq", "drive"])
+    if resolvedConfig.enableNoiseFilter && !isBass && !isSubtractive {
       toneNames.append("noiseCutoff")
     }
     let toneOpt = Adam(
       params: params.trainableStorage(names: toneNames),
       lr: resolvedConfig.toneLR)
-    let optimizers = [pitchOpt, ampOpt, decayOpt, noiseOpt, toneOpt]
+    // Raw oscillator mix/width gradients are much larger than transformed
+    // filter gradients. A dedicated slower group prevents pw/shape from
+    // sprinting to a compensating bound before the filter basin settles.
+    let oscillatorOpt = Adam(
+      params: params.trainableStorage(names: isSubtractive ? ["shape", "pw"] : []),
+      lr: resolvedConfig.toneLR * 0.1)
+    let optimizers = [pitchOpt, ampOpt, decayOpt, noiseOpt, toneOpt, oscillatorOpt]
     let baseLRs = optimizers.map(\.lr)
 
     func buildTarget() -> Signal {
@@ -461,6 +503,37 @@ final class SynthIDTrainer {
   // restart's own cold start actually won selection (rung 3 FIX 1).
   func restartInitial(pitchFit: PitchFit, restartIndex: Int) -> PatchValues {
     var values = PatchValues.midpoint.withPitch(pitchFit)
+    if config.profile == "subtractive-bass" {
+      func set(_ name: String, _ fraction: Float) {
+        guard let spec = KickParamSpecs.byName[name] else { return }
+        let bounds = spec.transformedBounds
+        values[name] = spec.inverse(bounds.min + fraction * (bounds.max - bounds.min))
+      }
+      let templates: [[String: Float]] = [
+        [:],
+        ["shape": 0.30, "pw": 0.35, "fBase": 0.35, "fAmt": 0.65,
+         "fDecay": 0.35, "res": 0.35, "attackTime": 0.35, "decayTime": 0.35,
+         "sustain": 0.65, "releaseTime": 0.35, "drive": 0.40, "outGain": 0.60],
+        ["shape": 0.70, "pw": 0.65, "fBase": 0.80, "fAmt": 0.45,
+         "fDecay": 0.65, "res": 0.65, "attackTime": 0.65, "decayTime": 0.65,
+         "sustain": 0.35, "releaseTime": 0.65, "drive": 0.60, "outGain": 0.40],
+        ["shape": 0.65, "pw": 0.25, "fBase": 0.60, "fAmt": 0.75,
+         "fDecay": 0.25, "res": 0.70, "attackTime": 0.25, "decayTime": 0.70,
+         "sustain": 0.55, "releaseTime": 0.30, "drive": 0.70, "outGain": 0.45],
+      ]
+      if restartIndex < templates.count {
+        for (name, fraction) in templates[restartIndex] { set(name, fraction) }
+      } else {
+        var rng = SplitMix64(seed: config.seed &+ UInt64(10_000 + restartIndex * 997))
+        for spec in KickParamSpecs.all {
+          let bounds = spec.transformedBounds
+          let fraction = rng.uniform(0.15, 0.85)
+          values[spec.name] = spec.inverse(
+            bounds.min + fraction * (bounds.max - bounds.min))
+        }
+      }
+      return values.clamped()
+    }
     if config.profile == "hoodie-bass" {
       let brightnessScales: [Float] = [1.0, 0.55, 1.65, 1.0]
       let attackScales: [Float] = [1.0, 0.6, 1.5, 1.0]
@@ -574,6 +647,74 @@ final class SynthIDTrainer {
       peakNormalized(rawTargetSamples, peak: resolvedConfig.peakNormalizeTo),
       frames: resolvedConfig.frames)
     return try lossFor(values: values, targetSamples: targetSamples, config: resolvedConfig)
+  }
+
+  /// Target-independent coordinate basin search for the smooth E1 objective.
+  /// The first pass covers each declared transformed bound; the second
+  /// re-scans a local neighborhood. It is deliberately derivative-free so it
+  /// can place sparse moving-edge controls in the right basin before Adam.
+  func smoothCoordinateSearch(
+    initial: PatchValues,
+    targetSamples: [Float]
+  ) throws -> CoordinateSearchResult {
+    precondition(config.useSmoothTrainingLoss)
+    let orderedNames = [
+      "shape", "pw", "fBase", "fAmt", "fDecay", "res",
+      "attackTime", "decayTime", "sustain", "releaseTime", "drive", "outGain",
+    ]
+    var best = initial.clamped()
+    var bestLoss = try evaluateLoss(values: best, targetSamples: targetSamples)
+    var trace: [CoordinateSearchStep] = []
+
+    for pass in 0..<2 {
+      for name in orderedNames {
+        guard let spec = KickParamSpecs.byName[name] else { continue }
+        let bounds = spec.transformedBounds
+        let span = bounds.max - bounds.min
+        let inset = span * 0.001
+        let center = spec.transform(best[name])
+        let radius = pass == 0 ? span : span * 0.06
+        let lower = pass == 0
+          ? bounds.min + inset
+          : max(bounds.min + inset, center - radius)
+        let upper = pass == 0
+          ? bounds.max - inset
+          : min(bounds.max - inset, center + radius)
+        let points: Int
+        if name == "pw" {
+          points = pass == 0 ? 257 : 129
+        } else if name == "shape" {
+          points = pass == 0 ? 65 : 49
+        } else {
+          points = pass == 0 ? 33 : 25
+        }
+
+        var parameterBest = best
+        var parameterLoss = bestLoss
+        for index in 0..<points {
+          let fraction = Float(index) / Float(max(1, points - 1))
+          var candidate = best
+          candidate[name] = spec.inverse(lower + (upper - lower) * fraction)
+          let loss = try evaluateLoss(values: candidate, targetSamples: targetSamples)
+          if loss < parameterLoss {
+            parameterBest = candidate
+            parameterLoss = loss
+          }
+        }
+        best = parameterBest
+        bestLoss = parameterLoss
+        trace.append(
+          CoordinateSearchStep(
+            pass: pass,
+            parameter: name,
+            naturalValue: best[name],
+            loss: bestLoss))
+        print(
+          "  basin pass=\(pass) \(name)=\(String(format: "%.6g", best[name]))"
+            + " loss=\(String(format: "%.6f", bestLoss))")
+      }
+    }
+    return CoordinateSearchResult(params: best, loss: bestLoss, steps: trace)
   }
 
   private func lossFor(

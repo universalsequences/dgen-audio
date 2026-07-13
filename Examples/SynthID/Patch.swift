@@ -150,8 +150,8 @@ enum SubtractiveBassVoice {
       min: 0.0,
       max: Float(config.frames + 1) / config.sampleRate + 1.0)
 
-    // E0 freezes f0 and the VCA/output controls so only the new oscillator and
-    // time-varying-filter paths participate in the prerequisite checks.
+    // f0 and note-off remain fixed for the first subtractive topology; E1
+    // trains the complete oscillator/filter/VCA/output patch sheet.
     let frequency = Signal.constant(110.0)
     let phase = Signal.statefulPhasor(frequency)
     let saw = polyblepSaw(phase, frequency: frequency, sampleRate: sr)
@@ -170,12 +170,13 @@ enum SubtractiveBassVoice {
         mode: Signal.constant(0.0))
       : oscillator
 
-    let attack = 1.0 - DGenLazy.exp(-t / 0.005)
-    let decay = 0.7 + 0.3 * DGenLazy.exp(-t / 0.2)
-    let release = 1.0 / (1.0 + DGenLazy.exp((t - 0.6) / 0.08))
-    let driven = filtered * attack * decay * release
+    let attack = 1.0 - DGenLazy.exp(-t / params.attackTime)
+    let decay = params.sustain
+      + (1.0 - params.sustain) * DGenLazy.exp(-t / params.decayTime)
+    let release = 1.0 / (1.0 + DGenLazy.exp((t - 0.6) / params.releaseTime))
+    let driven = filtered * attack * decay * release * params.drive
     let shaped = driven / (1.0 + DGenLazy.abs(driven))
-    return shaped * 0.5
+    return shaped * params.outGain
   }
 }
 

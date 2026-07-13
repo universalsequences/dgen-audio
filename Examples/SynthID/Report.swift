@@ -55,6 +55,61 @@ enum ReportWriter {
     var rows: [RecoveryRow] = []
     var equivalences: [EquivalenceRow] = []
     if let trueParams {
+      if KickParamSpecs.activeProfile == "subtractive-bass" {
+        func amplitudeEnvelope(_ values: PatchValues, at time: Float) -> Float {
+          let attack = 1 - Foundation.exp(-time / values.attackTime)
+          let decay = values.sustain
+            + (1 - values.sustain) * Foundation.exp(-time / values.decayTime)
+          let release = 1 / (1 + Foundation.exp((time - 0.6) / values.releaseTime))
+          return attack * decay * release
+        }
+        func effectiveOutputEnvelope(_ values: PatchValues, at time: Float) -> Float {
+          amplitudeEnvelope(values, at: time) * values.drive * values.outGain
+        }
+        func envelopeRatio(_ values: PatchValues, numerator: Float, denominator: Float) -> Float {
+          amplitudeEnvelope(values, at: numerator)
+            / max(amplitudeEnvelope(values, at: denominator), 1e-12)
+        }
+        rows = [
+          makeRow(
+            name: "fEnv(0)", unit: "Hz",
+            trueValue: trueParams.fBase + trueParams.fAmt,
+            recoveredValue: recovered.fBase + recovered.fAmt, tolerance: 0.10),
+          makeRow(
+            name: "fEnv(infinity)", unit: "Hz", trueValue: trueParams.fBase,
+            recoveredValue: recovered.fBase, tolerance: 0.10),
+          makeRow(
+            name: "res", unit: "Q", trueValue: trueParams.res,
+            recoveredValue: recovered.res, tolerance: 0.10),
+          makeRow(
+            name: "effective output envelope (10ms)", unit: "lin",
+            trueValue: effectiveOutputEnvelope(trueParams, at: 0.01),
+            recoveredValue: effectiveOutputEnvelope(recovered, at: 0.01), tolerance: 0.10),
+          makeRow(
+            name: "effective output envelope (300ms)", unit: "lin",
+            trueValue: effectiveOutputEnvelope(trueParams, at: 0.3),
+            recoveredValue: effectiveOutputEnvelope(recovered, at: 0.3), tolerance: 0.10),
+          makeRow(
+            name: "effective output envelope (700ms)", unit: "lin",
+            trueValue: effectiveOutputEnvelope(trueParams, at: 0.7),
+            recoveredValue: effectiveOutputEnvelope(recovered, at: 0.7), tolerance: 0.10),
+          makeRow(
+            name: "aEnv(300ms)/aEnv(10ms)", unit: "ratio",
+            trueValue: envelopeRatio(trueParams, numerator: 0.3, denominator: 0.01),
+            recoveredValue: envelopeRatio(recovered, numerator: 0.3, denominator: 0.01),
+            tolerance: 0.10),
+          makeRow(
+            name: "aEnv(700ms)/aEnv(300ms)", unit: "ratio",
+            trueValue: envelopeRatio(trueParams, numerator: 0.7, denominator: 0.3),
+            recoveredValue: envelopeRatio(recovered, numerator: 0.7, denominator: 0.3),
+            tolerance: 0.10),
+        ]
+        equivalences = KickParamSpecs.all.map { spec in
+          makeEquivalence(
+            name: "\(spec.name) (unscored knob)",
+            trueValue: trueParams[spec.name], recoveredValue: recovered[spec.name])
+        }
+      } else {
       rows = KickParamSpecs.all.filter { spec in
         (includeNoiseCutoff || spec.name != "noiseCutoff") && !degenerate.contains(spec.name)
       }.map { spec in
@@ -87,6 +142,7 @@ enum ReportWriter {
           name: "bodyAsymmetry (Rung 3 extension; unscored)",
           trueValue: trueParams.bodyAsymmetry,
           recoveredValue: recovered.bodyAsymmetry))
+      }
     }
 
     let floor = max(0, min(irreducibleLossFloor, initLoss))
@@ -166,11 +222,19 @@ enum ReportWriter {
       }
       return text
     }
-    text +=
-      "Note: `tanh((bodyAmp·body + clickAmp·click + noiseAmp·noise)·drive)·outGain` "
-      + "depends only on the products `amp·drive` and `outGain`; parameter sets with equal "
-      + "products render identical audio. The products are scored; the factors are listed "
-      + "unscored under Effective Gain Products.\n\n"
+    if KickParamSpecs.activeProfile == "subtractive-bass" {
+      text +=
+        "Note: the subtractive topology is scored on its declared invariants: filter-EG "
+        + "endpoints, resonance, effective output-envelope levels, and scale-free envelope "
+        + "ratios. "
+        + "Individual knobs along compensating ridges are diagnostic only.\n\n"
+    } else {
+      text +=
+        "Note: `tanh((bodyAmp·body + clickAmp·click + noiseAmp·noise)·drive)·outGain` "
+        + "depends only on the products `amp·drive` and on `outGain`; parameter sets with equal "
+        + "products render identical audio. The products are scored; the factors are listed "
+        + "unscored under Effective Gain Products.\n\n"
+    }
     text += "| Parameter | True | Recovered | Abs err | Rel err | Tol | Pass |\n"
     text += "| --- | ---: | ---: | ---: | ---: | ---: | --- |\n"
     for row in report.rows {

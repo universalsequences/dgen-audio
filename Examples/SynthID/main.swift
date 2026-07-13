@@ -17,6 +17,8 @@ enum SynthIDCLI {
       try render(options: parsed)
     case "train":
       try train(options: parsed)
+    case "score":
+      try score(options: parsed)
     case "rung1":
       try rung1(options: parsed)
     case "probe":
@@ -65,6 +67,9 @@ enum SynthIDCLI {
       print("warning: target sampleRate=\(sampleRate) config sampleRate=\(config.sampleRate); no resampling is applied")
     }
     let trueParams = try options["params"].map { try loadPatchValues(from: URL(fileURLWithPath: $0)) }
+    let initialOverride = try options["initial-params"].map {
+      try loadPatchValues(from: URL(fileURLWithPath: $0))
+    }
     try AudioFile.save(
       url: outDir.appendingPathComponent("target.wav"),
       samples: fitOrPad(peakNormalized(samples, peak: config.peakNormalizeTo), frames: config.frames),
@@ -99,13 +104,60 @@ enum SynthIDCLI {
     let result = try SynthIDTrainer(config: config).train(
       targetSamples: samples,
       outDir: outDir,
-      trueParams: trueParams)
+      trueParams: trueParams,
+      initialOverride: initialOverride)
     _ = try renderLearnedAndReport(
       result: result,
       trueParams: trueParams,
       targetSamples: samples,
       config: config,
       outDir: outDir)
+  }
+
+  private static func score(options: [String: String]) throws {
+    guard
+      let targetPath = options["target"],
+      let recoveredPath = options["params"],
+      let truePath = options["true-params"],
+      let initialPath = options["initial-params"],
+      let outPath = options["out"]
+    else {
+      throw SynthIDError.message(
+        "score requires --target, --params, --true-params, --initial-params, and --out")
+    }
+    var config = try loadConfig(url: options["config"].map { URL(fileURLWithPath: $0) })
+    try config.applyCLI(options)
+    config.rung = 1
+    config.useSmoothTrainingLoss = false
+    config.useSmoothBasinSearch = false
+    config.applyRuntime()
+
+    let (samples, _) = try AudioFile.load(url: URL(fileURLWithPath: targetPath))
+    let recovered = try loadPatchValues(from: URL(fileURLWithPath: recoveredPath))
+    let trueParams = try loadPatchValues(from: URL(fileURLWithPath: truePath))
+    let initial = try loadPatchValues(from: URL(fileURLWithPath: initialPath))
+    let trainer = SynthIDTrainer(config: config)
+    let initLoss = try trainer.evaluateLoss(values: initial, targetSamples: samples)
+    let finalLoss = try trainer.evaluateLoss(values: recovered, targetSamples: samples)
+    let outDir = URL(fileURLWithPath: outPath)
+    try ensureDirectory(outDir)
+    let result = TrainingRunResult(
+      recovered: recovered,
+      initial: initial,
+      pitchFit: PitchFit(fStart: 110, fEnd: 110, pitchDecay: -1, error: nil),
+      initLoss: initLoss,
+      bestLoss: finalLoss,
+      bestEpoch: 0,
+      losses: [])
+    let report = try renderLearnedAndReport(
+      result: result,
+      trueParams: trueParams,
+      targetSamples: samples,
+      config: config,
+      outDir: outDir)
+    print(
+      "score pass=\(report.pass) loss=\(String(format: "%.6f", finalLoss))"
+        + " ratio=\(String(format: "%.6f", report.lossRatio))")
   }
 
   private static func rung1(options: [String: String]) throws {
@@ -157,7 +209,9 @@ enum SynthIDCLI {
         "seed=\(seed) pass=\(report.pass) lossRatio=\(String(format: "%.6f", report.lossRatio))")
     }
 
-    let requiredPasses = seeds.count >= 5 ? 4 : seeds.count
+    let requiredPasses = config.profile == "subtractive-bass"
+      ? seeds.count / 2 + 1
+      : (seeds.count >= 5 ? 4 : seeds.count)
     if passed < requiredPasses && !options.keys.contains("allow-fail") {
       throw SynthIDError.message(
         "rung1 failed: \(passed)/\(seeds.count) seeds passed; required \(requiredPasses)")
@@ -525,6 +579,7 @@ enum SynthIDCLI {
     if allResults.count > 1 {
       let trainer = SynthIDTrainer(config: config)
       let isBass = config.profile == "hoodie-bass"
+      let isSubtractive = config.profile == "subtractive-bass"
       var noiseSubspace = ["noiseAmp", "noiseDecay"]
       if config.enableNoiseFilter { noiseSubspace.append("noiseCutoff") }
       var ampSubspace = ["bodyAmp", "drive", "outGain"]
@@ -532,21 +587,26 @@ enum SynthIDCLI {
         ampSubspace.append("bodyHarmonic")
         ampSubspace.append(contentsOf: KickParamSpecs.tr909HarmonicCorrections.map(\.name))
       }
-      let subspaces: [[String]] = isBass
+      let subspaces: [[String]] = isSubtractive
         ? [
+          ["shape", "pw"],
+          ["fBase", "fAmt", "fDecay", "res"],
+          ["attackTime", "decayTime", "sustain", "releaseTime"],
+          ["drive", "outGain"],
+        ]
+        : (isBass ? [
           ["f0"],
           ["attackTime", "decayTime", "sustain", "noteOff", "releaseTime"],
           ["brightnessDecay"]
             + KickParamSpecs.hoodieBassHarmonics.filter { $0.decay > 0 }.map(\.name),
           ["drive", "outGain"]
             + KickParamSpecs.hoodieBassHarmonics.filter { $0.decay == 0 }.map(\.name),
-        ]
-        : [
+        ] : [
           ["clickFreq", "clickAmp", "clickDecay"],
           ["fStart", "fEnd", "pitchDecay"],
           noiseSubspace,
           ampSubspace,
-        ]
+        ])
       var stitched = result.recovered
       var stitchedLoss = try trainer.evaluateLoss(values: stitched, targetSamples: samples)
       var improved = false
@@ -566,7 +626,7 @@ enum SynthIDCLI {
       // The millisecond click has a rippled frequency landscape. A coarse
       // audio-loss-only search provides the same honest basin selection used by
       // multiple random restarts, then gradient descent performs local tuning.
-      if !isBass {
+      if !isBass && !isSubtractive {
         let clickFrequencySpec = KickParamSpecs.byName["clickFreq"]!
         let clickFrequencySteps = 24
         for index in 0...clickFrequencySteps {
@@ -610,6 +670,174 @@ enum SynthIDCLI {
           bestRestartDir = stitchDir
         }
       }
+    }
+
+    if config.profile == "subtractive-bass" {
+      let trainer = SynthIDTrainer(config: config)
+      let pwSpec = KickParamSpecs.byName["pw"]!
+      let transitionWidth = 110.0 / config.sampleRate
+      let searchStep = transitionWidth * 0.5
+
+      func searchPulseWidth(
+        around center: PatchValues,
+        radius: Float,
+        step: Float = searchStep
+      ) throws -> (params: PatchValues, loss: Float, atEdge: Bool, points: Int) {
+        let lower = max(pwSpec.min, center.pw - radius)
+        let upper = min(pwSpec.max, center.pw + radius)
+        let intervals = max(1, Int(Foundation.ceil((upper - lower) / step)))
+        var best = center
+        var bestLoss = try trainer.evaluateLoss(values: center, targetSamples: samples)
+        var bestIndex = -1
+        for index in 0...intervals {
+          var candidate = center
+          candidate.pw = lower + (upper - lower) * Float(index) / Float(intervals)
+          let loss = try trainer.evaluateLoss(values: candidate, targetSamples: samples)
+          if loss < bestLoss {
+            best = candidate
+            bestLoss = loss
+            bestIndex = index
+          }
+        }
+        let atEdge = bestIndex >= 0 && (bestIndex <= 1 || bestIndex >= intervals - 1)
+        return (best, bestLoss, atEdge, intervals + 1)
+      }
+
+      let beforeSearchLoss = try trainer.evaluateLoss(
+        values: result.recovered, targetSamples: samples)
+      var basin = try searchPulseWidth(around: result.recovered, radius: 0.12)
+      if basin.atEdge {
+        let fullRadius = max(
+          result.recovered.pw - pwSpec.min,
+          pwSpec.max - result.recovered.pw)
+        basin = try searchPulseWidth(around: result.recovered, radius: fullRadius)
+      }
+      print(
+          "  pw basin: start=\(String(format: "%.6f", result.recovered.pw))"
+            + " loss=\(String(format: "%.6f", beforeSearchLoss))"
+            + " best=\(String(format: "%.6f", basin.params.pw))"
+            + " loss=\(String(format: "%.6f", basin.loss)) points=\(basin.points)")
+      try writeJSON(
+        [
+          "startPw": result.recovered.pw,
+          "startLoss": beforeSearchLoss,
+          "bestPw": basin.params.pw,
+          "bestLoss": basin.loss,
+          "step": searchStep,
+        ],
+        to: outDir.appendingPathComponent("pw_basin_search_initial.json"))
+
+      var tuneConfig = config
+      tuneConfig.epochs = max(300, config.epochs / 2)
+      tuneConfig.restarts = 1
+      tuneConfig.frozenParams = Array(Set(config.frozenParams).union(["pw"]))
+      let tuneDir = outDir.appendingPathComponent("restart-pw-refine")
+      let tuned = try SynthIDTrainer(config: tuneConfig).train(
+        targetSamples: samples,
+        outDir: tuneDir,
+        trueParams: trueParams,
+        initialOverride: basin.params)
+
+      var smoothConfig = config
+      smoothConfig.epochs = max(600, config.epochs)
+      smoothConfig.restarts = 1
+      smoothConfig.frozenParams = config.frozenParams
+      smoothConfig.useSmoothTrainingLoss = true
+      let smoothDir = outDir.appendingPathComponent("restart-smooth-refine")
+      let smoothed = try SynthIDTrainer(config: smoothConfig).train(
+        targetSamples: samples,
+        outDir: smoothDir,
+        trueParams: trueParams,
+        initialOverride: tuned.recovered)
+
+      let smoothProductionLoss = try trainer.evaluateLoss(
+        values: smoothed.recovered, targetSamples: samples)
+      var chosenParams = smoothed.recovered
+      var chosenProductionLoss = smoothProductionLoss
+      var chosenSmoothLoss = smoothed.bestLoss
+      var chosenEpoch = smoothed.bestEpoch
+      var chosenDir = smoothDir
+      var refinementLosses = smoothed.losses
+
+      if smoothProductionLoss / max(result.initLoss, 1e-12) > 0.02 {
+        var rescueConfig = smoothConfig
+        rescueConfig.useSmoothBasinSearch = true
+        let rescueDir = outDir.appendingPathComponent("restart-smooth-basin-rescue")
+        let rescued = try SynthIDTrainer(config: rescueConfig).train(
+          targetSamples: samples,
+          outDir: rescueDir,
+          trueParams: trueParams,
+          initialOverride: smoothed.recovered)
+        let rescueProductionLoss = try trainer.evaluateLoss(
+          values: rescued.recovered, targetSamples: samples)
+        refinementLosses += rescued.losses
+        if rescueProductionLoss < chosenProductionLoss {
+          chosenParams = rescued.recovered
+          chosenProductionLoss = rescueProductionLoss
+          chosenSmoothLoss = rescued.bestLoss
+          chosenEpoch = rescued.bestEpoch
+          chosenDir = rescueDir
+        }
+
+        var settleConfig = smoothConfig
+        settleConfig.useSmoothBasinSearch = false
+        let settleDir = outDir.appendingPathComponent("restart-smooth-basin-settle")
+        let settled = try SynthIDTrainer(config: settleConfig).train(
+          targetSamples: samples,
+          outDir: settleDir,
+          trueParams: trueParams,
+          initialOverride: rescued.recovered)
+        let settleProductionLoss = try trainer.evaluateLoss(
+          values: settled.recovered, targetSamples: samples)
+        refinementLosses += settled.losses
+        if settleProductionLoss < chosenProductionLoss {
+          chosenParams = settled.recovered
+          chosenProductionLoss = settleProductionLoss
+          chosenSmoothLoss = settled.bestLoss
+          chosenEpoch = settled.bestEpoch
+          chosenDir = settleDir
+        }
+        print(
+          "  smooth rescue: first=\(String(format: "%.6f", rescueProductionLoss))"
+            + " settled=\(String(format: "%.6f", settleProductionLoss))"
+            + " chosen=\(String(format: "%.6f", chosenProductionLoss))")
+      }
+
+      let fineStep = transitionWidth / 16.0
+      let finalBasin = try searchPulseWidth(
+        around: chosenParams,
+        radius: transitionWidth * 2.0,
+        step: fineStep)
+      print(
+          "  smooth refine: smooth=\(String(format: "%.6f", smoothed.bestLoss))"
+            + " production=\(String(format: "%.6f", smoothProductionLoss))")
+      print(
+          "  pw final: step=\(String(format: "%.7f", fineStep))"
+            + " pw=\(String(format: "%.6f", finalBasin.params.pw))"
+            + " loss=\(String(format: "%.6f", finalBasin.loss))")
+      try writeJSON(
+        [
+          "smoothObjectiveLoss": chosenSmoothLoss,
+          "productionLossBeforeFinalPw": chosenProductionLoss,
+          "bestPw": finalBasin.params.pw,
+          "bestLoss": finalBasin.loss,
+          "step": fineStep,
+        ],
+        to: outDir.appendingPathComponent("pw_basin_search_final.json"))
+      try writeJSON(
+        finalBasin.params, to: chosenDir.appendingPathComponent("recovered_params.json"))
+      try updateCheckpointAfterRung3Refinement(
+        outDir: chosenDir, params: finalBasin.params, loss: finalBasin.loss)
+
+      result = TrainingRunResult(
+        recovered: finalBasin.params,
+        initial: result.initial,
+        pitchFit: result.pitchFit,
+        initLoss: result.initLoss,
+        bestLoss: finalBasin.loss,
+        bestEpoch: chosenEpoch,
+        losses: result.losses + tuned.losses + refinementLosses)
+      bestRestartDir = chosenDir
     }
 
     if let bestRestartDir {
@@ -931,7 +1159,7 @@ enum SynthIDCLI {
       let flags: Set<String> = [
         "freeze-pitch", "no-linear-mag", "no-noise-filter", "allow-fail", "no-lr-decay",
         "verify-only", "prepare-only", "fdcheck-log-l2", "fdcheck-time-mse",
-        "fdcheck-directional",
+        "fdcheck-directional", "smooth-training-loss", "smooth-basin-search",
       ]
       if flags.contains(key) {
         options[key] = "true"
@@ -962,6 +1190,9 @@ enum SynthIDCLI {
 
       swift run SynthID render --params <json> --out <wav> [--frames N]
       swift run SynthID train  --target <wav> --out <dir> [--rung 1|2|3] [--params <truth.json>]
+      swift run SynthID train  --target <wav> --out <dir> --initial-params <params.json>
+      swift run SynthID train  --target <wav> --out <dir> --smooth-training-loss
+      swift run SynthID score  --target <wav> --params <recovered.json> --true-params <truth.json> --initial-params <initial.json> --out <dir>
       swift run SynthID train  --target <wav> --out <dir> --fdcheck <param> [--params <point.json>]
       swift run SynthID loss-sweep --target <wav> --params <json> --param <name> --out <csv>
       swift run SynthID rung1  --seed <N> --out <dir> [--epochs N] [--restarts N]
@@ -972,6 +1203,7 @@ enum SynthIDCLI {
       Common flags: --frames N --windows a,b,c --no-linear-mag --linear-mag-weight W
                     --pitch-lr LR --amp-lr LR --decay-lr LR --tone-lr LR --noise-lr LR
                     --no-noise-filter --fd-eps EPS --fdcheck-log-l2 --fdcheck-time-mse
+                    --freeze-params a,b,c
                     --fdcheck-directional --direction-eps EPS
                     --backend metal|cpu
                     --profile 808|909|hoodie-bass|subtractive-bass

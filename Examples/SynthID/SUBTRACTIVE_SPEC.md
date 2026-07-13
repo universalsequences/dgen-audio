@@ -1,6 +1,6 @@
 # SynthID Subtractive Fitting Path — Spec & Experiment Plan
 
-**Status: proposal / to validate.** Nothing below has run yet.
+**Status: E0 and E1 validated.** E2 and later experiments remain unrun.
 
 ## Thesis
 
@@ -216,6 +216,14 @@ never init on bounds, deterministic restarts).
 
 **Gate**: rung-1 acceptance style — invariant products within 10%, audible
 match, majority of seeds.
+
+> **Final E1 result: PASS (3/5 seeds).** Passing production-loss ratios are
+> 0.601%, 0.326%, and 0.361%; the maximum scored invariant error among passing
+> seeds is 2.24% (gates: 2% and 10%). The final target-independent policy uses
+> production `pw` basin placement, smooth log-L2 refinement, and a gated smooth
+> coordinate-basin rescue while always scoring with the unchanged production
+> loss. The amplitude ridge is scored through effective output-envelope levels
+> and scale-free envelope ratios. See `E1_FINDING.md`. E2 was not started.
 
 ### E2 — Rung 2 independent renderer + polyblep equivalence (days)
 

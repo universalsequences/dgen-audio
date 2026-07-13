@@ -203,15 +203,22 @@ enum KickParamSpecs {
     .init(name: $0.name, unit: "lin", min: -2.0, max: 2.0, reparam: .raw, tolerance: 0.20)
   }
 
-  // E0-only subtractive voice surface. Pitch, VCA, drive, and gain remain
-  // fixed until the filter/oscillator gradient prerequisites have passed.
+  // Subtractive voice surface. E0 exercised the first six new oscillator and
+  // filter parameters; E1 adds the already-established smooth VCA/output
+  // controls for self-inversion of the complete deployment topology.
   static let subtractiveBass: [ParameterSpec] = [
-    .init(name: "shape", unit: "lin", min: 0, max: 1, reparam: .raw, tolerance: 0.01),
-    .init(name: "pw", unit: "lin", min: 0.03, max: 0.97, reparam: .raw, tolerance: 0.01),
-    .init(name: "fBase", unit: "Hz", min: 30, max: 8000, reparam: .log, tolerance: 0.01),
-    .init(name: "fAmt", unit: "Hz", min: 0, max: 12000, reparam: .logOnePlus, tolerance: 0.01),
-    .init(name: "fDecay", unit: "s", min: 0.005, max: 2, reparam: .log, tolerance: 0.01),
-    .init(name: "res", unit: "Q", min: 0.5, max: 6, reparam: .log, tolerance: 0.01),
+    .init(name: "shape", unit: "lin", min: 0, max: 1, reparam: .raw, tolerance: 0.10),
+    .init(name: "pw", unit: "lin", min: 0.03, max: 0.97, reparam: .raw, tolerance: 0.10),
+    .init(name: "fBase", unit: "Hz", min: 30, max: 8000, reparam: .log, tolerance: 0.10),
+    .init(name: "fAmt", unit: "Hz", min: 0, max: 12000, reparam: .logOnePlus, tolerance: 0.10),
+    .init(name: "fDecay", unit: "s", min: 0.005, max: 2, reparam: .log, tolerance: 0.10),
+    .init(name: "res", unit: "Q", min: 0.5, max: 6, reparam: .log, tolerance: 0.10),
+    .init(name: "attackTime", unit: "s", min: 0.001, max: 0.5, reparam: .log, tolerance: 0.10),
+    .init(name: "decayTime", unit: "s", min: 0.01, max: 2, reparam: .log, tolerance: 0.10),
+    .init(name: "sustain", unit: "lin", min: 0, max: 1, reparam: .raw, tolerance: 0.10),
+    .init(name: "releaseTime", unit: "s", min: 0.01, max: 1, reparam: .log, tolerance: 0.10),
+    .init(name: "drive", unit: "lin", min: 0.25, max: 8, reparam: .log, tolerance: 0.10),
+    .init(name: "outGain", unit: "lin", min: 0.05, max: 2, reparam: .log, tolerance: 0.10),
   ]
 
   static var all: [ParameterSpec] {
@@ -317,6 +324,9 @@ struct PatchValues: Codable, Equatable {
       values["h3s"] = 0.28
       values["h5s"] = 0.08
       values["h7s"] = 0.05
+      return PatchValues(values)
+    }
+    if KickParamSpecs.activeProfile == "subtractive-bass" {
       return PatchValues(values)
     }
     if KickParamSpecs.activeProfile == "909" {
@@ -544,6 +554,24 @@ struct PatchValues: Codable, Equatable {
   static func sample(seed: UInt64) -> PatchValues {
     var rng = SplitMix64(seed: seed)
     var values = [String: Float]()
+    if KickParamSpecs.activeProfile == "subtractive-bass" {
+      // Keep synthetic truths strictly inside every transformed bound. The
+      // shorter VCA ranges ensure the fixed 0.6 s note-off and its release are
+      // observable in E1's 32,768-frame render without narrowing deployment
+      // bounds or initializing an optimizer on a bound.
+      for spec in KickParamSpecs.all {
+        let bounds = spec.transformedBounds
+        let u = rng.uniform(0.15, 0.85)
+        values[spec.name] = spec.inverse(bounds.min + u * (bounds.max - bounds.min))
+      }
+      values["attackTime"] = Foundation.exp(rng.uniform(Foundation.log(0.003), Foundation.log(0.05)))
+      values["decayTime"] = Foundation.exp(rng.uniform(Foundation.log(0.05), Foundation.log(0.5)))
+      values["sustain"] = rng.uniform(0.3, 0.9)
+      values["releaseTime"] = Foundation.exp(rng.uniform(Foundation.log(0.02), Foundation.log(0.15)))
+      values["drive"] = Foundation.exp(rng.uniform(Foundation.log(0.7), Foundation.log(4.0)))
+      values["outGain"] = rng.uniform(0.3, 0.8)
+      return PatchValues(values)
+    }
     let rung12Ranges: [String: (Float, Float)] = [
       "clickAmp": (0.05, 0.6),
       "clickDecay": (-900, -200),
@@ -604,6 +632,12 @@ struct SubtractiveBassVoiceSignals {
   var fAmt: Signal
   var fDecay: Signal
   var res: Signal
+  var attackTime: Signal
+  var decayTime: Signal
+  var sustain: Signal
+  var releaseTime: Signal
+  var drive: Signal
+  var outGain: Signal
 }
 
 final class TrainableKickParams {
@@ -615,7 +649,8 @@ final class TrainableKickParams {
     initial: PatchValues,
     trainable: Bool,
     freezePitch: Bool = false,
-    freezeBodyAsymmetry: Bool = false
+    freezeBodyAsymmetry: Bool = false,
+    frozenNames: Set<String> = []
   ) {
     frozenNaturalValues = initial.clamped()
     for spec in KickParamSpecs.all {
@@ -623,6 +658,7 @@ final class TrainableKickParams {
         trainable && !(freezePitch && ["fStart", "fEnd", "pitchDecay", "f0"].contains(spec.name))
           && !(freezeBodyAsymmetry
             && ["bodyAsymmetry", "bodyHarmonic", "ampCurve"].contains(spec.name))
+          && !frozenNames.contains(spec.name)
       let transformed = spec.transform(initial[spec.name])
       if shouldTrain {
         let bounds = spec.transformedBounds
@@ -679,7 +715,13 @@ final class TrainableKickParams {
       fBase: naturalSignal("fBase"),
       fAmt: naturalSignal("fAmt"),
       fDecay: naturalSignal("fDecay"),
-      res: naturalSignal("res"))
+      res: naturalSignal("res"),
+      attackTime: naturalSignal("attackTime"),
+      decayTime: naturalSignal("decayTime"),
+      sustain: naturalSignal("sustain"),
+      releaseTime: naturalSignal("releaseTime"),
+      drive: naturalSignal("drive"),
+      outGain: naturalSignal("outGain"))
   }
 
   var transformedParams: [String: Signal] { storage }

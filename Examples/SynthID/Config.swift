@@ -43,6 +43,8 @@ struct SynthIDConfig: Codable {
   var fdcheckTimeMSE: Bool? = nil
   var fdcheckDirectional: Bool? = nil
   var directionEpsilon: Float = 1e-4
+  var useSmoothTrainingLoss: Bool = false
+  var useSmoothBasinSearch: Bool = false
 
   // Spec §5 values. All pitch params are log-reparameterized, so pitchLR is a
   // relative step size; 1e-3 x 400 epochs allows up to ~40% travel when needed.
@@ -54,6 +56,7 @@ struct SynthIDConfig: Codable {
 
   var cosineLRDecay: Bool = true
   var freezePitch: Bool = false
+  var frozenParams: [String] = []
   var enableNoiseFilter: Bool = true
   var seed: UInt64 = 1
   var rung: Int = 1
@@ -98,12 +101,17 @@ struct SynthIDConfig: Codable {
       windowWeights = try parseFloatList(value, "--window-weights")
     }
     if options.keys.contains("freeze-pitch") { freezePitch = true }
+    if let value = options["freeze-params"] {
+      frozenParams = value.split(separator: ",").map(String.init).filter { !$0.isEmpty }
+    }
     if options.keys.contains("no-lr-decay") { cosineLRDecay = false }
     if options.keys.contains("no-linear-mag") { includeLinearMagnitude = false }
     if options.keys.contains("no-noise-filter") { enableNoiseFilter = false }
     if options.keys.contains("fdcheck-log-l2") { fdcheckLogMagnitudeL2 = true }
     if options.keys.contains("fdcheck-time-mse") { fdcheckTimeMSE = true }
     if options.keys.contains("fdcheck-directional") { fdcheckDirectional = true }
+    if options.keys.contains("smooth-training-loss") { useSmoothTrainingLoss = true }
+    if options.keys.contains("smooth-basin-search") { useSmoothBasinSearch = true }
     if let value = options["backend"] {
       switch value {
       case "metal": DGenConfig.backend = .metal
@@ -129,6 +137,12 @@ struct SynthIDConfig: Codable {
         // The steady-note CPU estimate is more reliable than the current
         // spectral-loss f0 adjoint (documented by the profile's fdcheck).
         // Freeze only f0; all timbre and envelope parameters remain trained.
+        freezePitch = true
+        if options["pitch-refine-epochs"] == nil { pitchRefineEpochs = 0 }
+      }
+      if value == "subtractive-bass" {
+        // f0 is a fixed CPU estimate in this topology, so the kick pitch
+        // refinement phase would perform hundreds of empty optimizer steps.
         freezePitch = true
         if options["pitch-refine-epochs"] == nil { pitchRefineEpochs = 0 }
       }
