@@ -35,6 +35,8 @@ enum SynthIDCLI {
       try BatchTrainBench.run(options: parsed)
     case "basin-search":
       try BasinSearch.run(options: parsed)
+    case "batch-refine":
+      try BatchRefine.run(options: parsed)
     case "help", "--help", "-h":
       printUsage()
     default:
@@ -1357,6 +1359,7 @@ enum SynthIDCLI {
       swift run SynthID rung3  --target <real-808-wav> --out <dir> [--prepare-only]
       swift run SynthID batch-bench [--seed-dir <dir>] [--out <dir>] [--batch-sizes 1,8,32,128,256] [--iters 20]
       swift run SynthID basin-search --target <wav> --out <dir> --base-params <initial.json> [--count 8192] [--batch 256] [--seed N]
+      swift run SynthID batch-refine --target <wav> --mode polish|escape|lr-sweep|probe-grads|probe-scalar [--elites <dir>] [--init <json>] [--batch 64] [--steps 300] [--jitter 0.05] [--out <dir>]
 
       Common flags: --frames N --windows a,b,c --no-linear-mag --linear-mag-weight W
                     --pitch-lr LR --amp-lr LR --decay-lr LR --tone-lr LR --noise-lr LR
