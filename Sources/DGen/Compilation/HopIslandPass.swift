@@ -111,7 +111,7 @@ extension HopIslandPass {
     case .fixedWithFrameLoop:
       return !usesFlatThreading(block.ops)
     case .perFrameScaled, .perFrameThreadgroup1, .perFrameScaledThreadgroup1,
-         .staticThreads, .gemm, .gemmStaged:
+         .staticThreads, .selfManagedThreads, .gemm, .gemmStaged:
       return false
     }
   }

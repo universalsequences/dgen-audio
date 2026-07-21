@@ -306,10 +306,15 @@ private func emitBlockBodyUOps(
   emittedNodes: inout Set<NodeID>
 ) throws -> (uops: [UOp], hasOwnFrameLoop: Bool) {
   if useShapeAwareEmission {
+    // Lane-parallel detached BPTT backward: bind the region element index to
+    // the thread id instead of emitting per-region element loops. Finalization
+    // consults the same decision to dispatch `.selfManagedThreads(W)`.
+    let bpttLane = StatefulTensorParallelPolicy.decideDetachedBPTTBackward(
+      block: block, graph: g, backend: backend)
     // Use specialized emission with per-shape element loops.
     let shapeAwareUOps = try emitScalarBlockWithShapeTransitions(
       ctx: ctx, block: block, blocks: blocks, g: g, transitions: shapeTransitions,
-      backend: backend
+      backend: backend, laneParallel: bpttLane.enabled
     )
     for nodeId in block.nodes {
       emittedNodes.insert(nodeId)

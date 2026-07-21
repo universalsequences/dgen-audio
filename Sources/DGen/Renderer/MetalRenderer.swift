@@ -627,6 +627,14 @@ public class MetalRenderer: Renderer, UOpEmitter {
         scheduleItem.ops.append(beginRange)
         hasFrameLoop = false
 
+      case .selfManagedThreads(let n):
+        // Block contains its own frame loops (lane-parallel BPTT) -- dispatch
+        // N threads, one per tensor lane, no wrapping.
+        let beginRange = UOp(
+          op: .beginRange(.constant(0, 0), .constant(0, Float(n))), value: .empty)
+        scheduleItem.ops.append(beginRange)
+        hasFrameLoop = false
+
       case .staticThreads(let n):
         // Static blocks: dispatch N threads with no frame loop.
         let beginRange = UOp(

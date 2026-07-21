@@ -1,8 +1,8 @@
 # Spec: Parallel-lane execution for tensor-biquad forward + BPTT backward
 
-Status: NOT STARTED. Written 2026-07-20. Follow-up to
-`docs/TENSOR_BIQUAD_GRADIENT_SPEC.md` (IMPLEMENTED — correctness done,
-performance not).
+Status: IMPLEMENTED 2026-07-20 (measured results in Acceptance below).
+Written 2026-07-20. Follow-up to `docs/TENSOR_BIQUAD_GRADIENT_SPEC.md`
+(IMPLEMENTED — correctness done, performance not).
 
 ## Problem statement
 
@@ -223,6 +223,56 @@ the B=32/64 numbers as the honest capability), and a decision is recorded on
 wiring batched refinement into `refine_elites.sh` (worth it iff the measured
 multi-elite wall-clock beats serial by ≥ 5x at production frame counts and
 epoch counts).
+
+### Results (2026-07-20, M-series laptop, release build, 8192 frames, 20 steps)
+
+Implementation:
+- `laneParallelizable` + relaxed `decide` + `decideDetachedBPTTBackward` in
+  `StatefulTensorParallelPolicy.swift`; lane-parallel region emission in
+  `RegionEmitter.swift` (`laneParallel:` flag binds the region element index
+  to the thread id, no per-region element loops); new dispatch mode
+  `.selfManagedThreads(W)` (W threads, block-owned reverse frame loop).
+- Forward biquad block now emits `.fixedWithFrameLoop(W)`:
+  `if (id < W) { for (frame) ... }`; consolidated backward emits
+  `.selfManagedThreads(W)`: `if (id < W) { for (i = frames-1; ...) ... }`.
+  Verified in dumped kernels: no inner element loops in either.
+
+Correctness gates (all green, zero test modifications):
+- `TensorBiquadTests` 6/6 (incl. `testLaneStateIsIndependent`),
+  `TensorBiquadGradientTests` 7/7 (incl. `testLaneGradientIndependence`),
+  `BPTTBiquadScratchTests` 9/9, all `--filter Biquad` suites, and the full
+  `swift test` suite pass.
+- `--probe-grads` worst rel diff vs single-lane: 1.07e-5 (B=2/4),
+  1.88e-5 (B=12), 2.28e-5 (B=32) — unchanged float-noise regime.
+- `--mode equivalence` B=12: worst per-step per-lane param rel diff 1.6e-4
+  with lanes parallel vs 1.7e-4 on the pre-change baseline (same machine,
+  same seed) — i.e. the pre-existing step-noise level, not a regression.
+- `--probe-forward` B=12: batched loss equals the per-lane sum to 5+ digits.
+- New predicate unit tests (`StatefulTensorParallelPolicyTests`, 9 tests):
+  noise / hop-gated history / scalar stateful / scalar history / scalar
+  write all fall back; clean forward + detached-backward blocks enable.
+
+Timing (batched s/step; serial-sum baseline 0.534-0.547 s/step = 0.0445
+s/lane-step; pre-change batched baseline measured same-machine via stash):
+
+| B  | before    | after     | s/lane-step | vs 12x serial | vs old batched |
+|----|-----------|-----------|-------------|---------------|----------------|
+| 12 | 0.731     | 0.162     | 0.0135      | 3.3x          | 4.5x           |
+| 32 | —         | 0.245     | 0.0077      | 5.8x (per lane) | —            |
+| 64 | 3.420     | 0.339     | 0.0053      | 8.4x (per lane) | 10.1x        |
+
+The B=12 wall-clock speedup vs serial is 3.3x, below the ≥ 8x target — as
+anticipated, W=12 threads underutilize a SIMD group and the remaining step
+time is dominated by the non-recurrence kernels (spectral loss, reductions,
+readback), which batching does not shrink. The honest capability is the
+B=32/64 curve: lanes are nearly free once dispatched (64 lanes cost 2.1x a
+12-lane step), reaching 8.4x per lane-step at B=64.
+
+Decision on `refine_elites.sh`: wire batched refinement **only for batch
+sizes ≥ 32** (elites × seeds × restarts packed into one batch): ≥ 5.8x per
+lane-step beats the ≥ 5x threshold. At B=12 (3.3x) it is below threshold —
+pad/pack the batch to ≥ 32 lanes in the harness rather than running small
+batches.
 
 ## Risks
 
