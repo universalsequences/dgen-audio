@@ -69,6 +69,25 @@ public func inferShape(op: LazyOp, inputs: [ValueShape], graph: Graph) throws ->
     }
     return firstInput
 
+  // Vector-width gradient carry cells (batched biquad BPTT) carry one slot per
+  // element; their reads/writes are tensor-shaped. All other memory cells stay scalar.
+  case .memoryRead(let cellId):
+    if graph.tensorGradCarryCells.contains(cellId),
+      let tensorId = graph.cellToTensor[cellId], let tensor = graph.tensors[tensorId]
+    {
+      return .tensor(tensor.shape)
+    }
+    return .scalar
+
+  case .memoryWrite(let cellId):
+    if graph.tensorGradCarryCells.contains(cellId) {
+      guard inputs.count >= 2 else {
+        throw DGenError.shapeInferenceFailed(op: "memoryWrite", reason: "missing value input")
+      }
+      return inputs[1]
+    }
+    return .scalar
+
   // Conv output shape matches input shape (same padding)
   case .conv1d(_):
     guard let firstInput = inputs.first else {
@@ -219,30 +238,26 @@ public func inferShape(op: LazyOp, inputs: [ValueShape], graph: Graph) throws ->
   case .sampleGradWrite(_, _, _, _, _, _, _), .sampleGradReduce(_, _, _, _, _, _, _, _):
     return .scalar
 
-  // Elementwise ops: broadcast tensor shapes, or inherit the single tensor shape, or scalar
+  // Elementwise ops: broadcast all tensor shapes, inherit the single tensor shape, or scalar.
+  // Scalars do not participate in the broadcast-shape reduction.
   case .add, .sub, .mul, .div, .sin, .cos, .exp, .sqrt, .tanh, .atan,
     .tan, .log, .log10, .abs, .sign, .floor, .ceil, .round,
     .pow, .mod, .min, .max, .atan2, .gt, .gte, .lt, .lte, .eq,
-    .and, .or, .xor, .gswitch, .mix,
+    .and, .or, .xor, .gswitch, .mix, .selector,
     .modulatedParam,
     .phasor(_), .accum(_), .latch(_), .deterministicPhasor, .gradDeterministicPhasor:
-    let tensors = inputs.filter { x in
-      if case .tensor(_) = x { return true }
-      return false
+    let tensorShapes = inputs.compactMap { input -> Shape? in
+      if case .tensor(let shape) = input { return shape }
+      return nil
     }
-    if tensors.count == 2 {
-      if case .tensor(let s1) = tensors[0], case .tensor(let s2) = tensors[1] {
-        if let broadcastShape = broadcastShapes(s1, s2) {
-          return .tensor(broadcastShape)
-        } else {
-          throw DGenError.shapeMismatch(op: "\(op)", shape1: s1, shape2: s2)
-        }
+    guard var resultShape = tensorShapes.first else { return .scalar }
+    for shape in tensorShapes.dropFirst() {
+      guard let broadcastShape = broadcastShapes(resultShape, shape) else {
+        throw DGenError.shapeMismatch(op: "\(op)", shape1: resultShape, shape2: shape)
       }
+      resultShape = broadcastShape
     }
-    if tensors.count > 0 {
-      return tensors[0]
-    }
-    return .scalar
+    return .tensor(resultShape)
 
   case .seq:
     return inputs.last ?? .scalar
@@ -291,8 +306,7 @@ public func inferShape(op: LazyOp, inputs: [ValueShape], graph: Graph) throws ->
     .spectralLossFFTBatchedGradSpec, .spectralLossFFTBatchedGradIFFT,
     .acceleratedFFT, .acceleratedIFFT, .phaseVocoderPitchShift, .partitionedSpectralConvolve,
     .selectRowGradWrite, .selectRowGradReduce,
-    .selector,
-    .memoryRead, .memoryWrite, .memoryAccumulate, .memoryCellSum,
+    .memoryAccumulate, .memoryCellSum,
     .historyReadWrite,
     .param, .click, .noise,
     .constant, .hostSampleRate, .output, .input:

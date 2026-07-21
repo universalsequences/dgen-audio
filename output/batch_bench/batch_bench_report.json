@@ -1,0 +1,72 @@
+{
+  "filterEnabled" : true,
+  "batchedLosses" : [
+    8.0689940840095176e-11,
+    0.066978931427001953,
+    0.084660641849040985,
+    0.11732494086027145,
+    0.052868429571390152,
+    0.051960103213787079,
+    0.062160350382328033,
+    0.054851409047842026
+  ],
+  "correctnessPass" : true,
+  "maxAbsDiffOverall" : 6.1699654906988144e-05,
+  "perCandidateMaxAbsDiff" : [
+    6.1699654906988144e-05,
+    1.1026859283447266e-06,
+    1.6376376152038574e-05,
+    2.5675108190625906e-05,
+    1.8142163753509521e-06,
+    2.8312206268310547e-07,
+    2.7398345991969109e-07,
+    3.5315752029418945e-06
+  ],
+  "serialLosses" : [
+    5.9562299536963792e-11,
+    0.066978931427001953,
+    0.084660612046718597,
+    0.11732492595911026,
+    0.05286841094493866,
+    0.051960103213787079,
+    0.062160361558198929,
+    0.054851394146680832
+  ],
+  "timing" : [
+    {
+      "batchSize" : 1,
+      "compileSeconds" : 0.088860415999999998,
+      "evalsPerHour" : 58521.058920094511,
+      "perCandidateMillis" : 61.516316800000006,
+      "steadyStatePerEvalSeconds" : 0.061516316800000005
+    },
+    {
+      "batchSize" : 8,
+      "compileSeconds" : 0.12928933400000001,
+      "evalsPerHour" : 182608.85255684561,
+      "perCandidateMillis" : 19.714268774999997,
+      "steadyStatePerEvalSeconds" : 0.15771415019999999
+    },
+    {
+      "batchSize" : 32,
+      "compileSeconds" : 0.51492845899999995,
+      "evalsPerHour" : 238725.40933024333,
+      "perCandidateMillis" : 15.080087243750002,
+      "steadyStatePerEvalSeconds" : 0.48256279180000006
+    },
+    {
+      "batchSize" : 128,
+      "compileSeconds" : 1.819212458,
+      "evalsPerHour" : 252985.31685947074,
+      "perCandidateMillis" : 14.230074870312501,
+      "steadyStatePerEvalSeconds" : 1.8214495834000002
+    },
+    {
+      "batchSize" : 256,
+      "compileSeconds" : 3.537960709,
+      "evalsPerHour" : 255493.20438947636,
+      "perCandidateMillis" : 14.090394335937502,
+      "steadyStatePerEvalSeconds" : 3.6071409500000002
+    }
+  ]
+}

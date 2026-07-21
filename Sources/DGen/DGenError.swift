@@ -10,6 +10,7 @@ public enum DGenError: Error, LocalizedError {
     case shapeMismatch(op: String, shape1: Shape, shape2: Shape)
     case shapeInferenceFailed(op: String, reason: String)
     case tensorError(op: String, reason: String)
+    case unsupportedGradient(String)
 
     public var errorDescription: String? {
         switch self {
@@ -31,6 +32,8 @@ public enum DGenError: Error, LocalizedError {
             return "Shape inference failed for \(op): \(reason)"
         case .tensorError(let op, let reason):
             return "\(op): \(reason)"
+        case .unsupportedGradient(let reason):
+            return "Unsupported gradient: \(reason)"
         }
     }
 }

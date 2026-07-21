@@ -34,6 +34,16 @@ extension GraphPrepPasses {
     for cellId in historyReads.keys.sorted() {
       guard let readNodeId = historyReads[cellId] else { continue }
       if let writeInfo = historyWrites[cellId] {
+        // historyReadWrite is a scalar delay operation. Tensor history must keep
+        // its explicit read/write pair so emission indexes every element and
+        // feedback scheduling keeps the whole state update in one frame loop.
+        guard graph.cellToTensor[cellId] == nil else {
+          if options.debug {
+            print("Skipping history fusion for tensor cell \(cellId)")
+          }
+          continue
+        }
+
         // Check if neither the read nor write node is in a feedback loop.
         // Skip writes that carry a reset (2nd input): historyReadWrite has no
         // reset path, so fusing would silently drop the reset.

@@ -1,0 +1,190 @@
+{
+  "createdAtUTC" : "2026-07-13T13:30:25Z",
+  "equivalences" : [
+    {
+      "name" : "shape (unscored knob)",
+      "recoveredValue" : 0.544483,
+      "relativeError" : 0.0038603928,
+      "trueValue" : 0.54659307
+    },
+    {
+      "name" : "pw (unscored knob)",
+      "recoveredValue" : 0.66109985,
+      "relativeError" : 0.000943893,
+      "trueValue" : 0.66172445
+    },
+    {
+      "name" : "fBase (unscored knob)",
+      "recoveredValue" : 2876.8435,
+      "relativeError" : 0.06896893,
+      "trueValue" : 3089.9543
+    },
+    {
+      "name" : "fAmt (unscored knob)",
+      "recoveredValue" : 81.867424,
+      "relativeError" : 0.09178089,
+      "trueValue" : 74.985214
+    },
+    {
+      "name" : "fDecay (unscored knob)",
+      "recoveredValue" : 0.6073144,
+      "relativeError" : 6.6724176,
+      "trueValue" : 0.07915554
+    },
+    {
+      "name" : "res (unscored knob)",
+      "recoveredValue" : 2.2465918,
+      "relativeError" : 0.17895684,
+      "trueValue" : 2.7362652
+    },
+    {
+      "name" : "attackTime (unscored knob)",
+      "recoveredValue" : 0.009883491,
+      "relativeError" : 0.08394022,
+      "trueValue" : 0.010789134
+    },
+    {
+      "name" : "decayTime (unscored knob)",
+      "recoveredValue" : 0.2489518,
+      "relativeError" : 0.46915072,
+      "trueValue" : 0.16945286
+    },
+    {
+      "name" : "sustain (unscored knob)",
+      "recoveredValue" : 0.5679694,
+      "relativeError" : 0.011378901,
+      "trueValue" : 0.5615792
+    },
+    {
+      "name" : "releaseTime (unscored knob)",
+      "recoveredValue" : 0.028727202,
+      "relativeError" : 0.025882263,
+      "trueValue" : 0.028002435
+    },
+    {
+      "name" : "drive (unscored knob)",
+      "recoveredValue" : 2.3648481,
+      "relativeError" : 0.09701227,
+      "trueValue" : 2.1557171
+    },
+    {
+      "name" : "outGain (unscored knob)",
+      "recoveredValue" : 0.65071553,
+      "relativeError" : 0.08048854,
+      "trueValue" : 0.7076753
+    }
+  ],
+  "finalLoss" : 0.66679734,
+  "initLoss" : 10.403644,
+  "irreducibleLossFloor" : 0,
+  "lossRatio" : 0.06409267,
+  "pass" : false,
+  "rawLossRatio" : 0.06409267,
+  "recoveredParams" : {
+    "ampCurve" : 0,
+    "ampDecay" : -7,
+    "attackTime" : 0.009883491,
+    "bodyAmp" : 0.75,
+    "bodyAsymmetry" : 0,
+    "bodyHarmonic" : 0,
+    "brightnessDecay" : 1,
+    "clickAmp" : 0.2,
+    "clickDecay" : -400,
+    "clickFreq" : 1400,
+    "decayTime" : 0.2489518,
+    "drive" : 2.3648481,
+    "f0" : 32.7,
+    "fAmt" : 81.867424,
+    "fBase" : 2876.8435,
+    "fDecay" : 0.6073144,
+    "fEnd" : 45,
+    "fStart" : 120,
+    "harmonicCorrections" : {
+
+    },
+    "noiseAmp" : 0.08,
+    "noiseCutoff" : 2800,
+    "noiseDecay" : -140,
+    "noteOff" : 1.55,
+    "outGain" : 0.65071553,
+    "pitchDecay" : -35,
+    "pw" : 0.66109985,
+    "releaseTime" : 0.028727202,
+    "res" : 2.2465918,
+    "shape" : 0.544483,
+    "sustain" : 0.5679694
+  },
+  "rows" : [
+    {
+      "absoluteError" : 206.22852,
+      "name" : "fEnv(0)",
+      "pass" : true,
+      "recoveredValue" : 2958.711,
+      "relativeError" : 0.065160334,
+      "tolerance" : 0.1,
+      "trueValue" : 3164.9395,
+      "unit" : "Hz"
+    },
+    {
+      "absoluteError" : 213.11084,
+      "name" : "fEnv(infinity)",
+      "pass" : true,
+      "recoveredValue" : 2876.8435,
+      "relativeError" : 0.06896893,
+      "tolerance" : 0.1,
+      "trueValue" : 3089.9543,
+      "unit" : "Hz"
+    },
+    {
+      "absoluteError" : 0.48967338,
+      "name" : "res",
+      "pass" : false,
+      "recoveredValue" : 2.2465918,
+      "relativeError" : 0.17895684,
+      "tolerance" : 0.1,
+      "trueValue" : 2.7362652,
+      "unit" : "Q"
+    },
+    {
+      "absoluteError" : 0.0132956505,
+      "name" : "drive*outGain",
+      "pass" : true,
+      "recoveredValue" : 1.5388434,
+      "relativeError" : 0.008715329,
+      "tolerance" : 0.1,
+      "trueValue" : 1.5255477,
+      "unit" : "lin"
+    },
+    {
+      "absoluteError" : 0.03658122,
+      "name" : "aEnv(10ms)",
+      "pass" : true,
+      "recoveredValue" : 0.62560594,
+      "relativeError" : 0.062104724,
+      "tolerance" : 0.1,
+      "trueValue" : 0.5890247,
+      "unit" : "lin"
+    },
+    {
+      "absoluteError" : 0.061205924,
+      "name" : "aEnv(300ms)",
+      "pass" : true,
+      "recoveredValue" : 0.69741833,
+      "relativeError" : 0.0962036,
+      "tolerance" : 0.1,
+      "trueValue" : 0.6362124,
+      "unit" : "lin"
+    },
+    {
+      "absoluteError" : 0.0021783886,
+      "name" : "aEnv(700ms)",
+      "pass" : false,
+      "recoveredValue" : 0.017733138,
+      "relativeError" : 0.14004652,
+      "tolerance" : 0.1,
+      "trueValue" : 0.015554749,
+      "unit" : "lin"
+    }
+  ],
+  "rung" : 1
+}

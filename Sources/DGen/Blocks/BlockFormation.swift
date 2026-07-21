@@ -377,6 +377,288 @@ public func splitReduceBlocks(g: Graph, blocks: [Block]) -> [Block] {
   return splitBlocks
 }
 
+/// The set of backward-partition nodes that must execute inside the single
+/// reverse frame loop of a vector-width BPTT (tensor-history) backward pass.
+///
+/// Includes:
+/// - every memoryWrite of a tensor grad carry cell, and its backward ancestors
+///   (the grad arithmetic feeding the temporal recurrence);
+/// - every memoryRead of a tensor grad carry cell, and its backward
+///   descendants (per-frame gradients that combine the carry with the
+///   downstream grad — reading the single-slot carry ring outside the reverse
+///   loop would see only the final frame's value);
+/// - backward ancestors of all of the above, so the block is closed over its
+///   inputs.
+///
+/// The walk stops at reductions to scalar and grad accumulates: those are not
+/// part of the recurrence (they reach carry writes only via seq side-effect
+/// ordering chains) and read their tensor inputs from frame-aware cells in
+/// later blocks.
+public func tensorBPTTRecurrenceClosure(g: Graph, lastForwardId: NodeID) -> Set<NodeID> {
+  func isBoundary(_ id: NodeID) -> Bool {
+    guard let node = g.nodes[id] else { return true }
+    switch node.op {
+    case .sum, .sumAxis, .memoryAccumulate, .tensorAccumulate:
+      return true
+    // Isolated-pass ops (spectral loss forward/backward, grad tapes) run in
+    // their own kernels with dedicated scratch and dispatch shapes. They
+    // materialize the upstream per-frame gradient before the recurrence; the
+    // consolidated reverse loop reads their outputs from frame-aware cells.
+    case .spectralLossFFT, .spectralLossFFTGradSpec, .spectralLossFFTGradIFFT,
+      .spectralLossFFTGradInline, .spectralLossFFTGradRead, .spectralLossFFTGradRead2,
+      .spectralLossFFTBatched, .spectralLossFFTBatchedReduce,
+      .spectralLossFFTBatchedGradSpec, .spectralLossFFTBatchedGradIFFT,
+      .spectralLossFFTBatchedGradRead, .spectralLossFFTBatchedGradRead2,
+      .sampleGradWrite, .selectRowGradWrite, .peekGradWrite,
+      .temporalGradStore, .temporalGradRead:
+      return true
+    default:
+      return false
+    }
+  }
+
+  // seq nodes exist to ORDER gradient side effects; only their second input
+  // is a value dependency. Walking the ordering edge would sweep unrelated
+  // grad chains (whatever side effect happened to be chained first) into the
+  // recurrence, nondeterministically per dictionary iteration order.
+  func valueDeps(_ node: Node) -> [NodeID] {
+    if case .seq = node.op, node.inputs.count == 2 {
+      return [node.inputs[1]]
+    }
+    return node.allDependencies
+  }
+
+  var seeds: [NodeID] = []
+  var carryReads: [NodeID] = []
+  for (id, node) in g.nodes where id > lastForwardId {
+    switch node.op {
+    case .memoryWrite(let c) where g.tensorGradCarryCells.contains(c):
+      seeds.append(id)
+    case .memoryRead(let c) where g.tensorGradCarryCells.contains(c):
+      seeds.append(id)
+      carryReads.append(id)
+    default:
+      break
+    }
+  }
+  guard !seeds.isEmpty else { return [] }
+
+  // Consumer adjacency over the backward partition (value edges only).
+  var consumers: [NodeID: [NodeID]] = [:]
+  for (id, node) in g.nodes where id > lastForwardId {
+    for dep in valueDeps(node) where dep > lastForwardId {
+      consumers[dep, default: []].append(id)
+    }
+  }
+
+  // Descendants of carry reads, stopping at (and excluding) boundary nodes.
+  var descendantStack = carryReads
+  var descendants = Set<NodeID>()
+  while let id = descendantStack.popLast() {
+    for consumer in consumers[id] ?? [] where !descendants.contains(consumer) {
+      guard !isBoundary(consumer) else { continue }
+      descendants.insert(consumer)
+      descendantStack.append(consumer)
+    }
+  }
+
+  // Ancestor closure over seeds + descendants, stopping at boundary nodes.
+  var stack = seeds + Array(descendants)
+  var closure = Set<NodeID>()
+  while let id = stack.popLast() {
+    guard closure.insert(id).inserted else { continue }
+    guard let node = g.nodes[id] else { continue }
+    for dep in valueDeps(node) where dep > lastForwardId && !isBoundary(dep) {
+      stack.append(dep)
+    }
+  }
+  return closure
+}
+
+/// Consolidate the vector-width BPTT recurrence (tensor-history biquad
+/// backward) into one sequential block.
+///
+/// The reverse-time recurrence — carry reads, the grad arithmetic between
+/// them, and the carry writes — must execute inside a single reverse frame
+/// loop (the detached-BPTT wrap in BlockEmission). Default block formation
+/// fragments these tensor-shaped backward nodes across several blocks, which
+/// both breaks the recurrence and leaves backward UOps referencing forward
+/// loop-scope variables. This pass extracts the closure of backward-partition
+/// ancestors of every tensor carry write into one new sequential block,
+/// inserted where the first of those nodes originally lived.
+///
+/// Safe by construction: closure nodes never depend on non-closure backward
+/// nodes (the closure is ancestor-closed within the backward partition), and
+/// consumers of closure outputs have higher node IDs so they sit in blocks at
+/// or after the insertion point.
+public func consolidateTensorBPTTBackwardBlocks(g: Graph, blocks: [Block], ctx: IRContext) -> [Block] {
+  let debug = ProcessInfo.processInfo.environment["DGEN_DEBUG_BPTT_SPLIT"] != nil
+  guard let lastForwardId = g.lastForwardNodeId, !g.tensorGradCarryCells.isEmpty else {
+    return blocks
+  }
+
+  var stack: [NodeID] = []
+  for (id, node) in g.nodes where id > lastForwardId {
+    if case .memoryWrite(let c) = node.op, g.tensorGradCarryCells.contains(c) {
+      stack.append(id)
+    }
+  }
+  let closure = tensorBPTTRecurrenceClosure(g: g, lastForwardId: lastForwardId)
+  guard !closure.isEmpty else { return blocks }
+
+  // Forward nodes whose values the closure consumes: the consolidated block
+  // must be inserted after the last block that produces any of them (block
+  // fusion can reorder blocks relative to node-ID order).
+  var forwardDeps = Set<NodeID>()
+  for id in closure {
+    guard let node = g.nodes[id] else { continue }
+    for dep in node.allDependencies where dep <= lastForwardId {
+      forwardDeps.insert(dep)
+    }
+  }
+
+  // Blocks whose forward half contains tensor-registered history ops: any
+  // backward leftovers here would trigger the scalar wrapWithBPTTLoops path,
+  // which cannot re-emit tensor UOps in its reverse loop. Their backward
+  // nodes are deferred to after the consolidated block instead.
+  func hasTensorHistory(_ block: Block) -> Bool {
+    block.nodes.contains { nodeId in
+      guard let node = g.nodes[nodeId] else { return false }
+      switch node.op {
+      case .historyRead(let c), .historyWrite(let c):
+        return g.cellToTensor[c] != nil
+      default:
+        return false
+      }
+    }
+  }
+
+  // Backward deps of the closure that were cut out of it (boundary nodes) must
+  // run before the consolidated block, alongside its forward deps.
+  var beforeDeps = forwardDeps
+  for id in closure {
+    guard let node = g.nodes[id] else { continue }
+    for dep in node.allDependencies where dep > lastForwardId && !closure.contains(dep) {
+      beforeDeps.insert(dep)
+    }
+  }
+
+  // Pass 1: strip closure nodes; defer backward leftovers of tensor-history
+  // blocks (they would otherwise trigger the scalar wrapWithBPTTLoops path).
+  // Nodes the closure itself depends on are never deferred.
+  var stripped: [Block] = []
+  var deferredBackward: [Block] = []
+  var deferredNodes = Set<NodeID>()
+  var templateTemporality: Temporality? = nil
+  var sawClosure = false
+  for block in blocks {
+    let hasClosure = block.nodes.contains { closure.contains($0) }
+    if hasClosure {
+      sawClosure = true
+      if templateTemporality == nil, block.temporality == .frameBased {
+        templateTemporality = block.temporality
+      }
+    }
+    var rest = block.nodes.filter { !closure.contains($0) }
+    if hasClosure || hasTensorHistory(block) {
+      let deferred = rest.filter { $0 > lastForwardId && !beforeDeps.contains($0) }
+      if !deferred.isEmpty {
+        var deferredBlock = Block(frameOrder: block.frameOrder)
+        deferredBlock.nodes = deferred
+        deferredBlock.shape = block.shape
+        deferredBlock.temporality = block.temporality
+        deferredBlock.tensorIndex = block.tensorIndex
+        deferredBackward.append(deferredBlock)
+        deferredNodes.formUnion(deferred)
+        rest = rest.filter { !deferredNodes.contains($0) }
+      }
+    }
+    if !rest.isEmpty {
+      var remainder = block
+      remainder.nodes = rest
+      stripped.append(remainder)
+    }
+  }
+  guard sawClosure else { return blocks }
+
+  // Transitive consumers of anything that now runs late (closure + deferred
+  // leftovers) must also run after the consolidated block.
+  var consumers: [NodeID: [NodeID]] = [:]
+  for (id, node) in g.nodes where id > lastForwardId {
+    for dep in node.allDependencies {
+      consumers[dep, default: []].append(id)
+    }
+  }
+  let lateSet = closure.union(deferredNodes)
+  var descendants = Set<NodeID>()
+  var descendantStack = Array(lateSet)
+  while let id = descendantStack.popLast() {
+    for consumer in consumers[id] ?? [] where !lateSet.contains(consumer) {
+      if descendants.insert(consumer).inserted {
+        descendantStack.append(consumer)
+      }
+    }
+  }
+
+  var bpttBlock = Block(frameOrder: .sequential)
+  // Backward node IDs are created in dependency order, so ID order is a valid
+  // topological order for the consolidated body.
+  bpttBlock.nodes = closure.sorted()
+  bpttBlock.temporality = templateTemporality ?? .frameBased
+  assignTensorIndexFromFirstTensorNode(to: &bpttBlock, graph: g, ctx: ctx)
+
+  // Pass 2: the consolidated block goes after every block containing one of
+  // its dependencies; any earlier block holding closure descendants has those
+  // nodes split out and moved after it.
+  var insertAt = 0
+  for (idx, block) in stripped.enumerated()
+  where block.nodes.contains(where: { beforeDeps.contains($0) }) {
+    insertAt = idx + 1
+  }
+
+  var before: [Block] = []
+  var after: [Block] = []
+  var movedConsumers: [Block] = []
+  for (idx, block) in stripped.enumerated() {
+    if idx >= insertAt {
+      after.append(block)
+      continue
+    }
+    let moved = block.nodes.filter { descendants.contains($0) }
+    if moved.isEmpty {
+      before.append(block)
+      continue
+    }
+    let stay = block.nodes.filter { !descendants.contains($0) }
+    if !stay.isEmpty {
+      var stayBlock = block
+      stayBlock.nodes = stay
+      before.append(stayBlock)
+    }
+    var movedBlock = Block(frameOrder: block.frameOrder)
+    movedBlock.nodes = moved
+    movedBlock.shape = block.shape
+    movedBlock.temporality = block.temporality
+    movedBlock.tensorIndex = block.tensorIndex
+    movedConsumers.append(movedBlock)
+  }
+
+  // Moved and deferred fragments are all backward nodes; order them by node ID
+  // (creation order is dependency order for backward nodes).
+  let tail = (movedConsumers + deferredBackward).sorted {
+    ($0.nodes.min() ?? 0) < ($1.nodes.min() ?? 0)
+  }
+  let result = before + [bpttBlock] + tail + after
+  if debug {
+    print(
+      "BPTT-CONSOLIDATE nodes=\(bpttBlock.nodes.count) at=\(before.count) "
+        + "moved=\(movedConsumers.map { $0.nodes.count }) "
+        + "deferred=\(deferredBackward.map { $0.nodes.count }) "
+        + "shape=\(String(describing: bpttBlock.shape)) temporality=\(bpttBlock.temporality)")
+  }
+  return result
+}
+
 /// Split SIMD blocks where a memoryRead depends on a memoryWrite to the same
 /// base cell. Without a kernel boundary, all frames execute simultaneously and
 /// reads may see unwritten data. Follows the same pattern as splitReduceBlocks.

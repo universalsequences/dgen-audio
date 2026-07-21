@@ -1162,9 +1162,42 @@ extension SignalTensor {
   /// - Returns: Filtered signal tensor (same shape)
   public func biquad(cutoff: Signal, resonance: Signal, gain: Signal, mode: Signal) -> SignalTensor {
     let nodeId = graph.graph.biquad(
-      self.nodeId, cutoff.nodeId, resonance.nodeId, gain.nodeId, mode.nodeId)
+      self.nodeId, cutoff.nodeId, resonance.nodeId, gain.nodeId, mode.nodeId,
+      elementShape: shape)
     let needsGrad = requiresGrad || cutoff.requiresGrad || resonance.requiresGrad
       || gain.requiresGrad || mode.requiresGrad
+    // Backward is validated only for rank-1 [B] element shapes (see
+    // docs/TENSOR_BIQUAD_GRADIENT_SPEC.md). Anything else must fail loudly
+    // rather than silently emit wrong adjoints.
+    if shape.count != 1 {
+      graph.unsupportedGradientNodes[nodeId] =
+        "tensor-shaped biquad backward is only validated for rank-1 [B] element shapes, got \(shape)"
+    }
+    return SignalTensor(nodeId: nodeId, graph: graph, shape: shape, requiresGrad: needsGrad)
+  }
+
+  /// Biquad filter with per-element cutoff and resonance controls.
+  /// Each control tensor must exactly match the audio tensor shape.
+  public func biquad(
+    cutoff: SignalTensor, resonance: SignalTensor,
+    gain: Signal, mode: Signal
+  ) -> SignalTensor {
+    precondition(
+      cutoff.shape == shape && resonance.shape == shape,
+      "per-element biquad controls must match audio shape")
+
+    let nodeId = graph.graph.biquad(
+      self.nodeId, cutoff.nodeId, resonance.nodeId, gain.nodeId, mode.nodeId,
+      elementShape: shape)
+    let needsGrad = requiresGrad || cutoff.requiresGrad || resonance.requiresGrad
+      || gain.requiresGrad || mode.requiresGrad
+    // Backward is validated only for rank-1 [B] element shapes (see
+    // docs/TENSOR_BIQUAD_GRADIENT_SPEC.md). Anything else must fail loudly
+    // rather than silently emit wrong adjoints.
+    if shape.count != 1 {
+      graph.unsupportedGradientNodes[nodeId] =
+        "tensor-shaped biquad backward is only validated for rank-1 [B] element shapes, got \(shape)"
+    }
     return SignalTensor(nodeId: nodeId, graph: graph, shape: shape, requiresGrad: needsGrad)
   }
 

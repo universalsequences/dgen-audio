@@ -29,6 +29,12 @@ enum SynthIDCLI {
       try rung2(options: parsed)
     case "rung3":
       try rung3(options: parsed)
+    case "batch-bench":
+      try BatchBench.run(options: parsed)
+    case "batch-train-bench":
+      try BatchTrainBench.run(options: parsed)
+    case "basin-search":
+      try BasinSearch.run(options: parsed)
     case "help", "--help", "-h":
       printUsage()
     default:
@@ -1308,6 +1314,7 @@ enum SynthIDCLI {
         "freeze-pitch", "no-linear-mag", "no-noise-filter", "allow-fail", "no-lr-decay",
         "verify-only", "prepare-only", "fdcheck-log-l2", "fdcheck-time-mse",
         "fdcheck-directional", "smooth-training-loss", "smooth-basin-search",
+        "probe-only",
       ]
       if flags.contains(key) {
         options[key] = "true"
@@ -1348,6 +1355,8 @@ enum SynthIDCLI {
       swift run SynthID rung2  --out <dir> [--seeds 1,2,3,4,5] [--verify-only]
       swift run SynthID rung2  --target <wav-from-numpy> --params <json> --out <dir> [--verify-only]
       swift run SynthID rung3  --target <real-808-wav> --out <dir> [--prepare-only]
+      swift run SynthID batch-bench [--seed-dir <dir>] [--out <dir>] [--batch-sizes 1,8,32,128,256] [--iters 20]
+      swift run SynthID basin-search --target <wav> --out <dir> --base-params <initial.json> [--count 8192] [--batch 256] [--seed N]
 
       Common flags: --frames N --windows a,b,c --no-linear-mag --linear-mag-weight W
                     --pitch-lr LR --amp-lr LR --decay-lr LR --tone-lr LR --noise-lr LR

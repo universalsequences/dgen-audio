@@ -8,13 +8,45 @@ extension LazyOp {
         throw DGenError.insufficientInputs(
           operator: "memoryRead", expected: 1, actual: inputs.count)
       }
-      b.use(val: b.memoryRead(cellId, b.value(inputs[0])))
+      if g.tensorGradCarryCells.contains(cellId) {
+        // Vector-width grad carry cell: per-element read into the output
+        // tensor, mirroring the historyRead tensor branch. The offset input
+        // (inputs[0]) is an ordering dependency only.
+        let outputTensorId = g.nodeToTensor[nodeId]!
+        let outputCellId = g.tensors[outputTensorId]!.cellId
+        guard let index = ctx.tensorIndices[nodeId] else {
+          throw DGenError.insufficientInputs(
+            operator: "memoryRead", expected: 1, actual: inputs.count)
+        }
+        let idx = b.value(index, scalarType: .int)
+        let value = b.tload(cellId, idx)
+        _ = b.tstore(outputCellId, idx, value)
+        ctx.values[nodeId] = .empty
+      } else {
+        b.use(val: b.memoryRead(cellId, b.value(inputs[0])))
+      }
     case .memoryWrite(let cellId):
       guard inputs.count == 2 else {
         throw DGenError.insufficientInputs(
           operator: "memoryWrite", expected: 2, actual: inputs.count)
       }
-      b.use(val: b.memoryWrite(cellId, b.value(inputs[0]), b.value(inputs[1])))
+      if g.tensorGradCarryCells.contains(cellId) {
+        // Vector-width grad carry cell: per-element copy from the value
+        // input's tensor into the carry cell, mirroring the historyWrite
+        // tensor branch. The offset input (inputs[0]) is a dependency only.
+        let valueTensorId = g.nodeToTensor[node.inputs[1]]!
+        let valueCellId = g.tensors[valueTensorId]!.cellId
+        guard let index = ctx.tensorIndices[nodeId] else {
+          throw DGenError.insufficientInputs(
+            operator: "memoryWrite", expected: 2, actual: inputs.count)
+        }
+        let idx = b.value(index, scalarType: .int)
+        let value = b.tload(valueCellId, idx)
+        _ = b.memoryWrite(cellId, b.cast(idx, to: .int), value)
+        ctx.values[nodeId] = .empty
+      } else {
+        b.use(val: b.memoryWrite(cellId, b.value(inputs[0]), b.value(inputs[1])))
+      }
     case .memoryAccumulate(let cellId):
       guard inputs.count == 2 else {
         throw DGenError.insufficientInputs(

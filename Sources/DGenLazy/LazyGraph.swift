@@ -48,6 +48,10 @@ public class LazyGraph {
   internal var tensors: [WeakRef<Tensor>] = []
   internal var signals: [WeakRef<Signal>] = []
 
+  /// Forward nodes whose gradients are intentionally unsupported. `runBackward`
+  /// checks whether any marked node is an ancestor of the requested loss.
+  internal var unsupportedGradientNodes: [NodeID: String] = [:]
+
   public init(sampleRate: Float = DGenConfig.sampleRate,
               maxFrameCount: Int = DGenConfig.maxFrameCount) {
     self.id = LazyGraph._nextId
@@ -158,6 +162,7 @@ public class LazyGraph {
     graph.lastForwardNodeId = nil
     graph.simdOptimizedConv2Ds.removeAll()
     graph.conv2dMaskCells.removeAll()
+    unsupportedGradientNodes.removeAll()
 
     // 5. Clear gradient cells from registry (they'll be recreated on next backward)
     parameterRegistry.tensorGradCells.removeAll()

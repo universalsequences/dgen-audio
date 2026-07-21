@@ -399,13 +399,30 @@ extension Graph {
   ///
   /// - Returns: Filtered output signal
   public func biquad(
-    _ in1: NodeID, _ cutoff: NodeID, _ resonance: NodeID, _ gain: NodeID, _ mode: NodeID
+    _ in1: NodeID, _ cutoff: NodeID, _ resonance: NodeID, _ gain: NodeID, _ mode: NodeID,
+    elementShape: Shape? = nil
   ) -> NodeID {
-    // Allocate history cells
-    let history0Cell = alloc()
-    let history1Cell = alloc()
-    let history2Cell = alloc()
-    let history3Cell = alloc()
+    // The scalar path intentionally uses the original single-cell allocation.
+    // Tensor biquads need one independently indexed state value per element and
+    // a tensor registration so historyRead/historyWrite use their tensor paths.
+    func allocateHistoryCell() -> CellID {
+      guard let elementShape else { return alloc() }
+
+      let width = Swift.max(1, elementShape.reduce(1, *))
+      let cellId = alloc(vectorWidth: width)
+      persistentCells.insert(cellId)
+
+      let tensorId = nextTensorId
+      nextTensorId += 1
+      tensors[tensorId] = Tensor(id: tensorId, shape: elementShape, cellId: cellId)
+      cellToTensor[cellId] = tensorId
+      return cellId
+    }
+
+    let history0Cell = allocateHistoryCell()
+    let history1Cell = allocateHistoryCell()
+    let history2Cell = allocateHistoryCell()
+    let history3Cell = allocateHistoryCell()
 
     // History reads
     let history0Read = n(.historyRead(history0Cell))

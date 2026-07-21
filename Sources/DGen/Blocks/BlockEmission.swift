@@ -314,6 +314,11 @@ private func emitBlockBodyUOps(
     for nodeId in block.nodes {
       emittedNodes.insert(nodeId)
     }
+    // A detached BPTT backward block must run its frames in reverse order
+    // regardless of which body-emission strategy produced the UOps.
+    if blockIsDetachedBPTTBackward(block: block, g: g) {
+      return (uops: wrapDetachedBPTTBackwardLoop(shapeAwareUOps), hasOwnFrameLoop: true)
+    }
     return (uops: shapeAwareUOps, hasOwnFrameLoop: false)
   }
   return try emitStandardBlockBodyUOps(

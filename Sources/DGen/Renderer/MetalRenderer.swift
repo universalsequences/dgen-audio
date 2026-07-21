@@ -1066,6 +1066,12 @@ public class MetalRenderer: Renderer, UOpEmitter {
       return "/* setThreadCountScale - handled in scheduler */"
 
     case .setFrameIndex(let idx):
+      // Declare once per kernel; later setFrameIndex ops in the same kernel
+      // (e.g. several tensor regions in one consolidated BPTT block) reassign,
+      // since a same-scope redeclaration fails to compile.
+      if frameIndexOverride != nil {
+        return "_frameIndex = (uint)(\(g(idx)));"
+      }
       frameIndexOverride = "_frameIndex"
       return "uint _frameIndex = (uint)(\(g(idx)));"
 

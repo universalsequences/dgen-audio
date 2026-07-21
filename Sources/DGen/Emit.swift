@@ -237,9 +237,11 @@ extension LazyOp {
         throw DGenError.insufficientInputs(
           operator: "selector", expected: 2, actual: inputs.count)
       }
-      let mode = inputs[0]
-      let options = Array(inputs.dropFirst())
-      b.use(val: b.selector(b.value(mode), options.map { b.value($0) }))
+      let mode = try b.readInput(node, inputs, at: 0)
+      let options = try inputs.indices.dropFirst().map {
+        try b.readInput(node, inputs, at: $0)
+      }
+      try b.writeOutput(node, b.selector(mode, options))
     case .modulatedParam(let mode, let minValue, let maxValue, let baseCellId, let activeCellId, let lanes):
       guard inputs.count == 1 else {
         throw DGenError.insufficientInputs(

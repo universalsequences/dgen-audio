@@ -352,15 +352,19 @@ public func findSequentialNodes(_ g: Graph, feedbackClusters: [[NodeID]], backen
       scalar.insert($0.id)  // Ring-buffer write + row advance must happen sequentially on hop boundaries; the op emits its own scalar `if` gate
     case .spectrumDelayMod(_, _, _, _, _):
       scalar.insert($0.id)  // Same reasoning — plus the fractional interpolation reads two ring rows per element
-    case .historyRead(let cellId), .historyWrite(let cellId):
-      // Scalar (non-tensor) history cells hold per-frame state in a single
-      // slot. Emitting the read or write in a parallel per-frame kernel makes
-      // every thread race on that slot (e.g. biquad's x-history write when its
-      // input comes from a parallel block), producing nondeterministic output.
-      // Feedback-cluster detection only catches reads/writes that close a
-      // cycle; chain writes like historyWrite(cell, someParallelValue) escape
-      // it. Tensor history cells are handled separately below (hop gating).
-      if g.cellToTensor[cellId] == nil {
+    case .historyRead, .historyWrite:
+      // History is state across frames whether its cell is scalar or tensor.
+      // Emitting a non-feedback read/write chain in a parallel per-frame kernel
+      // races on the persistent state (biquad's x[n-1]/x[n-2] chain is the
+      // canonical example). Feedback detection catches closed recurrences, but
+      // not every stateful chain, so all history operations stay frame-serial;
+      // tensor blocks still iterate/index their elements inside each frame.
+      scalar.insert($0.id)
+    case .memoryRead(let cellId), .memoryWrite(let cellId):
+      // Vector-width gradient carry cells are the reverse-time analogue of
+      // history: state carried across (reverse) frames. A parallel per-frame
+      // kernel would race on them exactly like scalar history cells.
+      if g.tensorGradCarryCells.contains(cellId) {
         scalar.insert($0.id)
       }
     default: break
@@ -477,6 +481,16 @@ public func findSequentialNodes(_ g: Graph, feedbackClusters: [[NodeID]], backen
     for nodeId in loop {
       scalar.insert(nodeId)
     }
+  }
+
+  // Vector-width BPTT (tensor-history biquad): the reverse-time recurrence —
+  // carry reads, the grad arithmetic between them, and the carry writes — must
+  // land in one sequential block so it can be wrapped in a single reverse
+  // frame loop. Backward tensor grad nodes are otherwise classified parallel,
+  // fragmenting the chain across blocks. Mark every backward-partition
+  // ancestor of a tensor carry write as scalar.
+  if !g.tensorGradCarryCells.isEmpty, let lastFwd = g.lastForwardNodeId {
+    scalar.formUnion(tensorBPTTRecurrenceClosure(g: g, lastForwardId: lastFwd))
   }
 
   // Remove SIMD-safe nodes from scalar set - these use atomics and are safe for parallel execution

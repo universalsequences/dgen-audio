@@ -19,6 +19,23 @@ extension Graph {
     if let existing = gradCarryCells[historyCellId] {
       return existing
     }
+    // Tensor-registered history cells (e.g. batched biquad state) need a
+    // width-W carry cell with its own tensor registration so carry
+    // reads/writes address one slot per element.
+    if let historyTensorId = cellToTensor[historyCellId],
+      let historyTensor = tensors[historyTensorId]
+    {
+      let width = Swift.max(1, historyTensor.shape.reduce(1, *))
+      let carryCell = alloc(vectorWidth: width)
+      gradCarryCells[historyCellId] = carryCell
+      persistentCells.insert(carryCell)
+      let tensorId = nextTensorId
+      nextTensorId += 1
+      tensors[tensorId] = Tensor(id: tensorId, shape: historyTensor.shape, cellId: carryCell)
+      cellToTensor[carryCell] = tensorId
+      tensorGradCarryCells.insert(carryCell)
+      return carryCell
+    }
     let carryCell = alloc()
     gradCarryCells[historyCellId] = carryCell
     // Carry cells are read/written via memoryRead/memoryWrite across kernels,
@@ -1366,10 +1383,20 @@ extension LazyOp {
     -> NodeID
   {
     guard let gradNode = g.nodes[grad],
-      case .tensor(let gradShape) = gradNode.shape,
-      case .tensor(let targetShapeArray) = targetShape
+      case .tensor(let gradShape) = gradNode.shape
     else {
-      // Scalar or unknown shape - no reduction needed
+      // Scalar or unknown gradient - no reduction needed
+      return grad
+    }
+    guard case .tensor(let targetShapeArray) = targetShape else {
+      // Tensor gradient flowing into a scalar operand (e.g. a shared scalar
+      // control broadcast across a [W]-lane tensor): sum over all lanes.
+      // Passing the tensor through unreduced would silently accumulate only
+      // an .empty placeholder into the scalar grad cell.
+      if case .scalar = targetShape {
+        return g.n(.sum, [grad])
+      }
+      // Unknown target shape - no reduction
       return grad
     }
 

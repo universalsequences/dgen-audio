@@ -365,6 +365,7 @@ public struct CompilationPipeline {
       finalBlocks = isolateSpectralPasses(finalBlocks, graph)
     }
     forceSequentialHopHistoryBlocks(&finalBlocks, graph: graph)
+    finalBlocks = consolidateTensorBPTTBackwardBlocks(g: graph, blocks: finalBlocks, ctx: context)
     return finalBlocks
   }
 

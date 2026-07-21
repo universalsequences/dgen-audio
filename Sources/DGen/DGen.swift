@@ -48,6 +48,11 @@ open class Graph {
     public var gradCarryCells: [CellID: CellID] = [:]
     public var tensorGradCells: [NodeID: CellID] = [:]
 
+    /// Gradient carry cells that mirror a tensor-registered history cell (width W).
+    /// memoryRead/memoryWrite of these cells use per-element tensor addressing;
+    /// all vector-width BPTT branches gate on this set so scalar graphs are untouched.
+    public var tensorGradCarryCells: Set<CellID> = []
+
     /// Track frame-aware tensor allocations: cellId -> (tensorSize, frameCount)
     /// Used for tensors with outbound dependencies that need tensorSize * frameCount cells.
     public var frameAwareCells: [CellID: (tensorSize: Int, frameCount: Int)] = [:]

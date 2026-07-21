@@ -152,6 +152,18 @@ extension LazyGraph {
   ///
   /// Both `Tensor.backward()` and `Signal.backward()` delegate here to avoid duplication.
   func runBackward(loss: NodeID, frameCount: Int) throws -> [Float] {
+    var visited = Set<NodeID>()
+    var pending = [loss]
+    while let nodeId = pending.popLast() {
+      guard visited.insert(nodeId).inserted else { continue }
+      if let reason = unsupportedGradientNodes[nodeId] {
+        throw DGenError.unsupportedGradient(reason)
+      }
+      if let node = graph.nodes[nodeId] {
+        pending.append(contentsOf: node.allDependencies)
+      }
+    }
+
     markDirty()
     _ = setupGradients(loss: loss, frameCount: frameCount)
 
