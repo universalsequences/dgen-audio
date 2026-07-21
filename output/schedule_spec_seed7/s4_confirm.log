@@ -1,0 +1,64 @@
+=== batch-refine mode=polish frames=32768 steps=300 ===
+pre-refine elite scores:
+  elite-00: 0.37065
+  elite-01: 0.43594
+  elite-02: 0.32228
+  elite-03: 0.36498
+  elite-04: 0.29553
+  elite-05: 0.34918
+  elite-06: 0.26273
+  elite-07: 0.36493
+  elite-08: 0.17886  <- best (padding source)
+  elite-09: 0.37145
+  elite-10: 0.26812
+  elite-11: 0.28332
+packed 12 elites x 6 restarts -> B=72 (jitter sigma=0.05 of transformed span)
+schedule s4:
+  A-smooth-lr2: 150 steps lrMult=2.0
+  B-prod-lr2: 500 steps lrMult=2.0
+[s4] step=0 phase=A-smooth-lr2 meanLoss=4.662115 elapsed=4.1s
+[s4] step=25 phase=A-smooth-lr2 meanLoss=2.037724 elapsed=58.2s
+[s4] step=50 phase=A-smooth-lr2 meanLoss=1.743126 elapsed=112.7s
+[s4] step=75 phase=A-smooth-lr2 meanLoss=1.621491 elapsed=164.4s
+[s4] step=100 phase=A-smooth-lr2 meanLoss=1.562831 elapsed=213.8s
+[s4] step=125 phase=A-smooth-lr2 meanLoss=1.541126 elapsed=265.7s
+[s4] step=150 phase=B-prod-lr2 meanLoss=2.431182 elapsed=320.0s
+[s4] step=175 phase=B-prod-lr2 meanLoss=2.345059 elapsed=402.2s
+[s4] step=200 phase=B-prod-lr2 meanLoss=2.278743 elapsed=486.4s
+[s4] step=225 phase=B-prod-lr2 meanLoss=2.244075 elapsed=575.9s
+[s4] step=250 phase=B-prod-lr2 meanLoss=2.229844 elapsed=661.9s
+[s4] step=275 phase=B-prod-lr2 meanLoss=2.220185 elapsed=753.5s
+[s4] step=300 phase=B-prod-lr2 meanLoss=2.193555 elapsed=839.4s
+[s4] step=325 phase=B-prod-lr2 meanLoss=2.174063 elapsed=928.9s
+[s4] step=350 phase=B-prod-lr2 meanLoss=2.165735 elapsed=1015.6s
+[s4] step=375 phase=B-prod-lr2 meanLoss=2.158578 elapsed=1104.9s
+[s4] step=400 phase=B-prod-lr2 meanLoss=2.157929 elapsed=1194.2s
+[s4] step=425 phase=B-prod-lr2 meanLoss=2.154617 elapsed=1278.9s
+[s4] step=450 phase=B-prod-lr2 meanLoss=2.148314 elapsed=1367.2s
+[s4] step=475 phase=B-prod-lr2 meanLoss=2.143373 elapsed=1447.2s
+[s4] step=500 phase=B-prod-lr2 meanLoss=2.139325 elapsed=1527.1s
+[s4] step=525 phase=B-prod-lr2 meanLoss=2.135498 elapsed=1607.0s
+[s4] step=550 phase=B-prod-lr2 meanLoss=2.134882 elapsed=1687.1s
+[s4] step=575 phase=B-prod-lr2 meanLoss=2.132625 elapsed=1767.8s
+[s4] step=600 phase=B-prod-lr2 meanLoss=2.131984 elapsed=1851.3s
+[s4] step=625 phase=B-prod-lr2 meanLoss=2.130134 elapsed=1941.0s
+[s4] step=649 phase=B-prod-lr2 meanLoss=2.130088 elapsed=2021.5s
+
+3.110 s/step for B=72 (0.0432 s/lane-step)
+
+per-elite results (CPU mrstft; lower is better):
+  elite-00: pre=0.37065 unjittered=0.10505 bestLane=0.10505 (lane 0, 6 lanes) prodLoss=0.829248 ratio=4.1822%
+  elite-01: pre=0.43594 unjittered=0.33907 bestLane=0.32952 (lane 9, 6 lanes) prodLoss=2.122840 ratio=10.7062%
+  elite-02: pre=0.32228 unjittered=0.10454 bestLane=0.10454 (lane 12, 6 lanes) prodLoss=0.831024 ratio=4.1911%
+  elite-03: pre=0.36498 unjittered=0.32752 bestLane=0.32039 (lane 22, 6 lanes) prodLoss=2.173180 ratio=10.9601%
+  elite-04: pre=0.29553 unjittered=0.10148 bestLane=0.00681 (lane 29, 6 lanes) prodLoss=0.088726 ratio=0.4475%
+  elite-05: pre=0.34918 unjittered=0.32724 bestLane=0.32724 (lane 30, 6 lanes) prodLoss=2.288612 ratio=11.5423%
+  elite-06: pre=0.26273 unjittered=0.00826 bestLane=0.00826 (lane 36, 6 lanes) prodLoss=0.109885 ratio=0.5542%
+  elite-07: pre=0.36493 unjittered=0.32986 bestLane=0.32986 (lane 42, 6 lanes) prodLoss=2.089674 ratio=10.5390%
+  elite-08: pre=0.17886 unjittered=0.10932 bestLane=0.10932 (lane 48, 6 lanes) prodLoss=0.817317 ratio=4.1220%
+  elite-09: pre=0.37145 unjittered=0.32720 bestLane=0.32014 (lane 55, 6 lanes) prodLoss=2.238989 ratio=11.2920%
+  elite-10: pre=0.26812 unjittered=0.10236 bestLane=0.00939 (lane 63, 6 lanes) prodLoss=0.137686 ratio=0.6944%
+  elite-11: pre=0.28332 unjittered=0.13590 bestLane=0.00148 (lane 71, 6 lanes) prodLoss=0.027613 ratio=0.1393%
+
+global best lane 71 (elite-11): 0.00148
+wrote /Users/alecresende/code/swift/dgen/output/schedule_spec_seed7/s4_confirm

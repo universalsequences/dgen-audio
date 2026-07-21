@@ -1,0 +1,30 @@
+basin-search v2: round 0 uniform count=8192 searchSeed=6018027440438976228
+  round 0 batch 8/32 best=0.487357 elapsed=2.4s
+  round 0 batch 16/32 best=0.487357 elapsed=4.8s
+  round 0 batch 24/32 best=0.438860 elapsed=7.2s
+  round 0 batch 32/32 best=0.438860 elapsed=10.2s
+round 1: resampling 7680 children (sigma=0.080 of span)
+  round 1 batch 8/30 best=0.431585 elapsed=3.3s
+  round 1 batch 16/30 best=0.431585 elapsed=6.6s
+  round 1 batch 24/30 best=0.392615 elapsed=9.6s
+  round 1 batch 30/30 best=0.376657 elapsed=11.9s
+round 2: resampling 7680 children (sigma=0.040 of span)
+  round 2 batch 8/30 best=0.322283 elapsed=3.2s
+  round 2 batch 16/30 best=0.295530 elapsed=6.5s
+  round 2 batch 24/30 best=0.262731 elapsed=9.9s
+  round 2 batch 30/30 best=0.178856 elapsed=12.9s
+
+stratified elites (post-resampling):
+  fBase[60,120)/shape<0.5: score=0.370653 fBase=87.95 shape=0.4512 pw=0.1792 res=0.680 fAmt=5534.2 fDecay=0.5088
+  fBase[60,120)/shape>=0.5: score=0.435937 fBase=94.52 shape=0.5168 pw=0.1227 res=1.726 fAmt=1312.2 fDecay=1.9881
+  fBase[120,240)/shape<0.5: score=0.322283 fBase=167.72 shape=0.4434 pw=0.1791 res=1.203 fAmt=6877.4 fDecay=0.8680
+  fBase[120,240)/shape>=0.5: score=0.364985 fBase=210.42 shape=0.5429 pw=0.1645 res=0.972 fAmt=4176.8 fDecay=1.0250
+  fBase[240,480)/shape<0.5: score=0.295530 fBase=341.72 shape=0.4582 pw=0.1773 res=0.733 fAmt=3061.9 fDecay=1.6970
+  fBase[240,480)/shape>=0.5: score=0.349180 fBase=383.44 shape=0.5285 pw=0.1422 res=0.737 fAmt=4001.5 fDecay=1.0446
+  fBase[480,960)/shape<0.5: score=0.262731 fBase=903.40 shape=0.4329 pw=0.1808 res=0.947 fAmt=2735.9 fDecay=1.0902
+  fBase[480,960)/shape>=0.5: score=0.364929 fBase=528.30 shape=0.5881 pw=0.1593 res=0.821 fAmt=2780.4 fDecay=1.1372
+  fBase[960,2000)/shape<0.5: score=0.178856 fBase=1180.72 shape=0.4267 pw=0.1815 res=0.693 fAmt=3225.7 fDecay=0.6037
+  fBase[960,2000)/shape>=0.5: score=0.371448 fBase=1059.74 shape=0.5205 pw=0.1660 res=0.693 fAmt=1720.8 fDecay=0.8366
+
+wrote 12 elites to /Users/alecresende/code/swift/dgen/output/schedule_spec_seed7/basin/elites
+wrote /Users/alecresende/code/swift/dgen/output/schedule_spec_seed7/basin/basin_search_report.json

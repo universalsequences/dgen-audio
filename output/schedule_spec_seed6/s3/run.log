@@ -1,0 +1,57 @@
+=== batch-refine mode=escape frames=32768 steps=300 ===
+escape: lane 0 = exact init, lanes 1..63 jittered (sigma=0.08)
+schedule s3:
+  A-smooth: 100 steps
+  B-blend: 200 steps
+  C-prod: 200 steps
+[s3] step=0 phase=A-smooth meanLoss=6.546566 elapsed=2.9s
+[s3] step=25 phase=A-smooth meanLoss=2.215637 elapsed=48.7s
+[s3] step=50 phase=A-smooth meanLoss=1.414848 elapsed=94.2s
+[s3] step=75 phase=A-smooth meanLoss=1.253677 elapsed=139.6s
+[s3] step=100 phase=B-blend meanLoss=1.228130 elapsed=192.7s
+[s3] step=125 phase=B-blend meanLoss=1.053077 elapsed=296.0s
+[s3] step=150 phase=B-blend meanLoss=0.931020 elapsed=398.9s
+[s3] step=175 phase=B-blend meanLoss=0.857506 elapsed=501.9s
+[s3] step=200 phase=B-blend meanLoss=0.811718 elapsed=606.2s
+[s3] step=225 phase=B-blend meanLoss=0.789009 elapsed=709.0s
+[s3] step=250 phase=B-blend meanLoss=0.777477 elapsed=812.9s
+[s3] step=275 phase=B-blend meanLoss=0.772817 elapsed=916.8s
+[s3] step=300 phase=C-prod meanLoss=1.259405 elapsed=1023.0s
+[s3] step=325 phase=C-prod meanLoss=1.216354 elapsed=1100.9s
+[s3] step=350 phase=C-prod meanLoss=1.187935 elapsed=1180.6s
+[s3] step=375 phase=C-prod meanLoss=1.165820 elapsed=1260.1s
+[s3] step=400 phase=C-prod meanLoss=1.153168 elapsed=1339.5s
+[s3] step=425 phase=C-prod meanLoss=1.146598 elapsed=1417.8s
+[s3] step=450 phase=C-prod meanLoss=1.143478 elapsed=1496.8s
+[s3] step=475 phase=C-prod meanLoss=1.141775 elapsed=1574.9s
+[s3] step=499 phase=C-prod meanLoss=1.141593 elapsed=1650.5s
+
+3.301 s/step for B=64
+lane 0 (stall reproduction): init=0.08141 final=0.01305
+top 8 lanes by final CPU score:
+  lane 9: init=0.11796 final=0.01081
+  lane 50: init=0.51218 final=0.01243
+  lane 14: init=0.26690 final=0.01263
+  lane 0: init=0.08141 final=0.01305
+  lane 27: init=0.10531 final=0.01313
+  lane 60: init=0.24918 final=0.01331
+  lane 51: init=0.18469 final=0.01430
+  lane 46: init=0.73986 final=0.01546
+3/63 jittered lanes beat the unjittered trajectory
+production loss: lane 0 0.304899 ratio=12.1849%  best lane 9 0.291679 ratio=11.6566%
+
+best lane 9 vs hidden truth (transformed-space abs err / span):
+  sustain: lane=    0.5893 truth=    0.5456 err=0.0437 OK
+  outGain: lane=    0.5494 truth=    0.5561 err=0.0033 OK
+  attackTime: lane=    0.0085 truth=    0.0052 err=0.0781 OK
+  decayTime: lane=    0.2249 truth=    0.3859 err=0.1019 MISS
+  releaseTime: lane=    0.0211 truth=    0.0214 err=0.0037 OK
+  fDecay: lane=    0.1308 truth=    0.1237 err=0.0093 OK
+  fBase: lane=   77.0844 truth=   86.4364 err=0.0205 OK
+  fAmt: lane=    8.5546 truth=    7.1892 err=0.0164 OK
+  res: lane=    1.7774 truth=    3.0415 err=0.2162 MISS
+  drive: lane=    3.1636 truth=    2.0444 err=0.1260 MISS
+  shape: lane=    0.7468 truth=    0.6679 err=0.0790 OK
+  pw: lane=    0.4770 truth=    0.4647 err=0.0131 OK
+recovered 9/12 params within spec tolerance
+wrote /Users/alecresende/code/swift/dgen/output/schedule_spec_seed6/s3

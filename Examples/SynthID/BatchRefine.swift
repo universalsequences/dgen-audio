@@ -70,7 +70,7 @@ enum BatchRefine {
     let eps: Float = 1e-8
     private var m: [String: [Float]] = [:]
     private var v: [String: [Float]] = [:]
-    private var t = 0
+    private var tPerParam: [String: Int] = [:]
     /// Cosine scale applied on top of each param's group LR (mirrors the
     /// production cosineLRDecay schedule).
     var lrScale: Float = 1.0
@@ -79,14 +79,20 @@ enum BatchRefine {
       self.laneLR = laneLR
     }
 
+    /// `frozen` params are skipped entirely: no weight update and no m/v/t
+    /// advance, so a param unfreezing mid-run starts with fresh Adam state
+    /// (its own bias-correction clock) instead of stale momentum.
     func step(
-      params: [(name: String, tensor: Tensor)], config: SynthIDConfig, gradClip: Float
+      params: [(name: String, tensor: Tensor)], config: SynthIDConfig, gradClip: Float,
+      frozen: Set<String> = []
     ) {
-      t += 1
-      let bc1 = 1.0 - Foundation.pow(beta1, Float(t))
-      let bc2 = 1.0 - Foundation.pow(beta2, Float(t))
       for (name, tensor) in params {
+        if frozen.contains(name) { continue }
         guard let gradData = tensor.grad?.getData(), let data = tensor.getData() else { continue }
+        let t = (tPerParam[name] ?? 0) + 1
+        tPerParam[name] = t
+        let bc1 = 1.0 - Foundation.pow(beta1, Float(t))
+        let bc2 = 1.0 - Foundation.pow(beta2, Float(t))
         let spec = KickParamSpecs.byName[name]!
         let bounds = spec.transformedBounds
         let base = groupLR(name, config: config) * lrScale
@@ -213,6 +219,11 @@ enum BatchRefine {
   /// `smooth` approximates the production smooth loss with log-magnitude L2
   /// (kink removal is the property that matters for the schedule).
   /// Scaled by B so per-lane gradients are batch-size invariant.
+  /// S5 (resonance-sensitized objective): extra high-resolution log-mag term
+  /// appended to every phase's loss to sharpen the resonance peak the 2048
+  /// window smears. nil for all other schedules.
+  static var hiResTerm: (window: Int, weight: Float)?
+
   static func buildBatchedLoss(
     student: SignalTensor, target: SignalTensor, batch: Int,
     config: SynthIDConfig, smooth: Bool
@@ -242,7 +253,104 @@ enum BatchRefine {
         total = total + linear * (weight * config.linearMagnitudeWeight)
       }
     }
+    if let term = hiResTerm {
+      let hiRes = spectralLossFFT(
+        student, target,
+        windowSize: term.window,
+        useHannWindow: config.useHannWindow,
+        useLogMagnitude: true,
+        lossMode: smooth ? .l2 : .l1,
+        hop: max(1, term.window / 4),
+        normalize: true)
+      total = total + hiRes * term.weight
+    }
     return total * Signal.constant(Float(batch))
+  }
+
+  /// λ·smooth + (1−λ)·production, both terms built in one graph, weighted
+  /// before the ×B rescale (SCHEDULE_SPEC.md delta 2; S3 / blend phases).
+  static func buildBlendedLoss(
+    student: SignalTensor, target: SignalTensor, batch: Int,
+    config: SynthIDConfig, lambda: Float
+  ) -> Signal {
+    let smooth = buildBatchedLoss(
+      student: student, target: target, batch: batch, config: config, smooth: true)
+    let production = buildBatchedLoss(
+      student: student, target: target, batch: batch, config: config, smooth: false)
+    return smooth * Signal.constant(lambda) + production * Signal.constant(1.0 - lambda)
+  }
+
+  // MARK: - Schedules (SCHEDULE_SPEC.md matrix)
+
+  enum PhaseKind {
+    case smooth
+    case production
+    /// Linear λ ramp (weight on the smooth term) across the phase.
+    case blend(from: Float, to: Float)
+  }
+
+  struct SchedulePhase {
+    let steps: Int
+    let kind: PhaseKind
+    let frozen: Set<String>
+    let lrMult: Float
+    let label: String
+  }
+
+  /// The control (S0) expressed as a schedule; used when --schedule is absent.
+  static func controlSchedule(smoothSteps: Int, steps: Int) -> [SchedulePhase] {
+    var phases: [SchedulePhase] = []
+    if smoothSteps > 0 {
+      phases.append(
+        SchedulePhase(steps: smoothSteps, kind: .smooth, frozen: [], lrMult: 1, label: "smooth"))
+    }
+    phases.append(
+      SchedulePhase(steps: steps, kind: .production, frozen: [], lrMult: 1, label: "production"))
+    return phases
+  }
+
+  static func namedSchedule(_ name: String) throws -> [SchedulePhase] {
+    let ridge: Set<String> = ["res", "shape"]
+    let others = Set(paramNames).subtracting(ridge)
+    switch name {
+    case "s1":
+      // Freeze-ridge curriculum: settle the 10 unambiguous knobs against a
+      // fixed res/shape background, then resolve the ridge pair alone, then a
+      // low-LR joint polish. Phase A keeps the control's 150-step smooth
+      // opening so the only variable vs S0 is the freeze masks.
+      return [
+        SchedulePhase(steps: 150, kind: .smooth, frozen: ridge, lrMult: 1, label: "A-smooth-freeze[res,shape]"),
+        SchedulePhase(steps: 50, kind: .production, frozen: ridge, lrMult: 1, label: "A-prod-freeze[res,shape]"),
+        SchedulePhase(steps: 150, kind: .production, frozen: others, lrMult: 1, label: "B-prod-freeze[others]"),
+        SchedulePhase(steps: 150, kind: .production, frozen: [], lrMult: 0.3, label: "C-prod-allfree-lr0.3"),
+      ]
+    case "s3":
+      // Gradual homotopy: replace the hard smooth->production handoff at step
+      // 150 with a linear λ-blend over steps 100..300; no other change.
+      return [
+        SchedulePhase(steps: 100, kind: .smooth, frozen: [], lrMult: 1, label: "A-smooth"),
+        SchedulePhase(steps: 200, kind: .blend(from: 1, to: 0), frozen: [], lrMult: 1, label: "B-blend"),
+        SchedulePhase(steps: 200, kind: .production, frozen: [], lrMult: 1, label: "C-prod"),
+      ]
+    case "s4":
+      // LR-corrected control (null hypothesis): S0 with the lr-sweep's x2.0
+      // group-LR multiplier and the production phase extended to 500.
+      return [
+        SchedulePhase(steps: 150, kind: .smooth, frozen: [], lrMult: 2, label: "A-smooth-lr2"),
+        SchedulePhase(steps: 500, kind: .production, frozen: [], lrMult: 2, label: "B-prod-lr2"),
+      ]
+    case "s5":
+      // Resonance-sensitized objective: the best surviving schedule (S4) with
+      // an extra 4096-window log-mag term x0.5 in every phase's training loss
+      // (hiResTerm; the gate metric stays the unchanged production loss).
+      hiResTerm = (window: 4096, weight: 0.5)
+      return [
+        SchedulePhase(steps: 150, kind: .smooth, frozen: [], lrMult: 2, label: "A-smooth-lr2-hires"),
+        SchedulePhase(steps: 500, kind: .production, frozen: [], lrMult: 2, label: "B-prod-lr2-hires"),
+      ]
+    default:
+      throw SynthIDError.message("unknown --schedule \(name); expected s1, s3, s4, or s5")
+    }
   }
 
   // MARK: - One batched trajectory
@@ -259,6 +367,17 @@ enum BatchRefine {
     steps: Int, smoothSteps: Int, laneLR: [Float], logEvery: Int,
     label: String
   ) throws -> TrajectoryResult {
+    try runTrajectory(
+      laneInits: laneInits, targetSamples: targetSamples, config: config,
+      phases: controlSchedule(smoothSteps: smoothSteps, steps: steps),
+      laneLR: laneLR, logEvery: logEvery, label: label)
+  }
+
+  static func runTrajectory(
+    laneInits: [PatchValues], targetSamples: [Float], config: SynthIDConfig,
+    phases: [SchedulePhase], laneLR: [Float], logEvery: Int,
+    label: String
+  ) throws -> TrajectoryResult {
     let batch = laneInits.count
     precondition(laneLR.count == batch)
     LazyGraphContext.reset()
@@ -270,14 +389,37 @@ enum BatchRefine {
 
     var meanLossTrace: [Float] = []
     var paramTrace: [[String: [Float]]] = []
-    let totalSteps = smoothSteps + steps
+    let totalSteps = phases.reduce(0) { $0 + $1.steps }
     let start = Date()
     for step in 0..<totalSteps {
-      let smooth = step < smoothSteps
+      // Locate the active phase and the step index within it.
+      var phaseStart = 0
+      var phase = phases[0]
+      for candidate in phases {
+        if step < phaseStart + candidate.steps {
+          phase = candidate
+          break
+        }
+        phaseStart += candidate.steps
+      }
+      let phaseStep = step - phaseStart
+      let phaseProgress = Float(phaseStep) / Float(max(1, phase.steps - 1))
+
       let student = buildStudent(z: z, batch: batch, config: config)
       let target = onesTensor * targetTensor.toSignal(maxFrames: config.frames)
-      let loss = buildBatchedLoss(
-        student: student, target: target, batch: batch, config: config, smooth: smooth)
+      let loss: Signal
+      switch phase.kind {
+      case .smooth:
+        loss = buildBatchedLoss(
+          student: student, target: target, batch: batch, config: config, smooth: true)
+      case .production:
+        loss = buildBatchedLoss(
+          student: student, target: target, batch: batch, config: config, smooth: false)
+      case .blend(let from, let to):
+        let lambda = from + (to - from) * phaseProgress
+        loss = buildBlendedLoss(
+          student: student, target: target, batch: batch, config: config, lambda: lambda)
+      }
       let lossValues = try loss.backward(frames: config.frames)
       let meanLoss = lossValues.reduce(0, +) / Float(batch)
       meanLossTrace.append(meanLoss)
@@ -287,17 +429,17 @@ enum BatchRefine {
       }
       if config.cosineLRDecay {
         // Anneal within each phase, matching the production trainer's shape.
-        let phaseLen = smooth ? smoothSteps : steps
-        let phaseStep = smooth ? step : step - smoothSteps
-        let progress = Float(phaseStep) / Float(max(1, phaseLen - 1))
-        opt.lrScale = 0.05 + 0.95 * 0.5 * (1.0 + Foundation.cos(Float.pi * progress))
+        opt.lrScale = (0.05 + 0.95 * 0.5 * (1.0 + Foundation.cos(Float.pi * phaseProgress)))
+          * phase.lrMult
+      } else {
+        opt.lrScale = phase.lrMult
       }
-      opt.step(params: z, config: config, gradClip: config.gradClip)
+      opt.step(params: z, config: config, gradClip: config.gradClip, frozen: phase.frozen)
       opt.zeroGrad(params: z)
       if logEvery > 0 && (step % logEvery == 0 || step == totalSteps - 1) {
         let elapsed = Date().timeIntervalSince(start)
         print(
-          "[\(label)] step=\(step)\(smooth ? " (smooth)" : "")"
+          "[\(label)] step=\(step) phase=\(phase.label)"
             + " meanLoss=\(String(format: "%.6f", meanLoss))"
             + " elapsed=\(String(format: "%.1f", elapsed))s")
         var snapshot: [String: [Float]] = [:]
@@ -571,11 +713,22 @@ enum BatchRefine {
       print("packed \(elites.count) elites x \(restarts) restarts -> B=\(batch)"
         + " (jitter sigma=\(jitterSigma) of transformed span)")
 
+      let scheduleName = options["schedule"]
+      let phases = try scheduleName.map { try namedSchedule($0) }
+        ?? controlSchedule(smoothSteps: smoothSteps, steps: steps)
+      if let scheduleName {
+        print("schedule \(scheduleName):")
+        for phase in phases {
+          print("  \(phase.label): \(phase.steps) steps"
+            + (phase.frozen.isEmpty ? "" : " frozen=\(phase.frozen.sorted())")
+            + (phase.lrMult == 1 ? "" : " lrMult=\(phase.lrMult)"))
+        }
+      }
       let result = try runTrajectory(
         laneInits: laneInits, targetSamples: targetSamples, config: config,
-        steps: steps, smoothSteps: smoothSteps,
+        phases: phases,
         laneLR: [Float](repeating: 1, count: batch), logEvery: logEvery,
-        label: "polish")
+        label: scheduleName ?? "polish")
       let finalScores = try scoreLanes(
         lanes: result.lanes, base: elites[0], scorer: scorer, config: config)
 
@@ -616,6 +769,7 @@ enum BatchRefine {
           to: outDir.appendingPathComponent("global_best.json"))
         let report: [String: Any] = [
           "mode": "polish", "batch": batch, "restartsPerElite": restarts,
+          "schedule": scheduleName ?? "control",
           "steps": steps, "smoothSteps": smoothSteps, "jitterSigma": jitterSigma,
           "secondsPerStep": result.secondsPerStep,
           "meanLossTrace": result.meanLossTrace,
@@ -637,13 +791,24 @@ enum BatchRefine {
       }
       print("escape: lane 0 = exact init, lanes 1..\(batch - 1) jittered"
         + " (sigma=\(jitterSigma))")
+      let scheduleName = options["schedule"]
+      let phases = try scheduleName.map { try namedSchedule($0) }
+        ?? controlSchedule(smoothSteps: smoothSteps, steps: steps)
+      if let scheduleName {
+        print("schedule \(scheduleName):")
+        for phase in phases {
+          print("  \(phase.label): \(phase.steps) steps"
+            + (phase.frozen.isEmpty ? "" : " frozen=\(phase.frozen.sorted())")
+            + (phase.lrMult == 1 ? "" : " lrMult=\(phase.lrMult)"))
+        }
+      }
       let initScores = try scoreLanes(
         lanes: laneInits, base: base, scorer: scorer, config: config)
       let result = try runTrajectory(
         laneInits: laneInits, targetSamples: targetSamples, config: config,
-        steps: steps, smoothSteps: smoothSteps,
+        phases: phases,
         laneLR: [Float](repeating: 1, count: batch), logEvery: logEvery,
-        label: "escape")
+        label: scheduleName ?? "escape")
       let finalScores = try scoreLanes(
         lanes: result.lanes, base: base, scorer: scorer, config: config)
 
@@ -689,6 +854,8 @@ enum BatchRefine {
         }
         let report: [String: Any] = [
           "mode": "escape", "batch": batch, "steps": steps,
+          "schedule": scheduleName ?? "control",
+          "phases": phases.map { "\($0.label):\($0.steps)" },
           "smoothSteps": smoothSteps, "jitterSigma": jitterSigma,
           "secondsPerStep": result.secondsPerStep,
           "meanLossTrace": result.meanLossTrace,
