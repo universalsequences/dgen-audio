@@ -1,0 +1,183 @@
+{
+  "loss" : 0.0016406922,
+  "params" : {
+    "ampCurve" : 0,
+    "ampDecay" : -7,
+    "attackTime" : 0.011352815,
+    "bodyAmp" : 0.75,
+    "bodyAsymmetry" : 0,
+    "bodyHarmonic" : 0,
+    "brightnessDecay" : 1,
+    "clickAmp" : 0.2,
+    "clickDecay" : -400,
+    "clickFreq" : 1400,
+    "decayTime" : 0.06190106,
+    "drive" : 0.7904369,
+    "f0" : 32.7,
+    "fAmt" : 122.30542,
+    "fBase" : 1034.5171,
+    "fDecay" : 0.01930788,
+    "fEnd" : 45,
+    "fStart" : 120,
+    "harmonicCorrections" : {
+
+    },
+    "noiseAmp" : 0.08,
+    "noiseCutoff" : 2800,
+    "noiseDecay" : -140,
+    "noteOff" : 1.55,
+    "outGain" : 0.3158105,
+    "pitchDecay" : -35,
+    "pw" : 0.5735449,
+    "releaseTime" : 0.06534525,
+    "res" : 1.3031124,
+    "shape" : 0.58230025,
+    "sustain" : 0.66658527
+  },
+  "steps" : [
+    {
+      "loss" : 0.0030242146,
+      "naturalValue" : 0.58480024,
+      "parameter" : "shape",
+      "pass" : 0
+    },
+    {
+      "loss" : 0.0030242146,
+      "naturalValue" : 0.5735449,
+      "parameter" : "pw",
+      "pass" : 0
+    },
+    {
+      "loss" : 0.0030242146,
+      "naturalValue" : 1034.5171,
+      "parameter" : "fBase",
+      "pass" : 0
+    },
+    {
+      "loss" : 0.0030242146,
+      "naturalValue" : 96.49937,
+      "parameter" : "fAmt",
+      "pass" : 0
+    },
+    {
+      "loss" : 0.0028249028,
+      "naturalValue" : 0.022427766,
+      "parameter" : "fDecay",
+      "pass" : 0
+    },
+    {
+      "loss" : 0.0028249028,
+      "naturalValue" : 1.287022,
+      "parameter" : "res",
+      "pass" : 0
+    },
+    {
+      "loss" : 0.0028249028,
+      "naturalValue" : 0.011352815,
+      "parameter" : "attackTime",
+      "pass" : 0
+    },
+    {
+      "loss" : 0.0027490284,
+      "naturalValue" : 0.06190106,
+      "parameter" : "decayTime",
+      "pass" : 0
+    },
+    {
+      "loss" : 0.0027490284,
+      "naturalValue" : 0.66658527,
+      "parameter" : "sustain",
+      "pass" : 0
+    },
+    {
+      "loss" : 0.0027490284,
+      "naturalValue" : 0.06534525,
+      "parameter" : "releaseTime",
+      "pass" : 0
+    },
+    {
+      "loss" : 0.0027490284,
+      "naturalValue" : 0.7904369,
+      "parameter" : "drive",
+      "pass" : 0
+    },
+    {
+      "loss" : 0.0027490284,
+      "naturalValue" : 0.3158105,
+      "parameter" : "outGain",
+      "pass" : 0
+    },
+    {
+      "loss" : 0.0026150506,
+      "naturalValue" : 0.58230025,
+      "parameter" : "shape",
+      "pass" : 1
+    },
+    {
+      "loss" : 0.0026150506,
+      "naturalValue" : 0.5735449,
+      "parameter" : "pw",
+      "pass" : 1
+    },
+    {
+      "loss" : 0.0026150506,
+      "naturalValue" : 1034.5171,
+      "parameter" : "fBase",
+      "pass" : 1
+    },
+    {
+      "loss" : 0.0022894563,
+      "naturalValue" : 122.30542,
+      "parameter" : "fAmt",
+      "pass" : 1
+    },
+    {
+      "loss" : 0.0022273993,
+      "naturalValue" : 0.01930788,
+      "parameter" : "fDecay",
+      "pass" : 1
+    },
+    {
+      "loss" : 0.0016406922,
+      "naturalValue" : 1.3031124,
+      "parameter" : "res",
+      "pass" : 1
+    },
+    {
+      "loss" : 0.0016406922,
+      "naturalValue" : 0.011352815,
+      "parameter" : "attackTime",
+      "pass" : 1
+    },
+    {
+      "loss" : 0.0016406922,
+      "naturalValue" : 0.06190106,
+      "parameter" : "decayTime",
+      "pass" : 1
+    },
+    {
+      "loss" : 0.0016406922,
+      "naturalValue" : 0.66658527,
+      "parameter" : "sustain",
+      "pass" : 1
+    },
+    {
+      "loss" : 0.0016406922,
+      "naturalValue" : 0.06534525,
+      "parameter" : "releaseTime",
+      "pass" : 1
+    },
+    {
+      "loss" : 0.0016406922,
+      "naturalValue" : 0.7904369,
+      "parameter" : "drive",
+      "pass" : 1
+    },
+    {
+      "loss" : 0.0016406922,
+      "naturalValue" : 0.3158105,
+      "parameter" : "outGain",
+      "pass" : 1
+    }
+  ]
+}
