@@ -9,6 +9,9 @@ enum KickVoice {
     if config.profile == "subtractive-bass" {
       return SubtractiveBassVoice.build(params: params.subtractiveBassSignals, config: config)
     }
+    if config.profile == "monologue-bass" {
+      return MonologueVoice.build(params: params.monologueSignals, config: config)
+    }
     return build(params: params.signals, config: config)
   }
 
@@ -146,7 +149,9 @@ enum SubtractiveBassVoice {
     params: SubtractiveBassVoiceSignals, config: SynthIDConfig
   ) -> Signal {
     let sr = Signal.constant(config.sampleRate)
-    let frequency = Signal.constant(110.0)
+    // Frozen fundamental from the CPU pitch fit (PatchValues.subF0; defaults
+    // to the historical 110 Hz for legacy artifacts).
+    let frequency = params.f0
     let phase = Signal.statefulPhasor(frequency)
     let saw = polyblepSaw(phase, frequency: frequency, sampleRate: sr)
     let pulse = polyblepPulse(
@@ -193,8 +198,111 @@ enum SubtractiveBassVoice {
     let attack = 1.0 - DGenLazy.exp(-t / params.attackTime)
     let decay = params.sustain
       + (1.0 - params.sustain) * DGenLazy.exp(-t / params.decayTime)
-    let release = 1.0 / (1.0 + DGenLazy.exp((t - 0.6) / params.releaseTime))
+    let release = 1.0 / (1.0 + DGenLazy.exp((t - params.noteOff) / params.releaseTime))
     let driven = filtered * attack * decay * release * params.drive
+    let shaped = driven / (1.0 + DGenLazy.abs(driven))
+    return shaped * params.outGain
+  }
+}
+
+/// Circuit-modeling subtractive voice: two detuned polyblep VCOs -> mixer ->
+/// asymmetric polynomial saturator -> ZDF SVF lowpass with feedback-state
+/// saturation -> VCA -> softsign drive. Every circuit stage is inert at its
+/// default (vco2Level=0, satA*=0/satBias=0/satGain=1, filtSat=0 -> exact
+/// linear Cytomic SVF), so the voice degrades to a plain subtractive patch.
+enum MonologueVoice {
+  private static func oscillator(
+    phase: Signal, frequency: Signal, shape: Signal, pw: Signal, sampleRate: Signal
+  ) -> Signal {
+    let dt = (frequency / sampleRate).clip(0.000001, 0.5)
+    let blep: (Signal) -> Signal = { p in
+      let lX = p / dt
+      let l = 2.0 * lX - lX * lX - 1.0
+      let rX = (p - 1.0) / dt
+      let r = rX * rX + 2.0 * rX + 1.0
+      return (p < dt) * l + (p > (1.0 - dt)) * r
+    }
+    let saw = (phase * 2.0 - 1.0) - blep(phase)
+    let clippedWidth = pw.clip(0.01, 0.99)
+    let fallingPhase = mod(phase - clippedWidth, 1.0)
+    let rawPulse = (phase < clippedWidth) * 2.0 - 1.0
+    let pulse = rawPulse + blep(phase) - blep(fallingPhase)
+    return (1.0 - shape) * saw + shape * pulse
+  }
+
+  /// Softsign with strength k: x / (1 + |k*x|). k = 0 is the identity.
+  private static func stateSat(_ x: Signal, k: Signal) -> Signal {
+    x / (1.0 + DGenLazy.abs(k * x))
+  }
+
+  static func build(params: MonologueVoiceSignals, config: SynthIDConfig) -> Signal {
+    let sr = Signal.constant(config.sampleRate)
+    let t = Signal.accum(
+      Signal.constant(1.0) / sr,
+      reset: 0.0,
+      min: 0.0,
+      max: Float(config.frames + 1) / config.sampleRate + 1.0)
+
+    // VCO2's detuned phase is closed-form: wrap(phase1 - t*detune). A
+    // trainable statefulPhasor FREQUENCY corrupts unrelated gradients (see
+    // SVFBPTTScratchTests.testFullVoiceManyTargetsGradientsWithTrainableDetune);
+    // the phase-offset form keeps vco2Detune differentiable through ordinary
+    // arithmetic (d wrap/d in = 1 a.e.), per the playbook's closed-form rule.
+    let phase1 = Signal.statefulPhasor(params.f0)
+    let phase2 = mod(phase1 - t * params.vco2Detune, 1.0)
+    let osc1 = oscillator(
+      phase: phase1, frequency: params.f0, shape: params.shape, pw: params.pw,
+      sampleRate: sr)
+    let osc2 = oscillator(
+      phase: phase2, frequency: params.f0, shape: params.shape, pw: params.pw,
+      sampleRate: sr)
+    let mixed = (osc1 + params.vco2Level * osc2) / (1.0 + params.vco2Level)
+
+    // Asymmetric polynomial saturator; the bias operating point's DC is
+    // subtracted so the stage is DC-free and exactly inert at a*=0.
+    let y = params.satGain * mixed + params.satBias
+    let b = params.satBias
+    let shapedPre =
+      y + params.satA2 * (y * y) + params.satA3 * (y * y * y)
+      + params.satA5 * (y * y * y * y * y)
+    let dcAtBias =
+      b + params.satA2 * (b * b) + params.satA3 * (b * b * b)
+      + params.satA5 * (b * b * b * b * b)
+    let preSat = shapedPre - dcAtBias
+
+    // ZDF SVF lowpass (Cytomic form; mirrors the eseq deployment `svf`
+    // macro) with per-sample envelope-driven cutoff and softsign-saturated
+    // integrator states (filtSat = 0 -> exact linear SVF).
+    let cutoffHz = (params.fBase + params.fAmt * DGenLazy.exp(-t / params.fDecay))
+      .clip(20.0, Double(config.sampleRate) * 0.49)
+    let g = DGenLazy.tan(Signal.constant(Float.pi) * cutoffHz / sr)
+    let kDamp = 1.0 / params.res
+    let a1 = 1.0 / (1.0 + g * (g + kDamp))
+    let a2 = g * a1
+
+    // Pass-through history writes are REQUIRED for correct BPTT: dangling
+    // writes (`_ = write(...)`) leave gradient carry cells unconsumed and the
+    // temporal gradient silently truncates (docs/BIQUAD_BPTT_GRADIENT_BUG.md
+    // Part B). Each write's output is routed back into the arithmetic with
+    // identical forward values: write returns 2v-s, so v = (write+s)/2, and
+    // v2 = s2 + g*v1 is the standard equivalent form of s2 + a2*s1 + a3*v3.
+    let ic1 = Signal.history()
+    let ic2 = Signal.history()
+    let s1 = stateSat(ic1.read, k: params.filtSat)
+    let s2 = stateSat(ic2.read, k: params.filtSat)
+    let v3 = preSat - s2
+    let v1 = a1 * s1 + a2 * v3
+    let ic1New = ic1.write(2.0 * v1 - s1)
+    let v1PassThrough = (ic1New + s1) * 0.5
+    let v2 = s2 + g * v1PassThrough
+    let ic2New = ic2.write(2.0 * v2 - s2)
+    let lowpass = (ic2New + s2) * 0.5
+
+    let attack = 1.0 - DGenLazy.exp(-t / params.attackTime)
+    let decay = params.sustain
+      + (1.0 - params.sustain) * DGenLazy.exp(-t / params.decayTime)
+    let release = 1.0 / (1.0 + DGenLazy.exp((t - params.noteOff) / params.releaseTime))
+    let driven = lowpass * attack * decay * release * params.drive
     let shaped = driven / (1.0 + DGenLazy.abs(driven))
     return shaped * params.outGain
   }

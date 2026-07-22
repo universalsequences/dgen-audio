@@ -74,6 +74,39 @@ BOUNDS_HOODIE_BASS = {
 for name, _, _, _ in reference.HOODIE_BASS_HARMONICS:
     BOUNDS_HOODIE_BASS[name] = (-2.0, 2.0, "linear")
 
+# Mirrors Params.swift KickParamSpecs.monologueBass: the subtractive surface
+# plus circuit stages (VCO2, polynomial pre-sat, SVF feedback saturation).
+BOUNDS_MONOLOGUE_EXTRA = {
+    "vco2Level": (0.0, 1.5, "linear"),
+    "vco2Detune": (0.05, 2.0, "log"),
+    "satGain": (0.25, 8.0, "log"),
+    "satBias": (-0.4, 0.4, "linear"),
+    "satA2": (-1.0, 1.0, "linear"),
+    "satA3": (-1.0, 1.0, "linear"),
+    "satA5": (-0.5, 0.5, "linear"),
+    "filtSat": (0.0, 4.0, "linear"),
+}
+
+# Mirrors Params.swift KickParamSpecs.subtractiveBass exactly. subF0/subNoteOff
+# are frozen documented scalars carried in the params JSON, never searched.
+BOUNDS_SUBTRACTIVE_BASS = {
+    "shape": (0.0, 1.0, "linear"),
+    "pw": (0.03, 0.97, "linear"),
+    "fBase": (30.0, 8000.0, "log"),
+    "fAmt": (0.0, 12000.0, "log1p"),
+    "fDecay": (0.005, 2.0, "log"),
+    "res": (0.5, 6.0, "log"),
+    "attackTime": (0.001, 0.5, "log"),
+    "decayTime": (0.01, 2.0, "log"),
+    "sustain": (0.0, 1.0, "linear"),
+    "releaseTime": (0.01, 1.0, "log"),
+    "drive": (0.25, 8.0, "log"),
+    "outGain": (0.05, 2.0, "log"),
+}
+
+BOUNDS_MONOLOGUE_BASS = dict(BOUNDS_SUBTRACTIVE_BASS)
+BOUNDS_MONOLOGUE_BASS.update(BOUNDS_MONOLOGUE_EXTRA)
+
 BOUNDS = BOUNDS_808
 
 
@@ -83,6 +116,8 @@ def transformed(name, value):
         return math.log(value)
     if mode == "logneg":
         return math.log(-value)
+    if mode == "log1p":
+        return math.log(1.0 + value)
     return value
 
 
@@ -92,6 +127,8 @@ def natural(name, value):
         return math.exp(value)
     if mode == "logneg":
         return -math.exp(value)
+    if mode == "log1p":
+        return math.exp(value) - 1.0
     return value
 
 
@@ -192,13 +229,18 @@ def main():
     parser.add_argument("--out-params", required=True)
     parser.add_argument("--json", required=True)
     parser.add_argument("--highpass-hz", type=float, default=compare.DEFAULT_HIGHPASS_HZ)
-    parser.add_argument("--profile", choices=["808", "909", "hoodie-bass"], default="808")
+    parser.add_argument(
+        "--profile",
+        choices=["808", "909", "hoodie-bass", "subtractive-bass", "monologue-bass"],
+        default="808")
     args = parser.parse_args()
 
     BOUNDS = {
         "808": BOUNDS_808,
         "909": BOUNDS_909,
         "hoodie-bass": BOUNDS_HOODIE_BASS,
+        "subtractive-bass": BOUNDS_SUBTRACTIVE_BASS,
+        "monologue-bass": BOUNDS_MONOLOGUE_BASS,
     }[args.profile]
 
     target, target_rate = compare.read_wav(args.target)
@@ -238,7 +280,29 @@ def main():
     best_distance = math.inf
     for index, start in enumerate(starts):
         print(f"refine_start={index}", flush=True)
-        if args.profile == "hoodie-bass":
+        if args.profile == "monologue-bass":
+            base_order = [
+                "fBase", "fAmt", "fDecay", "res", "filtSat",
+                "satGain", "satBias", "satA2", "satA3", "satA5",
+                "vco2Level", "vco2Detune", "shape", "pw",
+                "decayTime", "sustain", "attackTime", "releaseTime",
+                "drive", "outGain",
+            ]
+            params, distance = coordinate_refine(
+                objective, start, passes=8, steps=19,
+                order_override=base_order, contraction_rate=0.62)
+        elif args.profile == "subtractive-bass":
+            # Filter block first (patch identity), then VCA envelope, then
+            # tone/output. subF0/subNoteOff stay frozen in the params dict.
+            base_order = [
+                "fBase", "fAmt", "fDecay", "res", "shape", "pw",
+                "decayTime", "sustain", "attackTime", "releaseTime",
+                "drive", "outGain",
+            ]
+            params, distance = coordinate_refine(
+                objective, start, passes=8, steps=19,
+                order_override=base_order, contraction_rate=0.62)
+        elif args.profile == "hoodie-bass":
             base_order = [
                 "f0", "attackTime", "decayTime", "sustain", "noteOff",
                 "releaseTime", "brightnessDecay", "drive", "outGain",

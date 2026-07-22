@@ -36,7 +36,9 @@ def main():
     parser.add_argument("--sample-rate", type=int, default=None,
                          help="defaults to the target wav's sample rate")
     parser.add_argument("--highpass-hz", type=float, default=compare.DEFAULT_HIGHPASS_HZ)
-    parser.add_argument("--profile", choices=["808", "909", "hoodie-bass"], default="808",
+    parser.add_argument(
+        "--profile", choices=["808", "909", "hoodie-bass", "subtractive-bass", "monologue-bass"],
+        default="808",
                          help="accepted for CLI parity with refine_rung3.py; the raw"
                               " synth render does not depend on the profile's bounds")
     parser.add_argument("--no-noise-filter", action="store_true")

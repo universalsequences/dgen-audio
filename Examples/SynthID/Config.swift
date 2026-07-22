@@ -57,6 +57,9 @@ struct SynthIDConfig: Codable {
   var cosineLRDecay: Bool = true
   var freezePitch: Bool = false
   var frozenParams: [String] = []
+  // Frozen note-off (seconds) for the monologue-bass profile, from the
+  // Phase-1 measurement (--sub-note-off). nil keeps PatchValues' default.
+  var subNoteOffOverride: Float? = nil
   var enableNoiseFilter: Bool = true
   var seed: UInt64 = 1
   var rung: Int = 1
@@ -80,6 +83,9 @@ struct SynthIDConfig: Codable {
     if let value = options["rung"] { rung = try parseInt(value, "--rung") }
     if let value = options["grad-clip"] { gradClip = try parseFloat(value, "--grad-clip") }
     if let value = options["fd-eps"] { fdEpsilon = try parseFloat(value, "--fd-eps") }
+    if let value = options["sub-note-off"] {
+      subNoteOffOverride = try parseFloat(value, "--sub-note-off")
+    }
     if let value = options["direction-eps"] {
       directionEpsilon = try parseFloat(value, "--direction-eps")
     }
@@ -120,9 +126,10 @@ struct SynthIDConfig: Codable {
       }
     }
     if let value = options["profile"] {
-      guard ["808", "909", "hoodie-bass", "subtractive-bass"].contains(value) else {
+      guard ["808", "909", "hoodie-bass", "subtractive-bass", "monologue-bass"].contains(value)
+      else {
         throw SynthIDError.message(
-          "unknown --profile \(value); expected 808, 909, hoodie-bass, or subtractive-bass")
+          "unknown --profile \(value); expected 808, 909, hoodie-bass, subtractive-bass, or monologue-bass")
       }
       profile = value
       if value == "hoodie-bass" {
@@ -140,8 +147,8 @@ struct SynthIDConfig: Codable {
         freezePitch = true
         if options["pitch-refine-epochs"] == nil { pitchRefineEpochs = 0 }
       }
-      if value == "subtractive-bass" {
-        // f0 is a fixed CPU estimate in this topology, so the kick pitch
+      if value == "subtractive-bass" || value == "monologue-bass" {
+        // f0 is a fixed CPU estimate in these topologies, so the kick pitch
         // refinement phase would perform hundreds of empty optimizer steps.
         freezePitch = true
         if options["pitch-refine-epochs"] == nil { pitchRefineEpochs = 0 }

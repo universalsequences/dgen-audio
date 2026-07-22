@@ -1,0 +1,17 @@
+{
+  "cropped" : true,
+  "fittedFrames" : 26624,
+  "normalizationScale" : 1,
+  "onsetFrame" : 202,
+  "onsetSeconds" : 0.0045804987,
+  "onsetThresholdDB" : -40,
+  "outputFrames" : 26624,
+  "padded" : false,
+  "profile" : "subtractive-bass",
+  "resampledFrames" : 37870,
+  "sourceDurationSeconds" : 0.86331064,
+  "sourceFrames" : 38072,
+  "sourcePath" : "\/Users\/alecresende\/code\/swift\/dgen\/Assets\/monologue-bass.wav",
+  "sourceSampleRate" : 44100,
+  "targetSampleRate" : 44100
+}

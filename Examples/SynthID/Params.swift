@@ -221,11 +221,29 @@ enum KickParamSpecs {
     .init(name: "outGain", unit: "lin", min: 0.05, max: 2, reparam: .log, tolerance: 0.10),
   ]
 
+  // Circuit-modeling voice (monologue-bass): the subtractive surface plus a
+  // second detuned VCO, an asymmetric polynomial pre-filter saturator, and
+  // feedback saturation inside the ZDF SVF. Every addition is inert at a
+  // value inside its bounds (a*=0, satBias=0, filtSat=0 -> exact linear SVF,
+  // vco2Level=0), so the voice degrades to the plain subtractive topology.
+  static let monologueBass: [ParameterSpec] =
+    subtractiveBass + [
+      .init(name: "vco2Level", unit: "lin", min: 0, max: 1.5, reparam: .raw, tolerance: 0.10),
+      .init(name: "vco2Detune", unit: "Hz", min: 0.05, max: 2.0, reparam: .log, tolerance: 0.10),
+      .init(name: "satGain", unit: "lin", min: 0.25, max: 8, reparam: .log, tolerance: 0.10),
+      .init(name: "satBias", unit: "lin", min: -0.4, max: 0.4, reparam: .raw, tolerance: 0.10),
+      .init(name: "satA2", unit: "lin", min: -1, max: 1, reparam: .raw, tolerance: 0.10),
+      .init(name: "satA3", unit: "lin", min: -1, max: 1, reparam: .raw, tolerance: 0.10),
+      .init(name: "satA5", unit: "lin", min: -0.5, max: 0.5, reparam: .raw, tolerance: 0.10),
+      .init(name: "filtSat", unit: "lin", min: 0, max: 4, reparam: .raw, tolerance: 0.10),
+    ]
+
   static var all: [ParameterSpec] {
     switch activeProfile {
     case "909": return tr909
     case "hoodie-bass": return hoodieBass
     case "subtractive-bass": return subtractiveBass
+    case "monologue-bass": return monologueBass
     default: return tr808
     }
   }
@@ -266,6 +284,22 @@ struct PatchValues: Codable, Equatable {
   var fAmt: Float
   var fDecay: Float
   var res: Float
+  // Frozen documented scalars for the subtractive-bass profile (playbook bass
+  // section): oscillator fundamental from the CPU pitch fit and the measured
+  // note-off time. Profile-scoped keys so legacy subtractive artifacts (which
+  // carry unrelated hoodie-profile f0/noteOff defaults) keep rendering with
+  // the historical 110 Hz / 0.6 s constants.
+  var subF0: Float
+  var subNoteOff: Float
+  // monologue-bass circuit stages (inert defaults; absent in older JSONs)
+  var vco2Level: Float
+  var vco2Detune: Float
+  var satGain: Float
+  var satBias: Float
+  var satA2: Float
+  var satA3: Float
+  var satA5: Float
+  var filtSat: Float
 
   private enum CodingKeys: String, CodingKey {
     case fStart, fEnd, pitchDecay, bodyAmp, ampDecay
@@ -274,6 +308,8 @@ struct PatchValues: Codable, Equatable {
     case drive, outGain, bodyAsymmetry, bodyHarmonic, ampCurve, harmonicCorrections
     case f0, attackTime, decayTime, sustain, noteOff, releaseTime, brightnessDecay
     case shape, pw, fBase, fAmt, fDecay, res
+    case subF0, subNoteOff
+    case vco2Level, vco2Detune, satGain, satBias, satA2, satA3, satA5, filtSat
   }
 
   init(from decoder: Decoder) throws {
@@ -308,7 +344,17 @@ struct PatchValues: Codable, Equatable {
       fBase: try values.decodeIfPresent(Float.self, forKey: .fBase) ?? 490,
       fAmt: try values.decodeIfPresent(Float.self, forKey: .fAmt) ?? 108.55,
       fDecay: try values.decodeIfPresent(Float.self, forKey: .fDecay) ?? 0.1,
-      res: try values.decodeIfPresent(Float.self, forKey: .res) ?? 1.73)
+      res: try values.decodeIfPresent(Float.self, forKey: .res) ?? 1.73,
+      subF0: try values.decodeIfPresent(Float.self, forKey: .subF0) ?? 110.0,
+      subNoteOff: try values.decodeIfPresent(Float.self, forKey: .subNoteOff) ?? 0.6,
+      vco2Level: try values.decodeIfPresent(Float.self, forKey: .vco2Level) ?? 0,
+      vco2Detune: try values.decodeIfPresent(Float.self, forKey: .vco2Detune) ?? 0.316,
+      satGain: try values.decodeIfPresent(Float.self, forKey: .satGain) ?? 1.0,
+      satBias: try values.decodeIfPresent(Float.self, forKey: .satBias) ?? 0,
+      satA2: try values.decodeIfPresent(Float.self, forKey: .satA2) ?? 0,
+      satA3: try values.decodeIfPresent(Float.self, forKey: .satA3) ?? 0,
+      satA5: try values.decodeIfPresent(Float.self, forKey: .satA5) ?? 0,
+      filtSat: try values.decodeIfPresent(Float.self, forKey: .filtSat) ?? 0)
   }
 
   static var midpoint: PatchValues {
@@ -380,7 +426,17 @@ struct PatchValues: Codable, Equatable {
     fBase: Float = 490,
     fAmt: Float = 108.55,
     fDecay: Float = 0.1,
-    res: Float = 1.73
+    res: Float = 1.73,
+    subF0: Float = 110.0,
+    subNoteOff: Float = 0.6,
+    vco2Level: Float = 0,
+    vco2Detune: Float = 0.316,
+    satGain: Float = 1.0,
+    satBias: Float = 0,
+    satA2: Float = 0,
+    satA3: Float = 0,
+    satA5: Float = 0,
+    filtSat: Float = 0
   ) {
     self.fStart = fStart
     self.fEnd = fEnd
@@ -412,6 +468,16 @@ struct PatchValues: Codable, Equatable {
     self.fAmt = fAmt
     self.fDecay = fDecay
     self.res = res
+    self.subF0 = subF0
+    self.subNoteOff = subNoteOff
+    self.vco2Level = vco2Level
+    self.vco2Detune = vco2Detune
+    self.satGain = satGain
+    self.satBias = satBias
+    self.satA2 = satA2
+    self.satA3 = satA3
+    self.satA5 = satA5
+    self.filtSat = filtSat
   }
 
   init(_ dictionary: [String: Float]) {
@@ -449,7 +515,17 @@ struct PatchValues: Codable, Equatable {
       fBase: dictionary["fBase"] ?? 490,
       fAmt: dictionary["fAmt"] ?? 108.55,
       fDecay: dictionary["fDecay"] ?? 0.1,
-      res: dictionary["res"] ?? 1.73)
+      res: dictionary["res"] ?? 1.73,
+      subF0: dictionary["subF0"] ?? 110.0,
+      subNoteOff: dictionary["subNoteOff"] ?? 0.6,
+      vco2Level: dictionary["vco2Level"] ?? 0,
+      vco2Detune: dictionary["vco2Detune"] ?? 0.316,
+      satGain: dictionary["satGain"] ?? 1.0,
+      satBias: dictionary["satBias"] ?? 0,
+      satA2: dictionary["satA2"] ?? 0,
+      satA3: dictionary["satA3"] ?? 0,
+      satA5: dictionary["satA5"] ?? 0,
+      filtSat: dictionary["filtSat"] ?? 0)
   }
 
   subscript(name: String) -> Float {
@@ -484,6 +560,16 @@ struct PatchValues: Codable, Equatable {
       case "fAmt": return fAmt
       case "fDecay": return fDecay
       case "res": return res
+      case "subF0": return subF0
+      case "subNoteOff": return subNoteOff
+      case "vco2Level": return vco2Level
+      case "vco2Detune": return vco2Detune
+      case "satGain": return satGain
+      case "satBias": return satBias
+      case "satA2": return satA2
+      case "satA3": return satA3
+      case "satA5": return satA5
+      case "filtSat": return filtSat
       default: return harmonicCorrections[name] ?? .nan
       }
     }
@@ -518,6 +604,16 @@ struct PatchValues: Codable, Equatable {
       case "fAmt": fAmt = newValue
       case "fDecay": fDecay = newValue
       case "res": res = newValue
+      case "subF0": subF0 = newValue
+      case "subNoteOff": subNoteOff = newValue
+      case "vco2Level": vco2Level = newValue
+      case "vco2Detune": vco2Detune = newValue
+      case "satGain": satGain = newValue
+      case "satBias": satBias = newValue
+      case "satA2": satA2 = newValue
+      case "satA3": satA3 = newValue
+      case "satA5": satA5 = newValue
+      case "filtSat": filtSat = newValue
       default:
         if (KickParamSpecs.tr909HarmonicCorrections + KickParamSpecs.hoodieBassHarmonics)
           .contains(where: { $0.name == name }) {
@@ -544,6 +640,13 @@ struct PatchValues: Codable, Equatable {
     if KickParamSpecs.activeProfile == "hoodie-bass" {
       copy.f0 = pitch.fEnd
       return copy.clamped()
+    }
+    if KickParamSpecs.activeProfile == "monologue-bass" {
+      // subF0 is a frozen documented scalar, not a spec param — clamped()
+      // must not touch it, so set it after the spec-table clamp.
+      copy = copy.clamped()
+      copy.subF0 = pitch.fEnd
+      return copy
     }
     copy.fStart = pitch.fStart
     copy.fEnd = pitch.fEnd
@@ -625,7 +728,40 @@ struct BassVoiceSignals {
   var harmonics: [(spec: KickParamSpecs.HarmonicCorrection, coefficient: Signal)]
 }
 
+struct MonologueVoiceSignals {
+  // Frozen constants (not trainable): f0 from the CPU pitch fit, noteOff
+  // from the Phase-1 measurement.
+  var f0: Signal
+  var noteOff: Signal
+  // Subtractive surface
+  var shape: Signal
+  var pw: Signal
+  var fBase: Signal
+  var fAmt: Signal
+  var fDecay: Signal
+  var res: Signal
+  var attackTime: Signal
+  var decayTime: Signal
+  var sustain: Signal
+  var releaseTime: Signal
+  var drive: Signal
+  var outGain: Signal
+  // Circuit stages
+  var vco2Level: Signal
+  var vco2Detune: Signal
+  var satGain: Signal
+  var satBias: Signal
+  var satA2: Signal
+  var satA3: Signal
+  var satA5: Signal
+  var filtSat: Signal
+}
+
 struct SubtractiveBassVoiceSignals {
+  // Frozen constants (not trainable): f0 from the CPU pitch fit, noteOff
+  // from the Phase-1 measurement. See PatchValues.subF0/subNoteOff.
+  var f0: Signal
+  var noteOff: Signal
   var shape: Signal
   var pw: Signal
   var fBase: Signal
@@ -710,6 +846,8 @@ final class TrainableKickParams {
 
   var subtractiveBassSignals: SubtractiveBassVoiceSignals {
     SubtractiveBassVoiceSignals(
+      f0: Signal.constant(frozenNaturalValues.subF0),
+      noteOff: Signal.constant(frozenNaturalValues.subNoteOff),
       shape: naturalSignal("shape"),
       pw: naturalSignal("pw"),
       fBase: naturalSignal("fBase"),
@@ -724,6 +862,32 @@ final class TrainableKickParams {
       outGain: naturalSignal("outGain"))
   }
 
+  var monologueSignals: MonologueVoiceSignals {
+    MonologueVoiceSignals(
+      f0: Signal.constant(frozenNaturalValues.subF0),
+      noteOff: Signal.constant(frozenNaturalValues.subNoteOff),
+      shape: naturalSignal("shape"),
+      pw: naturalSignal("pw"),
+      fBase: naturalSignal("fBase"),
+      fAmt: naturalSignal("fAmt"),
+      fDecay: naturalSignal("fDecay"),
+      res: naturalSignal("res"),
+      attackTime: naturalSignal("attackTime"),
+      decayTime: naturalSignal("decayTime"),
+      sustain: naturalSignal("sustain"),
+      releaseTime: naturalSignal("releaseTime"),
+      drive: naturalSignal("drive"),
+      outGain: naturalSignal("outGain"),
+      vco2Level: naturalSignal("vco2Level"),
+      vco2Detune: naturalSignal("vco2Detune"),
+      satGain: naturalSignal("satGain"),
+      satBias: naturalSignal("satBias"),
+      satA2: naturalSignal("satA2"),
+      satA3: naturalSignal("satA3"),
+      satA5: naturalSignal("satA5"),
+      filtSat: naturalSignal("filtSat"))
+  }
+
   var transformedParams: [String: Signal] { storage }
 
   func trainableStorage(names: [String]) -> [Signal] {
@@ -731,12 +895,16 @@ final class TrainableKickParams {
   }
 
   func naturalValues() -> PatchValues {
-    var values = frozenNaturalValues.dictionary
+    // Start from the full frozen struct, NOT frozenNaturalValues.dictionary:
+    // the dictionary carries spec-table params only, so non-spec frozen
+    // scalars (subF0/subNoteOff) were silently reset to their defaults in
+    // every checkpoint (a 35 Hz patch re-rendered at 110 Hz).
+    var values = frozenNaturalValues
     for spec in KickParamSpecs.all {
       guard let raw = storage[spec.name]?.data else { continue }
       values[spec.name] = spec.inverse(raw)
     }
-    return PatchValues(values).clamped()
+    return values.clamped()
   }
 
   func transformedValues() -> [String: Float] {

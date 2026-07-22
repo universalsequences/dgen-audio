@@ -247,7 +247,7 @@ enum BasinSearch {
     LazyGraphContext.reset()
     config.applyRuntime()
     let params = BatchBench.makeParams(batchSize: batchSize)
-    let audio = BatchBench.buildAudio(params: params, config: config)
+    let audio = BatchBench.buildAudio(params: params, config: config, frozen: baseValues)
 
     func scoreAll(_ vecs: [[Float]], round: Int) throws -> [Scored] {
       let cands = vecs.map { candidate(fromTransformed: $0) }

@@ -88,6 +88,19 @@ final class SynthIDTrainer {
     let pitchFit: PitchFit
     if resolvedConfig.profile == "subtractive-bass" {
       pitchFit = PitchFit(fStart: 110, fEnd: 110, pitchDecay: -1, error: nil)
+    } else if resolvedConfig.profile == "monologue-bass" {
+      // Steady-bass median f0 over the sustained region; becomes the frozen
+      // subF0 via withPitch. 8192-sample windows cover >5 periods at 35 Hz.
+      let steady = PitchTrack.extract(
+        samples: targetSamples,
+        sampleRate: resolvedConfig.sampleRate,
+        windowSize: 8192,
+        hop: 1024,
+        minHz: 25,
+        maxHz: 160).filter { $0.time > 0.05 && $0.time < 0.5 }
+      let sorted = steady.map(\.hz).sorted()
+      let f0 = sorted.isEmpty ? 110.0 : sorted[sorted.count / 2]
+      pitchFit = PitchFit(fStart: f0, fEnd: f0, pitchDecay: -1, error: nil)
     } else if resolvedConfig.profile == "hoodie-bass" {
       let steady = PitchTrack.extract(
         samples: targetSamples,
@@ -129,7 +142,8 @@ final class SynthIDTrainer {
       frozenNames: Set(resolvedConfig.frozenParams))
 
     let isBass = resolvedConfig.profile == "hoodie-bass"
-    let isSubtractive = resolvedConfig.profile == "subtractive-bass"
+    let isMono = resolvedConfig.profile == "monologue-bass"
+    let isSubtractive = resolvedConfig.profile == "subtractive-bass" || isMono
     let pitchOpt = Adam(
       params: params.trainableStorage(
         names: isSubtractive ? [] : (isBass ? ["f0"] : ["fStart", "fEnd", "pitchDecay"])),
@@ -139,7 +153,7 @@ final class SynthIDTrainer {
       : (isBass ? KickParamSpecs.hoodieBassHarmonics.map(\.name) : [])
     let ampOpt = Adam(
       params: params.trainableStorage(
-        names: (isSubtractive ? ["sustain", "outGain"]
+        names: (isSubtractive ? ["sustain", "outGain"] + (isMono ? ["vco2Level"] : [])
           : (isBass ? ["sustain", "outGain"]
             : ["bodyAmp", "clickAmp", "outGain", "bodyAsymmetry", "bodyHarmonic"]))
           + harmonicNames),
@@ -155,7 +169,7 @@ final class SynthIDTrainer {
       params: params.trainableStorage(names: isSubtractive ? [] : ["noiseAmp"]),
       lr: resolvedConfig.noiseLR)
     var toneNames = isSubtractive
-      ? ["fBase", "fAmt", "res", "drive"]
+      ? ["fBase", "fAmt", "res", "drive"] + (isMono ? ["satGain", "filtSat"] : [])
       : (isBass ? ["drive"] : ["clickFreq", "drive"])
     if resolvedConfig.enableNoiseFilter && !isBass && !isSubtractive {
       toneNames.append("noiseCutoff")
@@ -167,7 +181,11 @@ final class SynthIDTrainer {
     // filter gradients. A dedicated slower group prevents pw/shape from
     // sprinting to a compensating bound before the filter basin settles.
     let oscillatorOpt = Adam(
-      params: params.trainableStorage(names: isSubtractive ? ["shape", "pw"] : []),
+      params: params.trainableStorage(
+        names: isSubtractive
+          ? ["shape", "pw"]
+            + (isMono ? ["satBias", "satA2", "satA3", "satA5", "vco2Detune"] : [])
+          : []),
       lr: resolvedConfig.toneLR * 0.1)
     let optimizers = [pitchOpt, ampOpt, decayOpt, noiseOpt, toneOpt, oscillatorOpt]
     let baseLRs = optimizers.map(\.lr)
@@ -503,7 +521,10 @@ final class SynthIDTrainer {
   // restart's own cold start actually won selection (rung 3 FIX 1).
   func restartInitial(pitchFit: PitchFit, restartIndex: Int) -> PatchValues {
     var values = PatchValues.midpoint.withPitch(pitchFit)
-    if config.profile == "subtractive-bass" {
+    if config.profile == "monologue-bass" {
+      if let noteOff = config.subNoteOffOverride { values.subNoteOff = noteOff }
+    }
+    if config.profile == "subtractive-bass" || config.profile == "monologue-bass" {
       func set(_ name: String, _ fraction: Float) {
         guard let spec = KickParamSpecs.byName[name] else { return }
         let bounds = spec.transformedBounds

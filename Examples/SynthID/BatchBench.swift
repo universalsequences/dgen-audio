@@ -140,7 +140,8 @@ enum BatchBench {
   }
 
   static func buildAudio(
-    params: BatchedSubtractiveParams, config: SynthIDConfig
+    params: BatchedSubtractiveParams, config: SynthIDConfig,
+    frozen: PatchValues = PatchValues([:])
   ) -> SignalTensor {
     let B = params.batchSize
     let sr = Signal.constant(config.sampleRate)
@@ -150,13 +151,14 @@ enum BatchBench {
       min: 0.0,
       max: Float(config.frames + 1) / config.sampleRate + 1.0)
 
-    // f0 fixed at 110 Hz for every candidate, exactly as the serial voice
-    // does. Routed through a [B] frequency tensor -> Signal.statefulPhasor so
-    // the batched stateful-phasor path is exercised (Signal.swift:222,
+    // f0 frozen per-target (PatchValues.subF0, default 110 Hz) for every
+    // candidate, exactly as the serial voice does. Routed through a [B]
+    // frequency tensor -> Signal.statefulPhasor so the batched
+    // stateful-phasor path is exercised (Signal.swift:222,
     // SignalTensor.swift:104), even though every lane holds the same value.
-    let freqTensor = Tensor([Float](repeating: 110.0, count: B))
+    let freqTensor = Tensor([Float](repeating: frozen.subF0, count: B))
     let phase = Signal.statefulPhasor(freqTensor)
-    let dt = (Signal.constant(110.0) / sr).clip(0.000001, 0.5)
+    let dt = (Signal.constant(frozen.subF0) / sr).clip(0.000001, 0.5)
 
     let saw = (phase * 2.0 - 1.0) - polyblep(phase, dt: dt)
     let clippedWidth = params.pw.clip(0.01, 0.99)
@@ -182,7 +184,7 @@ enum BatchBench {
       * DGenLazy.exp((Signal.constant(0.0) - t) / params.decayTime)
     let release = Signal.constant(1.0)
       / (Signal.constant(1.0)
-        + DGenLazy.exp((t - Signal.constant(0.6)) / params.releaseTime))
+        + DGenLazy.exp((t - Signal.constant(frozen.subNoteOff)) / params.releaseTime))
     let driven = filtered * attack * decay * release * params.drive
     let shaped = driven / (Signal.constant(1.0) + DGenLazy.abs(driven))
     return shaped * params.outGain

@@ -67,6 +67,9 @@ def render(
     if profile == "subtractive-bass":
         return render_subtractive_bass(
             params, t, sample_rate, enable_noise_filter, oscillator_only)
+    if profile == "monologue-bass":
+        return render_monologue_bass(
+            params, t, sample_rate, enable_noise_filter, oscillator_only)
     if profile == "hoodie-bass":
         return render_hoodie_bass(params, t)
     f_start = np.float32(params["fStart"])
@@ -180,7 +183,9 @@ def render_hoodie_bass(params, t):
 def render_subtractive_bass(
         params, t, sample_rate, enable_filter=True, oscillator_only=False):
     """Independent float32 transcription of the deployment PolyBLEP voice."""
-    frequency = np.float32(110.0)
+    # subF0/subNoteOff are frozen documented scalars (pitch fit + measured
+    # note-off); defaults preserve legacy artifacts' 110 Hz / 0.6 s constants.
+    frequency = np.float32(params.get("subF0", 110.0))
     phase = dgen_phasor(len(t), frequency, sample_rate)
     dt = np.clip(frequency / sample_rate, np.float32(0.000001), np.float32(0.5))
 
@@ -208,10 +213,104 @@ def render_subtractive_bass(
         -t / np.float32(params["decayTime"]))
     release = np.float32(1.0) / (
         np.float32(1.0)
-        + np.exp((t - np.float32(0.6)) / np.float32(params["releaseTime"])))
+        + np.exp((t - np.float32(params.get("subNoteOff", 0.6)))
+                 / np.float32(params["releaseTime"])))
     driven = filtered * attack * decay * release * np.float32(params["drive"])
     shaped = driven / (np.float32(1.0) + np.abs(driven))
     return (shaped * np.float32(params["outGain"])).astype(np.float32)
+
+
+def render_monologue_bass(params, t, sample_rate, enable_filter=True,
+                          oscillator_only=False):
+    """Independent float32 transcription of MonologueVoice (Patch.swift):
+    two detuned polyblep VCOs -> polynomial saturator -> ZDF SVF lowpass
+    with softsign-saturated integrator states -> VCA -> softsign drive."""
+    one = np.float32(1.0)
+
+    def osc(phase, freq):
+        dt = np.clip(np.float32(freq) / sample_rate,
+                     np.float32(0.000001), np.float32(0.5))
+        saw = phase * np.float32(2.0) - one - polyblep(phase, dt)
+        width = np.clip(np.float32(params["pw"]), np.float32(0.01), np.float32(0.99))
+        falling = np.mod(phase - width, one).astype(np.float32)
+        raw_pulse = (phase < width).astype(np.float32) * np.float32(2.0) - one
+        pulse = raw_pulse + polyblep(phase, dt) - polyblep(falling, dt)
+        shape = np.float32(params["shape"])
+        return ((one - shape) * saw + shape * pulse).astype(np.float32)
+
+    f0 = np.float32(params.get("subF0", 110.0))
+    # VCO2 phase is the closed-form offset wrap(phase1 - t*detune), matching
+    # MonologueVoice (a trainable statefulPhasor frequency corrupts unrelated
+    # gradients; see SVFBPTTScratchTests).
+    phase1 = dgen_phasor(len(t), float(f0), float(sample_rate))
+    detune = np.float32(params.get("vco2Detune", 0.316))
+    phase2 = np.mod(phase1 - t * detune, one).astype(np.float32)
+    osc1 = osc(phase1, f0)
+    osc2 = osc(phase2, f0)
+    lvl = np.float32(params.get("vco2Level", 0.0))
+    mixed = ((osc1 + lvl * osc2) / (one + lvl)).astype(np.float32)
+    if oscillator_only:
+        return mixed
+
+    g_sat = np.float32(params.get("satGain", 1.0))
+    bias = np.float32(params.get("satBias", 0.0))
+    a2s = np.float32(params.get("satA2", 0.0))
+    a3s = np.float32(params.get("satA3", 0.0))
+    a5s = np.float32(params.get("satA5", 0.0))
+    y = g_sat * mixed + bias
+    shaped_pre = y + a2s * (y * y) + a3s * (y * y * y) + a5s * (y * y * y * y * y)
+    dc = bias + a2s * (bias * bias) + a3s * (bias * bias * bias) \
+        + a5s * (bias * bias * bias * bias * bias)
+    pre = (shaped_pre - dc).astype(np.float32)
+
+    cutoff = np.clip(
+        (np.float32(params["fBase"])
+         + np.float32(params["fAmt"]) * np.exp(-t / np.float32(params["fDecay"]))),
+        np.float32(20.0), np.float32(sample_rate) * np.float32(0.49)).astype(np.float32)
+    if enable_filter:
+        filtered = zdf_svf_lowpass_sat(
+            pre, cutoff, np.float32(params["res"]),
+            np.float32(params.get("filtSat", 0.0)), np.float32(sample_rate))
+    else:
+        filtered = pre
+
+    attack = one - np.exp(-t / np.float32(params["attackTime"]))
+    sustain = np.float32(params["sustain"])
+    decay = sustain + (one - sustain) * np.exp(-t / np.float32(params["decayTime"]))
+    release = one / (one + np.exp(
+        (t - np.float32(params.get("subNoteOff", 0.6)))
+        / np.float32(params["releaseTime"])))
+    driven = filtered * attack * decay * release * np.float32(params["drive"])
+    shaped = driven / (one + np.abs(driven))
+    return (shaped * np.float32(params["outGain"])).astype(np.float32)
+
+
+def zdf_svf_lowpass_sat(x, cutoff, q, k_sat, sample_rate):
+    """Cytomic ZDF SVF (LP output) with softsign-saturated integrator state
+    reads; k_sat=0 is the exact linear SVF. Float32 throughout to mirror the
+    Metal render."""
+    y = np.zeros_like(x, dtype=np.float32)
+    ic1 = np.float32(0.0)
+    ic2 = np.float32(0.0)
+    one = np.float32(1.0)
+    two = np.float32(2.0)
+    k_damp = one / np.abs(np.float32(q))
+    k_sat = np.float32(k_sat)
+    pi_over_sr = np.float32(np.pi) / np.float32(sample_rate)
+    for i in range(len(x)):
+        g = np.tan(np.float32(cutoff[i]) * pi_over_sr, dtype=np.float32)
+        a1 = one / (one + g * (g + k_damp))
+        a2 = g * a1
+        a3 = g * a2
+        s1 = ic1 / (one + np.abs(k_sat * ic1))
+        s2 = ic2 / (one + np.abs(k_sat * ic2))
+        v3 = np.float32(x[i]) - s2
+        v1 = a1 * s1 + a2 * v3
+        v2 = s2 + a2 * s1 + a3 * v3
+        ic1 = np.float32(two * v1 - s1)
+        ic2 = np.float32(two * v2 - s2)
+        y[i] = v2
+    return y
 
 
 def polyblep(phase, dt):

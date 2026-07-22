@@ -158,7 +158,8 @@ enum BatchRefine {
   /// (shape/pw/sustain) are the tensors themselves; log params go through
   /// exp() in-graph; fAmt (logOnePlus) through exp()-1.
   static func buildStudent(
-    z zList: [(name: String, tensor: Tensor)], batch: Int, config: SynthIDConfig
+    z zList: [(name: String, tensor: Tensor)], batch: Int, config: SynthIDConfig,
+    frozen: PatchValues = PatchValues([:])
   ) -> SignalTensor {
     let z = Dictionary(uniqueKeysWithValues: zList)
     let one = Signal.constant(1.0)
@@ -184,11 +185,11 @@ enum BatchRefine {
     let drive = DGenLazy.exp(z["drive"]! * one)
     let outGain = DGenLazy.exp(z["outGain"]! * one)
 
-    // f0 is fixed at 110 Hz in this topology (freezePitch), same as the
-    // scalar voice and BatchBench.
-    let freqTensor = Tensor([Float](repeating: 110.0, count: batch))
+    // f0 is frozen per-target (PatchValues.subF0, default 110 Hz for legacy
+    // artifacts), shared across lanes, same as the scalar voice.
+    let freqTensor = Tensor([Float](repeating: frozen.subF0, count: batch))
     let phase = Signal.statefulPhasor(freqTensor)
-    let dt = (Signal.constant(110.0) / sr).clip(0.000001, 0.5)
+    let dt = (Signal.constant(frozen.subF0) / sr).clip(0.000001, 0.5)
 
     let saw = (phase * 2.0 - 1.0) - polyblep(phase, dt: dt)
     // pw's transformed bounds [0.03, 0.97] are inside the scalar voice's
@@ -208,7 +209,7 @@ enum BatchRefine {
     let decay = sustain
       + (Signal.constant(1.0) - sustain) * DGenLazy.exp((Signal.constant(0.0) - t) / decayTime)
     let release = Signal.constant(1.0)
-      / (Signal.constant(1.0) + DGenLazy.exp((t - Signal.constant(0.6)) / releaseTime))
+      / (Signal.constant(1.0) + DGenLazy.exp((t - Signal.constant(frozen.subNoteOff)) / releaseTime))
     let driven = filtered * attack * decay * release * drive
     let shaped = driven / (Signal.constant(1.0) + DGenLazy.abs(driven))
     return shaped * outGain
@@ -405,7 +406,7 @@ enum BatchRefine {
       let phaseStep = step - phaseStart
       let phaseProgress = Float(phaseStep) / Float(max(1, phase.steps - 1))
 
-      let student = buildStudent(z: z, batch: batch, config: config)
+      let student = buildStudent(z: z, batch: batch, config: config, frozen: laneInits[0])
       let target = onesTensor * targetTensor.toSignal(maxFrames: config.frames)
       let loss: Signal
       switch phase.kind {
@@ -472,7 +473,7 @@ enum BatchRefine {
     LazyGraphContext.reset()
     config.applyRuntime()
     let params = BatchBench.makeParams(batchSize: batch)
-    let audio = BatchBench.buildAudio(params: params, config: config)
+    let audio = BatchBench.buildAudio(params: params, config: config, frozen: base)
     params.update(candidates: lanes.map { SubtractiveCandidate($0.clamped()) })
     let flat = try audio.realize(frames: config.frames)
     let deinterleaved = BatchBench.deinterleave(flat, frames: config.frames, batchSize: batch)
@@ -516,7 +517,8 @@ enum BatchRefine {
     let z = makeZ(lanes: laneInits)
     let targetTensor = Tensor(targetSamples)
     let onesTensor = Tensor([Float](repeating: 1, count: laneInits.count))
-    let student = buildStudent(z: z, batch: laneInits.count, config: config)
+    let student = buildStudent(
+      z: z, batch: laneInits.count, config: config, frozen: laneInits[0])
     let target = onesTensor * targetTensor.toSignal(maxFrames: config.frames)
     let loss = buildBatchedLoss(
       student: student, target: target, batch: laneInits.count, config: config, smooth: false)
