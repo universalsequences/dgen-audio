@@ -28,14 +28,15 @@ func detectShapeTransitions(block: Block, g: Graph) -> [(nodeIndex: Int, shape: 
       // Check for shape change
       var needsNewRegion = shape != currentShape
 
-      // Conv2d/conv1d have global read patterns - they need ALL elements of their
+      // Conv2d/conv1d/cumsum/gather have global read patterns - they need ALL elements of their
       // input tensor to be computed before ANY conv2d output is computed.
       // Force a region boundary BEFORE conv2d so the input is complete.
       // Also, conv2d emits its own parallelRange internally, so it must be
       // in its own region (not mixed with other element-wise ops).
       switch node.op {
-      case .conv2d, .conv1d:
-        // Always start a new region for conv2d, even if shape matches
+      case .conv2d, .conv1d, .cumsum, .gather:
+        // Always start a new region for conv/cumsum/gather, even if shape matches:
+        // they read across the tensor and emit their own internal loop.
         needsNewRegion = true
       default:
         break
@@ -49,7 +50,7 @@ func detectShapeTransitions(block: Block, g: Graph) -> [(nodeIndex: Int, shape: 
       // Force region boundary AFTER conv2d - it has its own internal loop,
       // so subsequent ops must be in a separate region
       switch node.op {
-      case .conv2d, .conv1d:
+      case .conv2d, .conv1d, .cumsum, .gather:
         // Mark that next tensor node needs new region even if same shape
         currentShape = nil
       default:
@@ -105,16 +106,17 @@ func computeShapeAwareOutboundCells(
   var outbound = findOutboundTensorCells(blocks, g, block: block)
   outbound.formUnion(findCrossRegionOutboundCells(block: block, g: g, transitions: transitions))
 
-  // Conv ops use memoryRead() directly; input MUST be in memory, not registers.
+  // Conv/cumsum/gather ops use memoryRead() directly; input MUST be in memory, not registers.
   for nodeId in block.nodes {
     guard let node = g.nodes[nodeId] else { continue }
     switch node.op {
-    case .conv2d, .conv1d:
-      if let inputId = node.inputs.first,
-        let tensorId = g.nodeToTensor[inputId],
-        let tensor = g.tensors[tensorId]
-      {
-        outbound.insert(tensor.cellId)
+    case .conv2d, .conv1d, .cumsum, .gather:
+      for inputId in node.inputs {
+        if let tensorId = g.nodeToTensor[inputId],
+          let tensor = g.tensors[tensorId]
+        {
+          outbound.insert(tensor.cellId)
+        }
       }
     default:
       break
@@ -590,12 +592,12 @@ func buildRegions(
       }
     }
 
-    // Check if this region contains only conv2d (which has its own parallelRange)
+    // Check if this region contains only conv/cumsum/gather (which has its own parallelRange)
     let firstNodeId = block.nodes[transition.nodeIndex]
     let isConvOnly: Bool
     if let firstNode = g.nodes[firstNodeId] {
       switch firstNode.op {
-      case .conv2d, .conv1d:
+      case .conv2d, .conv1d, .cumsum, .gather:
         isConvOnly = (regionEnd - transition.nodeIndex == 1)
       default:
         isConvOnly = false
@@ -624,6 +626,15 @@ func buildRegions(
         scalarNodes: scalarNodes, tensorNodes: tensorNodes, shape: transition.shape,
         isConvOnly: isConvOnly, isSkipped: false, hopCounter: hopCounter
       ))
+  }
+
+  if ProcessInfo.processInfo.environment["DGEN_DEBUG_REGIONS"] != nil {
+    print("[Regions] block nodes=\(block.nodes)")
+    for (i, r) in regions.enumerated() {
+      let scalarOps = r.scalarNodes.map { "\($0):\(g.nodes[$0]?.op)" }
+      let tensorOps = r.tensorNodes.map { "\($0):\(g.nodes[$0]?.op)" }
+      print("[Regions]  #\(i) shape=\(r.shape) convOnly=\(r.isConvOnly) scalar=\(scalarOps) tensor=\(tensorOps)")
+    }
   }
 
   return regions

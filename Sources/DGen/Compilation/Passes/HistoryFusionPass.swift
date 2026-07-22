@@ -34,8 +34,21 @@ extension GraphPrepPasses {
     for cellId in historyReads.keys.sorted() {
       guard let readNodeId = historyReads[cellId] else { continue }
       if let writeInfo = historyWrites[cellId] {
+        // historyReadWrite is a scalar delay operation. Tensor history must keep
+        // its explicit read/write pair so emission indexes every element and
+        // feedback scheduling keeps the whole state update in one frame loop.
+        guard graph.cellToTensor[cellId] == nil else {
+          if options.debug {
+            print("Skipping history fusion for tensor cell \(cellId)")
+          }
+          continue
+        }
+
         // Check if neither the read nor write node is in a feedback loop.
-        if !nodesInFeedback.contains(readNodeId) && !nodesInFeedback.contains(writeInfo.nodeId) {
+        // Skip writes that carry a reset (2nd input): historyReadWrite has no
+        // reset path, so fusing would silently drop the reset.
+        if writeInfo.inputs.count <= 1
+          && !nodesInFeedback.contains(readNodeId) && !nodesInFeedback.contains(writeInfo.nodeId) {
           // Replace the historyRead node with historyReadWrite using the write's inputs.
           if graph.nodes[readNodeId] != nil {
             let newNode = Node(
@@ -47,6 +60,27 @@ extension GraphPrepPasses {
 
             // Remove the historyWrite node.
             graph.nodes.removeValue(forKey: writeInfo.nodeId)
+
+            // historyWrite is pass-through: its output is its input's value.
+            // Rewire any consumers of the removed write node to the write's
+            // input so they keep receiving the same (current-frame) value.
+            let passThroughSource = writeInfo.inputs[0]
+            for (consumerId, consumer) in graph.nodes
+            where consumer.inputs.contains(writeInfo.nodeId)
+              || consumer.temporalDependencies.contains(writeInfo.nodeId) {
+              var replacement = Node(
+                id: consumerId,
+                op: consumer.op,
+                inputs: consumer.inputs.map {
+                  $0 == writeInfo.nodeId ? passThroughSource : $0
+                }
+              )
+              replacement.temporalDependencies = consumer.temporalDependencies.map {
+                $0 == writeInfo.nodeId ? passThroughSource : $0
+              }
+              replacement.shape = consumer.shape
+              graph.nodes[consumerId] = replacement
+            }
 
             if options.debug {
               print("   - Converted read node \(readNodeId) to historyReadWrite")

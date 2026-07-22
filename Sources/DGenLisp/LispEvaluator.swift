@@ -30,20 +30,24 @@ struct ParamInfo {
   let max: Float?
   let unit: String?
   let hidden: Bool
+  let group: String?
+  let env: String?
+  let role: UIEnvelopeRole?
   let generatedKind: String?
   let generatedFor: String?
   let modulationMode: ModulationMode?
   let modulationDepthMin: Float?
   let modulationDepthMax: Float?
-  let modulationSourceParamName: String?
-  let modulationDepthParamName: String?
+  let modulationActiveParamName: String?
   let modulationResolvedSymbolName: String?
+  let generatedModulatorSlot: Int?
 }
 
 struct OutputInfo {
   let channel: Int
   let signal: Signal
   let name: String?
+  let modulatorSlot: Int?
 }
 
 struct InputInfo {
@@ -58,6 +62,7 @@ struct TensorInfo {
   let kind: String
   let mutable: Bool
   let sourceFile: String?
+  let sourceSampleRate: Float?
   let data: [Float]?
 }
 
@@ -95,6 +100,7 @@ class LispEvaluator {
     for node in nodes {
       let _ = try evaluateAST(node)
     }
+    try validateParamUIMetadata(params)
   }
 
   // MARK: - AST Evaluation
@@ -144,6 +150,10 @@ class LispEvaluator {
   // MARK: - Atom evaluation
 
   private func evaluateAtom(_ value: String) throws -> EvalResult {
+    if value.lowercased() == "samplerate" || value.lowercased() == "sample-rate" {
+      return .signal(Signal.hostSampleRate())
+    }
+
     if let result = definitions[value] {
       return result
     }
@@ -241,9 +251,53 @@ class LispEvaluator {
     return .none
   }
 
+  /// Parses trailing `@attr value` pairs starting at `startIndex` (after the name).
+  private func parseTrailingAttributes(
+    _ elements: [ASTNode], startIndex: Int, form: String
+  ) throws -> [(name: String, value: String)] {
+    var attrs: [(name: String, value: String)] = []
+    var i = startIndex
+    while i < elements.count {
+      guard case .atom(let key) = elements[i], key.hasPrefix("@") else {
+        throw LispError.parseError("\(form) expects attributes after the name")
+      }
+      if i + 1 < elements.count, case .atom(let attrValue) = elements[i + 1] {
+        attrs.append((key, attrValue))
+        i += 2
+      } else {
+        attrs.append((key, ""))
+        i += 1
+      }
+    }
+    return attrs
+  }
+
+  /// Creates a tensor history binding (optionally hop-gated) from parsed attributes.
+  private func makeTensorHistoryBinding(
+    name: String, attrs: [(name: String, value: String)], form: String
+  ) throws {
+    guard let shapeStr = attrValue(attrs, "@shape") else {
+      throw LispError.invalidArgument("\(form) requires @shape [d1,d2,...]")
+    }
+    let shape = parseShape(shapeStr)
+    let hop = attrValue(attrs, "@hop").flatMap { Int($0) }
+    let data = attrValue(attrs, "@data").map { parseFloatList($0) }
+    tensorHistoryBindings[name] = TensorHistory(shape: shape, hop: hop, data: data)
+  }
+
+  /// `(make-history name)` creates a scalar signal feedback cell.
+  /// `(make-history name @shape [...] [@hop N] [@data [...]])` creates a tensor
+  /// history (the `@shape` form); with `@hop` the feedback advances once per hop
+  /// (fs/hop) for STFT-style spectral state. Both attributes are optional; absent
+  /// `@shape` yields the scalar form. `read-history`/`write-history` work on either.
   private func evaluateMakeHistory(_ elements: [ASTNode]) throws -> EvalResult {
     guard elements.count >= 2, case .atom(let name) = elements[1] else {
       throw LispError.parseError("make-history requires a name: (make-history name)")
+    }
+    let attrs = try parseTrailingAttributes(elements, startIndex: 2, form: "make-history")
+    if attrValue(attrs, "@shape") != nil {
+      try makeTensorHistoryBinding(name: name, attrs: attrs, form: "make-history")
+      return .none
     }
     let history = Signal.history()
     historyBindings[name] = history
@@ -253,6 +307,9 @@ class LispEvaluator {
   private func evaluateReadHistory(_ elements: [ASTNode]) throws -> EvalResult {
     guard elements.count >= 2, case .atom(let name) = elements[1] else {
       throw LispError.parseError("read-history requires a name")
+    }
+    if let history = tensorHistoryBindings[name] {
+      return .signalTensor(history.read())
     }
     guard let binding = historyBindings[name] else {
       throw LispError.historyNotFound(name)
@@ -264,10 +321,19 @@ class LispEvaluator {
     guard elements.count >= 3, case .atom(let name) = elements[1] else {
       throw LispError.parseError("write-history requires name and value")
     }
+    if let history = tensorHistoryBindings[name] {
+      return try writeTensorHistoryValue(history, valueNode: elements[2])
+    }
     guard let binding = historyBindings[name] else {
       throw LispError.historyNotFound(name)
     }
     let value = try requireSignal(evaluateAST(elements[2]))
+    // Optional 3rd arg is a reset signal: when high, the cell stores 0 so the
+    // next read returns 0 (used to clear feedback on a trigger).
+    if elements.count >= 4 {
+      let reset = try requireSignal(evaluateAST(elements[3]))
+      return .signal(Signal.historyWriteReset(read: binding.read, value: value, reset: reset))
+    }
     let result = binding.write(value)
     return .signal(result)
   }
@@ -276,26 +342,8 @@ class LispEvaluator {
     guard elements.count >= 2, case .atom(let name) = elements[1] else {
       throw LispError.parseError("make-tensor-history requires a name")
     }
-    var attrs: [(name: String, value: String)] = []
-    var i = 2
-    while i < elements.count {
-      guard case .atom(let key) = elements[i], key.hasPrefix("@") else {
-        throw LispError.parseError("make-tensor-history expects attributes after the name")
-      }
-      if i + 1 < elements.count, case .atom(let attrValue) = elements[i + 1] {
-        attrs.append((key, attrValue))
-        i += 2
-      } else {
-        attrs.append((key, ""))
-        i += 1
-      }
-    }
-    guard let shapeStr = attrValue(attrs, "@shape") else {
-      throw LispError.invalidArgument("make-tensor-history requires @shape [d1,d2,...]")
-    }
-    let shape = parseShape(shapeStr)
-    let data = attrValue(attrs, "@data").map { parseFloatList($0) }
-    tensorHistoryBindings[name] = TensorHistory(shape: shape, data: data)
+    let attrs = try parseTrailingAttributes(elements, startIndex: 2, form: "make-tensor-history")
+    try makeTensorHistoryBinding(name: name, attrs: attrs, form: "make-tensor-history")
     return .none
   }
 
@@ -309,14 +357,10 @@ class LispEvaluator {
     return .signalTensor(history.read())
   }
 
-  private func evaluateWriteTensorHistory(_ elements: [ASTNode]) throws -> EvalResult {
-    guard elements.count >= 3, case .atom(let name) = elements[1] else {
-      throw LispError.parseError("write-tensor-history requires name and value")
-    }
-    guard let history = tensorHistoryBindings[name] else {
-      throw LispError.historyNotFound(name)
-    }
-    let value = try evaluateAST(elements[2])
+  private func writeTensorHistoryValue(
+    _ history: TensorHistory, valueNode: ASTNode
+  ) throws -> EvalResult {
+    let value = try evaluateAST(valueNode)
     switch value {
     case .tensor(let t):
       return .tensor(history.write(t))
@@ -325,6 +369,16 @@ class LispEvaluator {
     default:
       throw LispError.typeError("write-tensor-history: value must be tensor or signalTensor")
     }
+  }
+
+  private func evaluateWriteTensorHistory(_ elements: [ASTNode]) throws -> EvalResult {
+    guard elements.count >= 3, case .atom(let name) = elements[1] else {
+      throw LispError.parseError("write-tensor-history requires name and value")
+    }
+    guard let history = tensorHistoryBindings[name] else {
+      throw LispError.historyNotFound(name)
+    }
+    return try writeTensorHistoryValue(history, valueNode: elements[2])
   }
 
   // MARK: - Macro expansion
@@ -498,7 +552,7 @@ class LispEvaluator {
       return try evalMod(regularArgs)
 
     // Unary math
-    case "sin", "cos", "tan", "tanh", "exp", "log", "log10", "sqrt", "abs", "sign",
+    case "sin", "cos", "tan", "atan", "tanh", "exp", "log", "log10", "sqrt", "abs", "sign",
       "floor", "ceil", "round", "relu", "sigmoid":
       return try evalUnaryMath(regularArgs, fn: op)
 
@@ -592,6 +646,8 @@ class LispEvaluator {
       return try evalPeek(regularArgs)
     case "peek-row", "peekrow":
       return try evalPeekRow(regularArgs)
+    case "gather":
+      return try evalGather(regularArgs)
     case "sample":
       return try evalSample(regularArgs)
     case "to-signal", "tosignal":
@@ -611,7 +667,7 @@ class LispEvaluator {
     case "repeat":
       return try evalRepeat(regularArgs, attributes: attributePairs)
     case "conv2d":
-      return try evalConv2d(regularArgs)
+      return try evalConv2d(regularArgs, attributes: attributePairs)
     case "conv1d":
       return try evalConv1d(regularArgs)
     case "windows":
@@ -628,6 +684,8 @@ class LispEvaluator {
       return try evalSumAxis(regularArgs, attributes: attributePairs)
     case "mean-axis", "meanaxis":
       return try evalMeanAxis(regularArgs, attributes: attributePairs)
+    case "cumsum", "cumulative-sum":
+      return try evalCumsum(regularArgs, attributes: attributePairs)
     case "softmax":
       return try evalSoftmax(regularArgs, attributes: attributePairs)
 
@@ -668,6 +726,8 @@ class LispEvaluator {
       return try evalOverlapAdd(regularArgs)
 
     // Utility
+    case "tuple":
+      return try evalTuple(regularArgs)
     case "scale":
       return try evalScale(regularArgs)
     case "triangle":
@@ -680,6 +740,8 @@ class LispEvaluator {
       return try evalGswitch(regularArgs)
     case "selector":
       return try evalSelector(regularArgs)
+    case "__modulated-param":
+      return try evalModulatedParam(regularArgs, attributes: attributePairs)
 
     default:
       throw LispError.unknownOperator(opName)
@@ -687,6 +749,13 @@ class LispEvaluator {
   }
 
   // MARK: - Arithmetic
+
+  private func evalTuple(_ args: [ASTNode]) throws -> EvalResult {
+    guard !args.isEmpty else {
+      throw LispError.invalidArgument("tuple requires at least 1 argument")
+    }
+    return .tuple(try args.map { try evaluateAST($0) })
+  }
 
   private func evalBinaryArith(_ args: [ASTNode], op: String) throws -> EvalResult {
     guard args.count == 2 else {
@@ -761,6 +830,8 @@ class LispEvaluator {
       case "-": return .signalTensor(a - b)
       case "*": return .signalTensor(a * b)
       case "/": return .signalTensor(a / b)
+      case "min": return .signalTensor(DGenLazy.min(a, b))
+      case "max": return .signalTensor(DGenLazy.max(a, b))
       default: throw LispError.unknownOperator(op)
       }
 
@@ -897,6 +968,7 @@ class LispEvaluator {
       case "sin": return .float(Foundation.sin(f))
       case "cos": return .float(Foundation.cos(f))
       case "tan": return .float(Foundation.tan(f))
+      case "atan": return .float(Foundation.atan(f))
       case "tanh": return .float(Foundation.tanh(f))
       case "exp": return .float(Foundation.exp(f))
       case "log": return .float(Foundation.log(f))
@@ -917,6 +989,7 @@ class LispEvaluator {
       case "sin": return .signal(DGenLazy.sin(s))
       case "cos": return .signal(DGenLazy.cos(s))
       case "tan": return .signal(DGenLazy.tan(s))
+      case "atan": return .signal(DGenLazy.atan(s))
       case "tanh": return .signal(DGenLazy.tanh(s))
       case "exp": return .signal(DGenLazy.exp(s))
       case "log": return .signal(DGenLazy.log(s))
@@ -937,6 +1010,7 @@ class LispEvaluator {
       case "sin": return .tensor(DGenLazy.sin(t))
       case "cos": return .tensor(DGenLazy.cos(t))
       case "tan": return .tensor(DGenLazy.tan(t))
+      case "atan": return .tensor(DGenLazy.atan(t))
       case "tanh": return .tensor(DGenLazy.tanh(t))
       case "exp": return .tensor(DGenLazy.exp(t))
       case "log": return .tensor(DGenLazy.log(t))
@@ -956,6 +1030,7 @@ class LispEvaluator {
       switch fn {
       case "sin": return .signalTensor(DGenLazy.sin(st))
       case "cos": return .signalTensor(DGenLazy.cos(st))
+      case "atan": return .signalTensor(DGenLazy.atan(st))
       case "exp": return .signalTensor(DGenLazy.exp(st))
       case "log": return .signalTensor(DGenLazy.log(st))
       case "log10": return .signalTensor(DGenLazy.log10(st))
@@ -964,6 +1039,9 @@ class LispEvaluator {
       case "sign": return .signalTensor(DGenLazy.sign(st))
       case "tanh": return .signalTensor(DGenLazy.tanh(st))
       case "relu": return .signalTensor(DGenLazy.relu(st))
+      case "floor": return .signalTensor(DGenLazy.floor(st))
+      case "ceil": return .signalTensor(DGenLazy.ceil(st))
+      case "round": return .signalTensor(DGenLazy.round(st))
       default: throw LispError.typeError("\(fn) not available for SignalTensor")
       }
 
@@ -1033,6 +1111,12 @@ class LispEvaluator {
       return .signal(DGenLazy.mod(x, y))
     case (.signal(let x), .float(let y)):
       return .signal(DGenLazy.mod(x, Double(y)))
+    case (.signalTensor(let x), .signalTensor(let y)):
+      return .signalTensor(DGenLazy.mod(x, y))
+    case (.signalTensor(let x), .signal(let y)):
+      return .signalTensor(DGenLazy.mod(x, y))
+    case (.signalTensor(let x), .float(let y)):
+      return .signalTensor(DGenLazy.mod(x, Double(y)))
     default:
       throw LispError.typeError("%: unsupported type combination")
     }
@@ -1113,6 +1197,62 @@ class LispEvaluator {
       case "eq": return .tensor(a.eq(b))
       default: throw LispError.unknownOperator(op)
       }
+    case (.signalTensor(let a), .signalTensor(let b)):
+      switch op {
+      case "gt": return .signalTensor(a > b)
+      case "lt": return .signalTensor(a < b)
+      case "gte": return .signalTensor(a >= b)
+      case "lte": return .signalTensor(a <= b)
+      default: throw LispError.unknownOperator(op)
+      }
+    case (.signalTensor(let a), .signal(let b)):
+      switch op {
+      case "gt": return .signalTensor(a > b)
+      case "lt": return .signalTensor(a < b)
+      case "gte": return .signalTensor(a >= b)
+      case "lte": return .signalTensor(a <= b)
+      default: throw LispError.unknownOperator(op)
+      }
+    case (.signal(let a), .signalTensor(let b)):
+      switch op {
+      case "gt": return .signalTensor(a > b)
+      case "lt": return .signalTensor(a < b)
+      case "gte": return .signalTensor(a >= b)
+      case "lte": return .signalTensor(a <= b)
+      default: throw LispError.unknownOperator(op)
+      }
+    case (.signalTensor(let a), .tensor(let b)):
+      switch op {
+      case "gt": return .signalTensor(a > b)
+      case "lt": return .signalTensor(a < b)
+      case "gte": return .signalTensor(a >= b)
+      case "lte": return .signalTensor(a <= b)
+      default: throw LispError.unknownOperator(op)
+      }
+    case (.tensor(let a), .signalTensor(let b)):
+      switch op {
+      case "gt": return .signalTensor(a > b)
+      case "lt": return .signalTensor(a < b)
+      case "gte": return .signalTensor(a >= b)
+      case "lte": return .signalTensor(a <= b)
+      default: throw LispError.unknownOperator(op)
+      }
+    case (.signalTensor(let a), .float(let b)):
+      switch op {
+      case "gt": return .signalTensor(a > Double(b))
+      case "lt": return .signalTensor(a < Double(b))
+      case "gte": return .signalTensor(a >= Double(b))
+      case "lte": return .signalTensor(a <= Double(b))
+      default: throw LispError.unknownOperator(op)
+      }
+    case (.float(let a), .signalTensor(let b)):
+      switch op {
+      case "gt": return .signalTensor(Double(a) > b)
+      case "lt": return .signalTensor(Double(a) < b)
+      case "gte": return .signalTensor(Double(a) >= b)
+      case "lte": return .signalTensor(Double(a) <= b)
+      default: throw LispError.unknownOperator(op)
+      }
     default:
       throw LispError.typeError("Comparison \(op): unsupported type combination")
     }
@@ -1173,9 +1313,19 @@ class LispEvaluator {
     guard args.count == 2 else {
       throw LispError.invalidArgument("latch requires 2 arguments (value, trigger)")
     }
-    let value = try requireSignal(evaluateAST(args[0]))
+    let value = try promoteToValue(evaluateAST(args[0]))
     let trigger = try requireSignal(evaluateAST(args[1]))
-    return .signal(Signal.latch(value, when: trigger))
+    switch value {
+    case .signal(let signal):
+      return .signal(Signal.latch(signal, when: trigger))
+    case .signalTensor(let tensor):
+      return .signalTensor(SignalTensor.latch(tensor, when: trigger))
+    case .tensor(let tensor):
+      let promoted = tensor + (trigger * 0)
+      return .signalTensor(SignalTensor.latch(promoted, when: trigger))
+    default:
+      throw LispError.typeError("latch: value must be signal, tensor, or signalTensor")
+    }
   }
 
   private func evalHopHold(_ args: [ASTNode]) throws -> EvalResult {
@@ -1273,6 +1423,9 @@ class LispEvaluator {
     let maxVal = Float(attrValue(attributes, "@max") ?? "")
     let unit = attrValue(attributes, "@unit")
     let hidden = parseBoolAttr(attributes, "@hidden")
+    let group = try parseUIMetadataSymbol(attrValue(attributes, "@group"), attribute: "@group", paramName: name)
+    let env = try parseUIMetadataSymbol(attrValue(attributes, "@env"), attribute: "@env", paramName: name)
+    let role = try parseUIEnvelopeRole(attrValue(attributes, "@role"), paramName: name)
     let generatedKind = attrValue(attributes, "@generated")
     let generatedFor = attrValue(attributes, "@generated-for")
     let modulationMode = attrValue(attributes, "@mod-mode").flatMap {
@@ -1280,9 +1433,9 @@ class LispEvaluator {
     }
     let modulationDepthMin = Float(attrValue(attributes, "@mod-depth-min") ?? "")
     let modulationDepthMax = Float(attrValue(attributes, "@mod-depth-max") ?? "")
-    let modulationSourceParamName = attrValue(attributes, "@mod-source-param")
-    let modulationDepthParamName = attrValue(attributes, "@mod-depth-param")
+    let modulationActiveParamName = attrValue(attributes, "@mod-active-param")
     let modulationResolvedSymbolName = attrValue(attributes, "@mod-resolved-symbol")
+    let generatedModulatorSlot = Int(attrValue(attributes, "@modulator-slot") ?? "")
 
     let signal = Signal.param(defaultVal, min: minVal, max: maxVal)
 
@@ -1294,14 +1447,17 @@ class LispEvaluator {
       max: maxVal,
       unit: unit,
       hidden: hidden,
+      group: group,
+      env: env,
+      role: role,
       generatedKind: generatedKind,
       generatedFor: generatedFor,
       modulationMode: modulationMode,
       modulationDepthMin: modulationDepthMin,
       modulationDepthMax: modulationDepthMax,
-      modulationSourceParamName: modulationSourceParamName,
-      modulationDepthParamName: modulationDepthParamName,
-      modulationResolvedSymbolName: modulationResolvedSymbolName
+      modulationActiveParamName: modulationActiveParamName,
+      modulationResolvedSymbolName: modulationResolvedSymbolName,
+      generatedModulatorSlot: generatedModulatorSlot
     )
     params.append(info)
     definitions[name] = .signal(signal)
@@ -1348,7 +1504,15 @@ class LispEvaluator {
     let channel = channelLisp - 1
 
     let name = attrValue(attributes, "@name")
-    outputs.append(OutputInfo(channel: channel, signal: signal, name: name))
+    let modulatorSlot = try parseOptionalPositiveIntAttribute(attributes, "@modulator")
+    if let modulatorSlot,
+      outputs.contains(where: { $0.modulatorSlot == modulatorSlot })
+    {
+      throw LispError.invalidArgument("duplicate output @modulator slot \(modulatorSlot)")
+    }
+    outputs.append(
+      OutputInfo(channel: channel, signal: signal, name: name, modulatorSlot: modulatorSlot)
+    )
 
     return .none
   }
@@ -1441,6 +1605,7 @@ class LispEvaluator {
         kind: kind,
         mutable: false,
         sourceFile: file,
+        sourceSampleRate: loaded.sampleRate,
         data: samples
       ))
     return .tensor(tensor)
@@ -1699,6 +1864,7 @@ class LispEvaluator {
         kind: "wavetable",
         mutable: mutable,
         sourceFile: sourceFile,
+        sourceSampleRate: nil,
         data: data
       ))
     return .tensor(tensor)
@@ -1716,6 +1882,25 @@ class LispEvaluator {
     case .tensor(let t): return .signalTensor(t.peekRow(index))
     case .signalTensor(let st): return .signalTensor(st.peekRow(index))
     default: throw LispError.typeError("peek-row: first argument must be tensor or signalTensor")
+    }
+  }
+
+  private func evalGather(_ args: [ASTNode]) throws -> EvalResult {
+    guard args.count == 2 else {
+      throw LispError.invalidArgument("gather requires 2 arguments (source, indices)")
+    }
+    let source = try evaluateAST(args[0])
+    let indexResult = try evaluateAST(args[1])
+    switch (source, indexResult) {
+    // Static index tensor.
+    case (.tensor(let t), .tensor(let idx)): return .tensor(t.gather(idx))
+    case (.signalTensor(let st), .tensor(let idx)): return .signalTensor(st.gather(idx))
+    // Dynamic, per-frame index (SignalTensor) -> frame-aware gather.
+    case (.signalTensor(let st), .signalTensor(let idx)):
+      return .signalTensor(DGenLazy.gather(st, idx))
+    case (.tensor(let t), .signalTensor(let idx)):
+      return .signalTensor(DGenLazy.gather(t, idx))
+    default: throw LispError.typeError("gather: source must be tensor/signalTensor, index must be tensor/signalTensor")
     }
   }
 
@@ -1832,15 +2017,22 @@ class LispEvaluator {
     }
   }
 
-  private func evalConv2d(_ args: [ASTNode]) throws -> EvalResult {
+  private func evalConv2d(_ args: [ASTNode], attributes: [(name: String, value: String)]) throws
+    -> EvalResult
+  {
     guard args.count == 2 else {
       throw LispError.invalidArgument("conv2d requires 2 arguments (input, kernel)")
     }
     let val = try evaluateAST(args[0])
     let kernel = try requireTensor(evaluateAST(args[1]))
+    // Default is "valid" (asStrided window path, shrinks output). `@padding same`
+    // emits the zero-padded fused graph op so output shape == input shape.
+    let same = (attrValue(attributes, "@padding")?.lowercased() == "same")
     switch val {
-    case .tensor(let t): return .tensor(t.conv2d(kernel))
-    case .signalTensor(let st): return .signalTensor(st.conv2d(kernel))
+    case .tensor(let t):
+      return .tensor(same ? t.conv2dSame(kernel) : t.conv2d(kernel))
+    case .signalTensor(let st):
+      return .signalTensor(same ? st.conv2dSame(kernel) : st.conv2d(kernel))
     default: throw LispError.typeError("conv2d: first argument must be tensor or signalTensor")
     }
   }
@@ -1947,6 +2139,22 @@ class LispEvaluator {
     case .tensor(let t): return .tensor(t.sum(axis: axis))
     case .signalTensor(let st): return .signalTensor(st.sum(axis: axis))
     default: throw LispError.typeError("sum-axis: argument must be tensor or signalTensor")
+    }
+  }
+
+  private func evalCumsum(_ args: [ASTNode], attributes: [(name: String, value: String)]) throws
+    -> EvalResult
+  {
+    guard args.count == 1 else {
+      throw LispError.invalidArgument("cumsum requires 1 argument")
+    }
+    let val = try evaluateAST(args[0])
+    // Default to the last axis (the natural frequency-bin axis for spectral use).
+    let axis = Int(attrValue(attributes, "@axis") ?? "-1") ?? -1
+    switch val {
+    case .tensor(let t): return .tensor(t.cumsum(axis: axis))
+    case .signalTensor(let st): return .signalTensor(st.cumsum(axis: axis))
+    default: throw LispError.typeError("cumsum: argument must be tensor or signalTensor")
     }
   }
 
@@ -2288,13 +2496,22 @@ class LispEvaluator {
     guard args.count >= 1 else {
       throw LispError.invalidArgument("wrap requires at least 1 argument")
     }
-    let sig = try requireSignal(evaluateAST(args[0]))
+    let first = try evaluateAST(args[0])
     let minVal: Signal =
       args.count >= 2 ? try requireSignal(evaluateAST(args[1])) : Signal.constant(0)
     let maxVal: Signal =
       args.count >= 3 ? try requireSignal(evaluateAST(args[2])) : Signal.constant(1)
-
     let range = maxVal - minVal
+
+    // Per-frame wrap for a SignalTensor index/value: mod(x - min, range) + min,
+    // forced positive (mod is truncated) by adding one extra range before mod.
+    if case .signalTensor(let st) = first {
+      let shifted = st - minVal + range
+      let wrapped = DGenLazy.mod(shifted, range)
+      return .signalTensor(wrapped + minVal)
+    }
+
+    let sig = try requireSignal(first)
     // wrap: mod(sig - min, range) + min
     let shifted = sig - minVal
     let wrapped = DGenLazy.mod(shifted, range)
@@ -2356,6 +2573,43 @@ class LispEvaluator {
       try requireSignal(coerceToSignal(evaluateAST(arg)))
     }
     return .signal(DGenLazy.selector(mode, options))
+  }
+
+  private func evalModulatedParam(
+    _ args: [ASTNode],
+    attributes: [(name: String, value: String)]
+  ) throws -> EvalResult {
+    guard args.count >= 2, args.count % 2 == 0 else {
+      throw LispError.invalidArgument(
+        "__modulated-param requires base, active, and modulator/depth pairs")
+    }
+    guard let modeRaw = attrValue(attributes, "@mode"),
+          let mode = ModulatedParamMode(rawValue: modeRaw.lowercased()),
+          let minValue = Float(attrValue(attributes, "@min") ?? ""),
+          let maxValue = Float(attrValue(attributes, "@max") ?? "")
+    else {
+      throw LispError.invalidArgument(
+        "__modulated-param requires @mode, @min, and @max attributes")
+    }
+
+    let base = try requireSignal(coerceToSignal(evaluateAST(args[0])))
+    let active = try requireSignal(coerceToSignal(evaluateAST(args[1])))
+    var lanes: [(modulator: Signal, depth: Signal)] = []
+    var index = 2
+    while index < args.count {
+      let modulator = try requireSignal(coerceToSignal(evaluateAST(args[index])))
+      let depth = try requireSignal(coerceToSignal(evaluateAST(args[index + 1])))
+      lanes.append((modulator, depth))
+      index += 2
+    }
+
+    return .signal(DGenLazy.modulatedParam(
+      base,
+      active: active,
+      lanes: lanes,
+      mode: mode,
+      min: minValue,
+      max: maxValue))
   }
 
   private func evalBuffer(_ args: [ASTNode]) throws -> EvalResult {
@@ -2431,6 +2685,17 @@ class LispEvaluator {
 
   private func attrValue(_ attrs: [(name: String, value: String)], _ key: String) -> String? {
     attrs.first(where: { $0.name == key })?.value
+  }
+
+  private func parseOptionalPositiveIntAttribute(
+    _ attrs: [(name: String, value: String)],
+    _ key: String
+  ) throws -> Int? {
+    guard let rawValue = attrValue(attrs, key) else { return nil }
+    guard let value = Int(rawValue), value > 0 else {
+      throw LispError.invalidArgument("\(key) requires a positive integer")
+    }
+    return value
   }
 
   private func parseBoolAttr(_ attrs: [(name: String, value: String)], _ key: String) -> Bool {

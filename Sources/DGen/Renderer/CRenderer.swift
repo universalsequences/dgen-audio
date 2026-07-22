@@ -99,11 +99,14 @@ public class CRenderer: Renderer {
     // Add frameCount UOp that will render to function parameter
     scheduleItem.ops.append(UOp(op: .frameCount, value: .empty))
     let frameCountUOp = Lazy.variable(-1, nil)  // Special variable ID for frameCount
+    let scheduledRegions = HopIslandPass.buildRegions(for: uopBlocks)
 
     // Merge adjacent blocks of the same frameOrder into a single loop to reduce passes
     var currentFrameOrder: FrameOrder? = nil
     var currentTemporality: Temporality? = nil
     var currentDispatchMode: DispatchMode? = nil
+    var currentVectorWidth: Int? = nil
+    var currentThreadScale: Int? = nil
     var hopCheckOpen = false  // Track if we have an open hop check conditional
     var loopOpen = false
 
@@ -115,35 +118,66 @@ public class CRenderer: Renderer {
       return dest
     }
 
-    for block in uopBlocks {
+    func emitThreadCountScaleChange(_ newScale: Int?) {
+      guard newScale != currentThreadScale else { return }
+      if let scale = newScale {
+        scheduleItem.ops.append(UOp(op: .setThreadCountScale(scale), value: .empty))
+      } else {
+        scheduleItem.ops.append(UOp(op: .setThreadCountScale(0), value: .empty))  // 0 means nil
+      }
+      currentThreadScale = newScale
+    }
+
+    func closeOpenScope() {
+      if hopCheckOpen {
+        scheduleItem.ops.append(UOp(op: .endHopCheck, value: .empty))
+        hopCheckOpen = false
+      }
+
+      if loopOpen {
+        scheduleItem.ops.append(UOp(op: .endLoop, value: .empty))
+        loopOpen = false
+      }
+    }
+
+    func appendHoistedCounterLoad(counterLazy: Lazy, from blocks: [BlockUOps]) {
+      guard case .variable(let vid, _) = counterLazy else { return }
+      for block in blocks {
+        for uop in block.ops {
+          if case .loadGlobal(let id) = uop.op, id == vid {
+            scheduleItem.ops.append(uop)
+            return
+          }
+        }
+      }
+    }
+
+    func appendBlockOps(_ block: BlockUOps) {
+      for uop in block.ops {
+        // Don't skip defineGlobal - it needs to run through emit to mark loadedGlobal
+        scheduleItem.ops.append(uop)
+      }
+    }
+
+    func resetCurrentBlockState() {
+      currentFrameOrder = nil
+      currentTemporality = nil
+      currentDispatchMode = nil
+      currentVectorWidth = nil
+    }
+
+    func appendNormalBlock(_ block: BlockUOps) {
       let needsNewLoop =
         currentFrameOrder != block.frameOrder
         || currentTemporality != block.temporality
         || currentDispatchMode != block.dispatchMode
+        || currentVectorWidth != block.vectorWidth
 
       if needsNewLoop {
-        // Close previous hop check if open
-        if hopCheckOpen {
-          scheduleItem.ops.append(UOp(op: .endHopCheck, value: .empty))
-          hopCheckOpen = false
-        }
-
-        // Close previous loop if open
-        if loopOpen {
-          scheduleItem.ops.append(UOp(op: .endLoop, value: .empty))
-          loopOpen = false
-        }
+        closeOpenScope()
 
         // Emit setThreadCountScale UOp when scale changes so emit() can track it
-        let newScale = block.dispatchMode.threadCountScale
-        let oldScale = currentDispatchMode?.threadCountScale
-        if newScale != oldScale {
-          if let scale = newScale {
-            scheduleItem.ops.append(UOp(op: .setThreadCountScale(scale), value: .empty))
-          } else {
-            scheduleItem.ops.append(UOp(op: .setThreadCountScale(0), value: .empty))  // 0 means nil
-          }
-        }
+        emitThreadCountScaleChange(block.dispatchMode.threadCountScale)
 
         // Open new loop based on dispatch mode and temporality.
         // C is single-threaded, so all frame-based dispatch modes become loops.
@@ -159,14 +193,7 @@ public class CRenderer: Renderer {
             UOp(op: .beginLoop(frameCountUOp, block.vectorWidth), value: .empty)
           )
           // Hoist the counter's loadGlobal before beginHopCheck so the variable is declared
-          if case .variable(let vid, _) = counterLazy {
-            for uop in block.ops {
-              if case .loadGlobal(let id) = uop.op, id == vid {
-                scheduleItem.ops.append(uop)
-                break
-              }
-            }
-          }
+          appendHoistedCounterLoad(counterLazy: counterLazy, from: [block])
           scheduleItem.ops.append(UOp(op: .beginHopCheck(counterLazy), value: .empty))
           hopCheckOpen = true
           loopOpen = true
@@ -182,23 +209,53 @@ public class CRenderer: Renderer {
         currentFrameOrder = block.frameOrder
         currentTemporality = block.temporality
         currentDispatchMode = block.dispatchMode
+        currentVectorWidth = block.vectorWidth
       }
 
-      for uop in block.ops {
-        // Don't skip defineGlobal - it needs to run through emit to mark loadedGlobal
-        scheduleItem.ops.append(uop)
+      appendBlockOps(block)
+    }
+
+    func appendHopIsland(_ island: HopIsland) {
+      closeOpenScope()
+      emitThreadCountScaleChange(nil)
+      resetCurrentBlockState()
+
+      let islandBlocks = island.blockIndices.map { uopBlocks[$0] }
+      scheduleItem.ops.append(UOp(op: .beginLoop(frameCountUOp, 1), value: .empty))
+
+      for block in islandBlocks {
+        emitThreadCountScaleChange(block.dispatchMode.threadCountScale)
+        switch block.temporality {
+        case .hopBased(_, let counterNodeId):
+          guard let counterLazy = ctx.values[counterNodeId] else {
+            fatalError("Hop counter node \(counterNodeId) not found in ctx.values")
+          }
+          appendHoistedCounterLoad(counterLazy: counterLazy, from: [block])
+          scheduleItem.ops.append(UOp(op: .beginHopCheck(counterLazy), value: .empty))
+          appendBlockOps(block)
+          scheduleItem.ops.append(UOp(op: .endHopCheck, value: .empty))
+        case .frameBased:
+          appendBlockOps(block)
+        case .static_:
+          fatalError("Hop island cannot contain static blocks")
+        }
       }
-    }
 
-    // Close any open hop check
-    if hopCheckOpen {
-      scheduleItem.ops.append(UOp(op: .endHopCheck, value: .empty))
-    }
-
-    // Close any open loop
-    if loopOpen {
+      emitThreadCountScaleChange(nil)
       scheduleItem.ops.append(UOp(op: .endLoop, value: .empty))
+      resetCurrentBlockState()
     }
+
+    for region in scheduledRegions {
+      switch region {
+      case .block(let index):
+        appendNormalBlock(uopBlocks[index])
+      case .hopIsland(let island):
+        appendHopIsland(island)
+      }
+    }
+
+    closeOpenScope()
   }
 
   public override func render(
@@ -305,7 +362,7 @@ public class CRenderer: Renderer {
       """)
 
     code.append(
-      "void process(float * restrict const *in, float * restrict const *out, int nframes, void * restrict state, void * restrict buffers) {"
+      "void process(float * restrict const *in, float * restrict const *out, int nframes, void * restrict state, void * restrict buffers, float hostSampleRate) {"
     )
 
     // Use audiograph parameters directly - no mapping needed
@@ -439,6 +496,9 @@ public class CRenderer: Renderer {
     case .defineGlobal(let varId):
       // Declaration only; loadGlobal emits the SIMD variable when accessed
       return "/* t\(varId) declared globally */"
+    case .hostSampleRate:
+      let expr = uop.isSimd ? "vdupq_n_f32(hostSampleRate)" : "hostSampleRate"
+      return emitAssign(uop, expr, ctx)
 
     case .add(let a, let b):
       // Int-typed arithmetic inside a SIMD block is semantically scalar
@@ -678,6 +738,17 @@ public class CRenderer: Renderer {
         return emitAssign(uop, "memory[\(base) + \(safeOffset)]", ctx)
       }
 
+    case .broadcastScalar(let src):
+      // Loop-invariant scalar hoisted into a SIMD register for an element loop.
+      // The operand renders through the scalar path (t<id>, or t<id>[i] for
+      // frame-scoped globals), so the broadcast picks up the current frame's value.
+      let scalarExpr = emitScalarLazy(src, ctx: ctx)
+      if uop.isSimd {
+        return emitAssign(uop, "vdupq_n_f32(\(scalarExpr))", ctx)
+      } else {
+        return emitAssign(uop, scalarExpr, ctx)
+      }
+
     case .simdBroadcastLoad(let base, let offset):
       // Scalar load + broadcast to all lanes in SIMD context.
       // Used for runtime-variable lane-uniform values (e.g. dynamic kernel weights).
@@ -722,6 +793,39 @@ public class CRenderer: Renderer {
         let cast = isIntTypedOffset(offset) ? "" : "(int)"
         return "memory[\(base) + \(cast)\(g(offset))] = \(g(value));"
       }
+    case .memoryAccumulate(let base, let offset, let value):
+      // C kernels execute schedule items serially, so a plain add is sufficient.
+      // In a frame-SIMD loop, a lane-uniform offset (the parameter-gradient
+      // case) requires a horizontal reduction; lane-varying offsets scatter-add.
+      if uop.isSimd {
+        let valueExpr = g(value)
+        let offsetType: EmittedType
+        if case .variable(let varId, _) = offset {
+          offsetType = varEmittedTypes[varId] ?? .float32x4
+        } else if case .constant = offset {
+          offsetType = .int_
+        } else {
+          offsetType = .float32x4
+        }
+
+        switch offsetType {
+        case .int_, .float_:
+          let scalarOffsetExpr = emitScalarLazy(offset, ctx: ctx)
+          return
+            "memory[\(base) + (int)\(scalarOffsetExpr)] += vaddvq_f32(\(valueExpr));"
+        case .float32x4:
+          let offsetExpr = g(offset)
+          return """
+            memory[\(base) + (int)vgetq_lane_f32(\(offsetExpr), 0)] += vgetq_lane_f32(\(valueExpr), 0);
+            memory[\(base) + (int)vgetq_lane_f32(\(offsetExpr), 1)] += vgetq_lane_f32(\(valueExpr), 1);
+            memory[\(base) + (int)vgetq_lane_f32(\(offsetExpr), 2)] += vgetq_lane_f32(\(valueExpr), 2);
+            memory[\(base) + (int)vgetq_lane_f32(\(offsetExpr), 3)] += vgetq_lane_f32(\(valueExpr), 3);
+            """.trimmingCharacters(in: .whitespacesAndNewlines)
+        }
+      } else {
+        let cast = isIntTypedOffset(offset) ? "" : "(int)"
+        return "memory[\(base) + \(cast)\(g(offset))] += \(g(value));"
+      }
     case .sin(let a):
       let expr = uop.isSimd ? "vsinf(\(g(a)))" : "sinf(\(g(a)))"
       return emitAssign(uop, expr, ctx)
@@ -732,6 +836,10 @@ public class CRenderer: Renderer {
 
     case .tan(let a):
       let expr = uop.isSimd ? "vtanf(\(g(a)))" : "tanf(\(g(a)))"
+      return emitAssign(uop, expr, ctx)
+
+    case .atan(let a):
+      let expr = uop.isSimd ? "vatanf(\(g(a)))" : "atanf(\(g(a)))"
       return emitAssign(uop, expr, ctx)
 
     case .tanh(let a):

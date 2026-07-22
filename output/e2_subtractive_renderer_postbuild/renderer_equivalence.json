@@ -1,0 +1,8 @@
+{
+  "frames" : 32768,
+  "maxAbsoluteError" : 1.1622906e-06,
+  "meanAbsoluteError" : 6.078394e-08,
+  "pass" : true,
+  "rootMeanSquareError" : 9.15742e-08,
+  "threshold" : 0.001
+}

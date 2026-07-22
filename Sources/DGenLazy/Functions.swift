@@ -48,6 +48,11 @@ public func tan(_ x: Tensor) -> Tensor {
   return Tensor(nodeId: nodeId, graph: x.graph, shape: x.shape, requiresGrad: x.requiresGrad)
 }
 
+public func atan(_ x: Tensor) -> Tensor {
+  let nodeId = x.graph.node(.atan, [x.nodeId])
+  return Tensor(nodeId: nodeId, graph: x.graph, shape: x.shape, requiresGrad: x.requiresGrad)
+}
+
 public func tanh(_ x: Tensor) -> Tensor {
   let nodeId = x.graph.node(.tanh, [x.nodeId])
   return Tensor(nodeId: nodeId, graph: x.graph, shape: x.shape, requiresGrad: x.requiresGrad)
@@ -110,6 +115,11 @@ public func tan(_ x: Signal) -> Signal {
   return Signal(nodeId: nodeId, graph: x.graph, requiresGrad: x.requiresGrad)
 }
 
+public func atan(_ x: Signal) -> Signal {
+  let nodeId = x.graph.node(.atan, [x.nodeId])
+  return Signal(nodeId: nodeId, graph: x.graph, requiresGrad: x.requiresGrad)
+}
+
 public func tanh(_ x: Signal) -> Signal {
   let nodeId = x.graph.node(.tanh, [x.nodeId])
   return Signal(nodeId: nodeId, graph: x.graph, requiresGrad: x.requiresGrad)
@@ -124,6 +134,11 @@ public func sin(_ x: SignalTensor) -> SignalTensor {
 
 public func cos(_ x: SignalTensor) -> SignalTensor {
   let nodeId = x.graph.node(.cos, [x.nodeId])
+  return SignalTensor(nodeId: nodeId, graph: x.graph, shape: x.shape, requiresGrad: x.requiresGrad)
+}
+
+public func atan(_ x: SignalTensor) -> SignalTensor {
+  let nodeId = x.graph.node(.atan, [x.nodeId])
   return SignalTensor(nodeId: nodeId, graph: x.graph, shape: x.shape, requiresGrad: x.requiresGrad)
 }
 
@@ -155,6 +170,56 @@ public func sign(_ x: SignalTensor) -> SignalTensor {
 public func log(_ x: SignalTensor) -> SignalTensor {
   let nodeId = x.graph.node(.log, [x.nodeId])
   return SignalTensor(nodeId: nodeId, graph: x.graph, shape: x.shape, requiresGrad: x.requiresGrad)
+}
+
+public func floor(_ x: SignalTensor) -> SignalTensor {
+  let nodeId = x.graph.node(.floor, [x.nodeId])
+  return SignalTensor(nodeId: nodeId, graph: x.graph, shape: x.shape, requiresGrad: x.requiresGrad)
+}
+
+public func ceil(_ x: SignalTensor) -> SignalTensor {
+  let nodeId = x.graph.node(.ceil, [x.nodeId])
+  return SignalTensor(nodeId: nodeId, graph: x.graph, shape: x.shape, requiresGrad: x.requiresGrad)
+}
+
+public func round(_ x: SignalTensor) -> SignalTensor {
+  let nodeId = x.graph.node(.round, [x.nodeId])
+  return SignalTensor(nodeId: nodeId, graph: x.graph, shape: x.shape, requiresGrad: x.requiresGrad)
+}
+
+// Element-wise modulo for SignalTensor (per-bin, per-frame). The `.mod` UOp is
+// already emitted element-wise, so this composes like the other unary ops.
+public func mod(_ a: SignalTensor, _ b: SignalTensor) -> SignalTensor {
+  let nodeId = a.graph.node(.mod, [a.nodeId, b.nodeId])
+  return SignalTensor(nodeId: nodeId, graph: a.graph, shape: a.shape, requiresGrad: a.requiresGrad)
+}
+
+public func mod(_ a: SignalTensor, _ b: Double) -> SignalTensor {
+  let bNode = a.graph.node(.constant(Float(b)))
+  let nodeId = a.graph.node(.mod, [a.nodeId, bNode])
+  return SignalTensor(nodeId: nodeId, graph: a.graph, shape: a.shape, requiresGrad: a.requiresGrad)
+}
+
+public func mod(_ a: SignalTensor, _ b: Signal) -> SignalTensor {
+  let nodeId = a.graph.node(.mod, [a.nodeId, b.nodeId])
+  return SignalTensor(nodeId: nodeId, graph: a.graph, shape: a.shape, requiresGrad: a.requiresGrad)
+}
+
+/// Gather with a per-frame (SignalTensor) index. Output is a SignalTensor whose
+/// shape follows the index. The gather emission reads both source and index
+/// through tensorRead, which is frame-aware, so a dynamic index works directly.
+public func gather(_ source: SignalTensor, _ indices: SignalTensor) -> SignalTensor {
+  let nodeId = source.graph.graph.n(.gather, [source.nodeId, indices.nodeId])
+  return SignalTensor(
+    _view: nodeId, graph: source.graph, shape: indices.shape,
+    requiresGrad: source.requiresGrad)
+}
+
+public func gather(_ source: Tensor, _ indices: SignalTensor) -> SignalTensor {
+  let nodeId = source.graph.graph.n(.gather, [source.nodeId, indices.nodeId])
+  return SignalTensor(
+    _view: nodeId, graph: source.graph, shape: indices.shape,
+    requiresGrad: source.requiresGrad)
 }
 
 // MARK: - Binary Math Functions
@@ -486,6 +551,43 @@ public func selector(_ mode: Signal, _ options: [Signal]) -> Signal {
   return Signal(nodeId: nodeId, graph: mode.graph, requiresGrad: needsGrad)
 }
 
+public func modulatedParam(
+  _ base: Signal,
+  active: Signal,
+  lanes: [(modulator: Signal, depth: Signal)],
+  mode: ModulatedParamMode,
+  min: Float,
+  max: Float
+) -> Signal {
+  guard let baseCellId = base.memoryCellId else {
+    fatalError("modulatedParam base signal must be a parameter")
+  }
+  guard let activeCellId = active.memoryCellId else {
+    fatalError("modulatedParam active signal must be a parameter")
+  }
+  let opLanes = lanes.map { lane -> ModulatedParamLane in
+    guard let depthCellId = lane.depth.memoryCellId else {
+      fatalError("modulatedParam depth signals must be parameters")
+    }
+    guard let modulatorNode = base.graph.graph.nodes[lane.modulator.nodeId],
+          case .input(let channel) = modulatorNode.op
+    else {
+      fatalError("modulatedParam modulators must be input signals")
+    }
+    return ModulatedParamLane(modulatorChannel: channel, depthCellId: depthCellId)
+  }
+  let nodeId = base.graph.node(
+    .modulatedParam(
+      mode: mode,
+      min: min,
+      max: max,
+      baseCellId: baseCellId,
+      activeCellId: activeCellId,
+      lanes: opLanes),
+    [base.nodeId])
+  return Signal(nodeId: nodeId, graph: base.graph, requiresGrad: base.requiresGrad)
+}
+
 // MARK: - Loss Functions
 
 /// Mean squared error loss
@@ -644,6 +746,7 @@ extension Tensor {
   public func sqrt() -> Tensor { DGenLazy.sqrt(self) }
   public func sin() -> Tensor { DGenLazy.sin(self) }
   public func cos() -> Tensor { DGenLazy.cos(self) }
+  public func atan() -> Tensor { DGenLazy.atan(self) }
   public func tanh() -> Tensor { DGenLazy.tanh(self) }
   public func relu() -> Tensor { DGenLazy.relu(self) }
   public func sigmoid() -> Tensor { DGenLazy.sigmoid(self) }
@@ -667,6 +770,7 @@ extension Signal {
   public func sqrt() -> Signal { DGenLazy.sqrt(self) }
   public func sin() -> Signal { DGenLazy.sin(self) }
   public func cos() -> Signal { DGenLazy.cos(self) }
+  public func atan() -> Signal { DGenLazy.atan(self) }
   public func tanh() -> Signal { DGenLazy.tanh(self) }
   public func relu() -> Signal { DGenLazy.relu(self) }
   public func sigmoid() -> Signal { DGenLazy.sigmoid(self) }
@@ -689,6 +793,7 @@ extension SignalTensor {
   public func log() -> SignalTensor { DGenLazy.log(self) }
   public func sin() -> SignalTensor { DGenLazy.sin(self) }
   public func cos() -> SignalTensor { DGenLazy.cos(self) }
+  public func atan() -> SignalTensor { DGenLazy.atan(self) }
   public func exp() -> SignalTensor { DGenLazy.exp(self) }
   public func tanh() -> SignalTensor { DGenLazy.tanh(self) }
   public func relu() -> SignalTensor { DGenLazy.relu(self) }
@@ -769,6 +874,7 @@ extension SignalTensor {
 ///   - windowSize: FFT window size (must be power of 2)
 ///   - useHannWindow: Whether to apply Hann window before FFT (default: true)
 ///   - useLogMagnitude: Compare log-magnitudes `log(|X|+eps)` instead of magnitudes (default: false)
+///   - useSmoothLogMagnitude: Use `0.5*log(re²+im²+eps²)` (requires log magnitude)
 ///   - lossMode: `l2` for squared difference, `l1` for absolute difference
 ///   - hop: Compute spectral terms every `hop` frames (default: 1)
 /// - Returns: Scalar loss signal (per frame)
@@ -778,6 +884,7 @@ public func spectralLossFFT(
   windowSize: Int,
   useHannWindow: Bool = true,
   useLogMagnitude: Bool = false,
+  useSmoothLogMagnitude: Bool = false,
   lossMode: SpectralLossMode = .l2,
   hop: Int = 1,
   normalize: Bool = false
@@ -788,6 +895,7 @@ public func spectralLossFFT(
     windowSize: windowSize,
     useHannWindow: useHannWindow,
     useLogMagnitude: useLogMagnitude,
+    useSmoothLogMagnitude: useSmoothLogMagnitude,
     lossMode: lossMode,
     hop: hop
   )
@@ -1054,9 +1162,42 @@ extension SignalTensor {
   /// - Returns: Filtered signal tensor (same shape)
   public func biquad(cutoff: Signal, resonance: Signal, gain: Signal, mode: Signal) -> SignalTensor {
     let nodeId = graph.graph.biquad(
-      self.nodeId, cutoff.nodeId, resonance.nodeId, gain.nodeId, mode.nodeId)
+      self.nodeId, cutoff.nodeId, resonance.nodeId, gain.nodeId, mode.nodeId,
+      elementShape: shape)
     let needsGrad = requiresGrad || cutoff.requiresGrad || resonance.requiresGrad
       || gain.requiresGrad || mode.requiresGrad
+    // Backward is validated only for rank-1 [B] element shapes (see
+    // docs/TENSOR_BIQUAD_GRADIENT_SPEC.md). Anything else must fail loudly
+    // rather than silently emit wrong adjoints.
+    if shape.count != 1 {
+      graph.unsupportedGradientNodes[nodeId] =
+        "tensor-shaped biquad backward is only validated for rank-1 [B] element shapes, got \(shape)"
+    }
+    return SignalTensor(nodeId: nodeId, graph: graph, shape: shape, requiresGrad: needsGrad)
+  }
+
+  /// Biquad filter with per-element cutoff and resonance controls.
+  /// Each control tensor must exactly match the audio tensor shape.
+  public func biquad(
+    cutoff: SignalTensor, resonance: SignalTensor,
+    gain: Signal, mode: Signal
+  ) -> SignalTensor {
+    precondition(
+      cutoff.shape == shape && resonance.shape == shape,
+      "per-element biquad controls must match audio shape")
+
+    let nodeId = graph.graph.biquad(
+      self.nodeId, cutoff.nodeId, resonance.nodeId, gain.nodeId, mode.nodeId,
+      elementShape: shape)
+    let needsGrad = requiresGrad || cutoff.requiresGrad || resonance.requiresGrad
+      || gain.requiresGrad || mode.requiresGrad
+    // Backward is validated only for rank-1 [B] element shapes (see
+    // docs/TENSOR_BIQUAD_GRADIENT_SPEC.md). Anything else must fail loudly
+    // rather than silently emit wrong adjoints.
+    if shape.count != 1 {
+      graph.unsupportedGradientNodes[nodeId] =
+        "tensor-shaped biquad backward is only validated for rank-1 [B] element shapes, got \(shape)"
+    }
     return SignalTensor(nodeId: nodeId, graph: graph, shape: shape, requiresGrad: needsGrad)
   }
 

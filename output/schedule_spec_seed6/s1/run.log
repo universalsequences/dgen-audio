@@ -1,0 +1,58 @@
+=== batch-refine mode=escape frames=32768 steps=300 ===
+escape: lane 0 = exact init, lanes 1..63 jittered (sigma=0.08)
+schedule s1:
+  A-smooth-freeze[res,shape]: 150 steps frozen=["res", "shape"]
+  A-prod-freeze[res,shape]: 50 steps frozen=["res", "shape"]
+  B-prod-freeze[others]: 150 steps frozen=["attackTime", "decayTime", "drive", "fAmt", "fBase", "fDecay", "outGain", "pw", "releaseTime", "sustain"]
+  C-prod-allfree-lr0.3: 150 steps lrMult=0.3
+[s1] step=0 phase=A-smooth-freeze[res,shape] meanLoss=6.546566 elapsed=2.8s
+[s1] step=25 phase=A-smooth-freeze[res,shape] meanLoss=2.459981 elapsed=49.7s
+[s1] step=50 phase=A-smooth-freeze[res,shape] meanLoss=1.427567 elapsed=97.1s
+[s1] step=75 phase=A-smooth-freeze[res,shape] meanLoss=1.171716 elapsed=147.6s
+[s1] step=100 phase=A-smooth-freeze[res,shape] meanLoss=1.085618 elapsed=196.0s
+[s1] step=125 phase=A-smooth-freeze[res,shape] meanLoss=1.055768 elapsed=242.9s
+[s1] step=150 phase=A-prod-freeze[res,shape] meanLoss=1.458011 elapsed=291.9s
+[s1] step=175 phase=A-prod-freeze[res,shape] meanLoss=1.382129 elapsed=368.0s
+[s1] step=200 phase=B-prod-freeze[others] meanLoss=1.364870 elapsed=452.7s
+[s1] step=225 phase=B-prod-freeze[others] meanLoss=1.361293 elapsed=543.0s
+[s1] step=250 phase=B-prod-freeze[others] meanLoss=1.360521 elapsed=629.3s
+[s1] step=275 phase=B-prod-freeze[others] meanLoss=1.360170 elapsed=704.7s
+[s1] step=300 phase=B-prod-freeze[others] meanLoss=1.360076 elapsed=780.5s
+[s1] step=325 phase=B-prod-freeze[others] meanLoss=1.359782 elapsed=856.9s
+[s1] step=350 phase=C-prod-allfree-lr0.3 meanLoss=1.359645 elapsed=931.5s
+[s1] step=375 phase=C-prod-allfree-lr0.3 meanLoss=1.339083 elapsed=1005.8s
+[s1] step=400 phase=C-prod-allfree-lr0.3 meanLoss=1.319513 elapsed=1082.1s
+[s1] step=425 phase=C-prod-allfree-lr0.3 meanLoss=1.305891 elapsed=1158.8s
+[s1] step=450 phase=C-prod-allfree-lr0.3 meanLoss=1.297439 elapsed=1233.8s
+[s1] step=475 phase=C-prod-allfree-lr0.3 meanLoss=1.293612 elapsed=1310.0s
+[s1] step=499 phase=C-prod-allfree-lr0.3 meanLoss=1.292573 elapsed=1382.9s
+
+2.766 s/step for B=64
+lane 0 (stall reproduction): init=0.08141 final=0.02279
+top 8 lanes by final CPU score:
+  lane 0: init=0.08141 final=0.02279
+  lane 51: init=0.18469 final=0.02588
+  lane 9: init=0.11796 final=0.02627
+  lane 60: init=0.24918 final=0.02895
+  lane 14: init=0.26690 final=0.02947
+  lane 61: init=0.28585 final=0.03026
+  lane 46: init=0.73986 final=0.03369
+  lane 50: init=0.51218 final=0.03529
+0/63 jittered lanes beat the unjittered trajectory
+production loss: lane 0 0.463862 ratio=18.5377%  best lane 0 0.463862 ratio=18.5377%
+
+best lane 0 vs hidden truth (transformed-space abs err / span):
+  sustain: lane=    0.5064 truth=    0.5456 err=0.0392 OK
+  outGain: lane=    0.5439 truth=    0.5561 err=0.0060 OK
+  attackTime: lane=    0.0084 truth=    0.0052 err=0.0751 OK
+  decayTime: lane=    0.2636 truth=    0.3859 err=0.0719 OK
+  releaseTime: lane=    0.0268 truth=    0.0214 err=0.0490 OK
+  fDecay: lane=    0.0808 truth=    0.1237 err=0.0712 OK
+  fBase: lane=   67.0672 truth=   86.4364 err=0.0454 OK
+  fAmt: lane=    6.3221 truth=    7.1892 err=0.0119 OK
+  res: lane=    1.1233 truth=    3.0415 err=0.4008 MISS
+  drive: lane=    6.0891 truth=    2.0444 err=0.3149 MISS
+  shape: lane=    0.7408 truth=    0.6679 err=0.0729 OK
+  pw: lane=    0.4885 truth=    0.4647 err=0.0253 OK
+recovered 10/12 params within spec tolerance
+wrote /Users/alecresende/code/swift/dgen/output/schedule_spec_seed6/s1

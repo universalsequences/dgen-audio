@@ -1,0 +1,1468 @@
+basin-search: candidates=8192 batch=256 searchSeed=13064056694825329359
+  batch 4/32 scored=1024 best=0.162470 elapsed=13.7s
+  batch 8/32 scored=2048 best=0.162470 elapsed=27.3s
+  batch 12/32 scored=3072 best=0.162470 elapsed=41.0s
+  batch 16/32 scored=4096 best=0.159384 elapsed=54.8s
+  batch 20/32 scored=5120 best=0.148240 elapsed=68.5s
+  batch 24/32 scored=6144 best=0.129628 elapsed=82.3s
+  batch 28/32 scored=7168 best=0.129628 elapsed=96.4s
+  batch 32/32 scored=8192 best=0.129628 elapsed=110.2s
+
+stratified elites:
+  fBase[60,120)/shape<0.5: score=0.164462 fBase=68.34 shape=0.3886 pw=0.2913 res=0.751
+  fBase[60,120)/shape>=0.5: score=0.129628 fBase=74.65 shape=0.9722 pw=0.4379 res=3.878
+  fBase[120,240)/shape<0.5: score=0.163946 fBase=142.30 shape=0.2925 pw=0.7971 res=1.062
+  fBase[120,240)/shape>=0.5: score=0.146944 fBase=227.13 shape=0.7928 pw=0.5190 res=2.759
+  fBase[240,480)/shape<0.5: score=0.179284 fBase=264.75 shape=0.1941 pw=0.5941 res=0.464
+  fBase[240,480)/shape>=0.5: score=0.169107 fBase=289.11 shape=0.6467 pw=0.4742 res=1.982
+  fBase[480,960)/shape<0.5: score=0.199067 fBase=584.97 shape=0.3746 pw=0.3709 res=1.221
+  fBase[480,960)/shape>=0.5: score=0.203483 fBase=510.36 shape=0.8807 pw=0.4223 res=0.490
+  fBase[960,2000)/shape<0.5: score=0.266049 fBase=962.57 shape=0.1061 pw=0.4348 res=0.430
+  fBase[960,2000)/shape>=0.5: score=0.236547 fBase=1030.87 shape=0.9533 pw=0.3353 res=0.427
+
+wrote 12 elites to /Users/alecresende/code/swift/dgen/output/e1_basin_search_seed6/elites
+wrote /Users/alecresende/code/swift/dgen/output/e1_basin_search_seed6/basin_search_report.json
+=== elite-00: smooth 600 ===
+epoch=0 loss=2.088788
+  shape=     0.38856 grad=  2.1236e+00
+  pw=     0.29129 grad=  1.1502e+00
+  fBase=    68.34047 grad= -6.2195e-01
+  fAmt=   361.57553 grad= -1.7576e+00
+  fDecay=     0.28400 grad= -9.8319e-01
+  res=     0.75138 grad= -1.3672e-01
+  attackTime=     0.21055 grad=  7.0871e-01
+  decayTime=     0.53011 grad= -9.2335e-02
+  sustain=     0.61690 grad= -2.8829e-01
+  releaseTime=     0.04425 grad=  5.0289e-01
+  drive=     3.19847 grad= -1.0340e+00
+  outGain=     0.73404 grad= -1.1178e+00
+epoch=200 loss=1.396441
+  shape=     0.38387 grad=  5.9182e-03
+  pw=     0.28306 grad= -2.0634e-02
+  fBase=    75.49469 grad= -2.4830e-02
+  fAmt=   393.52710 grad= -4.1896e-03
+  fDecay=     0.26830 grad=  2.1291e-02
+  res=     0.68298 grad= -3.2294e-03
+  attackTime=     0.12805 grad=  1.2780e-02
+  decayTime=     0.25729 grad=  2.2242e-02
+  sustain=     0.59187 grad= -1.5236e-02
+  releaseTime=     0.01880 grad=  3.9380e-03
+  drive=     3.67009 grad=  2.5029e-03
+  outGain=     0.89553 grad= -4.4661e-02
+epoch=400 loss=1.343412
+  shape=     0.38468 grad= -5.9751e-04
+  pw=     0.28367 grad= -1.3543e-02
+  fBase=    81.29839 grad= -3.2309e-03
+  fAmt=   405.34930 grad= -3.0621e-03
+  fDecay=     0.25076 grad=  6.2896e-03
+  res=     0.68817 grad= -9.7846e-04
+  attackTime=     0.11892 grad=  2.0099e-03
+  decayTime=     0.07216 grad=  2.9806e-02
+  sustain=     0.54238 grad=  4.1186e-02
+  releaseTime=     0.01845 grad=  1.4810e-03
+  drive=     3.97707 grad= -2.6468e-02
+  outGain=     0.99251 grad= -5.1417e-02
+epoch=599 loss=1.330400
+  shape=     0.38461 grad=  8.5246e-04
+  pw=     0.28343 grad= -3.9364e-04
+  fBase=    81.68257 grad= -4.5338e-04
+  fAmt=   405.97971 grad= -9.4578e-05
+  fDecay=     0.24952 grad=  7.7875e-04
+  res=     0.68812 grad=  6.4357e-03
+  attackTime=     0.11901 grad= -3.0936e-03
+  decayTime=     0.05648 grad=  2.1838e-02
+  sustain=     0.48505 grad=  4.2594e-02
+  releaseTime=     0.01841 grad=  1.0980e-03
+  drive=     4.31977 grad= -3.1298e-02
+  outGain=     1.02703 grad= -4.8102e-02
+=== elite-00: production 800 ===
+epoch=0 loss=1.879260
+  shape=     0.38461 grad=  5.8653e-01
+  pw=     0.28343 grad= -1.4881e+00
+  fBase=    81.68257 grad= -1.3085e-01
+  fAmt=   405.97971 grad= -1.0123e-01
+  fDecay=     0.24952 grad= -1.6943e-01
+  res=     0.68812 grad= -9.4564e-02
+  attackTime=     0.11901 grad=  3.2229e-02
+  decayTime=     0.05648 grad=  2.9552e-03
+  sustain=     0.48505 grad= -1.5754e-01
+  releaseTime=     0.01841 grad=  4.5159e-02
+  drive=     4.31977 grad= -1.2092e-01
+  outGain=     1.02703 grad= -1.1822e-01
+epoch=200 loss=1.814092
+  shape=     0.35855 grad=  3.7046e-01
+  pw=     0.28442 grad= -1.5799e-01
+  fBase=   114.04855 grad= -8.8220e-03
+  fAmt=   300.99921 grad= -1.7504e-02
+  fDecay=     0.35627 grad= -1.0684e-02
+  res=     0.70119 grad= -6.6928e-02
+  attackTime=     0.07269 grad=  2.7666e-03
+  decayTime=     0.03599 grad= -2.7547e-03
+  sustain=     0.21439 grad=  1.8118e-02
+  releaseTime=     0.01595 grad= -2.1482e-03
+  drive=     6.72931 grad= -4.0442e-03
+  outGain=     1.11392 grad=  2.3920e-03
+epoch=400 loss=1.809558
+  shape=     0.35933 grad=  2.0108e-02
+  pw=     0.28427 grad= -7.7462e-02
+  fBase=   110.11216 grad=  4.5037e-04
+  fAmt=   298.27719 grad= -3.1388e-03
+  fDecay=     0.40524 grad= -3.5440e-03
+  res=     0.73818 grad= -2.5271e-03
+  attackTime=     0.07880 grad= -1.0987e-04
+  decayTime=     0.03635 grad=  2.2262e-05
+  sustain=     0.17729 grad=  2.9733e-03
+  releaseTime=     0.01586 grad= -2.4092e-05
+  drive=     8.00000 grad= -3.4842e-03
+  outGain=     1.06711 grad=  5.4324e-04
+epoch=600 loss=1.809401
+  shape=     0.35923 grad=  3.8876e-03
+  pw=     0.28432 grad= -3.3242e-02
+  fBase=   106.18832 grad=  1.1260e-03
+  fAmt=   301.84427 grad= -1.3748e-03
+  fDecay=     0.41706 grad= -3.1537e-03
+  res=     0.73737 grad= -5.5965e-04
+  attackTime=     0.07893 grad=  3.6871e-06
+  decayTime=     0.03644 grad= -4.5622e-05
+  sustain=     0.17619 grad=  7.5017e-04
+  releaseTime=     0.01592 grad=  3.3397e-06
+  drive=     8.00000 grad= -4.0105e-03
+  outGain=     1.06817 grad=  8.6267e-05
+epoch=799 loss=1.809346
+  shape=     0.35929 grad=  2.6785e-03
+  pw=     0.28432 grad=  1.8043e-02
+  fBase=   104.56615 grad=  3.1904e-03
+  fAmt=   303.36172 grad= -5.9885e-04
+  fDecay=     0.42195 grad= -2.3559e-03
+  res=     0.73724 grad=  6.1455e-04
+  attackTime=     0.07893 grad=  5.8647e-05
+  decayTime=     0.03645 grad= -2.8588e-05
+  sustain=     0.17596 grad=  1.6182e-03
+  releaseTime=     0.01593 grad= -1.0431e-04
+  drive=     8.00000 grad= -3.9842e-03
+  outGain=     1.06768 grad=  3.3263e-04
+=== elite-01: smooth 600 ===
+epoch=0 loss=2.213338
+  shape=     0.97217 grad=  3.3689e+00
+  pw=     0.43795 grad= -9.4629e+00
+  fBase=    74.65124 grad= -3.4695e+00
+  fAmt=   269.86749 grad= -3.1576e-01
+  fDecay=     0.04285 grad= -7.4263e-01
+  res=     3.87768 grad=  6.4947e-01
+  attackTime=     0.01652 grad= -3.3623e-01
+  decayTime=     0.29091 grad=  1.8228e-01
+  sustain=     0.68271 grad=  5.5599e-01
+  releaseTime=     0.01651 grad= -4.1306e-01
+  drive=     1.76219 grad=  2.7711e+00
+  outGain=     0.36229 grad=  1.5125e+00
+epoch=200 loss=0.330448
+  shape=     0.96549 grad= -9.3125e-02
+  pw=     0.45841 grad=  4.6514e+00
+  fBase=    80.43829 grad= -3.6259e-01
+  fAmt=   176.71167 grad= -2.8530e-02
+  fDecay=     0.01780 grad= -7.5717e-02
+  res=     2.06123 grad=  1.7562e-01
+  attackTime=     0.01447 grad= -1.4038e-02
+  decayTime=     0.39790 grad= -1.1566e-02
+  sustain=     0.80995 grad= -6.8995e-03
+  releaseTime=     0.02140 grad= -5.8032e-04
+  drive=     1.61567 grad= -2.0842e-01
+  outGain=     0.39203 grad= -1.6623e-01
+epoch=400 loss=0.243362
+  shape=     0.97042 grad= -4.3917e-03
+  pw=     0.46385 grad= -5.6774e-01
+  fBase=    77.56422 grad=  1.6729e-02
+  fAmt=   148.46881 grad=  6.7122e-02
+  fDecay=     0.01723 grad=  1.9907e-02
+  res=     1.83692 grad=  5.0132e-02
+  attackTime=     0.02054 grad= -2.0198e-02
+  decayTime=     0.36604 grad=  3.2561e-03
+  sustain=     0.67932 grad=  1.0652e-01
+  releaseTime=     0.02116 grad=  4.1306e-04
+  drive=     1.98698 grad= -2.3008e-02
+  outGain=     0.43886 grad= -4.3588e-02
+epoch=599 loss=0.235792
+  shape=     0.96951 grad= -5.8484e-04
+  pw=     0.46429 grad=  3.0029e-02
+  fBase=    77.35173 grad= -8.8391e-02
+  fAmt=   146.31923 grad=  3.1950e-03
+  fDecay=     0.01746 grad= -1.9126e-02
+  res=     1.82596 grad=  2.5407e-02
+  attackTime=     0.02254 grad= -1.6101e-02
+  decayTime=     0.35366 grad=  1.4674e-03
+  sustain=     0.64151 grad=  8.6979e-02
+  releaseTime=     0.02116 grad= -2.1428e-04
+  drive=     2.05478 grad= -2.4551e-02
+  outGain=     0.44917 grad= -4.0601e-02
+=== elite-01: production 800 ===
+epoch=0 loss=0.582285
+  shape=     0.96951 grad=  7.9513e-01
+  pw=     0.46429 grad=  2.1917e+01
+  fBase=    77.35158 grad= -2.6837e+00
+  fAmt=   146.32106 grad= -6.2221e-01
+  fDecay=     0.01746 grad= -1.2381e+00
+  res=     1.82598 grad=  1.0249e+00
+  attackTime=     0.02254 grad=  1.9257e-02
+  decayTime=     0.35368 grad=  4.4967e-02
+  sustain=     0.64158 grad=  5.7253e-01
+  releaseTime=     0.02116 grad= -4.6093e-02
+  drive=     2.05465 grad= -2.1625e-02
+  outGain=     0.44915 grad= -2.7513e-01
+epoch=200 loss=0.473078
+  shape=     0.97449 grad=  5.1629e-03
+  pw=     0.46726 grad= -1.3787e+01
+  fBase=    75.39871 grad=  3.8914e+00
+  fAmt=   148.32149 grad=  3.2539e-02
+  fDecay=     0.01894 grad=  1.8391e-01
+  res=     1.69458 grad= -1.3711e+00
+  attackTime=     0.03357 grad= -1.1408e-02
+  decayTime=     0.30254 grad=  1.0499e-01
+  sustain=     0.47739 grad=  4.3602e-01
+  releaseTime=     0.02098 grad= -3.7074e-03
+  drive=     2.42703 grad=  3.3163e-01
+  outGain=     0.55156 grad=  2.4809e-01
+epoch=400 loss=0.446530
+  shape=     0.97794 grad= -4.7136e-01
+  pw=     0.46581 grad=  5.3067e-01
+  fBase=    76.03516 grad=  2.2245e+00
+  fAmt=   126.07180 grad=  7.4736e-04
+  fDecay=     0.01870 grad= -1.5044e-01
+  res=     1.75706 grad= -1.0507e+00
+  attackTime=     0.03413 grad=  3.0767e-03
+  decayTime=     0.26608 grad= -1.0225e-01
+  sustain=     0.46652 grad= -5.1800e-01
+  releaseTime=     0.02101 grad=  1.3880e-02
+  drive=     2.42710 grad= -4.0131e-01
+  outGain=     0.54902 grad= -2.9520e-01
+epoch=600 loss=0.435331
+  shape=     0.97954 grad=  2.5576e-02
+  pw=     0.46502 grad= -5.7893e+00
+  fBase=    76.31586 grad=  2.1202e+00
+  fAmt=   122.87724 grad=  2.9416e-01
+  fDecay=     0.01873 grad=  4.9205e-01
+  res=     1.78889 grad= -3.6565e-01
+  attackTime=     0.03407 grad=  7.2414e-04
+  decayTime=     0.25174 grad=  4.2812e-02
+  sustain=     0.47159 grad=  1.7364e-01
+  releaseTime=     0.02101 grad= -3.1559e-03
+  drive=     2.41236 grad=  1.2635e-01
+  outGain=     0.55069 grad=  8.5455e-02
+epoch=799 loss=0.430307
+  shape=     0.98014 grad= -2.8911e-01
+  pw=     0.46508 grad= -8.9708e-01
+  fBase=    76.26431 grad= -1.9886e+00
+  fAmt=   122.99479 grad= -6.6145e-02
+  fDecay=     0.01874 grad= -1.0376e-01
+  res=     1.78641 grad=  2.9544e-01
+  attackTime=     0.03415 grad= -6.3631e-04
+  decayTime=     0.24938 grad= -2.8296e-02
+  sustain=     0.47159 grad= -1.7501e-01
+  releaseTime=     0.02101 grad=  3.0874e-03
+  drive=     2.41994 grad= -1.2430e-01
+  outGain=     0.55074 grad= -7.4418e-02
+=== elite-02: smooth 600 ===
+epoch=0 loss=1.556362
+  shape=     0.29252 grad= -3.8091e+00
+  pw=     0.79710 grad=  2.4620e+00
+  fBase=   142.30492 grad= -9.2636e-01
+  fAmt=   110.62118 grad=  1.3558e-01
+  fDecay=     0.06176 grad=  1.8407e-02
+  res=     1.06201 grad= -1.1578e-01
+  attackTime=     0.00789 grad= -6.5319e-02
+  decayTime=     0.40224 grad=  1.9244e-01
+  sustain=     0.20664 grad=  1.8104e-01
+  releaseTime=     0.01359 grad= -4.7047e-01
+  drive=     3.59112 grad=  1.1646e+00
+  outGain=     1.06021 grad=  6.8065e-01
+epoch=200 loss=1.301444
+  shape=     0.29279 grad=  3.2254e-02
+  pw=     0.79159 grad=  4.4454e-03
+  fBase=   149.54865 grad=  3.2762e-03
+  fAmt=    86.44685 grad=  7.4291e-03
+  fDecay=     0.05354 grad= -2.9119e-03
+  res=     1.07569 grad= -2.0756e-05
+  attackTime=     0.00691 grad=  7.1294e-04
+  decayTime=     0.49232 grad=  5.6539e-04
+  sustain=     0.30434 grad= -1.7340e-03
+  releaseTime=     0.01774 grad= -1.6664e-03
+  drive=     3.05112 grad= -7.8335e-03
+  outGain=     0.88153 grad=  2.4382e-02
+epoch=400 loss=1.296303
+  shape=     0.29570 grad=  6.2279e-03
+  pw=     0.79075 grad= -4.0780e-03
+  fBase=   148.03827 grad=  1.1378e-03
+  fAmt=    75.95506 grad=  3.8712e-04
+  fDecay=     0.05727 grad= -4.2694e-04
+  res=     1.09655 grad=  1.2708e-05
+  attackTime=     0.00671 grad= -6.3554e-05
+  decayTime=     0.47618 grad=  1.8378e-03
+  sustain=     0.31359 grad= -5.7613e-03
+  releaseTime=     0.01794 grad= -4.8681e-04
+  drive=     3.24137 grad= -4.3914e-03
+  outGain=     0.80822 grad=  1.4865e-02
+epoch=599 loss=1.296049
+  shape=     0.29567 grad= -4.7976e-05
+  pw=     0.79091 grad= -1.1366e-02
+  fBase=   148.06496 grad= -1.4282e-03
+  fAmt=    75.90048 grad= -9.2310e-05
+  fDecay=     0.05752 grad= -3.1553e-04
+  res=     1.09555 grad= -5.2985e-05
+  attackTime=     0.00673 grad= -5.7118e-05
+  decayTime=     0.46980 grad=  1.5280e-03
+  sustain=     0.31843 grad= -6.7744e-03
+  releaseTime=     0.01797 grad= -4.2381e-04
+  drive=     3.27678 grad= -3.9474e-03
+  outGain=     0.79375 grad=  1.1985e-02
+=== elite-02: production 800 ===
+epoch=0 loss=1.715611
+  shape=     0.29567 grad= -3.0455e-03
+  pw=     0.79091 grad=  4.8783e-01
+  fBase=   148.06609 grad= -1.1068e+00
+  fAmt=    75.90000 grad=  2.4594e-03
+  fDecay=     0.05752 grad= -3.2403e-02
+  res=     1.09561 grad= -5.2990e-01
+  attackTime=     0.00673 grad=  4.1767e-03
+  decayTime=     0.46994 grad= -3.2189e-02
+  sustain=     0.31831 grad= -8.2876e-02
+  releaseTime=     0.01797 grad=  3.4807e-02
+  drive=     3.27606 grad= -8.1712e-02
+  outGain=     0.79403 grad=  2.1686e-01
+epoch=200 loss=1.668366
+  shape=     0.29569 grad= -1.3483e+00
+  pw=     0.78994 grad=  7.0643e-01
+  fBase=   150.64491 grad= -8.6231e-01
+  fAmt=    56.03233 grad=  7.7770e-03
+  fDecay=     0.07538 grad= -3.2021e-02
+  res=     1.13121 grad= -2.5779e-01
+  attackTime=     0.00561 grad=  1.1160e-04
+  decayTime=     0.38731 grad= -4.4164e-03
+  sustain=     0.38834 grad= -2.0002e-02
+  releaseTime=     0.01749 grad=  1.3779e-04
+  drive=     3.75971 grad= -2.5683e-02
+  outGain=     0.62080 grad=  2.3548e-03
+epoch=400 loss=1.664395
+  shape=     0.29741 grad= -2.3119e-01
+  pw=     0.78955 grad=  8.3908e-02
+  fBase=   149.73167 grad= -1.1339e-01
+  fAmt=    51.26599 grad= -1.9438e-03
+  fDecay=     0.08148 grad= -4.4637e-03
+  res=     1.13882 grad= -3.2134e-02
+  attackTime=     0.00607 grad=  1.7749e-05
+  decayTime=     0.30547 grad=  2.0195e-04
+  sustain=     0.43409 grad= -3.7922e-03
+  releaseTime=     0.01753 grad=  8.6468e-06
+  drive=     3.96526 grad= -3.1690e-03
+  outGain=     0.59725 grad=  3.6395e-03
+epoch=600 loss=1.664238
+  shape=     0.29792 grad= -3.2352e-02
+  pw=     0.78966 grad= -2.3414e-02
+  fBase=   149.49718 grad=  2.0272e-04
+  fAmt=    50.99577 grad= -4.3798e-04
+  fDecay=     0.08165 grad= -8.3724e-04
+  res=     1.14189 grad=  5.2024e-03
+  attackTime=     0.00617 grad= -3.8351e-06
+  decayTime=     0.28635 grad=  4.8653e-04
+  sustain=     0.44364 grad=  1.7099e-05
+  releaseTime=     0.01756 grad=  1.0333e-04
+  drive=     4.02221 grad= -2.4052e-04
+  outGain=     0.59155 grad=  1.9903e-03
+epoch=799 loss=1.664351
+  shape=     0.29798 grad=  6.2413e-02
+  pw=     0.78966 grad= -1.5051e-02
+  fBase=   149.47864 grad=  2.6782e-02
+  fAmt=    50.96299 grad=  1.6508e-03
+  fDecay=     0.08169 grad=  1.2706e-03
+  res=     1.14209 grad=  7.3683e-03
+  attackTime=     0.00620 grad=  7.8150e-06
+  decayTime=     0.28277 grad=  3.0403e-04
+  sustain=     0.44503 grad= -3.7970e-04
+  releaseTime=     0.01756 grad= -6.5133e-05
+  drive=     4.03501 grad= -4.3863e-04
+  outGain=     0.59036 grad=  1.6552e-03
+=== elite-03: smooth 600 ===
+epoch=0 loss=1.737488
+  shape=     0.79280 grad=  1.8604e-01
+  pw=     0.51901 grad= -1.5391e+01
+  fBase=   227.12616 grad= -5.5326e-01
+  fAmt=  2207.21899 grad=  6.2245e-01
+  fDecay=     0.01930 grad=  3.4160e-01
+  res=     2.75931 grad=  2.6442e-01
+  attackTime=     0.04884 grad= -2.3662e-01
+  decayTime=     0.08069 grad= -5.1294e-02
+  sustain=     0.70382 grad= -3.8196e-01
+  releaseTime=     0.01979 grad=  3.0946e-01
+  drive=     0.58137 grad= -5.9692e-02
+  outGain=     1.01870 grad=  2.7700e-02
+epoch=200 loss=1.278822
+  shape=     0.80450 grad= -4.1179e-02
+  pw=     0.52258 grad= -1.0002e+00
+  fBase=   247.64075 grad=  2.1109e-01
+  fAmt=   754.64746 grad=  4.0563e-02
+  fDecay=     0.02442 grad=  1.0336e-02
+  res=     2.58532 grad=  2.1784e-02
+  attackTime=     0.05981 grad= -6.5121e-03
+  decayTime=     0.28037 grad= -2.3357e-03
+  sustain=     0.29209 grad=  8.1209e-02
+  releaseTime=     0.01763 grad= -1.1370e-02
+  drive=     0.80200 grad=  2.9049e-03
+  outGain=     0.93520 grad= -4.6207e-02
+epoch=400 loss=1.211428
+  shape=     0.78159 grad= -2.0042e-01
+  pw=     0.52216 grad=  1.0344e+01
+  fBase=   235.10686 grad= -2.9962e-01
+  fAmt=   637.83777 grad=  7.6234e-02
+  fDecay=     0.02259 grad=  3.7917e-03
+  res=     2.49271 grad= -7.2798e-02
+  attackTime=     0.06843 grad=  4.2683e-02
+  decayTime=     0.29964 grad=  7.5415e-03
+  sustain=     0.13664 grad=  6.5242e-02
+  releaseTime=     0.01845 grad= -3.8357e-03
+  drive=     0.81270 grad= -4.6626e-02
+  outGain=     1.39816 grad= -1.6620e-01
+epoch=599 loss=1.185186
+  shape=     0.77943 grad=  2.5124e-02
+  pw=     0.52191 grad=  8.0789e-01
+  fBase=   234.84085 grad= -1.8325e-02
+  fAmt=   583.50299 grad=  2.1859e-02
+  fDecay=     0.02065 grad= -2.9301e-03
+  res=     2.48895 grad=  2.1223e-03
+  attackTime=     0.06368 grad=  1.3829e-03
+  decayTime=     0.28382 grad=  6.6196e-03
+  sustain=     0.11128 grad=  1.0124e-02
+  releaseTime=     0.01866 grad= -4.1295e-04
+  drive=     0.81678 grad=  1.3356e-02
+  outGain=     1.56747 grad= -1.0587e-01
+=== elite-03: production 800 ===
+epoch=0 loss=1.692435
+  shape=     0.77943 grad= -2.4325e-01
+  pw=     0.52191 grad= -5.9242e+00
+  fBase=   234.84085 grad= -2.6236e-01
+  fAmt=   583.50299 grad=  1.7642e-02
+  fDecay=     0.02065 grad=  1.2354e-03
+  res=     2.48895 grad=  2.9985e-02
+  attackTime=     0.06368 grad=  1.0166e-02
+  decayTime=     0.28382 grad= -8.2964e-02
+  sustain=     0.11128 grad= -2.5931e-01
+  releaseTime=     0.01866 grad=  1.0008e-01
+  drive=     0.81678 grad= -6.8384e-02
+  outGain=     1.56747 grad=  1.2928e-02
+epoch=200 loss=1.614968
+  shape=     0.80910 grad=  3.2572e-02
+  pw=     0.52176 grad= -2.3734e+00
+  fBase=   234.37325 grad=  1.8004e-01
+  fAmt=   562.05341 grad=  2.3663e-02
+  fDecay=     0.02158 grad=  4.0109e-02
+  res=     1.99808 grad= -5.7968e-03
+  attackTime=     0.03823 grad= -5.3120e-05
+  decayTime=     0.44325 grad= -8.5899e-04
+  sustain=     0.20846 grad=  1.2221e-02
+  releaseTime=     0.01601 grad=  2.0993e-03
+  drive=     0.81187 grad= -5.7624e-04
+  outGain=     0.94434 grad=  5.5325e-02
+epoch=400 loss=1.548419
+  shape=     0.84044 grad= -1.4158e+00
+  pw=     0.52289 grad=  6.2963e-01
+  fBase=   194.90057 grad=  1.8359e+00
+  fAmt=   403.97049 grad=  1.2957e-01
+  fDecay=     0.02704 grad=  1.7297e-01
+  res=     2.71890 grad=  2.2839e-01
+  attackTime=     0.03824 grad=  1.5322e-03
+  decayTime=     0.58486 grad=  2.0470e-03
+  sustain=     0.19112 grad=  4.0977e-03
+  releaseTime=     0.01674 grad=  3.8378e-03
+  drive=     1.03074 grad=  3.9340e-03
+  outGain=     0.70597 grad=  5.7534e-02
+epoch=600 loss=1.520462
+  shape=     0.85017 grad= -4.2010e-02
+  pw=     0.52311 grad=  3.1723e-01
+  fBase=   195.99451 grad=  5.4654e-02
+  fAmt=   310.63074 grad= -3.4435e-03
+  fDecay=     0.02680 grad= -1.4544e-02
+  res=     2.72053 grad=  6.3593e-03
+  attackTime=     0.03180 grad=  4.0912e-04
+  decayTime=     0.59070 grad=  1.9659e-04
+  sustain=     0.19321 grad=  1.2783e-03
+  releaseTime=     0.01666 grad= -5.6083e-05
+  drive=     1.03694 grad= -5.1583e-04
+  outGain=     0.67522 grad= -1.9305e-04
+epoch=799 loss=1.520354
+  shape=     0.84886 grad= -2.6707e-03
+  pw=     0.52308 grad=  6.2842e-02
+  fBase=   195.74429 grad=  2.4872e-02
+  fAmt=   308.08044 grad=  2.6419e-03
+  fDecay=     0.02705 grad=  1.7123e-03
+  res=     2.72870 grad= -6.3377e-04
+  attackTime=     0.03178 grad=  1.1225e-04
+  decayTime=     0.59303 grad= -5.0027e-04
+  sustain=     0.19205 grad= -9.3870e-05
+  releaseTime=     0.01666 grad= -2.6181e-05
+  drive=     1.03899 grad= -8.6876e-04
+  outGain=     0.67502 grad= -3.4665e-04
+=== elite-04: smooth 600 ===
+epoch=0 loss=2.018015
+  shape=     0.19414 grad= -5.4558e-01
+  pw=     0.59405 grad= -2.0815e+00
+  fBase=   264.75024 grad= -6.0193e-01
+  fAmt=   815.93634 grad=  5.0020e-01
+  fDecay=     0.06478 grad=  5.4425e-02
+  res=     0.50000 grad=  6.5958e-01
+  attackTime=     0.01420 grad= -1.7788e-01
+  decayTime=     0.22377 grad= -1.9142e-01
+  sustain=     0.27761 grad= -4.9130e-01
+  releaseTime=     0.02931 grad=  4.7791e-01
+  drive=     1.27945 grad=  1.4473e-01
+  outGain=     0.99153 grad= -2.2114e-01
+epoch=200 loss=1.485472
+  shape=     0.21370 grad= -2.6789e-02
+  pw=     0.59898 grad= -1.7243e-02
+  fBase=   302.88110 grad=  1.0178e-02
+  fAmt=   454.39700 grad=  1.7285e-02
+  fDecay=     0.06691 grad=  1.0273e-02
+  res=     0.50386 grad= -1.5018e-02
+  attackTime=     0.03470 grad= -1.1731e-02
+  decayTime=     0.38907 grad= -4.5190e-03
+  sustain=     0.17421 grad=  4.1851e-02
+  releaseTime=     0.01917 grad= -3.4055e-03
+  drive=     0.82606 grad= -2.7771e-03
+  outGain=     1.53626 grad= -8.2423e-02
+epoch=400 loss=1.461608
+  shape=     0.21439 grad=  1.7916e-01
+  pw=     0.59913 grad=  1.3077e-01
+  fBase=   288.66241 grad=  1.4209e-02
+  fAmt=   438.96878 grad= -5.5517e-03
+  fDecay=     0.06215 grad=  3.9935e-03
+  res=     0.54045 grad= -6.5628e-03
+  attackTime=     0.04479 grad= -9.0218e-03
+  decayTime=     0.43748 grad= -3.5864e-03
+  sustain=     0.03305 grad=  2.3043e-02
+  releaseTime=     0.01976 grad= -2.9540e-03
+  drive=     0.82988 grad=  2.4443e-03
+  outGain=     1.84323 grad= -5.9930e-02
+epoch=599 loss=1.457234
+  shape=     0.21454 grad=  7.7855e-02
+  pw=     0.59917 grad=  4.1573e-02
+  fBase=   285.37439 grad=  9.8934e-03
+  fAmt=   448.14578 grad= -7.4305e-03
+  fDecay=     0.06036 grad=  3.4784e-03
+  res=     0.54978 grad= -4.0322e-03
+  attackTime=     0.04769 grad= -8.3903e-03
+  decayTime=     0.45290 grad= -2.9151e-03
+  sustain=     0.00433 grad=  1.9975e-02
+  releaseTime=     0.01987 grad= -2.3366e-03
+  drive=     0.81875 grad=  1.9353e-03
+  outGain=     1.92851 grad= -5.2265e-02
+=== elite-04: production 800 ===
+epoch=0 loss=1.912447
+  shape=     0.21454 grad=  1.5349e-02
+  pw=     0.59917 grad= -2.1634e+00
+  fBase=   285.38010 grad= -8.2359e-02
+  fAmt=   448.12201 grad=  1.3267e-02
+  fDecay=     0.06037 grad=  2.7657e-02
+  res=     0.54976 grad=  9.1940e-02
+  attackTime=     0.04768 grad=  1.2154e-02
+  decayTime=     0.45287 grad= -4.9532e-02
+  sustain=     0.00439 grad= -2.3996e-02
+  releaseTime=     0.01987 grad=  1.2745e-01
+  drive=     0.81878 grad= -1.2257e-01
+  outGain=     1.92834 grad= -1.8113e-01
+epoch=200 loss=1.873299
+  shape=     0.22381 grad=  8.8759e-03
+  pw=     0.60006 grad=  1.0054e-03
+  fBase=   299.54062 grad=  2.7553e-03
+  fAmt=   487.19962 grad= -3.6566e-04
+  fDecay=     0.05458 grad=  7.7851e-04
+  res=     0.50000 grad=  4.1702e-02
+  attackTime=     0.08147 grad= -3.0516e-04
+  decayTime=     0.33653 grad=  8.0013e-04
+  sustain=     0.00000 grad=  3.2308e-02
+  releaseTime=     0.01681 grad=  6.3099e-05
+  drive=     1.19044 grad= -4.5332e-04
+  outGain=     1.99202 grad=  1.8952e-03
+epoch=400 loss=1.872037
+  shape=     0.22203 grad= -2.1508e-03
+  pw=     0.60001 grad= -7.4555e-02
+  fBase=   300.73090 grad= -4.0217e-03
+  fAmt=   542.63257 grad= -8.8708e-04
+  fDecay=     0.05130 grad= -1.2256e-03
+  res=     0.50000 grad=  1.3786e-02
+  attackTime=     0.10764 grad= -1.0116e-04
+  decayTime=     0.30331 grad=  3.1294e-04
+  sustain=     0.00000 grad=  3.5059e-02
+  releaseTime=     0.01701 grad= -1.9108e-04
+  drive=     1.43414 grad= -1.1163e-03
+  outGain=     1.94267 grad=  7.4828e-04
+epoch=600 loss=1.871923
+  shape=     0.22210 grad= -3.0316e-03
+  pw=     0.60002 grad= -1.1614e-02
+  fBase=   300.78296 grad= -2.2462e-03
+  fAmt=   553.75165 grad=  5.2422e-06
+  fDecay=     0.05024 grad= -5.2143e-04
+  res=     0.50000 grad=  1.6702e-02
+  attackTime=     0.11488 grad= -2.2885e-04
+  decayTime=     0.29445 grad=  3.6597e-04
+  sustain=     0.00000 grad=  3.6458e-02
+  releaseTime=     0.01706 grad=  5.7383e-05
+  drive=     1.53772 grad= -7.3986e-04
+  outGain=     1.91414 grad=  2.6631e-04
+epoch=799 loss=1.871884
+  shape=     0.22210 grad=  1.7987e-04
+  pw=     0.60003 grad=  1.9683e-02
+  fBase=   300.77365 grad=  3.4166e-04
+  fAmt=   553.84290 grad=  2.9612e-05
+  fDecay=     0.05023 grad=  1.5416e-04
+  res=     0.50000 grad=  1.7376e-02
+  attackTime=     0.11772 grad= -1.0598e-04
+  decayTime=     0.29138 grad=  1.0514e-04
+  sustain=     0.00000 grad=  3.5999e-02
+  releaseTime=     0.01707 grad=  1.0490e-05
+  drive=     1.57382 grad= -8.7917e-04
+  outGain=     1.90782 grad=  4.3473e-04
+=== elite-05: smooth 600 ===
+epoch=0 loss=1.962791
+  shape=     0.64670 grad= -2.6485e+00
+  pw=     0.47422 grad= -2.5722e+01
+  fBase=   289.10873 grad= -4.1759e-01
+  fAmt=   887.69061 grad= -1.9206e-01
+  fDecay=     0.08149 grad= -3.9427e-01
+  res=     1.98222 grad= -4.5285e-02
+  attackTime=     0.07890 grad=  2.2581e-01
+  decayTime=     0.05257 grad= -3.7053e-02
+  sustain=     0.69346 grad= -9.0086e-01
+  releaseTime=     0.04105 grad=  7.3350e-01
+  drive=     0.60044 grad= -7.1951e-01
+  outGain=     0.72965 grad= -2.5975e-01
+epoch=200 loss=1.030421
+  shape=     0.79494 grad= -2.5894e-01
+  pw=     0.47829 grad=  4.0145e+00
+  fBase=   251.40118 grad= -8.5634e-02
+  fAmt=   457.45776 grad=  2.2707e-02
+  fDecay=     0.08424 grad= -2.8204e-02
+  res=     1.41859 grad= -4.6186e-02
+  attackTime=     0.03163 grad=  2.0357e-02
+  decayTime=     0.03207 grad=  2.1498e-03
+  sustain=     0.72072 grad=  2.3013e-02
+  releaseTime=     0.01792 grad= -4.5358e-02
+  drive=     0.86811 grad= -1.1539e-02
+  outGain=     0.49522 grad=  1.1059e-01
+epoch=400 loss=0.981729
+  shape=     0.81723 grad= -2.1362e-02
+  pw=     0.47810 grad=  1.5124e-01
+  fBase=   247.49118 grad=  6.2787e-03
+  fAmt=   311.66830 grad=  3.7783e-03
+  fDecay=     0.12547 grad= -1.0619e-02
+  res=     1.41303 grad=  4.0997e-03
+  attackTime=     0.02346 grad= -1.6303e-03
+  decayTime=     0.03844 grad= -1.5561e-03
+  sustain=     0.69693 grad= -4.9840e-03
+  releaseTime=     0.01854 grad= -7.2196e-03
+  drive=     0.91419 grad= -8.1145e-04
+  outGain=     0.41842 grad=  4.6753e-02
+epoch=599 loss=0.980150
+  shape=     0.81814 grad= -1.1734e-02
+  pw=     0.47805 grad= -5.9602e-03
+  fBase=   246.81696 grad=  1.8454e-03
+  fAmt=   307.72458 grad=  1.2791e-03
+  fDecay=     0.12979 grad= -3.5565e-03
+  res=     1.40764 grad=  2.2507e-03
+  attackTime=     0.02349 grad=  4.2867e-05
+  decayTime=     0.04068 grad= -4.6781e-04
+  sustain=     0.70040 grad= -3.3860e-03
+  releaseTime=     0.01867 grad= -3.1335e-03
+  drive=     0.91881 grad= -1.2215e-03
+  outGain=     0.40718 grad=  3.6157e-02
+=== elite-05: production 800 ===
+epoch=0 loss=1.438651
+  shape=     0.81814 grad=  3.1907e-01
+  pw=     0.47805 grad= -2.5945e+01
+  fBase=   246.81696 grad=  5.4464e-01
+  fAmt=   307.72458 grad=  2.0152e-01
+  fDecay=     0.12979 grad=  1.4441e-01
+  res=     1.40764 grad=  4.8434e-01
+  attackTime=     0.02349 grad=  9.3618e-03
+  decayTime=     0.04068 grad=  1.8419e-02
+  sustain=     0.70040 grad=  1.5244e-01
+  releaseTime=     0.01867 grad=  9.5457e-02
+  drive=     0.91881 grad=  1.0967e-01
+  outGain=     0.40718 grad=  1.5252e-01
+epoch=200 loss=1.312902
+  shape=     0.88106 grad= -1.0084e-01
+  pw=     0.47817 grad=  7.1605e+00
+  fBase=   223.56268 grad= -2.4872e-01
+  fAmt=   191.11035 grad= -7.3139e-02
+  fDecay=     0.21967 grad= -7.3192e-02
+  res=     1.23275 grad= -1.4248e-01
+  attackTime=     0.01051 grad=  4.3087e-04
+  decayTime=     0.03244 grad= -1.4473e-03
+  sustain=     0.70265 grad= -4.6302e-02
+  releaseTime=     0.01714 grad= -3.9797e-04
+  drive=     1.02793 grad= -3.7635e-02
+  outGain=     0.32186 grad= -2.3240e-02
+epoch=400 loss=1.312580
+  shape=     0.88393 grad= -4.2060e-02
+  pw=     0.47819 grad=  5.5741e+00
+  fBase=   220.95589 grad= -2.0911e-02
+  fAmt=   191.87128 grad= -3.3471e-03
+  fDecay=     0.22870 grad= -3.7546e-03
+  res=     1.23706 grad= -3.1901e-03
+  attackTime=     0.01067 grad= -2.4075e-04
+  decayTime=     0.03246 grad= -5.9427e-05
+  sustain=     0.69402 grad= -1.5801e-02
+  releaseTime=     0.01719 grad= -3.2776e-05
+  drive=     1.04008 grad= -1.3258e-02
+  outGain=     0.31985 grad= -5.9554e-03
+epoch=600 loss=1.312457
+  shape=     0.88363 grad= -3.9185e-02
+  pw=     0.47816 grad=  4.4147e+00
+  fBase=   220.90100 grad= -7.5450e-02
+  fAmt=   191.72832 grad= -1.2034e-02
+  fDecay=     0.22963 grad= -1.7283e-02
+  res=     1.23313 grad= -3.6463e-02
+  attackTime=     0.01075 grad= -4.5787e-05
+  decayTime=     0.03256 grad= -6.6839e-05
+  sustain=     0.68949 grad= -8.3090e-03
+  releaseTime=     0.01719 grad= -1.3746e-04
+  drive=     1.04811 grad= -8.1955e-03
+  outGain=     0.31989 grad= -3.9966e-03
+epoch=799 loss=1.312445
+  shape=     0.88391 grad=  3.5264e-04
+  pw=     0.47815 grad= -3.8922e-01
+  fBase=   220.96368 grad=  2.5218e-03
+  fAmt=   191.69633 grad=  1.1239e-05
+  fDecay=     0.22969 grad=  7.0880e-04
+  res=     1.23273 grad=  1.5512e-03
+  attackTime=     0.01079 grad= -9.7383e-05
+  decayTime=     0.03256 grad=  1.2540e-05
+  sustain=     0.68791 grad=  2.7063e-03
+  releaseTime=     0.01719 grad=  6.5110e-05
+  drive=     1.05024 grad= -3.7511e-04
+  outGain=     0.31976 grad=  3.8152e-04
+=== elite-06: smooth 600 ===
+epoch=0 loss=2.043757
+  shape=     0.37461 grad= -4.9544e-01
+  pw=     0.37095 grad=  1.0437e+01
+  fBase=   584.96582 grad=  1.1287e-01
+  fAmt=    19.65672 grad= -8.5291e-03
+  fDecay=     0.04668 grad= -7.0529e-03
+  res=     1.22097 grad=  1.0342e-01
+  attackTime=     0.00856 grad=  3.8805e-02
+  decayTime=     0.78581 grad=  5.1970e-02
+  sustain=     0.30581 grad=  1.6015e-01
+  releaseTime=     0.02747 grad=  5.1346e-01
+  drive=     0.47738 grad= -3.9365e-01
+  outGain=     0.55540 grad= -5.0605e-01
+epoch=200 loss=1.376237
+  shape=     0.36830 grad=  5.2672e-01
+  pw=     0.36950 grad=  2.8478e-02
+  fBase=   347.60178 grad=  4.0654e-02
+  fAmt=   143.80846 grad= -3.5350e-03
+  fDecay=     0.18690 grad= -3.7911e-03
+  res=     0.54439 grad= -3.2341e-02
+  attackTime=     0.01289 grad= -7.6570e-03
+  decayTime=     0.46613 grad=  1.3356e-03
+  sustain=     0.05405 grad=  8.0558e-03
+  releaseTime=     0.02064 grad=  2.6073e-03
+  drive=     1.38897 grad=  1.8139e-02
+  outGain=     0.84123 grad= -9.8867e-02
+epoch=400 loss=1.356362
+  shape=     0.36789 grad= -5.2078e-04
+  pw=     0.36928 grad=  6.1532e-03
+  fBase=   322.42371 grad=  1.6611e-03
+  fAmt=   173.95250 grad=  1.6659e-04
+  fDecay=     0.24993 grad= -7.5152e-04
+  res=     0.55888 grad= -1.5958e-03
+  attackTime=     0.01420 grad=  3.9760e-04
+  decayTime=     0.49722 grad= -8.0687e-04
+  sustain=     0.06847 grad= -1.5946e-03
+  releaseTime=     0.02060 grad=  1.2807e-04
+  drive=     1.17619 grad=  1.7259e-02
+  outGain=     0.95276 grad= -7.1688e-02
+epoch=599 loss=1.353194
+  shape=     0.36808 grad= -4.9120e-03
+  pw=     0.36919 grad=  1.8799e-03
+  fBase=   321.87607 grad= -4.9549e-05
+  fAmt=   173.82333 grad= -1.3941e-04
+  fDecay=     0.25429 grad= -3.9227e-04
+  res=     0.56048 grad= -1.0312e-03
+  attackTime=     0.01405 grad=  2.1297e-04
+  decayTime=     0.50103 grad= -7.3990e-04
+  sustain=     0.06995 grad= -7.5281e-04
+  releaseTime=     0.02059 grad=  2.7055e-05
+  drive=     1.12475 grad=  1.5342e-02
+  outGain=     0.98590 grad= -6.8492e-02
+=== elite-06: production 800 ===
+epoch=0 loss=1.833145
+  shape=     0.36808 grad= -2.3565e+00
+  pw=     0.36919 grad= -1.4952e+01
+  fBase=   321.87607 grad=  5.2684e-02
+  fAmt=   173.82333 grad=  3.6467e-02
+  fDecay=     0.25429 grad= -4.0262e-03
+  res=     0.56048 grad=  2.6767e-02
+  attackTime=     0.01405 grad=  5.0851e-03
+  decayTime=     0.50103 grad= -4.3560e-02
+  sustain=     0.06995 grad= -4.5268e-02
+  releaseTime=     0.02059 grad=  1.3633e-01
+  drive=     1.12475 grad= -1.0842e-01
+  outGain=     0.98590 grad= -1.5437e-01
+epoch=200 loss=1.775002
+  shape=     0.37802 grad= -4.7529e-01
+  pw=     0.36794 grad= -2.6432e+00
+  fBase=   225.44194 grad=  3.8315e-02
+  fAmt=   258.42618 grad=  1.3280e-02
+  fDecay=     0.34693 grad=  6.3843e-03
+  res=     0.50000 grad=  5.2720e-02
+  attackTime=     0.01374 grad= -1.6341e-04
+  decayTime=     0.75870 grad= -1.7148e-03
+  sustain=     0.11052 grad= -1.2917e-03
+  releaseTime=     0.01665 grad=  1.1351e-04
+  drive=     0.92003 grad=  2.2947e-03
+  outGain=     1.32122 grad= -9.4816e-03
+epoch=400 loss=1.768987
+  shape=     0.38101 grad= -1.6807e-01
+  pw=     0.36782 grad= -1.2684e+00
+  fBase=   174.26096 grad=  1.6270e-02
+  fAmt=   314.92841 grad=  8.7987e-03
+  fDecay=     0.45667 grad=  2.7497e-03
+  res=     0.50000 grad=  7.5873e-02
+  attackTime=     0.01254 grad= -2.4114e-05
+  decayTime=     0.94264 grad= -7.0151e-04
+  sustain=     0.15036 grad= -8.0792e-04
+  releaseTime=     0.01677 grad= -2.5849e-04
+  drive=     0.73723 grad=  1.6809e-03
+  outGain=     1.49853 grad= -3.7883e-03
+epoch=600 loss=1.767830
+  shape=     0.38111 grad= -7.1154e-03
+  pw=     0.36788 grad= -2.5938e-02
+  fBase=   155.89043 grad=  5.7343e-03
+  fAmt=   333.49713 grad= -7.9019e-04
+  fDecay=     0.49690 grad= -7.1925e-04
+  res=     0.50000 grad=  7.9054e-02
+  attackTime=     0.01226 grad=  8.9506e-06
+  decayTime=     1.00661 grad= -4.5802e-04
+  sustain=     0.16422 grad= -5.7121e-04
+  releaseTime=     0.01681 grad=  1.3146e-04
+  drive=     0.68966 grad=  6.7408e-04
+  outGain=     1.56128 grad= -2.7407e-03
+epoch=799 loss=1.767575
+  shape=     0.38112 grad= -4.3436e-03
+  pw=     0.36788 grad= -4.0223e-02
+  fBase=   150.99133 grad=  5.2701e-03
+  fAmt=   338.19278 grad= -7.2258e-04
+  fDecay=     0.50754 grad= -6.0256e-04
+  res=     0.50000 grad=  7.8267e-02
+  attackTime=     0.01217 grad=  1.0800e-05
+  decayTime=     1.02295 grad= -4.4332e-04
+  sustain=     0.16780 grad= -5.9056e-04
+  releaseTime=     0.01682 grad= -2.2415e-05
+  drive=     0.67949 grad=  4.7602e-04
+  outGain=     1.57641 grad= -2.2931e-03
+=== elite-07: smooth 600 ===
+epoch=0 loss=2.063192
+  shape=     0.88066 grad= -4.0827e-01
+  pw=     0.42234 grad=  8.6723e+00
+  fBase=   510.36371 grad= -1.8108e+00
+  fAmt=  2426.96411 grad= -3.8281e-02
+  fDecay=     0.06681 grad= -4.2597e-01
+  res=     0.50000 grad= -2.6641e-01
+  attackTime=     0.09850 grad=  1.6055e-01
+  decayTime=     0.17880 grad= -1.4493e-01
+  sustain=     0.49189 grad= -7.6712e-01
+  releaseTime=     0.02117 grad=  6.3897e-02
+  drive=     0.64853 grad= -6.2814e-01
+  outGain=     0.24649 grad= -1.2674e+00
+epoch=200 loss=1.480848
+  shape=     0.73514 grad=  7.3747e-01
+  pw=     0.42160 grad=  2.7161e+00
+  fBase=   592.17908 grad=  4.2236e-02
+  fAmt=  1018.10651 grad=  3.6569e-02
+  fDecay=     0.05614 grad=  1.0061e-02
+  res=     0.50000 grad=  1.5687e-01
+  attackTime=     0.04964 grad= -1.5682e-03
+  decayTime=     0.31733 grad=  1.9973e-02
+  sustain=     0.27623 grad=  1.4497e-01
+  releaseTime=     0.01940 grad=  1.3926e-02
+  drive=     0.84118 grad=  3.7338e-02
+  outGain=     0.36697 grad= -1.8161e-01
+epoch=400 loss=1.404962
+  shape=     0.68450 grad=  8.7698e-02
+  pw=     0.42180 grad= -9.6223e-03
+  fBase=   568.77551 grad=  6.4539e-03
+  fAmt=   838.59308 grad=  2.9241e-03
+  fDecay=     0.06525 grad=  1.4003e-03
+  res=     0.50549 grad= -1.0510e-02
+  attackTime=     0.05766 grad= -4.4245e-03
+  decayTime=     0.36679 grad= -1.4984e-03
+  sustain=     0.10539 grad=  3.8268e-02
+  releaseTime=     0.02051 grad= -6.4141e-04
+  drive=     0.91311 grad= -4.6069e-04
+  outGain=     0.45002 grad= -1.5149e-01
+epoch=599 loss=1.395841
+  shape=     0.68115 grad=  2.1154e-02
+  pw=     0.42197 grad= -3.5763e-03
+  fBase=   563.22046 grad=  5.2263e-03
+  fAmt=   827.14813 grad=  3.1922e-03
+  fDecay=     0.06472 grad=  1.3445e-03
+  res=     0.51287 grad= -8.2055e-03
+  attackTime=     0.06064 grad= -3.2836e-03
+  decayTime=     0.37677 grad= -1.2012e-03
+  sustain=     0.07380 grad=  3.0344e-02
+  releaseTime=     0.02077 grad= -4.8107e-04
+  drive=     0.90909 grad=  2.1654e-03
+  outGain=     0.47289 grad= -1.4436e-01
+=== elite-07: production 800 ===
+epoch=0 loss=1.834642
+  shape=     0.68115 grad=  6.7106e-02
+  pw=     0.42197 grad= -4.9914e+00
+  fBase=   563.22046 grad= -2.3301e-02
+  fAmt=   827.14813 grad=  7.0776e-03
+  fDecay=     0.06472 grad=  3.0509e-02
+  res=     0.51287 grad=  1.1425e-01
+  attackTime=     0.06064 grad=  1.2806e-02
+  decayTime=     0.37677 grad= -1.2081e-02
+  sustain=     0.07380 grad=  6.4292e-02
+  releaseTime=     0.02077 grad=  1.4475e-01
+  drive=     0.90909 grad= -5.8861e-02
+  outGain=     0.47289 grad= -1.5483e-01
+epoch=200 loss=1.755561
+  shape=     0.63644 grad= -2.0303e-02
+  pw=     0.42099 grad= -1.8494e+00
+  fBase=   559.67371 grad=  4.6005e-02
+  fAmt=   543.92944 grad=  6.0335e-03
+  fDecay=     0.04472 grad=  6.4702e-03
+  res=     0.50000 grad=  2.6377e-02
+  attackTime=     0.03988 grad=  1.4599e-04
+  decayTime=     0.35095 grad=  3.3016e-03
+  sustain=     0.00000 grad=  3.4291e-02
+  releaseTime=     0.01706 grad=  5.1339e-04
+  drive=     0.87070 grad=  5.5968e-03
+  outGain=     0.70594 grad= -2.8275e-02
+epoch=400 loss=1.750132
+  shape=     0.63720 grad= -3.7234e-03
+  pw=     0.42078 grad= -7.4496e-02
+  fBase=   543.35626 grad=  1.8549e-03
+  fAmt=   516.67133 grad=  4.7888e-04
+  fDecay=     0.04597 grad= -2.9818e-04
+  res=     0.52278 grad= -8.8646e-04
+  attackTime=     0.03995 grad=  2.6482e-05
+  decayTime=     0.35082 grad=  1.0995e-04
+  sustain=     0.00000 grad=  2.6743e-02
+  releaseTime=     0.01710 grad= -6.2431e-05
+  drive=     0.72436 grad=  1.9032e-03
+  outGain=     0.86010 grad= -1.6578e-02
+epoch=600 loss=1.748880
+  shape=     0.63828 grad= -8.6324e-03
+  pw=     0.42066 grad= -8.2025e-02
+  fBase=   537.74756 grad=  2.1164e-03
+  fAmt=   501.67868 grad=  4.8530e-04
+  fDecay=     0.04718 grad= -2.0915e-04
+  res=     0.52895 grad= -8.6733e-04
+  attackTime=     0.03915 grad=  1.3827e-04
+  decayTime=     0.35279 grad= -1.7381e-04
+  sustain=     0.00000 grad=  2.5118e-02
+  releaseTime=     0.01712 grad= -1.5295e-04
+  drive=     0.66735 grad=  1.1793e-03
+  outGain=     0.92871 grad= -1.1276e-02
+epoch=799 loss=1.748630
+  shape=     0.63845 grad=  1.5207e-03
+  pw=     0.42065 grad=  3.7002e-02
+  fBase=   536.37164 grad=  4.7703e-03
+  fAmt=   497.31442 grad=  5.4380e-04
+  fDecay=     0.04768 grad= -1.9463e-04
+  res=     0.53047 grad=  1.8345e-03
+  attackTime=     0.03884 grad=  3.7673e-05
+  decayTime=     0.35426 grad= -7.2834e-05
+  sustain=     0.00000 grad=  2.5115e-02
+  releaseTime=     0.01712 grad=  3.7760e-05
+  drive=     0.65149 grad=  1.2445e-03
+  outGain=     0.94730 grad= -1.0274e-02
+=== elite-08: smooth 600 ===
+epoch=0 loss=4.823187
+  shape=     0.10609 grad= -1.3905e+01
+  pw=     0.43478 grad= -6.6833e-01
+  fBase=   962.57428 grad=  5.3184e+00
+  fAmt=   498.91446 grad=  6.3051e-01
+  fDecay=     0.08635 grad=  4.6433e-01
+  res=     0.50000 grad=  5.0544e+00
+  attackTime=     0.00838 grad= -3.1877e-01
+  decayTime=     0.14726 grad=  1.5742e+00
+  sustain=     0.17257 grad=  8.0144e+00
+  releaseTime=     0.13053 grad=  4.9927e-02
+  drive=     2.47666 grad=  4.4386e+00
+  outGain=     0.20554 grad=  3.2759e+00
+epoch=200 loss=1.684931
+  shape=     0.19748 grad=  2.5313e-02
+  pw=     0.41735 grad= -1.6245e-01
+  fBase=   633.16425 grad=  6.8027e-05
+  fAmt=   273.71301 grad=  5.9508e-03
+  fDecay=     0.05100 grad= -8.2055e-03
+  res=     0.50021 grad= -2.7937e-02
+  attackTime=     0.01679 grad=  1.3008e-03
+  decayTime=     0.25382 grad= -3.2760e-02
+  sustain=     0.18550 grad= -4.3845e-02
+  releaseTime=     0.02158 grad=  9.4524e-02
+  drive=     2.04096 grad=  4.2109e-02
+  outGain=     0.25224 grad= -1.6076e-01
+epoch=400 loss=1.650943
+  shape=     0.19807 grad= -4.6108e-03
+  pw=     0.41724 grad=  2.2288e-03
+  fBase=   613.72711 grad=  6.9203e-03
+  fAmt=   263.61316 grad=  5.1017e-03
+  fDecay=     0.05574 grad= -3.3444e-03
+  res=     0.51992 grad= -1.2180e-02
+  attackTime=     0.01535 grad=  6.4913e-03
+  decayTime=     0.27429 grad= -1.4090e-02
+  sustain=     0.20562 grad= -4.0679e-03
+  releaseTime=     0.02006 grad=  3.3172e-03
+  drive=     1.72547 grad=  2.9954e-02
+  outGain=     0.28812 grad= -1.3832e-01
+epoch=599 loss=1.643911
+  shape=     0.19826 grad= -9.7274e-04
+  pw=     0.41714 grad= -1.4449e-03
+  fBase=   608.62244 grad=  6.5975e-03
+  fAmt=   259.65298 grad=  5.2597e-03
+  fDecay=     0.05653 grad= -2.5521e-03
+  res=     0.52612 grad= -1.0116e-02
+  attackTime=     0.01488 grad=  5.6004e-03
+  decayTime=     0.27950 grad= -1.3553e-02
+  sustain=     0.20602 grad=  1.4594e-03
+  releaseTime=     0.02001 grad=  1.8463e-03
+  drive=     1.65545 grad=  2.6483e-02
+  outGain=     0.29927 grad= -1.3065e-01
+=== elite-08: production 800 ===
+epoch=0 loss=1.959492
+  shape=     0.19826 grad= -1.1910e+00
+  pw=     0.41714 grad= -2.0488e+00
+  fBase=   608.62244 grad=  1.0058e-01
+  fAmt=   259.65298 grad= -6.5562e-04
+  fDecay=     0.05653 grad=  4.7498e-03
+  res=     0.52612 grad=  9.1488e-02
+  attackTime=     0.01488 grad= -2.8369e-03
+  decayTime=     0.27950 grad= -1.7024e-02
+  sustain=     0.20602 grad=  8.0338e-02
+  releaseTime=     0.02001 grad=  1.5639e-01
+  drive=     1.65545 grad=  7.4289e-03
+  outGain=     0.29927 grad= -4.1663e-02
+epoch=200 loss=1.896275
+  shape=     0.21995 grad=  2.0142e-02
+  pw=     0.41759 grad= -5.1918e-02
+  fBase=   604.08685 grad=  1.5139e-03
+  fAmt=   258.73077 grad= -3.8049e-04
+  fDecay=     0.06521 grad=  1.0803e-04
+  res=     0.50000 grad=  1.1278e-02
+  attackTime=     0.01527 grad= -3.6325e-04
+  decayTime=     0.41971 grad=  6.4399e-04
+  sustain=     0.00000 grad=  3.2838e-02
+  releaseTime=     0.01614 grad= -4.5284e-04
+  drive=     1.31402 grad=  1.5251e-03
+  outGain=     0.42771 grad= -6.8530e-03
+epoch=400 loss=1.895950
+  shape=     0.22007 grad=  1.9022e-02
+  pw=     0.41708 grad= -4.8172e-04
+  fBase=   603.50641 grad=  4.7213e-04
+  fAmt=   259.67239 grad=  3.3065e-05
+  fDecay=     0.06604 grad= -9.7574e-05
+  res=     0.50000 grad=  2.5025e-03
+  attackTime=     0.01499 grad=  2.9876e-04
+  decayTime=     0.40933 grad=  6.1566e-04
+  sustain=     0.00000 grad=  3.3532e-02
+  releaseTime=     0.01629 grad=  4.0945e-05
+  drive=     1.23151 grad=  8.5793e-04
+  outGain=     0.46092 grad= -1.8939e-03
+epoch=600 loss=1.887272
+  shape=     0.22422 grad=  5.1721e-04
+  pw=     0.41087 grad= -2.6348e-02
+  fBase=   596.78345 grad= -2.6812e-03
+  fAmt=   297.70905 grad= -9.0380e-05
+  fDecay=     0.05089 grad= -1.7347e-04
+  res=     0.52860 grad= -1.5201e-03
+  attackTime=     0.01898 grad= -2.5891e-05
+  decayTime=     0.39619 grad=  8.5776e-05
+  sustain=     0.00000 grad=  3.0295e-02
+  releaseTime=     0.01643 grad= -5.9078e-05
+  drive=     1.19050 grad=  4.5987e-04
+  outGain=     0.49284 grad= -4.6869e-03
+epoch=799 loss=1.887183
+  shape=     0.22424 grad= -4.1574e-04
+  pw=     0.41088 grad=  1.2726e-02
+  fBase=   596.53937 grad= -7.6471e-04
+  fAmt=   297.71176 grad= -1.3368e-04
+  fDecay=     0.05083 grad= -9.6484e-05
+  res=     0.52931 grad= -3.2986e-04
+  attackTime=     0.01905 grad=  6.9330e-05
+  decayTime=     0.39413 grad=  1.4933e-04
+  sustain=     0.00000 grad=  3.0663e-02
+  releaseTime=     0.01645 grad= -1.6469e-04
+  drive=     1.17149 grad=  3.8490e-04
+  outGain=     0.50236 grad= -4.1223e-03
+=== elite-09: smooth 600 ===
+epoch=0 loss=2.883239
+  shape=     0.95335 grad=  2.5202e+00
+  pw=     0.33526 grad= -1.8251e+02
+  fBase=  1030.87402 grad=  1.5495e+00
+  fAmt=  1509.67017 grad=  2.4945e-01
+  fDecay=     0.05090 grad=  1.3311e-01
+  res=     0.50000 grad=  9.6738e-01
+  attackTime=     0.01477 grad= -1.1011e-01
+  decayTime=     0.10539 grad=  1.0454e-02
+  sustain=     0.47062 grad=  2.7809e-01
+  releaseTime=     0.01627 grad= -2.6675e-01
+  drive=     0.48015 grad=  3.1474e-01
+  outGain=     0.20206 grad=  1.3333e-01
+epoch=200 loss=1.686302
+  shape=     0.75937 grad=  8.8513e-01
+  pw=     0.34294 grad= -1.6855e-02
+  fBase=   603.60455 grad= -6.3726e-02
+  fAmt=   666.55518 grad=  3.1591e-02
+  fDecay=     0.07068 grad=  1.2816e-02
+  res=     0.50000 grad=  5.0884e-02
+  attackTime=     0.02701 grad=  6.9817e-03
+  decayTime=     0.27008 grad= -5.8507e-03
+  sustain=     0.38767 grad=  9.7038e-02
+  releaseTime=     0.01888 grad= -1.5526e-03
+  drive=     0.77519 grad= -2.4801e-02
+  outGain=     0.32461 grad= -2.9450e-01
+epoch=400 loss=1.582530
+  shape=     0.70331 grad=  1.0597e-01
+  pw=     0.34330 grad= -1.5685e-01
+  fBase=   571.19415 grad=  2.1301e-02
+  fAmt=   463.50226 grad=  3.9501e-03
+  fDecay=     0.07419 grad= -1.2180e-03
+  res=     0.53582 grad= -1.7006e-02
+  attackTime=     0.02568 grad= -2.8328e-03
+  decayTime=     0.31375 grad= -3.4678e-03
+  sustain=     0.19812 grad=  4.0678e-02
+  releaseTime=     0.01986 grad= -1.8511e-03
+  drive=     0.91207 grad=  3.7187e-04
+  outGain=     0.39064 grad= -2.0145e-01
+epoch=599 loss=1.571028
+  shape=     0.70108 grad= -3.8907e-03
+  pw=     0.34349 grad= -2.3247e-02
+  fBase=   563.58179 grad=  7.5315e-03
+  fAmt=   453.73474 grad=  1.9586e-03
+  fDecay=     0.07560 grad= -9.1657e-04
+  res=     0.54370 grad= -5.8682e-03
+  attackTime=     0.02685 grad= -1.9751e-03
+  decayTime=     0.32777 grad= -3.1138e-03
+  sustain=     0.17206 grad=  2.6720e-02
+  releaseTime=     0.02004 grad= -1.1352e-03
+  drive=     0.89288 grad=  8.2253e-03
+  outGain=     0.41002 grad= -1.9880e-01
+=== elite-09: production 800 ===
+epoch=0 loss=1.915455
+  shape=     0.70108 grad= -3.2759e-01
+  pw=     0.34349 grad= -6.2826e+00
+  fBase=   563.58179 grad=  4.8630e-01
+  fAmt=   453.73474 grad=  1.6076e-02
+  fDecay=     0.07560 grad=  5.2692e-02
+  res=     0.54370 grad=  2.3457e-01
+  attackTime=     0.02685 grad=  4.3997e-03
+  decayTime=     0.32777 grad= -1.7174e-02
+  sustain=     0.17206 grad=  6.4031e-02
+  releaseTime=     0.02004 grad=  1.3922e-01
+  drive=     0.89288 grad= -5.6114e-02
+  outGain=     0.41002 grad= -1.0204e-01
+epoch=200 loss=1.748380
+  shape=     0.62134 grad= -3.5971e-02
+  pw=     0.34379 grad= -6.9714e-01
+  fBase=   397.91711 grad=  8.9196e-02
+  fAmt=   230.19260 grad=  7.4432e-03
+  fDecay=     0.03685 grad=  6.4741e-03
+  res=     1.07532 grad= -1.2564e-02
+  attackTime=     0.01235 grad=  5.1771e-04
+  decayTime=     0.71703 grad= -3.1792e-03
+  sustain=     0.07322 grad= -1.3389e-03
+  releaseTime=     0.01588 grad= -1.5032e-03
+  drive=     1.18272 grad= -2.0858e-03
+  outGain=     0.33122 grad=  2.0869e-02
+epoch=400 loss=1.652033
+  shape=     0.59403 grad= -4.0783e-02
+  pw=     0.33634 grad=  1.4664e+00
+  fBase=   263.95810 grad= -8.5068e-02
+  fAmt=   232.41298 grad=  8.3390e-04
+  fDecay=     0.05577 grad= -1.6581e-04
+  res=     2.15044 grad= -2.6856e-02
+  attackTime=     0.01538 grad= -5.6693e-04
+  decayTime=     0.86717 grad= -4.9522e-03
+  sustain=     0.10877 grad= -7.0961e-03
+  releaseTime=     0.01723 grad=  1.1456e-03
+  drive=     1.41927 grad= -1.3624e-02
+  outGain=     0.36634 grad= -2.4443e-02
+epoch=600 loss=1.651207
+  shape=     0.59336 grad=  2.5940e-03
+  pw=     0.33625 grad=  1.9025e-01
+  fBase=   263.87994 grad= -1.6573e-02
+  fAmt=   231.69586 grad= -9.0318e-04
+  fDecay=     0.05522 grad= -9.6503e-04
+  res=     2.15480 grad= -2.6932e-03
+  attackTime=     0.01548 grad= -6.0244e-05
+  decayTime=     0.86153 grad=  2.0837e-04
+  sustain=     0.10634 grad=  4.6587e-04
+  releaseTime=     0.01712 grad= -2.4407e-04
+  drive=     1.38129 grad=  1.1135e-03
+  outGain=     0.38977 grad= -5.4555e-03
+epoch=799 loss=1.651155
+  shape=     0.59335 grad=  1.4910e-03
+  pw=     0.33625 grad= -3.4058e-02
+  fBase=   263.87228 grad=  3.7063e-03
+  fAmt=   231.66402 grad= -2.1931e-05
+  fDecay=     0.05523 grad= -1.4247e-05
+  res=     2.15508 grad=  4.0563e-04
+  attackTime=     0.01549 grad= -3.5219e-05
+  decayTime=     0.86106 grad=  1.8394e-04
+  sustain=     0.10567 grad=  4.7701e-04
+  releaseTime=     0.01710 grad= -3.1918e-05
+  drive=     1.37454 grad=  6.8947e-04
+  outGain=     0.39365 grad= -4.1121e-03
+=== elite-10: smooth 600 ===
+epoch=0 loss=1.713904
+  shape=     0.86204 grad= -3.1939e+00
+  pw=     0.34876 grad= -2.1308e+00
+  fBase=   153.89890 grad=  1.0058e+00
+  fAmt=   516.91010 grad= -1.2076e-01
+  fDecay=     0.01827 grad= -1.0620e-01
+  res=     3.20712 grad= -6.7300e-01
+  attackTime=     0.07680 grad=  7.1287e-01
+  decayTime=     0.10343 grad= -4.1243e-01
+  sustain=     0.46686 grad= -2.4117e+00
+  releaseTime=     0.01561 grad= -2.2358e-01
+  drive=     0.62791 grad= -1.9425e+00
+  outGain=     1.46317 grad= -9.8237e-01
+epoch=200 loss=0.916766
+  shape=     0.85721 grad=  1.7098e-02
+  pw=     0.36479 grad= -2.3044e-02
+  fBase=   132.85469 grad= -3.4167e-02
+  fAmt=   603.20526 grad= -9.5499e-03
+  fDecay=     0.02354 grad= -2.7221e-02
+  res=     4.28774 grad= -5.4648e-03
+  attackTime=     0.04588 grad=  5.7091e-03
+  decayTime=     0.16166 grad= -8.0424e-04
+  sustain=     0.35876 grad= -8.6299e-03
+  releaseTime=     0.01925 grad= -6.5448e-04
+  drive=     0.74914 grad= -1.5638e-02
+  outGain=     1.14394 grad=  1.2764e-01
+epoch=400 loss=0.893826
+  shape=     0.84675 grad=  3.3616e-03
+  pw=     0.36462 grad= -5.5045e-02
+  fBase=   132.69951 grad=  6.5114e-02
+  fAmt=   602.96674 grad= -1.9338e-03
+  fDecay=     0.02360 grad= -1.9186e-03
+  res=     4.28352 grad=  1.4356e-02
+  attackTime=     0.04340 grad=  5.4354e-03
+  decayTime=     0.16377 grad= -1.5033e-03
+  sustain=     0.36698 grad= -1.5779e-02
+  releaseTime=     0.01967 grad= -3.0203e-04
+  drive=     0.82760 grad= -1.8454e-02
+  outGain=     0.94419 grad=  9.3024e-02
+epoch=599 loss=0.888535
+  shape=     0.84347 grad=  2.6240e-02
+  pw=     0.36451 grad=  8.7535e-03
+  fBase=   132.66142 grad=  2.8173e-02
+  fAmt=   601.49030 grad=  9.7181e-03
+  fDecay=     0.02364 grad= -1.2178e-02
+  res=     4.27492 grad=  7.3495e-03
+  attackTime=     0.04272 grad=  6.3427e-03
+  decayTime=     0.16400 grad= -5.5594e-04
+  sustain=     0.36880 grad= -8.3056e-03
+  releaseTime=     0.01978 grad= -3.6934e-04
+  drive=     0.85194 grad= -1.6378e-02
+  outGain=     0.89872 grad=  8.9024e-02
+=== elite-10: production 800 ===
+epoch=0 loss=1.325328
+  shape=     0.84348 grad= -5.7648e-01
+  pw=     0.36451 grad=  4.8430e+00
+  fBase=   132.66148 grad=  1.3059e+00
+  fAmt=   601.52563 grad= -3.7041e-01
+  fDecay=     0.02364 grad= -5.8699e-01
+  res=     4.27493 grad=  5.8862e-01
+  attackTime=     0.04272 grad=  2.6743e-02
+  decayTime=     0.16400 grad= -1.9984e-02
+  sustain=     0.36879 grad= -2.6111e-01
+  releaseTime=     0.01978 grad= -2.4426e-03
+  drive=     0.85188 grad= -1.2585e-01
+  outGain=     0.89881 grad=  2.3879e-01
+epoch=200 loss=1.161177
+  shape=     0.82290 grad=  8.0445e-01
+  pw=     0.36228 grad= -2.2642e+00
+  fBase=   128.67009 grad= -2.1105e+00
+  fAmt=   502.82068 grad=  4.6598e-01
+  fDecay=     0.01823 grad=  1.0042e+00
+  res=     4.52146 grad= -8.5965e-01
+  attackTime=     0.02125 grad= -5.2905e-03
+  decayTime=     0.15650 grad=  2.9666e-02
+  sustain=     0.42262 grad=  2.2394e-01
+  releaseTime=     0.02109 grad= -1.2586e-02
+  drive=     0.95453 grad=  1.2440e-01
+  outGain=     0.57577 grad=  9.5914e-02
+epoch=400 loss=1.155805
+  shape=     0.81169 grad= -3.6772e-01
+  pw=     0.36049 grad= -7.0406e+00
+  fBase=   128.85767 grad=  3.6058e+00
+  fAmt=   520.61755 grad=  6.2523e-01
+  fDecay=     0.01795 grad=  1.2361e+00
+  res=     4.55132 grad=  2.5597e-01
+  attackTime=     0.02175 grad= -7.9195e-05
+  decayTime=     0.15491 grad= -8.2692e-03
+  sustain=     0.42072 grad= -5.8858e-02
+  releaseTime=     0.02121 grad=  1.9858e-03
+  drive=     0.98356 grad= -3.8039e-02
+  outGain=     0.57403 grad= -2.2925e-02
+epoch=600 loss=1.154111
+  shape=     0.80724 grad=  7.7647e-02
+  pw=     0.36055 grad= -1.3091e+00
+  fBase=   128.74036 grad=  3.4779e-01
+  fAmt=   522.98956 grad=  1.9885e-01
+  fDecay=     0.01791 grad=  4.0399e-01
+  res=     4.55062 grad= -4.8530e-02
+  attackTime=     0.02196 grad= -1.4928e-04
+  decayTime=     0.15286 grad=  2.0838e-03
+  sustain=     0.41847 grad=  1.2725e-02
+  releaseTime=     0.02120 grad=  2.9545e-05
+  drive=     0.99835 grad=  3.9209e-03
+  outGain=     0.57402 grad=  4.2464e-03
+epoch=799 loss=1.153940
+  shape=     0.80588 grad=  1.8120e-01
+  pw=     0.36053 grad=  4.7488e-01
+  fBase=   128.68401 grad= -7.6457e-01
+  fAmt=   523.52954 grad= -5.6927e-02
+  fDecay=     0.01791 grad= -1.0387e-01
+  res=     4.55101 grad= -1.3884e-01
+  attackTime=     0.02205 grad= -2.4769e-05
+  decayTime=     0.15217 grad=  3.9687e-03
+  sustain=     0.41762 grad=  3.4096e-02
+  releaseTime=     0.02120 grad= -5.9446e-04
+  drive=     1.00294 grad=  1.4154e-02
+  outGain=     0.57389 grad=  1.0799e-02
+=== elite-11: smooth 600 ===
+epoch=0 loss=1.935986
+  shape=     0.90840 grad= -7.4603e-01
+  pw=     0.54315 grad=  3.3863e+01
+  fBase=   143.49107 grad=  2.8740e+00
+  fAmt=  1682.61975 grad= -1.3360e-01
+  fDecay=     0.01753 grad= -2.9706e-01
+  res=     0.76709 grad= -6.8104e-01
+  attackTime=     0.07649 grad=  5.5524e-01
+  decayTime=     0.48421 grad= -9.3085e-03
+  sustain=     0.72292 grad=  8.4003e-02
+  releaseTime=     0.02562 grad=  2.3874e-01
+  drive=     2.39388 grad= -7.4573e-01
+  outGain=     0.19668 grad= -6.2917e-01
+epoch=200 loss=0.476477
+  shape=     0.95931 grad=  8.5847e-02
+  pw=     0.52580 grad= -5.1418e+00
+  fBase=    77.34258 grad=  6.2040e-01
+  fAmt=   533.86859 grad=  9.8365e-02
+  fDecay=     0.00874 grad=  6.5757e-02
+  res=     1.11844 grad= -1.1103e-02
+  attackTime=     0.03742 grad= -1.4112e-02
+  decayTime=     0.23487 grad=  2.9309e-02
+  sustain=     0.41495 grad=  6.7753e-02
+  releaseTime=     0.02149 grad= -9.2401e-03
+  drive=     4.86950 grad=  7.3326e-02
+  outGain=     0.29670 grad= -6.4649e-02
+epoch=400 loss=0.444411
+  shape=     0.95116 grad=  6.8367e-03
+  pw=     0.52902 grad=  7.6052e-01
+  fBase=    79.61375 grad= -6.6086e-02
+  fAmt=   416.16470 grad=  1.5528e-02
+  fDecay=     0.00907 grad=  3.1937e-03
+  res=     1.21477 grad= -2.2718e-02
+  attackTime=     0.03781 grad= -3.7241e-03
+  decayTime=     0.15505 grad=  3.3645e-03
+  sustain=     0.40767 grad=  5.0760e-03
+  releaseTime=     0.02128 grad=  4.0310e-04
+  drive=     4.58559 grad=  6.5716e-03
+  outGain=     0.34410 grad= -6.3959e-02
+epoch=599 loss=0.440054
+  shape=     0.95057 grad= -8.6950e-03
+  pw=     0.52965 grad=  1.0305e-02
+  fBase=    80.15163 grad= -7.0859e-03
+  fAmt=   399.09387 grad=  1.2737e-02
+  fDecay=     0.00921 grad= -8.5233e-04
+  res=     1.23409 grad= -1.2646e-02
+  attackTime=     0.03824 grad= -2.8916e-03
+  decayTime=     0.14771 grad=  1.3430e-03
+  sustain=     0.40217 grad= -2.7066e-03
+  releaseTime=     0.02119 grad=  3.2720e-04
+  drive=     4.49301 grad=  2.6414e-03
+  outGain=     0.35633 grad= -5.8969e-02
+=== elite-11: production 800 ===
+epoch=0 loss=0.919886
+  shape=     0.95050 grad= -4.0298e-02
+  pw=     0.52963 grad= -2.0293e+01
+  fBase=    80.11288 grad=  1.6613e+00
+  fAmt=   400.49744 grad=  1.2134e-02
+  fDecay=     0.00920 grad=  9.3326e-02
+  res=     1.23288 grad=  3.7332e-01
+  attackTime=     0.03819 grad=  1.0819e-02
+  decayTime=     0.14834 grad=  2.2833e-02
+  sustain=     0.40267 grad=  1.4207e-01
+  releaseTime=     0.02120 grad= -2.8468e-02
+  drive=     4.50264 grad=  6.9454e-02
+  outGain=     0.35502 grad= -1.9757e-01
+epoch=200 loss=0.841739
+  shape=     0.94229 grad= -8.5108e-02
+  pw=     0.52928 grad= -9.9107e+00
+  fBase=    78.26718 grad=  8.1510e-01
+  fAmt=   290.74454 grad= -3.3137e-02
+  fDecay=     0.00919 grad=  5.3552e-02
+  res=     1.26945 grad=  1.1161e-01
+  attackTime=     0.03648 grad= -3.0542e-03
+  decayTime=     0.13656 grad= -3.3800e-03
+  sustain=     0.39209 grad= -3.7046e-02
+  releaseTime=     0.02050 grad= -4.0279e-04
+  drive=     4.01720 grad=  2.3842e-03
+  outGain=     0.51605 grad= -9.5131e-02
+epoch=400 loss=0.816373
+  shape=     0.94728 grad=  1.0672e-01
+  pw=     0.52965 grad= -1.1864e+00
+  fBase=    79.58346 grad=  9.1585e-01
+  fAmt=   234.44611 grad=  6.6257e-02
+  fDecay=     0.00883 grad=  1.9621e-01
+  res=     1.23651 grad= -1.1854e-01
+  attackTime=     0.02932 grad= -2.6006e-03
+  decayTime=     0.14445 grad=  1.2305e-02
+  sustain=     0.41253 grad=  8.6070e-02
+  releaseTime=     0.02041 grad=  1.9538e-04
+  drive=     3.60657 grad=  7.9738e-02
+  outGain=     0.53825 grad=  3.7084e-02
+epoch=600 loss=0.812769
+  shape=     0.95784 grad= -1.9190e-02
+  pw=     0.52944 grad= -5.5509e+00
+  fBase=    79.73170 grad=  1.0111e+00
+  fAmt=   242.34428 grad=  5.2348e-02
+  fDecay=     0.00879 grad=  1.2983e-01
+  res=     1.23068 grad= -4.1922e-02
+  attackTime=     0.02772 grad=  2.1206e-03
+  decayTime=     0.15432 grad=  1.3603e-03
+  sustain=     0.42617 grad=  1.7738e-02
+  releaseTime=     0.02038 grad= -4.6947e-03
+  drive=     3.39543 grad=  2.8609e-02
+  outGain=     0.53891 grad=  6.2048e-03
+epoch=799 loss=0.812323
+  shape=     0.96165 grad= -8.1025e-02
+  pw=     0.52949 grad=  7.0307e-01
+  fBase=    79.70773 grad= -2.6829e-01
+  fAmt=   242.06296 grad= -4.1651e-02
+  fDecay=     0.00879 grad= -8.3549e-02
+  res=     1.23178 grad= -1.0262e-02
+  attackTime=     0.02725 grad=  1.0080e-03
+  decayTime=     0.15749 grad= -1.0731e-02
+  sustain=     0.42970 grad= -5.9340e-02
+  releaseTime=     0.02045 grad=  2.3602e-03
+  drive=     3.33130 grad= -1.6872e-02
+  outGain=     0.53938 grad= -1.9357e-02
+
+=== summary (gate: finalLoss / coldBaseline <= 0.02) ===
+elite-01: finalLoss=0.427841 ratio=17.0982% FAIL
+elite-11: finalLoss=0.811743 ratio=32.4404% FAIL
+elite-10: finalLoss=1.153454 ratio=46.0964% FAIL
+elite-05: finalLoss=1.312419 ratio=52.4493% FAIL
+elite-03: finalLoss=1.520295 ratio=60.7568% FAIL
+elite-09: finalLoss=1.651135 ratio=65.9857% FAIL
+elite-02: finalLoss=1.664191 ratio=66.5074% FAIL
+elite-07: finalLoss=1.748630 ratio=69.8819% FAIL
+elite-06: finalLoss=1.767571 ratio=70.6389% FAIL
+elite-00: finalLoss=1.809338 ratio=72.3081% FAIL
+elite-04: finalLoss=1.871884 ratio=74.8076% FAIL
+elite-08: finalLoss=1.887176 ratio=75.4188% FAIL
+
+best: elite-01 finalLoss=0.427841 ratio=17.0982%

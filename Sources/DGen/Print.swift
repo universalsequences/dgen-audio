@@ -51,12 +51,16 @@ extension UOp {
             opStr = "\(ANSI.cyan)memoryAccumulate\(ANSI.reset)(\(base), \(offset), \(value))"
         case let .simdBroadcastLoad(base, offset):
             opStr = "\(ANSI.cyan)simdBroadcastLoad\(ANSI.reset)(\(base), \(offset))"
+        case let .broadcastScalar(src):
+            opStr = "\(ANSI.cyan)broadcastScalar\(ANSI.reset)(\(src))"
         case let .sin(a):
             opStr = "\(ANSI.green)sin\(ANSI.reset)(\(a))"
         case let .cos(a):
             opStr = "\(ANSI.green)cos\(ANSI.reset)(\(a))"
         case let .tan(a):
             opStr = "\(ANSI.green)tan\(ANSI.reset)(\(a))"
+        case let .atan(a):
+            opStr = "\(ANSI.green)atan\(ANSI.reset)(\(a))"
         case let .tanh(a):
             opStr = "\(ANSI.green)tanh\(ANSI.reset)(\(a))"
         case let .exp(a):
@@ -129,6 +133,8 @@ extension UOp {
             opStr = "\(ANSI.green)input\(ANSI.reset)(\(a))"
         case .frameCount:
             opStr = "\(ANSI.magenta)frameCount\(ANSI.reset)"
+        case .hostSampleRate:
+            opStr = "\(ANSI.magenta)hostSampleRate\(ANSI.reset)"
         case let .loadTape(val, offset):
             opStr = "\(ANSI.magenta)loadTape\(ANSI.reset)(\(val), \(offset))"
         case let .mse(a, b):

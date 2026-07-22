@@ -1,0 +1,42 @@
+{
+  "ampLR" : 0.03,
+  "checkpointEvery" : 300,
+  "cosineLRDecay" : true,
+  "decayLR" : 0.03,
+  "directionEpsilon" : 0.0001,
+  "enableNoiseFilter" : true,
+  "epochs" : 600,
+  "fdEpsilon" : 0.01,
+  "frames" : 32768,
+  "freezePitch" : true,
+  "frozenParams" : [
+
+  ],
+  "gradClip" : 1,
+  "includeLinearMagnitude" : true,
+  "linearMagnitudeWeight" : 0.1,
+  "logEvery" : 600,
+  "noiseLR" : 0.01,
+  "peakNormalizeTo" : 0.9,
+  "pitchLR" : 0.001,
+  "pitchRefineEpochs" : 0,
+  "profile" : "subtractive-bass",
+  "restarts" : 1,
+  "rung" : 1,
+  "sampleRate" : 44100,
+  "seed" : 7,
+  "spectralLogEpsilon" : 0.001,
+  "spectralWindows" : [
+    256,
+    512,
+    1024,
+    2048
+  ],
+  "toneLR" : 0.01,
+  "useHannWindow" : true,
+  "useSmoothBasinSearch" : true,
+  "useSmoothTrainingLoss" : true,
+  "windowWeights" : [
+
+  ]
+}

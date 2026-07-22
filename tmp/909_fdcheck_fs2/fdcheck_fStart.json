@@ -1,0 +1,13 @@
+{
+  "absoluteError" : 0.20136112,
+  "autogradGrad" : -0.28692955,
+  "baseLoss" : 2.1006694,
+  "baseNaturalValue" : 267.18884,
+  "baseTransformedValue" : 5.5879555,
+  "epsilon" : 0.01,
+  "finiteDifferenceGrad" : -0.08556843,
+  "lossMinus" : 2.1056979,
+  "lossPlus" : 2.1039865,
+  "paramName" : "fStart",
+  "relativeError" : 0.70177895
+}

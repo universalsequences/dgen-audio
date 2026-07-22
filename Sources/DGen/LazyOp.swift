@@ -15,6 +15,22 @@ public enum SpectralLossMode: String, Codable, Sendable {
   case l1
 }
 
+public enum ModulatedParamMode: String, Codable, Sendable {
+  case additive
+  case multiplicative
+  case semitone
+}
+
+public struct ModulatedParamLane: Hashable, Codable, Sendable {
+  public let modulatorChannel: Int
+  public let depthCellId: CellID
+
+  public init(modulatorChannel: Int, depthCellId: CellID) {
+    self.modulatorChannel = modulatorChannel
+    self.depthCellId = depthCellId
+  }
+}
+
 // MARK: - Tensor Emit Helpers
 
 /// Emit a binary op for scalars or tensors.
@@ -64,7 +80,7 @@ func emitTernaryOp(
 
 // frontend
 public enum LazyOp {
-  case add, sub, div, mul, abs, sign, sin, cos, tan, tanh, exp, log, log10, sqrt, atan2, gt, gte,
+  case add, sub, div, mul, abs, sign, sin, cos, tan, atan, tanh, exp, log, log10, sqrt, atan2, gt, gte,
     lte,
     lt, eq,
     gswitch, mix, pow, floor, ceil, round, mod, min, max, and, or, xor
@@ -76,6 +92,7 @@ public enum LazyOp {
     hop: Int,
     useHann: Bool,
     useLogMagnitude: Bool,
+    useSmoothLogMagnitude: Bool,
     lossMode: SpectralLossMode,
     windowCell: CellID,
     fft1Cell: CellID,
@@ -88,6 +105,7 @@ public enum LazyOp {
     windowSize: Int,
     hop: Int,
     useLogMagnitude: Bool,
+    useSmoothLogMagnitude: Bool,
     lossMode: SpectralLossMode,
     fft1Cell: CellID,
     fft2Cell: CellID,
@@ -261,6 +279,17 @@ public enum LazyOp {
     gradWriteCell: CellID, rowIdxCell: CellID, gradCell: CellID, numRows: Int, numCols: Int,
     maxFrameCount: Int)
   case selector  // selector(mode, options[])
+  /// Host-routed modulation destination. Inputs are:
+  /// [baseParam].
+  /// Scalar parameter cells are loaded as lane-uniform values so the same op is
+  /// safe in scalar and SIMD C frame loops.
+  case modulatedParam(
+    mode: ModulatedParamMode,
+    min: Float,
+    max: Float,
+    baseCellId: CellID,
+    activeCellId: CellID,
+    lanes: [ModulatedParamLane])
   case memoryRead(CellID)
   case memoryWrite(CellID)
   case memoryAccumulate(CellID)  // Atomic add to memory cell
@@ -291,6 +320,7 @@ public enum LazyOp {
   case spectrumDelay(CellID, CellID, CellID, Int, Int)  // ringCell, rowCell, outputCell, N, hops — N-bin spectrum from `hops` hops ago
   case spectrumDelayMod(CellID, CellID, CellID, Int, Int)  // ringCell, rowCell, outputCell, N, maxHops — fractional delay driven by a scalar `delay` input (0..maxHops)
   case constant(Float)
+  case hostSampleRate
   case output(Int)
   case input(Int)
   case tensorRef(TensorID)
@@ -312,6 +342,8 @@ public enum LazyOp {
   case gemmSmall(Int, Int, Int, Bool, Bool)  // M, N, K, transA, transB
   case maxAxis(Int)  // Reduce along axis keeping maximum
   case meanAxis(Int)  // Reduce along axis computing mean
+  case cumsum(Int)  // Cumulative (prefix) sum along an axis. Output shape == input shape.
+  case gather  // Indexed read: gather(source, indices). Output shape == indices shape.
   case reshape(Shape)  // Reshape tensor (metadata only, no data movement)
   case transpose([Int])  // Transpose/permute axes (metadata only)
   case shrink([(Int, Int)?])  // Shrink/slice tensor (metadata only, no data movement)
@@ -337,8 +369,16 @@ public enum LazyOp {
   case neg  // Unary negation: -x
   case expand(Shape)  // Broadcast scalar to tensor shape (sum backward)
   case expandAxis(Shape, Int)  // Broadcast along a specific axis (sumAxis backward)
-  case gradPhasor(NodeID)  // Gradient for phasor: needs frame index context
   case gradDeterministicPhasor  // Gradient for deterministic phasor
+  /// Stores a frame's upstream gradient and reset gate for a temporal reverse scan.
+  case temporalGradStore(
+    gradCell: CellID, resetCell: CellID, elementCount: Int)
+  /// Computes an exclusive, reset-aware suffix sum over stored frame gradients.
+  case temporalGradScan(
+    gradCell: CellID, resetCell: CellID, outputCell: CellID, elementCount: Int)
+  /// Reads one frame/element from a completed temporal gradient scan.
+  case temporalGradRead(
+    outputCell: CellID, shape: Shape, scaleBySampleRate: Bool)
 
   /// View-only ops: metadata transforms that emit no compute code.
   /// Used to skip these ops during shape transition detection, tensor block
@@ -394,6 +434,7 @@ public enum LazyOp {
       .phaseVocoderPitchShift,
       .overlapAdd, .overlapAddGradStore, .overlapAddGradGather,
       .bufferViewGradStore, .bufferViewGradRead,
+      .temporalGradStore, .temporalGradScan,
       .partitionedSpectralConvolve,
       .tensorNoise,
       .hopTensorNoise,
@@ -401,7 +442,7 @@ public enum LazyOp {
       .spectrumDelayMod,
       .gemm, .gemmStaged, .gemmChunkPartials, .gemmStagedChunkPartials,
       .gemmSmall,
-      .conv1d, .conv2d,
+      .conv1d, .conv2d, .cumsum, .gather,
       .tensorAccumulate, .chunkPartialsReduceToCell,
       .spectralLossFFT, .spectralLossFFTGradSpec, .spectralLossFFTGradIFFT,
       .spectralLossFFTGradInline, .spectralLossFFTGradRead, .spectralLossFFTGradRead2,

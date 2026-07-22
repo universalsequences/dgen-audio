@@ -5,6 +5,7 @@ import Foundation
 
 /// Check if any UOps contain patterns that prevent SIMD optimization:
 /// - Inner loops (beginLoop, beginForLoop)
+/// - Runtime control flow and mutation in the C backend
 /// - View operations (reshape, transpose, shrink) that require complex index arithmetic (C only)
 /// - Broadcast access (non-contiguous strides or shape mismatch) (C only)
 ///
@@ -17,6 +18,18 @@ private func containsSIMDBlockers(_ uops: [UOp], backend: Backend) -> Bool {
     switch uop.op {
     case .beginLoop, .beginForLoop, .beginReverseLoop:
       return true
+    case .beginIf, .endIf, .mutate, .declareVar:
+      if case .c = backend { return true }
+    case .delay1:
+      // The SIMD delay1 lowering (vextq_f32 + a 4-lane carry cell) is only
+      // correct when EVERY process() call covers a multiple of 4 frames: the
+      // carry cell stores the previous 4-lane group, so a partial group
+      // (nframes % 4 != 0, or a maxFrames 1/2 build) writes garbage lanes
+      // into the carry and the next call reads them back as x[n-1]/x[n-2].
+      // nframes is a runtime host parameter, so this can never be proven
+      // safe — force scalar per-frame emission (matches Metal, which already
+      // schedules historyReadWrite scalar).
+      if case .c = backend { return true }
     case .reshape, .transpose, .shrink, .pad:
       // Metal handles these fine with per-thread execution
       if case .c = backend { return true }
@@ -104,17 +117,18 @@ private func resetFrameAwareBlockContext(_ ctx: IRContext) {
 ///   - block: Block whose nodes are being inspected.
 ///   - g: Graph containing node and tensor metadata.
 private func markConvInputsAsOutbound(_ outboundCells: inout Set<CellID>, block: Block, g: Graph) {
-  // Mark conv2d/conv1d input tensors as outbound - they use memoryRead() directly
-  // instead of tload(), so the input MUST be in memory not just in registers.
+  // Mark conv2d/conv1d/cumsum/gather input tensors as outbound - they use memoryRead()
+  // directly instead of tload(), so the input MUST be in memory not just registers.
   for nodeId in block.nodes {
     guard let node = g.nodes[nodeId] else { continue }
     switch node.op {
-    case .conv2d, .conv1d:
-      if let inputId = node.inputs.first,
-        let tensorId = g.nodeToTensor[inputId],
-        let tensor = g.tensors[tensorId]
-      {
-        outboundCells.insert(tensor.cellId)
+    case .conv2d, .conv1d, .cumsum, .gather:
+      for inputId in node.inputs {
+        if let tensorId = g.nodeToTensor[inputId],
+          let tensor = g.tensors[tensorId]
+        {
+          outboundCells.insert(tensor.cellId)
+        }
       }
     default:
       break
@@ -261,6 +275,13 @@ private func emitStandardBlockBodyUOps(
       ctx: ctx
     )
     hasOwnFrameLoop = true
+  } else if blockIsDetachedBPTTBackward(block: block, g: g) {
+    // Spectral and other multi-kernel losses materialize the upstream gradient
+    // before this backward-only block. The carry recurrence still has to run in
+    // reverse time even though its forward history writes live in an earlier
+    // kernel and cannot be wrapped together with this body.
+    bodyUops = wrapDetachedBPTTBackwardLoop(bodyUops)
+    hasOwnFrameLoop = true
   }
 
   return (uops: bodyUops, hasOwnFrameLoop: hasOwnFrameLoop)
@@ -285,13 +306,23 @@ private func emitBlockBodyUOps(
   emittedNodes: inout Set<NodeID>
 ) throws -> (uops: [UOp], hasOwnFrameLoop: Bool) {
   if useShapeAwareEmission {
+    // Lane-parallel detached BPTT backward: bind the region element index to
+    // the thread id instead of emitting per-region element loops. Finalization
+    // consults the same decision to dispatch `.selfManagedThreads(W)`.
+    let bpttLane = StatefulTensorParallelPolicy.decideDetachedBPTTBackward(
+      block: block, graph: g, backend: backend)
     // Use specialized emission with per-shape element loops.
     let shapeAwareUOps = try emitScalarBlockWithShapeTransitions(
       ctx: ctx, block: block, blocks: blocks, g: g, transitions: shapeTransitions,
-      backend: backend
+      backend: backend, laneParallel: bpttLane.enabled
     )
     for nodeId in block.nodes {
       emittedNodes.insert(nodeId)
+    }
+    // A detached BPTT backward block must run its frames in reverse order
+    // regardless of which body-emission strategy produced the UOps.
+    if blockIsDetachedBPTTBackward(block: block, g: g) {
+      return (uops: wrapDetachedBPTTBackwardLoop(shapeAwareUOps), hasOwnFrameLoop: true)
     }
     return (uops: shapeAwareUOps, hasOwnFrameLoop: false)
   }

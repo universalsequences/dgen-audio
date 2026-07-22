@@ -53,6 +53,11 @@ private func emitRegion(
     } else {
       let elemVar = ctx.useVariable(src: nil)
       let elementCount = region.shape.reduce(1, *)
+      let savedFrame = ctx.frameAwareTensorFrameIndex
+      ctx.frameAwareTensorFrameIndex = nil
+      defer {
+        ctx.frameAwareTensorFrameIndex = savedFrame
+      }
 
       if !region.isConvOnly {
         let beginLoop = UOp(
@@ -101,7 +106,8 @@ private func emitRegion(
 public func emitScalarBlockWithShapeTransitions(
   ctx: IRContext, block: Block, blocks: [Block], g: Graph,
   transitions: [(nodeIndex: Int, shape: [Int])],
-  backend: Backend = .c
+  backend: Backend = .c,
+  laneParallel: Bool = false
 ) throws -> [UOp] {
   // Reset per-block sumAxis fusion metadata; detection repopulates it for this block.
   ctx.inlineReduceSources = [:]
@@ -123,6 +129,23 @@ public func emitScalarBlockWithShapeTransitions(
   let regions = buildRegions(
     block: block, g: g, ctx: ctx,
     transitions: transitions, skipRegions: skipRegions)
+
+  // Lane-parallel sequential recurrence (detached BPTT backward): one thread
+  // per tensor lane, each running the enclosing (reverse) frame loop privately.
+  // The region element index is the thread id — no per-region element loops.
+  // Scalar region nodes are pure value computations here (guaranteed by
+  // StatefulTensorParallelPolicy.laneParallelizable) and run redundantly per
+  // thread. The frame index intentionally stays un-overridden so frame-aware
+  // tensor reads/writes resolve to the enclosing loop variable.
+  if laneParallel, backend == .metal {
+    let setup = IRBuilder(ctx: ctx, nodeId: block.nodes[block.nodes.count - 1])
+    let laneIdx = setup.threadIndex()
+    var uops: [UOp] = setup.ops
+    for region in regions {
+      uops += try emitRegion(region, ctx: ctx, g: g, parallelElemIdx: laneIdx.lazy)
+    }
+    return uops
+  }
 
   // Metal: parallelize elements across threads when a single active region has uniform
   // element count. Guards: no scalar nodes (would execute per-thread), single active

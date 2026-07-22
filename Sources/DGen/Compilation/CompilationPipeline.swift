@@ -364,7 +364,34 @@ public struct CompilationPipeline {
     if graphContainsIsolatedPasses(graph) {
       finalBlocks = isolateSpectralPasses(finalBlocks, graph)
     }
+    forceSequentialHopHistoryBlocks(&finalBlocks, graph: graph)
+    finalBlocks = consolidateTensorBPTTBackwardBlocks(g: graph, blocks: finalBlocks, ctx: context)
     return finalBlocks
+  }
+
+  /// A hop-gated tensor history feedback (read → update → write-back) carries a
+  /// cross-hop dependency: hop N reads the state hop N-1 wrote. Block fusion can
+  /// merge the parallel hop buffer-window read into the same block, flipping the
+  /// block's `frameOrder` to `.parallel`. On Metal that dispatches frameCount*scale
+  /// threads, so every hop reads stale state and the feedback never accumulates.
+  /// Force such blocks back to sequential — the `perFrameScaled` path then emits a
+  /// single-threaded loop over (frame, element), matching the (correct) per-sample
+  /// tensor-history kernel with an added hop gate.
+  private static func forceSequentialHopHistoryBlocks(_ blocks: inout [Block], graph: Graph) {
+    for i in blocks.indices where blocks[i].frameOrder == .parallel {
+      let hasHopHistory = blocks[i].nodes.contains { nodeId in
+        guard let node = graph.nodes[nodeId], graph.nodeHopRate[nodeId] != nil else { return false }
+        switch node.op {
+        case .historyRead(let c), .historyWrite(let c), .historyReadWrite(let c):
+          return graph.cellToTensor[c] != nil
+        default:
+          return false
+        }
+      }
+      if hasHopHistory {
+        blocks[i].frameOrder = .sequential
+      }
+    }
   }
 
   /// Checks whether the graph needs isolated-pass handling.
@@ -380,7 +407,8 @@ public struct CompilationPipeline {
         .spectralLossFFTBatched, .spectralLossFFTBatchedReduce,
         .spectralLossFFTBatchedGradSpec, .spectralLossFFTBatchedGradIFFT,
         .spectralLossFFTBatchedGradRead, .spectralLossFFTBatchedGradRead2,
-        .sampleGradWrite, .selectRowGradWrite, .peekGradWrite:
+        .sampleGradWrite, .selectRowGradWrite, .peekGradWrite,
+        .temporalGradStore:
         return true
       default:
         return false
@@ -404,6 +432,15 @@ public struct CompilationPipeline {
         hopBasedNodes: temporalityResult.hopBasedNodes
       )
       context.hopBasedNodes = temporalityResult.hopBasedNodes
+    }
+    if ProcessInfo.processInfo.environment["DGEN_DEBUG_TEMPORALITY"] != nil {
+      for (bi, block) in blocks.enumerated() {
+        let kinds = block.nodes.compactMap { nid in graph.nodes[nid].map { n in "\(nid):\(n.op)" } }
+        let frame = block.nodes.filter { temporalityResult.frameBasedNodes.contains($0) }
+        FileHandle.standardError.write(
+          "[temporality] block \(bi) \(block.temporality) frameNodes=\(frame) ops=\(kinds)\n"
+            .data(using: .utf8)!)
+      }
     }
     return BlockTemporalityResult(
       frameBasedNodes: temporalityResult.frameBasedNodes,
@@ -454,6 +491,14 @@ public struct CompilationPipeline {
   ) throws -> [BlockUOps] {
     var uopBlocks = [BlockUOps]()
 
+    if ProcessInfo.processInfo.environment["DGEN_DEBUG_BLOCKS"] != nil {
+      for (i, block) in blocks.enumerated() {
+        let ops = block.nodes.map { "\($0):\(graph.nodes[$0].map { String(describing: $0.op) } ?? "?")" }
+        print(
+          "[Blocks] #\(i) frameOrder=\(block.frameOrder) shape=\(block.shape.map(String.init(describing:)) ?? "nil") tensorIndex=\(block.tensorIndex != nil) temporality=\(block.temporality) nodes=\(ops)"
+        )
+      }
+    }
     try timings.measure("emitBlockUOps") {
       for block in blocks {
         let emission = try emitBlockUOps(
@@ -473,7 +518,8 @@ public struct CompilationPipeline {
             backend: backend,
             bodyFrameOrder: emission.frameOrder,
             bodyVectorWidth: emission.vectorWidth,
-            hasOwnFrameLoop: emission.hasOwnFrameLoop
+            hasOwnFrameLoop: emission.hasOwnFrameLoop,
+            context: context
           )
         )
       }

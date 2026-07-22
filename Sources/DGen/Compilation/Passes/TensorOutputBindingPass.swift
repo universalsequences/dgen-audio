@@ -23,6 +23,31 @@ extension TensorOutputBindingPass {
       expandStateCellIfNeeded(node: node, outputShape: shape, graph: graph)
 
       switch node.op {
+      case .historyWrite:
+        // historyWrite is a pass-through operation. Its tensor result aliases
+        // the input tensor while the emitter separately copies each element to
+        // the persistent history cell. Reserving an unrelated output cell here
+        // would leave downstream consumers reading unwritten memory.
+        if let inputNodeId = node.inputs.first,
+          let inputTensorId = graph.nodeToTensor[inputNodeId]
+        {
+          graph.nodeToTensor[nodeId] = inputTensorId
+          continue
+        }
+
+      case .memoryWrite:
+        // Tensor-shaped memoryWrite only occurs for vector-width grad carry
+        // cells (see ShapeInference); like historyWrite it is pass-through of
+        // its value input (inputs[1]) — the emitter copies each element into
+        // the carry cell. Reserving a fresh output cell would leave consumers
+        // reading unwritten memory.
+        if node.inputs.count >= 2,
+          let valueTensorId = graph.nodeToTensor[node.inputs[1]]
+        {
+          graph.nodeToTensor[nodeId] = valueTensorId
+          continue
+        }
+
       case .reshape(let newShape):
         if bindViewOutput(
           nodeId: nodeId,

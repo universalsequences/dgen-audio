@@ -44,7 +44,9 @@ extension GraphPrepPasses {
   }
 
   /// Eligibility rules for the SIMD conv2d emission path:
-  /// - 2D input with inW divisible by 4 and inW ≥ 4 (so 4-wide NEON loads align to rows)
+  /// - 2D input with inW ≥ 4. Widths not divisible by 4 are handled by an
+  ///   overlapped final column group at outX_base = inW-4 (lanes recompute the
+  ///   same values, so the double-write is benign).
   /// - Kernel is a tensor-backed input (cellId known); runtime-variable values
   ///   are fine — they're loaded lane-uniform via `simdBroadcastLoad`.
   /// - kW ≤ 3 — our edge masks (left [0,1,1,1] / right [1,1,1,0]) only cover
@@ -75,7 +77,6 @@ extension GraphPrepPasses {
     }
     let inW = inShape[1]
     guard inW >= 4 else { return (false, "inW=\(inW) < 4") }
-    guard inW % 4 == 0 else { return (false, "inW=\(inW) not divisible by 4") }
 
     guard let kTensor = graph.nodeToTensor[node.inputs[1]].flatMap({ graph.tensors[$0] }) else {
       return (false, "kernel (input[1]) has no backing tensor")

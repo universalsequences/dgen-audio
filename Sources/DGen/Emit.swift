@@ -14,6 +14,9 @@ extension LazyOp {
     case .constant(let value):
       _ = ctx.useConstant(src: nodeId, value: value)
       return []
+    case .hostSampleRate:
+      let dest = ctx.useVariable(src: nodeId)
+      ops.append(UOp(op: .hostSampleRate, value: dest))
     case .tensorRef(_):
       // Register a placeholder value so that downstream ops can find this input
       // The actual tensor data is accessed via nodeToTensor lookup
@@ -135,6 +138,12 @@ extension LazyOp {
           operator: "tan", expected: 1, actual: inputs.count)
       }
       try emitUnaryOp(b: b, g: g, node: node, inputs: inputs) { b.tan($0) }
+    case .atan:
+      guard inputs.count == 1 else {
+        throw DGenError.insufficientInputs(
+          operator: "atan", expected: 1, actual: inputs.count)
+      }
+      try emitUnaryOp(b: b, g: g, node: node, inputs: inputs) { b.atan($0) }
     case .tanh:
       guard inputs.count == 1 else {
         throw DGenError.insufficientInputs(
@@ -228,9 +237,42 @@ extension LazyOp {
         throw DGenError.insufficientInputs(
           operator: "selector", expected: 2, actual: inputs.count)
       }
-      let mode = inputs[0]
-      let options = Array(inputs.dropFirst())
-      b.use(val: b.selector(b.value(mode), options.map { b.value($0) }))
+      let mode = try b.readInput(node, inputs, at: 0)
+      let options = try inputs.indices.dropFirst().map {
+        try b.readInput(node, inputs, at: $0)
+      }
+      try b.writeOutput(node, b.selector(mode, options))
+    case .modulatedParam(let mode, let minValue, let maxValue, let baseCellId, let activeCellId, let lanes):
+      guard inputs.count == 1 else {
+        throw DGenError.insufficientInputs(
+          operator: "modulatedParam", expected: 1, actual: inputs.count)
+      }
+      let zeroOffset = b.intConstant(0)
+      let base = b.simdBroadcastLoad(baseCellId, zeroOffset)
+      let active = b.simdBroadcastLoad(activeCellId, zeroOffset)
+      var modulation = b.constant(0.0)
+      for lane in lanes {
+        let modulator = b.input(lane.modulatorChannel)
+        let depth = b.simdBroadcastLoad(lane.depthCellId, zeroOffset)
+        modulation = modulation + (modulator * depth)
+      }
+
+      let resolved: Expr
+      switch mode {
+      case .additive:
+        resolved = b.min(b.max(base + modulation, b.constant(minValue)), b.constant(maxValue))
+      case .multiplicative:
+        resolved = b.min(
+          b.max(base * (b.constant(1.0) + modulation), b.constant(minValue)),
+          b.constant(maxValue))
+      case .semitone:
+        resolved = b.min(
+          b.max(
+            base * b.exp(b.constant(logf(2.0)) * (modulation / b.constant(12.0))),
+            b.constant(minValue)),
+          b.constant(maxValue))
+      }
+      b.use(val: b.gswitch(active > b.constant(0.0), resolved, base))
     case .mix:
       guard inputs.count == 3 else {
         throw DGenError.insufficientInputs(
@@ -266,6 +308,10 @@ extension LazyOp {
     case .overlapAdd, .overlapAddGradStore, .overlapAddGradGather,
       .bufferViewGradStore, .bufferViewGradRead:
       try emitFFT(b: b, ctx: ctx, g: g, node: node, inputs: inputs, nodeId: nodeId)
+
+    case .temporalGradStore, .temporalGradScan, .temporalGradRead:
+      try emitTemporalGradient(
+        b: b, ctx: ctx, g: g, node: node, inputs: inputs, nodeId: nodeId)
 
     case .tensorNoise(let stateCell, let outputCell, let size):
       // Sequential loop over N elements, each advancing the shared xorshift
@@ -427,8 +473,8 @@ extension LazyOp {
     case .gemmStaged, .gemmStagedChunkPartials:
       try emitGemmStaged(b: b, ctx: ctx, g: g, node: node, nodeId: nodeId, ops: &ops)
 
-    case .conv1d, .conv2d, .sum, .sumAxis, .sumMulAxis0, .gemmSmall, .maxAxis, .meanAxis, .reshape, .asStrided, .transpose, .shrink,
-      .pad, .expandView, .repeatView, .peek, .expand, .expandAxis, .gradPhasor:
+    case .conv1d, .conv2d, .cumsum, .gather, .sum, .sumAxis, .sumMulAxis0, .gemmSmall, .maxAxis, .meanAxis, .reshape, .asStrided, .transpose, .shrink,
+      .pad, .expandView, .repeatView, .peek, .expand, .expandAxis:
       try emitTensorOp(b: b, ctx: ctx, g: g, node: node, inputs: inputs, nodeId: nodeId, ops: &ops)
 
     case .memoryRead, .memoryWrite, .memoryAccumulate, .memoryCellSum, .tensorAccumulate,

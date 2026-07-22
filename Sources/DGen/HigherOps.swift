@@ -52,6 +52,7 @@ extension Graph {
     windowSize: Int,
     useHannWindow: Bool = true,
     useLogMagnitude: Bool = false,
+    useSmoothLogMagnitude: Bool = false,
     lossMode: SpectralLossMode = .l2,
     hop: Int = 1
   ) -> NodeID {
@@ -59,6 +60,9 @@ extension Graph {
       windowSize > 0 && (windowSize & (windowSize - 1)) == 0,
       "windowSize must be a power of 2")
     precondition(hop >= 1, "hop must be >= 1")
+    precondition(
+      !useSmoothLogMagnitude || useLogMagnitude,
+      "useSmoothLogMagnitude requires useLogMagnitude")
 
     let numBins = windowSize / 2 + 1
     let numStages = Int(log2(Double(windowSize)))
@@ -133,6 +137,7 @@ extension Graph {
         hop: hop,
         useHann: useHannWindow,
         useLogMagnitude: useLogMagnitude,
+        useSmoothLogMagnitude: useSmoothLogMagnitude,
         lossMode: lossMode,
         windowCell: windowCell,
         fft1Cell: fft1Cell,
@@ -394,13 +399,30 @@ extension Graph {
   ///
   /// - Returns: Filtered output signal
   public func biquad(
-    _ in1: NodeID, _ cutoff: NodeID, _ resonance: NodeID, _ gain: NodeID, _ mode: NodeID
+    _ in1: NodeID, _ cutoff: NodeID, _ resonance: NodeID, _ gain: NodeID, _ mode: NodeID,
+    elementShape: Shape? = nil
   ) -> NodeID {
-    // Allocate history cells
-    let history0Cell = alloc()
-    let history1Cell = alloc()
-    let history2Cell = alloc()
-    let history3Cell = alloc()
+    // The scalar path intentionally uses the original single-cell allocation.
+    // Tensor biquads need one independently indexed state value per element and
+    // a tensor registration so historyRead/historyWrite use their tensor paths.
+    func allocateHistoryCell() -> CellID {
+      guard let elementShape else { return alloc() }
+
+      let width = Swift.max(1, elementShape.reduce(1, *))
+      let cellId = alloc(vectorWidth: width)
+      persistentCells.insert(cellId)
+
+      let tensorId = nextTensorId
+      nextTensorId += 1
+      tensors[tensorId] = Tensor(id: tensorId, shape: elementShape, cellId: cellId)
+      cellToTensor[cellId] = tensorId
+      return cellId
+    }
+
+    let history0Cell = allocateHistoryCell()
+    let history1Cell = allocateHistoryCell()
+    let history2Cell = allocateHistoryCell()
+    let history3Cell = allocateHistoryCell()
 
     // History reads
     let history0Read = n(.historyRead(history0Cell))
@@ -408,12 +430,14 @@ extension Graph {
     let history2Read = n(.historyRead(history2Cell))
     let history3Read = n(.historyRead(history3Cell))
 
-    // History writes and chaining
-    _ = n(.historyWrite(history0Cell), history1Read)
-
-    _ = n(.historyWrite(history2Cell), in1)
-
-    _ = n(.historyWrite(history3Cell), history2Read)
+    // History writes and chaining. Each write is pass-through (outputs its
+    // input) and its output feeds the filter arithmetic below, so that
+    // historyWrite.backward runs (consuming the BPTT carry cells) and the
+    // reverse-time loop activates. Dangling writes silently truncate the
+    // temporal gradient for cutoff/resonance/gain (docs/BIQUAD_BPTT_GRADIENT_BUG.md).
+    let y1PassThrough = n(.historyWrite(history0Cell), history1Read)  // = y[n-1]
+    let x0PassThrough = n(.historyWrite(history2Cell), in1)  // = x[n]
+    let x1PassThrough = n(.historyWrite(history3Cell), history2Read)  // = x[n-1]
 
     // Core filter computation following TypeScript exactly
     let param3 = mode
@@ -508,13 +532,13 @@ extension Graph {
       add4, add10, sub12, n(.constant(0)), n(.constant(0)), mult31, mult31, hs_b1_norm, ls_b1_norm)
     let b1_scaled = n(.mul, selector32, mult26)
     let b1 = n(.gswitch, isShelfMode, selector32, b1_scaled)
-    let mult34 = n(.mul, history2Read, b1)
+    let mult34 = n(.mul, x1PassThrough, b1)
     let not_sub35 = n(.sub, n(.constant(1)), div18)
     let selector36 = selector(
       add4, div11, div13, div18, mult20, n(.constant(1)), not_sub35, hs_b0_norm, ls_b0_norm)
     let b0_scaled = n(.mul, selector36, mult26)
     let b0 = n(.gswitch, isShelfMode, selector36, b0_scaled)
-    let mult38 = n(.mul, in1, b0)
+    let mult38 = n(.mul, x0PassThrough, b0)
 
     // Final computation - following TypeScript s() pattern
     let add39 = n(.add, n(.add, mult28, mult34), mult38)
@@ -537,14 +561,12 @@ extension Graph {
       a1_orig)
 
     let mult42 = n(.mul, history040, a2)
-    let mult44 = n(.mul, history1Read, a1)
+    let mult44 = n(.mul, y1PassThrough, a1)
     let add45 = n(.add, mult42, mult44)
     let sub46 = n(.sub, add39, add45)
 
-    // Write final result to history1
-    _ = n(.historyWrite(history1Cell), sub46)
-
-    return sub46
+    // Write final result to history1 (pass-through: returned value == sub46)
+    return n(.historyWrite(history1Cell), sub46)
   }
 
   private func amp2db(_ amp: NodeID) -> NodeID {
@@ -572,7 +594,7 @@ extension Graph {
 
     // Attack and release coefficient calculations
     let log001 = n(.log, n(.constant(0.01)))
-    let sampleRate = n(.constant(self.sampleRate))
+    let sampleRate = n(.hostSampleRate)
 
     let attackSamples = n(.mul, attack, sampleRate)
     let attackCoef = n(.exp, n(.div, log001, attackSamples))

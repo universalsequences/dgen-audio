@@ -1,0 +1,7 @@
+{
+  "bestLoss" : 0.062537566,
+  "bestPw" : 0.66172415,
+  "productionLossBeforeFinalPw" : 0.062537566,
+  "smoothObjectiveLoss" : 0.0029766324,
+  "step" : 0.00015589569
+}

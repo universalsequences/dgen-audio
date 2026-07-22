@@ -44,12 +44,12 @@ private enum OpClass {
 private func classify(_ op: Op) -> OpClass {
   switch op {
   // Transcendental ops
-  case .sin, .cos, .tan, .tanh, .exp, .log, .log10, .sqrt, .pow, .atan2:
+  case .sin, .cos, .tan, .atan, .tanh, .exp, .log, .log10, .sqrt, .pow, .atan2:
     return .transcendental
 
   // Memory ops
   case .load, .store, .memoryRead, .memoryWrite, .memoryAccumulate,
-       .simdBroadcastLoad,
+       .simdBroadcastLoad, .broadcastScalar,
        .delay1, .loadGlobal, .loadTape,
        .simdgroupLoad, .simdgroupLoadScratch, .simdgroupStore,
        .threadgroupRead, .threadgroupWrite:
@@ -70,7 +70,7 @@ private func classify(_ op: Op) -> OpClass {
   // Control flow / markers — 0 FLOPs
   case .beginIf, .endIf, .beginLoop, .endLoop, .beginRange, .endRange,
        .beginForLoop, .beginParallelRange, .endParallelRange,
-       .setThreadCountScale, .setFrameIndex, .frameCount, .frameIndex,
+       .setThreadCountScale, .setFrameIndex, .frameCount, .hostSampleRate, .frameIndex,
        .threadIndex, .output, .input, .defineGlobal, .defineConstant,
        .reshape, .transpose, .shrink, .pad, .expandView, .repeatView,
        .broadcastAccess, .sumAxisMarker, .maxAxisMarker, .meanAxisMarker,

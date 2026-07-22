@@ -271,6 +271,14 @@ extension TensorMemoryMaterializationPass {
     let needsFrameAwareAlloc = needsFrameAwareForFlow || needsFrameAwareForMaterialize
 
     let shouldAllocate = shouldMaterialize || needsFrameAwareAlloc
+    if ProcessInfo.processInfo.environment["DGEN_DEBUG_TENSOR_ALLOC"] != nil {
+      let op = nodeId.flatMap { graph.nodes[$0]?.op }.map { "\($0)" } ?? "?"
+      print(
+        "TENSOR-ALLOC cell=\(lazyCellId) node=\(nodeId.map(String.init) ?? "-") op=\(op) "
+          + "outbound=\(isOutbound) frameBased=\(isFrameBased) feedback=\(isInFeedbackLoop) "
+          + "intraBlockFA=\(intraBlockFrameAwareCells.contains(lazyCellId)) "
+          + "materialize=\(shouldMaterialize) frameAware=\(needsFrameAwareAlloc)")
+    }
     return TensorAllocationDecision(
       shouldMaterialize: shouldAllocate,
       needsFrameAwareAlloc: needsFrameAwareAlloc

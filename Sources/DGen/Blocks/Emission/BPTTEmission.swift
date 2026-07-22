@@ -29,6 +29,46 @@ func blockHasPassThroughHistoryWriteWithCarry(block: Block, g: Graph) -> Bool {
   }
 }
 
+/// Returns true when a block is the detached backward half of a BPTT graph.
+///
+/// Losses with their own kernel boundaries (notably FFT spectral loss) separate
+/// the forward history loop from the generated adjoint nodes. In that layout the
+/// backward block contains only gradient carry reads/writes and must execute from
+/// the last frame to the first. Running it in the normal forward scalar loop
+/// truncates the recurrence to a one-frame derivative.
+func blockIsDetachedBPTTBackward(block: Block, g: Graph) -> Bool {
+  guard let lastForwardId = g.lastForwardNodeId,
+    !g.gradCarryCells.isEmpty,
+    block.nodes.allSatisfy({ $0 > lastForwardId })
+  else {
+    return false
+  }
+
+  let carryCells = Set(g.gradCarryCells.values)
+  var readsCarry = false
+  var writesCarry = false
+  for nodeId in block.nodes {
+    guard let node = g.nodes[nodeId] else { continue }
+    switch node.op {
+    case .memoryRead(let cellId):
+      readsCarry = readsCarry || carryCells.contains(cellId)
+    case .memoryWrite(let cellId):
+      writesCarry = writesCarry || carryCells.contains(cellId)
+    default:
+      break
+    }
+  }
+  return readsCarry && writesCarry
+}
+
+/// Wraps a detached BPTT backward body in one reverse frame loop.
+func wrapDetachedBPTTBackwardLoop(_ bodyUops: [UOp]) -> [UOp] {
+  let frameCount = Lazy.variable(-1, nil)
+  return [UOp(op: .beginReverseLoop(frameCount), value: .empty)]
+    + bodyUops
+    + [UOp(op: .endLoop, value: .empty)]
+}
+
 /// Tuple alias for a carry-cell read value that must be reloaded per reverse iteration.
 private typealias CarryCellRead = (cellId: CellID, originalLazy: Lazy)
 
@@ -125,22 +165,30 @@ private func collectCarryCellReads(
   carryCellIds: Set<CellID>,
   g: Graph,
   ctx: IRContext
-) -> [CarryCellRead] {
+) throws -> [CarryCellRead] {
   let blockNodeSet = Set(block.nodes)
   var carryCellReads: [CarryCellRead] = []
 
   for nodeId in g.nodes.keys where !blockNodeSet.contains(nodeId) {
     guard let node = g.nodes[nodeId] else { continue }
     guard case .memoryRead(let cell) = node.op, carryCellIds.contains(cell) else { continue }
-    guard let lz = ctx.values[nodeId] else { continue }
 
     let usedInBlock = backwardNodeIds.contains { bNodeId in
       guard let bNode = g.nodes[bNodeId] else { return false }
       return bNode.allDependencies.contains(nodeId)
     }
-    if usedInBlock {
-      carryCellReads.append((cellId: cell, originalLazy: lz))
+    guard usedInBlock else { continue }
+
+    // The scalar reload below re-reads one slot at offset 0; a vector-width
+    // carry cell cannot be represented by a single remapped Lazy, so this
+    // layout would silently truncate all lanes but one.
+    if g.tensorGradCarryCells.contains(cell) {
+      throw DGenError.unsupportedGradient(
+        "vector-width gradient carry cell \(cell) is read outside its BPTT block; "
+          + "this layout is not supported for tensor-shaped history gradients")
     }
+    guard let lz = ctx.values[nodeId] else { continue }
+    carryCellReads.append((cellId: cell, originalLazy: lz))
   }
 
   return carryCellReads
@@ -162,6 +210,11 @@ private func collectCarryCellWriteNodes(
   for (nodeId, node) in g.nodes {
     guard nodeId > lastForwardId else { continue }
     if case .memoryWrite(let cell) = node.op, carryCellIds.contains(cell) {
+      // Vector-width carry writes stay in the backward body: they are emitted
+      // per-element inside the block's element loops, in node order (reads
+      // precede writes), so the scalar skip-and-re-emit-at-loop-bottom
+      // treatment neither applies nor is needed.
+      if g.tensorGradCarryCells.contains(cell) { continue }
       carryCellWriteNodes.append(nodeId)
     }
   }
@@ -183,7 +236,7 @@ private func buildBPTTPlan(
   block: Block,
   g: Graph,
   ctx: IRContext
-) -> BPTTPlan {
+) throws -> BPTTPlan {
   let lastForwardId = g.lastForwardNodeId!
   let splitUOps = splitBodyUOpsForBPTT(bodyUops: bodyUops, backwardStartIndex: backwardStartIndex)
   let deps = collectForwardBackwardDependencies(block: block, lastForwardId: lastForwardId, g: g)
@@ -191,7 +244,7 @@ private func buildBPTTPlan(
     forwardValuesNeeded: deps.forwardValuesNeeded, ctx: ctx, g: g)
 
   let carryCellIds = Set(g.gradCarryCells.values)
-  let carryCellReads = collectCarryCellReads(
+  let carryCellReads = try collectCarryCellReads(
     block: block, backwardNodeIds: deps.backwardNodeIds, carryCellIds: carryCellIds, g: g, ctx: ctx)
   let carryCellWriteNodes = collectCarryCellWriteNodes(
     lastForwardId: lastForwardId, carryCellIds: carryCellIds, g: g)
@@ -405,7 +458,7 @@ func wrapWithBPTTLoops(
   g: Graph,
   ctx: IRContext
 ) throws -> [UOp] {
-  let plan = buildBPTTPlan(
+  let plan = try buildBPTTPlan(
     bodyUops: bodyUops,
     backwardStartIndex: backwardStartIndex,
     block: block,

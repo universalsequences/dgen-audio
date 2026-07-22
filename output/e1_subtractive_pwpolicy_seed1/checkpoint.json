@@ -1,0 +1,93 @@
+{
+  "config" : {
+    "ampLR" : 0.03,
+    "checkpointEvery" : 200,
+    "cosineLRDecay" : true,
+    "decayLR" : 0.03,
+    "directionEpsilon" : 0.0001,
+    "enableNoiseFilter" : true,
+    "epochs" : 300,
+    "fdEpsilon" : 0.01,
+    "frames" : 32768,
+    "freezePitch" : true,
+    "frozenParams" : [
+      "pw"
+    ],
+    "gradClip" : 1,
+    "includeLinearMagnitude" : true,
+    "linearMagnitudeWeight" : 0.1,
+    "logEvery" : 200,
+    "noiseLR" : 0.01,
+    "peakNormalizeTo" : 0.9,
+    "pitchLR" : 0.001,
+    "pitchRefineEpochs" : 0,
+    "profile" : "subtractive-bass",
+    "restarts" : 1,
+    "rung" : 1,
+    "sampleRate" : 44100,
+    "seed" : 1,
+    "spectralLogEpsilon" : 0.001,
+    "spectralWindows" : [
+      256,
+      512,
+      1024,
+      2048
+    ],
+    "toneLR" : 0.01,
+    "useHannWindow" : true,
+    "windowWeights" : [
+
+    ]
+  },
+  "createdAtUTC" : "2026-07-13T13:30:25Z",
+  "epoch" : 299,
+  "loss" : 0.66679734,
+  "params" : {
+    "ampCurve" : 0,
+    "ampDecay" : -7,
+    "attackTime" : 0.009883491,
+    "bodyAmp" : 0.75,
+    "bodyAsymmetry" : 0,
+    "bodyHarmonic" : 0,
+    "brightnessDecay" : 1,
+    "clickAmp" : 0.2,
+    "clickDecay" : -400,
+    "clickFreq" : 1400,
+    "decayTime" : 0.2489518,
+    "drive" : 2.3648481,
+    "f0" : 32.7,
+    "fAmt" : 81.867424,
+    "fBase" : 2876.8435,
+    "fDecay" : 0.6073144,
+    "fEnd" : 45,
+    "fStart" : 120,
+    "harmonicCorrections" : {
+
+    },
+    "noiseAmp" : 0.08,
+    "noiseCutoff" : 2800,
+    "noiseDecay" : -140,
+    "noteOff" : 1.55,
+    "outGain" : 0.65071553,
+    "pitchDecay" : -35,
+    "pw" : 0.66109985,
+    "releaseTime" : 0.028727202,
+    "res" : 2.2465918,
+    "shape" : 0.544483,
+    "sustain" : 0.5679694
+  },
+  "transformedParams" : {
+    "attackTime" : -4.6168895,
+    "decayTime" : -1.390496,
+    "drive" : 0.8607138,
+    "fAmt" : 4.417242,
+    "fBase" : 7.964449,
+    "fDecay" : -0.49870867,
+    "outGain" : -0.4296827,
+    "pw" : 0.66109985,
+    "releaseTime" : -3.5499108,
+    "res" : 0.8094143,
+    "shape" : 0.544483,
+    "sustain" : 0.5679694
+  }
+}

@@ -1,0 +1,50 @@
+{
+  "createdAtUTC" : "2026-07-11T19:41:53Z",
+  "equivalences" : [
+
+  ],
+  "finalLoss" : 1.8122759,
+  "initLoss" : 2.1006694,
+  "irreducibleLossFloor" : 0,
+  "lossRatio" : 0.8627135,
+  "pass" : false,
+  "rawLossRatio" : 0.8627135,
+  "recoveredParams" : {
+    "ampDecay" : -12.73374,
+    "bodyAmp" : 0.80535984,
+    "bodyAsymmetry" : 0.032421157,
+    "bodyHarmonic" : -0.5559486,
+    "clickAmp" : 0.5,
+    "clickDecay" : -288.05933,
+    "clickFreq" : 529.191,
+    "drive" : 3.9790046,
+    "fEnd" : 46.808178,
+    "fStart" : 231.00955,
+    "noiseAmp" : 0.0024754081,
+    "noiseCutoff" : 8000,
+    "noiseDecay" : -20,
+    "outGain" : 0.1785622,
+    "pitchDecay" : -47.18048
+  },
+  "residualMismatch" : "The learned patch is constrained to the fixed body, click, and filtered-noise voice. Any remaining difference in `compare.png` or `ab.wav`—especially attack\/beater texture and the late decay—is treated as model mismatch rather than hidden lookup data.",
+  "rows" : [
+
+  ],
+  "rung" : 3,
+  "rung3Comparison" : {
+    "highpassHz" : 30,
+    "improvement" : 0.2917121,
+    "initialDistance" : 0.03813528,
+    "learnedDistance" : 0.027010756,
+    "logEpsilon" : 0.001,
+    "magnitudeNormalization" : "hann coherent gain (sum(window) \/ 2)",
+    "pass" : false,
+    "requiredImprovement" : 0.8,
+    "windows" : [
+      256,
+      512,
+      1024,
+      2048
+    ]
+  }
+}

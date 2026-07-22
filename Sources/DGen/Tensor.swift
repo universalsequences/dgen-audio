@@ -1236,18 +1236,51 @@ extension Graph {
     public let cellId: CellID
     public let shape: Shape
     public let tensorId: TensorID
+    /// When non-nil, the history read/write tick once every `hopSize` frames
+    /// (fs/hop) instead of every frame — for STFT-style spectral feedback.
+    public var hopSize: Int? = nil
+    /// The per-frame counter node that gates the hop (wraps 0..hopSize-1).
+    public var counterNode: NodeID? = nil
   }
 
   /// Create a history buffer for tensor state that persists across frames
   /// Use with tensorHistoryRead/tensorHistoryWrite for membrane simulation etc.
-  public func tensorHistoryBuffer(shape: Shape, data: [Float]? = nil) -> TensorHistoryBuffer {
+  ///
+  /// - Parameter hop: When specified, the history read/write are tagged hop-based
+  ///   so the feedback advances once every `hop` frames (fs/hop) instead of once
+  ///   per frame. Defaults to `nil` (per-frame) so per-sample feedback (FDTD /
+  ///   membrane sims) is unchanged. Used for STFT-style per-bin spectral dynamics.
+  public func tensorHistoryBuffer(shape: Shape, hop: Int? = nil, data: [Float]? = nil)
+    -> TensorHistoryBuffer
+  {
     let size = shape.reduce(1, *)
     let cellId = alloc(vectorWidth: size)
+    // History state must survive across frames AND process() calls — exclude it
+    // from buffer-reuse liveness, which only sees load/store/delay1/noise as
+    // persistent and would otherwise donate this region to transient tensors
+    // (state silently clobbered every block; feedback reads scratch).
+    persistentCells.insert(cellId)
     let tensorId = nextTensorId
     nextTensorId += 1
     tensors[tensorId] = Tensor(id: tensorId, shape: shape, cellId: cellId, data: data)
     cellToTensor[cellId] = tensorId
-    return TensorHistoryBuffer(cellId: cellId, shape: shape, tensorId: tensorId)
+
+    // Hop-gating: build a per-frame counter that wraps at `hop` (mirrors
+    // bufferView). The counter runs every frame; the history read/write nodes are
+    // tagged with this rate (in tensorHistoryRead/Write) so their enclosing block
+    // is wrapped in `if (counter == 0)` and ticks once per hop.
+    var counterNode: NodeID? = nil
+    if let hop = hop {
+      let counterCell = alloc(vectorWidth: 1)
+      persistentCells.insert(counterCell)
+      let one = n(.constant(1.0))
+      let zero = n(.constant(0.0))
+      let hopConst = n(.constant(Float(hop)))
+      counterNode = n(.accum(counterCell), one, zero, zero, hopConst)
+    }
+
+    return TensorHistoryBuffer(
+      cellId: cellId, shape: shape, tensorId: tensorId, hopSize: hop, counterNode: counterNode)
   }
 
   /// Read the current state from a tensor history buffer
@@ -1267,6 +1300,7 @@ extension Graph {
     // Use unified historyRead - checks cellToTensor to determine if tensor or scalar
     let nodeId = n(.historyRead(buffer.cellId), [], shape: .tensor(buffer.shape))
     nodeToTensor[nodeId] = outputTensorId
+    tagHistoryHopRate(nodeId, buffer: buffer)
     return nodeId
   }
 
@@ -1274,7 +1308,20 @@ extension Graph {
   @discardableResult
   public func tensorHistoryWrite(_ buffer: TensorHistoryBuffer, _ value: NodeID) -> NodeID {
     // Use unified historyWrite - checks cellToTensor to determine if tensor or scalar
-    return n(.historyWrite(buffer.cellId), [value], shape: .tensor(buffer.shape))
+    let nodeId = n(.historyWrite(buffer.cellId), [value], shape: .tensor(buffer.shape))
+    tagHistoryHopRate(nodeId, buffer: buffer)
+    return nodeId
+  }
+
+  /// Tag a history read/write node with the buffer's hop rate (when hop-gated) so
+  /// `TemporalityPass` schedules its block once per hop, and add the counter as a
+  /// temporal dependency so the counter's per-frame block is ordered before it.
+  private func tagHistoryHopRate(_ nodeId: NodeID, buffer: TensorHistoryBuffer) {
+    guard let hop = buffer.hopSize, let counter = buffer.counterNode else { return }
+    nodeHopRate[nodeId] = (hop, counter)
+    if nodes[nodeId]?.temporalDependencies.contains(counter) == false {
+      nodes[nodeId]?.temporalDependencies.append(counter)
+    }
   }
 
   public func poke(tensor: NodeID, index: NodeID, channel: NodeID, value: NodeID) throws

@@ -376,7 +376,7 @@ public class MetalRenderer: Renderer, UOpEmitter {
   private func variableIdsUsed(in op: Op) -> Set<VarID> {
     switch op {
     case .store(_, let a), .delay1(_, let a), .abs(let a), .sign(let a), .sin(let a), .cos(let a),
-      .tan(let a), .tanh(let a), .exp(let a), .log(let a), .log10(let a), .sqrt(let a),
+      .tan(let a), .atan(let a), .tanh(let a), .exp(let a), .log(let a), .log10(let a), .sqrt(let a),
       .floor(let a), .ceil(let a), .round(let a), .beginIf(let a), .beginReverseLoop(let a),
       .beginHopCheck(let a), .setFrameIndex(let a), .identity(let a), .declareVar(let a),
       .cast(let a, _), .loadTape(let a, _), .output(_, let a):
@@ -627,6 +627,14 @@ public class MetalRenderer: Renderer, UOpEmitter {
         scheduleItem.ops.append(beginRange)
         hasFrameLoop = false
 
+      case .selfManagedThreads(let n):
+        // Block contains its own frame loops (lane-parallel BPTT) -- dispatch
+        // N threads, one per tensor lane, no wrapping.
+        let beginRange = UOp(
+          op: .beginRange(.constant(0, 0), .constant(0, Float(n))), value: .empty)
+        scheduleItem.ops.append(beginRange)
+        hasFrameLoop = false
+
       case .staticThreads(let n):
         // Static blocks: dispatch N threads with no frame loop.
         let beginRange = UOp(
@@ -871,8 +879,8 @@ public class MetalRenderer: Renderer, UOpEmitter {
         inputs.insert(varId)
       case .loadTape(let val, _):
         checkLazyForGlobal(val)
-      case .load, .store, .delay1, .memoryRead, .memoryWrite, .memoryAccumulate, .noise,
-        .simdgroupLoad, .simdgroupStore:
+      case .load, .store, .delay1, .memoryRead, .memoryWrite, .memoryAccumulate,
+        .simdBroadcastLoad, .noise, .simdgroupLoad, .simdgroupStore:
         needsMemory = true
       default:
         break
@@ -918,6 +926,8 @@ public class MetalRenderer: Renderer, UOpEmitter {
     let gi = { self.emitLazyTyped($0, ctx: ctx, asInt: uop.scalarType == .int) }
 
     switch uop.op {
+    case .hostSampleRate:
+      return emitAssign(uop, "\(ctx.g.sampleRate)", ctx)
     case .add(let a, let b): return emitAssign(uop, "\(gi(a)) + \(gi(b))", ctx)
     case .mul(let a, let b): return emitAssign(uop, "\(gi(a)) * \(gi(b))", ctx)
     case .sub(let a, let b): return emitAssign(uop, "\(gi(a)) - \(gi(b))", ctx)
@@ -1007,6 +1017,7 @@ public class MetalRenderer: Renderer, UOpEmitter {
     case .sin(let a): return emitAssign(uop, "metal::sin(\(g(a)))", ctx)
     case .cos(let a): return emitAssign(uop, "metal::cos(\(g(a)))", ctx)
     case .tan(let a): return emitAssign(uop, "metal::tan(\(g(a)))", ctx)
+    case .atan(let a): return emitAssign(uop, "metal::atan(\(g(a)))", ctx)
     case .tanh(let a): return emitAssign(uop, "metal::tanh(\(g(a)))", ctx)
     case .exp(let a): return emitAssign(uop, "metal::exp(\(g(a)))", ctx)
     case .log(let a): return emitAssign(uop, "metal::log(\(g(a)))", ctx)
@@ -1063,6 +1074,12 @@ public class MetalRenderer: Renderer, UOpEmitter {
       return "/* setThreadCountScale - handled in scheduler */"
 
     case .setFrameIndex(let idx):
+      // Declare once per kernel; later setFrameIndex ops in the same kernel
+      // (e.g. several tensor regions in one consolidated BPTT block) reassign,
+      // since a same-scope redeclaration fails to compile.
+      if frameIndexOverride != nil {
+        return "_frameIndex = (uint)(\(g(idx)));"
+      }
       frameIndexOverride = "_frameIndex"
       return "uint _frameIndex = (uint)(\(g(idx)));"
 

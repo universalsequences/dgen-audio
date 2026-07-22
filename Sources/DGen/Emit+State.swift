@@ -8,13 +8,45 @@ extension LazyOp {
         throw DGenError.insufficientInputs(
           operator: "memoryRead", expected: 1, actual: inputs.count)
       }
-      b.use(val: b.memoryRead(cellId, b.value(inputs[0])))
+      if g.tensorGradCarryCells.contains(cellId) {
+        // Vector-width grad carry cell: per-element read into the output
+        // tensor, mirroring the historyRead tensor branch. The offset input
+        // (inputs[0]) is an ordering dependency only.
+        let outputTensorId = g.nodeToTensor[nodeId]!
+        let outputCellId = g.tensors[outputTensorId]!.cellId
+        guard let index = ctx.tensorIndices[nodeId] else {
+          throw DGenError.insufficientInputs(
+            operator: "memoryRead", expected: 1, actual: inputs.count)
+        }
+        let idx = b.value(index, scalarType: .int)
+        let value = b.tload(cellId, idx)
+        _ = b.tstore(outputCellId, idx, value)
+        ctx.values[nodeId] = .empty
+      } else {
+        b.use(val: b.memoryRead(cellId, b.value(inputs[0])))
+      }
     case .memoryWrite(let cellId):
       guard inputs.count == 2 else {
         throw DGenError.insufficientInputs(
           operator: "memoryWrite", expected: 2, actual: inputs.count)
       }
-      b.use(val: b.memoryWrite(cellId, b.value(inputs[0]), b.value(inputs[1])))
+      if g.tensorGradCarryCells.contains(cellId) {
+        // Vector-width grad carry cell: per-element copy from the value
+        // input's tensor into the carry cell, mirroring the historyWrite
+        // tensor branch. The offset input (inputs[0]) is a dependency only.
+        let valueTensorId = g.nodeToTensor[node.inputs[1]]!
+        let valueCellId = g.tensors[valueTensorId]!.cellId
+        guard let index = ctx.tensorIndices[nodeId] else {
+          throw DGenError.insufficientInputs(
+            operator: "memoryWrite", expected: 2, actual: inputs.count)
+        }
+        let idx = b.value(index, scalarType: .int)
+        let value = b.tload(valueCellId, idx)
+        _ = b.memoryWrite(cellId, b.cast(idx, to: .int), value)
+        ctx.values[nodeId] = .empty
+      } else {
+        b.use(val: b.memoryWrite(cellId, b.value(inputs[0]), b.value(inputs[1])))
+      }
     case .memoryAccumulate(let cellId):
       guard inputs.count == 2 else {
         throw DGenError.insufficientInputs(
@@ -139,18 +171,30 @@ extension LazyOp {
         // Pass-through: output is same as input tensor
         ctx.values[nodeId] = .empty
       } else {
-        // Scalar write + pass-through
-        guard inputs.count == 1 else {
+        // Scalar write + pass-through. Optional 2nd input is a reset signal:
+        // when high, store 0 instead of the value (clears feedback on trigger).
+        guard inputs.count >= 1 else {
           throw DGenError.insufficientInputs(
             operator: "history write", expected: 1, actual: inputs.count)
         }
         let inputVal = b.value(inputs[0])
-        _ = b.store(cellId, inputVal)
-        // Pass-through: output the input value so downstream ops can use it
+        let storedVal: Expr
+        if inputs.count >= 2 {
+          let resetVal = b.value(inputs[1])
+          storedVal = b.gswitch(resetVal > b.constant(0.0), b.constant(0.0), inputVal)
+        } else {
+          storedVal = inputVal
+        }
+        _ = b.store(cellId, storedVal)
+        // Pass-through: output the (unreset) input value so downstream ops can use it
         b.use(val: inputVal)
       }
     case .param(let cellId):
-      b.use(val: b.load(cellId))
+      if (g.cellAllocationSizes[cellId] ?? 1) > 1 {
+        b.use(val: b.load(cellId))
+      } else {
+        b.use(val: b.simdBroadcastLoad(cellId, b.intConstant(0)))
+      }
     case .historyReadWrite(let cellId):
       // for simd its beyond just this -- we need to ensure that we shift the results 1
       guard inputs.count == 1 else {
@@ -292,7 +336,7 @@ extension LazyOp {
 
         // Phasor accumulator logic with indexed state
         // Uses gswitch instead of if statements for SIMD compatibility
-        let sampleRate = b.constant(b.ctx.g.sampleRate)
+        let sampleRate = b.hostSampleRate()
         let incr = freq / sampleRate
         let zero = b.constant(0.0)
         let one = b.constant(1.0)
@@ -332,7 +376,7 @@ extension LazyOp {
       }
       // Use emitUnaryOp to handle both scalar and tensor cases
       try emitUnaryOp(b: b, g: g, node: node, inputs: inputs) { freq in
-        let sampleRate = b.constant(g.sampleRate)
+        let sampleRate = b.hostSampleRate()
         // Use currentFrameIndex which returns the correct frame index in both normal
         // and frame-aware tensor blocks
         let frameIdx = b.currentFrameIndex()

@@ -36,6 +36,20 @@ func emitOptimizedConv2D(
   let (padH, padW) = (kH / 2, kW / 2)
   let inCell = inTensor.cellId
   let kernelCell = kTensor.cellId
+
+  // Frame-aware cells store one tensor slice per frame at
+  // `cellBase + frameIdx * tensorSize + elem`. This gather builds raw offsets,
+  // so the frame term must be folded in explicitly — otherwise every frame of
+  // a multi-frame block convolves frame 0's slice. The non-affine offset also
+  // (correctly) disqualifies the loop from the NEON upgrade pass.
+  let inFrameSize = g.frameAwareCells[inCell]?.tensorSize
+  let outFrameSize = g.frameAwareCells[outCell]?.tensorSize
+  let frameIdx: Expr? =
+    (inFrameSize != nil || outFrameSize != nil) ? b.currentFrameIndex() : nil
+  func withFrameOffset(_ offset: Expr, frameSize: Int?) -> Expr {
+    guard let frameSize, let frameIdx else { return offset }
+    return b.cast(frameIdx * b.intConstant(frameSize) + offset, to: .int)
+  }
   // Fast path: kernel data baked at graph-build time → hoist each weight as a
   // preamble-broadcast constant. Runtime path: load and broadcast inside the loop.
   let kernelData = kTensor.data
@@ -44,11 +58,14 @@ func emitOptimizedConv2D(
   let leftMaskOffset = 0
   let rightMaskOffset = 8
 
-  // Column groups per row: outX_base ∈ {0, 4, 8, ..., inW-4}.
+  // Column groups per row: outX_base ∈ {0, 4, 8, ...} plus, when inW is not a
+  // multiple of 4, a final overlapped group at inW-4 (its low lanes recompute
+  // values an earlier group already wrote — identical results, benign).
   // A group's kx=0 tap reads lane 0 OOB iff outX_base == 0.
   // A group's kx=kW-1 tap reads lane 3 OOB iff outX_base == inW - 4.
   // For inW == 4, a single group is simultaneously left- and right-edge.
-  let groups = stride(from: 0, to: inW, by: 4).map { $0 }
+  var groups = stride(from: 0, to: inW - 3, by: 4).map { $0 }
+  if groups.last != inW - 4 { groups.append(inW - 4) }
 
   for outY_i in 0..<inH {
     for outX_base in groups {
@@ -75,21 +92,33 @@ func emitOptimizedConv2D(
           guard inY >= 0 && inY < inH else { continue }
 
           for kx in 0..<kW {
+            // Constant-kernel zero taps contribute nothing — skip them entirely
+            // (e.g. the 3x3 laplacian has 4 zero taps, a 1D-in-3x3 kernel 6).
+            if let data = kernelData, data[ky * kW + kx] == 0 { continue }
             // Per-tap offset within the input cell: inY*inW + outX_base + (kx-padW)
             // plus the lane offset t. We fold the constant portion into a separate
             // int Expr and add `t` to it.
             let tapRowOffset = inY * inW + outX_base + (kx - padW)
             let tapOffset =
               tapRowOffset == 0 ? t : (b.intConstant(tapRowOffset) + t)
-            var v = b.memoryRead(inCell, tapOffset)
+            var v = b.memoryRead(inCell, withFrameOffset(tapOffset, frameSize: inFrameSize))
 
-            // Edge masking: multiply by pre-baked 4-lane mask vector.
-            if useLeftMask && kx == 0 {
-              let mask = b.memoryRead(maskCellId, b.intConstant(leftMaskOffset))
+            // Edge masking: multiply by pre-baked 4-lane mask vector. The
+            // offset must include the lane var `t`: SIMD rendering loads the
+            // same 4 contiguous lanes either way, but if the loop stays
+            // scalar (e.g. frame-aware offsets disqualify the NEON upgrade),
+            // a constant offset would apply mask lane 0 to every element.
+            // A tap only reads out of bounds horizontally when it actually
+            // reaches past the pad: kx < padW (left) / kx > padW (right).
+            // `kx == 0` / `kx == kW-1` are only valid proxies for kW == 2·padW+1
+            // taps that reach; for a column kernel (kW == 1, padW == 0) both
+            // held at once and zeroed the edge columns.
+            if useLeftMask && kx < padW {
+              let mask = b.memoryRead(maskCellId, b.intConstant(leftMaskOffset) + t)
               v = v * mask
             }
-            if useRightMask && kx == kW - 1 {
-              let mask = b.memoryRead(maskCellId, b.intConstant(rightMaskOffset))
+            if useRightMask && kx > padW {
+              let mask = b.memoryRead(maskCellId, b.intConstant(rightMaskOffset) + t)
               v = v * mask
             }
 
@@ -114,7 +143,7 @@ func emitOptimizedConv2D(
 
         // If every (outY, ky) was OOB for this row, running can be nil — fall back to zero.
         let value = running ?? b.constant(0.0)
-        _ = b.memoryWrite(outCell, offset, value)
+        _ = b.memoryWrite(outCell, withFrameOffset(offset, frameSize: outFrameSize), value)
       }
     }
   }

@@ -1,0 +1,62 @@
+=== batch-refine mode=escape frames=16384 steps=300 ===
+escape: lane 0 = exact init, lanes 1..63 jittered (sigma=0.08)
+schedule s4:
+  A-smooth-lr2: 150 steps lrMult=2.0
+  B-prod-lr2: 500 steps lrMult=2.0
+[s4] step=0 phase=A-smooth-lr2 meanLoss=14.117283 elapsed=2.7s
+[s4] step=25 phase=A-smooth-lr2 meanLoss=3.987951 elapsed=26.5s
+[s4] step=50 phase=A-smooth-lr2 meanLoss=1.898459 elapsed=52.2s
+[s4] step=75 phase=A-smooth-lr2 meanLoss=1.566104 elapsed=76.6s
+[s4] step=100 phase=A-smooth-lr2 meanLoss=1.461170 elapsed=100.9s
+[s4] step=125 phase=A-smooth-lr2 meanLoss=1.423173 elapsed=124.9s
+[s4] step=150 phase=B-prod-lr2 meanLoss=2.179280 elapsed=154.0s
+[s4] step=175 phase=B-prod-lr2 meanLoss=2.094631 elapsed=194.4s
+[s4] step=200 phase=B-prod-lr2 meanLoss=2.047137 elapsed=235.1s
+[s4] step=225 phase=B-prod-lr2 meanLoss=2.015114 elapsed=275.0s
+[s4] step=250 phase=B-prod-lr2 meanLoss=2.001014 elapsed=319.1s
+[s4] step=275 phase=B-prod-lr2 meanLoss=1.991922 elapsed=360.0s
+[s4] step=300 phase=B-prod-lr2 meanLoss=1.986009 elapsed=400.5s
+[s4] step=325 phase=B-prod-lr2 meanLoss=1.980236 elapsed=439.6s
+[s4] step=350 phase=B-prod-lr2 meanLoss=1.976429 elapsed=478.4s
+[s4] step=375 phase=B-prod-lr2 meanLoss=1.973807 elapsed=519.1s
+[s4] step=400 phase=B-prod-lr2 meanLoss=1.971976 elapsed=559.3s
+[s4] step=425 phase=B-prod-lr2 meanLoss=1.971074 elapsed=598.5s
+[s4] step=450 phase=B-prod-lr2 meanLoss=1.969466 elapsed=637.0s
+[s4] step=475 phase=B-prod-lr2 meanLoss=1.968531 elapsed=675.8s
+[s4] step=500 phase=B-prod-lr2 meanLoss=1.966653 elapsed=714.9s
+[s4] step=525 phase=B-prod-lr2 meanLoss=1.965706 elapsed=755.2s
+[s4] step=550 phase=B-prod-lr2 meanLoss=1.966352 elapsed=799.8s
+[s4] step=575 phase=B-prod-lr2 meanLoss=1.965372 elapsed=844.1s
+[s4] step=600 phase=B-prod-lr2 meanLoss=1.964649 elapsed=888.0s
+[s4] step=625 phase=B-prod-lr2 meanLoss=1.964801 elapsed=927.1s
+[s4] step=649 phase=B-prod-lr2 meanLoss=1.964828 elapsed=963.3s
+
+1.482 s/step for B=64
+lane 0 (stall reproduction): init=0.43121 final=0.16749
+top 8 lanes by final CPU score:
+  lane 52: init=0.62402 final=0.03323
+  lane 44: init=0.57558 final=0.03470
+  lane 56: init=0.63260 final=0.06003
+  lane 18: init=0.73674 final=0.08237
+  lane 31: init=0.44692 final=0.08504
+  lane 23: init=0.54211 final=0.08627
+  lane 26: init=0.60381 final=0.08832
+  lane 16: init=0.27012 final=0.09024
+30/63 jittered lanes beat the unjittered trajectory
+production loss: lane 0 2.018799  best lane 52 0.845922
+
+best lane 52 vs hidden truth (transformed-space abs err / span):
+  sustain: lane=    0.5408 truth=    0.5456 err=0.0048 OK
+  outGain: lane=    0.5546 truth=    0.5561 err=0.0007 OK
+  attackTime: lane=    0.0076 truth=    0.0052 err=0.0601 OK
+  decayTime: lane=    0.4169 truth=    0.3859 err=0.0146 OK
+  releaseTime: lane=    0.0205 truth=    0.0214 err=0.0097 OK
+  fDecay: lane=    0.1212 truth=    0.1237 err=0.0035 OK
+  fBase: lane=  100.9827 truth=   86.4364 err=0.0278 OK
+  fAmt: lane=   17.3428 truth=    7.1892 err=0.0859 OK
+  res: lane=    0.8870 truth=    3.0415 err=0.4959 MISS
+  drive: lane=    8.0000 truth=    2.0444 err=0.3937 MISS
+  shape: lane=    0.8418 truth=    0.6679 err=0.1739 MISS
+  pw: lane=    0.4917 truth=    0.4647 err=0.0288 OK
+recovered 9/12 params within spec tolerance
+wrote /Users/alecresende/code/swift/dgen/output/schedule_spec_seed6/s5r

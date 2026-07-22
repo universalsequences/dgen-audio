@@ -55,7 +55,11 @@ false         ; 0.0
 ```lisp
 (def name expr)
 (def osc (sin (* (phasor 440) twopi)))
+(def (x y z) (tuple 1 2 3))
 ```
+
+Destructuring `def` binds each name from a tuple-producing expression. Built-in multi-output
+operators like `fft` return tuples, and macros can return explicit tuples with `(tuple ...)`.
 
 #### defmacro — define a reusable macro
 
@@ -68,6 +72,9 @@ false         ; 0.0
   (def v (+ sig (* g ds)))
   (write-history h v)
   (- ds (* g v)))
+
+(defmacro multi (a b c)
+  (tuple (* a 2) (* a b) (* b c)))
 ```
 
 Local `def` and `make-history` bindings inside macros are automatically scoped — multiple calls to the same macro won't collide.
@@ -85,15 +92,19 @@ Local `def` and `make-history` bindings inside macros are automatically scoped �
 #### param — host-controllable parameter
 
 ```lisp
-(param name @default value @min value @max value @unit string)
+(param name @default value @min value @max value @unit string
+       @group group-name @env env-name @role attack|decay|sustain|release)
 
 (param freq @default 440 @min 20 @max 20000 @unit Hz)
 (param gain @default 0.5 @min 0 @max 1)
 (param cutoff @default 2400 @min 60 @max 12000 @unit Hz @mod true @mod-mode additive)
+(param amp-attack @group amp @env amp-env @role attack @default 0.01)
 ```
 
 The name becomes a symbol you can use in expressions. Parameters appear in the manifest with their physical memory cell ID for host-side control.
-Modulatable params generate hidden modulation source/depth params plus `modDestinations` metadata in the manifest.
+Modulatable params generate one hidden active flag plus one hidden depth param per declared modulator, and expose those cells through `modDestinations` metadata in the manifest.
+
+UI metadata attributes are optional and do not affect DSP behavior. `@group` places a param in a generated UI group. `@env` marks a param as part of an envelope, and requires a valid `@role`. Params in the same envelope cannot duplicate roles or declare conflicting groups.
 
 #### in — audio input channel
 
@@ -112,9 +123,11 @@ Modulatable params generate hidden modulation source/depth params plus `modDesti
 (out expr channel @name string)
 
 (out (sin (* (phasor 440) twopi)) 1 @name audio)
+(out (phasor 0.25) 2 @name macro-a @modulator 1)
 ```
 
 At least one `out` is required. Channel numbers are 1-indexed.
+`@modulator <slot>` marks an output as a host-visible modulation output.
 
 ### Arithmetic
 
@@ -376,8 +389,25 @@ Floats are promoted automatically when combined with graph types. Signals and te
     "max": 20000,
     "unit": "Hz"
   }],
+  "groups": [{"name": "amp"}],
+  "envelopes": [{
+    "name": "amp-env",
+    "group": "amp",
+    "roles": {
+      "attack": "amp-attack",
+      "decay": "amp-decay",
+      "sustain": "amp-sustain",
+      "release": "amp-release"
+    }
+  }],
   "inputs": [{"channel": 0, "name": "signal"}],
   "outputs": [{"channel": 0, "name": "audio"}],
+  "modOutputs": [{
+    "slot": 1,
+    "channel": 1,
+    "name": "macro-a",
+    "range": "unipolar"
+  }],
   "tensors": [{
     "name": "waves",
     "cellOffset": 100,
@@ -391,6 +421,7 @@ Floats are promoted automatically when combined with graph types. Signals and te
 ```
 
 - `cellId` values are **physical** memory offsets (after remapping), ready for direct indexing into the memory buffer
+- `groups` and `envelopes` are derived from param UI metadata in first-reference order
 - `tensors` gives named metadata for tensor-backed assets and editable tensor slots
 - `tensorInitData` entries must be written to the memory buffer before the first `process()` call
 - `totalMemorySlots` is the required memory buffer size (in floats)

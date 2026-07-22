@@ -95,7 +95,7 @@ let u_max = binaryOp(Op.max)
 
 func u_phasor(_ cellId: CellID, freq: Expr, reset: Expr) -> (IRBuilder) -> Expr {
   return { b in
-    let b_sr = b.constant(b.ctx.g.sampleRate)
+    let b_sr = b.hostSampleRate()
     return u_accum(
       cellId, incr: freq / b_sr, reset: reset, min: b.constant(0), max: b.constant(1))(b)
   }
@@ -244,4 +244,3 @@ func u_accum(_ cellId: CellID, incr: Expr, reset: Expr, min: Expr, max: Expr) ->
     return acc
   }
 }
-

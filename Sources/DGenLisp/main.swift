@@ -4,7 +4,7 @@
 //   -o, --output <dir>       Output directory (default: .)
 //   --name <name>            Output name (default: patch)
 //   --sample-rate <rate>     Sample rate (default: 44100)
-//   --max-frames <count>     Max frame count (default: 4096)
+//   --max-frames <count>     Max frame count (default: 512)
 //   --voices <count>         Voice count for polyphony (default: 1)
 //   --asset-base <dir>        Base directory for relative tensor/wavetable files
 //   --debug                  Debug output
@@ -21,7 +21,7 @@ struct CLIArgs {
     var outputDir: String = "."
     var name: String = "patch"
     var sampleRate: Float = 44100
-    var maxFrames: Int = 4096
+    var maxFrames: Int = 512
     var voiceCount: Int = 1
     var assetBase: String? = nil
     var debug: Bool = false
@@ -48,7 +48,7 @@ func parseArgs(_ args: [String]) -> CLIArgs {
             if i < args.count { cli.sampleRate = Float(args[i]) ?? 44100 }
         case "--max-frames":
             i += 1
-            if i < args.count { cli.maxFrames = Int(args[i]) ?? 4096 }
+            if i < args.count { cli.maxFrames = Int(args[i]) ?? 512 }
         case "--voices":
             i += 1
             if i < args.count { cli.voiceCount = Int(args[i]) ?? 1 }
@@ -88,7 +88,7 @@ func printUsage() {
           -o, --output <dir>       Output directory (default: .)
           --name <name>            Output name (default: patch)
           --sample-rate <rate>     Sample rate (default: 44100)
-          --max-frames <count>     Max frame count (default: 4096)
+          --max-frames <count>     Max frame count (default: 512)
           --voices <count>         Voice count for polyphony (default: 1)
           --asset-base <dir>        Base directory for relative tensor/wavetable files
           --debug                  Debug output
@@ -135,6 +135,9 @@ func main() throws {
     DGenConfig.sampleRate = cli.sampleRate
     DGenConfig.maxFrameCount = cli.maxFrames
     DGenConfig.debug = cli.debug
+    if ProcessInfo.processInfo.environment["DGEN_NO_REUSE"] != nil {
+        DGenConfig.enableBufferReuse = false
+    }
 
     // Reset graph
     LazyGraphContext.reset()

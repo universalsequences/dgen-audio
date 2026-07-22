@@ -56,13 +56,25 @@ func remapVectorMemorySlots(
   for block in uopBlocks {
     for uop in block.ops {
       if let cellId = uop.op.memoryCellId {
-        registerCell(cellId, vectorWidth: block.vectorWidth)
+        let memoryWidth: Int
+        if case .simdBroadcastLoad = uop.op {
+          memoryWidth = 1
+        } else {
+          memoryWidth = block.vectorWidth
+        }
+        registerCell(cellId, vectorWidth: memoryWidth)
       }
     }
   }
 
   if let voiceCellId = voiceCellId {
     registerCell(voiceCellId, vectorWidth: 4)
+  }
+
+  if let graph = graph {
+    for cellId in graph.parameterCells {
+      registerCell(cellId, vectorWidth: 1)
+    }
   }
 
   // Collect cells with injectable initial data (e.g. twiddle factors).
@@ -98,14 +110,49 @@ func remapVectorMemorySlots(
     // Includes load/store/delay1 cells (detected from UOps) AND cells explicitly
     // marked as persistent by graph construction (circular buffers, ring buffers).
     var persistentCells: Set<CellID> = graph?.persistentCells ?? []
+    let parameterCells: Set<CellID> = graph?.parameterCells ?? []
     var accumulateCells: Set<CellID> = []  // memoryAccumulate — need zeroed memory
     var cellFirstUse: [CellID: Int] = [:]
     var cellLastUse: [CellID: Int] = [:]
 
-    // Compute liveness at BLOCK granularity, not UOp granularity.
-    // A cell used anywhere in a block is live for the entire block's execution,
+    // Compute liveness at EXECUTION-GROUP granularity, not UOp granularity.
+    // A cell used anywhere in a group is live for the entire group's execution,
     // since a kernel reads/writes all its cells concurrently within the loop.
-    // Using the block index ensures two cells in the same kernel never share memory.
+    //
+    // A "group" is the set of adjacent blocks the C renderer will merge into a
+    // single frame loop (CRenderer.prepareSchedule merges consecutive blocks
+    // with identical frameOrder/temporality/dispatchMode/vectorWidth, and hop
+    // islands wrap several blocks in one shared loop). Blocks that share a
+    // frame loop INTERLEAVE per frame, so plain block-index liveness is wrong
+    // there: block A's read at frame f+1 executes after block B's write at
+    // frame f, even though A precedes B in block order. Measured failure:
+    // membrane-tabla's hoisted strike-mask morph was clobbered by a later
+    // per-frame temp sharing its buffer inside the merged FDTD loop.
+    var blockGroup = [Int](repeating: 0, count: uopBlocks.count)
+    do {
+      let regions = HopIslandPass.buildRegions(for: uopBlocks)
+      var group = -1
+      var prevKey: (FrameOrder, Temporality, DispatchMode, Int)? = nil
+      for region in regions {
+        switch region {
+        case .block(let idx):
+          let b = uopBlocks[idx]
+          let key = (b.frameOrder, b.temporality, b.dispatchMode, b.vectorWidth)
+          if prevKey == nil || prevKey! != key {
+            group += 1
+            prevKey = key
+          }
+          blockGroup[idx] = group
+        case .hopIsland(let island):
+          group += 1
+          for idx in island.blockIndices {
+            blockGroup[idx] = group
+          }
+          prevKey = nil  // the block after an island always opens a new loop
+        }
+      }
+    }
+
     for (blockIndex, block) in uopBlocks.enumerated() {
       for uop in block.ops {
         if let cellId = uop.op.memoryCellId {
@@ -118,9 +165,9 @@ func remapVectorMemorySlots(
             break
           }
           if cellFirstUse[cellId] == nil {
-            cellFirstUse[cellId] = blockIndex
+            cellFirstUse[cellId] = blockGroup[blockIndex]
           }
-          cellLastUse[cellId] = blockIndex
+          cellLastUse[cellId] = blockGroup[blockIndex]
         }
       }
     }
@@ -135,6 +182,7 @@ func remapVectorMemorySlots(
     for cellId in memoryUsage.keys {
       if injectableCellIds.contains(cellId) { continue }
       if persistentCells.contains(cellId) { continue }
+      if parameterCells.contains(cellId) { continue }
       if cellId == voiceCellId { continue }
       reuseEligible.insert(cellId)
     }
@@ -180,9 +228,12 @@ func remapVectorMemorySlots(
   var freeRegions: [(offset: Int, size: Int, availableAfter: Int)] = []
   var reusedCount = 0
 
+  let reuseLimit = ProcessInfo.processInfo.environment["DGEN_REUSE_LIMIT"].flatMap { Int($0) }
+
   for interval in intervals {
     let needsAlignment = interval.vectorWidth > 1
     let allocSize = needsAlignment ? max(4, interval.size) : interval.size
+    let reuseAllowed = reuseLimit.map { reusedCount < $0 } ?? true
 
     // Find best-fit free region: must be available and large enough, prefer least waste.
     // Accumulate cells (memoryAccumulate) skip reuse — they do += and need zeroed memory.
@@ -191,7 +242,7 @@ func remapVectorMemorySlots(
     var bestWaste = Int.max
     var bestOffset = 0
 
-    if interval.canReceiveReuse {
+    if interval.canReceiveReuse && reuseAllowed {
       for (idx, region) in freeRegions.enumerated() {
         guard region.availableAfter < interval.firstUse else { continue }
         let effectiveOffset = needsAlignment ? ((region.offset + 3) / 4) * 4 : region.offset
@@ -210,6 +261,11 @@ func remapVectorMemorySlots(
       cellRemapping[interval.cellId] = bestOffset
       freeRegions[idx].availableAfter = interval.lastUse
       reusedCount += 1
+      if ProcessInfo.processInfo.environment["DGEN_DUMP_REUSE"] != nil {
+        FileHandle.standardError.write(
+          "[reuse] cell \(interval.cellId) size \(interval.size) blocks [\(interval.firstUse),\(interval.lastUse)] -> phys \(bestOffset) (reused)\n"
+            .data(using: .utf8)!)
+      }
     } else {
       // No reusable region — allocate fresh
       let offset: Int
@@ -222,6 +278,11 @@ func remapVectorMemorySlots(
       }
       cellRemapping[interval.cellId] = offset
       freeRegions.append((offset: offset, size: allocSize, availableAfter: interval.lastUse))
+      if ProcessInfo.processInfo.environment["DGEN_DUMP_REUSE"] != nil {
+        FileHandle.standardError.write(
+          "[reuse] cell \(interval.cellId) size \(interval.size) blocks [\(interval.firstUse),\(interval.lastUse)] -> phys \(offset) (fresh)\n"
+            .data(using: .utf8)!)
+      }
     }
   }
 
@@ -246,6 +307,14 @@ func remapVectorMemorySlots(
     }
   }
 
+  if ProcessInfo.processInfo.environment["DGEN_DUMP_REUSE"] != nil {
+    for (cell, phys) in cellRemapping.sorted(by: { $0.value < $1.value }) {
+      let sz = cellSizes[cell] ?? 1
+      FileHandle.standardError.write(
+        "[map] cell \(cell) -> phys \(phys) size \(sz)\n".data(using: .utf8)!)
+    }
+  }
+
   // Third pass: apply the remapping to all UOps
   for blockIndex in 0..<uopBlocks.count {
     for uopIndex in 0..<uopBlocks[blockIndex].ops.count {
@@ -257,6 +326,18 @@ func remapVectorMemorySlots(
           vectorWidth: uop.vectorWidth,
           scalarType: uop.scalarType
         )
+      }
+    }
+  }
+
+  if ProcessInfo.processInfo.environment["DGEN_DUMP_REUSE"] != nil {
+    let watch: Set<CellID> = [360, 396, 432]
+    for (blockIndex, block) in uopBlocks.enumerated() {
+      for uop in block.ops {
+        if let c = uop.op.memoryCellId, watch.contains(c) {
+          FileHandle.standardError.write(
+            "[touch] block \(blockIndex) phys \(c) op \(uop.op)\n".data(using: .utf8)!)
+        }
       }
     }
   }

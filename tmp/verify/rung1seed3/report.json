@@ -1,0 +1,209 @@
+{
+  "createdAtUTC" : "2026-07-11T18:57:55Z",
+  "equivalences" : [
+    {
+      "name" : "bodyAmp*drive*outGain",
+      "recoveredValue" : 1.05,
+      "relativeError" : 0.17362945,
+      "trueValue" : 0.89466053
+    },
+    {
+      "name" : "clickAmp*drive*outGain",
+      "recoveredValue" : 0.45499998,
+      "relativeError" : 1.1942805,
+      "trueValue" : 0.20735726
+    },
+    {
+      "name" : "noiseAmp*drive*outGain",
+      "recoveredValue" : 0.21000001,
+      "relativeError" : 0.5276285,
+      "trueValue" : 0.44456536
+    },
+    {
+      "name" : "bodyAmp (unscored factor)",
+      "recoveredValue" : 0.75,
+      "relativeError" : 0.39812338,
+      "trueValue" : 0.53643334
+    },
+    {
+      "name" : "clickAmp (unscored factor)",
+      "recoveredValue" : 0.325,
+      "relativeError" : 1.6140063,
+      "trueValue" : 0.12433022
+    },
+    {
+      "name" : "noiseAmp (unscored factor)",
+      "recoveredValue" : 0.15,
+      "relativeError" : 0.4372724,
+      "trueValue" : 0.26655883
+    },
+    {
+      "name" : "drive (unscored factor)",
+      "recoveredValue" : 2,
+      "relativeError" : 0.17483999,
+      "trueValue" : 2.4237723
+    },
+    {
+      "name" : "bodyAsymmetry (Rung 3 extension; unscored)",
+      "recoveredValue" : 0,
+      "relativeError" : 0,
+      "trueValue" : 0
+    }
+  ],
+  "finalLoss" : 0.9960062,
+  "initLoss" : 0.9960062,
+  "irreducibleLossFloor" : 0,
+  "lossRatio" : 1,
+  "pass" : false,
+  "rawLossRatio" : 1,
+  "recoveredParams" : {
+    "ampDecay" : -7.5,
+    "bodyAmp" : 0.75,
+    "bodyAsymmetry" : 0,
+    "bodyHarmonic" : 0,
+    "clickAmp" : 0.325,
+    "clickDecay" : -424.264,
+    "clickFreq" : 1341.6409,
+    "drive" : 2,
+    "fEnd" : 52.79331,
+    "fStart" : 82.049,
+    "noiseAmp" : 0.15,
+    "noiseCutoff" : 2828.4268,
+    "noiseDecay" : -154.91931,
+    "outGain" : 0.7,
+    "pitchDecay" : -25.000002
+  },
+  "rows" : [
+    {
+      "absoluteError" : 9.296028,
+      "name" : "fStart",
+      "pass" : false,
+      "recoveredValue" : 82.049,
+      "relativeError" : 0.10176829,
+      "tolerance" : 0.03,
+      "trueValue" : 91.34503,
+      "unit" : "Hz"
+    },
+    {
+      "absoluteError" : 0.28596878,
+      "name" : "fEnd",
+      "pass" : true,
+      "recoveredValue" : 52.79331,
+      "relativeError" : 0.005446263,
+      "tolerance" : 0.03,
+      "trueValue" : 52.50734,
+      "unit" : "Hz"
+    },
+    {
+      "absoluteError" : 15.156645,
+      "name" : "pitchDecay",
+      "pass" : false,
+      "recoveredValue" : -25.000002,
+      "relativeError" : 0.377438,
+      "tolerance" : 0.1,
+      "trueValue" : -40.156647,
+      "unit" : "1\/s"
+    },
+    {
+      "absoluteError" : 2.5520487,
+      "name" : "ampDecay",
+      "pass" : false,
+      "recoveredValue" : -7.5,
+      "relativeError" : 0.25388345,
+      "tolerance" : 0.1,
+      "trueValue" : -10.052049,
+      "unit" : "1\/s"
+    },
+    {
+      "absoluteError" : 785.2927,
+      "name" : "clickFreq",
+      "pass" : false,
+      "recoveredValue" : 1341.6409,
+      "relativeError" : 0.36921355,
+      "tolerance" : 0.1,
+      "trueValue" : 2126.9336,
+      "unit" : "Hz"
+    },
+    {
+      "absoluteError" : 146.36691,
+      "name" : "clickDecay",
+      "pass" : false,
+      "recoveredValue" : -424.264,
+      "relativeError" : 0.52669466,
+      "tolerance" : 0.2,
+      "trueValue" : -277.8971,
+      "unit" : "1\/s"
+    },
+    {
+      "absoluteError" : 1609.0098,
+      "name" : "noiseCutoff",
+      "pass" : false,
+      "recoveredValue" : 2828.4268,
+      "relativeError" : 0.36259893,
+      "tolerance" : 0.1,
+      "trueValue" : 4437.4365,
+      "unit" : "Hz"
+    },
+    {
+      "absoluteError" : 7.6123962,
+      "name" : "noiseDecay",
+      "pass" : true,
+      "recoveredValue" : -154.91931,
+      "relativeError" : 0.046836376,
+      "tolerance" : 0.2,
+      "trueValue" : -162.53171,
+      "unit" : "1\/s"
+    },
+    {
+      "absoluteError" : 0.011901319,
+      "name" : "outGain",
+      "pass" : true,
+      "recoveredValue" : 0.7,
+      "relativeError" : 0.01729595,
+      "tolerance" : 0.1,
+      "trueValue" : 0.68809867,
+      "unit" : "lin"
+    },
+    {
+      "absoluteError" : 0,
+      "name" : "bodyHarmonic",
+      "pass" : true,
+      "recoveredValue" : 0,
+      "relativeError" : 0,
+      "tolerance" : 0.2,
+      "trueValue" : 0,
+      "unit" : "lin"
+    },
+    {
+      "absoluteError" : 0.19980776,
+      "name" : "bodyAmp*drive",
+      "pass" : false,
+      "recoveredValue" : 1.5,
+      "relativeError" : 0.15367556,
+      "tolerance" : 0.1,
+      "trueValue" : 1.3001922,
+      "unit" : "lin"
+    },
+    {
+      "absoluteError" : 0.34865183,
+      "name" : "clickAmp*drive",
+      "pass" : false,
+      "recoveredValue" : 0.65,
+      "relativeError" : 1.1569735,
+      "tolerance" : 0.2,
+      "trueValue" : 0.30134815,
+      "unit" : "lin"
+    },
+    {
+      "absoluteError" : 0.34607792,
+      "name" : "noiseAmp*drive",
+      "pass" : false,
+      "recoveredValue" : 0.3,
+      "relativeError" : 0.53565973,
+      "tolerance" : 0.2,
+      "trueValue" : 0.64607793,
+      "unit" : "lin"
+    }
+  ],
+  "rung" : 1
+}

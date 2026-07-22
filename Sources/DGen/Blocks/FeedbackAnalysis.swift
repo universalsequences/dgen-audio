@@ -4,16 +4,22 @@ import Foundation
 // Find all nodes that participate in feedback loops (not just minimal cycles)
 public func findFeedbackLoops(_ g: Graph) -> [[NodeID]] {
   // Build maps of history cells to their read/write nodes
-  // historyRead/historyWrite now handle both scalar and tensor cases
-  var cellReads: [Int: NodeID] = [:]
-  var cellWrites: [Int: NodeID] = [:]
+  // historyRead/historyWrite now handle both scalar and tensor cases.
+  // A cell can have MULTIPLE reads (e.g. the same tensor history read twice);
+  // every one of them closes the write -> read feedback edge, so track them
+  // all. Iterate node IDs sorted so the resulting clusters are deterministic
+  // (dictionary order used to pick an arbitrary "winning" read per cell,
+  // which made compilation of duplicate-read graphs nondeterministic).
+  var cellReads: [Int: [NodeID]] = [:]
+  var cellWrites: [Int: [NodeID]] = [:]
 
-  for (nodeId, node) in g.nodes {
+  for nodeId in g.nodes.keys.sorted() {
+    guard let node = g.nodes[nodeId] else { continue }
     switch node.op {
     case .historyRead(let cell):
-      cellReads[cell] = nodeId
+      cellReads[cell, default: []].append(nodeId)
     case .historyWrite(let cell):
-      cellWrites[cell] = nodeId
+      cellWrites[cell, default: []].append(nodeId)
     default:
       break
     }
@@ -42,9 +48,11 @@ public func findFeedbackLoops(_ g: Graph) -> [[NodeID]] {
 
       // Handle implicit historyWrite -> historyRead connection
       if let n = g.nodes[node] {
-        if case .historyWrite(let cellId) = n.op, let readNode = cellReads[cellId] {
-          if reached.insert(readNode).inserted {
-            queue.append(readNode)
+        if case .historyWrite(let cellId) = n.op {
+          for readNode in cellReads[cellId] ?? [] {
+            if reached.insert(readNode).inserted {
+              queue.append(readNode)
+            }
           }
         }
       }
@@ -70,9 +78,11 @@ public func findFeedbackLoops(_ g: Graph) -> [[NodeID]] {
 
       // Handle implicit historyRead -> historyWrite connection
       if let n = g.nodes[node] {
-        if case .historyRead(let cellId) = n.op, let writeNode = cellWrites[cellId] {
-          if reached.insert(writeNode).inserted {
-            queue.append(writeNode)
+        if case .historyRead(let cellId) = n.op {
+          for writeNode in cellWrites[cellId] ?? [] {
+            if reached.insert(writeNode).inserted {
+              queue.append(writeNode)
+            }
           }
         }
       }
@@ -84,15 +94,17 @@ public func findFeedbackLoops(_ g: Graph) -> [[NodeID]] {
   // Find feedback clusters - a cluster exists when any history write depends on any history read
   var clusters: [Set<NodeID>] = []
   var processedWrites = Set<NodeID>()
+  let allWriteNodes = Set(cellWrites.values.flatMap { $0 })
 
-  for (cellId, writeNode) in cellWrites {
+  for cellId in cellWrites.keys.sorted() {
+    for writeNode in cellWrites[cellId]!.sorted() {
     if processedWrites.contains(writeNode) { continue }
 
     // Find all nodes this write depends on
     let writeDeps = reachBackward(from: [writeNode])
 
     // Find all history reads (for this cell) that this write depends on
-    let dependentReads = writeDeps.intersection(Set([cellReads[cellId]!]))
+    let dependentReads = writeDeps.intersection(Set(cellReads[cellId] ?? []))
 
     if !dependentReads.isEmpty {
       // This write creates feedback - find all writes reachable from the reads it depends on
@@ -101,7 +113,6 @@ public func findFeedbackLoops(_ g: Graph) -> [[NodeID]] {
 
       // OPTIMIZATION: Precompute which nodes can reach writeNode (done once)
       let canReachWriteNode = reachBackward(from: [writeNode])
-      let allWriteNodes = Set(cellWrites.values)
 
       // Keep expanding until we find all connected reads and writes
       var changed = true
@@ -137,19 +148,26 @@ public func findFeedbackLoops(_ g: Graph) -> [[NodeID]] {
       // If a read is in the cluster, its corresponding write must also be included
       for readNode in allReadsInCluster {
         if let node = g.nodes[readNode] {
-          if case .historyRead(let cell) = node.op, let writeNode = cellWrites[cell] {
-            clusterNodes.insert(writeNode)
-            allWritesInCluster.insert(writeNode)
+          if case .historyRead(let cell) = node.op {
+            for writeNode in cellWrites[cell] ?? [] {
+              clusterNodes.insert(writeNode)
+              allWritesInCluster.insert(writeNode)
+            }
           }
         }
       }
 
-      // If a write is in the cluster, its corresponding read must also be included
+      // If a write is in the cluster, ALL reads of that cell must also be
+      // included — a read left out of the cluster can be scheduled in a
+      // different block, where it observes block-stale state instead of the
+      // previous frame's value.
       for writeNode in allWritesInCluster {
         if let node = g.nodes[writeNode] {
-          if case .historyWrite(let cell) = node.op, let readNode = cellReads[cell] {
-            clusterNodes.insert(readNode)
-            allReadsInCluster.insert(readNode)
+          if case .historyWrite(let cell) = node.op {
+            for readNode in cellReads[cell] ?? [] {
+              clusterNodes.insert(readNode)
+              allReadsInCluster.insert(readNode)
+            }
           }
         }
       }
@@ -166,6 +184,57 @@ public func findFeedbackLoops(_ g: Graph) -> [[NodeID]] {
       let nodesOnFeedbackPaths = forwardFromReadsAll.intersection(backwardToWrites)
       clusterNodes.formUnion(nodesOnFeedbackPaths)
 
+      // Same-cell + path closure. Two invariants:
+      // (1) Every read and write of any history cell touched by the cluster
+      //     must execute in the same sequential frame loop. Reads can enter
+      //     the cluster via path analysis alone (e.g. biquad's x-history read
+      //     feeding the y recursion) while the cell's write dangles outside;
+      //     a write scheduled in a different kernel runs for ALL frames before
+      //     the cluster's loop, so every frame reads the final frame's state.
+      // (2) Any node on a path between cluster state ops (e.g. a consumer of
+      //     a pass-through historyWrite output that feeds the recursion) must
+      //     join the cluster, otherwise its group both depends on and is a
+      //     dependency of the cluster group — a scheduling cycle.
+      var closureChanged = true
+      while closureChanged {
+        closureChanged = false
+
+        for nodeId in Array(clusterNodes) {
+          guard let node = g.nodes[nodeId] else { continue }
+          let cell: Int?
+          switch node.op {
+          case .historyRead(let c), .historyWrite(let c):
+            cell = c
+          default:
+            cell = nil
+          }
+          guard let cell else { continue }
+          for other in (cellReads[cell] ?? []) + (cellWrites[cell] ?? []) {
+            if clusterNodes.insert(other).inserted { closureChanged = true }
+          }
+        }
+
+        var stateNodes = Set<NodeID>()
+        var stateWrites = Set<NodeID>()
+        for nodeId in clusterNodes {
+          guard let node = g.nodes[nodeId] else { continue }
+          switch node.op {
+          case .historyRead:
+            stateNodes.insert(nodeId)
+          case .historyWrite:
+            stateNodes.insert(nodeId)
+            stateWrites.insert(nodeId)
+          default:
+            break
+          }
+        }
+        let onStatePaths = reachForward(from: stateNodes)
+          .intersection(reachBackward(from: stateWrites))
+        let beforeCount = clusterNodes.count
+        clusterNodes.formUnion(onStatePaths)
+        if clusterNodes.count != beforeCount { closureChanged = true }
+      }
+
       // NOTE: For tensor feedback loops like Conv2D, nodes downstream of historyRead
       // but not on the path to historyWrite (like sumAxis -> output) also need
       // sequential execution. However, including ALL forward-reachable nodes is too
@@ -174,6 +243,7 @@ public func findFeedbackLoops(_ g: Graph) -> [[NodeID]] {
       // TODO: Implement proper nested loop execution for tensor feedback clusters.
 
       clusters.append(clusterNodes)
+    }
     }
   }
 
@@ -269,6 +339,11 @@ public func findSequentialNodes(_ g: Graph, feedbackClusters: [[NodeID]], backen
       scalar.insert($0.id)  // Click reads/writes cell — needs sequential frame execution
     case .noise(_):
       scalar.insert($0.id)  // Noise PRNG reads/writes state cell — needs sequential frame execution
+    case .temporalGradStore, .temporalGradRead:
+      // These ops use explicit frame-indexed tape addressing. Metal maps that
+      // safely to one thread per frame; the C backend's frame-axis SIMD upgrade
+      // cannot represent their integer offsets lane-wise, so keep it scalar.
+      if backend == .c { scalar.insert($0.id) }
     case .tensorNoise(_, _, _):
       scalar.insert($0.id)  // Tensor noise shares a single PRNG state across N per-frame iterations — must stay scalar so the xorshift advances sequentially rather than being SIMD-vectorized 4-at-once
     case .hopTensorNoise(_, _, _):
@@ -277,6 +352,21 @@ public func findSequentialNodes(_ g: Graph, feedbackClusters: [[NodeID]], backen
       scalar.insert($0.id)  // Ring-buffer write + row advance must happen sequentially on hop boundaries; the op emits its own scalar `if` gate
     case .spectrumDelayMod(_, _, _, _, _):
       scalar.insert($0.id)  // Same reasoning — plus the fractional interpolation reads two ring rows per element
+    case .historyRead, .historyWrite:
+      // History is state across frames whether its cell is scalar or tensor.
+      // Emitting a non-feedback read/write chain in a parallel per-frame kernel
+      // races on the persistent state (biquad's x[n-1]/x[n-2] chain is the
+      // canonical example). Feedback detection catches closed recurrences, but
+      // not every stateful chain, so all history operations stay frame-serial;
+      // tensor blocks still iterate/index their elements inside each frame.
+      scalar.insert($0.id)
+    case .memoryRead(let cellId), .memoryWrite(let cellId):
+      // Vector-width gradient carry cells are the reverse-time analogue of
+      // history: state carried across (reverse) frames. A parallel per-frame
+      // kernel would race on them exactly like scalar history cells.
+      if g.tensorGradCarryCells.contains(cellId) {
+        scalar.insert($0.id)
+      }
     default: break
     }
   }
@@ -366,12 +456,41 @@ public func findSequentialNodes(_ g: Graph, feedbackClusters: [[NodeID]], backen
     }
   }
 
+  // Hop-gated tensor history feedback must run sequentially across frames: the
+  // state at hop N depends on hop N-1. Element-parallelizing it across frames
+  // (ThreadCountScale → perFrameScaled) would split the read+update into a
+  // parallel kernel and the write-back into a separate sequential kernel, so
+  // every hop would read stale state. Marking read/write scalar keeps the whole
+  // feedback path in one sequential frame loop (matching the C tensor-history
+  // path). Gated on the explicit hop tag so per-sample history (membrane / FDTD)
+  // keeps its existing Metal SIMD-across-frames behavior.
+  g.nodes.values.forEach {
+    switch $0.op {
+    case .historyRead(let cellId), .historyWrite(let cellId):
+      if g.nodeHopRate[$0.id] != nil, g.cellToTensor[cellId] != nil {
+        scalar.insert($0.id)
+      }
+    default:
+      break
+    }
+  }
+
   // Use feedback loop detection to mark all nodes in feedback loops as scalar
   // This is the core reason for scalar execution - frame-to-frame state dependencies
   for loop in feedbackClusters {
     for nodeId in loop {
       scalar.insert(nodeId)
     }
+  }
+
+  // Vector-width BPTT (tensor-history biquad): the reverse-time recurrence —
+  // carry reads, the grad arithmetic between them, and the carry writes — must
+  // land in one sequential block so it can be wrapped in a single reverse
+  // frame loop. Backward tensor grad nodes are otherwise classified parallel,
+  // fragmenting the chain across blocks. Mark every backward-partition
+  // ancestor of a tensor carry write as scalar.
+  if !g.tensorGradCarryCells.isEmpty, let lastFwd = g.lastForwardNodeId {
+    scalar.formUnion(tensorBPTTRecurrenceClosure(g: g, lastForwardId: lastFwd))
   }
 
   // Remove SIMD-safe nodes from scalar set - these use atomics and are safe for parallel execution

@@ -1,0 +1,16 @@
+{
+  "highpassHz": 30.0,
+  "improvement": 0.8009510359841543,
+  "initialDistance": 0.11223193545058903,
+  "learnedDistance": 0.022339650480933015,
+  "logEpsilon": 0.001,
+  "magnitudeNormalization": "hann coherent gain (sum(window) / 2)",
+  "pass": true,
+  "requiredImprovement": 0.8,
+  "windows": [
+    256,
+    512,
+    1024,
+    2048
+  ]
+}

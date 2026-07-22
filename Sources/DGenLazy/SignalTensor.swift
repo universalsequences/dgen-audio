@@ -151,3 +151,24 @@ extension SignalTensor {
         return Signal(nodeId: nodeId, graph: graph, requiresGrad: requiresGrad)
     }
 }
+
+// MARK: - Stateful
+
+extension SignalTensor {
+    /// Sample-and-hold every tensor element when `condition > 0`.
+    public static func latch(_ value: SignalTensor, when condition: Signal) -> SignalTensor {
+        let graph = value.graph
+        graph.markDirty()
+        let nodeId = graph.graph.latch(value.nodeId, condition.nodeId)
+        return SignalTensor(
+            nodeId: nodeId,
+            graph: graph,
+            shape: value.shape,
+            requiresGrad: value.requiresGrad || condition.requiresGrad)
+    }
+
+    /// Sample-and-hold every tensor element when `condition > 0`.
+    public func latch(when condition: Signal) -> SignalTensor {
+        SignalTensor.latch(self, when: condition)
+    }
+}

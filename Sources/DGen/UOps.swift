@@ -31,6 +31,7 @@ public enum Op {
   case or(Lazy, Lazy)
   case xor(Lazy, Lazy)
   case tan(Lazy)
+  case atan(Lazy)
   case tanh(Lazy)
   case exp(Lazy)
   case log(Lazy)
@@ -58,6 +59,11 @@ public enum Op {
   /// to `memoryRead`. Used for runtime-variable kernel coefficients and other
   /// lane-uniform loads inside NEON inner loops.
   case simdBroadcastLoad(CellID, Lazy)
+  /// Broadcast a loop-invariant scalar float variable across all 4 SIMD lanes
+  /// (`vdupq_n_f32(t<id>)` / `vdupq_n_f32(t<id>[i])` for frame-scoped globals).
+  /// Inserted by the C-backend region-loop SIMD upgrade so element loops can
+  /// reference frame-scope scalars. Scalar mode degrades to a plain copy.
+  case broadcastScalar(Lazy)
   case latch(Lazy, Lazy)
   case beginIf(Lazy)
   case gswitch(Lazy, Lazy, Lazy)
@@ -79,6 +85,7 @@ public enum Op {
   case output(ChannelNumber, Lazy)
   case input(ChannelNumber)
   case frameCount
+  case hostSampleRate
   case frameIndex
   case threadIndex
   case loadTape(Lazy, Lazy)
@@ -181,6 +188,7 @@ public enum Op {
     case .or(let a, let b): return .or(r(a), r(b))
     case .xor(let a, let b): return .xor(r(a), r(b))
     case .tan(let a): return .tan(r(a))
+    case .atan(let a): return .atan(r(a))
     case .tanh(let a): return .tanh(r(a))
     case .exp(let a): return .exp(r(a))
     case .log(let a): return .log(r(a))
@@ -202,6 +210,7 @@ public enum Op {
     case .memoryRead(let c, let o): return .memoryRead(c, r(o))
     case .memoryWrite(let c, let o, let v): return .memoryWrite(c, r(o), r(v))
     case .simdBroadcastLoad(let c, let o): return .simdBroadcastLoad(c, r(o))
+    case .broadcastScalar(let a): return .broadcastScalar(r(a))
     case .memoryAccumulate(let c, let o, let v): return .memoryAccumulate(c, r(o), r(v))
     case .latch(let a, let b): return .latch(r(a), r(b))
     case .gswitch(let c, let a, let b): return .gswitch(r(c), r(a), r(b))

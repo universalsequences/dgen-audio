@@ -165,6 +165,16 @@ public class Signal: LazyValue {
     return Signal(nodeId: nodeId, graph: graph, requiresGrad: false)
   }
 
+  /// Current host sample rate in Hz.
+  ///
+  /// C-generated DGen kernels read this from the process function argument so
+  /// the same compiled DSP can run correctly at different host rates.
+  public static func hostSampleRate() -> Signal {
+    let graph = LazyGraphContext.current
+    let nodeId = graph.node(.hostSampleRate)
+    return Signal(nodeId: nodeId, graph: graph, requiresGrad: false)
+  }
+
   /// Create a phasor (ramp oscillator)
   /// - Parameters:
   ///   - freq: Frequency in Hz (can be Signal, Tensor, or Float)
@@ -267,6 +277,19 @@ public class Signal: LazyValue {
     return (read: readSignal, write: writeFunc)
   }
 
+  /// Write a scalar history cell with a `reset`: when `reset` is high, the cell
+  /// stores 0 (so the next read returns 0). The reset is handled inside the
+  /// historyWrite op so it does not introduce a separate node into the feedback
+  /// path, which would break feedback-delay analysis. `read` must be the read
+  /// signal returned by `history()` for the same cell.
+  public static func historyWriteReset(read: Signal, value: Signal, reset: Signal) -> Signal {
+    guard let cellId = read.memoryCellId else {
+      fatalError("historyWriteReset: read signal has no history cell")
+    }
+    let writeNode = read.graph.node(.historyWrite(cellId), [value.nodeId, reset.nodeId])
+    return Signal(nodeId: writeNode, graph: read.graph, requiresGrad: value.requiresGrad, cellId: cellId)
+  }
+
   /// Create an accumulator
   /// - Parameters:
   ///   - increment: Value to add each frame
@@ -323,6 +346,14 @@ public class Signal: LazyValue {
 
     let nodeId = graph.node(.latch(cellId), [value.nodeId, condition.nodeId])
     let needsGrad = value.requiresGrad || condition.requiresGrad
+
+    // Mirror Graph.latch (HigherOps+Latch.swift): a latch whose trigger is
+    // hop-rate only changes value on hop boundaries, so tag it hop-producing.
+    // Without this, downstream consumers of a scalar latch demote to
+    // per-frame execution even when the trigger comes from hop-hold.
+    if let hopRate = graph.graph.nodeHopRate[condition.nodeId] {
+      graph.graph.nodeHopRate[nodeId] = hopRate
+    }
 
     return Signal(nodeId: nodeId, graph: graph, requiresGrad: needsGrad, cellId: cellId)
   }

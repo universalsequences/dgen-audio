@@ -42,6 +42,10 @@ public enum DispatchMode: Equatable {
   /// 1 thread, no frame loop — block has its own loops (BPTT)
   case selfManaged
 
+  /// N threads, no renderer frame loop — block has its own loops (BPTT), one
+  /// thread per tensor lane (lane-parallel reverse recurrence)
+  case selfManagedThreads(Int)
+
   /// frameCount threads, threadGroupSize=1 (for kernels using threadgroup scratch memory)
   case perFrameThreadgroup1
 
@@ -70,7 +74,8 @@ extension DispatchMode {
     case .perFrame, .perFrameThreadgroup1: return frameCount
     case .perFrameScaled(let n): return frameCount * max(1, n)
     case .perFrameScaledThreadgroup1(let n): return frameCount * max(1, n)
-    case .fixedWithFrameLoop(let n), .staticThreads(let n): return max(1, n)
+    case .fixedWithFrameLoop(let n), .staticThreads(let n), .selfManagedThreads(let n):
+      return max(1, n)
     case .gemm(let tilesM, let tilesN, let depth):
       let d = depth ?? 1
       return max(1, tilesM) * max(1, tilesN) * max(1, d) * 32
@@ -84,7 +89,7 @@ extension DispatchMode {
   var hasRendererFrameLoop: Bool {
     switch self {
     case .singleThreaded, .fixedWithFrameLoop: return true
-    case .perFrame, .perFrameThreadgroup1, .perFrameScaled, .perFrameScaledThreadgroup1, .staticThreads, .selfManaged, .gemm, .gemmStaged:
+    case .perFrame, .perFrameThreadgroup1, .perFrameScaled, .perFrameScaledThreadgroup1, .staticThreads, .selfManaged, .selfManagedThreads, .gemm, .gemmStaged:
       return false
     }
   }
@@ -110,10 +115,14 @@ extension DispatchMode {
     }
   }
 
-  /// Fixed thread count for modes that dispatch a constant number of threads with a frame loop.
+  /// Fixed thread count for modes that dispatch a constant number of threads
+  /// with a per-thread frame loop (renderer-wrapped or block-owned). The Metal
+  /// renderer also keys `threadIndex` → `id` off this.
   var fixedThreadCount: Int? {
-    if case .fixedWithFrameLoop(let n) = self { return n }
-    return nil
+    switch self {
+    case .fixedWithFrameLoop(let n), .selfManagedThreads(let n): return n
+    default: return nil
+    }
   }
 }
 

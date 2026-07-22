@@ -1,0 +1,14 @@
+{
+  "distance": 1.5941355819412453e-07,
+  "frames": 32768,
+  "logEpsilon": 0.001,
+  "pass": true,
+  "sampleRate": 44100,
+  "threshold": 0.00308,
+  "windows": [
+    256,
+    512,
+    1024,
+    2048
+  ]
+}

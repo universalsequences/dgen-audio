@@ -1,0 +1,50 @@
+{
+  "createdAtUTC" : "2026-07-13T22:24:00Z",
+  "equivalences" : [
+
+  ],
+  "finalLoss" : 1.3118293,
+  "initLoss" : 1.7016193,
+  "irreducibleLossFloor" : 0,
+  "lossRatio" : 0.77093,
+  "pass" : true,
+  "rawLossRatio" : 0.77093,
+  "recoveredParams" : {
+    "ampCurve" : 0,
+    "ampDecay" : -7,
+    "attackTime" : 0.03598123,
+    "bodyAmp" : 0.75,
+    "bodyAsymmetry" : 0,
+    "bodyHarmonic" : 0,
+    "brightnessDecay" : 1,
+    "clickAmp" : 0.2,
+    "clickDecay" : -400,
+    "clickFreq" : 1400,
+    "decayTime" : 0.06300852,
+    "drive" : 1.2167978,
+    "f0" : 32.7,
+    "fAmt" : 32.862305,
+    "fBase" : 3115.7754,
+    "fDecay" : 0.23105776,
+    "fEnd" : 45,
+    "fStart" : 120,
+    "harmonicCorrections" : {
+
+    },
+    "noiseAmp" : 0.08,
+    "noiseCutoff" : 2800,
+    "noiseDecay" : -140,
+    "noteOff" : 1.55,
+    "outGain" : 0.7810433,
+    "pitchDecay" : -35,
+    "pw" : 0.17187308,
+    "releaseTime" : 0.06453201,
+    "res" : 0.50210184,
+    "shape" : 0.5698597,
+    "sustain" : 0.80568904
+  },
+  "rows" : [
+
+  ],
+  "rung" : 1
+}

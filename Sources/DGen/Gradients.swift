@@ -19,8 +19,30 @@ extension Graph {
     if let existing = gradCarryCells[historyCellId] {
       return existing
     }
+    // Tensor-registered history cells (e.g. batched biquad state) need a
+    // width-W carry cell with its own tensor registration so carry
+    // reads/writes address one slot per element.
+    if let historyTensorId = cellToTensor[historyCellId],
+      let historyTensor = tensors[historyTensorId]
+    {
+      let width = Swift.max(1, historyTensor.shape.reduce(1, *))
+      let carryCell = alloc(vectorWidth: width)
+      gradCarryCells[historyCellId] = carryCell
+      persistentCells.insert(carryCell)
+      let tensorId = nextTensorId
+      nextTensorId += 1
+      tensors[tensorId] = Tensor(id: tensorId, shape: historyTensor.shape, cellId: carryCell)
+      cellToTensor[carryCell] = tensorId
+      tensorGradCarryCells.insert(carryCell)
+      return carryCell
+    }
     let carryCell = alloc()
     gradCarryCells[historyCellId] = carryCell
+    // Carry cells are read/written via memoryRead/memoryWrite across kernels,
+    // which the buffer-reuse liveness analysis does not track. Without this,
+    // remapVectorMemorySlots can alias a carry cell onto live gradient storage
+    // (e.g. a param's grad-accumulation cell or spectral gradTime cells).
+    persistentCells.insert(carryCell)
     return carryCell
   }
 
@@ -98,7 +120,14 @@ extension Graph {
 
     for nodeId in topologicalOrder(from: root) {
       guard let node = nodes[nodeId] else { continue }
-      let isTarget = targets.contains(nodeId)
+      // historyRead counts as a target: its accumulated gradient is the BPTT
+      // temporal carry. Without this, historyWrite nodes whose input is a
+      // historyRead (e.g. biquad's x/y state chaining) are pruned, their
+      // backward never consumes the carry cell, and the temporal gradient
+      // recursion silently truncates (docs/BIQUAD_BPTT_GRADIENT_BUG.md).
+      let isHistoryRead: Bool
+      if case .historyRead = node.op { isHistoryRead = true } else { isHistoryRead = false }
+      let isTarget = targets.contains(nodeId) || isHistoryRead
       let hasTargetDescendant = node.inputs.contains { onTargetPath[$0] == true }
       onTargetPath[nodeId] = isTarget || hasTargetDescendant
     }
@@ -133,6 +162,60 @@ extension Graph {
 }
 
 // MARK: - LazyOp Backward Rules
+
+/// Builds the O(N) reverse scan used by stateful accumulator-style operators.
+///
+/// Both `phasor` and `accum` return the state *before* applying the current
+/// frame's increment. Therefore the increment gradient is the exclusive suffix
+/// sum of future output gradients. A reset at frame n discards increment n and
+/// cuts all contributions from frames after n, while output n still contributes
+/// to the state entering that frame.
+private func temporalIncrementGradient(
+  graph g: Graph,
+  node: Node,
+  gradOutput: NodeID,
+  scaleBySampleRate: Bool
+) -> NodeID {
+  let shape: Shape
+  switch node.shape ?? .scalar {
+  case .scalar:
+    shape = []
+  case .tensor(let tensorShape):
+    shape = tensorShape
+  }
+  let elementCount = max(1, shape.reduce(1, *))
+  let gradCell = g.alloc(vectorWidth: g.maxFrameCount * elementCount)
+  let resetCell = g.alloc(vectorWidth: g.maxFrameCount)
+  let outputCell = g.alloc(vectorWidth: g.maxFrameCount * elementCount)
+  // These tapes are read and written by separate kernels. Raw memory-cell
+  // dependencies are intentionally outside ordinary tensor liveness analysis,
+  // so keep buffer reuse from aliasing them onto other live gradient storage.
+  g.persistentCells.formUnion([gradCell, resetCell, outputCell])
+
+  let store = g.n(
+    .temporalGradStore(
+      gradCell: gradCell,
+      resetCell: resetCell,
+      elementCount: elementCount),
+    [gradOutput, node.inputs[1]])
+  g.addGradientSideEffect(store)
+
+  let scan = g.n(
+    .temporalGradScan(
+      gradCell: gradCell,
+      resetCell: resetCell,
+      outputCell: outputCell,
+      elementCount: elementCount),
+    [store])
+
+  return g.n(
+    .temporalGradRead(
+      outputCell: outputCell,
+      shape: shape,
+      scaleBySampleRate: scaleBySampleRate),
+    [scan],
+    shape: shape.isEmpty ? .scalar : .tensor(shape))
+}
 
 extension LazyOp {
 
@@ -320,6 +403,14 @@ extension LazyOp {
       let secSq = g.n(.div, [one, cosXSq])
       return [g.n(.mul, [secSq, gradOutput])]
 
+    case .atan:
+      // d(atan(x))/dx = 1/(1+x^2) * grad
+      let x = node.inputs[0]
+      let one = g.n(.constant(1.0), [])
+      let xSq = g.n(.mul, [x, x])
+      let denom = g.n(.add, [one, xSq])
+      return [g.n(.mul, [g.n(.div, [one, denom]), gradOutput])]
+
     case .tanh:
       // d(tanh(x))/dx = (1 - tanh^2(x)) * grad
       let x = node.inputs[0]
@@ -379,19 +470,29 @@ extension LazyOp {
       return [zero, gradX, gradY]
 
     case .selector:
-      // selector(mode, options...) -> gradient flows to selected option only
+      // selector(mode, options...) -> gradient flows to selected option only.
+      // Forward is 1-indexed (see IRBuilder+Math.selector and the renderers):
+      // mode <= 0 yields 0, option k is selected when mode == k+1. So input i
+      // (option i-1) is selected when mode == i.
       guard node.inputs.count >= 2 else { return [] }
       let mode = node.inputs[0]
       let zero = g.n(.constant(0.0), [])
 
       var grads: [NodeID?] = [zero]  // mode has zero gradient
       for i in 1..<node.inputs.count {
-        let optionIndex = g.n(.constant(Float(i - 1)), [])
-        let isSelected = g.n(.eq, [mode, optionIndex])
+        let selectorValue = g.n(.constant(Float(i)), [])
+        let isSelected = g.n(.eq, [mode, selectorValue])
         let gradOption = g.n(.gswitch, [isSelected, gradOutput, zero])
         grads.append(gradOption)
       }
       return grads
+
+    case .modulatedParam:
+      // Host modulation routing is not part of the training surface.
+      // Preserve gradient flow to the base parameter and treat active/depth lanes
+      // as non-differentiable controls.
+      let zero = g.n(.constant(0.0), [])
+      return node.inputs.enumerated().map { index, _ in index == 0 ? gradOutput : zero }
 
     case .mix:
       // mix(x, y, t) = x * (1-t) + y * t
@@ -556,22 +657,29 @@ extension LazyOp {
     // MARK: Stateful Operations
 
     case .phasor(_):
-      // d(phase)/d(freq) = frameIndex / sampleRate
-      let sampleRate = g.n(.constant(g.sampleRate), [])
-      return [g.n(.gradPhasor(node.id), [gradOutput, sampleRate])]
+      let gradFreq = temporalIncrementGradient(
+        graph: g,
+        node: node,
+        gradOutput: gradOutput,
+        scaleBySampleRate: true)
+      let zero = g.n(.constant(0.0), [])
+      return [gradFreq, zero]
 
     case .deterministicPhasor:
       // d(phase)/d(freq) = frameIndex / sampleRate
       // Similar to phasor but stateless
-      let sampleRate = g.n(.constant(g.sampleRate), [])
+      let sampleRate = g.n(.hostSampleRate, [])
       return [g.n(.gradDeterministicPhasor, [gradOutput, sampleRate])]
 
     case .accum(_):
-      // Accumulator gradient is complex due to temporal dependencies
-      // For now, pass gradient to increment input, zero to others
+      let gradIncrement = temporalIncrementGradient(
+        graph: g,
+        node: node,
+        gradOutput: gradOutput,
+        scaleBySampleRate: false)
       let zero = g.n(.constant(0.0), [])
       // inputs: [increment, reset, min, max]
-      return [gradOutput, zero, zero, zero]
+      return [gradIncrement, zero, zero, zero]
 
     case .latch(_):
       // Gradient flows through value when condition was true
@@ -613,7 +721,7 @@ extension LazyOp {
 
     // MARK: I/O and Constants
 
-    case .constant(_):
+    case .constant(_), .hostSampleRate:
       return []  // No inputs
 
     case .input(_):
@@ -727,8 +835,18 @@ extension LazyOp {
       // For now, return nil (not yet supported in graph form)
       return node.inputs.map { _ in nil }
 
+    case .cumsum(_):
+      // Inference-only for now (backward would be a reverse-cumsum scan).
+      return node.inputs.map { _ in nil }
+
+    case .gather:
+      // Inference-only for now (backward would scatter-add into the source tensor;
+      // indices are intentionally non-differentiable).
+      return node.inputs.map { _ in nil }
+
     case .spectralLossFFT(
-      let windowSize, let hop, _, let useLogMagnitude, let lossMode, let windowCell,
+      let windowSize, let hop, _, let useLogMagnitude, let useSmoothLogMagnitude, let lossMode,
+      let windowCell,
       let fft1Cell, let fft2Cell, let mag1Cell, let mag2Cell, _):
       // FFT-based spectral loss backward pass using O(N log N) IFFT
       // Reads the forward pass's per-frame FFT/magnitude cells directly,
@@ -761,6 +879,7 @@ extension LazyOp {
           windowSize: windowSize,
           hop: hop,
           useLogMagnitude: useLogMagnitude,
+          useSmoothLogMagnitude: useSmoothLogMagnitude,
           lossMode: lossMode,
           fft1Cell: fft1Cell,
           fft2Cell: fft2Cell,
@@ -813,7 +932,7 @@ extension LazyOp {
       for _ in 2..<node.inputs.count { result.append(nil) }
       return result
 
-    case .spectralLossFFTGradSpec(_, _, _, _, _, _, _, _, _, _):
+    case .spectralLossFFTGradSpec(_, _, _, _, _, _, _, _, _, _, _):
       // Gradient ops don't need their own gradients
       return node.inputs.map { _ in nil }
 
@@ -1196,7 +1315,9 @@ extension LazyOp {
 
     // MARK: Non-differentiable compute ops
 
-    case .gradPhasor(_), .gradDeterministicPhasor, .gemm(_, _, _, _, _), .sumMulAxis0,
+    case .gradDeterministicPhasor,
+      .temporalGradStore, .temporalGradScan, .temporalGradRead,
+      .gemm(_, _, _, _, _), .sumMulAxis0,
       .gemmStaged(_, _, _, _, _, _, _, _),
       .gemmSmall(_, _, _, _, _),
       .gemmChunkPartials(_, _, _, _, _, _, _),
@@ -1262,10 +1383,20 @@ extension LazyOp {
     -> NodeID
   {
     guard let gradNode = g.nodes[grad],
-      case .tensor(let gradShape) = gradNode.shape,
-      case .tensor(let targetShapeArray) = targetShape
+      case .tensor(let gradShape) = gradNode.shape
     else {
-      // Scalar or unknown shape - no reduction needed
+      // Scalar or unknown gradient - no reduction needed
+      return grad
+    }
+    guard case .tensor(let targetShapeArray) = targetShape else {
+      // Tensor gradient flowing into a scalar operand (e.g. a shared scalar
+      // control broadcast across a [W]-lane tensor): sum over all lanes.
+      // Passing the tensor through unreduced would silently accumulate only
+      // an .empty placeholder into the scalar grad cell.
+      if case .scalar = targetShape {
+        return g.n(.sum, [grad])
+      }
+      // Unknown target shape - no reduction
       return grad
     }
 
@@ -1350,5 +1481,4 @@ extension LazyOp {
 // case neg                           // Unary negation: -x
 // case expand(Shape)                 // Broadcast scalar to tensor shape
 // case expandAxis(Shape, Int)        // Broadcast along a specific axis
-// case gradPhasor(NodeID)            // Special gradient for phasor (needs frame index)
 // case gradDeterministicPhasor       // Special gradient for deterministic phasor

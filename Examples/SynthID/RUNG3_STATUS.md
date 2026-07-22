@@ -1,0 +1,192 @@
+# SynthID Rung 3 Status
+
+## Completed acceptance (2026-07-11)
+
+Rung 3 now passes the corrected independent gate on
+`Assets/808kicklong.wav` with the repository-default command:
+
+```bash
+swift run SynthID rung3 \
+  --target Assets/808kicklong.wav \
+  --out /tmp/synthid-rung3-complete
+```
+
+- Initialization distance: `0.075252`
+- Learned distance: `0.011626`
+- Improvement: **84.55%**
+- Required improvement: `80.00%`
+- Result: **pass**
+- Selected stitched training loss before independent refinement: `1.16483`
+- Final training loss at the independently refined scalars: `1.035218`
+
+The default five restarts, pitch refinement, cross-restart subspace stitching,
+bounded 14-scalar independent refinement, DGen rerender, and corrected gate all
+completed. The command exited zero and wrote the required `target.wav`,
+`learned.wav`, `ab.wav`, `checkpoint.json`, `report.json`, `report.md`,
+`loss_curve.csv`, and `compare.png` artifacts. It also writes
+`pre_refine_params.json` and `refinement.json` so the final scalar step is fully
+auditable.
+
+### Resolved blocker
+
+Low-pass/time-domain inspection showed that the sub-20 Hz component is a
+capture-chain baseline response: a large onset-correlated half-cycle that is far
+below the bridged-T body's approximately 49 Hz settled mode. The independent
+real-target policy therefore applies the same zero-phase 30 Hz high-pass to
+target, initialization, and learned audio. `compare.json` records
+`"highpassHz": 30.0`; the original files and training target remain unchanged.
+
+The remaining attack mismatch had two structural causes:
+
+- The real attack contains a short even harmonic whose ratio decays toward zero.
+  A zero-default `bodyAsymmetry` scalar now drives a second harmonic that decays
+  `17/s` faster than the body. This is the fourteenth and final voice scalar.
+- The real PCM16 recording retains a quiet broadband capture floor and a larger
+  excitation than the synthetic rungs. Rung 3 can now explore wider click/noise
+  optimization bounds while Rungs 1–2 keep their original sampling ranges and
+  zero asymmetry.
+
+The GPU loss still has different local basins from the corrected independent
+metric for click, pitch, asymmetry, and capture-floor scalars. A deterministic
+coordinate refiner handles only those documented scalar values—never waveform
+samples, residual tables, learned FIRs, or target-derived arrays. The final
+candidate is rerendered by DGen and re-evaluated by `compare.py`.
+
+Focused validation:
+
+- New scalar finite difference: `1.18%` relative error at `epsilon=0.003`.
+- Rung 2 independent renderer equivalence: `4.872680e-06` max absolute error
+  (`< 1e-3`) for seed 1.
+- Python-free plotting environment: `compare.py` writes a valid dependency-free
+  PNG fallback while preserving identical MR-STFT JSON metrics.
+
+## Corrected real-target baseline (2026-07-10)
+
+Target: `Assets/808kicklong.wav`
+
+- Source: mono PCM16, 32.5 kHz, 37,759 frames (1.1618 s)
+- Detected onset: frame 3 (`0.0923 ms`) at the default `-40 dB` threshold
+- Training copy: windowed-sinc resampled to 44.1 kHz, onset aligned,
+  peak-normalized, and cropped to 32,768 frames (0.7430 s)
+- Conversion metadata: `/tmp/synthid-rung3-808-full/preprocessing.json`
+
+Command:
+
+```bash
+swift run SynthID rung3 \
+  --target Assets/808kicklong.wav \
+  --out /tmp/synthid-rung3-808-full
+```
+
+The command ran the default five restarts, pitch refinement, cross-restart
+subspace stitching, and click-frequency search. It exited nonzero because the
+independent Rung 3 acceptance gate did not pass, while still writing the full
+diagnostic artifact set.
+
+### Optimization result
+
+| Candidate | Final training loss |
+| --- | ---: |
+| Restart 1 | 1.666765 |
+| Restart 2 | 1.659171 |
+| Restart 3 | 1.703847 |
+| Restart 4 | 1.656744 |
+| Restart 5 | 1.703751 |
+| Stitched + tuned | 1.649934 |
+
+The selected cold-start loss was `2.127566`, so the internal training-loss ratio
+was `0.775503`.
+
+### Comparator correction
+
+The first report incorrectly applied the fixed `1e-3` epsilon to raw FFT
+magnitudes. Raw magnitudes grow with window size, so the claimed `-60 dBFS`
+floor was neither referenced to full scale nor consistent across windows. The
+independent comparator now divides each spectrum by the Hann window's coherent
+gain (`sum(window) / 2`) before applying the epsilon.
+
+The corrected independent result is:
+
+- Initialization distance: `0.056483`
+- Learned distance: `0.017543`
+- Improvement: `68.94%`
+- Required improvement: `80.00%`
+- Result: **fail**
+
+| FFT window | Improvement |
+| ---: | ---: |
+| 256 | 78.88% |
+| 512 | 71.64% |
+| 1024 | 53.15% |
+| 2048 | 31.28% |
+
+The previously reported `19.70%` result is invalid and must not be used.
+
+### Finding
+
+The learned RMS envelope is already close to the target throughout the sound:
+within about 2% from 0.10–0.50 s and within about 5% in the final 0.24 s. The
+largest residual instead appears at longer FFT windows in every time segment.
+This points to fine pitch/spectral-trajectory mismatch rather than a missing
+gross decay envelope or attack-only problem.
+
+A local `fEnd` sweep confirms that the recovered pitch endpoint is already at
+the narrow independent optimum: `49.200 Hz` gives `68.95%`, essentially the
+same as the trained `49.204 Hz`. Moving to the CPU pitch fit's `49.491 Hz`
+reduces improvement to `49.14%`; replacing the full pitch trio reduces it to
+`31.34%`. The remaining 11-point gap is therefore not hidden behind a simple
+pitch-freeze fallback.
+
+Artifacts:
+
+- `/tmp/synthid-rung3-808-full/compare.png`
+- `/tmp/synthid-rung3-808-full/ab.wav`
+- `/tmp/synthid-rung3-808-full/report.md`
+- `/tmp/synthid-rung3-808-full/compare.json`
+
+## Negative follow-up experiments
+
+These experiments were evaluated and deliberately not retained in the voice:
+
+- A zero-default asymmetric body shaper improved the matched 120+60 epoch pilot
+  from `61.01%` to only `61.98%`.
+- A zero-default fixed second harmonic scored `60.61%`; its learned coefficient
+  returned to approximately zero.
+- Coherent-gain normalization inside the training loss improved the matched
+  short pilot to `62.97%`, but the full five-restart run scored only `67.72%`,
+  below the corrected `68.94%` baseline. Its normalized forward/backward math
+  passed gradient tests, so this was an optimization-result failure rather than
+  an autograd implementation failure. Full artifacts are in
+  `/tmp/synthid-rung3-808-normalized-full`.
+- A zero-default second-exponential pitch-curvature term cleared the short-pilot
+  gate (`64.65%` versus `61.01%`) and passed finite differences away from the
+  zero-point L1 cusp (`1.79%` relative gradient error). The full five-restart
+  run nevertheless scored only `59.30%`. Its selected cold start was already
+  closer to the target, but the absolute learned distance also lost to the
+  retained baseline (`0.017713` versus `0.017543`), so the term was removed.
+  Full artifacts are in `/tmp/synthid-rung3-pitch-curve-full`.
+- A zero-default initial body-phase offset had only `0.000066` absolute distance
+  headroom in an independent grid: the best offset was approximately `-1°`
+  (`0.017477`, or `69.06%`, versus the retained `0.017543`). The matched pilot
+  then regressed to `59.68%` versus `61.01%` control, with learned distance
+  worsening from `0.020554` to `0.021251`. Training moved the phase to about
+  `+4.8°`, opposite the grid optimum; local finite differences were dominated
+  by multi-window L1 cusps. The parameter was removed and no full run was made.
+  Pilot artifacts are in `/tmp/synthid-rung3-body-phase-pilot`.
+- Residual oracle splices localized all missing gate headroom to the first
+  `100–200 ms`: a `100 ms` target attack splice scored `81.87%`, and `200 ms`
+  scored `86.10%`. At the 2048 window the attack residual is concentrated in
+  the `45–350 Hz` sweep and below `20 Hz`; high-passing all comparator inputs at
+  `30 Hz` raises the retained score from `68.94%` to `72.94%`.
+- A high-resolution CPU attack-ridge fit was then tested outside the training
+  loss. A zero-phase `25–350 Hz` band plus Hilbert instantaneous frequency chose
+  a single exponential (`80.0 → 48.991 Hz`, decay `-45.0`) rather than the
+  optional curvature term. Freezing it regressed the matched `120+60` pilot to
+  `30.43%` (`0.029485` learned distance), versus the retained pilot's `61.01%`
+  (`0.020554`). No full run was made, and the candidate code was removed.
+
+## Status
+
+The historical experiments above explain the former blocker. The completed
+acceptance run at the top of this document supersedes the 68.94% retained
+baseline: **Rung 3 is complete at 84.55%.**

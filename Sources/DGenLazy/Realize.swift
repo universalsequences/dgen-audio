@@ -41,7 +41,13 @@ public class CLazyRuntime: LazyRuntime {
     private let memorySize: Int
     private let outputsSize: Int
 
-    public init(kernels: [CompiledKernel], cellAllocations: CellAllocations, memorySize: Int, frameCount: Int) throws {
+    public init(
+        kernels: [CompiledKernel],
+        cellAllocations: CellAllocations,
+        memorySize: Int,
+        frameCount: Int,
+        defaultHostSampleRate: Float
+    ) throws {
         self.cellAllocations = cellAllocations
         self.memorySize = max(memorySize, 1024)
         self.outputsSize = frameCount
@@ -51,7 +57,8 @@ public class CLazyRuntime: LazyRuntime {
         self.kernel = CCompiledKernel(
             source: combinedSource,
             cellAllocations: cellAllocations,
-            memorySize: self.memorySize
+            memorySize: self.memorySize,
+            defaultHostSampleRate: defaultHostSampleRate
         )
 
         self.memory = .allocate(capacity: self.memorySize)
@@ -192,7 +199,8 @@ extension LazyGraph {
                 kernels: result.kernels,
                 cellAllocations: result.cellAllocations,
                 memorySize: result.totalMemorySlots,
-                frameCount: frameCount
+                frameCount: frameCount,
+                defaultHostSampleRate: result.graph.sampleRate
             )
         }
     }

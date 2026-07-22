@@ -1,0 +1,221 @@
+{
+  "eliteCount" : 8,
+  "generations" : [
+    {
+      "bestLoss" : 2.023981,
+      "eliteLoss" : 4.953229,
+      "generation" : 0,
+      "meanStandardDeviation" : 0.228315
+    },
+    {
+      "bestLoss" : 1.9114348,
+      "eliteLoss" : 3.1540394,
+      "generation" : 1,
+      "meanStandardDeviation" : 0.19011174
+    },
+    {
+      "bestLoss" : 1.9114348,
+      "eliteLoss" : 2.5789268,
+      "generation" : 2,
+      "meanStandardDeviation" : 0.15664293
+    },
+    {
+      "bestLoss" : 1.4019431,
+      "eliteLoss" : 2.078467,
+      "generation" : 3,
+      "meanStandardDeviation" : 0.1325738
+    },
+    {
+      "bestLoss" : 1.4019431,
+      "eliteLoss" : 2.1059456,
+      "generation" : 4,
+      "meanStandardDeviation" : 0.12843102
+    },
+    {
+      "bestLoss" : 1.3406062,
+      "eliteLoss" : 1.6510358,
+      "generation" : 5,
+      "meanStandardDeviation" : 0.11098722
+    },
+    {
+      "bestLoss" : 1.3205824,
+      "eliteLoss" : 1.5579555,
+      "generation" : 6,
+      "meanStandardDeviation" : 0.08962535
+    },
+    {
+      "bestLoss" : 1.2590771,
+      "eliteLoss" : 1.4365965,
+      "generation" : 7,
+      "meanStandardDeviation" : 0.07121029
+    },
+    {
+      "bestLoss" : 1.0566119,
+      "eliteLoss" : 1.3128563,
+      "generation" : 8,
+      "meanStandardDeviation" : 0.06121476
+    },
+    {
+      "bestLoss" : 0.99453855,
+      "eliteLoss" : 1.2934656,
+      "generation" : 9,
+      "meanStandardDeviation" : 0.053853814
+    },
+    {
+      "bestLoss" : 0.84407556,
+      "eliteLoss" : 1.0752193,
+      "generation" : 10,
+      "meanStandardDeviation" : 0.042411078
+    },
+    {
+      "bestLoss" : 0.84407556,
+      "eliteLoss" : 1.116865,
+      "generation" : 11,
+      "meanStandardDeviation" : 0.036098268
+    },
+    {
+      "bestLoss" : 0.791611,
+      "eliteLoss" : 1.0272869,
+      "generation" : 12,
+      "meanStandardDeviation" : 0.034958504
+    },
+    {
+      "bestLoss" : 0.7905555,
+      "eliteLoss" : 1.0395802,
+      "generation" : 13,
+      "meanStandardDeviation" : 0.032044727
+    },
+    {
+      "bestLoss" : 0.7707972,
+      "eliteLoss" : 1.0063663,
+      "generation" : 14,
+      "meanStandardDeviation" : 0.02955339
+    },
+    {
+      "bestLoss" : 0.7707972,
+      "eliteLoss" : 0.96778095,
+      "generation" : 15,
+      "meanStandardDeviation" : 0.029118879
+    },
+    {
+      "bestLoss" : 0.6058525,
+      "eliteLoss" : 0.8765489,
+      "generation" : 16,
+      "meanStandardDeviation" : 0.029213727
+    },
+    {
+      "bestLoss" : 0.6058525,
+      "eliteLoss" : 1.0099759,
+      "generation" : 17,
+      "meanStandardDeviation" : 0.028599797
+    },
+    {
+      "bestLoss" : 0.6058525,
+      "eliteLoss" : 1.0216479,
+      "generation" : 18,
+      "meanStandardDeviation" : 0.028251506
+    },
+    {
+      "bestLoss" : 0.6058525,
+      "eliteLoss" : 0.97779477,
+      "generation" : 19,
+      "meanStandardDeviation" : 0.02756854
+    },
+    {
+      "bestLoss" : 0.6058525,
+      "eliteLoss" : 1.0239345,
+      "generation" : 20,
+      "meanStandardDeviation" : 0.028833829
+    },
+    {
+      "bestLoss" : 0.6058525,
+      "eliteLoss" : 0.9953915,
+      "generation" : 21,
+      "meanStandardDeviation" : 0.029262563
+    },
+    {
+      "bestLoss" : 0.59484637,
+      "eliteLoss" : 0.95831203,
+      "generation" : 22,
+      "meanStandardDeviation" : 0.028226636
+    },
+    {
+      "bestLoss" : 0.59484637,
+      "eliteLoss" : 1.012107,
+      "generation" : 23,
+      "meanStandardDeviation" : 0.028446056
+    },
+    {
+      "bestLoss" : 0.59484637,
+      "eliteLoss" : 0.86232287,
+      "generation" : 24,
+      "meanStandardDeviation" : 0.029697923
+    },
+    {
+      "bestLoss" : 0.59484637,
+      "eliteLoss" : 1.0439043,
+      "generation" : 25,
+      "meanStandardDeviation" : 0.029959112
+    },
+    {
+      "bestLoss" : 0.59484637,
+      "eliteLoss" : 0.94027704,
+      "generation" : 26,
+      "meanStandardDeviation" : 0.027514145
+    },
+    {
+      "bestLoss" : 0.59484637,
+      "eliteLoss" : 0.9249846,
+      "generation" : 27,
+      "meanStandardDeviation" : 0.028110867
+    },
+    {
+      "bestLoss" : 0.59484637,
+      "eliteLoss" : 1.007953,
+      "generation" : 28,
+      "meanStandardDeviation" : 0.028448304
+    },
+    {
+      "bestLoss" : 0.59484637,
+      "eliteLoss" : 1.0064007,
+      "generation" : 29,
+      "meanStandardDeviation" : 0.029236823
+    }
+  ],
+  "loss" : 0.59484637,
+  "params" : {
+    "ampCurve" : 0,
+    "ampDecay" : -7,
+    "attackTime" : 0.007597531,
+    "bodyAmp" : 0.75,
+    "bodyAsymmetry" : 0,
+    "bodyHarmonic" : 0,
+    "brightnessDecay" : 1,
+    "clickAmp" : 0.2,
+    "clickDecay" : -400,
+    "clickFreq" : 1400,
+    "decayTime" : 0.13180618,
+    "drive" : 1.5638478,
+    "f0" : 32.7,
+    "fAmt" : 72.480316,
+    "fBase" : 97.31706,
+    "fDecay" : 0.02052029,
+    "fEnd" : 110,
+    "fStart" : 110,
+    "harmonicCorrections" : {
+
+    },
+    "noiseAmp" : 0.08,
+    "noiseCutoff" : 2800,
+    "noiseDecay" : -140,
+    "noteOff" : 1.55,
+    "outGain" : 0.45919383,
+    "pitchDecay" : -1,
+    "pw" : 0.42963645,
+    "releaseTime" : 0.02343398,
+    "res" : 3.4479039,
+    "shape" : 0.77059656,
+    "sustain" : 0.42583594
+  },
+  "population" : 48
+}

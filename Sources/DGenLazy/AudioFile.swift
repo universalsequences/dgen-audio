@@ -158,18 +158,30 @@ public struct AudioFile {
 
         switch audioFormat {
         case 1:  // PCM integer
-            guard bitsPerSample == 16 else {
-                throw AudioFileError.unsupportedFormat("PCM \(bitsPerSample)-bit (only 16-bit supported)")
+            guard bitsPerSample == 16 || bitsPerSample == 24 else {
+                throw AudioFileError.unsupportedFormat("PCM \(bitsPerSample)-bit (only 16-bit and 24-bit supported)")
             }
-            let bytesPerSample = 2
+            let bytesPerSample = Int(bitsPerSample / 8)
             let totalSamples = dataSize / bytesPerSample
             let framesCount = totalSamples / channels
             samples = [Float](repeating: 0, count: framesCount * channels)
 
             data.withUnsafeBytes { buf in
                 for i in 0..<totalSamples {
-                    let raw = buf.load(fromByteOffset: dataOffset + i * 2, as: Int16.self).littleEndian
-                    samples[i] = Float(raw) / 32768.0
+                    let byteOffset = dataOffset + i * bytesPerSample
+                    if bitsPerSample == 16 {
+                        let raw = buf.load(fromByteOffset: byteOffset, as: Int16.self).littleEndian
+                        samples[i] = Float(raw) / 32768.0
+                    } else {
+                        let b0 = Int32(buf[byteOffset])
+                        let b1 = Int32(buf[byteOffset + 1]) << 8
+                        let b2 = Int32(buf[byteOffset + 2]) << 16
+                        var raw = b0 | b1 | b2
+                        if (raw & 0x0080_0000) != 0 {
+                            raw |= ~0x00FF_FFFF
+                        }
+                        samples[i] = Float(raw) / 8_388_608.0
+                    }
                 }
             }
 

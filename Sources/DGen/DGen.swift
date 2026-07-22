@@ -48,6 +48,11 @@ open class Graph {
     public var gradCarryCells: [CellID: CellID] = [:]
     public var tensorGradCells: [NodeID: CellID] = [:]
 
+    /// Gradient carry cells that mirror a tensor-registered history cell (width W).
+    /// memoryRead/memoryWrite of these cells use per-element tensor addressing;
+    /// all vector-width BPTT branches gate on this set so scalar graphs are untouched.
+    public var tensorGradCarryCells: Set<CellID> = []
+
     /// Track frame-aware tensor allocations: cellId -> (tensorSize, frameCount)
     /// Used for tensors with outbound dependencies that need tensorSize * frameCount cells.
     public var frameAwareCells: [CellID: (tensorSize: Int, frameCount: Int)] = [:]
@@ -55,6 +60,10 @@ open class Graph {
     /// Cells that persist data across frame iterations (circular buffers, ring buffers, etc.)
     /// These must not be shared with other cells during buffer reuse optimization.
     public var persistentCells: Set<CellID> = []
+
+    /// Host-addressable parameter cells.
+    /// These must keep unique physical slots even when their compile-time lifetimes do not overlap.
+    public var parameterCells: Set<CellID> = []
 
     /// Nodes that should have their tensor results materialized in memory (for realize())
     public var materializeNodes: Set<NodeID> = []
@@ -111,6 +120,10 @@ open class Graph {
         let id = next
         next += 1
         nodes[id] = Node(id: id, op: op, inputs: ins)
+
+        if case .param(let cellId) = op {
+            parameterCells.insert(cellId)
+        }
 
         // If shape is explicitly provided, use it. Otherwise, infer from inputs.
         if let explicitShape = shape {

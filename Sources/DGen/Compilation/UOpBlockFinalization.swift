@@ -18,7 +18,8 @@ extension UOpBlockFinalization {
     backend: Backend,
     bodyFrameOrder: FrameOrder,
     bodyVectorWidth: Int,
-    hasOwnFrameLoop: Bool
+    hasOwnFrameLoop: Bool,
+    context: IRContext? = nil
   ) -> BlockUOps {
     let statefulTensorDecision = StatefulTensorParallelPolicy.decide(
       block: block,
@@ -43,11 +44,19 @@ extension UOpBlockFinalization {
 
     if backend == .c {
       upgradeElementLoopsToSIMD(&finalOps)
+      if let context {
+        upgradeRegionElementLoopsToSIMD(
+          &finalOps,
+          globalVarIds: Set(context.globals),
+          makeVar: { context.useVariable(src: nil, trackInValues: false) }
+        )
+      }
     }
 
     let dispatchMode = computeDispatchMode(
       block: block,
       graph: graph,
+      backend: backend,
       threadCountScale: threadCountScale,
       statefulTensorDecision: statefulTensorDecision,
       hasOwnFrameLoop: hasOwnFrameLoop,
@@ -122,13 +131,21 @@ extension UOpBlockFinalization {
   private static func computeDispatchMode(
     block: Block,
     graph: Graph,
+    backend: Backend,
     threadCountScale: Int?,
     statefulTensorDecision: StatefulTensorParallelPolicy.Decision,
     hasOwnFrameLoop: Bool,
     frameOrder: FrameOrder,
     ops: [UOp]
   ) -> DispatchMode {
-    if hasOwnFrameLoop { return .selfManaged }
+    if hasOwnFrameLoop {
+      // Lane-parallel detached BPTT backward: same decision block emission
+      // used to bind the region element index to the thread id.
+      let bpttLane = StatefulTensorParallelPolicy.decideDetachedBPTTBackward(
+        block: block, graph: graph, backend: backend)
+      if bpttLane.enabled { return .selfManagedThreads(bpttLane.tensorSize) }
+      return .selfManaged
+    }
 
     // GEMM ops override dispatch: gemm/gemmChunkPartials use 2D threadgroup grids,
     // gemmSmall uses per-frame element-parallel dispatch.
