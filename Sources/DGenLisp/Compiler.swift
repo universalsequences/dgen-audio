@@ -51,24 +51,11 @@ func compilePatch(
     let dylibPath = "\(options.outputDir)/\(options.name).dylib"
 
     let compile = Process()
-    compile.launchPath = "/usr/bin/clang"
-    let arguments = [
-        "-Ofast",
-        "-mcpu=native",
-        "-flto=thin",
-        "-ffast-math",
-        "-fno-math-errno",
-        "-fno-trapping-math",
-        "-ffp-contract=fast",
-        "-fvectorize",
-        "-fslp-vectorize",
-        "-funroll-loops",
-        "-fPIC", "-shared",
-        "-framework", "Accelerate",
-        "-std=c11",
-        "-x", "c",
-        "-o", dylibPath, cFilePath,
-    ]
+    let invocation = try DGenToolchainPolicy.compileInvocation(
+        outputPath: dylibPath,
+        sourcePath: cFilePath)
+    compile.launchPath = invocation.executable
+    let arguments = invocation.arguments
 
     let errorPipe = Pipe()
     compile.standardError = errorPipe

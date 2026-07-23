@@ -66,8 +66,8 @@ final class WavetableTensorTests: XCTestCase {
             )
         )
 
-        XCTAssertEqual(manifest.version, 2)
-        XCTAssertEqual(manifest.processAbi, "dgen-c-v2-host-sample-rate")
+        XCTAssertEqual(manifest.version, 3)
+        XCTAssertEqual(manifest.processAbi, "dgen-host-abi-v1")
         XCTAssertEqual(manifest.tensors.count, 1)
         XCTAssertEqual(manifest.tensors[0].name, "waves")
         XCTAssertEqual(manifest.tensors[0].shape, [2, 4])

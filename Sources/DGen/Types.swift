@@ -1,10 +1,28 @@
 public typealias TensorID = Int
 public typealias Shape = [Int]
 
+@frozen
+public struct DGenProcessContextV1 {
+  public var abiVersion: UInt32
+  public var structSize: UInt32
+  public var sampleRate: Float
+  public var reserved: UInt32
+
+  public init(sampleRate: Float) {
+    abiVersion = 1
+    structSize = UInt32(MemoryLayout<Self>.size)
+    self.sampleRate = sampleRate
+    reserved = 0
+  }
+}
+
 public typealias CProcessFunction = @convention(c) (
+  UnsafePointer<UnsafePointer<Float>?>?,
   UnsafePointer<UnsafeMutablePointer<Float>?>?,
-  UnsafePointer<UnsafeMutablePointer<Float>?>?, Int32, UnsafeMutableRawPointer?,
-  UnsafeMutableRawPointer?, Float
+  UInt32,
+  UnsafeMutableRawPointer?,
+  UnsafeRawPointer?,
+  UnsafeRawPointer?
 ) -> Void
 
 public enum ValueShape: Equatable {

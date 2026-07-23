@@ -146,8 +146,8 @@ public protocol CompiledKernelRuntime {
 
 public class CCompiledKernel: CompiledKernelRuntime {
   public let source: String
-  public let symbolName: String = "process"
-  public let setParamValueSymbolName: String = "setParamValue"
+  public let symbolName: String = "dgen_process_v1"
+  public let setParamValueSymbolName: String = "dgen_set_param_value_v1"
 
   var outputBuffer: [Float] = []
   var scratchBuffer: [Float] = []
@@ -174,14 +174,6 @@ public class CCompiledKernel: CompiledKernelRuntime {
   private let defaultHostSampleRate: Float
 
   private static let clangPath = "/usr/bin/clang"
-  private static let cachedCompileArgumentTemplate = [
-    "-Ofast", "-mcpu=native", "-flto=thin",
-    "-ffast-math", "-fno-math-errno", "-fno-trapping-math", "-ffp-contract=fast",
-    "-fvectorize", "-fslp-vectorize", "-funroll-loops",
-    "-fPIC", "-shared",
-    "-framework", "Accelerate",
-    "-std=c11", "-x", "c",
-  ]
   private static let cachedCompilerVersion: String = {
     let process = Process()
     process.launchPath = clangPath
@@ -203,15 +195,14 @@ public class CCompiledKernel: CompiledKernelRuntime {
   }()
 
   private static func cachedCompilerSignature() -> String {
-    [
+    let placeholder = DGenToolchainPolicy.systemDevelopmentInvocation(
+      outputPath: "<output>",
+      sourcePath: "<source>")
+    return [
       "clang=\(clangPath)",
       "version=\(cachedCompilerVersion)",
-      "args=\(cachedCompileArgumentTemplate.joined(separator: "\n"))",
+      placeholder.policySignature,
     ].joined(separator: "\n")
-  }
-
-  private static func cachedCompileArguments(outputPath: String, sourcePath: String) -> [String] {
-    cachedCompileArgumentTemplate + ["-o", outputPath, sourcePath]
   }
 
   public init(
@@ -238,37 +229,11 @@ public class CCompiledKernel: CompiledKernelRuntime {
     try source.write(to: cFile, atomically: true, encoding: .utf8)
 
     let compile = Process()
-    compile.launchPath = "/usr/bin/clang"
-    let arguments = [
-      // Force arm64 target so codegen doesn't follow the inherited
-      // posix_spawn arch preference (which can land on x86_64 when the
-      // app is launched from Finder).
-      "-arch", "arm64",
-      // Optimization and CPU tuning. -mcpu=apple-m1 (not =native): when
-      // clang is cross-compiling (x86_64 slice → arm64 codegen), `native`
-      // can't be resolved against the host CPU. apple-m1 is forward-
-      // compatible — M2/M3/M4 are supersets.
-      "-Ofast",
-      "-mcpu=apple-m1",
-      "-flto=thin",
-      // Floating point fast math (ok for DSP if acceptable)
-      "-ffast-math",
-      "-fno-math-errno",
-      "-fno-trapping-math",
-      "-ffp-contract=fast",
-      // Vectorizer hints (mostly enabled by -Ofast, but explicit here)
-      "-fvectorize",
-      "-fslp-vectorize",
-      "-funroll-loops",
-      // Dylib and platform flags
-      "-fPIC", "-shared",
-      "-framework", "Accelerate",
-      // Language & input
-      "-std=c11",  // Ensure C11 standard
-      "-x", "c",  // Explicitly treat as C source
-      // Output
-      "-o", dylibFile.path, cFile.path,
-    ]
+    let invocation = try DGenToolchainPolicy.compileInvocation(
+      outputPath: dylibFile.path,
+      sourcePath: cFile.path)
+    compile.launchPath = invocation.executable
+    let arguments = invocation.arguments
 
     print("clang \(arguments.joined(separator: " "))")
 
@@ -444,9 +409,11 @@ public class CCompiledKernel: CompiledKernelRuntime {
     // Compile with clang
     let clangStart = CFAbsoluteTimeGetCurrent()
     let compile = Process()
-    compile.launchPath = Self.clangPath
-    let arguments = Self.cachedCompileArguments(outputPath: dylibFile.path, sourcePath: cFile.path)
-    compile.arguments = arguments
+    let invocation = try DGenToolchainPolicy.compileInvocation(
+      outputPath: dylibFile.path,
+      sourcePath: cFile.path)
+    compile.launchPath = invocation.executable
+    compile.arguments = invocation.arguments
 
     let errorPipe = Pipe()
     compile.standardError = errorPipe
@@ -769,18 +736,21 @@ public class CCompiledKernel: CompiledKernelRuntime {
 
     // Create channel arrays for audiograph signature compatibility
     let outputChannels: [UnsafeMutablePointer<Float>?] = [outputs]
-    let inputChannels: [UnsafeMutablePointer<Float>?] = [UnsafeMutablePointer(mutating: inputs)]
+    let inputChannels: [UnsafePointer<Float>?] = [inputs]
 
     // TODO - actually pass real buffers
     outputChannels.withUnsafeBufferPointer { outPtr in
       inputChannels.withUnsafeBufferPointer { inPtr in
-        process(
-          inPtr.baseAddress,
-          outPtr.baseAddress,
-          Int32(frameCount),
-          memory,
-          memory,
-          hostSampleRate)
+        var context = DGenProcessContextV1(sampleRate: hostSampleRate)
+        withUnsafePointer(to: &context) { contextPointer in
+          process(
+            inPtr.baseAddress,
+            outPtr.baseAddress,
+            UInt32(frameCount),
+            memory,
+            UnsafeRawPointer(contextPointer),
+            nil as UnsafeRawPointer?)
+        }
       }
     }
   }

@@ -270,20 +270,14 @@ public class CRenderer: Renderer {
     inScaledFrameLoop = false  // Reset scaled frame loop tracking
     var code: [String] = []
 
-    // C includes and function signature
+    // The generated translation unit includes only DGen's versioned runtime
+    // contract. That header, in turn, may include selected Clang resource
+    // headers such as arm_neon.h and stdint.h; no Apple SDK header is allowed.
     code.append(
       """
-      #include <arm_neon.h>
-      #include <stdint.h>
-      #include <stdio.h>
-      #include <string.h>
-      #include <math.h>
-      #include <Accelerate/Accelerate.h>
-      #include <mach/mach_time.h>
+      #include "dgen_runtime.h"
 
-      // Enable profiling only when DGEN_PROFILE is defined by build flags
-
-      float32x4_t vfmodq_f32(float32x4_t a, float32x4_t b) {
+      static inline float32x4_t vfmodq_f32(float32x4_t a, float32x4_t b) {
         // a - floor(a / b) * b  (faster and correct for positive ranges)
         float32x4_t q = vdivq_f32(a, b);
         float32x4_t q_floor = vrndmq_f32(q);  // floor
@@ -326,24 +320,15 @@ public class CRenderer: Renderer {
           return boolmask_to_float(m);
       }
 
-      // Replace NaN/Inf with 0 so a single bad node can't poison the whole graph.
-      static inline float sanitize_out_f32(float v) {
-          return isfinite(v) ? v : 0.0f;
-      }
-      static inline float32x4_t sanitize_out_f32x4(float32x4_t v) {
-          uint32x4_t finite = vcltq_f32(vabsq_f32(v), vdupq_n_f32(INFINITY));
-          return vbslq_f32(finite, v, vdupq_n_f32(0.0f));
-      }
-
       """)
 
     // Declare globals
     let sortedGlobals = ctx.globals.sorted()
-    code.append("const int VOICE_COUNT = \(voiceCount);")
-    code.append("const int SCRATCH_STRIDE = \(max(512, graph.maxFrameCount));")
+    code.append(
+      "enum { VOICE_COUNT = \(voiceCount), SCRATCH_STRIDE = \(max(512, graph.maxFrameCount)) };")
     for varId in sortedGlobals {
       code.append(
-        "float t\(varId)_g[VOICE_COUNT * SCRATCH_STRIDE] __attribute__((aligned(64))) = {0};"
+        "static float t\(varId)_g[VOICE_COUNT * SCRATCH_STRIDE] __attribute__((aligned(64))) = {0};"
       )
     }
 
@@ -355,18 +340,23 @@ public class CRenderer: Renderer {
     code.append(
       """
 
-      void setParamValue(int cellId, float val) {
+      void dgen_set_param_value_v1(int32_t cell_id, float value) {
+        (void)cell_id;
+        (void)value;
         //memory[cellId] = val;
       }
 
       """)
 
     code.append(
-      "void process(float * restrict const *in, float * restrict const *out, int nframes, void * restrict state, void * restrict buffers, float hostSampleRate) {"
+      "void dgen_process_v1(const float * const *in, float * const *out, uint32_t nframes, void *state, const DGenProcessContextV1 *context, const DGenHostServicesV1 *host) {"
     )
 
     // Use audiograph parameters directly - no mapping needed
-    code.append("  int frameCount = nframes;  // Use audiograph frame count parameter")
+    code.append("  int frameCount = (int)nframes;")
+    code.append(
+      "  float hostSampleRate = (context != NULL && context->abi_version == DGEN_ABI_VERSION_V1 && context->struct_size >= sizeof(DGenProcessContextV1)) ? context->sample_rate : 0.0f;"
+    )
     code.append("  int i = 0;")
 
     loadedGlobal = [:]
@@ -635,7 +625,7 @@ public class CRenderer: Renderer {
       return emitAssign(uop, expr, ctx)
 
     case .abs(let a):
-      let expr = uop.isSimd ? "vabsq_f32(\(g(a)))" : "fabs(\(g(a)))"
+      let expr = uop.isSimd ? "vabsq_f32(\(g(a)))" : "fabsf(\(g(a)))"
       return emitAssign(uop, expr, ctx)
 
     case .sign(let a):
@@ -734,7 +724,7 @@ public class CRenderer: Renderer {
         if isIntTypedOffset(offset) {
           return emitAssign(uop, "memory[\(base) + \(g(offset))]", ctx)
         }
-        let safeOffset = "(isfinite((int) \(g(offset))) ? (int) \(g(offset)) : 0)"
+        let safeOffset = "(isfinite(\(g(offset))) ? (int) \(g(offset)) : 0)"
         return emitAssign(uop, "memory[\(base) + \(safeOffset)]", ctx)
       }
 
@@ -1027,10 +1017,10 @@ public class CRenderer: Renderer {
       if uop.isSimd {
         if frameIndexOverride != nil {
           let idx = "(int)(\(idxExpr))"
-          return "out[\(channel)][\(idx)] = sanitize_out_f32(\(g(val)));"
+          return "out[\(channel)][\(idx)] = dgen_sanitize_f32(\(g(val)));"
         } else {
           let ptr = "out[\(channel)] + i"
-          return "vst1q_f32(\(ptr), sanitize_out_f32x4(\(g(val))));"
+          return "vst1q_f32(\(ptr), dgen_sanitize_f32x4(\(g(val))));"
         }
       } else {
         let baseIdx = "i"
@@ -1039,7 +1029,7 @@ public class CRenderer: Renderer {
           ?? (currentThreadCountScale == nil
             ? baseIdx : "(\(baseIdx) / \(currentThreadCountScale!))")
         let addr = "out[\(channel)][\(idx)]"
-        return "\(addr) = sanitize_out_f32(\(g(val)));"
+        return "\(addr) = dgen_sanitize_f32(\(g(val)));"
       }
 
     case .beginLoop(let iters, let step):
@@ -1235,44 +1225,58 @@ public class CRenderer: Renderer {
       let ringReCell, let ringImCell,
       let irReCell, let irImCell,
       let reOutCell, let imOutCell):
-      // Zero the output, then K calls to vDSP_zvma: Y = X[k] * H[k] + Y.
-      // Each partition is a heavily NEON-optimized N-element complex MAC.
+      // Zero the output, then K host calls that each process a complete
+      // N-element complex multiply-accumulate buffer.
       return """
         {
           int _dgen_p = (int)memory[\(partitionIdxCell)];
           memset(&memory[\(reOutCell)], 0, \(N) * sizeof(float));
           memset(&memory[\(imOutCell)], 0, \(N) * sizeof(float));
-          DSPSplitComplex _dgen_Y = { .realp = &memory[\(reOutCell)], .imagp = &memory[\(imOutCell)] };
-          for (int _dgen_k = 0; _dgen_k < \(K); _dgen_k++) {
-            int _dgen_ring_off = (_dgen_p + \(K) - _dgen_k) * \(N);
-            DSPSplitComplex _dgen_X = {
-              .realp = &memory[\(ringReCell) + _dgen_ring_off],
-              .imagp = &memory[\(ringImCell) + _dgen_ring_off]
-            };
-            int _dgen_ir_off = _dgen_k * \(N);
-            DSPSplitComplex _dgen_H = {
-              .realp = &memory[\(irReCell) + _dgen_ir_off],
-              .imagp = &memory[\(irImCell) + _dgen_ir_off]
-            };
-            vDSP_zvma(&_dgen_X, 1, &_dgen_H, 1, &_dgen_Y, 1, &_dgen_Y, 1, \(N));
+          if (host != NULL &&
+              host->abi_version == DGEN_ABI_VERSION_V1 &&
+              host->struct_size >= sizeof(DGenHostServicesV1) &&
+              host->complex_multiply_accumulate_fn != NULL) {
+            for (int _dgen_k = 0; _dgen_k < \(K); _dgen_k++) {
+              int _dgen_ring_off = (_dgen_p + \(K) - _dgen_k) * \(N);
+              int _dgen_ir_off = _dgen_k * \(N);
+              host->complex_multiply_accumulate_fn(
+                &memory[\(ringReCell) + _dgen_ring_off],
+                &memory[\(ringImCell) + _dgen_ring_off],
+                &memory[\(irReCell) + _dgen_ir_off],
+                &memory[\(irImCell) + _dgen_ir_off],
+                &memory[\(reOutCell)],
+                &memory[\(imOutCell)],
+                \(N)u);
+            }
           }
         }
         """
 
     case .acceleratedFFTCall(let log2N, let reCell, let imCell, let inverse):
-      let direction = inverse ? "kFFTDirection_Inverse" : "kFFTDirection_Forward"
+      let operation = inverse ? "fft_inverse_fn" : "fft_forward_fn"
       // Lazy-init a per-log2N FFTSetup using a static — persists across frames,
       // single-threaded audio callback means no locking needed.
       // FFT_CALL_USES: re=\(reCell), im=\(imCell) — keeps cell refs visible to
       // textual search tools without affecting generated semantics.
       return """
         {
-          static FFTSetup _dgen_fft_setup_\(log2N) = NULL;
-          if (_dgen_fft_setup_\(log2N) == NULL) {
-            _dgen_fft_setup_\(log2N) = vDSP_create_fftsetup(\(log2N), kFFTRadix2);
+          static DGenFFTSetupV1 _dgen_fft_setup_\(log2N) = NULL;
+          if (host != NULL &&
+              host->abi_version == DGEN_ABI_VERSION_V1 &&
+              host->struct_size >= sizeof(DGenHostServicesV1) &&
+              host->fft_setup_create_fn != NULL &&
+              host->\(operation) != NULL) {
+            if (_dgen_fft_setup_\(log2N) == NULL) {
+              _dgen_fft_setup_\(log2N) = host->fft_setup_create_fn(\(log2N)u);
+            }
+            if (_dgen_fft_setup_\(log2N) != NULL) {
+              host->\(operation)(
+                _dgen_fft_setup_\(log2N),
+                &memory[\(reCell)],
+                &memory[\(imCell)],
+                \(log2N)u);
+            }
           }
-          DSPSplitComplex _dgen_sc = { .realp = &memory[\(reCell)], .imagp = &memory[\(imCell)] };
-          vDSP_fft_zip(_dgen_fft_setup_\(log2N), &_dgen_sc, 1, \(log2N), \(direction));
         }
         """
 

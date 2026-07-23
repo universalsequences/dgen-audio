@@ -316,8 +316,8 @@ func generateManifest(
     )
 
     return PatchManifest(
-        version: 2,
-        processAbi: "dgen-c-v2-host-sample-rate",
+        version: 3,
+        processAbi: "dgen-host-abi-v1",
         dylib: "\(options.name).dylib",
         cSourcePath: compilerResult.cSourcePath,
         sampleRate: options.sampleRate,
