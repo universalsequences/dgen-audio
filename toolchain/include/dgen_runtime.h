@@ -87,13 +87,26 @@ static inline float32x4_t dgen_sanitize_f32x4(float32x4_t value) {
 /*
  * Four-lane math names are part of the renderer/runtime-header boundary, not
  * the host-service ABI. These clean-room NEON polynomials use standard range
- * reduction and polynomial evaluation identities. Their measured domains,
- * accuracy, and speed are recorded in docs/vector-math-lowering.md.
+ * reduction and polynomial evaluation identities. Sine and cosine use a
+ * three-term Cody-Waite reduction guaranteed for float32 arguments with
+ * |x| <= 1.0e6. Beyond that range, float32 argument quantization, rather than
+ * the reduction constants, becomes the limiting source of phase accuracy.
+ * Measured domains, accuracy, and speed are recorded in
+ * docs/vector-math-lowering.md.
  */
+static inline float32x4_t dgen_reduce_two_pi_f32x4(float32x4_t x) {
+  const float32x4_t inv_two_pi = vdupq_n_f32(0x1.45f306p-3f);
+  const float32x4_t two_pi_hi = vdupq_n_f32(0x1.921fb6p+2f);
+  const float32x4_t two_pi_mid = vdupq_n_f32(-0x1.777a5cp-23f);
+  const float32x4_t two_pi_lo = vdupq_n_f32(-0x1.0p-47f);
+  float32x4_t n = vrndnq_f32(vmulq_f32(x, inv_two_pi));
+  x = vfmsq_f32(x, n, two_pi_hi);
+  x = vfmsq_f32(x, n, two_pi_mid);
+  return vfmsq_f32(x, n, two_pi_lo);
+}
+
 static inline float32x4_t dgen_poly_vsinf(float32x4_t x) {
-  const float32x4_t inv_two_pi = vdupq_n_f32(0.15915494309189535f);
-  const float32x4_t two_pi = vdupq_n_f32(6.2831853071795865f);
-  x = vsubq_f32(x, vmulq_f32(vrndnq_f32(vmulq_f32(x, inv_two_pi)), two_pi));
+  x = dgen_reduce_two_pi_f32x4(x);
   uint32x4_t over = vcgtq_f32(x, vdupq_n_f32(1.5707963267948966f));
   uint32x4_t under = vcltq_f32(x, vdupq_n_f32(-1.5707963267948966f));
   x = vbslq_f32(over, vsubq_f32(vdupq_n_f32(3.1415926535897932f), x), x);
@@ -108,9 +121,7 @@ static inline float32x4_t dgen_poly_vsinf(float32x4_t x) {
 }
 
 static inline float32x4_t dgen_poly_vcosf(float32x4_t x) {
-  const float32x4_t inv_two_pi = vdupq_n_f32(0.15915494309189535f);
-  const float32x4_t two_pi = vdupq_n_f32(6.2831853071795865f);
-  x = vsubq_f32(x, vmulq_f32(vrndnq_f32(vmulq_f32(x, inv_two_pi)), two_pi));
+  x = dgen_reduce_two_pi_f32x4(x);
   float32x4_t ax = vabsq_f32(x);
   uint32x4_t reflected = vcgtq_f32(ax, vdupq_n_f32(1.5707963267948966f));
   x = vbslq_f32(

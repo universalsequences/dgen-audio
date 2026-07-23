@@ -16,11 +16,30 @@
 
 typedef float32x4_t (*UnaryVectorFn)(float32x4_t);
 
-static inline float32x4_t dgen_poly_sin(float32x4_t x) {
+static inline float32x4_t dgen_reduce_two_pi(float32x4_t x) {
+  const float32x4_t inv_two_pi = vdupq_n_f32(0x1.45f306p-3f);
+  const float32x4_t two_pi_hi = vdupq_n_f32(0x1.921fb6p+2f);
+  const float32x4_t two_pi_mid = vdupq_n_f32(-0x1.777a5cp-23f);
+  const float32x4_t two_pi_lo = vdupq_n_f32(-0x1.0p-47f);
+  float32x4_t n = vrndnq_f32(vmulq_f32(x, inv_two_pi));
+  x = vfmsq_f32(x, n, two_pi_hi);
+  x = vfmsq_f32(x, n, two_pi_mid);
+  return vfmsq_f32(x, n, two_pi_lo);
+}
+
+/*
+ * Retained only as an in-process timing control for the range-reduction
+ * change. Shipped generated code uses dgen_reduce_two_pi.
+ */
+static inline float32x4_t dgen_reduce_two_pi_single_step(float32x4_t x) {
   const float32x4_t inv_two_pi = vdupq_n_f32(0.15915494309189535f);
   const float32x4_t two_pi = vdupq_n_f32(6.2831853071795865f);
-  x = vsubq_f32(x, vmulq_f32(vrndnq_f32(vmulq_f32(x, inv_two_pi)), two_pi));
+  return vsubq_f32(
+    x,
+    vmulq_f32(vrndnq_f32(vmulq_f32(x, inv_two_pi)), two_pi));
+}
 
+static inline float32x4_t dgen_poly_sin_reduced(float32x4_t x) {
   uint32x4_t over = vcgtq_f32(x, vdupq_n_f32(1.5707963267948966f));
   uint32x4_t under = vcltq_f32(x, vdupq_n_f32(-1.5707963267948966f));
   x = vbslq_f32(over, vsubq_f32(vdupq_n_f32(3.1415926535897932f), x), x);
@@ -35,11 +54,15 @@ static inline float32x4_t dgen_poly_sin(float32x4_t x) {
   return vfmaq_f32(x, vmulq_f32(x, x2), p);
 }
 
-static inline float32x4_t dgen_poly_cos(float32x4_t x) {
-  const float32x4_t inv_two_pi = vdupq_n_f32(0.15915494309189535f);
-  const float32x4_t two_pi = vdupq_n_f32(6.2831853071795865f);
-  x = vsubq_f32(x, vmulq_f32(vrndnq_f32(vmulq_f32(x, inv_two_pi)), two_pi));
+static inline float32x4_t dgen_poly_sin(float32x4_t x) {
+  return dgen_poly_sin_reduced(dgen_reduce_two_pi(x));
+}
 
+static inline float32x4_t dgen_poly_sin_single_step(float32x4_t x) {
+  return dgen_poly_sin_reduced(dgen_reduce_two_pi_single_step(x));
+}
+
+static inline float32x4_t dgen_poly_cos_reduced(float32x4_t x) {
   float32x4_t ax = vabsq_f32(x);
   uint32x4_t reflected = vcgtq_f32(ax, vdupq_n_f32(1.5707963267948966f));
   float32x4_t reduced = vsubq_f32(vdupq_n_f32(3.1415926535897932f), ax);
@@ -53,6 +76,14 @@ static inline float32x4_t dgen_poly_cos(float32x4_t x) {
   p = vfmaq_f32(vdupq_n_f32(-5.0e-1f), p, x2);
   float32x4_t result = vfmaq_f32(vdupq_n_f32(1.0f), x2, p);
   return vbslq_f32(reflected, vnegq_f32(result), result);
+}
+
+static inline float32x4_t dgen_poly_cos(float32x4_t x) {
+  return dgen_poly_cos_reduced(dgen_reduce_two_pi(x));
+}
+
+static inline float32x4_t dgen_poly_cos_single_step(float32x4_t x) {
+  return dgen_poly_cos_reduced(dgen_reduce_two_pi_single_step(x));
 }
 
 static inline float32x4_t dgen_poly_exp(float32x4_t x) {
@@ -128,6 +159,7 @@ static double seconds_now(void) {
 }
 
 static volatile float benchmark_sink;
+static int accuracy_failures;
 
 static double benchmark(
   UnaryVectorFn function,
@@ -183,10 +215,60 @@ static void accuracy(
   printf("accuracy,%s,max_abs,%.9g,max_ulp,%u\n", name, maximum_absolute, maximum_ulp);
 }
 
+static void trigonometric_magnitude_accuracy(
+  const char *name,
+  UnaryVectorFn candidate,
+  double (*reference)(double)) {
+  const float magnitudes[] = {
+    6.2831853071795865f,
+    1.0e2f,
+    1.0e3f,
+    1.0e4f,
+    1.0e5f,
+    1.0e6f,
+  };
+  const int count = 1 << 20;
+  for (size_t magnitude_index = 0;
+       magnitude_index < sizeof(magnitudes) / sizeof(magnitudes[0]);
+       ++magnitude_index) {
+    float magnitude = magnitudes[magnitude_index];
+    double maximum_absolute = 0.0;
+    for (int base = 0; base < count; base += 4) {
+      float lanes[4];
+      for (int lane = 0; lane < 4; ++lane) {
+        int index = base + lane;
+        double unit = (double)index / (double)(count - 1);
+        lanes[lane] = (float)(-(double)magnitude + 2.0 * (double)magnitude * unit);
+      }
+      float result[4];
+      vst1q_f32(result, candidate(vld1q_f32(lanes)));
+      for (int lane = 0; lane < 4; ++lane) {
+        double expected = reference((double)lanes[lane]);
+        double absolute = fabs((double)result[lane] - expected);
+        if (absolute > maximum_absolute) maximum_absolute = absolute;
+      }
+    }
+    printf(
+      "magnitude-accuracy,%s,max_magnitude,%.9g,max_abs,%.9g\n",
+      name,
+      (double)magnitude,
+      maximum_absolute);
+    if (magnitude == 1.0e4f && maximum_absolute >= 1.0e-5) {
+      fprintf(
+        stderr,
+        "%s error at |x| <= 1e4 exceeds gate: %.9g >= 1e-5\n",
+        name,
+        maximum_absolute);
+      accuracy_failures += 1;
+    }
+  }
+}
+
 typedef struct {
   const char *name;
   UnaryVectorFn baseline;
   UnaryVectorFn scalar;
+  UnaryVectorFn single_step;
   UnaryVectorFn polynomial;
   float (*reference)(float);
   float minimum;
@@ -195,11 +277,56 @@ typedef struct {
 
 int main(void) {
   FunctionFamily families[] = {
-    {"sin", vsinf, dgen_scalar_sin, dgen_poly_sin, sinf, -6.28318531f, 6.28318531f},
-    {"cos", vcosf, dgen_scalar_cos, dgen_poly_cos, cosf, -6.28318531f, 6.28318531f},
-    {"tanh", vtanhf, dgen_scalar_tanh, dgen_poly_tanh, tanhf, -8.0f, 8.0f},
-    {"exp", vexpf, dgen_scalar_exp, dgen_poly_exp, expf, -10.0f, 10.0f},
-    {"log", vlogf, dgen_scalar_log, dgen_poly_log, logf, 0.0001f, 100.0f},
+    {
+      "sin",
+      vsinf,
+      dgen_scalar_sin,
+      dgen_poly_sin_single_step,
+      dgen_poly_sin,
+      sinf,
+      -6.28318531f,
+      6.28318531f,
+    },
+    {
+      "cos",
+      vcosf,
+      dgen_scalar_cos,
+      dgen_poly_cos_single_step,
+      dgen_poly_cos,
+      cosf,
+      -6.28318531f,
+      6.28318531f,
+    },
+    {
+      "tanh",
+      vtanhf,
+      dgen_scalar_tanh,
+      NULL,
+      dgen_poly_tanh,
+      tanhf,
+      -8.0f,
+      8.0f,
+    },
+    {
+      "exp",
+      vexpf,
+      dgen_scalar_exp,
+      NULL,
+      dgen_poly_exp,
+      expf,
+      -10.0f,
+      10.0f,
+    },
+    {
+      "log",
+      vlogf,
+      dgen_scalar_log,
+      NULL,
+      dgen_poly_log,
+      logf,
+      0.0001f,
+      100.0f,
+    },
   };
   const int frame_counts[] = {64, 256, 1024};
   float input[1024];
@@ -220,12 +347,32 @@ int main(void) {
       int iterations = 64000000 / frames;
       double baseline = benchmark(family.baseline, input, frames, iterations);
       double scalar = benchmark(family.scalar, input, frames, iterations);
+      double single_step = family.single_step == NULL
+        ? 0.0
+        : benchmark(family.single_step, input, frames, iterations);
       double polynomial = benchmark(family.polynomial, input, frames, iterations);
       printf("speed,%s,vecLib,%d,%.6f\n", family.name, frames, baseline);
       printf("speed,%s,scalar-libm,%d,%.6f\n", family.name, frames, scalar);
+      if (family.single_step != NULL) {
+        printf(
+          "speed,%s,polynomial-single-step,%d,%.6f\n",
+          family.name,
+          frames,
+          single_step);
+      }
       printf("speed,%s,polynomial,%d,%.6f\n", family.name, frames, polynomial);
     }
-    accuracy(family.name, family.polynomial, family.reference, family.minimum, family.maximum);
+    accuracy(
+      family.name,
+      family.polynomial,
+      family.reference,
+      family.minimum,
+      family.maximum);
+    if (strcmp(family.name, "sin") == 0) {
+      trigonometric_magnitude_accuracy("sin", family.polynomial, sin);
+    } else if (strcmp(family.name, "cos") == 0) {
+      trigonometric_magnitude_accuracy("cos", family.polynomial, cos);
+    }
   }
-  return benchmark_sink == FLT_MAX;
+  return accuracy_failures != 0 || benchmark_sink == FLT_MAX;
 }
