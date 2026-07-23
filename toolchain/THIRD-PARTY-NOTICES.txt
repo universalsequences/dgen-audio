@@ -20,3 +20,10 @@ part of the staged distribution.
 
 No executable, library, header, or SDK stub is copied from Xcode. The
 libSystem.tbd file is DGen-authored from docs/toolchain-symbol-inventory.md.
+
+The four-lane sin, cos, tanh, exp, and log implementations in
+dgen_runtime.h are DGen clean-room code derived from standard mathematical
+range-reduction identities and polynomial evaluation. They do not incorporate
+SLEEF or another third-party implementation. SLEEF was considered as an
+acceptable Boost-licensed reference source, but no SLEEF source was copied or
+adapted.

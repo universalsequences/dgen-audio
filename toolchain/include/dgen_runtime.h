@@ -78,10 +78,127 @@ static inline float32x4_t dgen_sanitize_f32x4(float32x4_t value) {
 
 /*
  * Four-lane math names are part of the renderer/runtime-header boundary, not
- * the host-service ABI. Phase 2's measured lowering keeps these calls direct
- * and inline. The selected implementations are recorded in
- * docs/vector-math-lowering.md.
+ * the host-service ABI. These clean-room NEON polynomials use standard range
+ * reduction and polynomial evaluation identities. Their measured domains,
+ * accuracy, and speed are recorded in docs/vector-math-lowering.md.
  */
+static inline float32x4_t dgen_poly_vsinf(float32x4_t x) {
+  const float32x4_t inv_two_pi = vdupq_n_f32(0.15915494309189535f);
+  const float32x4_t two_pi = vdupq_n_f32(6.2831853071795865f);
+  x = vsubq_f32(x, vmulq_f32(vrndnq_f32(vmulq_f32(x, inv_two_pi)), two_pi));
+  uint32x4_t over = vcgtq_f32(x, vdupq_n_f32(1.5707963267948966f));
+  uint32x4_t under = vcltq_f32(x, vdupq_n_f32(-1.5707963267948966f));
+  x = vbslq_f32(over, vsubq_f32(vdupq_n_f32(3.1415926535897932f), x), x);
+  x = vbslq_f32(under, vsubq_f32(vdupq_n_f32(-3.1415926535897932f), x), x);
+  float32x4_t x2 = vmulq_f32(x, x);
+  float32x4_t p = vdupq_n_f32(-2.50521084e-8f);
+  p = vfmaq_f32(vdupq_n_f32(2.75573192e-6f), p, x2);
+  p = vfmaq_f32(vdupq_n_f32(-1.98412698e-4f), p, x2);
+  p = vfmaq_f32(vdupq_n_f32(8.33333333e-3f), p, x2);
+  p = vfmaq_f32(vdupq_n_f32(-1.66666667e-1f), p, x2);
+  return vfmaq_f32(x, vmulq_f32(x, x2), p);
+}
+
+static inline float32x4_t dgen_poly_vcosf(float32x4_t x) {
+  const float32x4_t inv_two_pi = vdupq_n_f32(0.15915494309189535f);
+  const float32x4_t two_pi = vdupq_n_f32(6.2831853071795865f);
+  x = vsubq_f32(x, vmulq_f32(vrndnq_f32(vmulq_f32(x, inv_two_pi)), two_pi));
+  float32x4_t ax = vabsq_f32(x);
+  uint32x4_t reflected = vcgtq_f32(ax, vdupq_n_f32(1.5707963267948966f));
+  x = vbslq_f32(
+    reflected,
+    vsubq_f32(vdupq_n_f32(3.1415926535897932f), ax),
+    ax);
+  float32x4_t x2 = vmulq_f32(x, x);
+  float32x4_t p = vdupq_n_f32(-2.75573192e-7f);
+  p = vfmaq_f32(vdupq_n_f32(2.48015873e-5f), p, x2);
+  p = vfmaq_f32(vdupq_n_f32(-1.38888889e-3f), p, x2);
+  p = vfmaq_f32(vdupq_n_f32(4.16666667e-2f), p, x2);
+  p = vfmaq_f32(vdupq_n_f32(-5.0e-1f), p, x2);
+  float32x4_t result = vfmaq_f32(vdupq_n_f32(1.0f), x2, p);
+  return vbslq_f32(reflected, vnegq_f32(result), result);
+}
+
+static inline float32x4_t dgen_poly_vexpf(float32x4_t x) {
+  x = vmaxq_f32(vdupq_n_f32(-80.0f), vminq_f32(x, vdupq_n_f32(80.0f)));
+  float32x4_t nf = vrndnq_f32(vmulq_f32(x, vdupq_n_f32(1.4426950408889634f)));
+  float32x4_t r = vfmsq_f32(x, nf, vdupq_n_f32(0.6931471805599453f));
+  float32x4_t p = vdupq_n_f32(1.38888889e-3f);
+  p = vfmaq_f32(vdupq_n_f32(8.33333333e-3f), p, r);
+  p = vfmaq_f32(vdupq_n_f32(4.16666667e-2f), p, r);
+  p = vfmaq_f32(vdupq_n_f32(1.66666667e-1f), p, r);
+  p = vfmaq_f32(vdupq_n_f32(5.0e-1f), p, r);
+  p = vfmaq_f32(vdupq_n_f32(1.0f), p, r);
+  p = vfmaq_f32(vdupq_n_f32(1.0f), p, r);
+  int32x4_t n = vcvtq_s32_f32(nf);
+  uint32x4_t exponent = vshlq_n_u32(
+    vreinterpretq_u32_s32(vaddq_s32(n, vdupq_n_s32(127))),
+    23);
+  return vmulq_f32(p, vreinterpretq_f32_u32(exponent));
+}
+
+static inline float32x4_t dgen_poly_vlogf(float32x4_t x) {
+  uint32x4_t bits = vreinterpretq_u32_f32(x);
+  int32x4_t exponent = vsubq_s32(
+    vreinterpretq_s32_u32(vshrq_n_u32(bits, 23)),
+    vdupq_n_s32(127));
+  uint32x4_t mantissa_bits = vorrq_u32(
+    vandq_u32(bits, vdupq_n_u32(UINT32_C(0x007fffff))),
+    vdupq_n_u32(UINT32_C(0x3f800000)));
+  float32x4_t m = vreinterpretq_f32_u32(mantissa_bits);
+  uint32x4_t upper = vcgtq_f32(m, vdupq_n_f32(1.4142135623730951f));
+  m = vbslq_f32(upper, vmulq_n_f32(m, 0.5f), m);
+  exponent = vaddq_s32(
+    exponent,
+    vreinterpretq_s32_u32(vandq_u32(upper, vdupq_n_u32(1u))));
+  float32x4_t y = vdivq_f32(
+    vsubq_f32(m, vdupq_n_f32(1.0f)),
+    vaddq_f32(m, vdupq_n_f32(1.0f)));
+  float32x4_t y2 = vmulq_f32(y, y);
+  float32x4_t p = vdupq_n_f32(1.0f / 9.0f);
+  p = vfmaq_f32(vdupq_n_f32(1.0f / 7.0f), p, y2);
+  p = vfmaq_f32(vdupq_n_f32(1.0f / 5.0f), p, y2);
+  p = vfmaq_f32(vdupq_n_f32(1.0f / 3.0f), p, y2);
+  p = vfmaq_f32(vdupq_n_f32(1.0f), p, y2);
+  return vfmaq_f32(
+    vmulq_n_f32(vmulq_f32(y, p), 2.0f),
+    vcvtq_f32_s32(exponent),
+    vdupq_n_f32(0.6931471805599453f));
+}
+
+static inline float32x4_t dgen_poly_vtanhf(float32x4_t x) {
+  float32x4_t magnitude = vabsq_f32(x);
+  float32x4_t exponential = dgen_poly_vexpf(vmulq_n_f32(magnitude, -2.0f));
+  float32x4_t result = vdivq_f32(
+    vsubq_f32(vdupq_n_f32(1.0f), exponential),
+    vaddq_f32(vdupq_n_f32(1.0f), exponential));
+  return vbslq_f32(
+    vcltq_f32(x, vdupq_n_f32(0.0f)),
+    vnegq_f32(result),
+    result);
+}
+
+static inline float32x4_t vsinf(float32x4_t value) {
+  return dgen_poly_vsinf(value);
+}
+
+static inline float32x4_t vcosf(float32x4_t value) {
+  return dgen_poly_vcosf(value);
+}
+
+static inline float32x4_t vtanhf(float32x4_t value) {
+  return dgen_poly_vtanhf(value);
+}
+
+static inline float32x4_t vexpf(float32x4_t value) {
+  return dgen_poly_vexpf(value);
+}
+
+static inline float32x4_t vlogf(float32x4_t value) {
+  return dgen_poly_vlogf(value);
+}
+
+/* Less frequent families keep the accurate, unsurprising lane-wise lowering. */
 #define DGEN_UNARY_VECTOR_WRAPPER(vector_name, scalar_name)                 \
   static inline float32x4_t vector_name(float32x4_t value) {               \
     return (float32x4_t){                                                    \
@@ -102,13 +219,8 @@ static inline float32x4_t dgen_sanitize_f32x4(float32x4_t value) {
     };                                                                       \
   }
 
-DGEN_UNARY_VECTOR_WRAPPER(vsinf, sinf)
-DGEN_UNARY_VECTOR_WRAPPER(vcosf, cosf)
 DGEN_UNARY_VECTOR_WRAPPER(vtanf, tanf)
 DGEN_UNARY_VECTOR_WRAPPER(vatanf, atanf)
-DGEN_UNARY_VECTOR_WRAPPER(vtanhf, tanhf)
-DGEN_UNARY_VECTOR_WRAPPER(vexpf, expf)
-DGEN_UNARY_VECTOR_WRAPPER(vlogf, logf)
 DGEN_UNARY_VECTOR_WRAPPER(vsqrtf, sqrtf)
 DGEN_BINARY_VECTOR_WRAPPER(vatan2f, atan2f)
 DGEN_BINARY_VECTOR_WRAPPER(vpowf, powf)
