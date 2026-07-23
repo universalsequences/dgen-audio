@@ -53,7 +53,7 @@
       "name" : "gain"
     }
   ],
-  "processAbi" : "dgen-c-v2-host-sample-rate",
+  "processAbi" : "dgen-host-abi-v1",
   "sampleRate" : 48000,
   "tensorInitData" : [
 
@@ -62,6 +62,6 @@
 
   ],
   "totalMemorySlots" : 4,
-  "version" : 2,
+  "version" : 3,
   "voiceCount" : 1
 }

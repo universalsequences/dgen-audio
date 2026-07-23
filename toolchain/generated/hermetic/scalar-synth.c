@@ -1,8 +1,6 @@
-#include "phase1_compat.h"
+#include "dgen_runtime.h"
 
-// Enable profiling only when DGEN_PROFILE is defined by build flags
-
-float32x4_t vfmodq_f32(float32x4_t a, float32x4_t b) {
+static inline float32x4_t vfmodq_f32(float32x4_t a, float32x4_t b) {
   // a - floor(a / b) * b  (faster and correct for positive ranges)
   float32x4_t q = vdivq_f32(a, b);
   float32x4_t q_floor = vrndmq_f32(q);  // floor
@@ -45,29 +43,22 @@ static inline float32x4_t simd_xor_f32(float32x4_t a, float32x4_t b) {
     return boolmask_to_float(m);
 }
 
-// Replace NaN/Inf with 0 so a single bad node can't poison the whole graph.
-static inline float sanitize_out_f32(float v) {
-    return isfinite(v) ? v : 0.0f;
-}
-static inline float32x4_t sanitize_out_f32x4(float32x4_t v) {
-    uint32x4_t finite = vcltq_f32(vabsq_f32(v), vdupq_n_f32(INFINITY));
-    return vbslq_f32(finite, v, vdupq_n_f32(0.0f));
-}
-
-const int VOICE_COUNT = 1;
-const int SCRATCH_STRIDE = 512;
-float t1_g[VOICE_COUNT * SCRATCH_STRIDE] __attribute__((aligned(64))) = {0};
-float t2_g[VOICE_COUNT * SCRATCH_STRIDE] __attribute__((aligned(64))) = {0};
-float t3_g[VOICE_COUNT * SCRATCH_STRIDE] __attribute__((aligned(64))) = {0};
-float t6_g[VOICE_COUNT * SCRATCH_STRIDE] __attribute__((aligned(64))) = {0};
+enum { VOICE_COUNT = 1, SCRATCH_STRIDE = 512 };
+static float t1_g[VOICE_COUNT * SCRATCH_STRIDE] __attribute__((aligned(64))) = {0};
+static float t2_g[VOICE_COUNT * SCRATCH_STRIDE] __attribute__((aligned(64))) = {0};
+static float t3_g[VOICE_COUNT * SCRATCH_STRIDE] __attribute__((aligned(64))) = {0};
+static float t6_g[VOICE_COUNT * SCRATCH_STRIDE] __attribute__((aligned(64))) = {0};
 // Memory size required: 1024 floats
 
-void setParamValue(int cellId, float val) {
+void dgen_set_param_value_v1(int32_t cell_id, float value) {
+  (void)cell_id;
+  (void)value;
   //memory[cellId] = val;
 }
 
-void process(float * restrict const *in, float * restrict const *out, int nframes, void * restrict state, void * restrict buffers, float hostSampleRate) {
-  int frameCount = nframes;  // Use audiograph frame count parameter
+void dgen_process_v1(const float * const *in, float * const *out, uint32_t nframes, void *state, const DGenProcessContextV1 *context, const DGenHostServicesV1 *host) {
+  int frameCount = (int)nframes;
+  float hostSampleRate = (context != NULL && context->abi_version == DGEN_ABI_VERSION_V1 && context->struct_size >= sizeof(DGenProcessContextV1)) ? context->sample_rate : 0.0f;
   int i = 0;
   float32x4_t c1 = vdupq_n_f32(0.0f);
   float32x4_t c2 = vdupq_n_f32(1.0f);
@@ -127,6 +118,6 @@ void process(float * restrict const *in, float * restrict const *out, int nframe
     float32x4_t simd29 = vmulq_f32(simd2, simd28);
     float32x4_t simd30 = vtanhf(simd29);
     float32x4_t simd31 = vmulq_f32(simd3, simd30);
-    vst1q_f32(out[0] + i, sanitize_out_f32x4(simd31));
+    vst1q_f32(out[0] + i, dgen_sanitize_f32x4(simd31));
   }
 }

@@ -1,14 +1,6 @@
-#include <arm_neon.h>
-#include <stdint.h>
-#include <stdio.h>
-#include <string.h>
-#include <math.h>
-#include <Accelerate/Accelerate.h>
-#include <mach/mach_time.h>
+#include "dgen_runtime.h"
 
-// Enable profiling only when DGEN_PROFILE is defined by build flags
-
-float32x4_t vfmodq_f32(float32x4_t a, float32x4_t b) {
+static inline float32x4_t vfmodq_f32(float32x4_t a, float32x4_t b) {
   // a - floor(a / b) * b  (faster and correct for positive ranges)
   float32x4_t q = vdivq_f32(a, b);
   float32x4_t q_floor = vrndmq_f32(q);  // floor
@@ -51,30 +43,23 @@ static inline float32x4_t simd_xor_f32(float32x4_t a, float32x4_t b) {
     return boolmask_to_float(m);
 }
 
-// Replace NaN/Inf with 0 so a single bad node can't poison the whole graph.
-static inline float sanitize_out_f32(float v) {
-    return isfinite(v) ? v : 0.0f;
-}
-static inline float32x4_t sanitize_out_f32x4(float32x4_t v) {
-    uint32x4_t finite = vcltq_f32(vabsq_f32(v), vdupq_n_f32(INFINITY));
-    return vbslq_f32(finite, v, vdupq_n_f32(0.0f));
-}
-
-const int VOICE_COUNT = 1;
-const int SCRATCH_STRIDE = 512;
-float t11_g[VOICE_COUNT * SCRATCH_STRIDE] __attribute__((aligned(64))) = {0};
-float t12_g[VOICE_COUNT * SCRATCH_STRIDE] __attribute__((aligned(64))) = {0};
-float t29_g[VOICE_COUNT * SCRATCH_STRIDE] __attribute__((aligned(64))) = {0};
-float t30_g[VOICE_COUNT * SCRATCH_STRIDE] __attribute__((aligned(64))) = {0};
-float t31_g[VOICE_COUNT * SCRATCH_STRIDE] __attribute__((aligned(64))) = {0};
+enum { VOICE_COUNT = 1, SCRATCH_STRIDE = 512 };
+static float t11_g[VOICE_COUNT * SCRATCH_STRIDE] __attribute__((aligned(64))) = {0};
+static float t12_g[VOICE_COUNT * SCRATCH_STRIDE] __attribute__((aligned(64))) = {0};
+static float t29_g[VOICE_COUNT * SCRATCH_STRIDE] __attribute__((aligned(64))) = {0};
+static float t30_g[VOICE_COUNT * SCRATCH_STRIDE] __attribute__((aligned(64))) = {0};
+static float t31_g[VOICE_COUNT * SCRATCH_STRIDE] __attribute__((aligned(64))) = {0};
 // Memory size required: 3700 floats
 
-void setParamValue(int cellId, float val) {
+void dgen_set_param_value_v1(int32_t cell_id, float value) {
+  (void)cell_id;
+  (void)value;
   //memory[cellId] = val;
 }
 
-void process(float * restrict const *in, float * restrict const *out, int nframes, void * restrict state, void * restrict buffers, float hostSampleRate) {
-  int frameCount = nframes;  // Use audiograph frame count parameter
+void dgen_process_v1(const float * const *in, float * const *out, uint32_t nframes, void *state, const DGenProcessContextV1 *context, const DGenHostServicesV1 *host) {
+  int frameCount = (int)nframes;
+  float hostSampleRate = (context != NULL && context->abi_version == DGEN_ABI_VERSION_V1 && context->struct_size >= sizeof(DGenProcessContextV1)) ? context->sample_rate : 0.0f;
   int i = 0;
   float32x4_t c1 = vdupq_n_f32(1.0f);
   float32x4_t c2 = vdupq_n_f32(0.0f);
@@ -178,7 +163,7 @@ void process(float * restrict const *in, float * restrict const *out, int nframe
         int t61 = t52 * 79;
         int t62 = t61 + t60;
         float t63 = memory[3344 + t62];
-        float t64 = memory[32 + (isfinite((int) t49) ? (int) t49 : 0)];
+        float t64 = memory[32 + (isfinite(t49) ? (int) t49 : 0)];
         float t65 = t63 * t64;
         int t66 = i;
         int t67 = t66 * 16;
@@ -200,12 +185,23 @@ void process(float * restrict const *in, float * restrict const *out, int nframe
         vst1q_f32(&memory[192 + (int)simd70], c2);
       }
       {
-  static FFTSetup _dgen_fft_setup_4 = NULL;
-  if (_dgen_fft_setup_4 == NULL) {
-    _dgen_fft_setup_4 = vDSP_create_fftsetup(4, kFFTRadix2);
+  static DGenFFTSetupV1 _dgen_fft_setup_4 = NULL;
+  if (host != NULL &&
+      host->abi_version == DGEN_ABI_VERSION_V1 &&
+      host->struct_size >= sizeof(DGenHostServicesV1) &&
+      host->fft_setup_create_fn != NULL &&
+      host->fft_forward_fn != NULL) {
+    if (_dgen_fft_setup_4 == NULL) {
+      _dgen_fft_setup_4 = host->fft_setup_create_fn(4u);
+    }
+    if (_dgen_fft_setup_4 != NULL) {
+      host->fft_forward_fn(
+        _dgen_fft_setup_4,
+        &memory[176],
+        &memory[192],
+        4u);
+    }
   }
-  DSPSplitComplex _dgen_sc = { .realp = &memory[176], .imagp = &memory[192] };
-  vDSP_fft_zip(_dgen_fft_setup_4, &_dgen_sc, 1, 4, kFFTDirection_Forward);
 }
     }
     /* skip scalar load */
@@ -219,7 +215,7 @@ void process(float * restrict const *in, float * restrict const *out, int nframe
       /* skip scalar load */
       float32x4_t simd29 = vld1q_f32(t29 + i); /* extra */
     t29[i] = t29[i];
-      float t79 = memory[3681 + (isfinite((int) 0.0) ? (int) 0.0 : 0)];
+      float t79 = memory[3681 + (isfinite(0.0) ? (int) 0.0 : 0)];
       float t80 = (int)t79;
       int t81 = t80 * 16;
       int t82 = t80 + 4;
@@ -240,19 +236,22 @@ void process(float * restrict const *in, float * restrict const *out, int nframe
   int _dgen_p = (int)memory[3681];
   memset(&memory[208], 0, 16 * sizeof(float));
   memset(&memory[224], 0, 16 * sizeof(float));
-  DSPSplitComplex _dgen_Y = { .realp = &memory[208], .imagp = &memory[224] };
-  for (int _dgen_k = 0; _dgen_k < 4; _dgen_k++) {
-    int _dgen_ring_off = (_dgen_p + 4 - _dgen_k) * 16;
-    DSPSplitComplex _dgen_X = {
-      .realp = &memory[3425 + _dgen_ring_off],
-      .imagp = &memory[3553 + _dgen_ring_off]
-    };
-    int _dgen_ir_off = _dgen_k * 16;
-    DSPSplitComplex _dgen_H = {
-      .realp = &memory[48 + _dgen_ir_off],
-      .imagp = &memory[112 + _dgen_ir_off]
-    };
-    vDSP_zvma(&_dgen_X, 1, &_dgen_H, 1, &_dgen_Y, 1, &_dgen_Y, 1, 16);
+  if (host != NULL &&
+      host->abi_version == DGEN_ABI_VERSION_V1 &&
+      host->struct_size >= sizeof(DGenHostServicesV1) &&
+      host->complex_multiply_accumulate_fn != NULL) {
+    for (int _dgen_k = 0; _dgen_k < 4; _dgen_k++) {
+      int _dgen_ring_off = (_dgen_p + 4 - _dgen_k) * 16;
+      int _dgen_ir_off = _dgen_k * 16;
+      host->complex_multiply_accumulate_fn(
+        &memory[3425 + _dgen_ring_off],
+        &memory[3553 + _dgen_ring_off],
+        &memory[48 + _dgen_ir_off],
+        &memory[112 + _dgen_ir_off],
+        &memory[208],
+        &memory[224],
+        16u);
+    }
   }
 }
       int t97 = t80 + 1;
@@ -279,12 +278,23 @@ void process(float * restrict const *in, float * restrict const *out, int nframe
         vst1q_f32(&memory[256 + (int)simd102], simd104);
       }
       {
-  static FFTSetup _dgen_fft_setup_4 = NULL;
-  if (_dgen_fft_setup_4 == NULL) {
-    _dgen_fft_setup_4 = vDSP_create_fftsetup(4, kFFTRadix2);
+  static DGenFFTSetupV1 _dgen_fft_setup_4 = NULL;
+  if (host != NULL &&
+      host->abi_version == DGEN_ABI_VERSION_V1 &&
+      host->struct_size >= sizeof(DGenHostServicesV1) &&
+      host->fft_setup_create_fn != NULL &&
+      host->fft_inverse_fn != NULL) {
+    if (_dgen_fft_setup_4 == NULL) {
+      _dgen_fft_setup_4 = host->fft_setup_create_fn(4u);
+    }
+    if (_dgen_fft_setup_4 != NULL) {
+      host->fft_inverse_fn(
+        _dgen_fft_setup_4,
+        &memory[240],
+        &memory[256],
+        4u);
+    }
   }
-  DSPSplitComplex _dgen_sc = { .realp = &memory[240], .imagp = &memory[256] };
-  vDSP_fft_zip(_dgen_fft_setup_4, &_dgen_sc, 1, 4, kFFTDirection_Inverse);
 }
       for (int simd109 = 0; simd109 < 16; simd109+=4) {
         float32x4_t simd110 = vld1q_f32(&memory[240 + (int)simd109]);
@@ -326,8 +336,8 @@ void process(float * restrict const *in, float * restrict const *out, int nframe
     }
     float32x4_t simd29 = vld1q_f32(t29 + i); /* extra */
     t29[i] = t29[i];
-    float t132 = memory[3698 + (isfinite((int) 0.0) ? (int) 0.0 : 0)];
-    float t133 = memory[3699 + (isfinite((int) 0.0) ? (int) 0.0 : 0)];
+    float t132 = memory[3698 + (isfinite(0.0) ? (int) 0.0 : 0)];
+    float t133 = memory[3699 + (isfinite(0.0) ? (int) 0.0 : 0)];
     float t134 = t133 == 0.0;
     if (t134) {
       for (int t136 = 0; t136 < 16; t136++) {
@@ -340,13 +350,13 @@ void process(float * restrict const *in, float * restrict const *out, int nframe
         float t143 = t141 - 16.0;
         float t144 = t142 > 0.0f ? t143 : t141;
         float t145 = (int)t144;
-        float t146 = memory[3682 + (isfinite((int) t145) ? (int) t145 : 0)];
+        float t146 = memory[3682 + (isfinite(t145) ? (int) t145 : 0)];
         float t147 = t146 + t140;
         memory[3682 + (int)t145] = t147;
       }
     }
     float t151 = (int)t132;
-    float t152 = memory[3682 + (isfinite((int) t151) ? (int) t151 : 0)];
+    float t152 = memory[3682 + (isfinite(t151) ? (int) t151 : 0)];
     float t153 = (int)t132;
     memory[3682 + (int)t153] = 0.0;
     float t155 = t132 + 1.0;
@@ -357,6 +367,6 @@ void process(float * restrict const *in, float * restrict const *out, int nframe
     float t160 = t159 >= 8.0;
     float t161 = t160 > 0.0f ? 0.0 : t159;
     memory[3699 + (int)0.0] = t161;
-    out[0][i] = sanitize_out_f32(t152);
+    out[0][i] = dgen_sanitize_f32(t152);
   }
 }

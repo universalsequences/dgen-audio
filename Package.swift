@@ -19,11 +19,20 @@ let package = Package(
     targets: [
         .target(
             name: "DGen",
+            dependencies: ["DGenHostSupport"],
             linkerSettings: [
                 .linkedFramework("Cocoa"),
                 .linkedFramework("Metal"),
                 .linkedFramework("MetalKit"),
                 .linkedFramework("QuartzCore")
+            ]
+        ),
+        .target(
+            name: "DGenHostSupport",
+            path: "Sources/DGenHostSupport",
+            publicHeadersPath: "include",
+            linkerSettings: [
+                .linkedFramework("Accelerate")
             ]
         ),
         .executableTarget(

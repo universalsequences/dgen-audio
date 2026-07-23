@@ -21,7 +21,7 @@ dgenlisp compile [<file.lisp>] [options]
 
 ### Output
 
-- `<name>.dylib` — Compiled shared library exporting `process()` and `setParamValue()`
+- `<name>.dylib` — Compiled shared library exporting the DGen host ABI v1 entry points
 - `<name>.json` — Manifest with params, I/O, memory layout (also printed to stdout)
 
 ## Language Reference
@@ -423,28 +423,33 @@ Floats are promoted automatically when combined with graph types. Signals and te
 - `cellId` values are **physical** memory offsets (after remapping), ready for direct indexing into the memory buffer
 - `groups` and `envelopes` are derived from param UI metadata in first-reference order
 - `tensors` gives named metadata for tensor-backed assets and editable tensor slots
-- `tensorInitData` entries must be written to the memory buffer before the first `process()` call
+- `tensorInitData` entries must be written to the memory buffer before the first `dgen_process_v1()` call
 - `totalMemorySlots` is the required memory buffer size (in floats)
 
 ### Host Integration
 
-The dylib exports:
+The dylib includes `dgen_runtime.h` and exports exactly:
 
 ```c
-void process(
-    float** inputs,      // input channel pointers
-    float** outputs,     // output channel pointers
-    int frameCount,      // number of frames to process
-    void* memoryRead,    // memory buffer (read)
-    void* memoryWrite    // memory buffer (write, usually same pointer)
+void dgen_process_v1(
+    const float *const *inputs,
+    float *const *outputs,
+    uint32_t frame_count,
+    void *state,
+    const DGenProcessContextV1 *context,
+    const DGenHostServicesV1 *host
 );
 
-void setParamValue(
-    void* memory,        // memory buffer
-    int cellId,          // physical cell ID from manifest
-    float value          // new parameter value
-);
+void dgen_set_param_value_v1(int32_t cell_id, float value);
 ```
+
+`DGenProcessContextV1` supplies the runtime sample rate.
+`DGenHostServicesV1` supplies only block-level FFT setup, forward/inverse FFT,
+and complex multiply-accumulate callbacks. A host must initialize both
+structures with ABI version 1 and their full structure sizes. See
+`toolchain/include/dgen_runtime.h` and
+`toolchain/harness/toolchain_harness.c` for the normative declaration and
+reference host.
 
 ## Examples
 

@@ -10,13 +10,11 @@ mkdir -p "${output_dir}"
 for input_path in "${input_dir}"/*.c; do
   fixture_name=$(basename "${input_path}")
   output_path="${output_dir}/${fixture_name}"
-  temporary_path="${output_path}.tmp"
-
-  {
-    echo '#include "phase1_compat.h"'
-    sed '/^#include </d' "${input_path}"
-  } > "${temporary_path}"
-  mv "${temporary_path}" "${output_path}"
+  if ! grep -q '^#include "dgen_runtime.h"$' "${input_path}"; then
+    echo "error: generated fixture does not use dgen_runtime.h: ${input_path}" >&2
+    exit 1
+  fi
+  cp "${input_path}" "${output_path}"
 done
 
-echo "Prepared fixture-only no-SDK C sources in ${output_dir}"
+echo "Copied generated runtime-ABI fixtures into ${output_dir}"

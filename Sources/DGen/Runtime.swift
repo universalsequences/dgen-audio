@@ -1,6 +1,7 @@
 import AVFoundation
 import AudioToolbox  // kAudioUnitProperty_MaximumFramesPerSlice
 import CryptoKit
+import DGenHostSupport
 import Foundation
 import Metal
 
@@ -760,7 +761,7 @@ public class CCompiledKernel: CompiledKernelRuntime {
             UInt32(frameCount),
             memory,
             UnsafeRawPointer(contextPointer),
-            nil as UnsafeRawPointer?)
+            UnsafeRawPointer(dgen_reference_host_services_v1()))
         }
       }
     }

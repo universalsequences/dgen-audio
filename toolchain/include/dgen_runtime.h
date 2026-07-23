@@ -58,6 +58,12 @@ extern void *memset(void *destination, int value, size_t count);
 static inline int dgen_isfinite_f32(float value) {
   uint32_t bits;
   __builtin_memcpy(&bits, &value, sizeof(bits));
+  /*
+   * Break the optimizer's finite-math provenance between the float and its
+   * integer representation. The empty constraint emits no instruction, but
+   * prevents -ffinite-math-only from proving this test true.
+   */
+  __asm__ __volatile__("" : "+r"(bits));
   return (bits & UINT32_C(0x7f800000)) != UINT32_C(0x7f800000);
 }
 
@@ -68,8 +74,10 @@ static inline float dgen_sanitize_f32(float value) {
 }
 
 static inline float32x4_t dgen_sanitize_f32x4(float32x4_t value) {
+  uint32x4_t bits = vreinterpretq_u32_f32(value);
+  __asm__ __volatile__("" : "+w"(bits));
   uint32x4_t exponent = vandq_u32(
-    vreinterpretq_u32_f32(value),
+    bits,
     vdupq_n_u32(UINT32_C(0x7f800000)));
   uint32x4_t finite = vmvnq_u32(
     vceqq_u32(exponent, vdupq_n_u32(UINT32_C(0x7f800000))));

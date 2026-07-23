@@ -1,4 +1,68 @@
-# Embedded DGen toolchain Phase 1 proof
+# Embedded DGen toolchain proofs
+
+## Phase 2 closed-ABI proof
+
+Status: complete
+
+Authoritative run: 2026-07-23 on arm64 macOS 26.5.1
+
+Phase 2 replaces the fixture-only header patch with the production
+`dgen_runtime.h` contract and versioned `dgen_process_v1` ABI. The renderer
+routes setup, forward FFT, inverse FFT, and partitioned complex
+multiply-accumulate through `DGenHostServicesV1`. Generated dylibs contain no
+Accelerate calls or load command; the reference host harness links Accelerate
+and implements those four block-level callbacks.
+
+Run the complete proof from the repository root:
+
+```sh
+scripts/prove-toolchain.sh
+cat .toolchain/proof/proof-report.txt
+```
+
+Candidate C compilation and linking run under `env -i` with an unreachable
+`PATH`, empty `DEVELOPER_DIR` and `SDKROOT`, an empty controlled sysroot,
+`-nostdinc`, `-nostdlib`, explicit staged resource paths, the generated
+minimal libSystem stub, and the staged compiler-rt builtins archive. The
+system compiler is used only to build the comparison dylibs and the host
+harness; it is not reachable during candidate compilation.
+
+Every baseline and candidate link is audited by
+`scripts/audit-dgen-dylib.sh`. The audit requires:
+
+- an arm64 Mach-O dynamic library with macOS 11.0 deployment target;
+- exactly `_dgen_process_v1` and `_dgen_set_param_value_v1` exported;
+- every undefined symbol in `toolchain/abi/libsystem-symbols-v1.txt`;
+- exactly `/usr/lib/libSystem.B.dylib` as a load dependency;
+- no `LC_RPATH` and no developer, workspace, user, or temporary path.
+
+The accepted optimization policy is explicit `-O3 -ffast-math` plus the
+spelled-out DSP/vectorization flags in `DGenToolchainPolicy`. The runtime
+header uses IEEE-754 exponent bits behind an optimizer barrier for finite
+classification. The proof compiles a fixture containing actual NaN and
+infinity bit patterns under those same flags and verifies that every output
+is replaced by zero.
+
+The authoritative run produced:
+
+| Fixture | Duration/samples | Maximum absolute error |
+|---|---:|---:|
+| Scalar synth | 8,192 samples | `9.68575478e-08` |
+| Feedback/delay effect | 5 seconds / 240,000 samples | `0` |
+| Wavetable instrument | 8,192 samples | `1.49011612e-08` |
+| FFT/spectral effect | 8,192 samples | `0` |
+
+The tolerance is `2e-5`. It is deliberately much larger than the observed
+compiler-codegen differences but small enough to catch audible algorithmic
+drift. The feedback fixture runs for five seconds so its delay state wraps
+and small recursive differences have time to diverge. The spectral fixture
+uses the Accelerate-backed reference host table and exercises all four host
+services.
+
+The vector-math measurement and accuracy decision is separately reproducible
+as documented in `docs/vector-math-lowering.md`.
+
+## Phase 1 historical proof
 
 Status: Phase 1 prototype
 
