@@ -145,6 +145,7 @@ public enum DGenToolchainPolicy {
         "-Wl,-dead_strip",
         "-L\(stubDirectory)",
         sourcePath,
+        "-x", "none",
         builtins,
         "-lSystem",
         "-o", outputPath,

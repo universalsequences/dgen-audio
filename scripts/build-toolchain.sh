@@ -1,7 +1,7 @@
 #!/bin/sh
 set -eu
 
-# Reproducible upstream-only Phase 1 DGen toolchain build.
+# Reproducible upstream-only DGen toolchain build.
 # No executable or library is copied from Xcode into the staged distribution.
 
 llvm_version=20.1.8
@@ -51,6 +51,8 @@ mkdir -p \
   "$(dirname "${archive_output}")" \
   "$(dirname "${metadata_output}")" \
   "$(dirname "${size_report}")"
+
+"${repo_root}/scripts/generate-libsystem-stub.sh"
 
 if [ ! -f "${archive_path}" ]; then
   curl -fL --retry 3 -o "${archive_path}.partial" "${llvm_url}"
@@ -165,13 +167,14 @@ mkdir -p \
   "${stage_root}/include" \
   "${stage_root}/lib/clang/${llvm_version%%.*}/include" \
   "${stage_root}/lib/clang/${llvm_version%%.*}/lib/darwin" \
+  "${stage_root}/empty-sdk" \
   "${stage_root}/LICENSES"
 
 cp "${build_root}/bin/clang" "${stage_root}/bin/dgen-clang"
 cp "${build_root}/bin/ld64.lld" "${stage_root}/bin/ld64.lld"
 cp -R "${build_root}/lib/clang/${llvm_version%%.*}/include/." \
   "${stage_root}/lib/clang/${llvm_version%%.*}/include/"
-cp "${repo_root}/toolchain/include/phase1_compat.h" "${stage_root}/include/"
+cp "${repo_root}/toolchain/include/dgen_runtime.h" "${stage_root}/include/"
 cp "${repo_root}/toolchain/lib/libSystem.tbd" "${stage_root}/lib/"
 cp "${source_root}/llvm/LICENSE.TXT" "${stage_root}/LICENSES/LLVM-LICENSE.txt"
 cp "${repo_root}/toolchain/THIRD-PARTY-NOTICES.txt" \
@@ -224,8 +227,10 @@ dgen_compiler_version=$(git -C "${repo_root}" rev-parse HEAD 2>/dev/null || echo
 
 cat > "${stage_root}/VERSION.json" <<EOF
 {
-  "distribution_version": 1,
+  "distribution_version": 2,
   "dgen_abi_version": 1,
+  "codegen_policy_version": 1,
+  "architecture_lowering_version": 1,
   "dgen_compiler_version": "${dgen_compiler_version}",
   "llvm_version": "${llvm_version}",
   "llvm_source_sha256": "${llvm_sha256}",

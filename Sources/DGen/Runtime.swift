@@ -278,6 +278,8 @@ public class CCompiledKernel: CompiledKernelRuntime {
         userInfo: [NSLocalizedDescriptionKey: "Failed to compile kernel: \(errorOutput)"])
     }
 
+    try DGenBinaryAudit.audit(dylibFile.path)
+
     dylibHandle = dlopen(dylibFile.path, RTLD_NOW)
     dylibFileURL = dylibFile
     guard let handle = dylibHandle else {
@@ -448,6 +450,8 @@ public class CCompiledKernel: CompiledKernelRuntime {
       )
     }
 
+    try DGenBinaryAudit.audit(dylibFile.path)
+
     // Load the newly compiled dylib
     let dlopenStart = CFAbsoluteTimeGetCurrent()
     self.dylibHandle = dlopen(dylibFile.path, RTLD_NOW)
@@ -518,6 +522,13 @@ public class CCompiledKernel: CompiledKernelRuntime {
   }
 
   private func loadCachedDylib(at cachedPath: URL) -> Bool {
+    do {
+      try DGenBinaryAudit.audit(cachedPath.path)
+    } catch {
+      print("⚠️ Cached dylib failed DGen ABI audit: \(error.localizedDescription)")
+      return false
+    }
+
     guard let handle = dlopen(cachedPath.path, RTLD_NOW) else {
       print("⚠️ Failed to dlopen cached dylib: \(cachedPath.lastPathComponent)")
       return false

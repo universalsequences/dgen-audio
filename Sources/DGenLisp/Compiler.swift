@@ -82,6 +82,8 @@ func compilePatch(
         throw DGenLazyError.compilationFailed("clang failed (exit \(compile.terminationStatus)): \(errorStr)")
     }
 
+    try DGenBinaryAudit.audit(dylibPath)
+
     if options.debug {
         let errorStr = String(data: errorData, encoding: .utf8) ?? ""
         if !errorStr.isEmpty {

@@ -7,9 +7,6 @@ compatibility-version: 1.0.0
 exports:
   - targets:         [ arm64-macos ]
     symbols:
-      - dyld_stub_binder
-      - ___isfinitef
-      - ___memset_chk
       - _atan2f
       - _atanf
       - _bzero
@@ -17,7 +14,7 @@ exports:
       - _copysignf
       - _cosf
       - _expf
-      - _fabs
+      - _fabsf
       - _floorf
       - _fmaxf
       - _fminf
@@ -32,4 +29,5 @@ exports:
       - _sqrtf
       - _tanf
       - _tanhf
+      - dyld_stub_binder
 ...
