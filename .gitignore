@@ -45,3 +45,7 @@ KERNEL_OPTIMIZATIONS.md
 bending_metal.wav
 .harmonic_cache_accordion
 .harmonic_cache_accordion_24k
+/.toolchain-build/
+/.toolchain-downloads/
+/.toolchain/
+/toolchain/generated/current/*.dylib

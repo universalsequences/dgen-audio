@@ -1,0 +1,22 @@
+DGen embedded toolchain Phase 1 third-party inventory
+
+The staged toolchain is built from the upstream llvm-project 20.1.8 source
+release. The distributed components are:
+
+  - LLVM core libraries needed by Clang and LLD
+  - Clang C frontend, driver, and builtin resource headers
+  - LLVM AArch64 target
+  - LLD Mach-O linker (ld64.lld)
+  - compiler-rt builtins for arm64 macOS
+
+LLVM, Clang, LLD, and compiler-rt are licensed under Apache License v2.0 with
+LLVM Exceptions. See LLVM-LICENSE.txt in the staged LICENSES directory.
+
+Optional LLVM integrations with zlib, zstd, libxml2, libedit, terminfo, curl,
+and httplib are disabled by scripts/build-toolchain.sh. Tests, examples,
+benchmarks, documentation, static analysis, sanitizers, profiling runtimes,
+XRay, libFuzzer, ORC runtime support, and unrelated LLVM targets/tools are not
+part of the staged distribution.
+
+No executable, library, header, or SDK stub is copied from Xcode. The
+libSystem.tbd file is DGen-authored from docs/toolchain-symbol-inventory.md.

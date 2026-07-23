@@ -1,0 +1,12 @@
+{
+  "distribution_version": 1,
+  "dgen_abi_version": 1,
+  "dgen_compiler_version": "c3357374f71b7f33297480cd89be26e3720dfdc0",
+  "llvm_version": "20.1.8",
+  "llvm_source_sha256": "6898f963c8e938981e6c4a302e83ec5beb4630147c7311183cf61069af16333d",
+  "target": "arm64-apple-macos",
+  "minimum_macos": "11.0",
+  "clang_sha256": "2ac73943c36157dbd8e4d8b730d73971b2cd6914555ab2c8b4324b41bd5b4f5e",
+  "lld_sha256": "acf75170895c5cad5b3c0172642163bb66d92af81d808bb6f916c45525173d5d",
+  "runtime_headers_sha256": "4327d00a8fa00287a123328dc74837f35f7183f0f9106970db97bdd4d48177f7"
+}

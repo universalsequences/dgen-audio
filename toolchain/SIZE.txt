@@ -1,0 +1,4 @@
+LLVM source archive: 147242952 bytes
+Installed staging prefix: 146874368 bytes
+Compressed toolchain archive: 46976294 bytes
+Compressed archive SHA-256: 84721a4882abaa67708797cd01542ca22dfbe11a550eb2adfd62f5060681b5ee

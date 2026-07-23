@@ -1,0 +1,113 @@
+{
+  "cSourcePath" : "toolchain\/generated\/current\/wavetable-instrument.c",
+  "dylib" : "wavetable-instrument.dylib",
+  "envelopes" : [
+
+  ],
+  "groups" : [
+
+  ],
+  "inputs" : [
+
+  ],
+  "maxFrameCount" : 64,
+  "modDestinations" : [
+
+  ],
+  "modOutputs" : [
+
+  ],
+  "modulators" : [
+
+  ],
+  "outputs" : [
+    {
+      "channel" : 0,
+      "name" : "audio"
+    }
+  ],
+  "params" : [
+    {
+      "cellId" : 32,
+      "cellSpan" : 1,
+      "default" : 110,
+      "max" : 20000,
+      "min" : 20,
+      "name" : "freq",
+      "unit" : "Hz"
+    },
+    {
+      "cellId" : 33,
+      "cellSpan" : 1,
+      "default" : 0.35,
+      "max" : 1,
+      "min" : 0,
+      "name" : "wave"
+    },
+    {
+      "cellId" : 34,
+      "cellSpan" : 1,
+      "default" : 0.2,
+      "max" : 1,
+      "min" : 0,
+      "name" : "gain"
+    }
+  ],
+  "processAbi" : "dgen-c-v2-host-sample-rate",
+  "sampleRate" : 48000,
+  "tensorInitData" : [
+    {
+      "data" : [
+        0,
+        0,
+        0.38268343,
+        0.125,
+        0.70710677,
+        0.25,
+        0.9238795,
+        0.375,
+        1,
+        0.5,
+        0.9238795,
+        0.625,
+        0.70710677,
+        0.75,
+        0.38268343,
+        0.875,
+        0,
+        -1,
+        -0.38268343,
+        -0.875,
+        -0.70710677,
+        -0.75,
+        -0.9238795,
+        -0.625,
+        -1,
+        -0.5,
+        -0.9238795,
+        -0.375,
+        -0.70710677,
+        -0.25,
+        -0.38268343,
+        -0.125
+      ],
+      "offset" : 0
+    }
+  ],
+  "tensors" : [
+    {
+      "cellOffset" : 0,
+      "kind" : "wavetable",
+      "mutable" : false,
+      "name" : "waves",
+      "shape" : [
+        16,
+        2
+      ],
+      "sourceFile" : "waves\/tiny-bank.json"
+    }
+  ],
+  "totalMemorySlots" : 36,
+  "version" : 2,
+  "voiceCount" : 1
+}

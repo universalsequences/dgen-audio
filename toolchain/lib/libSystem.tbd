@@ -1,0 +1,35 @@
+--- !tapi-tbd
+tbd-version:     4
+targets:         [ arm64-macos ]
+install-name:    '/usr/lib/libSystem.B.dylib'
+current-version: 1.0.0
+compatibility-version: 1.0.0
+exports:
+  - targets:         [ arm64-macos ]
+    symbols:
+      - dyld_stub_binder
+      - ___isfinitef
+      - ___memset_chk
+      - _atan2f
+      - _atanf
+      - _bzero
+      - _ceilf
+      - _copysignf
+      - _cosf
+      - _expf
+      - _fabs
+      - _floorf
+      - _fmaxf
+      - _fminf
+      - _fmodf
+      - _log10f
+      - _logf
+      - _memcpy
+      - _memset
+      - _powf
+      - _roundf
+      - _sinf
+      - _sqrtf
+      - _tanf
+      - _tanhf
+...
