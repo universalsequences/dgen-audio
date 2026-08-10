@@ -20,6 +20,9 @@ struct CompilerOptions {
     let sampleRate: Float
     let maxFrames: Int
     let voiceCount: Int
+    /// Host-selected staged toolchain root; `nil` falls back to
+    /// `DGEN_TOOLCHAIN_STAGE_ROOT`, then to the development system Clang.
+    var toolchainRoot: String? = nil
     let debug: Bool
 }
 
@@ -53,7 +56,8 @@ func compilePatch(
     let compile = Process()
     let invocation = try DGenToolchainPolicy.compileInvocation(
         outputPath: dylibPath,
-        sourcePath: cFilePath)
+        sourcePath: cFilePath,
+        toolchainRoot: options.toolchainRoot)
     compile.launchPath = invocation.executable
     let arguments = invocation.arguments
 

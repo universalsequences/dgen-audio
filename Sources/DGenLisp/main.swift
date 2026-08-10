@@ -7,6 +7,7 @@
 //   --max-frames <count>     Max frame count (default: 512)
 //   --voices <count>         Voice count for polyphony (default: 1)
 //   --asset-base <dir>        Base directory for relative tensor/wavetable files
+//   --toolchain-root <dir>   Staged DGen toolchain root (embedded clang/lld)
 //   --debug                  Debug output
 //   -                        Read from stdin (also default if no file given)
 
@@ -24,6 +25,7 @@ struct CLIArgs {
     var maxFrames: Int = 512
     var voiceCount: Int = 1
     var assetBase: String? = nil
+    var toolchainRoot: String? = nil
     var debug: Bool = false
     var readStdin: Bool = false
 }
@@ -55,6 +57,9 @@ func parseArgs(_ args: [String]) -> CLIArgs {
         case "--asset-base":
             i += 1
             if i < args.count { cli.assetBase = args[i] }
+        case "--toolchain-root":
+            i += 1
+            if i < args.count { cli.toolchainRoot = args[i] }
         case "--debug":
             cli.debug = true
         case "-":
@@ -91,6 +96,8 @@ func printUsage() {
           --max-frames <count>     Max frame count (default: 512)
           --voices <count>         Voice count for polyphony (default: 1)
           --asset-base <dir>        Base directory for relative tensor/wavetable files
+          --toolchain-root <dir>   Staged DGen toolchain root (overrides
+                                   DGEN_TOOLCHAIN_STAGE_ROOT)
           --debug                  Debug output
           -                        Read from stdin (also default if no file given)
           -h, --help               Show this help
@@ -167,6 +174,7 @@ func main() throws {
         sampleRate: cli.sampleRate,
         maxFrames: cli.maxFrames,
         voiceCount: cli.voiceCount,
+        toolchainRoot: cli.toolchainRoot,
         debug: cli.debug
     )
 

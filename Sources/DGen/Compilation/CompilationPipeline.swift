@@ -262,8 +262,9 @@ public struct CompilationPipeline {
   }
 
   /// Reject ops that require a specific backend. Currently: acceleratedFFT/IFFT
-  /// depend on Apple's Accelerate framework (vDSP) and are C-only — using them
-  /// on Metal is a compile-time error directing the user to tensorFFT instead.
+  /// lower to the host FFT callbacks in `DGenHostServicesV1` and are C-only —
+  /// using them on Metal is a compile-time error directing the user to
+  /// tensorFFT instead.
   private static func rejectUnsupportedBackendOps(graph: Graph, backend: Backend) throws {
     guard backend == .metal else { return }
     for nodeId in graph.nodes.keys.sorted() {
@@ -271,8 +272,9 @@ public struct CompilationPipeline {
       switch node.op {
       case .acceleratedFFT, .acceleratedIFFT:
         throw DGenError.compilationFailed(
-          "acceleratedFFT/acceleratedIFFT require the Accelerate framework and are "
-            + "only supported on the C backend. Use tensorFFT/tensorIFFT for Metal.")
+          "acceleratedFFT/acceleratedIFFT are dispatched through the host FFT "
+            + "services (DGenHostServicesV1) and are only supported on the C "
+            + "backend. Use tensorFFT/tensorIFFT for Metal.")
       case .partitionedSpectralConvolve:
         throw DGenError.compilationFailed(
           "partitionedSpectralConvolve depends on acceleratedFFT-style hop-rate "

@@ -1,3 +1,4 @@
+import CryptoKit
 import Foundation
 
 public struct DGenCompilerInvocation {
@@ -8,9 +9,11 @@ public struct DGenCompilerInvocation {
 
 /// Versioned compile/link policy shared by the DGen runtime and DGenLisp.
 ///
-/// Production selects the staged toolchain explicitly with
-/// `DGEN_TOOLCHAIN_STAGE_ROOT`. The system-Clang path is a development-only
-/// compatibility path; generated C and numerical semantics are identical.
+/// Production selects the staged toolchain explicitly: hosts pass the stage
+/// root per invocation (`--toolchain-root`), and `DGEN_TOOLCHAIN_STAGE_ROOT`
+/// remains as a development fallback. The system-Clang path is a
+/// development-only compatibility path; generated C and numerical semantics
+/// are identical.
 public enum DGenToolchainPolicy {
   public static let policyVersion = 1
   public static let target = "arm64-apple-macos11.0"
@@ -58,19 +61,50 @@ public enum DGenToolchainPolicy {
     return repositoryRoot.appendingPathComponent("toolchain/include", isDirectory: true)
   }
 
-  public static func compileInvocation(
-    outputPath: String,
-    sourcePath: String
-  ) throws -> DGenCompilerInvocation {
+  /// Resolves the staged toolchain root for one invocation.
+  ///
+  /// An explicit root — the host-selected `--toolchain-root` — always wins over
+  /// the `DGEN_TOOLCHAIN_STAGE_ROOT` development fallback. `nil` means no
+  /// staged toolchain was selected at all, which is the only case that may use
+  /// the system-Clang development path.
+  public static func resolvedStageRoot(explicit: String? = nil) -> URL? {
+    if let explicit, !explicit.isEmpty {
+      return URL(fileURLWithPath: explicit, isDirectory: true)
+    }
     if let stagePath = ProcessInfo.processInfo.environment["DGEN_TOOLCHAIN_STAGE_ROOT"],
       !stagePath.isEmpty
     {
+      return URL(fileURLWithPath: stagePath, isDirectory: true)
+    }
+    return nil
+  }
+
+  public static func compileInvocation(
+    outputPath: String,
+    sourcePath: String,
+    toolchainRoot: String? = nil
+  ) throws -> DGenCompilerInvocation {
+    // A selected root is binding: an incomplete stage is an error, never a
+    // silent downgrade to the system compiler.
+    if let stageRoot = resolvedStageRoot(explicit: toolchainRoot) {
       return try embeddedInvocation(
-        stageRoot: URL(fileURLWithPath: stagePath),
+        stageRoot: stageRoot,
         outputPath: outputPath,
         sourcePath: sourcePath)
     }
     return systemDevelopmentInvocation(outputPath: outputPath, sourcePath: sourcePath)
+  }
+
+  /// SHA-256 of the staged distribution's `VERSION.json` — the toolchain's own
+  /// identity record, and the only compiler fingerprint the embedded path may
+  /// consult. It covers the distribution, ABI, codegen-policy, and LLVM
+  /// versions plus the staged `clang`/`lld`/runtime-header digests.
+  public static func stagedVersionDigest(stageRoot: URL) -> String {
+    let versionFile = stageRoot.appendingPathComponent("VERSION.json")
+    guard let data = try? Data(contentsOf: versionFile) else {
+      return "unavailable"
+    }
+    return SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
   }
 
   public static func systemDevelopmentInvocation(
@@ -110,15 +144,25 @@ public enum DGenToolchainPolicy {
     let stubDirectory = stageRoot.appendingPathComponent("lib").path
     let emptySDK = stageRoot.appendingPathComponent("empty-sdk").path
 
-    for required in [
+    // Every file the staged layout promises (toolchain/LAYOUT.md). A selected
+    // root that cannot satisfy it fails the compile outright.
+    let missing = [
       clang, linker, builtins,
       stageRoot.appendingPathComponent("include/dgen_runtime.h").path,
       stageRoot.appendingPathComponent("lib/libSystem.tbd").path,
-    ] where !FileManager.default.fileExists(atPath: required) {
+      stageRoot.appendingPathComponent("VERSION.json").path,
+    ].filter { !FileManager.default.fileExists(atPath: $0) }
+
+    if !missing.isEmpty {
       throw NSError(
         domain: "DGenToolchainPolicy",
         code: 1,
-        userInfo: [NSLocalizedDescriptionKey: "Embedded DGen toolchain file is missing: \(required)"])
+        userInfo: [
+          NSLocalizedDescriptionKey: """
+            Embedded DGen toolchain root is incomplete: \(stageRoot.path)
+            Missing: \(missing.joined(separator: ", "))
+            """
+        ])
     }
 
     try FileManager.default.createDirectory(
