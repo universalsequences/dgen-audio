@@ -34,7 +34,13 @@ Every baseline and candidate link is audited by
 - exactly `_dgen_process_v1` and `_dgen_set_param_value_v1` exported;
 - every undefined symbol in `toolchain/abi/libsystem-symbols-v1.txt`;
 - exactly `/usr/lib/libSystem.B.dylib` as a load dependency;
+- an `@rpath`-relative `LC_ID_DYLIB` install name, so no build-machine staging
+  path is baked into a published artifact;
 - no `LC_RPATH` and no developer, workspace, user, or temporary path.
+
+The staged distribution that hosts consume — its directory layout, which files
+are guaranteed at which relative paths, and how a host selects it with
+`DGenLisp --toolchain-root` — is specified in `toolchain/LAYOUT.md`.
 
 The accepted optimization policy is explicit `-O3 -ffast-math` plus the
 spelled-out DSP/vectorization flags in `DGenToolchainPolicy`. The runtime
