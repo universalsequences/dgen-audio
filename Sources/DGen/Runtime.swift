@@ -175,6 +175,8 @@ public class CCompiledKernel: CompiledKernelRuntime {
   private let defaultHostSampleRate: Float
 
   private static let clangPath = "/usr/bin/clang"
+  /// Development-only compiler fingerprint. Lazily evaluated, so the embedded
+  /// toolchain path never spawns the system Clang.
   private static let cachedCompilerVersion: String = {
     let process = Process()
     process.launchPath = clangPath
@@ -196,10 +198,24 @@ public class CCompiledKernel: CompiledKernelRuntime {
   }()
 
   private static func cachedCompilerSignature() -> String {
+    // Embedded path: the staged distribution describes itself, so the system
+    // Clang is never consulted — not even to fingerprint it.
+    if let stageRoot = DGenToolchainPolicy.resolvedStageRoot() {
+      return [
+        "toolchain=embedded",
+        "stage-version-sha256=\(DGenToolchainPolicy.stagedVersionDigest(stageRoot: stageRoot))",
+        "policy=\(DGenToolchainPolicy.policyVersion)",
+        "target=\(DGenToolchainPolicy.target)",
+      ].joined(separator: "\n")
+    }
+
+    // Development-only fallback: the system Clang carries no VERSION.json, so
+    // its own version banner is the closest available fingerprint.
     let placeholder = DGenToolchainPolicy.systemDevelopmentInvocation(
       outputPath: "<output>",
       sourcePath: "<source>")
     return [
+      "toolchain=system-development",
       "clang=\(clangPath)",
       "version=\(cachedCompilerVersion)",
       placeholder.policySignature,

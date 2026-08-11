@@ -163,6 +163,7 @@ cmake --build "${build_root}/runtimes/builtins-bins" \
 
 rm -rf "${stage_root}"
 mkdir -p \
+  "${stage_root}/abi" \
   "${stage_root}/bin" \
   "${stage_root}/include" \
   "${stage_root}/lib/clang/${llvm_version%%.*}/include" \
@@ -176,6 +177,11 @@ cp -R "${build_root}/lib/clang/${llvm_version%%.*}/include/." \
   "${stage_root}/lib/clang/${llvm_version%%.*}/include/"
 cp "${repo_root}/toolchain/include/dgen_runtime.h" "${stage_root}/include/"
 cp "${repo_root}/toolchain/lib/libSystem.tbd" "${stage_root}/lib/"
+# The binary-audit contract travels with the toolchain that produces the
+# binaries, so a toolchain update moves both atomically (toolchain/LAYOUT.md).
+cp "${repo_root}/toolchain/abi/exports-v1.txt" "${stage_root}/abi/"
+cp "${repo_root}/toolchain/abi/libsystem-symbols-v1.txt" "${stage_root}/abi/"
+cp "${repo_root}/toolchain/LAYOUT.md" "${stage_root}/LAYOUT.md"
 cp "${source_root}/llvm/LICENSE.TXT" "${stage_root}/LICENSES/LLVM-LICENSE.txt"
 cp "${repo_root}/toolchain/THIRD-PARTY-NOTICES.txt" \
   "${stage_root}/LICENSES/THIRD-PARTY-NOTICES.txt"
@@ -245,6 +251,14 @@ cp "${stage_root}/VERSION.json" "${metadata_output}"
 
 installed_bytes=$(du -sk "${stage_root}" | awk '{print $1 * 1024}')
 
+# The staged report covers the installed footprint only — an archive cannot
+# carry its own compressed size or digest. The repository copy below appends
+# those two lines after the archive exists.
+cat > "${stage_root}/SIZE.txt" <<EOF
+LLVM source archive: $(stat -f %z "${archive_path}") bytes
+Installed staging prefix: ${installed_bytes} bytes
+EOF
+
 python3 - "${stage_root}" "${archive_output}" <<'PY'
 import gzip
 import os
@@ -273,9 +287,8 @@ PY
 compressed_bytes=$(stat -f %z "${archive_output}")
 archive_sha=$(shasum -a 256 "${archive_output}" | awk '{print $1}')
 
-cat > "${size_report}" <<EOF
-LLVM source archive: $(stat -f %z "${archive_path}") bytes
-Installed staging prefix: ${installed_bytes} bytes
+cp "${stage_root}/SIZE.txt" "${size_report}"
+cat >> "${size_report}" <<EOF
 Compressed toolchain archive: ${compressed_bytes} bytes
 Compressed archive SHA-256: ${archive_sha}
 EOF

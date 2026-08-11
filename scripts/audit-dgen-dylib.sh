@@ -1,6 +1,13 @@
 #!/bin/sh
 set -eu
 
+# The audit inspects an already-built artifact; it is a verification step, not
+# part of the hermetic compile, and it needs the system binutils. Callers
+# legitimately run under a deliberately neutered PATH to prove the *compile*
+# reaches no system tool, so restore a usable search path here.
+PATH="${PATH:+${PATH}:}/usr/bin:/bin"
+export PATH
+
 repo_root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 dylib=${1:-}
 exports_allowlist=${DGEN_EXPORT_ALLOWLIST:-"${repo_root}/toolchain/abi/exports-v1.txt"}
@@ -38,6 +45,21 @@ if [ "${actual_minimum}" != "${minimum_macos}" ]; then
   echo "error: expected deployment target ${minimum_macos}, got ${actual_minimum:-missing}" >&2
   exit 1
 fi
+
+# LC_ID_DYLIB must be relocatable. An absolute install name bakes the build
+# machine's staging path into every published artifact.
+install_name=$(otool -D "${dylib}" | tail -n +2 | head -n 1)
+case "${install_name}" in
+  @rpath/*) ;;
+  "")
+    echo "error: dylib has no LC_ID_DYLIB install name" >&2
+    exit 1
+    ;;
+  *)
+    echo "error: install name must be @rpath-relative; found: ${install_name}" >&2
+    exit 1
+    ;;
+esac
 
 LC_ALL=C sort -u "${exports_allowlist}" > "${audit_root}/expected-exports"
 nm -gU "${dylib}" | awk 'NF { print $NF }' | LC_ALL=C sort -u \
