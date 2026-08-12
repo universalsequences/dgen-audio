@@ -404,6 +404,53 @@ public enum LazyOp {
     }
   }
 
+  /// Memory cells this op treats as persistent state: written this frame and
+  /// read back on a later frame (or a later `process()` call entirely).
+  ///
+  /// This is the *graph-level* authority the memory planner consults. It exists
+  /// because the buffer-reuse liveness pass in `remapVectorMemorySlots` can only
+  /// see UOps, where it recognizes `load`/`store`/`delay1`/`noise` as persistent.
+  /// Stateful ops that lower through the **tensor** path (`.phasor`, `.accum`,
+  /// … under a `tensorIndex`) emit `memoryRead`/`memoryWrite` instead, which are
+  /// indistinguishable from transient tensor traffic. Those cells were therefore
+  /// treated as reuse-eligible and could be aliased onto a tensor temporary,
+  /// silently clobbering the state on every block. Reporting the cells here
+  /// keeps one authority for "this is state" regardless of how it lowers.
+  ///
+  /// Being listed here only *removes* a cell from the reuse pool, so it is
+  /// always the conservative/correct answer.
+  public var persistentStateCellIds: [CellID] {
+    switch self {
+    // Core scalar/tensor stateful ops. The tensor lowerings of these emit
+    // memoryRead/memoryWrite and are the ones the UOp scan cannot classify.
+    case .phasor(let cellId), .accum(let cellId), .latch(let cellId),
+      .click(let cellId), .noise(let cellId):
+      return [cellId]
+
+    // History (delay/feedback) buffers.
+    case .historyRead(let cellId), .historyWrite(let cellId),
+      .historyReadWrite(let cellId):
+      return [cellId]
+
+    // Per-element RNG state (output cell holds its value between hops).
+    case .tensorNoise(let stateCell, let outputCell, _),
+      .hopTensorNoise(let stateCell, let outputCell, _):
+      return [stateCell, outputCell]
+
+    // Spectral ring buffers plus the row/output cells that hold across hops.
+    case .spectrumDelay(let ringCell, let rowCell, let outputCell, _, _),
+      .spectrumDelayMod(let ringCell, let rowCell, let outputCell, _, _):
+      return [ringCell, rowCell, outputCell]
+
+    // Overlap-add output ring, read cursor and hop counter.
+    case .overlapAdd(_, _, let outputRingCell, let readPosCell, let counterCell):
+      return [outputRingCell, readPosCell, counterCell]
+
+    default:
+      return []
+    }
+  }
+
   /// GEMM variants that own their dispatch grid (excludes `.gemmSmall`, which
   /// uses `perFrameScaled` and carries a shape-driven `tensorIndex`).
   public var isSelfDispatchedGemm: Bool {

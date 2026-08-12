@@ -972,7 +972,7 @@ public func spectralLossFFT(
 /// - Returns: SignalTensor [numCols] containing the interpolated row per frame
 extension Tensor {
   public func peekRow(_ rowIndex: Signal) -> SignalTensor {
-    return self.sample(rowIndex)
+    return self.sampleRow(rowIndex)
   }
 }
 
@@ -997,33 +997,44 @@ extension Tensor {
 /// Read a row from a 2D SignalTensor with linear interpolation
 extension SignalTensor {
   public func peekRow(_ rowIndex: Signal) -> SignalTensor {
-    return self.sample(rowIndex)
+    return self.sampleRow(rowIndex)
+  }
+
+  /// Read a scalar from a SignalTensor at (index, channel) with interpolation.
+  /// Mirrors `Tensor.peek`; for 1D the channel is ignored (auto-promoted to [N, 1]).
+  public func peek(_ index: Signal, channel: Signal? = nil) -> Signal {
+    let ch = channel ?? Signal.constant(0.0)
+    let nodeId = try! graph.graph.peek(tensor: self.nodeId, index: index.nodeId, channel: ch.nodeId)
+    return Signal(nodeId: nodeId, graph: graph, requiresGrad: requiresGrad || index.requiresGrad)
   }
 }
 
-/// Sample along axis 0 with interpolation. Reduces rank by 1.
+/// Sample a whole ROW along axis 0 with interpolation. Reduces rank by 1.
 /// Index is in raw [0, D0) space. Integer = exact row, fractional = lerp.
+///
+/// Swift-only API — the lisp `sample` operator is the gen-style normalized-phase
+/// scalar read, not this row read.
 extension Tensor {
-  public func sample(_ index: Signal) -> SignalTensor {
+  public func sampleRow(_ index: Signal) -> SignalTensor {
     guard shape.count >= 2 else {
-      fatalError("sample requires at least 2D tensor, got shape \(shape)")
+      fatalError("sampleRow requires at least 2D tensor, got shape \(shape)")
     }
     let remainingShape = Array(shape.dropFirst())
-    let nodeId = try! graph.graph.sample(tensor: self.nodeId, index: index.nodeId)
+    let nodeId = try! graph.graph.sampleRow(tensor: self.nodeId, index: index.nodeId)
     return SignalTensor(
       nodeId: nodeId, graph: graph, shape: remainingShape,
       requiresGrad: requiresGrad || index.requiresGrad)
   }
 }
 
-/// Sample along axis 0 with interpolation on SignalTensor. Reduces rank by 1.
+/// Sample a whole ROW along axis 0 with interpolation on SignalTensor. Reduces rank by 1.
 extension SignalTensor {
-  public func sample(_ index: Signal) -> SignalTensor {
+  public func sampleRow(_ index: Signal) -> SignalTensor {
     guard shape.count >= 2 else {
-      fatalError("sample requires at least 2D tensor, got shape \(shape)")
+      fatalError("sampleRow requires at least 2D tensor, got shape \(shape)")
     }
     let remainingShape = Array(shape.dropFirst())
-    let nodeId = try! graph.graph.sample(tensor: self.nodeId, index: index.nodeId)
+    let nodeId = try! graph.graph.sampleRow(tensor: self.nodeId, index: index.nodeId)
     return SignalTensor(
       nodeId: nodeId, graph: graph, shape: remainingShape,
       requiresGrad: requiresGrad || index.requiresGrad)

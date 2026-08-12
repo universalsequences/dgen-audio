@@ -111,6 +111,19 @@ func remapVectorMemorySlots(
     // marked as persistent by graph construction (circular buffers, ring buffers).
     var persistentCells: Set<CellID> = graph?.persistentCells ?? []
     let parameterCells: Set<CellID> = graph?.parameterCells ?? []
+
+    // Graph-level state cells. The UOp scan below only recognizes
+    // load/store/delay1/noise as persistent, so stateful ops that lower through
+    // the TENSOR path (`.phasor`/`.accum`/… with a tensorIndex emit plain
+    // memoryRead/memoryWrite) looked like transient tensor traffic and could be
+    // aliased onto a tensor temporary — their state was clobbered every block.
+    // Asking the ops themselves keeps one authority for what counts as state.
+    if let graph = graph {
+      for nodeId in graph.nodes.keys.sorted() {
+        guard let node = graph.nodes[nodeId] else { continue }
+        persistentCells.formUnion(node.op.persistentStateCellIds)
+      }
+    }
     var accumulateCells: Set<CellID> = []  // memoryAccumulate — need zeroed memory
     var cellFirstUse: [CellID: Int] = [:]
     var cellLastUse: [CellID: Int] = [:]

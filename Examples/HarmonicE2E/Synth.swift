@@ -74,13 +74,13 @@ enum HarmonicSynth {
     let noiseGain2D = controls.noiseGain.reshape([B, F]).transpose([1, 0])
     let filter3D = controls.noiseFilter.reshape([B, F, controls.noiseFilter.shape[1]]).transpose([1, 0, 2])
 
-    let ampsAtTimeRaw = amps3D.sample(playhead)   // [B, K]
-    let gainAtTime = gain2D.sample(playhead)      // [B]
-    let noiseGainAtTime = noiseGain2D.sample(playhead)
-    let filterTapsAtTime = filter3D.sample(playhead)  // [B, FIR]
+    let ampsAtTimeRaw = amps3D.sampleRow(playhead)   // [B, K]
+    let gainAtTime = gain2D.sampleRow(playhead)      // [B]
+    let noiseGainAtTime = noiseGain2D.sampleRow(playhead)
+    let filterTapsAtTime = filter3D.sampleRow(playhead)  // [B, FIR]
 
-    let f0AtTime = tensors.f0.sample(playhead)
-    let uvAtTime = tensors.uv.sample(playhead)
+    let f0AtTime = tensors.f0.sampleRow(playhead)
+    let uvAtTime = tensors.uv.sampleRow(playhead)
     let f0Expanded = f0AtTime.reshape([B, 1]).expand([B, K])
     let harmonicFreqs = tensors.harmonicIndices * f0Expanded
 

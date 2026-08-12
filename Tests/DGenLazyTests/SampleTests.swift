@@ -24,7 +24,7 @@ final class SampleTests: XCTestCase {
     ]
     let tensor = Tensor(data)
     let index = Signal.constant(2.0)
-    let sampled = tensor.sample(index)  // should be [7, 8, 9]
+    let sampled = tensor.sampleRow(index)  // should be [7, 8, 9]
     let output = sampled.sum()
 
     let frameCount = 1
@@ -43,7 +43,7 @@ final class SampleTests: XCTestCase {
     ]
     let tensor = Tensor(data)
     let index = Signal.constant(1.5)
-    let sampled = tensor.sample(index)
+    let sampled = tensor.sampleRow(index)
     // Expected: 0.5 * [2,4,6] + 0.5 * [10,20,30] = [6, 12, 18]
     let output = sampled.sum()
 
@@ -62,7 +62,7 @@ final class SampleTests: XCTestCase {
       9, 10, 11, 12,
     ])
     let index = Signal.constant(1.0)
-    let sampled = tensor.sample(index)  // should be [5,6,7,8] as [2,2]
+    let sampled = tensor.sampleRow(index)  // should be [5,6,7,8] as [2,2]
     let output = sampled.sum()
 
     let frameCount = 1
@@ -84,7 +84,7 @@ final class SampleTests: XCTestCase {
     LazyGraphContext.reset()
     let tensor1 = Tensor(data)
     let playhead1 = Signal.phasor(DGenConfig.sampleRate / Float(frameCount)) * 2.0
-    let sampled1 = tensor1.sample(playhead1)
+    let sampled1 = tensor1.sampleRow(playhead1)
     let output1 = sampled1.sum()
     let result1 = try output1.backward(frames: frameCount)
 
@@ -117,7 +117,7 @@ final class SampleTests: XCTestCase {
     ])
     let target = Signal.constant(5.0)
     let playhead = Signal.phasor(DGenConfig.sampleRate / Float(frameCount)) * 3.0
-    let sampled = param.sample(playhead)
+    let sampled = param.sampleRow(playhead)
     let loss = mse(sampled.sum(), target)
 
     _ = try loss.backward(frames: frameCount)
@@ -137,7 +137,7 @@ final class SampleTests: XCTestCase {
       1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12,
     ])
     let playhead1 = Signal.phasor(DGenConfig.sampleRate / Float(frameCount)) * 3.0
-    let sampled1 = param1.sample(playhead1)
+    let sampled1 = param1.sampleRow(playhead1)
     let loss1 = mse(sampled1.sum(), Signal.constant(5.0))
     _ = try loss1.backward(frames: frameCount)
     let grad1 = param1.grad?.getData() ?? []
@@ -171,7 +171,7 @@ final class SampleTests: XCTestCase {
     ])
     let target = Signal.constant(3.0)
     let playhead = Signal.phasor(DGenConfig.sampleRate / Float(frameCount)) * 2.0
-    let sampled = param.sample(playhead)  // [2, 2]
+    let sampled = param.sampleRow(playhead)  // [2, 2]
     let loss = mse(sampled.sum(), target)
 
     _ = try loss.backward(frames: frameCount)
@@ -197,7 +197,7 @@ final class SampleTests: XCTestCase {
 
     func buildLoss() -> Signal {
       let playhead = Signal.phasor(DGenConfig.sampleRate / Float(frameCount)) * 3.0
-      let sampled = param.sample(playhead)
+      let sampled = param.sampleRow(playhead)
       return mse(sampled.sum(), Signal.constant(2.0))
     }
 

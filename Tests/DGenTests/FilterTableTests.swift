@@ -31,7 +31,7 @@ final class FilterTableTests: XCTestCase {
         let sampleRateRowIndex = g.n(.gte, frameCounter, switchThreshold)
         let hopHeldRowIndex = g.hopHold(sampleRateRowIndex, hopSize: hop)
 
-        let tableFrame = try g.sample(tensor: table, index: hopHeldRowIndex)
+        let tableFrame = try g.sampleRow(tensor: table, index: hopHeldRowIndex)
         let (hRe, hIm) = g.acceleratedFFT(tableFrame, N: N)
 
         let yRe = g.n(.sub, g.n(.mul, xRe, hRe), g.n(.mul, xIm, hIm))

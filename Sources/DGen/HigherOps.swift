@@ -826,23 +826,27 @@ extension Graph {
   }
 
   /// Read a row from a 2D tensor with linear interpolation between adjacent rows.
-  /// Delegates to the generalized `sample` op internally.
+  /// Delegates to the generalized `sampleRow` op internally.
   /// - Parameters:
   ///   - tensor: 2D tensor [numRows, numCols]
   ///   - rowIndex: Scalar row index (fractional values interpolate between rows)
   /// - Returns: 1D tensor [numCols] containing the interpolated row
   public func peekRow(tensor: NodeID, rowIndex: NodeID) throws -> NodeID {
-    return try sample(tensor: tensor, index: rowIndex)
+    return try sampleRow(tensor: tensor, index: rowIndex)
   }
 
-  /// Generalized sampling along axis 0 with interpolation for any-rank tensor (N >= 2).
+  /// Generalized row sampling along axis 0 with interpolation for any-rank tensor (N >= 2).
   /// Input index is in raw [0, D0) space. Integer = exact row, fractional = lerp.
-  public func sample(tensor: NodeID, index: NodeID) throws -> NodeID {
+  ///
+  /// Swift-only: this row read is deliberately NOT bound to a lisp operator. The lisp
+  /// `sample` is the gen-style normalized-phase *scalar* read (see `evalSample` in
+  /// DGenLisp). The underlying IR op name (`.sampleInline`) is unchanged.
+  public func sampleRow(tensor: NodeID, index: NodeID) throws -> NodeID {
     guard let tensorNode = nodes[tensor],
       case .tensor(let shape) = tensorNode.shape,
       shape.count >= 2
     else {
-      throw DGenError.tensorError(op: "sample", reason: "requires at least 2D tensor input")
+      throw DGenError.tensorError(op: "sampleRow", reason: "requires at least 2D tensor input")
     }
     let numRows = shape[0]
     let remainingShape = Array(shape.dropFirst())

@@ -373,7 +373,7 @@ enum HarmonicE2ETrainer {
         min: 0.0,
         max: Float(frameCount)
       )
-      let target = synthTensors.target!.sample(targetPlayhead)
+      let target = synthTensors.target!.sampleRow(targetPlayhead)
       let loss = fullBatchedLoss(
         prediction: prediction,
         target: target,

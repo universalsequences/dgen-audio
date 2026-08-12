@@ -347,12 +347,12 @@ High-level expansion:
 (overlap-add (* td win gain) hop)
 ```
 
-Filter IR wavetable morphing should be expressible by combining `wavetable`/`sample` with FFT:
+Filter IR wavetable morphing should be expressible by combining `tensor`/`peek-row` with FFT:
 
 ```lisp
-(def bank (wavetable @shape [16 2048] @file "filters/morph_bank.json"))
+(def bank (tensor @shape [16 2048] @file "filters/morph_bank.json"))
 (def pos (* (phasor 0.05) 15))
-(def ir-frame (sample bank pos))
+(def ir-frame (peek-row bank pos))
 (def wet (partitioned-convolve input ir-frame @N 1024 @hop 256))
 ```
 

@@ -1006,7 +1006,7 @@ enum DDSPE2ETrainer {
         min: 0.0,
         max: Float(frameCount)
       )
-      let targetBatched = synthTensors.target!.sample(targetPlayhead)  // [B]
+      let targetBatched = synthTensors.target!.sampleRow(targetPlayhead)  // [B]
 
       var loss = DDSPTrainingLosses.fullBatchedLoss(
         prediction: prediction,

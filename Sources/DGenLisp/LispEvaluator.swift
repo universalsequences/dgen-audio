@@ -620,6 +620,7 @@ class LispEvaluator {
     // Tensor creation
     case "tensor":
       return try evalTensor(regularArgs, attributes: attributePairs)
+    // DEPRECATED hidden alias of `tensor` (undocumented; kept for old sources only).
     case "wavetable":
       return try evalWavetable(regularArgs, attributes: attributePairs, mutable: false)
     case "zeros":
@@ -632,6 +633,7 @@ class LispEvaluator {
       return try evalTensorCreate(regularArgs, fill: .randn)
     case "tensor-param":
       return try evalTensorParam(regularArgs, attributes: attributePairs)
+    // DEPRECATED hidden alias of `tensor-param` (undocumented; kept for old sources only).
     case "wavetable-param":
       return try evalWavetable(regularArgs, attributes: attributePairs, mutable: true)
     case "audio-tensor":
@@ -1273,9 +1275,15 @@ class LispEvaluator {
     case .float(let freq):
       return .signal(Signal.phasor(freq, reset: reset))
     case .tensor(let freqs):
-      return .signalTensor(Signal.phasor(freqs, reset: reset))
+      // Tensor frequencies lower to the stateful per-lane phasor
+      // (BATCH_VOICE_LOWERING_SPEC). SignalTensor.phasor's deterministicPhasor
+      // is block-restart-relative and only valid for single-call offline
+      // renders (training), so real-time `phasor` must not emit it.
+      return .signalTensor(Signal.statefulPhasor(freqs, reset: reset))
+    case .signalTensor(let freqs):
+      return .signalTensor(Signal.statefulPhasor(freqs, reset: reset))
     default:
-      throw LispError.typeError("phasor: freq must be signal, float, or tensor")
+      throw LispError.typeError("phasor: freq must be signal, float, tensor, or signalTensor")
     }
   }
 
@@ -1534,6 +1542,8 @@ class LispEvaluator {
     if attrValue(attributes, "@file") != nil || attrValue(attributes, "@shape") != nil {
       return try evalWavetable(args, attributes: attributes, mutable: false)
     }
+    // DEPRECATED silent legacy path: positional `(tensor rows cols)`. Undocumented;
+    // kept working for old sources. New code uses `(tensor @shape [rows cols])`.
     guard args.count >= 2 else {
       throw LispError.invalidArgument("tensor requires at least 2 arguments (rows, cols)")
     }
@@ -1852,9 +1862,21 @@ class LispEvaluator {
       args, attributes: attributes, op: mutable ? "wavetable-param" : "wavetable")
     let fileAttr = attrValue(attributes, "@file") ?? attrValue(attributes, "@default-file")
     let sourceFile = fileAttr.map(unquote)
-    let data =
-      try sourceFile.map { try loadTensorData(file: $0, expectedShape: shape) }
-      ?? [Float](repeating: 0, count: shape.reduce(1, *))
+    let data: [Float]
+    if let sourceFile {
+      data = try loadTensorData(file: sourceFile, expectedShape: shape)
+    } else if let inline = attrValue(attributes, "@data").map(parseFloatList) {
+      // Honor inline @data so the legacy `wavetable` spelling is a faithful
+      // alias of `tensor` (it used to silently zero-fill), and so
+      // `tensor-param`/`wavetable-param` can seed defaults inline.
+      guard inline.count == shape.reduce(1, *) else {
+        throw LispError.invalidArgument(
+          "@data has \(inline.count) values, expected \(shape.reduce(1, *))")
+      }
+      data = inline
+    } else {
+      data = [Float](repeating: 0, count: shape.reduce(1, *))
+    }
 
     let tensor = makeTensor(shape: shape, data: data, mutable: mutable)
     tensors.append(
@@ -1904,16 +1926,56 @@ class LispEvaluator {
     }
   }
 
+  /// `(sample tensor phase [channel])` — gen-style scalar read at a *normalized* phase.
+  ///
+  /// `phase` is a signal in 0..1 (values outside the range wrap). The read is exactly
+  /// equivalent to `(peek tensor (* (wrap phase 0 1) N) channel)` where N is the
+  /// tensor's compile-time `shape[0]`; it lowers through the same `.peek` machinery.
+  ///
+  /// `channel` is optional and defaults to 0 (peek auto-promotes 1D tensors to [N, 1]),
+  /// but the 2D convention is [samples, channels/waves] so it is normally supplied.
+  ///
+  /// Note: this is NOT the whole-row read — that is the Swift-only `sampleRow`.
   private func evalSample(_ args: [ASTNode]) throws -> EvalResult {
-    guard args.count == 2 else {
-      throw LispError.invalidArgument("sample requires 2 arguments (tensor, index)")
+    guard args.count == 2 || args.count == 3 else {
+      throw LispError.invalidArgument(
+        "sample requires 2 or 3 arguments (tensor, phase [, channel])")
     }
     let val = try evaluateAST(args[0])
-    let index = try requireSignal(evaluateAST(args[1]))
+
+    let numRows: Int
     switch val {
-    case .tensor(let t): return .signalTensor(t.sample(index))
-    case .signalTensor(let st): return .signalTensor(st.sample(index))
-    default: throw LispError.typeError("sample: first argument must be tensor or signalTensor")
+    case .tensor(let t):
+      guard let d0 = t.shape.first, d0 > 0 else {
+        throw LispError.typeError("sample: tensor must have a non-empty first dimension")
+      }
+      numRows = d0
+    case .signalTensor(let st):
+      guard let d0 = st.shape.first, d0 > 0 else {
+        throw LispError.typeError("sample: tensor must have a non-empty first dimension")
+      }
+      numRows = d0
+    default:
+      throw LispError.typeError("sample: first argument must be a tensor or signalTensor")
+    }
+
+    let phase = try requireSignal(coerceToSignal(evaluateAST(args[1])))
+    let channel: Signal =
+      args.count == 3
+      ? try requireSignal(coerceToSignal(evaluateAST(args[2])))
+      : Signal.constant(0)
+
+    // wrap(phase, 0, 1) -- mirrors evalWrap's mod(sig - min, range) + min.
+    let minVal = Signal.constant(0)
+    let maxVal = Signal.constant(1)
+    let range = maxVal - minVal
+    let wrapped = DGenLazy.mod(phase - minVal, range) + minVal
+    let index = wrapped * Signal.constant(Float(numRows))
+
+    switch val {
+    case .tensor(let t): return .signal(t.peek(index, channel: channel))
+    case .signalTensor(let st): return .signal(st.peek(index, channel: channel))
+    default: throw LispError.typeError("sample: first argument must be a tensor or signalTensor")
     }
   }
 

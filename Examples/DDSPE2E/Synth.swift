@@ -104,18 +104,18 @@ enum DDSPSynth {
       noiseGain2D = noiseGain2DRaw
     }
 
-    // Sample at playhead position: [F, B, K].sample(playhead) → [B, K]
-    let ampsAtTimeRaw = amps3D.sample(playhead)
-    // [F, B].sample(playhead) → [B]
-    let gainAtTimeRaw = gain2D.sample(playhead)
+    // Sample at playhead position: [F, B, K].sampleRow(playhead) → [B, K]
+    let ampsAtTimeRaw = amps3D.sampleRow(playhead)
+    // [F, B].sampleRow(playhead) → [B]
+    let gainAtTimeRaw = gain2D.sampleRow(playhead)
 
     let smoothedAmps = ampsAtTimeRaw
     let smoothedGain = gainAtTimeRaw
 
     // Sample f0/uv from pre-allocated [F, B] tensors
     // f0/uv are already sanitized on the CPU side during data loading
-    let f0AtTime = tensors.f0.sample(playhead)   // [B]
-    let uvAtTime = tensors.uv.sample(playhead)   // [B]
+    let f0AtTime = tensors.f0.sampleRow(playhead)   // [B]
+    let uvAtTime = tensors.uv.sampleRow(playhead)   // [B]
 
     // Harmonic frequencies: harmonicIndices [B, K] * f0 [B] → [B, K]
     let f0Expanded = f0AtTime.reshape([B, 1]).expand([B, K])
@@ -139,7 +139,7 @@ enum DDSPSynth {
     var harmonicOut = harmonic * uvAtTime * smoothedGain
 
     // --- Filtered Noise ---
-    let noiseGainAtTimeRaw = noiseGain2D.sample(playhead)  // [B]
+    let noiseGainAtTimeRaw = noiseGain2D.sampleRow(playhead)  // [B]
     let smoothedNoiseGain = noiseGainAtTimeRaw
 
     if let noiseFilter = controls.noiseFilter {
@@ -147,7 +147,7 @@ enum DDSPSynth {
 
       // Reshape filter taps: [B*F, firK] → [B, F, firK] → [F, B, firK]
       let filter3D = noiseFilter.reshape([B, F, firK]).transpose([1, 0, 2])
-      let filterTapsAtTime = filter3D.sample(playhead)  // [B, firK]
+      let filterTapsAtTime = filter3D.sampleRow(playhead)  // [B, firK]
 
       // Shared noise → buffer → broadcast → per-batch FIR
       let noise = Signal.noise()
