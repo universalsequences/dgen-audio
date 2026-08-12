@@ -23,6 +23,12 @@ struct CompilerOptions {
     /// Host-selected staged toolchain root; `nil` falls back to
     /// `DGEN_TOOLCHAIN_STAGE_ROOT`, then to the development system Clang.
     var toolchainRoot: String? = nil
+    /// Skip the post-compile binary audit entirely; the host process takes
+    /// responsibility for auditing the artifact (e.g. ESeq's Rust audit).
+    var skipInlineAudit: Bool = false
+    /// Explicit path to the audit script for the inline audit; overrides
+    /// DGEN_BINARY_AUDIT_TOOL and the repo-relative fallback.
+    var auditToolPath: String? = nil
     let debug: Bool
 }
 
@@ -86,7 +92,9 @@ func compilePatch(
         throw DGenLazyError.compilationFailed("clang failed (exit \(compile.terminationStatus)): \(errorStr)")
     }
 
-    try DGenBinaryAudit.audit(dylibPath)
+    if !options.skipInlineAudit {
+        try DGenBinaryAudit.audit(dylibPath, auditTool: options.auditToolPath)
+    }
 
     if options.debug {
         let errorStr = String(data: errorData, encoding: .utf8) ?? ""

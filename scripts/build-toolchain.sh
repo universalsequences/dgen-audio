@@ -3,6 +3,17 @@ set -eu
 
 # Reproducible upstream-only DGen toolchain build.
 # No executable or library is copied from Xcode into the staged distribution.
+#
+# --repack: skip the LLVM download/build/stage entirely and regenerate
+# VERSION.json, SIZE.txt, and the compressed archive from the existing staged
+# prefix. Use after metadata-only changes (e.g. bumping
+# toolchain/COMPILER_VERSION) when the binaries are unchanged.
+
+repack=0
+if [ "${1:-}" = "--repack" ]; then
+  repack=1
+  shift
+fi
 
 llvm_version=20.1.8
 llvm_archive="llvm-project-${llvm_version}.src.tar.xz"
@@ -31,14 +42,16 @@ require_tool() {
   }
 }
 
-require_tool cmake
-require_tool curl
-require_tool otool
 require_tool python3
-require_tool patch
 require_tool shasum
-require_tool strings
 require_tool tar
+if [ "${repack}" -eq 0 ]; then
+  require_tool cmake
+  require_tool curl
+  require_tool otool
+  require_tool patch
+  require_tool strings
+fi
 
 case "${source_root}:${build_root}:${stage_root}" in
   *":/:"*|"/:"*|*":/") echo "error: refusing a root-directory build or stage path" >&2; exit 1 ;;
@@ -51,6 +64,24 @@ mkdir -p \
   "$(dirname "${archive_output}")" \
   "$(dirname "${metadata_output}")" \
   "$(dirname "${size_report}")"
+
+if [ "${repack}" -eq 1 ]; then
+  for staged_file in \
+    "${stage_root}/bin/dgen-clang" \
+    "${stage_root}/bin/ld64.lld" \
+    "${stage_root}/lib/libSystem.tbd"; do
+    if [ ! -f "${staged_file}" ]; then
+      echo "error: --repack requires an existing staged prefix; missing: ${staged_file}" >&2
+      exit 1
+    fi
+  done
+  if [ ! -f "${archive_path}" ]; then
+    echo "error: --repack needs the LLVM source download for SIZE.txt bookkeeping: ${archive_path}" >&2
+    exit 1
+  fi
+fi
+
+if [ "${repack}" -eq 0 ]; then
 
 "${repo_root}/scripts/generate-libsystem-stub.sh"
 
@@ -218,6 +249,8 @@ for staged_binary in "${stage_root}/bin/dgen-clang" "${stage_root}/bin/ld64.lld"
   fi
 done
 
+fi  # end of the full-build path skipped by --repack
+
 clang_sha=$(shasum -a 256 "${stage_root}/bin/dgen-clang" | awk '{print $1}')
 lld_sha=$(shasum -a 256 "${stage_root}/bin/ld64.lld" | awk '{print $1}')
 runtime_headers_sha=$(
@@ -229,11 +262,23 @@ runtime_headers_sha=$(
     done |
     shasum -a 256 | awk '{print $1}'
 )
-dgen_compiler_version=$(git -C "${repo_root}" rev-parse HEAD 2>/dev/null || echo unknown)
+# The compiler version is a stable, manually-bumped identifier
+# (toolchain/COMPILER_VERSION), not a git sha: VERSION.json feeds host cache
+# keys, and a transient sha would churn those keys on every dgen commit.
+compiler_version_file="${repo_root}/toolchain/COMPILER_VERSION"
+if [ ! -f "${compiler_version_file}" ]; then
+  echo "error: missing ${compiler_version_file} (single-line compiler version, e.g. abi-v1.1)" >&2
+  exit 1
+fi
+dgen_compiler_version=$(head -n 1 "${compiler_version_file}" | tr -d '[:space:]')
+if [ -z "${dgen_compiler_version}" ]; then
+  echo "error: ${compiler_version_file} is empty" >&2
+  exit 1
+fi
 
 cat > "${stage_root}/VERSION.json" <<EOF
 {
-  "distribution_version": 2,
+  "distribution_version": 3,
   "dgen_abi_version": 1,
   "codegen_policy_version": 1,
   "architecture_lowering_version": 1,
