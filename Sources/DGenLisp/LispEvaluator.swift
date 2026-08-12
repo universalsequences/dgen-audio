@@ -768,177 +768,237 @@ class LispEvaluator {
     return try applyBinaryOp(lhs, rhs, op: op)
   }
 
+  /// Numeric domains, ordered from narrowest to widest. Every binary numeric op
+  /// lifts both operands into the join of their domains and then applies a
+  /// single implementation, so mixed-type combinations (tensor × param signal,
+  /// signalTensor × float, …) all work uniformly instead of needing one switch
+  /// case per (lhs, rhs) pair.
+  private enum NumericDomain: Int {
+    case float = 0
+    case signal = 1
+    case tensor = 2
+    case signalTensor = 3
+  }
+
+  private func numericDomain(of value: EvalResult) -> NumericDomain? {
+    switch value {
+    case .float: return .float
+    case .signal: return .signal
+    case .tensor: return .tensor
+    case .signalTensor: return .signalTensor
+    default: return nil
+    }
+  }
+
+  /// Join of two domains. `signal` mixed with `tensor` is frame-varying, so it
+  /// widens to `signalTensor` rather than to either input domain.
+  private func joinDomains(_ a: NumericDomain, _ b: NumericDomain) -> NumericDomain {
+    if (a == .signal && b == .tensor) || (a == .tensor && b == .signal) {
+      return .signalTensor
+    }
+    return a.rawValue >= b.rawValue ? a : b
+  }
+
+  private func numericDomain(
+    _ lhs: EvalResult, _ rhs: EvalResult, op: String
+  ) throws -> NumericDomain {
+    guard let l = numericDomain(of: lhs), let r = numericDomain(of: rhs) else {
+      throw LispError.typeError(
+        "\(op): operands must be float, signal, tensor, or signalTensor "
+          + "(got \(describeKind(lhs)) and \(describeKind(rhs)))")
+    }
+    return joinDomains(l, r)
+  }
+
+  private func describeKind(_ value: EvalResult) -> String {
+    switch value {
+    case .float: return "float"
+    case .signal: return "signal"
+    case .tensor: return "tensor"
+    case .signalTensor: return "signalTensor"
+    case .tuple: return "tuple"
+    case .none: return "nothing"
+    }
+  }
+
+  /// Per-frame element count of the widest tensor-shaped operand, used to give
+  /// lifted scalars a shape. Scalars stay scalar-shaped in the graph and
+  /// broadcast; the declared shape only drives Swift-side bookkeeping.
+  private func broadcastShapeOf(_ values: [EvalResult]) -> [Int] {
+    var shape: [Int] = []
+    for value in values {
+      switch value {
+      case .tensor(let t): if t.shape.count > shape.count { shape = t.shape }
+      case .signalTensor(let st): if st.shape.count > shape.count { shape = st.shape }
+      default: continue
+      }
+    }
+    return shape
+  }
+
+  private func asSignal(_ value: EvalResult, op: String) throws -> Signal {
+    switch value {
+    case .signal(let s): return s
+    case .float(let f): return Signal.constant(f)
+    default: throw LispError.typeError("\(op): expected a scalar, got \(describeKind(value))")
+    }
+  }
+
+  private func asTensor(_ value: EvalResult, op: String) throws -> Tensor {
+    switch value {
+    case .tensor(let t): return t
+    case .float(let f): return Tensor([f])
+    default:
+      throw LispError.typeError("\(op): expected a constant tensor, got \(describeKind(value))")
+    }
+  }
+
+  /// Lift any numeric value into the frame-varying tensor domain.
+  private func asSignalTensor(
+    _ value: EvalResult, shape: [Int], op: String
+  ) throws -> SignalTensor {
+    switch value {
+    case .signalTensor(let st): return st
+    case .tensor(let t): return SignalTensor.lift(t)
+    case .signal(let s): return SignalTensor.lift(s, shape: shape)
+    case .float(let f): return SignalTensor.lift(Signal.constant(f), shape: shape)
+    default:
+      throw LispError.typeError("\(op): cannot use \(describeKind(value)) as a tensor operand")
+    }
+  }
+
   private func applyBinaryOp(_ lhs: EvalResult, _ rhs: EvalResult, op: String) throws -> EvalResult
   {
-    // Promote floats to signals for operations
     let l = promoteToValue(lhs)
     let r = promoteToValue(rhs)
 
-    switch (l, r) {
-    case (.float(let a), .float(let b)):
+    switch try numericDomain(l, r, op: op) {
+    case .float:
+      let a = try requireFloat(l)
+      let b = try requireFloat(r)
       switch op {
       case "+": return .float(a + b)
       case "-": return .float(a - b)
       case "*": return .float(a * b)
       case "/": return .float(a / b)
+      case "%": return .float(a.truncatingRemainder(dividingBy: b))
+      case "pow": return .float(Foundation.pow(a, b))
+      case "atan2": return .float(Foundation.atan2(a, b))
       case "min": return .float(Swift.min(a, b))
       case "max": return .float(Swift.max(a, b))
+      case "gt": return .float(a > b ? 1 : 0)
+      case "lt": return .float(a < b ? 1 : 0)
+      case "gte": return .float(a >= b ? 1 : 0)
+      case "lte": return .float(a <= b ? 1 : 0)
+      case "eq": return .float(a == b ? 1 : 0)
       default: throw LispError.unknownOperator(op)
       }
 
-    case (.signal(let a), .signal(let b)):
+    case .signal:
+      let a = try asSignal(l, op: op)
+      let b = try asSignal(r, op: op)
       switch op {
       case "+": return .signal(a + b)
       case "-": return .signal(a - b)
       case "*": return .signal(a * b)
       case "/": return .signal(a / b)
+      case "%": return .signal(DGenLazy.mod(a, b))
+      case "pow": return .signal(DGenLazy.pow(a, b))
+      case "atan2": return .signal(DGenLazy.atan2(a, b))
       case "min": return .signal(DGenLazy.min(a, b))
       case "max": return .signal(DGenLazy.max(a, b))
+      case "gt": return .signal(a > b)
+      case "lt": return .signal(a < b)
+      case "gte": return .signal(a >= b)
+      case "lte": return .signal(a <= b)
+      case "eq": return .signal(a.eq(b))
       default: throw LispError.unknownOperator(op)
       }
 
-    case (.tensor(let a), .tensor(let b)):
+    case .tensor:
+      // A float operand stays a scalar constant here (rather than becoming a
+      // 1-element tensor) so no extra tensor buffer lands in the manifest.
+      switch (l, r) {
+      case (.tensor(let a), .float(let b)):
+        switch op {
+        case "+": return .tensor(a + b)
+        case "-": return .tensor(a - b)
+        case "*": return .tensor(a * b)
+        case "/": return .tensor(a / b)
+        case "pow": return .tensor(DGenLazy.pow(a, b))
+        case "min": return .tensor(DGenLazy.min(a, Double(b)))
+        case "max": return .tensor(DGenLazy.max(a, Double(b)))
+        case "gt": return .tensor(a > Double(b))
+        case "lt": return .tensor(a < Double(b))
+        case "gte": return .tensor(a >= Double(b))
+        case "lte": return .tensor(a <= Double(b))
+        case "eq": return .tensor(a.eq(b))
+        default: break
+        }
+      case (.float(let a), .tensor(let b)):
+        switch op {
+        case "+": return .tensor(b + a)
+        case "*": return .tensor(b * a)
+        case "-": return .tensor(a - b)
+        case "/": return .tensor(a / b)
+        case "pow": return .tensor(DGenLazy.pow(a, b))
+        case "min": return .tensor(DGenLazy.min(b, Double(a)))
+        case "max": return .tensor(DGenLazy.max(b, Double(a)))
+        case "gt": return .tensor(Double(a) > b)
+        case "lt": return .tensor(Double(a) < b)
+        case "gte": return .tensor(Double(a) >= b)
+        case "lte": return .tensor(Double(a) <= b)
+        case "eq": return .tensor(b.eq(a))
+        default: break
+        }
+      default:
+        break
+      }
+
+      let a = try asTensor(l, op: op)
+      let b = try asTensor(r, op: op)
       switch op {
       case "+": return .tensor(a + b)
       case "-": return .tensor(a - b)
       case "*": return .tensor(a * b)
       case "/": return .tensor(a / b)
+      case "pow": return .tensor(DGenLazy.pow(a, b))
+      case "atan2": return .tensor(DGenLazy.atan2(a, b))
       case "min": return .tensor(DGenLazy.min(a, b))
       case "max": return .tensor(DGenLazy.max(a, b))
+      case "gt": return .tensor(a > b)
+      case "lt": return .tensor(a < b)
+      case "gte": return .tensor(a >= b)
+      case "lte": return .tensor(a <= b)
+      case "eq": return .tensor(a.eq(b))
+      case "%":
+        // `.mod` has no constant-folding Tensor overload; evaluate it in the
+        // frame-varying domain, which lowers to the same elementwise UOp.
+        return .signalTensor(DGenLazy.mod(SignalTensor.lift(a), SignalTensor.lift(b)))
       default: throw LispError.unknownOperator(op)
       }
 
-    case (.signal(let a), .tensor(let b)):
+    case .signalTensor:
+      let shape = broadcastShapeOf([l, r])
+      let a = try asSignalTensor(l, shape: shape, op: op)
+      let b = try asSignalTensor(r, shape: shape, op: op)
       switch op {
       case "+": return .signalTensor(a + b)
       case "-": return .signalTensor(a - b)
       case "*": return .signalTensor(a * b)
       case "/": return .signalTensor(a / b)
-      default: throw LispError.unknownOperator(op)
-      }
-
-    case (.tensor(let a), .signal(let b)):
-      switch op {
-      case "+": return .signalTensor(a + b)
-      case "-": return .signalTensor(a - b)
-      case "*": return .signalTensor(a * b)
-      case "/": return .signalTensor(a / b)
-      default: throw LispError.unknownOperator(op)
-      }
-
-    case (.signalTensor(let a), .signalTensor(let b)):
-      switch op {
-      case "+": return .signalTensor(a + b)
-      case "-": return .signalTensor(a - b)
-      case "*": return .signalTensor(a * b)
-      case "/": return .signalTensor(a / b)
+      case "%": return .signalTensor(DGenLazy.mod(a, b))
+      case "pow": return .signalTensor(DGenLazy.pow(a, b))
+      case "atan2": return .signalTensor(DGenLazy.atan2(a, b))
       case "min": return .signalTensor(DGenLazy.min(a, b))
       case "max": return .signalTensor(DGenLazy.max(a, b))
+      case "gt": return .signalTensor(a > b)
+      case "lt": return .signalTensor(a < b)
+      case "gte": return .signalTensor(a >= b)
+      case "lte": return .signalTensor(a <= b)
+      case "eq": return .signalTensor(a.eq(b))
       default: throw LispError.unknownOperator(op)
       }
-
-    case (.signalTensor(let a), .signal(let b)):
-      switch op {
-      case "+": return .signalTensor(a + b)
-      case "-": return .signalTensor(a - b)
-      case "*": return .signalTensor(a * b)
-      case "/": return .signalTensor(a / b)
-      default: throw LispError.typeError("Unsupported op \(op) for signalTensor op signal")
-      }
-
-    case (.signal(let a), .signalTensor(let b)):
-      switch op {
-      case "+": return .signalTensor(a + b)
-      case "-": return .signalTensor(a - b)
-      case "*": return .signalTensor(a * b)
-      case "/": return .signalTensor(a / b)
-      default: throw LispError.typeError("Unsupported op \(op) for signal op signalTensor")
-      }
-
-    case (.signalTensor(let a), .tensor(let b)):
-      switch op {
-      case "+": return .signalTensor(a + b)
-      case "-": return .signalTensor(a - b)
-      case "*": return .signalTensor(a * b)
-      default: throw LispError.typeError("Unsupported op \(op) for signalTensor op tensor")
-      }
-
-    case (.tensor(let a), .signalTensor(let b)):
-      switch op {
-      case "+": return .signalTensor(a + b)
-      case "-": return .signalTensor(a - b)
-      case "*": return .signalTensor(a * b)
-      default: throw LispError.typeError("Unsupported op \(op) for tensor op signalTensor")
-      }
-
-    case (.signal(let a), .float(let b)):
-      switch op {
-      case "+": return .signal(a + b)
-      case "-": return .signal(a - b)
-      case "*": return .signal(a * b)
-      case "/": return .signal(a / b)
-      case "min": return .signal(DGenLazy.min(a, Double(b)))
-      case "max": return .signal(DGenLazy.max(a, Double(b)))
-      default: throw LispError.unknownOperator(op)
-      }
-
-    case (.float(let a), .signal(let b)):
-      switch op {
-      case "+": return .signal(b + a)
-      case "-": return .signal(Signal.constant(a) - b)
-      case "*": return .signal(b * a)
-      case "/": return .signal(Signal.constant(a) / b)
-      case "min": return .signal(DGenLazy.min(b, Double(a)))
-      case "max": return .signal(DGenLazy.max(b, Double(a)))
-      default: throw LispError.unknownOperator(op)
-      }
-
-    case (.tensor(let a), .float(let b)):
-      switch op {
-      case "+": return .tensor(a + b)
-      case "-": return .tensor(a - b)
-      case "*": return .tensor(a * b)
-      case "/": return .tensor(a / b)
-      case "min": return .tensor(DGenLazy.min(a, Double(b)))
-      case "max": return .tensor(DGenLazy.max(a, Double(b)))
-      default: throw LispError.unknownOperator(op)
-      }
-
-    case (.float(let a), .tensor(let b)):
-      switch op {
-      case "+": return .tensor(b + a)
-      case "-": return .tensor(Tensor([a]) - b)
-      case "*": return .tensor(b * a)
-      case "/": return .tensor(Tensor([a]) / b)
-      case "min": return .tensor(DGenLazy.min(b, Double(a)))
-      case "max": return .tensor(DGenLazy.max(b, Double(a)))
-      default: throw LispError.unknownOperator(op)
-      }
-
-    case (.signalTensor(let a), .float(let b)):
-      switch op {
-      case "+": return .signalTensor(a + b)
-      case "-": return .signalTensor(a - b)
-      case "*": return .signalTensor(a * b)
-      case "/": return .signalTensor(a / b)
-      case "min": return .signalTensor(DGenLazy.min(a, Double(b)))
-      case "max": return .signalTensor(DGenLazy.max(a, Double(b)))
-      default: throw LispError.typeError("Unsupported op \(op) for signalTensor op float")
-      }
-
-    case (.float(let a), .signalTensor(let b)):
-      switch op {
-      case "+": return .signalTensor(b + a)
-      case "-": return .signalTensor(a - b)
-      case "*": return .signalTensor(b * a)
-      case "/": return .signalTensor(a / b)
-      case "min": return .signalTensor(DGenLazy.min(Double(a), b))
-      case "max": return .signalTensor(DGenLazy.max(Double(a), b))
-      default: throw LispError.typeError("Unsupported op \(op) for float op signalTensor")
-      }
-
-    default:
-      throw LispError.typeError("Cannot apply \(op) to given types")
     }
   }
 
@@ -1044,6 +1104,8 @@ class LispEvaluator {
       case "floor": return .signalTensor(DGenLazy.floor(st))
       case "ceil": return .signalTensor(DGenLazy.ceil(st))
       case "round": return .signalTensor(DGenLazy.round(st))
+      case "tan": return .signalTensor(DGenLazy.tan(st))
+      case "sigmoid": return .signalTensor(DGenLazy.sigmoid(st))
       default: throw LispError.typeError("\(fn) not available for SignalTensor")
       }
 
@@ -1058,90 +1120,24 @@ class LispEvaluator {
     guard args.count == 2 else {
       throw LispError.invalidArgument("pow requires 2 arguments")
     }
-    let base = try promoteToValue(evaluateAST(args[0]))
-    let exp = try promoteToValue(evaluateAST(args[1]))
-
-    switch (base, exp) {
-    case (.float(let a), .float(let b)):
-      return .float(Foundation.pow(a, b))
-    case (.signal(let a), .signal(let b)):
-      return .signal(DGenLazy.pow(a, b))
-    case (.signal(let a), .float(let b)):
-      return .signal(DGenLazy.pow(a, b))
-    case (.float(let a), .signal(let b)):
-      return .signal(DGenLazy.pow(a, b))
-    case (.tensor(let a), .tensor(let b)):
-      return .tensor(DGenLazy.pow(a, b))
-    case (.tensor(let a), .float(let b)):
-      return .tensor(DGenLazy.pow(a, b))
-    case (.float(let a), .tensor(let b)):
-      return .tensor(DGenLazy.pow(a, b))
-    case (.signal(let a), .tensor(let b)):
-      return .signalTensor(DGenLazy.pow(a, b))
-    case (.tensor(let a), .signal(let b)):
-      return .signalTensor(DGenLazy.pow(a, b))
-    case (.signalTensor(let a), .signalTensor(let b)):
-      return .signalTensor(DGenLazy.pow(a, b))
-    case (.signalTensor(let a), .signal(let b)):
-      return .signalTensor(DGenLazy.pow(a, b))
-    case (.signal(let a), .signalTensor(let b)):
-      return .signalTensor(DGenLazy.pow(a, b))
-    case (.signalTensor(let a), .tensor(let b)):
-      return .signalTensor(DGenLazy.pow(a, b))
-    case (.tensor(let a), .signalTensor(let b)):
-      return .signalTensor(DGenLazy.pow(a, b))
-    case (.signalTensor(let a), .float(let b)):
-      return .signalTensor(DGenLazy.pow(a, b))
-    case (.float(let a), .signalTensor(let b)):
-      return .signalTensor(DGenLazy.pow(a, b))
-    default:
-      throw LispError.typeError("pow: unsupported type combination")
-    }
+    return try applyBinaryOp(
+      promoteToValue(evaluateAST(args[0])), promoteToValue(evaluateAST(args[1])), op: "pow")
   }
 
   private func evalMod(_ args: [ASTNode]) throws -> EvalResult {
     guard args.count == 2 else {
       throw LispError.invalidArgument("% requires 2 arguments")
     }
-    let a = try promoteToValue(evaluateAST(args[0]))
-    let b = try promoteToValue(evaluateAST(args[1]))
-
-    switch (a, b) {
-    case (.float(let x), .float(let y)):
-      return .float(x.truncatingRemainder(dividingBy: y))
-    case (.signal(let x), .signal(let y)):
-      return .signal(DGenLazy.mod(x, y))
-    case (.signal(let x), .float(let y)):
-      return .signal(DGenLazy.mod(x, Double(y)))
-    case (.signalTensor(let x), .signalTensor(let y)):
-      return .signalTensor(DGenLazy.mod(x, y))
-    case (.signalTensor(let x), .signal(let y)):
-      return .signalTensor(DGenLazy.mod(x, y))
-    case (.signalTensor(let x), .float(let y)):
-      return .signalTensor(DGenLazy.mod(x, Double(y)))
-    default:
-      throw LispError.typeError("%: unsupported type combination")
-    }
+    return try applyBinaryOp(
+      promoteToValue(evaluateAST(args[0])), promoteToValue(evaluateAST(args[1])), op: "%")
   }
 
   private func evalAtan2(_ args: [ASTNode]) throws -> EvalResult {
     guard args.count == 2 else {
       throw LispError.invalidArgument("atan2 requires 2 arguments (y, x)")
     }
-    let y = try promoteToValue(evaluateAST(args[0]))
-    let x = try promoteToValue(evaluateAST(args[1]))
-    switch (y, x) {
-    case (.float(let a), .float(let b)):
-      return .float(Foundation.atan2(a, b))
-    case (.signal(let a), .signal(let b)):
-      return .signal(DGenLazy.atan2(a, b))
-    case (.tensor(let a), .tensor(let b)):
-      return .tensor(DGenLazy.atan2(a, b))
-    case (.signalTensor(let a), .signalTensor(let b)):
-      return .signalTensor(DGenLazy.atan2(a, b))
-    default:
-      throw LispError.typeError("atan2 operands must have matching scalar/tensor kind")
-    }
+    return try applyBinaryOp(
+      promoteToValue(evaluateAST(args[0])), promoteToValue(evaluateAST(args[1])), op: "atan2")
   }
 
   // MARK: - Comparison
@@ -1150,115 +1146,10 @@ class LispEvaluator {
     guard args.count == 2 else {
       throw LispError.invalidArgument("\(op) requires 2 arguments")
     }
-    let lhs = try promoteToValue(evaluateAST(args[0]))
-    let rhs = try promoteToValue(evaluateAST(args[1]))
-
-    switch (lhs, rhs) {
-    case (.signal(let a), .signal(let b)):
-      switch op {
-      case "gt": return .signal(a > b)
-      case "lt": return .signal(a < b)
-      case "gte": return .signal(a >= b)
-      case "lte": return .signal(a <= b)
-      case "eq": return .signal(a.eq(b))
-      default: throw LispError.unknownOperator(op)
-      }
-    case (.signal(let a), .float(let b)):
-      switch op {
-      case "gt": return .signal(a > Double(b))
-      case "lt": return .signal(a < Double(b))
-      case "gte": return .signal(a >= Double(b))
-      case "lte": return .signal(a <= Double(b))
-      case "eq": return .signal(a.eq(b))
-      default: throw LispError.unknownOperator(op)
-      }
-    case (.float(let a), .signal(let b)):
-      switch op {
-      case "gt": return .signal(Double(a) > b)
-      case "lt": return .signal(Double(a) < b)
-      case "gte": return .signal(Double(a) >= b)
-      case "lte": return .signal(Double(a) <= b)
-      case "eq": return .signal(b.eq(a))
-      default: throw LispError.unknownOperator(op)
-      }
-    case (.float(let a), .float(let b)):
-      switch op {
-      case "gt": return .float(a > b ? 1 : 0)
-      case "lt": return .float(a < b ? 1 : 0)
-      case "gte": return .float(a >= b ? 1 : 0)
-      case "lte": return .float(a <= b ? 1 : 0)
-      case "eq": return .float(a == b ? 1 : 0)
-      default: throw LispError.unknownOperator(op)
-      }
-    case (.tensor(let a), .tensor(let b)):
-      switch op {
-      case "gt": return .tensor(a > b)
-      case "lt": return .tensor(a < b)
-      case "gte": return .tensor(a >= b)
-      case "lte": return .tensor(a <= b)
-      case "eq": return .tensor(a.eq(b))
-      default: throw LispError.unknownOperator(op)
-      }
-    case (.signalTensor(let a), .signalTensor(let b)):
-      switch op {
-      case "gt": return .signalTensor(a > b)
-      case "lt": return .signalTensor(a < b)
-      case "gte": return .signalTensor(a >= b)
-      case "lte": return .signalTensor(a <= b)
-      default: throw LispError.unknownOperator(op)
-      }
-    case (.signalTensor(let a), .signal(let b)):
-      switch op {
-      case "gt": return .signalTensor(a > b)
-      case "lt": return .signalTensor(a < b)
-      case "gte": return .signalTensor(a >= b)
-      case "lte": return .signalTensor(a <= b)
-      default: throw LispError.unknownOperator(op)
-      }
-    case (.signal(let a), .signalTensor(let b)):
-      switch op {
-      case "gt": return .signalTensor(a > b)
-      case "lt": return .signalTensor(a < b)
-      case "gte": return .signalTensor(a >= b)
-      case "lte": return .signalTensor(a <= b)
-      default: throw LispError.unknownOperator(op)
-      }
-    case (.signalTensor(let a), .tensor(let b)):
-      switch op {
-      case "gt": return .signalTensor(a > b)
-      case "lt": return .signalTensor(a < b)
-      case "gte": return .signalTensor(a >= b)
-      case "lte": return .signalTensor(a <= b)
-      default: throw LispError.unknownOperator(op)
-      }
-    case (.tensor(let a), .signalTensor(let b)):
-      switch op {
-      case "gt": return .signalTensor(a > b)
-      case "lt": return .signalTensor(a < b)
-      case "gte": return .signalTensor(a >= b)
-      case "lte": return .signalTensor(a <= b)
-      default: throw LispError.unknownOperator(op)
-      }
-    case (.signalTensor(let a), .float(let b)):
-      switch op {
-      case "gt": return .signalTensor(a > Double(b))
-      case "lt": return .signalTensor(a < Double(b))
-      case "gte": return .signalTensor(a >= Double(b))
-      case "lte": return .signalTensor(a <= Double(b))
-      default: throw LispError.unknownOperator(op)
-      }
-    case (.float(let a), .signalTensor(let b)):
-      switch op {
-      case "gt": return .signalTensor(Double(a) > b)
-      case "lt": return .signalTensor(Double(a) < b)
-      case "gte": return .signalTensor(Double(a) >= b)
-      case "lte": return .signalTensor(Double(a) <= b)
-      default: throw LispError.unknownOperator(op)
-      }
-    default:
-      throw LispError.typeError("Comparison \(op): unsupported type combination")
-    }
+    return try applyBinaryOp(
+      promoteToValue(evaluateAST(args[0])), promoteToValue(evaluateAST(args[1])), op: op)
   }
+
 
   // MARK: - Signal generators
 
@@ -1354,14 +1245,22 @@ class LispEvaluator {
     guard args.count == 3 else {
       throw LispError.invalidArgument("mix requires 3 arguments (a, b, t)")
     }
-    let a = try requireSignal(evaluateAST(args[0]))
-    let b = try requireSignal(evaluateAST(args[1]))
+    let aResult = try promoteToValue(evaluateAST(args[0]))
+    let bResult = try promoteToValue(evaluateAST(args[1]))
     let tResult = try promoteToValue(evaluateAST(args[2]))
-    switch tResult {
-    case .signal(let t): return .signal(Signal.mix(a, b, t))
-    case .float(let t): return .signal(Signal.mix(a, b, t))
-    default: throw LispError.typeError("mix: t must be signal or float")
+
+    // Keep the dedicated scalar lowering (it emits the `.mix` UOp directly).
+    if case .signal(let a) = aResult, case .signal(let b) = bResult {
+      switch tResult {
+      case .signal(let t): return .signal(Signal.mix(a, b, t))
+      case .float(let t): return .signal(Signal.mix(a, b, t))
+      default: break
+      }
     }
+
+    // Otherwise mix elementwise: a + (b - a) * t, through the domain-generic ops.
+    let delta = try applyBinaryOp(bResult, aResult, op: "-")
+    return try applyBinaryOp(aResult, try applyBinaryOp(delta, tResult, op: "*"), op: "+")
   }
 
   // MARK: - Effects
@@ -1625,9 +1524,44 @@ class LispEvaluator {
     guard args.count == 2 else {
       throw LispError.invalidArgument("matmul requires 2 arguments")
     }
-    let a = try requireTensor(evaluateAST(args[0]))
-    let b = try requireTensor(evaluateAST(args[1]))
-    return .tensor(a.matmul(b))
+    let lhs = try evaluateAST(args[0])
+    let rhs = try evaluateAST(args[1])
+
+    func shape(_ value: EvalResult) throws -> [Int] {
+      switch value {
+      case .tensor(let t): return t.shape
+      case .signalTensor(let st): return st.shape
+      default:
+        throw LispError.typeError(
+          "matmul: operands must be tensors or signalTensors, got \(describeKind(value))")
+      }
+    }
+    let aShape = try shape(lhs)
+    let bShape = try shape(rhs)
+    guard aShape.count == 2, bShape.count == 2 else {
+      throw LispError.typeError(
+        "matmul requires 2D operands, got \(aShape.count)D and \(bShape.count)D")
+    }
+    guard aShape[1] == bShape[0] else {
+      throw LispError.typeError(
+        "matmul dimension mismatch: [\(aShape[0]),\(aShape[1])] @ [\(bShape[0]),\(bShape[1])]")
+    }
+
+    // A frame-varying operand keeps the whole product frame-varying. Graph-level
+    // matmul lowers to views + broadcast multiply + axis sum, which are all
+    // shape-generic, so no separate codegen is needed for the signalTensor case.
+    switch (lhs, rhs) {
+    case (.tensor(let a), .tensor(let b)):
+      return .tensor(a.matmul(b))
+    case (.signalTensor(let a), .signalTensor(let b)):
+      return .signalTensor(try a.matmul(b))
+    case (.signalTensor(let a), .tensor(let b)):
+      return .signalTensor(try a.matmul(b))
+    case (.tensor(let a), .signalTensor(let b)):
+      return .signalTensor(try a.matmul(b))
+    default:
+      throw LispError.typeError("matmul: unsupported operand combination")
+    }
   }
 
   private func evalPeek(_ args: [ASTNode]) throws -> EvalResult {
@@ -2531,16 +2465,22 @@ class LispEvaluator {
     guard args.count == 5 else {
       throw LispError.invalidArgument("scale requires 5 arguments (sig inMin inMax outMin outMax)")
     }
-    let sig = try requireSignal(evaluateAST(args[0]))
-    let inMin = try requireSignalOrFloat(evaluateAST(args[1]))
-    let inMax = try requireSignalOrFloat(evaluateAST(args[2]))
-    let outMin = try requireSignalOrFloat(evaluateAST(args[3]))
-    let outMax = try requireSignalOrFloat(evaluateAST(args[4]))
+    // Built from the domain-generic binary ops, so it works for signals,
+    // tensors, and frame-varying tensors alike.
+    let x = try promoteToValue(evaluateAST(args[0]))
+    let inMin = try promoteToValue(evaluateAST(args[1]))
+    let inMax = try promoteToValue(evaluateAST(args[2]))
+    let outMin = try promoteToValue(evaluateAST(args[3]))
+    let outMax = try promoteToValue(evaluateAST(args[4]))
 
     // scale(x, a, b, c, d) = c + (x - a) / (b - a) * (d - c)
-    let normalized = (sig - inMin) / (inMax - inMin)
-    let result = outMin + normalized * (outMax - outMin)
-    return .signal(result)
+    let normalized = try applyBinaryOp(
+      try applyBinaryOp(x, inMin, op: "-"),
+      try applyBinaryOp(inMax, inMin, op: "-"),
+      op: "/")
+    let spanned = try applyBinaryOp(
+      normalized, try applyBinaryOp(outMax, outMin, op: "-"), op: "*")
+    return try applyBinaryOp(outMin, spanned, op: "+")
   }
 
   private func evalTriangle(_ args: [ASTNode]) throws -> EvalResult {
@@ -2548,9 +2488,40 @@ class LispEvaluator {
     guard args.count >= 1 else {
       throw LispError.invalidArgument("triangle requires at least 1 argument (phase)")
     }
-    let phase = try requireSignal(evaluateAST(args[0]))
-    let duty: Signal? = args.count >= 2 ? try requireSignal(evaluateAST(args[1])) : nil
-    return .signal(phase.triangle(duty: duty))
+    let phaseResult = try promoteToValue(evaluateAST(args[0]))
+    let dutyResult: EvalResult? = args.count >= 2 ? try promoteToValue(evaluateAST(args[1])) : nil
+
+    switch phaseResult {
+    case .signal, .float:
+      let phase = try requireSignal(phaseResult)
+      let duty: Signal? = try dutyResult.map { try requireSignal($0) }
+      return .signal(phase.triangle(duty: duty))
+    case .tensor(let t):
+      // A constant phase tensor still yields a constant triangle, but the
+      // composite is built with the frame-varying ops, so keep the result in
+      // the signalTensor domain (same math either way).
+      return try triangleOverSignalTensor(SignalTensor.lift(t), duty: dutyResult)
+    case .signalTensor(let st):
+      return try triangleOverSignalTensor(st, duty: dutyResult)
+    default:
+      throw LispError.typeError(
+        "triangle: phase must be a signal, float, tensor, or signalTensor, "
+          + "got \(describeKind(phaseResult))")
+    }
+  }
+
+  private func triangleOverSignalTensor(
+    _ phase: SignalTensor, duty: EvalResult?
+  ) throws -> EvalResult {
+    guard let duty else { return .signalTensor(phase.triangle()) }
+    switch duty {
+    case .signal(let s): return .signalTensor(phase.triangle(duty: s))
+    case .float(let f): return .signalTensor(phase.triangle(duty: Signal.constant(f)))
+    case .tensor(let t): return .signalTensor(phase.triangle(duty: SignalTensor.lift(t)))
+    case .signalTensor(let st): return .signalTensor(phase.triangle(duty: st))
+    default:
+      throw LispError.typeError("triangle: duty must be numeric, got \(describeKind(duty))")
+    }
   }
 
   private func evalWrap(_ args: [ASTNode]) throws -> EvalResult {
@@ -2585,20 +2556,15 @@ class LispEvaluator {
     guard args.count == 3 else {
       throw LispError.invalidArgument("clip requires 3 arguments (sig, min, max)")
     }
-    let sig = try requireSignal(evaluateAST(args[0]))
+    let value = try promoteToValue(evaluateAST(args[0]))
     let minResult = try promoteToValue(evaluateAST(args[1]))
     let maxResult = try promoteToValue(evaluateAST(args[2]))
 
-    switch (minResult, maxResult) {
-    case (.float(let lo), .float(let hi)):
-      return .signal(sig.clip(Double(lo), Double(hi)))
-    case (.signal(let lo), .signal(let hi)):
-      return .signal(sig.clip(lo, hi))
-    default:
-      let lo = try requireSignal(coerceToSignal(minResult))
-      let hi = try requireSignal(coerceToSignal(maxResult))
-      return .signal(sig.clip(lo, hi))
-    }
+    // clip(x, lo, hi) = max(min(x, hi), lo) — expressed through the
+    // domain-generic ops so tensor / signalTensor inputs work too.
+    let clamped = try applyBinaryOp(
+      try applyBinaryOp(value, maxResult, op: "min"), minResult, op: "max")
+    return clamped
   }
 
   private func evalGswitch(_ args: [ASTNode]) throws -> EvalResult {
@@ -2621,7 +2587,22 @@ class LispEvaluator {
     case (.tensor(let c), .tensor(let va), .tensor(let vb)):
       return .tensor(DGenLazy.gswitch(c, va, vb))
     default:
-      throw LispError.typeError("gswitch: unsupported type combination")
+      // Anything involving a frame-varying tensor is evaluated elementwise in
+      // the signalTensor domain (`.gswitch` is an elementwise, broadcasting op).
+      guard let dc = numericDomain(of: cond), let da = numericDomain(of: a),
+        let db = numericDomain(of: b),
+        joinDomains(joinDomains(dc, da), db) == .signalTensor
+      else {
+        throw LispError.typeError(
+          "gswitch: unsupported operand combination "
+            + "(\(describeKind(cond)), \(describeKind(a)), \(describeKind(b)))")
+      }
+      let shape = broadcastShapeOf([cond, a, b])
+      return .signalTensor(
+        DGenLazy.gswitch(
+          try asSignalTensor(cond, shape: shape, op: "gswitch"),
+          try asSignalTensor(a, shape: shape, op: "gswitch"),
+          try asSignalTensor(b, shape: shape, op: "gswitch")))
     }
   }
 
