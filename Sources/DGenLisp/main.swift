@@ -8,6 +8,8 @@
 //   --voices <count>         Voice count for polyphony (default: 1)
 //   --asset-base <dir>        Base directory for relative tensor/wavetable files
 //   --toolchain-root <dir>   Staged DGen toolchain root (embedded clang/lld)
+//   --skip-inline-audit      Skip the post-compile binary audit (host audits)
+//   --audit-tool <path>      Explicit audit script for the inline audit
 //   --debug                  Debug output
 //   -                        Read from stdin (also default if no file given)
 
@@ -26,6 +28,8 @@ struct CLIArgs {
     var voiceCount: Int = 1
     var assetBase: String? = nil
     var toolchainRoot: String? = nil
+    var skipInlineAudit: Bool = false
+    var auditTool: String? = nil
     var debug: Bool = false
     var readStdin: Bool = false
 }
@@ -60,6 +64,11 @@ func parseArgs(_ args: [String]) -> CLIArgs {
         case "--toolchain-root":
             i += 1
             if i < args.count { cli.toolchainRoot = args[i] }
+        case "--skip-inline-audit":
+            cli.skipInlineAudit = true
+        case "--audit-tool":
+            i += 1
+            if i < args.count { cli.auditTool = args[i] }
         case "--debug":
             cli.debug = true
         case "-":
@@ -98,6 +107,11 @@ func printUsage() {
           --asset-base <dir>        Base directory for relative tensor/wavetable files
           --toolchain-root <dir>   Staged DGen toolchain root (overrides
                                    DGEN_TOOLCHAIN_STAGE_ROOT)
+          --skip-inline-audit      Skip the post-compile binary audit; the
+                                   host process audits the artifact itself
+          --audit-tool <path>      Audit script for the inline audit
+                                   (overrides DGEN_BINARY_AUDIT_TOOL and the
+                                   dgen-checkout fallback)
           --debug                  Debug output
           -                        Read from stdin (also default if no file given)
           -h, --help               Show this help
@@ -175,6 +189,8 @@ func main() throws {
         maxFrames: cli.maxFrames,
         voiceCount: cli.voiceCount,
         toolchainRoot: cli.toolchainRoot,
+        skipInlineAudit: cli.skipInlineAudit,
+        auditToolPath: cli.auditTool,
         debug: cli.debug
     )
 

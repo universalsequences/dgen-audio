@@ -1,9 +1,9 @@
 {
-  "distribution_version": 2,
+  "distribution_version": 3,
   "dgen_abi_version": 1,
   "codegen_policy_version": 1,
   "architecture_lowering_version": 1,
-  "dgen_compiler_version": "phase2-abi-v1",
+  "dgen_compiler_version": "abi-v1.1",
   "llvm_version": "20.1.8",
   "llvm_source_sha256": "6898f963c8e938981e6c4a302e83ec5beb4630147c7311183cf61069af16333d",
   "target": "arm64-apple-macos",
