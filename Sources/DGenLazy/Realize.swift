@@ -116,12 +116,19 @@ public class ExecutionContext {
 extension LazyGraph {
     /// Compile and run the graph, returning the execution context
     func compile(frameCount: Int) throws -> ExecutionContext {
+        lastExecutionTiming = LazyExecutionTiming()
+
         // Use cached compilation if available and not dirty
         let compileFingerprint =
             "\(graph.nodes.count)|\(graph.tensors.count)|\(frameCount)|backend:\(DGenConfig.backend)|gemm:\(DGenConfig.gemmStrategy)|reuse:\(DGenConfig.enableBufferReuse)"
 
         if !isDirty, let cached = compilationCache, let runtime = runtimeCache,
            let fullCached = fullCompilationCache, fullCached.fingerprint == compileFingerprint {
+            lastExecutionTiming.fullCompilationCacheHit = true
+            lastExecutionTiming.runtimeCacheHit = true
+            if timingEnabled {
+                lastExecutionTiming.kernelSourceHashes = [kernelSourceHash(cached.kernels)]
+            }
             return ExecutionContext(compilationResult: cached, runtime: runtime, frameCount: frameCount)
         }
 
@@ -131,10 +138,16 @@ extension LazyGraph {
             compilationCache = cached.result
             runtimeCache = cached.runtime
             isDirty = false
+            lastExecutionTiming.fullCompilationCacheHit = true
+            lastExecutionTiming.runtimeCacheHit = true
+            if timingEnabled {
+                lastExecutionTiming.kernelSourceHashes = [kernelSourceHash(cached.result.kernels)]
+            }
             return ExecutionContext(compilationResult: cached.result, runtime: cached.runtime, frameCount: frameCount)
         }
 
         // Compile the graph
+        let compilationStart = CFAbsoluteTimeGetCurrent()
         let result = try CompilationPipeline.compile(
             graph: graph,
             backend: DGenConfig.backend,
@@ -144,6 +157,8 @@ extension LazyGraph {
                 enableBufferReuse: DGenConfig.enableBufferReuse,
                 gemmStrategy: DGenConfig.gemmStrategy)
         )
+        lastExecutionTiming.compilationMS =
+            (CFAbsoluteTimeGetCurrent() - compilationStart) * 1000
 
         if DGenConfig.debug {
             let kernelCount = result.kernels.count
@@ -158,13 +173,24 @@ extension LazyGraph {
 
         // Reuse cached runtime if kernel sources are identical, otherwise create a new one.
         // Identical topology produces identical MSL each epoch, so we skip MTLLibrary compilation.
-        let kernelHash = kernelSourceHash(result.kernels)
+        let shouldHash = timingEnabled || !runtimeCacheByKernelHash.isEmpty
+        let kernelHash = shouldHash ? kernelSourceHash(result.kernels) : nil
+        if timingEnabled, let kernelHash {
+            lastExecutionTiming.kernelSourceHashes = [kernelHash]
+        }
         let runtime: LazyRuntime
-        if let cached = runtimeCacheByKernelHash[kernelHash] {
+        if let kernelHash, let cached = runtimeCacheByKernelHash[kernelHash] {
             runtime = cached
+            lastExecutionTiming.runtimeCacheHit = true
         } else {
+            let runtimeStart = CFAbsoluteTimeGetCurrent()
             runtime = try createRuntime(from: result, frameCount: frameCount)
-            runtimeCacheByKernelHash[kernelHash] = runtime
+            lastExecutionTiming.runtimeCreationMS =
+                (CFAbsoluteTimeGetCurrent() - runtimeStart) * 1000
+            // Seed the cache after the first compile without paying for hashing
+            // in ordinary single-shot execution.
+            let cacheKey = kernelHash ?? kernelSourceHash(result.kernels)
+            runtimeCacheByKernelHash[cacheKey] = runtime
         }
 
         fullCompilationCache = (fingerprint: compileFingerprint, result: result, runtime: runtime)
@@ -176,13 +202,20 @@ extension LazyGraph {
     }
 
     /// Hash all kernel sources to produce a cache key for runtime reuse
-    private func kernelSourceHash(_ kernels: [CompiledKernel]) -> Int {
-        var hasher = Hasher()
+    private func kernelSourceHash(_ kernels: [CompiledKernel]) -> UInt64 {
+        // Include source boundaries so ["ab", "c"] cannot alias ["a", "bc"].
+        var hash: UInt64 = 14695981039346656037
         for kernel in kernels {
-            hasher.combine(kernel.source)
+            hash ^= UInt64(kernel.source.utf8.count)
+            hash &*= 1099511628211
+            for byte in kernel.source.utf8 {
+                hash ^= UInt64(byte)
+                hash &*= 1099511628211
+            }
         }
-        return hasher.finalize()
+        return hash
     }
+
 
     /// Create a backend-appropriate runtime from compilation output
     private func createRuntime(from result: CompilationResult, frameCount: Int) throws -> LazyRuntime {
@@ -240,7 +273,10 @@ extension LazyGraph {
             injectTensorData(context: context)
             injectSignalParams(context: context)
         }
+        let executionStart = CFAbsoluteTimeGetCurrent()
         context.runtime.runNoCopy(frameCount: context.frameCount)
+        lastExecutionTiming.executionMS =
+            (CFAbsoluteTimeGetCurrent() - executionStart) * 1000
     }
 
     /// Read output buffer

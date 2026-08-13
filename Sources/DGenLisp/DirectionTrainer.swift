@@ -8,12 +8,11 @@
 // projection and a global LR at 2x the legacy production tone LR per
 // BATCH_REFINE_FINDING.
 //
-// Each epoch rebuilds the whole graph (LazyGraphContext.reset + re-evaluate
-// the lowered patch): parameter values live in the CPU-side optimizer state
-// and are written into the fresh graph before backward, which sidesteps the
-// stale-nodeId class of bugs entirely. Preview WAVs are rendered by
-// re-invoking this executable (`train-render`) — realize() must never
-// interleave with backward() in the same process (SPEC.md §5).
+// Each epoch rebuilds the graph and re-evaluates the lowered patch. Compiled
+// artifacts are carried across those resets, while parameter and state memory
+// remain fresh. Preview WAVs are rendered by re-invoking this executable
+// (`train-render`) — realize() must never interleave with backward() in the
+// same process (SPEC.md §5).
 
 import DGen
 import DGenLazy
@@ -80,6 +79,15 @@ enum DirectionTrainer {
     ) throws -> ResultEvent {
         let epochs = min(max(options.epochs ?? defaultEpochs, 1), 2000)
         let crop = patchPlan.plan.cropFrames
+        let previousCachePolicy = LazyGraphContext.preserveCompilationCaches
+        let previousTimingPolicy = LazyGraphContext.collectExecutionTiming
+        LazyGraphContext.preserveCompilationCaches = true
+        LazyGraphContext.collectExecutionTiming =
+            ProcessInfo.processInfo.environment["DGENLISP_TRAIN_TIMING"] == "1"
+        defer {
+            LazyGraphContext.preserveCompilationCaches = previousCachePolicy
+            LazyGraphContext.collectExecutionTiming = previousTimingPolicy
+        }
         let transforms = patchPlan.learnable.map(TransformedParam.init)
 
         // Target: peak-normalize to 0.9, fit to the crop (SPEC.md §4).
@@ -162,11 +170,14 @@ enum DirectionTrainer {
         var result = PhaseResult(initLoss: .infinity, bestLoss: .infinity, bestZ: z)
         let checkpointEvery = options.checkpointEvery ?? defaultCheckpointEvery
         var deadEpochs = 0
+        let timingEnabled =
+            ProcessInfo.processInfo.environment["DGENLISP_TRAIN_TIMING"] == "1"
+
+        configureRuntime(options: options, sampleRate: sampleRate, crop: crop)
 
         for epoch in 1...epochs {
-            configureRuntime(options: options, sampleRate: sampleRate, crop: crop)
             LazyGraphContext.reset()
-
+            let evalStart = CFAbsoluteTimeGetCurrent()
             let evaluator = LispEvaluator()
             do {
                 try evaluator.evaluate(nodes: patchPlan.loweredNodes)
@@ -181,9 +192,14 @@ enum DirectionTrainer {
             guard let output = outputSignal(evaluator: evaluator) else {
                 throw TrainProtocolError("patch lost its channel-0 output during re-evaluation")
             }
+            let lispEvalMS = (CFAbsoluteTimeGetCurrent() - evalStart) * 1000
+
+            let graphBuildStart = CFAbsoluteTimeGetCurrent()
             let targetSignal = Tensor(target).toSignal(maxFrames: crop)
             let loss = multiResolutionSpectralLoss(
                 synth: output, target: targetSignal, frames: crop)
+            let graphBuildMS = (CFAbsoluteTimeGetCurrent() - graphBuildStart) * 1000
+            let epochGraph = LazyGraphContext.current
             let lossValues = try loss.backward(frames: crop)
             let epochLoss = lossValues.reduce(0, +)
             guard epochLoss.isFinite else {
@@ -198,6 +214,7 @@ enum DirectionTrainer {
             // Zero-amplitude dead-start trap: if every gradient is exactly
             // zero (e.g. gain hit 0 and the whole voice is silent), no step
             // can ever recover — stop the phase instead of idling.
+            let optimizerStart = CFAbsoluteTimeGetCurrent()
             let naturalGrads = paramSignals.map { $0.grad?.data ?? 0 }
             if naturalGrads.allSatisfy({ $0 == 0 }) {
                 deadEpochs += 1
@@ -228,6 +245,14 @@ enum DirectionTrainer {
                 z[i] -= lr * mHat / (vHat.squareRoot() + 1e-8)
                 z[i] = Swift.min(Swift.max(z[i], t.zMin), t.zMax)
             }
+            let optimizerMS = (CFAbsoluteTimeGetCurrent() - optimizerStart) * 1000
+
+            if timingEnabled {
+                emitTiming(
+                    phase: name, epoch: epoch, lispEvalMS: lispEvalMS,
+                    graphBuildMS: graphBuildMS, optimizerMS: optimizerMS,
+                    lazy: epochGraph.lastExecutionTiming)
+            }
 
             if epoch % logEvery == 0 || epoch == epochs {
                 try sink.emit(
@@ -253,6 +278,19 @@ enum DirectionTrainer {
             }
         }
         return result
+    }
+
+    private static func emitTiming(
+        phase: String, epoch: Int, lispEvalMS: Double, graphBuildMS: Double,
+        optimizerMS: Double, lazy: LazyExecutionTiming
+    ) {
+        let hashes = lazy.kernelSourceHashes.map { String($0, radix: 16) }.joined(separator: ",")
+        let line = String(
+            format: "[train-timing] phase=%@ epoch=%d lisp_eval_ms=%.3f graph_build_ms=%.3f dgen_compile_ms=%.3f pipeline_create_ms=%.3f gpu_execute_ms=%.3f optimizer_ms=%.3f full_cache_hit=%d runtime_cache_hit=%d kernel_hashes=%@\n",
+            phase, epoch, lispEvalMS, graphBuildMS, lazy.compilationMS,
+            lazy.runtimeCreationMS, lazy.executionMS, optimizerMS,
+            lazy.fullCompilationCacheHit ? 1 : 0, lazy.runtimeCacheHit ? 1 : 0, hashes)
+        FileHandle.standardError.write(Data(line.utf8))
     }
 
     // MARK: - Debug fdcheck

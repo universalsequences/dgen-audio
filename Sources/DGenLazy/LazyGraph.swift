@@ -5,6 +5,19 @@
 
 import DGen
 
+/// Timing for the most recent lazy compilation/execution. This is intentionally
+/// lightweight so CLI clients can report profiling without enabling verbose DGen debug output.
+public struct LazyExecutionTiming {
+  public internal(set) var compilationMS: Double = 0
+  public internal(set) var runtimeCreationMS: Double = 0
+  public internal(set) var executionMS: Double = 0
+  public internal(set) var fullCompilationCacheHit = false
+  public internal(set) var runtimeCacheHit = false
+  public internal(set) var kernelSourceHashes: [UInt64] = []
+
+  public init() {}
+}
+
 /// Weak reference wrapper for tracking tensors/signals without preventing deallocation
 internal class WeakRef<T: AnyObject> {
   weak var value: T?
@@ -39,7 +52,11 @@ public class LazyGraph {
 
   /// Metal runtime (MTLLibrary + pipeline states) cached by kernel source hash.
   /// Persists across graph clears since identical topology produces identical kernels.
-  internal var runtimeCacheByKernelHash: [Int: LazyRuntime] = [:]
+  internal var runtimeCacheByKernelHash: [UInt64: LazyRuntime] = [:]
+
+  /// Profiling data for the last execution.
+  public internal(set) var lastExecutionTiming = LazyExecutionTiming()
+  internal var timingEnabled = false
 
   /// Full compilation cache keyed by graph fingerprint (node count, tensor count, frame count).
   /// Skips both DGen compilation and runtime creation when topology is unchanged across epochs.
@@ -196,6 +213,17 @@ public class LazyGraph {
 /// Thread-local default graph for implicit graph management
 /// Each thread gets its own graph to avoid concurrency issues
 public class LazyGraphContext {
+  /// Opt-in cache carry-over for workloads which deliberately rebuild an identical
+  /// topology in fresh graphs. Disabled by default so compile and test callers keep
+  /// reset's historical isolation semantics.
+  public static var preserveCompilationCaches = false
+
+  /// Enables detailed timing/hash collection for the current graph. Hashing very
+  /// large generated kernels is deliberately skipped unless this is enabled.
+  public static var collectExecutionTiming = false {
+    didSet { _current?.timingEnabled = collectExecutionTiming }
+  }
+
   /// The current default graph (thread-local via static)
   /// Internal so DGenConfig.didSet can propagate changes
   internal static var _current: LazyGraph?
@@ -204,6 +232,7 @@ public class LazyGraphContext {
   public static var current: LazyGraph {
     if _current == nil {
       _current = LazyGraph()
+      _current?.timingEnabled = collectExecutionTiming
     }
     return _current!
   }
@@ -215,8 +244,14 @@ public class LazyGraphContext {
 
   /// Reset to a fresh graph
   public static func reset() {
-    // Clear the parameter registry when resetting graph
+    // Clear the parameter registry when resetting graph. Only compiled artifacts,
+    // never memory contents or parameter objects, may cross this boundary.
+    let carriedRuntimeCache =
+      preserveCompilationCaches ? (_current?.runtimeCacheByKernelHash ?? [:]) : [:]
     _current?.parameterRegistry.clear()
-    _current = LazyGraph()
+    let fresh = LazyGraph()
+    fresh.runtimeCacheByKernelHash = carriedRuntimeCache
+    fresh.timingEnabled = collectExecutionTiming
+    _current = fresh
   }
 }
