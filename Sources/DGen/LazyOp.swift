@@ -317,6 +317,7 @@ public enum LazyOp {
   case noise(CellID)
   case tensorNoise(CellID, CellID, Int)  // stateCell, outputCell, size — N independent random values per frame
   case hopTensorNoise(CellID, CellID, Int)  // stateCell, outputCell, size — regenerates only on hop boundaries (counter input == 0), holds between hops
+  case delayLine(CellID, CellID, CellID, Shape, Int)  // bufferCell, writePosCell, outputCell, elementShape, maxDelay — per-lane interpolated delay lines for tensor signals
   case spectrumDelay(CellID, CellID, CellID, Int, Int)  // ringCell, rowCell, outputCell, N, hops — N-bin spectrum from `hops` hops ago
   case spectrumDelayMod(CellID, CellID, CellID, Int, Int)  // ringCell, rowCell, outputCell, N, maxHops — fractional delay driven by a scalar `delay` input (0..maxHops)
   case constant(Float)
@@ -442,6 +443,11 @@ public enum LazyOp {
       .spectrumDelayMod(let ringCell, let rowCell, let outputCell, _, _):
       return [ringCell, rowCell, outputCell]
 
+    // Per-lane delay lines: sample ring, shared write head, and the output
+    // cell downstream tensor reads resolve against.
+    case .delayLine(let bufferCell, let writePosCell, let outputCell, _, _):
+      return [bufferCell, writePosCell, outputCell]
+
     // Overlap-add output ring, read cursor and hop counter.
     case .overlapAdd(_, _, let outputRingCell, let readPosCell, let counterCell):
       return [outputRingCell, readPosCell, counterCell]
@@ -485,6 +491,7 @@ public enum LazyOp {
       .partitionedSpectralConvolve,
       .tensorNoise,
       .hopTensorNoise,
+      .delayLine,
       .spectrumDelay,
       .spectrumDelayMod,
       .gemm, .gemmStaged, .gemmChunkPartials, .gemmStagedChunkPartials,

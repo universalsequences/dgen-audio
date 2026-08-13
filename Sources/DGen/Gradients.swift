@@ -819,6 +819,11 @@ extension LazyOp {
     case .hopTensorNoise(_, _, _):
       return []
 
+    case .delayLine(_, _, _, _, _):
+      // Non-differentiable for now (same stance as spectrumDelay): the
+      // forward ring indexing has no registered adjoint.
+      return []
+
     case .spectrumDelay(_, _, _, _, _):
       return []
 

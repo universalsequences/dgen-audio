@@ -1143,17 +1143,21 @@ extension Signal {
   /// let delayed = audio.delay(Signal.constant(4410))  // 100ms at 44.1kHz
   /// ```
   ///
-  /// - Parameter delayTimeInSamples: Delay time in samples (0 to 88000)
+  /// - Parameters:
+  ///   - delayTimeInSamples: Delay time in samples (0 to maxDelay)
+  ///   - maxDelay: circular buffer length in samples (default 88000, the
+  ///     historical scalar buffer size — the default path is byte-for-byte
+  ///     identical to the pre-`maxDelay` implementation)
   /// - Returns: Delayed signal
-  public func delay(_ delayTimeInSamples: Signal) -> Signal {
-    let nodeId = graph.graph.delay(self.nodeId, delayTimeInSamples.nodeId)
+  public func delay(_ delayTimeInSamples: Signal, maxDelay: Int = 88000) -> Signal {
+    let nodeId = graph.graph.delay(self.nodeId, delayTimeInSamples.nodeId, maxDelay: maxDelay)
     let needsGrad = requiresGrad || delayTimeInSamples.requiresGrad
     return Signal(nodeId: nodeId, graph: graph, requiresGrad: needsGrad)
   }
 
   /// Delay with Float parameter
-  public func delay(_ delayTimeInSamples: Float) -> Signal {
-    return delay(Signal.constant(delayTimeInSamples))
+  public func delay(_ delayTimeInSamples: Float, maxDelay: Int = 88000) -> Signal {
+    return delay(Signal.constant(delayTimeInSamples), maxDelay: maxDelay)
   }
 }
 
@@ -1275,19 +1279,61 @@ extension SignalTensor {
       release: Signal.constant(release))
   }
 
-  /// Delay applied element-wise to each signal in the tensor.
+  /// Default per-lane buffer length for tensor delays, in samples (~1s at
+  /// 48kHz). Deliberately smaller than the scalar delay's 88000: memory cost
+  /// is `lanes * maxDelay` floats, so an unbounded default gets expensive
+  /// fast (16 lanes × 88000 = 5.6MB). Override per call site (dgenlisp:
+  /// `@max-delay`) when longer lines are needed.
+  public static let defaultMaxDelay = 48000
+
+  /// Delay applied element-wise: each tensor lane gets its own interpolated
+  /// delay line, with a broadcast scalar delay time.
   ///
-  /// - Parameter delayTimeInSamples: Delay time in samples (0 to 88000)
+  /// - Parameters:
+  ///   - delayTimeInSamples: Delay time in samples, clamped to `[0, maxDelay - 1]`
+  ///   - maxDelay: per-lane circular buffer length in samples
   /// - Returns: Delayed signal tensor (same shape)
-  public func delay(_ delayTimeInSamples: Signal) -> SignalTensor {
-    let nodeId = graph.graph.delay(self.nodeId, delayTimeInSamples.nodeId)
+  public func delay(
+    _ delayTimeInSamples: Signal, maxDelay: Int = SignalTensor.defaultMaxDelay
+  ) -> SignalTensor {
+    let nodeId = graph.graph.tensorDelay(
+      self.nodeId, delayTimeInSamples.nodeId, elementShape: shape, maxDelay: maxDelay)
+    let needsGrad = requiresGrad || delayTimeInSamples.requiresGrad
+    return SignalTensor(nodeId: nodeId, graph: graph, shape: shape, requiresGrad: needsGrad)
+  }
+
+  /// Delay with per-lane delay times (the classic multichannel move).
+  /// The time tensor's shape must match the audio tensor's shape.
+  public func delay(
+    _ delayTimeInSamples: SignalTensor, maxDelay: Int = SignalTensor.defaultMaxDelay
+  ) -> SignalTensor {
+    precondition(
+      delayTimeInSamples.shape == shape,
+      "per-lane delay times must match audio shape (\(delayTimeInSamples.shape) vs \(shape))")
+    let nodeId = graph.graph.tensorDelay(
+      self.nodeId, delayTimeInSamples.nodeId, elementShape: shape, maxDelay: maxDelay)
+    let needsGrad = requiresGrad || delayTimeInSamples.requiresGrad
+    return SignalTensor(nodeId: nodeId, graph: graph, shape: shape, requiresGrad: needsGrad)
+  }
+
+  /// Delay with per-lane constant delay times.
+  public func delay(
+    _ delayTimeInSamples: Tensor, maxDelay: Int = SignalTensor.defaultMaxDelay
+  ) -> SignalTensor {
+    precondition(
+      delayTimeInSamples.shape == shape,
+      "per-lane delay times must match audio shape (\(delayTimeInSamples.shape) vs \(shape))")
+    let nodeId = graph.graph.tensorDelay(
+      self.nodeId, delayTimeInSamples.nodeId, elementShape: shape, maxDelay: maxDelay)
     let needsGrad = requiresGrad || delayTimeInSamples.requiresGrad
     return SignalTensor(nodeId: nodeId, graph: graph, shape: shape, requiresGrad: needsGrad)
   }
 
   /// Delay with Float parameter
-  public func delay(_ delayTimeInSamples: Float) -> SignalTensor {
-    return delay(Signal.constant(delayTimeInSamples))
+  public func delay(
+    _ delayTimeInSamples: Float, maxDelay: Int = SignalTensor.defaultMaxDelay
+  ) -> SignalTensor {
+    return delay(Signal.constant(delayTimeInSamples), maxDelay: maxDelay)
   }
 }
 
