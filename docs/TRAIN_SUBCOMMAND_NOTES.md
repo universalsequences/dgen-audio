@@ -1,5 +1,41 @@
 # `dgenlisp train` — implementation notes, deviations, punts
 
+## Post-landing findings (monologue-bass shakedown, 2026-08-13)
+
+Fitting a real eseq-style monologue patch to `Assets/monologue-bass.wav`
+surfaced and fixed, in order:
+
+1. **Modulated-param machinery**: `@modulator` inlets must stay input
+   inlets (silent = no modulation); `@mod` params are stripped before
+   lowering (`(mod x)` == `x` with silent modulators) because their
+   generated kernels miscompile in the training pipeline.
+2. **Pitch detach is value-level, not edge-level**: gradient is blocked
+   into any node used as a phasor frequency input, at every use —
+   otherwise Adam's normalized steps walk tuning params audibly off pitch
+   on residual PolyBLEP-dt gradients (vco2_interval drifted -12 -> -11.22
+   semitones before this fix).
+3. **Coordinates**: all params train range-normalized ([0,1], log-space
+   for wide positive ranges), LR 5e-3 = 0.5% of range/step; raw natural
+   coordinates left wide knobs untrainable and narrow knobs hot. A phase
+   stops after 3 all-zero-gradient epochs (zero-amplitude dead-start trap).
+4. **THE big one — history-write BPTT truncation (library bug, fixed in
+   Sources/DGen/Gradients.swift)**: unconsumed `historyWrite` nodes were
+   pruned from the reverse walk, so the temporal carry never flowed into
+   the written expression. Any lisp-built state filter (`(write-history ...)`
+   statement form) got truncated coefficient gradients — the SVF macro's
+   cutoff gradient was SIGN-FLIPPED vs finite difference. Swift voices had
+   dodged this via the pass-through-write idiom (biquad B1 bug class).
+   History writes are now always-live backward roots. Reproducers +
+   verification via the `DGENLISP_TRAIN_FDCHECK=<params|all>` env harness
+   in DirectionTrainer (runs FD vs autograd through the real trainer loss,
+   then stops).
+
+Result on the monologue patch after all fixes: 26.9% improvement,
+abs 4.10 (from 5.61), basin ok, deltas musically coherent; residual is
+extra resonant-sweep character vs the cleaner target — the known
+res/shape quasi-degenerate direction. `--checkpoint-every N` supports
+short audible confirm runs.
+
 Status: Phases A–C landed (protocol layer, real plan event, E4 direction
 trainer). Companion to the eseq repo's `docs/patch-learn-spec.md` (rev 1).
 Items marked **SPEC-SYNC** need the spec updated to match (or the code
