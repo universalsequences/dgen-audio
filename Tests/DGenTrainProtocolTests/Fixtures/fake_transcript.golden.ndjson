@@ -1,0 +1,11 @@
+{"crop_frames":32768,"frozen":[{"name":"f0","reason":"f0-adjoint-unreliable"}],"gate_frames":8820,"learnable":["ratio","sinefm"],"pitch_hz":110,"seed_echo":{"ratio":0.05,"sinefm":0.06},"type":"plan","unsupported":[]}
+{"name":"train","total":60,"type":"stage"}
+{"epoch":10,"loss":0.224286,"params":{"ratio":0.089347,"sinefm":0.099347},"total":60,"type":"epoch"}
+{"epoch":20,"loss":0.140758,"params":{"ratio":0.113212,"sinefm":0.123212},"total":60,"type":"epoch"}
+{"epoch":25,"type":"checkpoint","wav":"<job-dir>/epoch0025.wav"}
+{"epoch":30,"loss":0.090096,"params":{"ratio":0.127687,"sinefm":0.137687},"total":60,"type":"epoch"}
+{"epoch":40,"loss":0.059367,"params":{"ratio":0.136466,"sinefm":0.146466},"total":60,"type":"epoch"}
+{"epoch":50,"loss":0.04073,"params":{"ratio":0.141792,"sinefm":0.151792},"total":60,"type":"epoch"}
+{"epoch":50,"type":"checkpoint","wav":"<job-dir>/epoch0050.wav"}
+{"epoch":60,"loss":0.029425,"params":{"ratio":0.145021,"sinefm":0.155021},"total":60,"type":"epoch"}
+{"abs_distance":0.029425,"basin_check":"ok","deltas":{"ratio":{"from":0.05,"to":0.145021},"sinefm":{"from":0.06,"to":0.155021}},"final_wav":"<job-dir>/final.wav","improvement_pct":91.871547,"type":"result"}

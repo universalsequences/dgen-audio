@@ -14,7 +14,18 @@
 //   -                        Read from stdin (also default if no file given)
 
 import DGenLazy
+import DGenTrainProtocol
 import Foundation
+
+// The train subcommand has its own protocol-owning argument parser and
+// never returns (it owns stdout and the exit code). Route before the
+// compile-oriented parser can touch the arguments.
+if CommandLine.arguments.count > 1 && CommandLine.arguments[1] == "train" {
+    TrainCommand.run(
+        arguments: Array(CommandLine.arguments.dropFirst(2)),
+        realTrainer: nil  // Phase C wires the Metal trainer here
+    )
+}
 
 // MARK: - Argument parsing
 
@@ -97,6 +108,10 @@ func parseArgs(_ args: [String]) -> CLIArgs {
 func printUsage() {
     let usage = """
         Usage: dgenlisp compile [<file.lisp>] [options]
+               dgenlisp train --patch <dsp.lisp> --target <sample.wav> \\
+                              --seed-params <seed.json> --job-dir <dir> \\
+                              [--mode direction] [--epochs N] \\
+                              [--gate-frames N] [--pitch-hz F]
 
         Options:
           -o, --output <dir>       Output directory (default: .)

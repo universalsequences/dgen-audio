@@ -66,8 +66,12 @@ let package = Package(
         ),
         .executableTarget(
             name: "DGenLisp",
-            dependencies: ["DGenLazy"],
+            dependencies: ["DGenLazy", "DGenTrainProtocol"],
             path: "Sources/DGenLisp"
+        ),
+        .target(
+            name: "DGenTrainProtocol",
+            path: "Sources/DGenTrainProtocol"
         ),
         .target(
             name: "DGenLazy",
@@ -85,8 +89,14 @@ let package = Package(
         ),
         .testTarget(
             name: "DGenLispTests",
-            dependencies: ["DGenLisp", "DGenLazy"],
+            dependencies: ["DGenLisp", "DGenLazy", "DGenTrainProtocol"],
             path: "Tests/DGenLispTests"
+        ),
+        .testTarget(
+            name: "DGenTrainProtocolTests",
+            dependencies: ["DGenTrainProtocol"],
+            path: "Tests/DGenTrainProtocolTests",
+            resources: [.copy("Fixtures")]
         ),
     ]
 )
