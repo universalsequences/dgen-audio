@@ -57,6 +57,45 @@ extension LazyGraph {
         return found
     }
 
+    /// Param cells with at least one gradient-live path to `signal` under
+    /// the detached-phasor-frequency policy: phasor inputs are never
+    /// traversed (their gradients are severed), while history feedback IS
+    /// traversed (BPTT carry cells propagate gradients through
+    /// read-history by following the matching history writes).
+    public func gradientReachableParamCells(from signal: Signal) -> Set<CellID> {
+        // Pre-index history writes by cell so reads can jump to them.
+        var writesByCell: [CellID: [NodeID]] = [:]
+        for (id, node) in graph.nodes {
+            switch node.op {
+            case .historyWrite(let cell), .historyReadWrite(let cell):
+                writesByCell[cell, default: []].append(id)
+            default:
+                break
+            }
+        }
+
+        var cells: Set<CellID> = []
+        var stack = [signal.nodeId]
+        var seen: Set<NodeID> = []
+        while let id = stack.popLast() {
+            guard seen.insert(id).inserted, let node = graph.nodes[id] else { continue }
+            switch node.op {
+            case .param(let cell):
+                cells.insert(cell)
+            case .phasor, .deterministicPhasor:
+                continue  // detached: gradient never crosses into the inputs
+            case .historyRead(let cell), .historyReadWrite(let cell):
+                stack.append(contentsOf: node.inputs)
+                stack.append(contentsOf: writesByCell[cell] ?? [])
+                continue
+            default:
+                break
+            }
+            stack.append(contentsOf: node.inputs)
+        }
+        return cells
+    }
+
     private func visitAncestors(of root: NodeID, _ visit: (Node) -> Void) {
         var stack = [root]
         var seen: Set<NodeID> = []

@@ -31,7 +31,12 @@ struct PatchPlan {
 
 enum TrainPlanner {
     /// Freeze/refuse reasons (stable strings — the host displays them).
-    static let reasonF0 = "f0-adjoint-unreliable"
+    /// Pitch-only params: training runs with stop-gradient at phasor
+    /// frequency inputs (DGenGradientConfig.detachPhasorFrequency), so a
+    /// param whose every path to the output crosses a frequency input
+    /// provably receives zero gradient. Pitch is never learned.
+    static let reasonPitchDetached = "pitch-path-detached"
+    static let reasonNoGradPath = "no-gradient-path"
     static let reasonMissingBounds = "missing-bounds"
     static let reasonGenerated = "generated-param"
     static let reasonHidden = "hidden-param"
@@ -79,6 +84,13 @@ enum TrainPlanner {
         }
 
         let analysis = LazyGraphContext.current.analyzePhasorFrequencies()
+        let gradReachable: Set<CellID>
+        if let output = (evaluator.outputs.first { $0.channel == 0 } ?? evaluator.outputs.first) {
+            gradReachable = LazyGraphContext.current.gradientReachableParamCells(
+                from: output.signal)
+        } else {
+            gradReachable = []
+        }
 
         var learnable: [LearnableParam] = []
         var frozen: [ParamVerdict] = []
@@ -91,10 +103,13 @@ enum TrainPlanner {
                 frozen.append(ParamVerdict(name: param.name, reason: reasonHidden))
                 continue
             }
-            if let cell = param.cellId, analysis.frequencyParamCells.contains(cell) {
-                // Swept f0 fails fdcheck; trainable statefulPhasor frequency
-                // corrupts other params' gradients ~10x. Freeze, don't guess.
-                frozen.append(ParamVerdict(name: param.name, reason: reasonF0))
+            if let cell = param.cellId, !gradReachable.contains(cell) {
+                // Zero gradient by construction. Distinguish "all paths
+                // cross a detached phasor frequency" from "not connected".
+                let reason =
+                    analysis.frequencyParamCells.contains(cell)
+                    ? reasonPitchDetached : reasonNoGradPath
+                frozen.append(ParamVerdict(name: param.name, reason: reason))
                 continue
             }
             guard let minBound = param.min, let maxBound = param.max, minBound < maxBound else {

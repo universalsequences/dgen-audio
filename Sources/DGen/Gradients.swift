@@ -657,6 +657,11 @@ extension LazyOp {
     // MARK: Stateful Operations
 
     case .phasor(_):
+      if DGenGradientConfig.detachPhasorFrequency {
+        // Stop-gradient policy (see DGenGradientConfig): identity forward,
+        // no gradient through the frequency (or reset) input.
+        return [nil, nil]
+      }
       let gradFreq = temporalIncrementGradient(
         graph: g,
         node: node,
@@ -666,6 +671,9 @@ extension LazyOp {
       return [gradFreq, zero]
 
     case .deterministicPhasor:
+      if DGenGradientConfig.detachPhasorFrequency {
+        return node.inputs.map { _ in nil }
+      }
       // d(phase)/d(freq) = frameIndex / sampleRate
       // Similar to phasor but stateless
       let sampleRate = g.n(.hostSampleRate, [])

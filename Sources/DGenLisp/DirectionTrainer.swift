@@ -241,6 +241,9 @@ enum DirectionTrainer {
         DGenConfig.maxFrameCount = crop
         DGenConfig.defaultFrameCount = crop
         DGenSpectralConfig.logMagnitudeEpsilon = logEpsilon
+        // Stop-gradient at phasor frequency inputs: forward unchanged,
+        // no gradient through pitch (matches the plan's freeze verdict).
+        DGenGradientConfig.detachPhasorFrequency = true
     }
 
     static func learnableSignals(

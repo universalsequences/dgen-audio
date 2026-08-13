@@ -9,6 +9,16 @@ public enum DGenGradientConfig {
   /// Can be enabled for experiments via `DGEN_FAST_PEEKROW_GRAD=1`.
   public static var useFastPeekRowGradReduce: Bool =
     (ProcessInfo.processInfo.environment["DGEN_FAST_PEEKROW_GRAD"] == "1")
+
+  /// `true`: stop-gradient at every phasor frequency input. The forward
+  /// graph is unchanged (pitch modulation still sounds), but no gradient
+  /// flows through oscillator frequency — the swept-f0 adjoint fails
+  /// fdcheck (~0.47 rel error) and a trainable phasor frequency corrupts
+  /// OTHER params' gradients ~10x (SVFBPTTScratchTests TrainableDetune).
+  /// Params whose only influence is through frequency simply receive zero
+  /// gradient; params with mixed paths train on their non-pitch component.
+  /// Set by `dgenlisp train`; defaults off for all other uses.
+  public static var detachPhasorFrequency: Bool = false
 }
 
 /// Runtime knobs for spectral loss semantics.
