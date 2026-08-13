@@ -23,9 +23,11 @@ import Foundation
 enum DirectionTrainer {
     static let defaultEpochs = 300
     static let logEvery = 10
-    static let checkpointEvery = 25
-    /// 2x legacy production toneLR (1e-2), per BATCH_REFINE_FINDING.
-    static let transformedLR: Float = 2e-2
+    static let defaultCheckpointEvery = 25
+    /// Range-normalized coordinates: 0.5% of a knob's range per Adam step
+    /// (2e-2 railed wide params in ~50 steps and slammed gain into the
+    /// zero-amplitude dead-start trap on the monologue fit).
+    static let transformedLR: Float = 5e-3
     static let gradClip: Float = 1.0
     /// Cold restart beats the seeded run "decisively" below this ratio.
     static let basinDecisiveRatio: Float = 0.75
@@ -47,23 +49,25 @@ enum DirectionTrainer {
             useLog = p.min > 0 && p.max / p.min >= 8
         }
 
-        // Linear params train span-normalized (z in [0,1]) so an Adam step
-        // of `lr` uniformly means "lr fraction of the range": raw natural
-        // coordinates make wide knobs (e.g. a +/-5000 Hz env amount)
-        // untrainable and narrow knobs hot under Adam's normalized steps.
-        // Log params train in log(natural) as before.
-        var span: Float { max - min }
+        // All params train span-normalized: z in [0,1] across the declared
+        // range (in log space for wide positive ranges, linear otherwise),
+        // so an Adam step of `lr` uniformly means "lr fraction of the
+        // range". Raw natural coordinates make wide knobs untrainable and
+        // narrow knobs hot under Adam's normalized steps.
+        var span: Float { useLog ? log(max) - log(min) : max - min }
 
         func toZ(_ natural: Float) -> Float {
-            useLog ? log(natural) : (natural - min) / span
+            useLog ? (log(natural) - log(min)) / span : (natural - min) / span
         }
         func fromZ(_ z: Float) -> Float {
-            let natural = useLog ? exp(z) : min + z * span
+            let natural = useLog ? exp(log(min) + z * span) : min + z * span
             return Swift.min(Swift.max(natural, min), max)
         }
-        func dNaturalDZ(_ z: Float) -> Float { useLog ? exp(z) : span }
-        var zMin: Float { useLog ? log(min) : 0 }
-        var zMax: Float { useLog ? log(max) : 1 }
+        func dNaturalDZ(_ z: Float) -> Float {
+            useLog ? fromZ(z) * span : span
+        }
+        var zMin: Float { 0 }
+        var zMax: Float { 1 }
     }
 
     static func train(
@@ -145,6 +149,8 @@ enum DirectionTrainer {
         var m = [Float](repeating: 0, count: z.count)
         var v = [Float](repeating: 0, count: z.count)
         var result = PhaseResult(initLoss: .infinity, bestLoss: .infinity, bestZ: z)
+        let checkpointEvery = options.checkpointEvery ?? defaultCheckpointEvery
+        var deadEpochs = 0
 
         for epoch in 1...epochs {
             configureRuntime(options: options, sampleRate: sampleRate, crop: crop)
@@ -178,12 +184,29 @@ enum DirectionTrainer {
                 result.bestZ = z
             }
 
+            // Zero-amplitude dead-start trap: if every gradient is exactly
+            // zero (e.g. gain hit 0 and the whole voice is silent), no step
+            // can ever recover — stop the phase instead of idling.
+            let naturalGrads = paramSignals.map { $0.grad?.data ?? 0 }
+            if naturalGrads.allSatisfy({ $0 == 0 }) {
+                deadEpochs += 1
+                if deadEpochs >= 3 {
+                    FileHandle.standardError.write(
+                        Data(
+                            "[train] \(name): all gradients zero for \(deadEpochs) epochs (silent voice?); stopping phase at epoch \(epoch)\n"
+                                .utf8))
+                    break
+                }
+            } else {
+                deadEpochs = 0
+            }
+
             // Adam in transformed coordinates, cosine LR decay
             // (Trainer.swift convention), per-param clip, bounds projection.
             let progress = Float(epoch - 1) / Float(max(epochs - 1, 1))
             let lr = transformedLR * (0.05 + 0.95 * 0.5 * (1 + cos(.pi * progress)))
             for (i, t) in transforms.enumerated() {
-                let gNatural = paramSignals[i].grad?.data ?? 0
+                let gNatural = naturalGrads[i]
                 var g = gNatural * t.dNaturalDZ(z[i])
                 if !g.isFinite { g = 0 }
                 g = Swift.min(Swift.max(g, -gradClip), gradClip)
@@ -204,6 +227,7 @@ enum DirectionTrainer {
                                 .mapValues(Double.init))))
             }
             if emitCheckpoints, epoch % checkpointEvery == 0, epoch < epochs {
+                // (cadence: --checkpoint-every, default 25)
                 let wav = jobDir.epochWav(epoch)
                 do {
                     try renderViaSubprocess(

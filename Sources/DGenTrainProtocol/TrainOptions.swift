@@ -12,6 +12,8 @@ public struct TrainOptions: Equatable {
     public var epochs: Int?
     /// nil = derive from the target's amplitude envelope (spec §6).
     public var gateFrames: Int?
+    /// Preview WAV cadence; nil = trainer default (25).
+    public var checkpointEvery: Int?
     /// nil = CPU pitch estimate from the target (spec §6).
     public var pitchHz: Double?
 
@@ -48,6 +50,7 @@ public struct TrainOptions: Equatable {
         var mode = "direction"
         var epochs: Int?
         var gateFrames: Int?
+        var checkpointEvery: Int?
         var pitchHz: Double?
         var planOnly = false
         var backend = "metal"
@@ -76,6 +79,7 @@ public struct TrainOptions: Equatable {
             case "--mode": mode = try value(arg)
             case "--epochs": epochs = try intValue(arg)
             case "--gate-frames": gateFrames = try intValue(arg)
+            case "--checkpoint-every": checkpointEvery = try intValue(arg)
             case "--pitch-hz":
                 let raw = try value(arg)
                 guard let v = Double(raw) else {
@@ -111,6 +115,7 @@ public struct TrainOptions: Equatable {
         options.mode = mode
         options.epochs = epochs
         options.gateFrames = gateFrames
+        options.checkpointEvery = checkpointEvery
         options.pitchHz = pitchHz
         options.backend = backend
         options.planOnly = planOnly
