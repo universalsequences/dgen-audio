@@ -151,7 +151,41 @@ under ~0.5 s/epoch, Milestone 2 can be deferred — decide on measured numbers.
 - Evaluator/param registry: `Sources/DGenLisp/LispEvaluator.swift`
   (`evalParam` ~1382, `definitions`), `Sources/DGenLazy/Signal.swift:137`
   (`Signal.param`, `updateDataLazily`).
-- Timing baseline commands: TRAIN_SUBCOMMAND_NOTES "Post-landing findings"
-  section; monologue patch + seed live in the shakedown scratchpad — recreate
-  from any eseq-style patch with the `svf` macro, or use
-  `Tests/DGenLispTests/TrainE2ETests.swift` assets for CI-sized timing.
+- Benchmark assets are checked in at `benchmarks/train_monologue/`
+  (patch.lisp = the real eseq-style monologue voice, seed.json = its param
+  defaults); target is `Assets/monologue-bass.wav`.
+
+## Benchmark commands (the exact runs behind the numbers above)
+
+```sh
+swift build -c release --product DGenLisp
+
+# 15-epoch confirm run (the ~38 s baseline; 2x15 epochs + plan + final render)
+time .build/release/DGenLisp train \
+  --patch benchmarks/train_monologue/patch.lisp \
+  --target Assets/monologue-bass.wav \
+  --seed-params benchmarks/train_monologue/seed.json \
+  --job-dir /tmp/train-bench-15 \
+  --epochs 15 --checkpoint-every 999 > /tmp/train-bench-15.ndjson
+
+# 150-epoch full run (the ~5-6 min baseline)
+time .build/release/DGenLisp train \
+  --patch benchmarks/train_monologue/patch.lisp \
+  --target Assets/monologue-bass.wav \
+  --seed-params benchmarks/train_monologue/seed.json \
+  --job-dir /tmp/train-bench-150 \
+  --epochs 150 --checkpoint-every 25 > /tmp/train-bench-150.ndjson
+
+# Gradient-equivalence gate (must be unchanged by caching):
+DGENLISP_TRAIN_FDCHECK=all .build/release/DGenLisp train \
+  --patch benchmarks/train_monologue/patch.lisp \
+  --target Assets/monologue-bass.wav \
+  --seed-params benchmarks/train_monologue/seed.json \
+  --job-dir /tmp/train-bench-fd 2>&1 >/dev/null | grep fdcheck
+```
+
+Baseline reference results (2026-08-13, M-series, release, this repo at
+commit 1761442+): 15-epoch run ~38 s wall; 150-epoch run ~5-6 min;
+final 150-epoch result improvement_pct 26.9, abs_distance 4.099,
+basin_check ok. Trajectory-equivalence checks diff the epoch-event `loss`
+fields of the .ndjson files before/after.
