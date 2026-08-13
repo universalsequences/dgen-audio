@@ -48,7 +48,7 @@ enum RealTrainer {
             options: options)
         try sink.emit(.plan(patchPlan.plan))
 
-        try TrainPlanner.loweredSource(patchSource: patchSource, plan: patchPlan.plan)
+        try TrainPlanner.loweredSource(patchPlan: patchPlan)
             .data(using: .utf8)!
             .write(to: jobDir.loweredLisp, options: .atomic)
 
@@ -67,7 +67,6 @@ enum RealTrainer {
 
         return try DirectionTrainer.train(
             options: options,
-            patchSource: patchSource,
             patchPlan: patchPlan,
             targetSamples: target.samples,
             targetSampleRate: target.sampleRate,

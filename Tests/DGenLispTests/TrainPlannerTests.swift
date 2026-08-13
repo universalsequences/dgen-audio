@@ -187,8 +187,39 @@ final class TrainPlannerTests: XCTestCase {
             (out (phasor freq) 0)
             """
         let patchPlan = try plan(source)
-        let lowered = TrainPlanner.loweredSource(patchSource: source, plan: patchPlan.plan)
+        let lowered = TrainPlanner.loweredSource(patchPlan: patchPlan)
         XCTAssertTrue(lowered.contains("; frozen: freq (f0-adjoint-unreliable)"))
-        XCTAssertTrue(lowered.hasSuffix(source))
+        XCTAssertTrue(lowered.contains("(out (phasor freq) 0)"))
+        // lowered.lisp must be re-parseable (train-render consumes it).
+        XCTAssertNoThrow(try parseSource(lowered))
+    }
+
+    // `(in ...)` inlets are rewritten to the excitation convention; the
+    // driven graph is what gets classified and trained.
+    func testInputInletsDrivenByExcitation() throws {
+        let source = """
+            (def amp (param amp @default 0.5 @min 0 @max 1))
+            (out (* (in 1 @name gate) (* amp (* (in 2 @name velocity) (phasor (in 3 @name pitch))))) 0)
+            """
+        let patchPlan = try plan(source)
+        XCTAssertTrue(patchPlan.plan.unsupported.isEmpty)
+        XCTAssertEqual(patchPlan.plan.learnable, ["amp"])
+        let lowered = TrainPlanner.loweredSource(patchPlan: patchPlan)
+        XCTAssertFalse(lowered.contains("(in "), "all inlets should be rewritten")
+        XCTAssertTrue(lowered.contains("(accum 1.0 0.0 0.0 1000000000.0)"), lowered)
+        XCTAssertTrue(lowered.contains("110.0"), "pitch inlet becomes the frozen pitch constant")
+    }
+
+    // Inlets outside the convention are refused, not silently zeroed.
+    func testUnknownInletRefused() throws {
+        let source = """
+            (def amp (param amp @default 0.5 @min 0 @max 1))
+            (out (* amp (in 1 @name aftertouch)) 0)
+            """
+        let patchPlan = try plan(source)
+        XCTAssertEqual(
+            patchPlan.plan.unsupported,
+            [ParamVerdict(name: "in#aftertouch", reason: TrainPlanner.reasonUndrivenInput)])
+        XCTAssertFalse(patchPlan.fatalUnsupported.isEmpty)
     }
 }

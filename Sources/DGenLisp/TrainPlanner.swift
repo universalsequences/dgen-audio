@@ -24,6 +24,9 @@ struct PatchPlan {
     let learnable: [LearnableParam]
     /// Non-empty means the job must fail fast right after emitting the plan.
     let fatalUnsupported: [ParamVerdict]
+    /// Modulation-lowered AST with `(in ...)` inlets rewritten to the
+    /// excitation convention — the graph training actually runs on.
+    let loweredNodes: [ASTNode]
 }
 
 enum TrainPlanner {
@@ -33,6 +36,7 @@ enum TrainPlanner {
     static let reasonGenerated = "generated-param"
     static let reasonHidden = "hidden-param"
     static let reasonSync = "oscillator-sync"
+    static let reasonUndrivenInput = "input-not-in-excitation-convention"
 
     /// Evaluates the patch into the CURRENT lazy graph (caller must have
     /// reset the context and configured DGenConfig) and classifies params.
@@ -44,11 +48,29 @@ enum TrainPlanner {
         targetSampleRate: Float,
         options: TrainOptions
     ) throws -> (PatchPlan, LispEvaluator) {
+        // Excitation (spec §6) is measured before evaluation because the
+        // inlet rewrite needs the chosen values. CLI overrides win.
+        let cropFrames = Excitation.cropFrames(sampleCount: targetSamples.count)
+        let pitchHz =
+            options.pitchHz
+            ?? Excitation.estimatePitchHz(samples: targetSamples, sampleRate: targetSampleRate)
+            ?? 0
+        guard pitchHz > 0 else {
+            throw TrainProtocolError(
+                "no confident pitch estimate for target; pass --pitch-hz explicitly")
+        }
+        let gateFrames = min(
+            options.gateFrames ?? Excitation.gateFrames(samples: targetSamples),
+            cropFrames)
+
         let evaluator = LispEvaluator(sourceDirectory: assetBase)
+        let rewrite: ExcitationLowering.Rewrite
         do {
             let nodes = try parseSource(patchSource)
             let lowered = try lowerModulation(in: nodes)
-            try evaluator.evaluate(nodes: lowered)
+            rewrite = ExcitationLowering.drive(
+                nodes: lowered, pitchHz: pitchHz, gateFrames: gateFrames)
+            try evaluator.evaluate(nodes: rewrite.nodes)
         } catch let error as LispError {
             throw TrainProtocolError("patch parse/eval failed: \(error.message)")
         }
@@ -87,8 +109,11 @@ enum TrainPlanner {
                     seedValue: Swift.min(Swift.max(seedValue, minBound), maxBound)))
         }
 
-        let unsupported = analysis.syncPhasorNodeIds.map {
+        var unsupported = analysis.syncPhasorNodeIds.map {
             ParamVerdict(name: "phasor#\($0)", reason: reasonSync)
+        }
+        unsupported += rewrite.undriven.map {
+            ParamVerdict(name: $0, reason: reasonUndrivenInput)
         }
 
         for name in seed.params.keys.sorted()
@@ -96,20 +121,6 @@ enum TrainPlanner {
             FileHandle.standardError.write(
                 Data("[train] seed param '\(name)' not present in patch; ignored\n".utf8))
         }
-
-        // Excitation (spec §6): CLI overrides win over measurement.
-        let cropFrames = Excitation.cropFrames(sampleCount: targetSamples.count)
-        let pitchHz =
-            options.pitchHz
-            ?? Excitation.estimatePitchHz(samples: targetSamples, sampleRate: targetSampleRate)
-            ?? 0
-        guard pitchHz > 0 else {
-            throw TrainProtocolError(
-                "no confident pitch estimate for target; pass --pitch-hz explicitly")
-        }
-        let gateFrames = min(
-            options.gateFrames ?? Excitation.gateFrames(samples: targetSamples),
-            cropFrames)
 
         let plan = PlanEvent(
             learnable: learnable.map(\.name).sorted(),
@@ -120,14 +131,18 @@ enum TrainPlanner {
             gateFrames: gateFrames,
             cropFrames: cropFrames)
         return (
-            PatchPlan(plan: plan, learnable: learnable, fatalUnsupported: unsupported),
+            PatchPlan(
+                plan: plan, learnable: learnable, fatalUnsupported: unsupported,
+                loweredNodes: rewrite.nodes),
             evaluator
         )
     }
 
-    /// lowered.lisp: the patch the trainer actually trained on, annotated
-    /// with the lowering verdict (artifact-trail contract, spec §5).
-    static func loweredSource(patchSource: String, plan: PlanEvent) -> String {
+    /// lowered.lisp: the patch the trainer actually trained on (inlets
+    /// rewritten to the excitation convention), annotated with the lowering
+    /// verdict (artifact-trail contract, spec §5). Re-parseable lisp.
+    static func loweredSource(patchPlan: PatchPlan) -> String {
+        let plan = patchPlan.plan
         var header = "; dgenlisp train lowering verdict\n"
         header += "; learnable: \(plan.learnable.joined(separator: " "))\n"
         for v in plan.frozen {
@@ -137,6 +152,7 @@ enum TrainPlanner {
             header += "; unsupported: \(v.name) (\(v.reason))\n"
         }
         header += "; excitation: pitch_hz=\(plan.pitchHz) gate_frames=\(plan.gateFrames) crop_frames=\(plan.cropFrames)\n"
-        return header + patchSource
+        let body = patchPlan.loweredNodes.map(ExcitationLowering.printAST).joined(separator: "\n")
+        return header + body + "\n"
     }
 }
