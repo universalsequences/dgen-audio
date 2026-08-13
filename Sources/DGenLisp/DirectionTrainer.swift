@@ -47,13 +47,23 @@ enum DirectionTrainer {
             useLog = p.min > 0 && p.max / p.min >= 8
         }
 
-        func toZ(_ natural: Float) -> Float { useLog ? log(natural) : natural }
-        func fromZ(_ z: Float) -> Float {
-            Swift.min(Swift.max(useLog ? exp(z) : z, min), max)
+        // Linear params train span-normalized (z in [0,1]) so an Adam step
+        // of `lr` uniformly means "lr fraction of the range": raw natural
+        // coordinates make wide knobs (e.g. a +/-5000 Hz env amount)
+        // untrainable and narrow knobs hot under Adam's normalized steps.
+        // Log params train in log(natural) as before.
+        var span: Float { max - min }
+
+        func toZ(_ natural: Float) -> Float {
+            useLog ? log(natural) : (natural - min) / span
         }
-        func dNaturalDZ(_ z: Float) -> Float { useLog ? exp(z) : 1 }
-        var zMin: Float { useLog ? log(min) : min }
-        var zMax: Float { useLog ? log(max) : max }
+        func fromZ(_ z: Float) -> Float {
+            let natural = useLog ? exp(z) : min + z * span
+            return Swift.min(Swift.max(natural, min), max)
+        }
+        func dNaturalDZ(_ z: Float) -> Float { useLog ? exp(z) : span }
+        var zMin: Float { useLog ? log(min) : 0 }
+        var zMax: Float { useLog ? log(max) : 1 }
     }
 
     static func train(
