@@ -23,7 +23,7 @@ import Foundation
 if CommandLine.arguments.count > 1 && CommandLine.arguments[1] == "train" {
     TrainCommand.run(
         arguments: Array(CommandLine.arguments.dropFirst(2)),
-        realTrainer: nil  // Phase C wires the Metal trainer here
+        realTrainer: RealTrainer.run
     )
 }
 

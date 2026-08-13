@@ -1,4 +1,5 @@
 import DGenLazy
+import DGenTrainProtocol
 import Foundation
 
 struct SynthIDCheckpoint: Codable {

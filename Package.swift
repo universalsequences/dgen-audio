@@ -60,7 +60,7 @@ let package = Package(
         ),
         .executableTarget(
             name: "SynthID",
-            dependencies: ["DGenLazy", "DGen"],
+            dependencies: ["DGenLazy", "DGen", "DGenTrainProtocol"],
             path: "Examples/SynthID",
             exclude: ["SPEC.md", "FDCHECK_FINDING.md", "RUNG1_REMAINING.md", "RUNG2_STATUS.md", "RUNG3_STATUS.md", "RUNG3_BLOCKER.md", "scripts", "targets"]
         ),

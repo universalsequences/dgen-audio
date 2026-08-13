@@ -225,6 +225,46 @@ final class TrainCLITests: XCTestCase {
         })
     }
 
+    func testPlanOnlyEmitsRealPlanThenError() throws {
+        let patch = workDir.appendingPathComponent("patch.lisp")
+        try """
+            (def freq (param freq @default 110 @min 50 @max 400))
+            (def amp (param amp @default 0.5 @min 0 @max 1))
+            (out (* amp (phasor freq)) 0)
+            """.write(to: patch, atomically: true, encoding: .utf8)
+        let target = workDir.appendingPathComponent("target.wav")
+        let sine = (0..<16384).map { i in
+            Float(0.5 * sin(2.0 * Double.pi * 110.0 * Double(i) / 44100.0))
+        }
+        try MiniWav.write(url: target, samples: sine)
+        let seed = workDir.appendingPathComponent("seed.json")
+        try #"{"params":{"amp":0.8}}"#.write(to: seed, atomically: true, encoding: .utf8)
+        let jobDir = workDir.appendingPathComponent("job")
+
+        let outcome = try runTrain([
+            "--patch", patch.path, "--target", target.path,
+            "--seed-params", seed.path, "--job-dir", jobDir.path,
+            "--plan-only",
+        ])
+
+        XCTAssertNotEqual(outcome.exitStatus, 0)
+        guard case .plan(let plan) = outcome.events.first else {
+            return XCTFail("first event must be the real plan")
+        }
+        XCTAssertEqual(plan.learnable, ["amp"])
+        XCTAssertEqual(plan.frozen, [ParamVerdict(name: "freq", reason: "f0-adjoint-unreliable")])
+        XCTAssertEqual(plan.seedEcho, ["amp": 0.8])
+        XCTAssertEqual(plan.pitchHz, 110, accuracy: 2.0)
+        XCTAssertEqual(plan.cropFrames, 16384)
+        guard case .error(let err) = outcome.events.last else {
+            return XCTFail("plan-only must terminate with an error event")
+        }
+        XCTAssertTrue(err.message.contains("plan-only"))
+        XCTAssertTrue(
+            FileManager.default.fileExists(
+                atPath: jobDir.appendingPathComponent("lowered.lisp").path))
+    }
+
     func testMockHostScriptAcceptsStream() throws {
         let script = URL(fileURLWithPath: #filePath)
             .deletingLastPathComponent()  // Tests/DGenLispTests

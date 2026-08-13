@@ -15,6 +15,10 @@ public struct TrainOptions: Equatable {
     /// nil = CPU pitch estimate from the target (spec §6).
     public var pitchHz: Double?
 
+    /// Emit the plan event and stop (no GPU time). The job still terminates
+    /// with an error event ("plan-only"), never a result.
+    public var planOnly: Bool = false
+
     // Hidden/testing knobs (not part of the host-facing contract).
     public var useFakeTrainer: Bool = false
     public var fakeFailAtEpoch: Int?
@@ -41,6 +45,7 @@ public struct TrainOptions: Equatable {
         var epochs: Int?
         var gateFrames: Int?
         var pitchHz: Double?
+        var planOnly = false
         var fake = environment["DGENLISP_FAKE_TRAINER"] != nil
         var fakeFailAtEpoch: Int?
         var fakeEpochMs = 0
@@ -72,6 +77,7 @@ public struct TrainOptions: Equatable {
                     throw TrainProtocolError("Invalid number for --pitch-hz: \(raw)")
                 }
                 pitchHz = v
+            case "--plan-only": planOnly = true
             case "--fake-trainer": fake = true
             case "--fake-fail-at-epoch": fakeFailAtEpoch = try intValue(arg)
             case "--fake-epoch-ms": fakeEpochMs = try intValue(arg)
@@ -96,6 +102,7 @@ public struct TrainOptions: Equatable {
         options.epochs = epochs
         options.gateFrames = gateFrames
         options.pitchHz = pitchHz
+        options.planOnly = planOnly
         options.useFakeTrainer = fake
         options.fakeFailAtEpoch = fakeFailAtEpoch
         options.fakeEpochMs = fakeEpochMs
