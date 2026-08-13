@@ -66,7 +66,7 @@ enum TrainPlanner {
         let evaluator = LispEvaluator(sourceDirectory: assetBase)
         let rewrite: ExcitationLowering.Rewrite
         do {
-            let nodes = try parseSource(patchSource)
+            let nodes = ExcitationLowering.stripModulation(nodes: try parseSource(patchSource))
             let lowered = try lowerModulation(in: nodes)
             rewrite = ExcitationLowering.drive(
                 nodes: lowered, pitchHz: pitchHz, gateFrames: gateFrames)
