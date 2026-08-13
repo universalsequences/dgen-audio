@@ -44,6 +44,10 @@ enum StatefulTensorParallelPolicy {
         if graph.cellToTensor[cellId] != nil {
           return Decision(enabled: false, tensorSize: tensorSize)
         }
+      case .delayLine:
+        // Emits its own lane loop and advances a shared write head; running
+        // it once per lane thread would advance the head N times per frame.
+        return Decision(enabled: false, tensorSize: tensorSize)
       case .historyRead(let cellId), .historyWrite(let cellId):
         if graph.cellToTensor[cellId] != nil {
           hasTensorHistory = true

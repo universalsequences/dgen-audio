@@ -34,9 +34,12 @@ func detectShapeTransitions(block: Block, g: Graph) -> [(nodeIndex: Int, shape: 
       // Also, conv2d emits its own parallelRange internally, so it must be
       // in its own region (not mixed with other element-wise ops).
       switch node.op {
-      case .conv2d, .conv1d, .cumsum, .gather:
-        // Always start a new region for conv/cumsum/gather, even if shape matches:
-        // they read across the tensor and emit their own internal loop.
+      case .conv2d, .conv1d, .cumsum, .gather, .delayLine:
+        // Always start a new region for conv/cumsum/gather/delayLine, even if
+        // shape matches: they read across the tensor and emit their own
+        // internal loop. Left inside a sibling element loop, delayLine would
+        // run its whole lane sweep once per element AND advance its shared
+        // write head N times per frame.
         needsNewRegion = true
       default:
         break
@@ -50,7 +53,7 @@ func detectShapeTransitions(block: Block, g: Graph) -> [(nodeIndex: Int, shape: 
       // Force region boundary AFTER conv2d - it has its own internal loop,
       // so subsequent ops must be in a separate region
       switch node.op {
-      case .conv2d, .conv1d, .cumsum, .gather:
+      case .conv2d, .conv1d, .cumsum, .gather, .delayLine:
         // Mark that next tensor node needs new region even if same shape
         currentShape = nil
       default:

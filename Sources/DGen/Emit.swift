@@ -328,6 +328,80 @@ extension LazyOp {
       }
       ctx.values[nodeId] = .empty
 
+    case .delayLine(let bufferCell, let writePosCell, let outputCell, let elementShape, let maxDelay):
+      // Per-lane interpolated delay lines for tensor signals.
+      // Inputs: [input, delayTime]. Every frame: write one sample per lane
+      // at the shared write head, read each lane at
+      // `head - delayTime[lane]` with linear interpolation, then advance
+      // the head. Write-before-read matches scalar `Graph.delay`, so a
+      // 0-sample delay returns the current frame and feedback loops
+      // through the delay stay stable. The delay time is clamped to
+      // `[0, maxDelay - 1]`.
+      guard node.inputs.count == 2 else {
+        throw DGenError.insufficientInputs(
+          operator: "delayLine", expected: 2, actual: node.inputs.count)
+      }
+      guard let inTensorId = g.nodeToTensor[node.inputs[0]],
+        let inTensor = g.tensors[inTensorId]
+      else {
+        throw DGenError.tensorError(
+          op: "delayLine", reason: "input 0 must be a tensor node")
+      }
+      let lanes = Swift.max(1, elementShape.reduce(1, *))
+      // Per-lane delay time when input 1 is tensor-shaped; broadcast scalar otherwise.
+      var timeTensor: Tensor? = nil
+      if let timeNode = g.nodes[node.inputs[1]], case .tensor = timeNode.shape {
+        guard let timeTensorId = g.nodeToTensor[node.inputs[1]],
+          let resolved = g.tensors[timeTensorId]
+        else {
+          throw DGenError.tensorError(
+            op: "delayLine", reason: "tensor delay time has no materialized tensor")
+        }
+        timeTensor = resolved
+      }
+      let timeScalar = timeTensor == nil ? b.value(inputs[1]) : b.constant(0.0)
+      let zeroD = b.constant(0.0)
+      let oneD = b.constant(1.0)
+      let maxDelayF = b.constant(Float(maxDelay))
+      let maxReadF = b.constant(Float(maxDelay - 1))
+      let maxDelayInt = b.intConstant(maxDelay)
+      let wposF = b.memoryRead(writePosCell, zeroD)
+      let wposInt = b.cast(wposF, to: .int)
+      // Write pass: buffer[lane * maxDelay + head] = input[lane].
+      b.loop(lanes) { e in
+        let v = b.tensorRead(inTensor, flatIdx: e, shape: inTensor.shape)
+        _ = b.memoryWrite(bufferCell, e * maxDelayInt + wposInt, v)
+      }
+      // Read pass: linear interpolation between the two ring slots
+      // bracketing `head - delayTime`.
+      b.loop(lanes) { e in
+        let dRaw =
+          timeTensor.map { b.tensorRead($0, flatIdx: e, shape: $0.shape) } ?? timeScalar
+        let dClamped = b.gswitch(
+          dRaw > maxReadF, maxReadF, b.gswitch(dRaw < zeroD, zeroD, dRaw))
+        let kFloorF = b.floor(dClamped)
+        let frac = dClamped - kFloorF
+        let kInt = b.cast(kFloorF, to: .int)
+        let laneBase = e * maxDelayInt
+        // wpos - k is in (-maxDelay, maxDelay); one/two additions of
+        // maxDelay before mod keep the operand non-negative.
+        let pos0 = b.mod(wposInt - kInt + maxDelayInt, maxDelayInt)
+        let pos1 = b.mod(
+          wposInt - kInt - b.intConstant(1) + maxDelayInt + maxDelayInt, maxDelayInt)
+        let s0 = b.memoryRead(bufferCell, laneBase + pos0)
+        let s1 = b.memoryRead(bufferCell, laneBase + pos1)
+        let mixed = s0 * (oneD - frac) + s1 * frac
+        // Frame-aware write: when a later block (separate frame loop)
+        // consumes the delayed tensor, each frame's output must land in its
+        // own slot — a plain cell write would leave only the final frame.
+        _ = b.frameAwareTensorWrite(
+          cellId: outputCell, tensorSize: lanes, elemIdx: e, value: mixed)
+      }
+      // Advance the shared write head after both passes.
+      let nextW = b.gswitch(wposF + oneD >= maxDelayF, zeroD, wposF + oneD)
+      _ = b.memoryWrite(writePosCell, zeroD, nextW)
+      ctx.values[nodeId] = .empty
+
     case .spectrumDelay(let ringCell, let rowCell, let outputCell, let N, let hops):
       // One-hop delay line for `[N]` spectra. Inputs: [input, hopCounter].
       // On hop boundaries (counter == 0): write current input to ring row

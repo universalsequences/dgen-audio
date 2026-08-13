@@ -226,6 +226,9 @@ public func inferShape(op: LazyOp, inputs: [ValueShape], graph: Graph) throws ->
   case .hopTensorNoise(_, _, let size):
     return .tensor([size])
 
+  case .delayLine(_, _, _, let elementShape, _):
+    return .tensor(elementShape)
+
   case .spectrumDelay(_, _, _, let N, _):
     return .tensor([N])
 

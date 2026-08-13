@@ -659,10 +659,14 @@ extension Graph {
   /// Delay: delays the input signal by a variable amount of time with linear interpolation
   /// delay(input, delayTimeInSamples)
   /// - input: input signal to delay
-  /// - delayTimeInSamples: delay time in samples (0 to MAX_DELAY)
+  /// - delayTimeInSamples: delay time in samples (0 to maxDelay)
+  /// - maxDelay: circular buffer length in samples (default 88000, the historical
+  ///   scalar buffer size; `@max-delay` lets callers shrink it)
   /// Implements a circular buffer with linear interpolation for fractional delay times
-  public func delay(_ input: NodeID, _ delayTimeInSamples: NodeID) -> NodeID {
-    let MAX_DELAY = 88000
+  public func delay(_ input: NodeID, _ delayTimeInSamples: NodeID, maxDelay: Int = 88000)
+    -> NodeID
+  {
+    let MAX_DELAY = maxDelay
     let bufferBase = alloc(vectorWidth: MAX_DELAY)
     let writePosCellId = alloc()
     persistentCells.insert(bufferBase)

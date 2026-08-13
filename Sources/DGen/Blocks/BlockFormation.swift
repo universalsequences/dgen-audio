@@ -728,6 +728,10 @@ private func assignTensorIndexFromFirstTensorNode(
 ) {
   for nodeId in block.nodes {
     guard let node = graph.nodes[nodeId], case .tensor(let shape) = node.shape else { continue }
+    // Self-iterating ops (delayLine, spectrumDelay, ...) emit their own lane
+    // loops; a block whose only tensor work is self-iterating must not get a
+    // block-level element loop wrapped around it.
+    if node.op.emitsInternalIteration { continue }
     guard block.tensorIndex == nil else { break }
     block.tensorIndex = ctx.useVariable(src: nil)
     block.shape = shape

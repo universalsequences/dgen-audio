@@ -607,7 +607,7 @@ class LispEvaluator {
     case "compressor":
       return try evalCompressor(regularArgs, rawArgs: args, attributes: attributePairs)
     case "delay":
-      return try evalDelay(regularArgs)
+      return try evalDelay(regularArgs, attributes: attributePairs)
 
     // I/O
     case "param":
@@ -1302,16 +1302,78 @@ class LispEvaluator {
     }
   }
 
-  private func evalDelay(_ args: [ASTNode]) throws -> EvalResult {
+  private func evalDelay(_ args: [ASTNode], attributes: [(name: String, value: String)]) throws
+    -> EvalResult
+  {
     guard args.count == 2 else {
       throw LispError.invalidArgument("delay requires 2 arguments (signal, time)")
     }
-    let sig = try requireSignal(evaluateAST(args[0]))
+    // Optional `@max-delay N` bounds the circular buffer (per lane for tensor
+    // input). Defaults: 88000 for scalars (the historical size),
+    // `SignalTensor.defaultMaxDelay` (48000, ~1s at 48kHz) per lane for
+    // tensors — N lanes cost `N * maxDelay` floats.
+    var maxDelayAttr: Int? = nil
+    if let raw = attrValue(attributes, "@max-delay") {
+      guard let parsed = Float(raw), parsed >= 2, parsed == parsed.rounded() else {
+        throw LispError.invalidArgument(
+          "delay: @max-delay must be a whole number of samples >= 2, got '\(raw)'")
+      }
+      maxDelayAttr = Int(parsed)
+    }
+
+    let inputResult = try promoteToValue(evaluateAST(args[0]))
     let timeResult = try promoteToValue(evaluateAST(args[1]))
-    switch timeResult {
-    case .signal(let t): return .signal(sig.delay(t))
-    case .float(let t): return .signal(sig.delay(t))
-    default: throw LispError.typeError("delay: time must be signal or float")
+
+    switch inputResult {
+    case .signal, .float:
+      let sig = try requireSignal(inputResult)
+      let maxDelay = maxDelayAttr ?? 88000
+      switch timeResult {
+      case .signal(let t): return .signal(sig.delay(t, maxDelay: maxDelay))
+      case .float(let t): return .signal(sig.delay(t, maxDelay: maxDelay))
+      case .tensor, .signalTensor:
+        throw LispError.typeError(
+          "delay: a tensor delay time needs a tensor input signal so each lane has its own delay line; the input here is a scalar signal")
+      default:
+        throw LispError.typeError(
+          "delay: time must be signal, float, or tensor, got \(describeKind(timeResult))")
+      }
+
+    case .tensor, .signalTensor:
+      // Per-lane delay lines; the shape comes from the input tensor.
+      let shape: [Int]
+      switch inputResult {
+      case .signalTensor(let st): shape = st.shape
+      case .tensor(let t): shape = t.shape
+      default: shape = []
+      }
+      let input = try asSignalTensor(inputResult, shape: shape, op: "delay")
+      let maxDelay = maxDelayAttr ?? SignalTensor.defaultMaxDelay
+      switch timeResult {
+      case .signal(let t):
+        return .signalTensor(input.delay(t, maxDelay: maxDelay))
+      case .float(let t):
+        return .signalTensor(input.delay(t, maxDelay: maxDelay))
+      case .tensor(let t):
+        guard t.shape == shape else {
+          throw LispError.typeError(
+            "delay: per-lane delay times must match the input shape (times are \(t.shape), input is \(shape))")
+        }
+        return .signalTensor(input.delay(t, maxDelay: maxDelay))
+      case .signalTensor(let t):
+        guard t.shape == shape else {
+          throw LispError.typeError(
+            "delay: per-lane delay times must match the input shape (times are \(t.shape), input is \(shape))")
+        }
+        return .signalTensor(input.delay(t, maxDelay: maxDelay))
+      default:
+        throw LispError.typeError(
+          "delay: time must be signal, float, or tensor, got \(describeKind(timeResult))")
+      }
+
+    default:
+      throw LispError.typeError(
+        "delay: input must be a signal or tensor, got \(describeKind(inputResult))")
     }
   }
 
