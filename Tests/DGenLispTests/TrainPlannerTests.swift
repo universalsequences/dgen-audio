@@ -123,6 +123,25 @@ final class TrainPlannerTests: XCTestCase {
         XCTAssertTrue(patchPlan.plan.frozen.isEmpty)
     }
 
+    // A frequency VALUE is a gradient sink at every use: a param whose
+    // node feeds a phasor also gets no gradient from its other uses
+    // (PolyBLEP-dt-style side paths), so it must be reported frozen —
+    // otherwise Adam's normalized steps walk tuning params off pitch on
+    // residual gradients (heard as dissonant oscillators on the
+    // monologue-bass fit).
+    func testFrequencyValueIsSinkAtEveryUse() throws {
+        let source = """
+            (def freq (param freq @default 110 @min 50 @max 400))
+            (def amp (param amp @default 0.5 @min 0 @max 1))
+            (out (* amp (+ (phasor freq) (* 0.001 freq))) 0)
+            """
+        let patchPlan = try plan(source)
+        XCTAssertEqual(patchPlan.plan.learnable, ["amp"])
+        XCTAssertEqual(
+            patchPlan.plan.frozen,
+            [ParamVerdict(name: "freq", reason: TrainPlanner.reasonPitchDetached)])
+    }
+
     // Params with no path to the output at all are frozen distinctly.
     func testUnusedParamFrozen() throws {
         let source = """

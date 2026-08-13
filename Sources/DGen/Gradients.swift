@@ -57,6 +57,24 @@ extension Graph {
     var grads: [NodeID: NodeID] = [:]
     gradientSideEffects = []
 
+    // Detached-pitch policy: any node used as a phasor frequency input is a
+    // gradient sink at EVERY use, not just at the phasor edge. The same
+    // value node typically also feeds pitch-derived side computations
+    // (e.g. the PolyBLEP transition width dt = freq/samplerate); training
+    // on those residual gradients lets Adam's normalized steps walk tuning
+    // params audibly off pitch with no corrective signal.
+    var frequencySinks: Set<NodeID> = []
+    if DGenGradientConfig.detachPhasorFrequency {
+      for (_, node) in nodes {
+        switch node.op {
+        case .phasor, .deterministicPhasor:
+          frequencySinks.formUnion(node.inputs)
+        default:
+          break
+        }
+      }
+    }
+
     // Seed: gradient of loss w.r.t. itself = 1.0
     grads[loss] = n(.constant(1.0), [])
 
@@ -82,6 +100,7 @@ extension Graph {
       // Accumulate gradients (as graph nodes, not values!)
       for (inputId, grad) in zip(node.inputs, inputGrads) {
         guard let grad = grad else { continue }
+        if frequencySinks.contains(inputId) { continue }
 
         if let existing = grads[inputId] {
           grads[inputId] = n(.add, [existing, grad])

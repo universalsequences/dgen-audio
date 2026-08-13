@@ -63,12 +63,19 @@ extension LazyGraph {
     /// traversed (BPTT carry cells propagate gradients through
     /// read-history by following the matching history writes).
     public func gradientReachableParamCells(from signal: Signal) -> Set<CellID> {
-        // Pre-index history writes by cell so reads can jump to them.
+        // Pre-index history writes by cell so reads can jump to them, and
+        // collect frequency sink nodes: any node used as a phasor input is
+        // a gradient sink at EVERY use (mirrors computeGradients'
+        // detachPhasorFrequency policy — the same value node also feeds
+        // pitch-derived side computations like the PolyBLEP dt).
         var writesByCell: [CellID: [NodeID]] = [:]
+        var frequencySinks: Set<NodeID> = []
         for (id, node) in graph.nodes {
             switch node.op {
             case .historyWrite(let cell), .historyReadWrite(let cell):
                 writesByCell[cell, default: []].append(id)
+            case .phasor, .deterministicPhasor:
+                frequencySinks.formUnion(node.inputs)
             default:
                 break
             }
@@ -79,6 +86,7 @@ extension LazyGraph {
         var seen: Set<NodeID> = []
         while let id = stack.popLast() {
             guard seen.insert(id).inserted, let node = graph.nodes[id] else { continue }
+            if frequencySinks.contains(id) { continue }
             switch node.op {
             case .param(let cell):
                 cells.insert(cell)
