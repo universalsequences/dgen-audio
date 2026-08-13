@@ -90,6 +90,17 @@ enum DirectionTrainer {
         // bounds; the honest generic init per SPEC.md §3/§5).
         let coldZ = transforms.map { ($0.zMin + $0.zMax) / 2 }
 
+        // Debug: DGENLISP_TRAIN_FDCHECK=<param,param,...|all> — compare the
+        // trainer's autograd gradients against central finite differences
+        // in transformed coordinates at the seed point, then stop.
+        if let fdParams = ProcessInfo.processInfo.environment["DGENLISP_TRAIN_FDCHECK"] {
+            try fdcheck(
+                names: fdParams, transforms: transforms, seedZ: seedZ,
+                patchPlan: patchPlan, target: prepared,
+                sampleRate: targetSampleRate, crop: crop, options: options)
+            throw TrainProtocolError("fdcheck-only run (DGENLISP_TRAIN_FDCHECK)")
+        }
+
         let seeded = try runPhase(
             name: "train", initialZ: seedZ, epochs: epochs,
             transforms: transforms, patchPlan: patchPlan, target: prepared,
@@ -242,6 +253,77 @@ enum DirectionTrainer {
             }
         }
         return result
+    }
+
+    // MARK: - Debug fdcheck
+
+    private static func fdcheck(
+        names: String, transforms: [TransformedParam], seedZ: [Float],
+        patchPlan: PatchPlan, target: [Float], sampleRate: Float, crop: Int,
+        options: TrainOptions
+    ) throws {
+        let wanted = Set(names.split(separator: ",").map(String.init))
+        let indices = transforms.indices.filter {
+            names == "all" || wanted.contains(transforms[$0].name)
+        }
+
+        func lossAt(_ z: [Float]) throws -> Float {
+            configureRuntime(options: options, sampleRate: sampleRate, crop: crop)
+            LazyGraphContext.reset()
+            let evaluator = LispEvaluator()
+            try evaluator.evaluate(nodes: patchPlan.loweredNodes)
+            let signals = try learnableSignals(evaluator: evaluator, transforms: transforms)
+            for (i, t) in transforms.enumerated() { signals[i].updateDataLazily(t.fromZ(z[i])) }
+            guard let output = outputSignal(evaluator: evaluator) else {
+                throw TrainProtocolError("no output")
+            }
+            let targetSignal = Tensor(target).toSignal(maxFrames: crop)
+            let loss = multiResolutionSpectralLoss(
+                synth: output, target: targetSignal, frames: crop)
+            return try loss.realize(frames: crop).reduce(0, +)
+        }
+
+        // Finite differences FIRST (forward-only), then one backward.
+        let eps: Float = 0.005  // 0.5% of range in z
+        var fdGrads: [Int: Float] = [:]
+        let base = try lossAt(seedZ)
+        FileHandle.standardError.write(Data("[fdcheck] loss at seed: \(base)\n".utf8))
+        for i in indices {
+            var zp = seedZ
+            zp[i] += eps
+            var zm = seedZ
+            zm[i] -= eps
+            fdGrads[i] = (try lossAt(zp) - (try lossAt(zm))) / (2 * eps)
+        }
+
+        configureRuntime(options: options, sampleRate: sampleRate, crop: crop)
+        LazyGraphContext.reset()
+        let evaluator = LispEvaluator()
+        try evaluator.evaluate(nodes: patchPlan.loweredNodes)
+        let signals = try learnableSignals(evaluator: evaluator, transforms: transforms)
+        for (i, t) in transforms.enumerated() { signals[i].updateDataLazily(t.fromZ(seedZ[i])) }
+        guard let output = outputSignal(evaluator: evaluator) else {
+            throw TrainProtocolError("no output")
+        }
+        let targetSignal = Tensor(target).toSignal(maxFrames: crop)
+        let loss = multiResolutionSpectralLoss(synth: output, target: targetSignal, frames: crop)
+        let lossValues = try loss.backward(frames: crop)
+        FileHandle.standardError.write(
+            Data("[fdcheck] backward loss: \(lossValues.reduce(0, +))\n".utf8))
+
+        FileHandle.standardError.write(
+            Data("[fdcheck] param                    autograd(z)        fd(z)   sign-match\n".utf8))
+        for i in indices {
+            let t = transforms[i]
+            let autograd = (signals[i].grad?.data ?? 0) * t.dNaturalDZ(seedZ[i])
+            let fd = fdGrads[i] ?? 0
+            let match = autograd == 0 || fd == 0 ? "?" : (autograd * fd > 0 ? "YES" : "NO")
+            FileHandle.standardError.write(
+                Data(
+                    String(
+                        format: "[fdcheck] %-22s %12.5g %12.5g   %@\n",
+                        (t.name as NSString).utf8String!, autograd, fd, match).utf8))
+        }
     }
 
     // MARK: - Loss (frozen SPEC.md §4 config)

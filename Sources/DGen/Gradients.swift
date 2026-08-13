@@ -64,7 +64,9 @@ extension Graph {
     // on those residual gradients lets Adam's normalized steps walk tuning
     // params audibly off pitch with no corrective signal.
     var frequencySinks: Set<NodeID> = []
-    if DGenGradientConfig.detachPhasorFrequency {
+    if DGenGradientConfig.detachPhasorFrequency,
+      ProcessInfo.processInfo.environment["DGEN_NO_FREQ_SINKS"] == nil
+    {
       for (_, node) in nodes {
         switch node.op {
         case .phasor, .deterministicPhasor:
@@ -78,8 +80,28 @@ extension Graph {
     // Seed: gradient of loss w.r.t. itself = 1.0
     grads[loss] = n(.constant(1.0), [])
 
+    // History writes are temporal side effects: their stored value affects
+    // the loss through FUTURE frames' historyRead even when the write
+    // node's own output is unconsumed (the natural `(write-history ...)`
+    // statement form). The reverse walk would prune such nodes, their
+    // backward would never read the gradient carry cell, and the temporal
+    // recursion would silently truncate — wrong-sign coefficient gradients
+    // for any state filter not written in the pass-through-consuming idiom
+    // (docs/BIQUAD_BPTT_GRADIENT_BUG.md, SVF lisp-macro reproducer).
+    // Treat every pure historyWrite as an additional backward root with a
+    // zero seed; consumed writes just add their downstream gradient on top.
+    var historyWriteRoots: [NodeID] = []
+    for (id, node) in nodes {
+      if case .historyWrite = node.op { historyWriteRoots.append(id) }
+    }
+    historyWriteRoots.sort()
+    for writeId in historyWriteRoots where grads[writeId] == nil {
+      grads[writeId] = n(.constant(0.0), [])
+    }
+
     // Walk in reverse topological order
-    let reverseOrder = reverseTopologicalOrder(from: loss, targets: targets)
+    let reverseOrder = reverseTopologicalOrder(
+      from: [loss] + historyWriteRoots, targets: targets)
     for nodeId in reverseOrder {
       guard let upstreamGrad = grads[nodeId],
         let node = nodes[nodeId]
@@ -133,11 +155,11 @@ extension Graph {
   }
 
   /// Compute reverse topological order from loss, only including nodes on paths to targets.
-  private func reverseTopologicalOrder(from root: NodeID, targets: Set<NodeID>) -> [NodeID] {
+  private func reverseTopologicalOrder(from roots: [NodeID], targets: Set<NodeID>) -> [NodeID] {
     // First, find which nodes are on paths to targets
     var onTargetPath: [NodeID: Bool] = [:]
 
-    for nodeId in topologicalOrder(from: root) {
+    for nodeId in topologicalOrder(from: roots) {
       guard let node = nodes[nodeId] else { continue }
       // historyRead counts as a target: its accumulated gradient is the BPTT
       // temporal carry. Without this, historyWrite nodes whose input is a
@@ -152,14 +174,14 @@ extension Graph {
     }
 
     // Now collect nodes in topological order, filtering to target paths
-    let topo = topologicalOrder(from: root).filter { onTargetPath[$0] == true }
+    let topo = topologicalOrder(from: roots).filter { onTargetPath[$0] == true }
 
     // Return reversed
     return topo.reversed()
   }
 
-  /// Standard topological sort from a root node.
-  private func topologicalOrder(from root: NodeID) -> [NodeID] {
+  /// Standard topological sort from one or more root nodes.
+  private func topologicalOrder(from roots: [NodeID]) -> [NodeID] {
     var visited = Set<NodeID>()
     var order: [NodeID] = []
 
@@ -175,7 +197,9 @@ extension Graph {
       order.append(nodeId)
     }
 
-    visit(root)
+    for root in roots {
+      visit(root)
+    }
     return order
   }
 }
