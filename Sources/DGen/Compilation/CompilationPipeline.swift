@@ -181,6 +181,11 @@ public struct CompilationPipeline {
       hopBasedNodes: peelHopNodes,
       timings: &timings)
 
+    if backend == .metal {
+      promoteFrameIndependentSumBlocks(&finalBlocks, graph: graph)
+      promoteParallelBufferViewWriteBlocks(&finalBlocks, graph: graph)
+    }
+
     let temporalityResult = assignTemporality(
       nodeTemporality,
       blocks: &finalBlocks,

@@ -97,6 +97,95 @@ public func fuseBlocks(_ blocks: [Block]) -> [Block] {
   return fused
 }
 
+/// Promote scalar tensor-reduction blocks that are independent across frames.
+///
+/// Backward broadcast gradients commonly lower to `sum(tensor) -> scalar math`.
+/// A `seq` ordering edge can conservatively classify that whole block as
+/// sequential even though each frame reads a disjoint frame-aware tensor slice.
+/// On Metal, leaving such a block sequential makes one GPU thread perform every
+/// tensor reduction for every frame.  Keep this intentionally narrow: the block
+/// must start with `sum` and contain only pure scalar arithmetic. Feedback
+/// membership does not disqualify it: blocks are kernel boundaries, so all of
+/// the reduction's inputs have already been materialized before this kernel and
+/// its only cross-frame writes are the compiler-managed output tape.
+public func promoteFrameIndependentSumBlocks(_ blocks: inout [Block], graph: Graph) {
+  func isPureScalarMath(_ op: LazyOp) -> Bool {
+    switch op {
+    case .sum,
+      .constant,
+      .add, .sub, .div, .mul, .neg,
+      .abs, .sign, .sin, .cos, .tan, .atan, .tanh, .exp, .log, .log10, .sqrt,
+      .atan2, .gt, .gte, .lte, .lt, .eq, .gswitch, .mix, .pow,
+      .floor, .ceil, .round, .mod, .min, .max, .and, .or, .xor:
+      return true
+    default:
+      return false
+    }
+  }
+
+  for index in blocks.indices where blocks[index].frameOrder == .sequential {
+    let nodeIds = blocks[index].nodes
+    guard let firstId = nodeIds.first,
+      let first = graph.nodes[firstId],
+      case .sum = first.op,
+      nodeIds.allSatisfy({ id in graph.nodes[id].map { isPureScalarMath($0.op) } ?? false })
+    else { continue }
+
+    blocks[index].frameOrder = .parallel
+  }
+}
+
+/// Promote the producer kernel for a circular `bufferView` to one thread per
+/// frame. `bufferView` deliberately allocates `maxFrameCount + windowSize - 1`
+/// slots, and its write position advances once per frame, so the writes within
+/// one render call are disjoint even when the surrounding signal math was swept
+/// into the sequential set by the position accumulator's ordering edge.
+///
+/// Infer the special write from the tensor's sliding-window transform instead
+/// of accepting arbitrary memory writes: dynamic offsets in delay lines and
+/// gradient stores can alias and must remain serial.
+public func promoteParallelBufferViewWriteBlocks(_ blocks: inout [Block], graph: Graph) {
+  func isPureScalarMath(_ op: LazyOp) -> Bool {
+    switch op {
+    case .constant,
+      .add, .sub, .div, .mul, .neg,
+      .abs, .sign, .sin, .cos, .tan, .atan, .tanh, .exp, .log, .log10, .sqrt,
+      .atan2, .gt, .gte, .lte, .lt, .eq, .gswitch, .mix, .pow,
+      .floor, .ceil, .round, .mod, .min, .max, .and, .or, .xor:
+      return true
+    default:
+      return false
+    }
+  }
+
+  func isBufferViewWrite(_ node: Node) -> Bool {
+    guard case .memoryWrite(let cellId) = node.op,
+      node.inputs.count == 2,
+      let tensorId = graph.cellToTensor[cellId],
+      let tensor = graph.tensors[tensorId]
+    else { return false }
+
+    let offsetNode = node.inputs[0]
+    return tensor.transforms.contains { transform in
+      if case .slidingWindow(_, _, let positionNode) = transform {
+        return positionNode == offsetNode
+      }
+      return false
+    }
+  }
+
+  for index in blocks.indices where blocks[index].frameOrder == .sequential {
+    let nodes = blocks[index].nodes.compactMap { graph.nodes[$0] }
+    let writes = nodes.filter(isBufferViewWrite)
+    guard writes.count == 1,
+      nodes.count == blocks[index].nodes.count,
+      nodes.allSatisfy({ isPureScalarMath($0.op) || isBufferViewWrite($0) })
+    else { continue }
+
+    blocks[index].frameOrder = .parallel
+  }
+}
+
 /// Isolate special passes into their own blocks to prevent unsafe fusion.
 /// Includes:
 /// - FFT-based spectral ops (shared scratch / race-avoidance)

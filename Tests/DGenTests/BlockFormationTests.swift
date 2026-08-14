@@ -653,4 +653,52 @@ final class BlockFormationTests: XCTestCase {
         XCTAssertEqual(result[0].nodes, [input, reduced, post])
         XCTAssertNotNil(result[0].tensorIndex)
     }
+
+    func testPromotesFrameIndependentSumBlock() {
+        let g = Graph()
+        let input = g.n(.constant(2))
+        let sum = g.n(.sum, input)
+        let negated = g.n(.neg, sum)
+        var blocks = [Block(frameOrder: .sequential)]
+        blocks[0].nodes = [sum, negated]
+
+        promoteFrameIndependentSumBlocks(&blocks, graph: g)
+
+        XCTAssertEqual(blocks[0].frameOrder, .parallel)
+    }
+
+    func testSumPromotionRejectsStatefulTail() {
+        let g = Graph()
+        let input = g.n(.constant(2))
+        let sum = g.n(.sum, input)
+        let write = g.n(.memoryWrite(g.alloc()), g.n(.constant(0)), sum)
+        var blocks = [Block(frameOrder: .sequential)]
+        blocks[0].nodes = [sum, write]
+
+        promoteFrameIndependentSumBlocks(&blocks, graph: g)
+
+        XCTAssertEqual(blocks[0].frameOrder, .sequential)
+    }
+
+    func testPromotesOnlySlidingWindowBufferWrite() {
+        let g = Graph()
+        let input = g.n(.constant(1))
+        _ = g.bufferView(input, size: 8)
+        let bufferWrite = g.nodes.values.first { node in
+            guard case .memoryWrite(let cell) = node.op else { return false }
+            return g.cellToTensor[cell] != nil
+        }!.id
+        var blocks = [Block(frameOrder: .sequential)]
+        blocks[0].nodes = [bufferWrite]
+
+        promoteParallelBufferViewWriteBlocks(&blocks, graph: g)
+
+        XCTAssertEqual(blocks[0].frameOrder, .parallel)
+
+        let arbitraryWrite = g.n(.memoryWrite(g.alloc()), g.n(.constant(0)), input)
+        var arbitraryBlocks = [Block(frameOrder: .sequential)]
+        arbitraryBlocks[0].nodes = [arbitraryWrite]
+        promoteParallelBufferViewWriteBlocks(&arbitraryBlocks, graph: g)
+        XCTAssertEqual(arbitraryBlocks[0].frameOrder, .sequential)
+    }
 }

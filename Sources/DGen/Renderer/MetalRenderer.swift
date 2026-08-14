@@ -16,6 +16,22 @@ public class MetalRenderer: Renderer, UOpEmitter {
   private var currentThreadCountScale: Int? = nil
   private var currentThreadCountOverride: Int? = nil
   private var isGemmKernel: Bool = false
+  /// Cross-kernel values normally read through the device `t` tape even after
+  /// this kernel has just computed them. Serial frame loops suffer especially:
+  /// every reuse becomes a high-latency device read by the same thread. Cache
+  /// safe, reused definitions in a function-local scalar while still writing
+  /// through to the tape for later kernels.
+  private var cacheableLocalGlobals: Set<VarID> = []
+  private var activeLocalGlobals: Set<VarID> = []
+  private var preloadedInputGlobals: Set<VarID> = []
+  /// Scalar state accessed at a fixed address inside a serial frame loop. Keep
+  /// it in a register across frames and flush written values once.
+  private var cacheableScalarMemoryCells: Set<CellID> = []
+  private var cachedScalarMemoryWrites: Set<CellID> = []
+  private var activeScalarMemoryCells: Set<CellID> = []
+  /// Set immediately before emitting a loop terminator whose body performs no
+  /// device writes. Such a loop cannot need a device-memory ordering fence.
+  private var omitCurrentLoopFence = false
   /// Kernel uses threadgroup scratch (threadGroupSize=1) — skip device memory fences
   private var usesThreadgroupScratch: Bool = false
   /// Track scalarType of emitted UOps by their VarID for offset type lookups
@@ -39,6 +55,7 @@ public class MetalRenderer: Renderer, UOpEmitter {
     totalMemorySlots: Int,
     name: String = "kernel"
   ) -> [CompiledKernel] {
+    let scheduleItems = parallelizeFrameIndependentSerialKernels(scheduleItems, ctx: ctx)
     repairCrossKernelVarDependencies(scheduleItems, ctx: ctx)
 
     staticGlobalVars.removeAll()
@@ -151,6 +168,188 @@ public class MetalRenderer: Renderer, UOpEmitter {
         needsReducedGradsSum: useReduced,
         memorySize: max(totalMemorySlots, 1024)  // Match memory size calculation from render method
       )
+    }
+  }
+
+  /// Convert a conservatively serial scalar kernel to one thread per frame
+  /// when its emitted IR has no loop-carried state. The narrow write exception
+  /// handles final scalar carry stores: every frame computes its value, but
+  /// only the frame that was last in the original traversal commits it.
+  private func parallelizeFrameIndependentSerialKernels(
+    _ scheduleItems: [ScheduleItem], ctx: IRContext
+  ) -> [ScheduleItem] {
+    scheduleItems.map { item in
+      guard item.dispatchMode == .singleThreaded,
+        item.frameOrder == .sequential,
+        item.temporality == .frameBased,
+        item.ops.filter({ uop in
+          switch uop.op {
+          case .beginLoop, .beginReverseLoop: return true
+          default: return false
+          }
+        }).count == 1
+      else { return item }
+
+      guard
+        let frameLoopStart = item.ops.firstIndex(where: { uop in
+          switch uop.op {
+          case .beginLoop, .beginReverseLoop: return true
+          default: return false
+          }
+        })
+      else { return item }
+
+      var loopDepth = 0
+      var frameLoopEnd: Int?
+      findFrameLoopEnd: for index in frameLoopStart..<item.ops.count {
+        switch item.ops[index].op {
+        case .beginLoop, .beginReverseLoop, .beginForLoop, .beginParallelRange:
+          loopDepth += 1
+        case .endLoop, .endParallelRange:
+          loopDepth -= 1
+          if loopDepth == 0 {
+            frameLoopEnd = index
+            break findFrameLoopEnd
+          }
+        default:
+          break
+        }
+      }
+      guard let frameLoopEnd else { return item }
+
+      let prefix = item.ops[..<frameLoopStart]
+      let suffix = item.ops[(frameLoopEnd + 1)...]
+      let canonicalDispatchRangeCount = prefix.filter { uop in
+        guard
+          case .beginRange(.constant(_, let start), .constant(_, let end)) = uop.op
+        else { return false }
+        return start == 0 && end == 1
+      }.count
+      let prefixIsSafe = prefix.allSatisfy { uop in
+        switch uop.op {
+        case .frameCount, .defineGlobal, .defineConstant, .loadGlobal:
+          return true
+        case .beginRange(.constant(_, let start), .constant(_, let end)):
+          return start == 0 && end == 1
+        default:
+          return false
+        }
+      }
+      let suffixIsSafe = suffix.allSatisfy { uop in
+        if case .endRange = uop.op { return true }
+        return false
+      }
+      guard canonicalDispatchRangeCount == 1, prefixIsSafe, suffixIsSafe else { return item }
+
+      let body = Array(item.ops[(frameLoopStart + 1)..<frameLoopEnd])
+      var readCells = Set<CellID>()
+      var fixedWriteCells = Set<CellID>()
+      var writeIndices = Set<Int>()
+      var eligible = true
+
+      for (bodyIndex, uop) in body.enumerated() {
+        switch uop.op {
+        case .load(let cell), .memoryRead(let cell, _), .simdBroadcastLoad(let cell, _),
+          .simdgroupLoad(let cell, _, _, _):
+          readCells.insert(cell)
+        case .memoryWrite(let cell, let offset, _):
+          guard case .constant = offset else {
+            eligible = false
+            continue
+          }
+          fixedWriteCells.insert(cell)
+          writeIndices.insert(bodyIndex)
+          if case .variable(let resultId, _) = uop.value {
+            let usedLater = body.dropFirst(bodyIndex + 1).contains {
+              self.variableIdsUsed(in: $0.op).contains(resultId)
+            }
+            if usedLater { eligible = false }
+          }
+        case .mutate(let destination, _):
+          let destinationId = extractVarId(destination)
+          let initializedInFrame = body.prefix(bodyIndex).contains { candidate in
+            self.valueProducingOp(candidate.op)
+              && extractVarId(candidate.value) == destinationId
+          }
+          if ctx.globals.contains(destinationId) || !initializedInFrame {
+            eligible = false
+          }
+        case .store, .delay1, .noise, .memoryAccumulate, .simdgroupStore,
+          .setFrameIndex, .beginLoop, .beginReverseLoop,
+          .threadgroupWrite, .threadgroupBarrier:
+          eligible = false
+        case .loadTape(let source, _):
+          if case .variable(let sourceId, _) = source {
+            let definedHere = body.contains { candidate in
+              self.valueProducingOp(candidate.op)
+                && extractVarId(candidate.value) == sourceId
+            }
+            if definedHere { eligible = false }
+          }
+        default:
+          break
+        }
+      }
+
+      guard eligible, !fixedWriteCells.isEmpty,
+        fixedWriteCells.isDisjoint(with: readCells)
+      else { return item }
+
+      let finalFrameIsZero: Bool
+      switch item.ops[frameLoopStart].op {
+      case .beginReverseLoop:
+        finalFrameIsZero = true
+      case .beginLoop(_, let step):
+        guard step == 1 else { return item }
+        finalFrameIsZero = false
+      default:
+        return item
+      }
+
+      let parallel = ScheduleItem(
+        frameOrder: .parallel, vectorWidth: item.vectorWidth, temporality: item.temporality)
+      parallel.dispatchMode = .perFrame
+
+      let threadId = ctx.useVariable(src: nil, trackInValues: false)
+      let finalFrame: Lazy
+      var gatePrologue = [UOp(op: .threadIndex, value: threadId, scalarType: .int)]
+      if finalFrameIsZero {
+        finalFrame = .constant(0, 0)
+      } else {
+        let lastFrame = ctx.useVariable(src: nil, trackInValues: false)
+        gatePrologue.append(
+          UOp(
+            op: .sub(.variable(-1, nil), .constant(0, 1)), value: lastFrame,
+            scalarType: .int))
+        finalFrame = lastFrame
+      }
+      let isFinalFrame = ctx.useVariable(src: nil, trackInValues: false)
+      gatePrologue.append(UOp(op: .eq(threadId, finalFrame), value: isFinalFrame))
+
+      for index in item.ops.indices {
+        if index == frameLoopStart {
+          parallel.ops.append(contentsOf: gatePrologue)
+          continue
+        }
+        if index == frameLoopEnd { continue }
+
+        let uop = item.ops[index]
+        if index < frameLoopStart, case .beginRange = uop.op {
+          parallel.ops.append(
+            UOp(op: .beginRange(.constant(0, 0), .variable(-1, nil)), value: uop.value))
+          continue
+        }
+
+        let bodyIndex = index - frameLoopStart - 1
+        if writeIndices.contains(bodyIndex) {
+          parallel.ops.append(UOp(op: .beginIf(isFinalFrame), value: .empty))
+          parallel.ops.append(uop)
+          parallel.ops.append(UOp(op: .endIf, value: .empty))
+        } else {
+          parallel.ops.append(uop)
+        }
+      }
+      return parallel
     }
   }
 
@@ -735,6 +934,13 @@ public class MetalRenderer: Renderer, UOpEmitter {
     currentThreadCountOverride = scheduleItem.dispatchMode.fixedThreadCount
     currentTemporality = scheduleItem.temporality  // Set temporality for gradient indexing
     currentFrameOrder = scheduleItem.frameOrder
+    cacheableLocalGlobals = reusableTopLevelGlobals(in: scheduleItem, ctx: ctx)
+    preloadedInputGlobals = reusableInputGlobals(in: scheduleItem, ctx: ctx)
+    let scalarMemoryCache = reusableScalarMemoryCells(in: scheduleItem)
+    cacheableScalarMemoryCells = scalarMemoryCache.cells
+    cachedScalarMemoryWrites = scalarMemoryCache.writes
+    activeLocalGlobals.removeAll(keepingCapacity: true)
+    activeScalarMemoryCells.removeAll(keepingCapacity: true)
     let isGemmStagedKernel: Bool
     switch scheduleItem.dispatchMode {
     case .gemmStaged:
@@ -813,14 +1019,24 @@ public class MetalRenderer: Renderer, UOpEmitter {
     kernels += "  #pragma clang diagnostic push\n"
     kernels += "  #pragma clang diagnostic ignored \"-Wunused-variable\"\n"
 
+    for id in preloadedInputGlobals.sorted() {
+      kernels += "  float t\(id);\n"
+    }
+    for cell in cacheableScalarMemoryCells.sorted() {
+      kernels += "  float m\(cell) = memory[\(cell)];\n"
+    }
+
     var indent = 1
+    var didPreloadFrameInputs = false
+    var renderLoopKinds: [Bool] = []  // true for frame loops, false for element loops
 
     // For static blocks, define i=0 since there's no frame loop
     if case .static_ = currentTemporality {
       kernels += "  uint i = 0; // Static block - no frame loop\n"
     }
 
-    for uop in scheduleItem.ops {
+    let readOnlyLoopEnds = readOnlyLoopEndIndices(in: scheduleItem, ctx: ctx)
+    for (uopIndex, uop) in scheduleItem.ops.enumerated() {
       var diff = 0
       switch uop.op {
       case .beginIf, .beginLoop, .beginReverseLoop, .beginRange, .beginForLoop, .beginParallelRange,
@@ -832,15 +1048,182 @@ public class MetalRenderer: Renderer, UOpEmitter {
         break
       }
 
+      omitCurrentLoopFence = readOnlyLoopEnds.contains(uopIndex)
       kernels +=
         "\(String(repeating: "  ", count: indent))\(emit(uop, ctx: ctx))\n"
+      omitCurrentLoopFence = false
       indent += diff
+
+      switch uop.op {
+      case .beginLoop, .beginReverseLoop:
+        renderLoopKinds.append(true)
+        if activeScalarMemoryCells.isEmpty {
+          activeScalarMemoryCells.formUnion(cacheableScalarMemoryCells)
+        }
+      case .beginForLoop, .beginParallelRange:
+        renderLoopKinds.append(false)
+      case .endLoop:
+        if renderLoopKinds.popLast() == true && !activeScalarMemoryCells.isEmpty {
+          for cell in activeScalarMemoryCells.intersection(cachedScalarMemoryWrites).sorted() {
+            kernels += "\(String(repeating: "  ", count: indent))memory[\(cell)] = m\(cell);\n"
+          }
+          activeScalarMemoryCells.removeAll(keepingCapacity: true)
+        }
+      case .endParallelRange:
+        _ = renderLoopKinds.popLast()
+      default:
+        break
+      }
+
+      if !didPreloadFrameInputs {
+        let opensFrameLoop: Bool
+        switch uop.op {
+        case .beginLoop, .beginReverseLoop:
+          opensFrameLoop = true
+        default:
+          opensFrameLoop = false
+        }
+        if opensFrameLoop {
+          for id in preloadedInputGlobals.sorted() {
+            let slot = ctx.getGlobalId(id)
+            kernels +=
+              "\(String(repeating: "  ", count: indent))t\(id) = t[\(slot)*frameCount + i];\n"
+          }
+          activeLocalGlobals.formUnion(preloadedInputGlobals)
+          didPreloadFrameInputs = true
+        }
+      }
     }
 
     // Restore warning settings
     kernels += "  #pragma clang diagnostic pop\n"
     kernels += "}\n\n"
     return kernels
+  }
+
+  /// Locate loop terminators whose complete body is read-only with respect to
+  /// device buffers. Metal device fences order memory but do not synchronize
+  /// threads; in a read-only reduction loop they have no correctness role and
+  /// can otherwise execute tens of thousands of times inside a frame loop.
+  private func readOnlyLoopEndIndices(in scheduleItem: ScheduleItem, ctx: IRContext) -> Set<Int> {
+    struct LoopState {
+      var writesDeviceMemory = false
+    }
+
+    func writesDeviceMemory(_ uop: UOp) -> Bool {
+      switch uop.op {
+      case .memoryWrite, .memoryAccumulate, .store, .delay1, .noise,
+        .simdgroupStore, .output:
+        return true
+      case .mutate(let destination, _):
+        return ctx.globals.contains(extractVarId(destination))
+      default:
+        if valueProducingOp(uop.op) {
+          return ctx.globals.contains(extractVarId(uop.value))
+        }
+        return false
+      }
+    }
+
+    var stack: [LoopState] = []
+    var readOnlyEnds = Set<Int>()
+    for (index, uop) in scheduleItem.ops.enumerated() {
+      switch uop.op {
+      case .beginLoop, .beginReverseLoop, .beginForLoop, .beginParallelRange:
+        stack.append(LoopState())
+      case .endLoop, .endParallelRange:
+        guard let completed = stack.popLast() else { continue }
+        if !completed.writesDeviceMemory { readOnlyEnds.insert(index) }
+        if completed.writesDeviceMemory, !stack.isEmpty {
+          stack[stack.count - 1].writesDeviceMemory = true
+        }
+      default:
+        if writesDeviceMemory(uop), !stack.isEmpty {
+          stack[stack.count - 1].writesDeviceMemory = true
+        }
+      }
+    }
+    return readOnlyEnds
+  }
+
+  /// Fixed-address scalar state in a one-thread frame loop is semantically a
+  /// loop invariant (read-only), final value (write-only), or loop-carried local.
+  /// Repeated device loads/stores only add latency. Cache a cell when every
+  /// access in the kernel is scalar/fixed-zero, flushing written cells once.
+  private func reusableScalarMemoryCells(in scheduleItem: ScheduleItem) -> (
+    cells: Set<CellID>, writes: Set<CellID>
+  ) {
+    guard scheduleItem.frameOrder == .sequential,
+      scheduleItem.temporality != .static_
+    else { return ([], []) }
+
+    var frameLoopDepth = 0
+    var algorithmicDepth = 0
+    var frameLoopCount = 0
+    var reads = Set<CellID>()
+    var writes = Set<CellID>()
+    var disallowed = Set<CellID>()
+
+    func isZero(_ value: Lazy) -> Bool {
+      if case .constant(_, let scalar) = value { return scalar == 0 }
+      return false
+    }
+
+    for uop in scheduleItem.ops {
+      switch uop.op {
+      case .beginLoop, .beginReverseLoop:
+        if frameLoopDepth == 0 && algorithmicDepth == 0 { frameLoopCount += 1 }
+        frameLoopDepth += 1
+        continue
+      case .beginForLoop, .beginParallelRange:
+        algorithmicDepth += 1
+        continue
+      case .endLoop:
+        if algorithmicDepth > 0 { algorithmicDepth -= 1 } else { frameLoopDepth -= 1 }
+        continue
+      case .endParallelRange:
+        algorithmicDepth -= 1
+        continue
+      default:
+        break
+      }
+
+      let insideFrameLoop = frameLoopDepth > 0
+      switch uop.op {
+      case .load(let cell), .simdBroadcastLoad(let cell, .constant(_, 0)):
+        if insideFrameLoop { reads.insert(cell) } else { disallowed.insert(cell) }
+      case .store(let cell, _):
+        if insideFrameLoop { writes.insert(cell) } else { disallowed.insert(cell) }
+      case .delay1(let cell, _), .noise(let cell):
+        if insideFrameLoop {
+          reads.insert(cell)
+          writes.insert(cell)
+        } else {
+          disallowed.insert(cell)
+        }
+      case .memoryRead(let cell, let offset), .simdBroadcastLoad(let cell, let offset):
+        if insideFrameLoop && isZero(offset) {
+          reads.insert(cell)
+        } else {
+          disallowed.insert(cell)
+        }
+      case .memoryWrite(let cell, let offset, _):
+        if insideFrameLoop && isZero(offset) {
+          writes.insert(cell)
+        } else {
+          disallowed.insert(cell)
+        }
+      case .memoryAccumulate(let cell, _, _), .simdgroupLoad(let cell, _, _, _),
+        .simdgroupStore(_, let cell, _, _):
+        disallowed.insert(cell)
+      default:
+        break
+      }
+    }
+
+    guard frameLoopCount == 1 else { return ([], []) }
+    let cells = reads.union(writes).subtracting(disallowed)
+    return (cells, writes.intersection(cells))
   }
 
   func analyzeDependencies(scheduleItem: ScheduleItem, ctx: IRContext) -> (
@@ -988,25 +1371,41 @@ public class MetalRenderer: Renderer, UOpEmitter {
     case .round(let a): return emitAssign(uop, "metal::round\(g(a)))", ctx)
     case .noise(let cellId):
       // Xorshift32 PRNG - better spectral properties than LCG
+      let state = activeScalarMemoryCells.contains(cellId) ? "m\(cellId)" : "memory[\(cellId)]"
       let expr = """
         ({
-          uint s = as_type<uint>(memory[\(cellId)]);
+          uint s = as_type<uint>(\(state));
           if (s == 0u) s = 1u;
           s ^= s << 13; s ^= s >> 17; s ^= s << 5;
-          memory[\(cellId)] = as_type<float>(s);
+          \(state) = as_type<float>(s);
           float(s) / 4294967296.0f;
         })
         """
       return emitAssign(uop, expr, ctx)
     case .memoryRead(let base, let offset):
+      if activeScalarMemoryCells.contains(base), case .constant(_, let value) = offset,
+        value == 0
+      {
+        return emitAssign(uop, "m\(base)", ctx)
+      }
       let cast = intCastPrefix(for: offset)
       return emitAssign(uop, "memory[\(base) + \(cast)\(g(offset))]", ctx)
     case .simdBroadcastLoad(let base, let offset):
+      if activeScalarMemoryCells.contains(base), case .constant(_, let value) = offset,
+        value == 0
+      {
+        return emitAssign(uop, "m\(base)", ctx)
+      }
       // On Metal each thread processes one element, so a lane-uniform broadcast
       // has the same shape as a plain scalar read — no per-lane materialization.
       let cast = intCastPrefix(for: offset)
       return emitAssign(uop, "memory[\(base) + \(cast)\(g(offset))]", ctx)
     case .memoryWrite(let base, let offset, let value):
+      if activeScalarMemoryCells.contains(base), case .constant(_, let scalar) = offset,
+        scalar == 0
+      {
+        return "m\(base) = \(g(value));"
+      }
       let cast = intCastPrefix(for: offset)
       return "memory[\(base) + \(cast)\(g(offset))] = \(g(value));"
     case .memoryAccumulate(let base, let offset, let value):
@@ -1038,8 +1437,9 @@ public class MetalRenderer: Renderer, UOpEmitter {
       return emitAssign(uop, expr, ctx)
     case .delay1(let cell, let a):
       // Scalar: read previous value, then write current value
-      let assign = emitAssign(uop, "memory[\(cell)]", ctx)
-      return "\(assign) memory[\(cell)] = \(g(a));"
+      let state = activeScalarMemoryCells.contains(cell) ? "m\(cell)" : "memory[\(cell)]"
+      let assign = emitAssign(uop, state, ctx)
+      return "\(assign) \(state) = \(g(a));"
     case .selector(let mode, let options):
       // Metal: if mode <= 0 return 0, if mode <= 1 return options[0], etc.
       var expr = "0.0f"  // Default value
@@ -1054,7 +1454,9 @@ public class MetalRenderer: Renderer, UOpEmitter {
 
       return emitAssign(uop, expr, ctx)
 
-    case .load(let cell): return emitAssign(uop, "memory[\(cell)]", ctx)
+    case .load(let cell):
+      let state = activeScalarMemoryCells.contains(cell) ? "m\(cell)" : "memory[\(cell)]"
+      return emitAssign(uop, state, ctx)
     case .frameIndex:
       // Use id for SIMD blocks, i for scalar blocks
       let baseIdx = (currentFrameOrder == .parallel) ? "id" : "i"
@@ -1064,7 +1466,9 @@ public class MetalRenderer: Renderer, UOpEmitter {
       let boundedFetch =
         "(\(g(offset)) < 0 || \(g(offset)) >= frameCount) ? 0.0 : t[\(varId) * frameCount + (int)\(g(offset))]"
       return emitAssign(uop, boundedFetch, ctx)
-    case .store(let cell, let val): return "memory[\(cell)] = \(g(val));"
+    case .store(let cell, let val):
+      let state = activeScalarMemoryCells.contains(cell) ? "m\(cell)" : "memory[\(cell)]"
+      return "\(state) = \(g(val));"
     case .mutate(let a, let b):
       return "\(emitLazy(a, ctx: ctx, isOut: true)) = \(g(b));"
     case .beginIf(let cond): return "if (\(g(cond))) {"
@@ -1108,7 +1512,7 @@ public class MetalRenderer: Renderer, UOpEmitter {
       // single thread per threadgroup — no cross-thread synchronization needed)
       // GEMM loops are register-local; device fences in their inner loops are unnecessary
       // and can dominate runtime at large K.
-      if usesThreadgroupScratch || isGemmKernel {
+      if usesThreadgroupScratch || isGemmKernel || omitCurrentLoopFence {
         return "}"
       }
       return "} atomic_thread_fence(metal::mem_flags::mem_device, metal::memory_order_seq_cst);"
@@ -1199,7 +1603,7 @@ public class MetalRenderer: Renderer, UOpEmitter {
       //
       // The fence ensures writes complete and are visible before the next frame's reads.
       // This matches how the C backend behaves (sequential consistency on CPU).
-      if parallelRangeMode == .thread || isGemmKernel {
+      if parallelRangeMode == .thread || isGemmKernel || omitCurrentLoopFence {
         return "}"
       }
       return "} atomic_thread_fence(metal::mem_flags::mem_device, metal::memory_order_seq_cst);"
@@ -1272,6 +1676,7 @@ public class MetalRenderer: Renderer, UOpEmitter {
         // This is a parallel range loop variable - use _pr prefix
         return "_pr\(id)"
       } else if ctx.globals.contains(id) {
+        if !isOut && activeLocalGlobals.contains(id) { return "t\(id)" }
         let tapeSlot = ctx.getGlobalId(id)
         let baseIdx = (currentFrameOrder == .parallel) ? threadIndexExpr() : "i"
         let idx =
@@ -1287,6 +1692,7 @@ public class MetalRenderer: Renderer, UOpEmitter {
       }
     case .global(let id):
       // Global variables are accessed through global buffers
+      if !isOut && activeLocalGlobals.contains(id) { return "t\(id)" }
       let tapeSlot = ctx.getGlobalId(id)
       let baseIdx = (currentFrameOrder == .parallel) ? threadIndexExpr() : "i"
       let idx =
@@ -1303,13 +1709,164 @@ public class MetalRenderer: Renderer, UOpEmitter {
 
   func emitAssign(_ uop: UOp, _ expr: String, _ ctx: IRContext) -> String {
     let lhs = emitLazy(uop.value, ctx: ctx, isOut: true)
-    let isGlobal = ctx.globals.contains(extractVarId(uop.value))
+    let varId = extractVarId(uop.value)
+    let isGlobal = ctx.globals.contains(varId)
 
     if isGlobal {
+      if cacheableLocalGlobals.contains(varId) {
+        let typeStr = uop.scalarType == .int ? "int" : "float"
+        if activeLocalGlobals.insert(varId).inserted {
+          return "\(typeStr) t\(varId) = \(expr); \(lhs) = t\(varId);"
+        }
+        return "t\(varId) = \(expr); \(lhs) = t\(varId);"
+      }
       return "\(lhs) = \(expr);"
     }
     let typeStr = uop.scalarType == .int ? "int" : "float"
     return "\(typeStr) \(lhs) = \(expr);"
+  }
+
+  /// Find global values whose first definition is in the serial frame body's
+  /// top-level scope and which are read again later in the same kernel. Values
+  /// first defined inside a conditional/element loop, or mutated indirectly,
+  /// stay tape-backed so generated lexical scope and mutation semantics remain
+  /// unchanged.
+  private func reusableTopLevelGlobals(in scheduleItem: ScheduleItem, ctx: IRContext)
+    -> Set<VarID>
+  {
+    let frameLoopCount = scheduleItem.ops.reduce(into: 0) { count, uop in
+      switch uop.op {
+      case .beginLoop, .beginReverseLoop:
+        count += 1
+      default:
+        break
+      }
+    }
+    guard scheduleItem.frameOrder == .sequential,
+      scheduleItem.temporality != .static_,
+      frameLoopCount == 1
+    else { return [] }
+
+    let globalIds = Set(ctx.globals)
+    var disallowed = Set<VarID>()
+    for uop in scheduleItem.ops {
+      if case .mutate(let destination, _) = uop.op,
+        case .variable(let id, _) = destination
+      {
+        disallowed.insert(id)
+      }
+    }
+
+    var nestedDepth = 0
+    var loopNesting: [Bool] = []
+    var firstTopLevelDefinition: [VarID: Int] = [:]
+    for (index, uop) in scheduleItem.ops.enumerated() {
+      switch uop.op {
+      case .endIf, .endParallelRange, .endHopCheck:
+        nestedDepth = max(0, nestedDepth - 1)
+      case .endLoop:
+        if loopNesting.popLast() == true { nestedDepth = max(0, nestedDepth - 1) }
+      default:
+        break
+      }
+
+      if nestedDepth == 0, valueProducingOp(uop.op),
+        case .variable(let id, _) = uop.value,
+        globalIds.contains(id), firstTopLevelDefinition[id] == nil
+      {
+        firstTopLevelDefinition[id] = index
+      }
+
+      switch uop.op {
+      case .beginIf, .beginParallelRange, .beginHopCheck:
+        nestedDepth += 1
+      case .beginForLoop:
+        nestedDepth += 1
+        loopNesting.append(true)
+      case .beginLoop, .beginReverseLoop:
+        loopNesting.append(false)
+      default:
+        break
+      }
+    }
+
+    var reusable = Set<VarID>()
+    for (id, definitionIndex) in firstTopLevelDefinition where !disallowed.contains(id) {
+      let usedLater = scheduleItem.ops.dropFirst(definitionIndex + 1).contains { uop in
+        variableIdsUsed(in: uop.op).contains(id)
+      }
+      if usedLater { reusable.insert(id) }
+    }
+    return reusable
+  }
+
+  /// Device-tape inputs used repeatedly by a serial frame kernel are loaded
+  /// once at the top of each frame. This is especially valuable for reverse
+  /// recurrences, where a single GPU thread otherwise issues many identical,
+  /// non-coalesced reads from the variable-major tape.
+  private func reusableInputGlobals(in scheduleItem: ScheduleItem, ctx: IRContext)
+    -> Set<VarID>
+  {
+    let frameLoopCount = scheduleItem.ops.reduce(into: 0) { count, uop in
+      switch uop.op {
+      case .beginLoop, .beginReverseLoop:
+        count += 1
+      default:
+        break
+      }
+    }
+    guard scheduleItem.frameOrder == .sequential,
+      scheduleItem.temporality == .frameBased,
+      // The preload is activated for the first frame loop. Kernels containing
+      // multiple frame loops may revisit the same tape inputs in a different
+      // order, so a function-scoped cached value would be stale there.
+      frameLoopCount == 1,
+      !scheduleItem.ops.contains(where: {
+        if case .setFrameIndex = $0.op { return true }
+        return false
+      })
+    else { return [] }
+
+    let globalIds = Set(ctx.globals).subtracting(staticGlobalVars)
+    let definitions = Set(
+      scheduleItem.ops.compactMap { uop -> VarID? in
+        guard valueProducingOp(uop.op), case .variable(let id, _) = uop.value else { return nil }
+        return id
+      })
+    var useCounts: [VarID: Int] = [:]
+    var mutated = Set<VarID>()
+    for uop in scheduleItem.ops {
+      for id in variableIdsUsed(in: uop.op) where globalIds.contains(id) {
+        useCounts[id, default: 0] += 1
+      }
+      if case .mutate(let destination, _) = uop.op,
+        case .variable(let id, _) = destination
+      {
+        mutated.insert(id)
+      }
+    }
+
+    return Set(
+      useCounts.compactMap { id, count in
+        count >= 2 && !definitions.contains(id) && !mutated.contains(id) ? id : nil
+      })
+  }
+
+  private func valueProducingOp(_ op: Op) -> Bool {
+    switch op {
+    case .load, .delay1, .mse,
+      .add, .sub, .mul, .div, .abs, .sign, .sin, .cos, .and, .or, .xor,
+      .tan, .atan, .tanh, .exp, .log, .log10, .sqrt, .pow, .atan2, .mod,
+      .gt, .gte, .lte, .lt, .eq, .min, .max, .floor, .ceil, .round,
+      .noise, .memoryRead, .simdBroadcastLoad, .broadcastScalar, .latch,
+      .gswitch, .selector, .hostSampleRate, .frameIndex, .threadIndex,
+      .loadTape, .cast, .identity, .declareVar, .threadgroupRead,
+      .threadgroupPositionX, .threadgroupPositionY, .threadgroupPositionZ,
+      .threadIndexInThreadgroup, .simdgroupIndexInThreadgroup:
+      return true
+    default:
+      return false
+    }
   }
 
   private func threadIndexExpr() -> String {
