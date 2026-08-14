@@ -203,7 +203,13 @@ public class LazyGraph {
     }
     signals = signals.filter { $0.value != nil }
     for ref in signals {
-      ref.value?.refresh()
+      guard let signal = ref.value else { continue }
+      // Re-entrant Lisp evaluation must recreate params at their original AST
+      // position so node/cell ordering stays identical to a fresh evaluation.
+      // evalParam refreshes these named survivors on demand.
+      if !parameterRegistry.isNamed(signal) {
+        signal.refresh()
+      }
     }
   }
 }

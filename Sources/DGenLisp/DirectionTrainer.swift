@@ -8,10 +8,10 @@
 // projection and a global LR at 2x the legacy production tone LR per
 // BATCH_REFINE_FINDING.
 //
-// Each epoch rebuilds the graph and re-evaluates the lowered patch. Compiled
-// artifacts are carried across those resets, while parameter and state memory
-// remain fresh. Preview WAVs are rendered by re-invoking this executable
-// (`train-render`) — realize() must never interleave with backward() in the
+// Each phase resets the lazy graph once. Every epoch re-evaluates the lowered
+// patch in that graph; named parameters survive the backward graph clear while
+// voice/state nodes are rebuilt from silence. Preview WAVs are rendered by
+// re-invoking this executable (`train-render`) — realize() must never interleave with backward() in the
 // same process (SPEC.md §5).
 
 import DGen
@@ -190,23 +190,26 @@ enum DirectionTrainer {
             ProcessInfo.processInfo.environment["DGENLISP_TRAIN_TIMING"] == "1"
 
         configureRuntime(options: options, sampleRate: sampleRate, crop: crop)
+        LazyGraphContext.reset()
 
+        // Discover and register every Lisp parameter before the first measured
+        // build. Named parameters refresh lazily at their AST positions after
+        // this clear, preserving fresh-evaluation node and cell ordering.
+        do {
+            let evaluator = LispEvaluator(reusesRegisteredParameters: true)
+            try evaluator.evaluate(nodes: patchPlan.loweredNodes)
+        } catch let error as LispError {
+            throw TrainProtocolError("parameter registration failed: \(error.message)")
+        }
+        LazyGraphContext.current.clearComputationGraph()
+
+        var expectedBuildShape: (nodes: Int, tensors: Int, cells: Int)?
         for epoch in 1...epochs {
-            LazyGraphContext.reset()
             let evalStart = CFAbsoluteTimeGetCurrent()
-            let evaluator = LispEvaluator()
-            do {
-                try evaluator.evaluate(nodes: patchPlan.loweredNodes)
-            } catch let error as LispError {
-                throw TrainProtocolError("epoch re-evaluation failed: \(error.message)")
-            }
-            let paramSignals = try learnableSignals(evaluator: evaluator, transforms: transforms)
+            let (paramSignals, output) = try evaluateTrainingPatch(
+                nodes: patchPlan.loweredNodes, transforms: transforms)
             for (i, t) in transforms.enumerated() {
                 paramSignals[i].updateDataLazily(t.fromZ(z[i]))
-            }
-
-            guard let output = outputSignal(evaluator: evaluator) else {
-                throw TrainProtocolError("patch lost its channel-0 output during re-evaluation")
             }
             let lispEvalMS = (CFAbsoluteTimeGetCurrent() - evalStart) * 1000
 
@@ -216,6 +219,21 @@ enum DirectionTrainer {
                 synth: output, target: targetSignal, frames: crop)
             let graphBuildMS = (CFAbsoluteTimeGetCurrent() - graphBuildStart) * 1000
             let epochGraph = LazyGraphContext.current
+            let buildShape = (
+                nodes: epochGraph.debugNodeCount,
+                tensors: epochGraph.debugTensorCount,
+                cells: epochGraph.debugMemoryCellCount)
+            if let expected = expectedBuildShape,
+                buildShape.nodes != expected.nodes || buildShape.tensors != expected.tensors
+                    || buildShape.cells != expected.cells
+            {
+                throw TrainProtocolError(
+                    "\(name) graph grew while rebuilding epoch \(epoch): "
+                        + "expected \(expected.nodes) nodes/\(expected.tensors) tensors/"
+                        + "\(expected.cells) cells, got \(buildShape.nodes)/"
+                        + "\(buildShape.tensors)/\(buildShape.cells)")
+            }
+            expectedBuildShape = buildShape
             let lossValues = try loss.backward(frames: crop)
             if epoch == 1,
                 ProcessInfo.processInfo.environment["DGENLISP_TRAIN_PROFILE"] == "1"
@@ -247,6 +265,7 @@ enum DirectionTrainer {
                         Data(
                             "[train] \(name): all gradients zero for \(deadEpochs) epochs (silent voice?); stopping phase at epoch \(epoch)\n"
                                 .utf8))
+                    for signal in paramSignals { signal.grad = nil }
                     break
                 }
             } else {
@@ -300,8 +319,28 @@ enum DirectionTrainer {
                         Data("[train] checkpoint render failed at epoch \(epoch): \(error)\n".utf8))
                 }
             }
+
+            // Gradients have already been copied into naturalGrads and all
+            // epoch metrics above were captured before clearing them.
+            for signal in paramSignals { signal.grad = nil }
         }
         return result
+    }
+
+    private static func evaluateTrainingPatch(
+        nodes: [ASTNode], transforms: [TransformedParam]
+    ) throws -> (params: [Signal], output: Signal) {
+        let evaluator = LispEvaluator(reusesRegisteredParameters: true)
+        do {
+            try evaluator.evaluate(nodes: nodes)
+        } catch let error as LispError {
+            throw TrainProtocolError("epoch re-evaluation failed: \(error.message)")
+        }
+        let signals = try learnableSignals(evaluator: evaluator, transforms: transforms)
+        guard let output = outputSignal(evaluator: evaluator) else {
+            throw TrainProtocolError("patch lost its channel-0 output during re-evaluation")
+        }
+        return (signals, output)
     }
 
     private static func emitTiming(

@@ -84,9 +84,14 @@ class LispEvaluator {
   var tensors: [TensorInfo] = []
   var macroExpansionCounter: Int = 0
   let sourceDirectory: URL
+  let reusesRegisteredParameters: Bool
 
-  init(sourceDirectory: URL = URL(fileURLWithPath: FileManager.default.currentDirectoryPath)) {
+  init(
+    sourceDirectory: URL = URL(fileURLWithPath: FileManager.default.currentDirectoryPath),
+    reusesRegisteredParameters: Bool = false
+  ) {
     self.sourceDirectory = sourceDirectory
+    self.reusesRegisteredParameters = reusesRegisteredParameters
   }
 
   // MARK: - Top-level evaluation
@@ -97,6 +102,20 @@ class LispEvaluator {
   }
 
   func evaluate(nodes: [ASTNode]) throws {
+    if reusesRegisteredParameters {
+      // Every non-parameter value belongs to the computation graph generation
+      // in which it was built. Never let those stale node IDs leak into a
+      // re-evaluation after backward() has cleared that generation.
+      definitions.removeAll()
+      historyBindings.removeAll()
+      tensorHistoryBindings.removeAll()
+      macros.removeAll()
+      params.removeAll()
+      outputs.removeAll()
+      inputs.removeAll()
+      tensors.removeAll()
+      macroExpansionCounter = 0
+    }
     for node in nodes {
       let _ = try evaluateAST(node)
     }
@@ -1432,7 +1451,17 @@ class LispEvaluator {
     let modulationResolvedSymbolName = attrValue(attributes, "@mod-resolved-symbol")
     let generatedModulatorSlot = Int(attrValue(attributes, "@modulator-slot") ?? "")
 
-    let signal = Signal.param(defaultVal, min: minVal, max: maxVal)
+    let graph = LazyGraphContext.current
+    let signal: Signal
+    if reusesRegisteredParameters, let registered = graph.registeredSignalParameter(named: name) {
+      registered.refresh()
+      signal = registered
+    } else {
+      signal = Signal.param(defaultVal, min: minVal, max: maxVal)
+      if reusesRegisteredParameters {
+        graph.registerParameter(signal, named: name)
+      }
+    }
 
     let info = ParamInfo(
       name: name,
