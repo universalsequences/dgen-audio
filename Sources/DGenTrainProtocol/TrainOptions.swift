@@ -25,7 +25,9 @@ public struct TrainOptions: Equatable {
 
     /// Replace `(svf ...)` calls with the differentiable frequency-sampled
     /// training surrogate. Rendering always keeps the real SVF.
-    public var filterSurrogate: String = "freq"
+    /// Default "none": the surrogate mode was determined to be broken;
+    /// opt back in with --filter-surrogate freq.
+    public var filterSurrogate: String = "none"
     public var surrogateWindow: Int = 1024
     public var surrogateHop: Int = 256
     /// Optional true-SVF refinement after surrogate training.
@@ -65,7 +67,7 @@ public struct TrainOptions: Equatable {
         var pitchHz: Double?
         var planOnly = false
         var backend = "metal"
-        var filterSurrogate = "freq"
+        var filterSurrogate = "none"
         var surrogateWindow = 1024
         var surrogateHop = 256
         var polishEpochs = 0

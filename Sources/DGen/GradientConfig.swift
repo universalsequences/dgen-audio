@@ -12,12 +12,12 @@ public enum DGenGradientConfig {
 
   /// `true`: stop-gradient at every phasor frequency input. The forward
   /// graph is unchanged (pitch modulation still sounds), but no gradient
-  /// flows through oscillator frequency — the swept-f0 adjoint fails
-  /// fdcheck (~0.47 rel error) and a trainable phasor frequency corrupts
-  /// OTHER params' gradients ~10x (SVFBPTTScratchTests TrainableDetune).
-  /// Params whose only influence is through frequency simply receive zero
-  /// gradient; params with mixed paths train on their non-pitch component.
-  /// Set by `dgenlisp train`; defaults off for all other uses.
+  /// flows through oscillator frequency. Off by default: the historical
+  /// cross-param corruption (a trainable phasor frequency corrupting a
+  /// coupled-history param's gradient ~30x) was a block-formation bug —
+  /// the phasor's suffix-scan tape severed the scalar BPTT recurrence —
+  /// fixed by consolidateScalarBPTTBackwardBlocks. Kept as an opt-out
+  /// for experiments that want pitch pinned.
   public static var detachPhasorFrequency: Bool = false
 }
 

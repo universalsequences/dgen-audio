@@ -10,8 +10,10 @@ import Foundation
 
 public struct PhasorFrequencyAnalysis {
     /// Cell ids of `.param` nodes that are ancestors of any phasor node's
-    /// frequency input. Training must freeze these (swept-f0 /
-    /// trainable-statefulPhasor-frequency adjoints are unreliable).
+    /// frequency input. Informational: frequency params are trainable
+    /// (the phasor suffix-scan adjoint composes with history BPTT since
+    /// the scalar-recurrence consolidation fix); hosts may still surface
+    /// which params drive pitch.
     public let frequencyParamCells: Set<CellID>
     /// Phasor nodes whose reset input is driven by another oscillator
     /// (oscillator sync — a declared non-goal; refuse to train).
@@ -57,25 +59,18 @@ extension LazyGraph {
         return found
     }
 
-    /// Param cells with at least one gradient-live path to `signal` under
-    /// the detached-phasor-frequency policy: phasor inputs are never
-    /// traversed (their gradients are severed), while history feedback IS
-    /// traversed (BPTT carry cells propagate gradients through
+    /// Param cells with at least one gradient-live path to `signal`.
+    /// Phasor frequency inputs ARE traversed (the suffix-scan adjoint
+    /// delivers frequency gradients; reset inputs get none), and history
+    /// feedback IS traversed (BPTT carry cells propagate gradients through
     /// read-history by following the matching history writes).
     public func gradientReachableParamCells(from signal: Signal) -> Set<CellID> {
-        // Pre-index history writes by cell so reads can jump to them, and
-        // collect frequency sink nodes: any node used as a phasor input is
-        // a gradient sink at EVERY use (mirrors computeGradients'
-        // detachPhasorFrequency policy — the same value node also feeds
-        // pitch-derived side computations like the PolyBLEP dt).
+        // Pre-index history writes by cell so reads can jump to them.
         var writesByCell: [CellID: [NodeID]] = [:]
-        var frequencySinks: Set<NodeID> = []
         for (id, node) in graph.nodes {
             switch node.op {
             case .historyWrite(let cell), .historyReadWrite(let cell):
                 writesByCell[cell, default: []].append(id)
-            case .phasor, .deterministicPhasor:
-                frequencySinks.formUnion(node.inputs)
             default:
                 break
             }
@@ -86,12 +81,14 @@ extension LazyGraph {
         var seen: Set<NodeID> = []
         while let id = stack.popLast() {
             guard seen.insert(id).inserted, let node = graph.nodes[id] else { continue }
-            if frequencySinks.contains(id) { continue }
             switch node.op {
             case .param(let cell):
                 cells.insert(cell)
             case .phasor, .deterministicPhasor:
-                continue  // detached: gradient never crosses into the inputs
+                // Gradient flows into the frequency input only; a phasor's
+                // reset input receives a structurally zero gradient.
+                if let freq = node.inputs.first { stack.append(freq) }
+                continue
             case .historyRead(let cell), .historyReadWrite(let cell):
                 stack.append(contentsOf: node.inputs)
                 stack.append(contentsOf: writesByCell[cell] ?? [])

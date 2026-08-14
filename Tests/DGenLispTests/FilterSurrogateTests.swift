@@ -20,6 +20,8 @@ final class FilterSurrogateTests: XCTestCase {
             seedParamsPath: "unused", jobDirPath: "unused")
         options.pitchHz = 220
         options.gateFrames = 1024
+        // Surrogate mode defaults off; this test exercises the opt-in rewrite.
+        options.filterSurrogate = "freq"
         options.surrogateWindow = 64
         options.surrogateHop = 16
         let target = (0..<2048).map {

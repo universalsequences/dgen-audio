@@ -252,8 +252,8 @@ final class TrainCLITests: XCTestCase {
         guard case .plan(let plan) = outcome.events.first else {
             return XCTFail("first event must be the real plan")
         }
-        XCTAssertEqual(plan.learnable, ["amp"])
-        XCTAssertEqual(plan.frozen, [ParamVerdict(name: "freq", reason: "pitch-path-detached")])
+        XCTAssertEqual(plan.learnable, ["amp", "freq"])
+        XCTAssertTrue(plan.frozen.isEmpty)
         XCTAssertEqual(plan.seedEcho, ["amp": 0.8])
         XCTAssertEqual(plan.pitchHz, 110, accuracy: 2.0)
         XCTAssertEqual(plan.cropFrames, 16384)

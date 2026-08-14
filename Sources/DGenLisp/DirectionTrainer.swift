@@ -475,9 +475,10 @@ enum DirectionTrainer {
         DGenConfig.maxFrameCount = crop
         DGenConfig.defaultFrameCount = crop
         DGenSpectralConfig.logMagnitudeEpsilon = logEpsilon
-        // Stop-gradient at phasor frequency inputs: forward unchanged,
-        // no gradient through pitch (matches the plan's freeze verdict).
-        DGenGradientConfig.detachPhasorFrequency = true
+        // Phasor frequency is trainable: the suffix-scan adjoint composes
+        // with history BPTT since the scalar-recurrence consolidation fix.
+        // Reset explicitly in case another phase flipped the global.
+        DGenGradientConfig.detachPhasorFrequency = false
     }
 
     static func learnableSignals(

@@ -34,11 +34,9 @@ struct PatchPlan {
 
 enum TrainPlanner {
     /// Freeze/refuse reasons (stable strings — the host displays them).
-    /// Pitch-only params: training runs with stop-gradient at phasor
-    /// frequency inputs (DGenGradientConfig.detachPhasorFrequency), so a
-    /// param whose every path to the output crosses a frequency input
-    /// provably receives zero gradient. Pitch is never learned.
-    static let reasonPitchDetached = "pitch-path-detached"
+    /// Phasor frequency params are trainable: the suffix-scan adjoint
+    /// composes correctly with history BPTT since the scalar-recurrence
+    /// consolidation fix, so no pitch-path freeze applies anymore.
     static let reasonNoGradPath = "no-gradient-path"
     static let reasonMissingBounds = "missing-bounds"
     static let reasonGenerated = "generated-param"
@@ -115,12 +113,8 @@ enum TrainPlanner {
                 continue
             }
             if let cell = param.cellId, !gradReachable.contains(cell) {
-                // Zero gradient by construction. Distinguish "all paths
-                // cross a detached phasor frequency" from "not connected".
-                let reason =
-                    analysis.frequencyParamCells.contains(cell)
-                    ? reasonPitchDetached : reasonNoGradPath
-                frozen.append(ParamVerdict(name: param.name, reason: reason))
+                // Zero gradient by construction: no path to the output.
+                frozen.append(ParamVerdict(name: param.name, reason: reasonNoGradPath))
                 continue
             }
             guard let minBound = param.min, let maxBound = param.max, minBound < maxBound else {

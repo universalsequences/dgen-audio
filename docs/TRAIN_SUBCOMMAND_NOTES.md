@@ -1,5 +1,19 @@
 # `dgenlisp train` — implementation notes, deviations, punts
 
+## Policy changes (2026-08-14)
+
+- **Phasor frequency params are trainable** — the pitch-path freeze
+  (value-level stop-gradient via `DGenGradientConfig.detachPhasorFrequency`
+  plus the `pitch-path-detached` plan verdict) is removed. The corruption it
+  guarded against was a block-formation bug: the phasor suffix-scan adjoint
+  severed the scalar BPTT recurrence when composed with coupled-history
+  filters (~30x wrong coupled-param gradients). Fixed by
+  `consolidateScalarBPTTBackwardBlocks` (see
+  `TemporalGradientCompositionTests`); deviation #2 below is historical.
+- **`--filter-surrogate` defaults to `none`** — the frequency-sampled SVF
+  surrogate mode was determined to be broken; opt back in with
+  `--filter-surrogate freq`.
+
 ## Post-landing findings (monologue-bass shakedown, 2026-08-13)
 
 Fitting a real eseq-style monologue patch to `Assets/monologue-bass.wav`

@@ -70,48 +70,44 @@ final class TrainPlannerTests: XCTestCase {
         )
     }
 
-    // (b) param feeding a phasor frequency is frozen.
-    func testPhasorFrequencyParamFrozen() throws {
+    // (b) param feeding a phasor frequency is learnable (the suffix-scan
+    // adjoint composes with history BPTT since the scalar-recurrence
+    // consolidation fix; no pitch-path freeze).
+    func testPhasorFrequencyParamLearnable() throws {
         let source = """
             (def freq (param freq @default 110 @min 50 @max 400))
             (def amp (param amp @default 0.5 @min 0 @max 1))
             (out (* amp (phasor freq)) 0)
             """
         let patchPlan = try plan(source)
-        XCTAssertEqual(patchPlan.plan.learnable, ["amp"])
-        XCTAssertEqual(
-            patchPlan.plan.frozen,
-            [ParamVerdict(name: "freq", reason: TrainPlanner.reasonPitchDetached)])
+        XCTAssertEqual(patchPlan.plan.learnable, ["amp", "freq"])
+        XCTAssertTrue(patchPlan.plan.frozen.isEmpty)
     }
 
-    // (b') the freeze policy sees through defs AND macro expansion.
-    func testPhasorFrequencyFrozenThroughMacro() throws {
+    // (b') classification sees through defs AND macro expansion.
+    func testPhasorFrequencyLearnableThroughMacro() throws {
         let source = """
             (defmacro myosc (f) (phasor (* f 1.0)))
             (def freq (param freq @default 110 @min 50 @max 400))
             (out (myosc freq) 0)
             """
         let patchPlan = try plan(source)
-        XCTAssertEqual(
-            patchPlan.plan.frozen,
-            [ParamVerdict(name: "freq", reason: TrainPlanner.reasonPitchDetached)])
-        XCTAssertTrue(patchPlan.plan.learnable.isEmpty)
+        XCTAssertEqual(patchPlan.plan.learnable, ["freq"])
+        XCTAssertTrue(patchPlan.plan.frozen.isEmpty)
     }
 
-    // (b'') stateful-phasor frequency params freeze identically.
-    func testStatefulPhasorFrequencyFrozen() throws {
+    // (b'') stateful-phasor frequency params are learnable identically.
+    func testStatefulPhasorFrequencyLearnable() throws {
         let source = """
             (def freq (param freq @default 110 @min 50 @max 400))
             (out (stateful-phasor freq) 0)
             """
         let patchPlan = try plan(source)
-        XCTAssertEqual(
-            patchPlan.plan.frozen,
-            [ParamVerdict(name: "freq", reason: TrainPlanner.reasonPitchDetached)])
+        XCTAssertEqual(patchPlan.plan.learnable, ["freq"])
+        XCTAssertTrue(patchPlan.plan.frozen.isEmpty)
     }
 
-    // (b''') mixed-path params stay learnable: the pitch path is severed
-    // by stop-gradient, but the amplitude path still carries gradient.
+    // (b''') mixed-path params are learnable through both routes.
     func testMixedPathParamStaysLearnable() throws {
         let source = """
             (def bright (param bright @default 1.0 @min 0.1 @max 5.0))
@@ -123,23 +119,17 @@ final class TrainPlannerTests: XCTestCase {
         XCTAssertTrue(patchPlan.plan.frozen.isEmpty)
     }
 
-    // A frequency VALUE is a gradient sink at every use: a param whose
-    // node feeds a phasor also gets no gradient from its other uses
-    // (PolyBLEP-dt-style side paths), so it must be reported frozen —
-    // otherwise Adam's normalized steps walk tuning params off pitch on
-    // residual gradients (heard as dissonant oscillators on the
-    // monologue-bass fit).
-    func testFrequencyValueIsSinkAtEveryUse() throws {
+    // A param that feeds both a phasor frequency and a direct side path
+    // is learnable — gradient now flows through both uses.
+    func testFrequencyValueLearnableAtEveryUse() throws {
         let source = """
             (def freq (param freq @default 110 @min 50 @max 400))
             (def amp (param amp @default 0.5 @min 0 @max 1))
             (out (* amp (+ (phasor freq) (* 0.001 freq))) 0)
             """
         let patchPlan = try plan(source)
-        XCTAssertEqual(patchPlan.plan.learnable, ["amp"])
-        XCTAssertEqual(
-            patchPlan.plan.frozen,
-            [ParamVerdict(name: "freq", reason: TrainPlanner.reasonPitchDetached)])
+        XCTAssertEqual(patchPlan.plan.learnable, ["amp", "freq"])
+        XCTAssertTrue(patchPlan.plan.frozen.isEmpty)
     }
 
     // Params with no path to the output at all are frozen distinctly.
@@ -234,7 +224,7 @@ final class TrainPlannerTests: XCTestCase {
             """
         let patchPlan = try plan(source)
         let lowered = TrainPlanner.loweredSource(patchPlan: patchPlan)
-        XCTAssertTrue(lowered.contains("; frozen: freq (pitch-path-detached)"))
+        XCTAssertTrue(lowered.contains("; learnable: freq"))
         XCTAssertTrue(lowered.contains("(out (phasor freq) 0)"))
         // lowered.lisp must be re-parseable (train-render consumes it).
         XCTAssertNoThrow(try parseSource(lowered))
