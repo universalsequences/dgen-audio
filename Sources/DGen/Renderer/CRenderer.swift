@@ -515,7 +515,12 @@ public class CRenderer: Renderer {
       return emitAssign(uop, expr, ctx)
 
     case .div(let a, let b):
-      if uop.scalarType == .int && !uop.isSimd {
+      // Integer values remain lane-uniform scalar temporaries even when the
+      // enclosing tensor element loop is NEON-upgraded. The SIMD legality pass
+      // only permits integer division when both operands are uniform, so using
+      // scalar names here is both correct and avoids declaring `int` from a
+      // float32x4_t expression.
+      if uop.scalarType == .int {
         return emitAssign(uop, "\(gi(a)) / \(gi(b))", ctx)
       }
       // Strength-reduce division by constant to multiply by reciprocal
@@ -534,7 +539,8 @@ public class CRenderer: Renderer {
       }
 
     case .mod(let a, let b):
-      if uop.scalarType == .int && !uop.isSimd {
+      // Same lane-uniform rule as integer division above.
+      if uop.scalarType == .int {
         return emitAssign(uop, "\(gi(a)) % \(gi(b))", ctx)
       }
       // Fast modulo for constant denominator: a - floor(a / b) * b
