@@ -14,6 +14,8 @@ public struct TrainOptions: Equatable {
     public var gateFrames: Int?
     /// Preview WAV cadence; nil = trainer default (25).
     public var checkpointEvery: Int?
+    /// Epoch event cadence; nil = trainer default (10).
+    public var reportEvery: Int?
     /// nil = CPU pitch estimate from the target (spec §6).
     public var pitchHz: Double?
 
@@ -59,6 +61,7 @@ public struct TrainOptions: Equatable {
         var epochs: Int?
         var gateFrames: Int?
         var checkpointEvery: Int?
+        var reportEvery: Int?
         var pitchHz: Double?
         var planOnly = false
         var backend = "metal"
@@ -92,6 +95,7 @@ public struct TrainOptions: Equatable {
             case "--epochs": epochs = try intValue(arg)
             case "--gate-frames": gateFrames = try intValue(arg)
             case "--checkpoint-every": checkpointEvery = try intValue(arg)
+            case "--report-every": reportEvery = try intValue(arg)
             case "--pitch-hz":
                 let raw = try value(arg)
                 guard let v = Double(raw) else {
@@ -139,6 +143,11 @@ public struct TrainOptions: Equatable {
         guard polishEpochs >= 0 else {
             throw TrainProtocolError("--polish-epochs must be >= 0")
         }
+        if let reportEvery {
+            guard reportEvery > 0 else {
+                throw TrainProtocolError("--report-every must be > 0")
+            }
+        }
 
         var options = TrainOptions(
             patchPath: patchPath, targetPath: targetPath,
@@ -147,6 +156,7 @@ public struct TrainOptions: Equatable {
         options.epochs = epochs
         options.gateFrames = gateFrames
         options.checkpointEvery = checkpointEvery
+        options.reportEvery = reportEvery
         options.pitchHz = pitchHz
         options.backend = backend
         options.filterSurrogate = filterSurrogate

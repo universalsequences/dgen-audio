@@ -25,7 +25,7 @@ final class EventCodingTests: XCTestCase {
                     "sinefm": ParamDelta(from: 0.06, to: 0.11),
                     "ratio": ParamDelta(from: 0.05, to: 0.02),
                 ],
-                finalWav: "/tmp/job/final.wav")),
+                seededWav: "/tmp/job/seeded.wav", finalWav: "/tmp/job/final.wav")),
         .error(ErrorEvent(message: "boom")),
     ]
 
@@ -44,7 +44,7 @@ final class EventCodingTests: XCTestCase {
             XCTAssertTrue(planLine.contains(key), "plan missing \(key): \(planLine)")
         }
         let resultLine = try TrainEventCoding.encodeLine(Self.sampleEvents[4])
-        for key in ["\"improvement_pct\"", "\"abs_distance\"", "\"basin_check\"", "\"final_wav\"", "\"deltas\"", "\"from\"", "\"to\"" ] {
+        for key in ["\"improvement_pct\"", "\"abs_distance\"", "\"basin_check\"", "\"seeded_wav\"", "\"final_wav\"", "\"deltas\"", "\"from\"", "\"to\"" ] {
             XCTAssertTrue(resultLine.contains(key), "result missing \(key): \(resultLine)")
         }
         let epochLine = try TrainEventCoding.encodeLine(Self.sampleEvents[2])
@@ -78,7 +78,7 @@ final class EventCodingTests: XCTestCase {
 
     func testTerminalClassification() {
         XCTAssertTrue(TrainEvent.result(
-            ResultEvent(improvementPct: 0, absDistance: 0, basinCheck: "ok", deltas: [:], finalWav: "")
+            ResultEvent(improvementPct: 0, absDistance: 0, basinCheck: "ok", deltas: [:], seededWav: "", finalWav: "")
         ).isTerminal)
         XCTAssertTrue(TrainEvent.error(ErrorEvent(message: "x")).isTerminal)
         XCTAssertFalse(TrainEvent.stage(StageEvent(name: "train", total: 1)).isTerminal)

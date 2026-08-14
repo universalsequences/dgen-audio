@@ -1,7 +1,7 @@
 // JobDir.swift — the trainer's sandbox (patch-learn-spec §5).
 //
 // The host creates learn-jobs/<id>/ and passes it via --job-dir. The
-// trainer writes ONLY here: lowered.lisp, epoch*.wav, final.wav,
+// trainer writes ONLY here: lowered.lisp, seeded.wav, epoch*.wav, final.wav,
 // result.json. events.jsonl belongs to the host (it appends the consumed
 // stream) — the trainer must never touch it.
 
@@ -27,6 +27,7 @@ public struct JobDir {
 
     public var loweredLisp: URL { file("lowered.lisp") }
     public var renderLisp: URL { file("render.lisp") }
+    public var seededWav: URL { file("seeded.wav") }
     public var finalWav: URL { file("final.wav") }
     public var resultJSON: URL { file("result.json") }
 

@@ -10,7 +10,7 @@ import Foundation
 
 public enum FakeTrainer {
     public static let defaultEpochs = 100
-    static let logEvery = 10
+    static let defaultReportEvery = 10
     static let checkpointEvery = 25
 
     /// Runs the fake job: emits plan/stage/epoch/checkpoint events and writes
@@ -21,6 +21,7 @@ public enum FakeTrainer {
     ) throws -> TrainCompletion {
         let seed = try SeedParams.load(url: URL(fileURLWithPath: options.seedParamsPath))
         let epochs = options.epochs ?? defaultEpochs
+        let reportEvery = options.reportEvery ?? defaultReportEvery
 
         // lowered.lisp: the fake "lowering pass" is an annotated copy.
         let patchSource = try String(
@@ -54,7 +55,7 @@ public enum FakeTrainer {
                 throw TrainProtocolError("induced fake-trainer failure at epoch \(epoch)")
             }
             finalLoss = syntheticLoss(epoch: epoch, total: epochs)
-            if epoch % logEvery == 0 || epoch == epochs {
+            if epoch % reportEvery == 0 || epoch == epochs {
                 try sink.emit(
                     .epoch(
                         EpochEvent(
@@ -69,6 +70,7 @@ public enum FakeTrainer {
             }
         }
 
+        try MiniWav.write(url: jobDir.seededWav, samples: previewSamples(epoch: 0))
         try MiniWav.write(url: jobDir.finalWav, samples: previewSamples(epoch: epochs))
 
         let finalParams = syntheticParams(seed: seed, epoch: epochs, total: epochs)
@@ -83,6 +85,7 @@ public enum FakeTrainer {
                 absDistance: finalLoss,
                 basinCheck: "ok",
                 deltas: deltas,
+                seededWav: jobDir.seededWav.path,
                 finalWav: jobDir.finalWav.path))
     }
 

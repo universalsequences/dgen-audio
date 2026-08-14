@@ -106,6 +106,7 @@ public struct ResultEvent: Codable, Equatable {
     /// "ok" | "wrong_neighborhood"
     public var basinCheck: String
     public var deltas: [String: ParamDelta]
+    public var seededWav: String
     public var finalWav: String
 
     enum CodingKeys: String, CodingKey {
@@ -113,17 +114,19 @@ public struct ResultEvent: Codable, Equatable {
         case absDistance = "abs_distance"
         case basinCheck = "basin_check"
         case deltas
+        case seededWav = "seeded_wav"
         case finalWav = "final_wav"
     }
 
     public init(
         improvementPct: Double, absDistance: Double, basinCheck: String,
-        deltas: [String: ParamDelta], finalWav: String
+        deltas: [String: ParamDelta], seededWav: String, finalWav: String
     ) {
         self.improvementPct = improvementPct
         self.absDistance = absDistance
         self.basinCheck = basinCheck
         self.deltas = deltas
+        self.seededWav = seededWav
         self.finalWav = finalWav
     }
 }

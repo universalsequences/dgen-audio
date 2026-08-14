@@ -21,7 +21,7 @@ import Foundation
 
 enum DirectionTrainer {
     static let defaultEpochs = 300
-    static let logEvery = 10
+    static let defaultReportEvery = 10
     static let defaultCheckpointEvery = 25
     /// Range-normalized coordinates: 0.5% of a knob's range per Adam step
     /// (2e-2 railed wide params in ~50 steps and slammed gain into the
@@ -109,6 +109,11 @@ enum DirectionTrainer {
             throw TrainProtocolError("fdcheck-only run (DGENLISP_TRAIN_FDCHECK)")
         }
 
+        try renderViaSubprocess(
+            params: naturalValues(z: seedZ, transforms: transforms),
+            jobDir: jobDir, out: jobDir.seededWav, frames: crop,
+            sampleRate: targetSampleRate, options: options)
+
         let seeded = try runPhase(
             name: "train", initialZ: seedZ, epochs: epochs,
             transforms: transforms, patchPlan: patchPlan, target: prepared,
@@ -160,6 +165,7 @@ enum DirectionTrainer {
             absDistance: Double(finalPhase.bestLoss),
             basinCheck: basinCheck,
             deltas: deltas,
+            seededWav: jobDir.seededWav.path,
             finalWav: jobDir.finalWav.path)
     }
 
@@ -184,6 +190,7 @@ enum DirectionTrainer {
         var m = [Float](repeating: 0, count: z.count)
         var v = [Float](repeating: 0, count: z.count)
         var result = PhaseResult(initLoss: .infinity, bestLoss: .infinity, bestZ: z)
+        let reportEvery = options.reportEvery ?? defaultReportEvery
         let checkpointEvery = options.checkpointEvery ?? defaultCheckpointEvery
         var deadEpochs = 0
         let timingEnabled =
@@ -306,7 +313,7 @@ enum DirectionTrainer {
                     lazy: epochGraph.lastExecutionTiming)
             }
 
-            if epoch % logEvery == 0 || epoch == epochs {
+            if epoch % reportEvery == 0 || epoch == epochs {
                 try sink.emit(
                     .epoch(
                         EpochEvent(

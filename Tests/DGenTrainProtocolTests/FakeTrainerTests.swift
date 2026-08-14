@@ -100,6 +100,7 @@ final class FakeTrainerTests: XCTestCase {
 
         // Artifacts per spec §5.
         XCTAssertTrue(FileManager.default.fileExists(atPath: jobDir.loweredLisp.path))
+        XCTAssertTrue(FileManager.default.fileExists(atPath: jobDir.seededWav.path))
         XCTAssertTrue(FileManager.default.fileExists(atPath: jobDir.finalWav.path))
         let lowered = try String(contentsOf: jobDir.loweredLisp, encoding: .utf8)
         XCTAssertTrue(lowered.contains("(out (phasor 110) 0)"))
@@ -115,6 +116,19 @@ final class FakeTrainerTests: XCTestCase {
             FakeTrainer.run(options: options, sink: sinkB, jobDir: jobDir))
         XCTAssertEqual(sinkA.events, sinkB.events)
         XCTAssertEqual(resultA, resultB)
+    }
+
+    func testReportEveryOneEmitsEveryEpoch() throws {
+        var (options, jobDir) = try makeOptions(epochs: 4)
+        options.reportEvery = 1
+        let sink = CollectingEventSink()
+        _ = try FakeTrainer.run(options: options, sink: sink, jobDir: jobDir)
+
+        let epochs = sink.events.compactMap { event -> Int? in
+            guard case .epoch(let epoch) = event else { return nil }
+            return epoch.epoch
+        }
+        XCTAssertEqual(epochs, [1, 2, 3, 4])
     }
 
     func testInducedFailureThrows() throws {
