@@ -73,16 +73,19 @@ enum TrainPlanner {
 
         let evaluator = LispEvaluator(sourceDirectory: assetBase)
         let rewrite: ExcitationLowering.Rewrite
+        let trainingNodes: [ASTNode]
         do {
             let nodes = ExcitationLowering.stripModulation(nodes: try parseSource(patchSource))
             let lowered = try lowerModulation(in: nodes)
             rewrite = ExcitationLowering.drive(
                 nodes: lowered, pitchHz: pitchHz, gateFrames: gateFrames)
-            let trainingNodes = options.filterSurrogate == "freq"
+            let analyticEnvelopeNodes = try AnalyticADSRLowering.lower(
+                nodes: rewrite.nodes, gateFrames: gateFrames)
+            trainingNodes = options.filterSurrogate == "freq"
                 ? FilterSurrogateLowering.lower(
-                    nodes: rewrite.nodes, window: options.surrogateWindow,
+                    nodes: analyticEnvelopeNodes, window: options.surrogateWindow,
                     hop: options.surrogateHop)
-                : rewrite.nodes
+                : analyticEnvelopeNodes
             try evaluator.evaluate(nodes: trainingNodes)
         } catch let error as LispError {
             throw TrainProtocolError("patch parse/eval failed: \(error.message)")
@@ -156,11 +159,7 @@ enum TrainPlanner {
         return (
             PatchPlan(
                 plan: plan, learnable: learnable, fatalUnsupported: unsupported,
-                loweredNodes: options.filterSurrogate == "freq"
-                    ? FilterSurrogateLowering.lower(
-                        nodes: rewrite.nodes, window: options.surrogateWindow,
-                        hop: options.surrogateHop)
-                    : rewrite.nodes,
+                loweredNodes: trainingNodes,
                 renderNodes: rewrite.nodes),
             evaluator
         )
