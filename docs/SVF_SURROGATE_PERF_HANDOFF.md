@@ -1,5 +1,11 @@
 # Handoff: make the SVF frequency-sampled surrogate fast (43 s → ~2 s/epoch)
 
+> **STATUS 2026-08-14: DONE.** 42.9 s → **2.30 s/epoch** gpu_execute
+> (goal was ≤ ~2.5 s), epoch-1 loss/params bit-identical to the pre-fix
+> baseline, Metal fdcheck 0.99990 unchanged, regression filter identical to
+> baseline. See "Resolution" at the end of this document for what was done
+> and what remains.
+
 Audience: a fresh implementer with no context on this effort. This document
 contains everything learned the hard way on 2026-08-13. Companion spec (design
 + math + what's already landed): `docs/SVF_FREQ_SURROGATE_SPEC.md`.
@@ -288,3 +294,74 @@ Suggested order of attack (biggest win first, each independently testable):
 5. Then run rung C (`docs/SVF_FREQ_SURROGATE_SPEC.md` § Validation ladder):
    synth-target recovery ≈ current rung-2 (~94%), real-target loss parity
    ≈ 0.21 after `--polish-epochs`, and record the ms/epoch deliverable.
+
+## Resolution (2026-08-14)
+
+Result: **2.30 s/epoch gpu_execute** (from 42.9 s), stable across epochs;
+epoch-1 loss and every param bit-identical to the pre-fix run; Metal fdcheck
+still 0.99990; regression filter failure set identical to baseline
+(attributed by stashing the four changed files and re-running the same
+filter).
+
+Root cause confirmed: the hop-rate tensor chains were swept into the SCALAR
+node set by feedback-cluster path analysis (`findSequentialNodes` marks all
+feedback-cluster members scalar; the mask-backward chain sits on read→write
+paths via seq/ordering edges), so `partitionIntoBlocks` put them in
+sequential runs and no later pass could rescue them. Verified with the
+env-gated `DGEN_DEBUG_SCALAR_HOP=1` probe (prints tensor-shaped scalar-set
+members with feedback membership).
+
+Two mechanisms, both in `Sources/DGen/Blocks/BlockFormation.swift`, both
+gated to Metal (`CompilationPipeline` passes `hopBasedNodes: [:]` for C — the
+C renderer's SIMD lowering emits undeclared `simdNN` temps for peeled
+blocks):
+
+1. **`peelHopTensorRuns`** (fixes kernel_128-class, −25 s; also captured the
+   forward STFT mask math in kernel_80, 1.49 s → 0.09 s).
+   `TemporalityPass.inferTemporality` now runs BEFORE block formation
+   (node temporality never depended on blocks), and `determineTensorBlocks`
+   peels maximal contiguous runs of hop-classified pure tensor math out of
+   sequential blocks into parallel blocks. Block temporality assignment then
+   gives them `hopBased` and emission produces the butterfly target shape.
+   Peel predicate excludes anything stateful: history/accum/latch/noise ops,
+   raw memory ops, reduces, self-iterating ops, gemm/conv, tensorRef/seq.
+   Safe because these chains read/write hop-sliced frame-aware cells and
+   recompute identical values on every frame of a span (idempotent), so
+   hop-gating them is semantics-preserving; genuine cross-frame state can
+   only flow through the excluded ops.
+2. **`isIsolatableHopSerialOp`** (fixes kernels 137/143/131/149-class,
+   −14 s). `splitOutAcceleratedFFTNodes` generalized: hop-tagged
+   self-iterating grad ops (`bufferViewGradStore`, `overlapAddGradGather`,
+   …) are isolated into their own single-op sequential blocks, which then
+   classify hopBased and get the block-level hop guard OUTSIDE the frame
+   loop (they previously ran their 1024-element loops on all 38072 frames
+   behind an in-loop select). They exchange data via memory cells /
+   per-frame `t` globals, so the new kernel boundaries are safe;
+   intrinsically frame-based ops (`bufferViewGradRead`) stay in the frame
+   loop.
+
+Footgun hit on the way: with `inferTemporality` moved earlier,
+`temporalDependencies` (hop counters, position deps) are populated before
+`partitionIntoBlocks`, and the output-node placement walked
+`allDependencies` — the output followed its counter temporal-dep into a much
+earlier block than its value producer (`insufficientInputs(output)`).
+Placement now walks `node.inputs` only, which is exactly the old behavior.
+
+Bonus: kernel hashes now stabilize after epoch 1 (`runtime_cache_hit=1`,
+`pipeline_create_ms=0` from epoch 2 on) — the alternating-hash issue in the
+footguns list no longer reproduces. Per-epoch `dgen_compile` (~3 s) remains;
+that is the `docs/TRAIN_EPOCH_CACHE_SPEC.md` work.
+
+150-epoch monologue benchmark (surrogate default path, post-fix):
+`improvement_pct 41.4`, `abs_distance 4.141`, `basin_check ok` — vs the
+BPTT baseline reference `26.9` / `4.099` from
+`docs/TRAIN_EPOCH_CACHE_SPEC.md`. Param distance at parity, loss improvement
+substantially better. Wall clock 27:14 for the full run (2×150 epochs +
+renders), now dominated by the ~3 s/epoch `dgen_compile` — that is the
+epoch-cache work, not this one.
+
+Remaining floor (2.27 s total GPU): two ~0.43 s kernels that recompute a
+loop-invariant hop-row sum-reduce (1024 elems) inside the per-frame loop —
+hoistable to hop rate with a hop-sliced scalar + held read-back, but the
+consumer chain is genuinely per-frame; diminishing returns. Then ~4 serial
+scalar kernels at ~0.23 s each (the kernel_76 floor).

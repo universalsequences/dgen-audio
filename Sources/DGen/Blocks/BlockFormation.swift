@@ -13,11 +13,15 @@ public func partitionIntoBlocks(
     let isScalar = scalar.contains(nodeId)
     let frameOrder: FrameOrder = isScalar ? .sequential : .parallel
 
-    // Special handling for output nodes - they go in the same block as their dependencies
+    // Special handling for output nodes - they go in the same block as their dependencies.
+    // Value inputs only: temporality analysis now runs before block formation, so
+    // temporalDependencies (hop counters, position deps) are already populated here —
+    // following them would drag the output into the counter's (much earlier) block,
+    // ahead of its value producer.
     if let node = g.nodes[nodeId], case .output = node.op {
       // Find the block containing the first dependency
       var targetBlockIdx = -1
-      for inputID in node.allDependencies {
+      for inputID in node.inputs {
         for (blockIdx, block) in blocks.enumerated() {
           if block.nodes.contains(inputID) {
             targetBlockIdx = blockIdx
@@ -1079,10 +1083,34 @@ private func isAcceleratedFFTOp(_ op: LazyOp) -> Bool {
   return false
 }
 
-/// Splits a sequential block so each accelerated FFT/IFFT node sits alone in
-/// its own block (shape/tensorIndex cleared — the op self-iterates). Non-FFT
-/// runs keep the original block's properties and ordering.
-private func splitOutAcceleratedFFTNodes(_ block: Block, graph: Graph) -> [Block] {
+/// Returns true when a node fused into a sequential block should be isolated
+/// into its own block so TemporalityPass can give it hop-rate scheduling:
+/// accelerated FFT/IFFT, and hop-tagged self-iterating grad ops
+/// (bufferViewGradStore, overlapAddGradGather, ...) whose per-window element
+/// loops would otherwise run inside the frame loop on every frame — `hop`×
+/// redundant work gated only by an in-loop select. Isolated, the block-level
+/// hop guard skips the loop on non-hop frames entirely. These ops exchange
+/// data through memory cells / per-frame globals, so a kernel boundary is
+/// safe.
+private func isIsolatableHopSerialOp(
+  _ nodeId: NodeID, graph: Graph, hopBasedNodes: [NodeID: (Int, NodeID)]
+) -> Bool {
+  guard let node = graph.nodes[nodeId] else { return false }
+  if isAcceleratedFFTOp(node.op) { return true }
+  guard hopBasedNodes[nodeId] != nil else { return false }
+  guard node.op.emitsInternalIteration else { return false }
+  // Per-sample outputs must stay in the frame loop.
+  if TemporalityPass.isIntrinsicallyFrameBased(node.op) { return false }
+  return true
+}
+
+/// Splits a sequential block so each accelerated FFT/IFFT node (and each
+/// hop-tagged self-iterating grad op, see `isIsolatableHopSerialOp`) sits
+/// alone in its own block (shape/tensorIndex cleared — the op self-iterates).
+/// Other runs keep the original block's properties and ordering.
+private func splitOutAcceleratedFFTNodes(
+  _ block: Block, graph: Graph, hopBasedNodes: [NodeID: (Int, NodeID)]
+) -> [Block] {
   guard block.nodes.count > 1 else { return [block] }
   var result: [Block] = []
   var run: [NodeID] = []
@@ -1094,7 +1122,7 @@ private func splitOutAcceleratedFFTNodes(_ block: Block, graph: Graph) -> [Block
     run = []
   }
   for nodeId in block.nodes {
-    if let node = graph.nodes[nodeId], isAcceleratedFFTOp(node.op) {
+    if isIsolatableHopSerialOp(nodeId, graph: graph, hopBasedNodes: hopBasedNodes) {
       flushRun()
       var fftBlock = block
       fftBlock.nodes = [nodeId]
@@ -1109,51 +1137,140 @@ private func splitOutAcceleratedFFTNodes(_ block: Block, graph: Graph) -> [Block
   return result
 }
 
-func determineTensorBlocks(_ blocks: [Block], _ graph: Graph, _ ctx: IRContext) -> [Block] {
+/// Returns true when a node is safe to peel out of a sequential block into a
+/// hop-gated parallel block: hop-classified pure tensor math with no
+/// frame-serial state.
+///
+/// Feedback-cluster / seq-scalar propagation can sweep hop-rate tensor chains
+/// (e.g. the svf-freq mask backward) into sequential scalar blocks, where they
+/// re-run identically on all `hop` frames of each span, serially, instead of
+/// once per hop across parallel threads. Those chains read and write
+/// hop-sliced frame-aware cells, so every frame of a span computes the same
+/// values — peeling them into a hop-gated parallel block preserves semantics.
+/// Stateful ops (history/accum/latch/noise), raw memory ops, reduces, and
+/// self-iterating ops must keep their original schedule: genuine cross-frame
+/// state can only flow through them, never through pure tensor math.
+private func isPeelableHopTensorNode(
+  _ nodeId: NodeID, graph: Graph, hopBasedNodes: [NodeID: (Int, NodeID)]
+) -> Bool {
+  guard hopBasedNodes[nodeId] != nil else { return false }
+  guard let node = graph.nodes[nodeId] else { return false }
+  guard case .tensor = node.shape else { return false }
+  switch node.op {
+  case .historyRead, .historyWrite, .historyReadWrite, .accum, .latch,
+    .tensorNoise, .hopTensorNoise, .spectrumDelay, .spectrumDelayMod, .delayLine,
+    .memoryRead, .memoryWrite, .memoryAccumulate, .tensorAccumulate,
+    .tensorRef, .seq, .conv2d, .gemmSmall:
+    return false
+  default:
+    break
+  }
+  if node.op.emitsInternalIteration { return false }
+  if node.op.isSelfDispatchedGemm { return false }
+  if isReductionOp(node.op) { return false }
+  return true
+}
+
+/// Splits a sequential block into alternating runs: maximal contiguous runs of
+/// peelable hop-tensor nodes become parallel blocks (so TemporalityPass gives
+/// them hop-based scheduling and emission gives them per-frame threads with the
+/// hop guard outside the element loops), everything else keeps the original
+/// sequential order and frameOrder.
+private func peelHopTensorRuns(
+  _ block: Block, graph: Graph, hopBasedNodes: [NodeID: (Int, NodeID)]
+) -> [(block: Block, peeled: Bool)] {
+  guard !hopBasedNodes.isEmpty else { return [(block, false)] }
+  var result: [(block: Block, peeled: Bool)] = []
+  var run: [NodeID] = []
+  var runPeeled = false
+  func flush() {
+    guard !run.isEmpty else { return }
+    var b = makeTensorGroupingBlock(from: block)
+    b.frameOrder = runPeeled ? .parallel : block.frameOrder
+    b.nodes = run
+    result.append((b, runPeeled))
+    run = []
+  }
+  for nodeId in block.nodes {
+    let peelable = isPeelableHopTensorNode(nodeId, graph: graph, hopBasedNodes: hopBasedNodes)
+    if peelable != runPeeled {
+      flush()
+      runPeeled = peelable
+    }
+    run.append(nodeId)
+  }
+  flush()
+  return result
+}
+
+/// The pre-peel sequential-block handling: FFT isolation + scalar/tensor
+/// grouping splits.
+private func determineSequentialBlockParts(
+  _ block: Block, graph: Graph, ctx: IRContext,
+  hopBasedNodes: [NodeID: (Int, NodeID)]
+) -> [Block] {
+  var determined: [Block] = []
+  // Accelerated FFT/IFFT nodes (and hop-tagged self-iterating grad ops)
+  // fused into a scalar block alongside frame-rate neighbors (overlapAdd
+  // output taps, waveshapers, ...) would inherit the block's frameBased
+  // temporality and run the transform once per FRAME instead of once per
+  // hop — catastrophically expensive. The parallel path already isolates
+  // self-iterating ops (groupRegularTensorBlock); do the same minimal
+  // isolation here so TemporalityPass can give the transform its own
+  // hop-rate block.
+  let parts = splitOutAcceleratedFFTNodes(block, graph: graph, hopBasedNodes: hopBasedNodes)
+  if parts.count > 1 {
+    for part in parts {
+      if part.nodes.count == 1,
+        isIsolatableHopSerialOp(part.nodes[0], graph: graph, hopBasedNodes: hopBasedNodes)
+      {
+        determined.append(part)
+      } else {
+        var split = splitScalarBlockForTensorGrouping(part, graph: graph, ctx: ctx)
+        for i in split.indices {
+          clearWastedTensorLoopMetadata(&split[i], graph: graph)
+        }
+        determined.append(contentsOf: split)
+      }
+    }
+    return determined
+  }
+  var split = splitScalarBlockForTensorGrouping(block, graph: graph, ctx: ctx)
+  // Scalar blocks that happen to "own" a tensorRef (e.g. bufferView's write
+  // block, [memoryWrite, tensorRef]) inherit the tensorRef's shape here.
+  // Without this sweep, `wrapBodyUOpsWithTensorLoopIfNeeded` wraps the
+  // scalar memoryWrite in `parallelRange(tensorSize)` — a dead inner loop
+  // that executes the same per-frame write hundreds of times.
+  //
+  // Scalar prefixes always strip when they contain no per-element work.
+  // The parallel tensor-suffix also strips when every node there is
+  // self-iterating (hopTensorNoise / FFT-family / overlapAdd) — the
+  // combined `determineVectorPlan` + `hasSIMDBlockers` check keeps
+  // SIMD-4 promotion from firing on blocks with internal scalar loops.
+  for i in split.indices {
+    clearWastedTensorLoopMetadata(&split[i], graph: graph)
+  }
+  determined.append(contentsOf: split)
+  return determined
+}
+
+func determineTensorBlocks(
+  _ blocks: [Block], _ graph: Graph, _ ctx: IRContext,
+  hopBasedNodes: [NodeID: (Int, NodeID)] = [:]
+) -> [Block] {
   var determined: [Block] = []
 
   for block in blocks {
     if block.frameOrder == .sequential {
-      // Accelerated FFT/IFFT nodes fused into a scalar block alongside
-      // frame-rate neighbors (overlapAdd output taps, waveshapers, ...) would
-      // inherit the block's frameBased temporality and run the transform once
-      // per FRAME instead of once per hop — catastrophically expensive. The
-      // parallel path already isolates self-iterating ops
-      // (groupRegularTensorBlock); do the same minimal isolation here so
-      // TemporalityPass can give the transform its own hop-rate block.
-      let parts = splitOutAcceleratedFFTNodes(block, graph: graph)
-      if parts.count > 1 {
-        for part in parts {
-          if part.nodes.count == 1, let node = graph.nodes[part.nodes[0]],
-            isAcceleratedFFTOp(node.op)
-          {
-            determined.append(part)
-          } else {
-            var split = splitScalarBlockForTensorGrouping(part, graph: graph, ctx: ctx)
-            for i in split.indices {
-              clearWastedTensorLoopMetadata(&split[i], graph: graph)
-            }
-            determined.append(contentsOf: split)
-          }
+      for (part, peeled) in peelHopTensorRuns(block, graph: graph, hopBasedNodes: hopBasedNodes) {
+        if peeled {
+          determined.append(contentsOf: groupRegularTensorBlock(part, graph: graph, ctx: ctx))
+        } else {
+          determined.append(
+            contentsOf: determineSequentialBlockParts(
+              part, graph: graph, ctx: ctx, hopBasedNodes: hopBasedNodes))
         }
-        continue
       }
-      var split = splitScalarBlockForTensorGrouping(block, graph: graph, ctx: ctx)
-      // Scalar blocks that happen to "own" a tensorRef (e.g. bufferView's write
-      // block, [memoryWrite, tensorRef]) inherit the tensorRef's shape here.
-      // Without this sweep, `wrapBodyUOpsWithTensorLoopIfNeeded` wraps the
-      // scalar memoryWrite in `parallelRange(tensorSize)` — a dead inner loop
-      // that executes the same per-frame write hundreds of times.
-      //
-      // Scalar prefixes always strip when they contain no per-element work.
-      // The parallel tensor-suffix also strips when every node there is
-      // self-iterating (hopTensorNoise / FFT-family / overlapAdd) — the
-      // combined `determineVectorPlan` + `hasSIMDBlockers` check keeps
-      // SIMD-4 promotion from firing on blocks with internal scalar loops.
-      for i in split.indices {
-        clearWastedTensorLoopMetadata(&split[i], graph: graph)
-      }
-      determined.append(contentsOf: split)
       continue
     }
     determined.append(contentsOf: groupRegularTensorBlock(block, graph: graph, ctx: ctx))
