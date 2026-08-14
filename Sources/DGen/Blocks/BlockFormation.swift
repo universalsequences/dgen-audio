@@ -488,6 +488,19 @@ public func splitReduceBlocks(g: Graph, blocks: [Block]) -> [Block] {
 /// ordering chains) and read their tensor inputs from frame-aware cells in
 /// later blocks.
 public func tensorBPTTRecurrenceClosure(g: Graph, lastForwardId: NodeID) -> Set<NodeID> {
+  bpttRecurrenceClosure(g: g, lastForwardId: lastForwardId, carryCells: g.tensorGradCarryCells)
+}
+
+/// Generalized form of `tensorBPTTRecurrenceClosure` over an arbitrary set of
+/// gradient carry cells. Scalar (`Signal.history()`) BPTT needs the same
+/// closure: when the reverse-time arithmetic between a carry read and its carry
+/// write is scattered across blocks, the recurrence is severed (the carry write
+/// re-emitted at the reverse loop bottom cannot see a grad input produced in a
+/// later block) and per-frame gradients computed outside the reverse loop read
+/// only the last reverse iteration's value.
+public func bpttRecurrenceClosure(
+  g: Graph, lastForwardId: NodeID, carryCells: Set<CellID>
+) -> Set<NodeID> {
   func isBoundary(_ id: NodeID) -> Bool {
     guard let node = g.nodes[id] else { return true }
     switch node.op {
@@ -525,9 +538,9 @@ public func tensorBPTTRecurrenceClosure(g: Graph, lastForwardId: NodeID) -> Set<
   var carryReads: [NodeID] = []
   for (id, node) in g.nodes where id > lastForwardId {
     switch node.op {
-    case .memoryWrite(let c) where g.tensorGradCarryCells.contains(c):
+    case .memoryWrite(let c) where carryCells.contains(c):
       seeds.append(id)
-    case .memoryRead(let c) where g.tensorGradCarryCells.contains(c):
+    case .memoryRead(let c) where carryCells.contains(c):
       seeds.append(id)
       carryReads.append(id)
     default:
@@ -748,6 +761,142 @@ public func consolidateTensorBPTTBackwardBlocks(g: Graph, blocks: [Block], ctx: 
         + "moved=\(movedConsumers.map { $0.nodes.count }) "
         + "deferred=\(deferredBackward.map { $0.nodes.count }) "
         + "shape=\(String(describing: bpttBlock.shape)) temporality=\(bpttBlock.temporality)")
+  }
+  return result
+}
+
+/// Consolidate the scalar (`Signal.history()`) BPTT recurrence into the block
+/// that owns the corresponding forward history writes.
+///
+/// `wrapWithBPTTLoops` turns that block into a forward frame loop followed by a
+/// single reverse frame loop; every per-frame adjoint of the history recurrence
+/// must be emitted inside that reverse loop. Default block formation can strand
+/// part of the recurrence in later blocks — an isolated-pass op such as
+/// `temporalGradStore` (a trainable phasor's suffix-scan adjoint) forces a block
+/// split in node-ID order, and the reverse topological walk can emit those tape
+/// nodes before the history-gradient arithmetic finishes. Two failures follow:
+///
+/// 1. The carry-cell writes re-emitted at the reverse loop bottom cannot see a
+///    grad input produced in a later block, so the write is silently dropped and
+///    the recurrence never advances.
+/// 2. Per-frame gradients computed in a later frame-parallel block read
+///    loop-scope values that only hold the final reverse iteration's value,
+///    inflating unrelated parameter gradients.
+///
+/// This pass hoists the whole recurrence closure (carry reads, carry writes and
+/// the value-connected backward arithmetic between them — see
+/// `bpttRecurrenceClosure`) into the host block, keeping isolated-pass tape ops
+/// (`temporalGradStore` / `temporalGradScan` / `temporalGradRead`) and grad
+/// accumulates outside it as closure boundaries.
+///
+/// Conservative by design: if any value dependency of the closure is produced in
+/// a block after the host, the layout is left untouched.
+public func consolidateScalarBPTTBackwardBlocks(g: Graph, blocks: [Block], ctx: IRContext) -> [Block]
+{
+  let debug = ProcessInfo.processInfo.environment["DGEN_DEBUG_BPTT_SPLIT"] != nil
+  guard let lastForwardId = g.lastForwardNodeId else { return blocks }
+  let scalarCarryCells = Set(g.gradCarryCells.values).subtracting(g.tensorGradCarryCells)
+  guard !scalarCarryCells.isEmpty else { return blocks }
+
+  let closure = bpttRecurrenceClosure(
+    g: g, lastForwardId: lastForwardId, carryCells: scalarCarryCells)
+  guard !closure.isEmpty else { return blocks }
+
+  var nodeBlock: [NodeID: Int] = [:]
+  for (i, block) in blocks.enumerated() {
+    for nodeId in block.nodes { nodeBlock[nodeId] = i }
+  }
+
+  // Host block: the last block whose forward half writes a scalar history cell
+  // whose gradient flows through one of these carry cells. That is the block
+  // `blockHasPassThroughHistoryWriteWithCarry` selects for BPTT wrapping.
+  let carriedHistoryCells = Set(
+    g.gradCarryCells.filter { scalarCarryCells.contains($0.value) }.map { $0.key })
+  var hostIdxOpt: Int? = nil
+  for (idx, block) in blocks.enumerated() {
+    let ownsHistory = block.nodes.contains { nodeId in
+      guard nodeId <= lastForwardId, let node = g.nodes[nodeId] else { return false }
+      guard case .historyWrite(let cell) = node.op else { return false }
+      return carriedHistoryCells.contains(cell) && g.cellToTensor[cell] == nil
+    }
+    if ownsHistory { hostIdxOpt = idx }
+  }
+  guard let hostIdx = hostIdxOpt else { return blocks }
+  // Only the scalar sequential BPTT layout is handled here; anything else keeps
+  // its existing (tensor / detached) emission path.
+  guard blocks[hostIdx].frameOrder == .sequential else { return blocks }
+
+  let strayClosureNodes = closure.filter { nodeBlock[$0] != hostIdx }
+  guard !strayClosureNodes.isEmpty else { return blocks }
+
+  // Value dependencies of the closure must already be available at the host
+  // block; otherwise hoisting would move a consumer before its producer.
+  for nodeId in closure {
+    guard let node = g.nodes[nodeId] else { continue }
+    for dep in node.inputs where !closure.contains(dep) {
+      if let depBlock = nodeBlock[dep], depBlock > hostIdx {
+        if debug {
+          print(
+            "BPTT-SCALAR-CONSOLIDATE skipped: node \(nodeId) depends on \(dep) "
+              + "in block \(depBlock) after host \(hostIdx)")
+        }
+        return blocks
+      }
+    }
+  }
+
+  // Backward consumers of closure values that currently live before the host
+  // block have to move after it.
+  var consumers: [NodeID: [NodeID]] = [:]
+  for (id, node) in g.nodes where id > lastForwardId {
+    for dep in node.inputs { consumers[dep, default: []].append(id) }
+  }
+  var descendants = Set<NodeID>()
+  var stack = Array(closure)
+  while let id = stack.popLast() {
+    for consumer in consumers[id] ?? [] where !closure.contains(consumer) {
+      if descendants.insert(consumer).inserted { stack.append(consumer) }
+    }
+  }
+
+  var result: [Block] = []
+  var movedFragments: [Block] = []
+  for (idx, block) in blocks.enumerated() {
+    if idx == hostIdx {
+      var host = block
+      let forwardPart = block.nodes.filter { $0 <= lastForwardId }
+      let backwardPart = Set(block.nodes.filter { $0 > lastForwardId }).union(closure)
+      // Backward node IDs are created in dependency order, so ID order is a
+      // valid topological order for the reverse-loop body.
+      host.nodes = forwardPart + backwardPart.sorted()
+      result.append(host)
+      result.append(contentsOf: movedFragments.sorted { ($0.nodes.min() ?? 0) < ($1.nodes.min() ?? 0) })
+      movedFragments.removeAll()
+      continue
+    }
+    var rest = block.nodes.filter { !closure.contains($0) }
+    if idx < hostIdx {
+      let moved = rest.filter { descendants.contains($0) }
+      if !moved.isEmpty {
+        rest = rest.filter { !descendants.contains($0) }
+        var movedBlock = Block(frameOrder: block.frameOrder)
+        movedBlock.nodes = moved
+        movedBlock.shape = block.shape
+        movedBlock.temporality = block.temporality
+        movedBlock.tensorIndex = block.tensorIndex
+        movedFragments.append(movedBlock)
+      }
+    }
+    guard !rest.isEmpty else { continue }
+    var remainder = block
+    remainder.nodes = rest
+    result.append(remainder)
+  }
+
+  if debug {
+    print(
+      "BPTT-SCALAR-CONSOLIDATE host=\(hostIdx) hoisted=\(strayClosureNodes.sorted()) "
+        + "moved=\(descendants.sorted())")
   }
   return result
 }

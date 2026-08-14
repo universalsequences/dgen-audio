@@ -387,6 +387,7 @@ public struct CompilationPipeline {
     }
     forceSequentialHopHistoryBlocks(&finalBlocks, graph: graph)
     finalBlocks = consolidateTensorBPTTBackwardBlocks(g: graph, blocks: finalBlocks, ctx: context)
+    finalBlocks = consolidateScalarBPTTBackwardBlocks(g: graph, blocks: finalBlocks, ctx: context)
     return finalBlocks
   }
 
@@ -510,7 +511,12 @@ public struct CompilationPipeline {
 
     if ProcessInfo.processInfo.environment["DGEN_DEBUG_BLOCKS"] != nil {
       for (i, block) in blocks.enumerated() {
-        let ops = block.nodes.map { "\($0):\(graph.nodes[$0].map { String(describing: $0.op) } ?? "?")" }
+        let showDeps = ProcessInfo.processInfo.environment["DGEN_DEBUG_BLOCK_DEPS"] != nil
+        let ops = block.nodes.map { id -> String in
+          let base = "\(id):\(graph.nodes[id].map { String(describing: $0.op) } ?? "?")"
+          guard showDeps, let n = graph.nodes[id] else { return base }
+          return base + "<-\(n.allDependencies)"
+        }
         print(
           "[Blocks] #\(i) frameOrder=\(block.frameOrder) shape=\(block.shape.map(String.init(describing:)) ?? "nil") tensorIndex=\(block.tensorIndex != nil) temporality=\(block.temporality) nodes=\(ops)"
         )

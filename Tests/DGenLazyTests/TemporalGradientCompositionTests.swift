@@ -178,9 +178,6 @@ final class TemporalGradientCompositionTests: XCTestCase {
     let fd = try finiteDifference(svfLoss, parameter: initial, epsilon: epsilon)
     let autograd = try XCTUnwrap(cutoff.grad?.data)
     let error = relativeError(autograd, fd)
-    XCTExpectFailure(
-      "A phasor suffix-scan adjoint corrupts an unrelated coupled-history BPTT gradient") {
-        XCTAssertLessThan(error, 0.02, "autograd=\(autograd), fd=\(fd), relError=\(error)")
-      }
+    XCTAssertLessThan(error, 0.02, "autograd=\(autograd), fd=\(fd), relError=\(error)")
   }
 }

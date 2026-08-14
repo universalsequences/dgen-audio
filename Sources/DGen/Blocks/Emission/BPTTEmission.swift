@@ -398,19 +398,36 @@ private func appendCarryCellWrites(
   carryCellWriteNodes: [NodeID],
   valueRemapping: [Lazy: Lazy],
   zeroConst: Lazy,
+  block: Block,
   g: Graph,
   ctx: IRContext
-) {
+) throws {
+  // Cells this block reads inside its reverse loop: their recurrence is owned
+  // here, so a missing write would silently truncate it to a one-frame
+  // derivative rather than merely deferring the write to another block.
+  var carryCellsReadHere = Set<CellID>()
+  for nodeId in block.nodes {
+    guard let node = g.nodes[nodeId], case .memoryRead(let cell) = node.op else { continue }
+    carryCellsReadHere.insert(cell)
+  }
+
   for writeNodeId in carryCellWriteNodes {
     guard let writeNode = g.nodes[writeNodeId] else { continue }
     if case .memoryWrite(let cell) = writeNode.op {
       let gradInput = writeNode.inputs.count > 1 ? writeNode.inputs[1] : writeNode.inputs[0]
-      if let gradLz = ctx.values[gradInput] {
-        let remappedGradLz = valueRemapping[gradLz] ?? gradLz
-        let writeVar = ctx.useVariable(src: nil)
-        result.append(
-          UOp(op: .memoryWrite(cell, zeroConst, remappedGradLz), value: writeVar))
+      guard let gradLz = ctx.values[gradInput] else {
+        if carryCellsReadHere.contains(cell) {
+          throw DGenError.unsupportedGradient(
+            "BPTT carry write for cell \(cell) (node \(writeNodeId)) has no emitted value for its "
+              + "gradient input (node \(gradInput)): the recurrence arithmetic was scheduled into a "
+              + "later block, which would silently truncate the reverse-time recurrence")
+        }
+        continue
       }
+      let remappedGradLz = valueRemapping[gradLz] ?? gradLz
+      let writeVar = ctx.useVariable(src: nil)
+      result.append(
+        UOp(op: .memoryWrite(cell, zeroConst, remappedGradLz), value: writeVar))
     }
   }
 }
@@ -485,11 +502,12 @@ func wrapWithBPTTLoops(
     carryCellWriteSet: carryCellWriteSet,
     valueRemapping: remapState.valueRemapping
   )
-  appendCarryCellWrites(
+  try appendCarryCellWrites(
     result: &result,
     carryCellWriteNodes: plan.carryCellWriteNodes,
     valueRemapping: remapState.valueRemapping,
     zeroConst: remapState.zeroConst,
+    block: block,
     g: g,
     ctx: ctx
   )
