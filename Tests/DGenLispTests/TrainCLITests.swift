@@ -225,7 +225,7 @@ final class TrainCLITests: XCTestCase {
         })
     }
 
-    func testPlanOnlyEmitsRealPlanThenError() throws {
+    func testPlanOnlyEmitsRealPlanAndExitsSuccessfully() throws {
         let patch = workDir.appendingPathComponent("patch.lisp")
         try """
             (def freq (param freq @default 110 @min 50 @max 400))
@@ -247,7 +247,8 @@ final class TrainCLITests: XCTestCase {
             "--plan-only",
         ])
 
-        XCTAssertNotEqual(outcome.exitStatus, 0)
+        XCTAssertEqual(outcome.exitStatus, 0)
+        XCTAssertEqual(outcome.events.count, 1)
         guard case .plan(let plan) = outcome.events.first else {
             return XCTFail("first event must be the real plan")
         }
@@ -256,13 +257,38 @@ final class TrainCLITests: XCTestCase {
         XCTAssertEqual(plan.seedEcho, ["amp": 0.8])
         XCTAssertEqual(plan.pitchHz, 110, accuracy: 2.0)
         XCTAssertEqual(plan.cropFrames, 16384)
-        guard case .error(let err) = outcome.events.last else {
-            return XCTFail("plan-only must terminate with an error event")
-        }
-        XCTAssertTrue(err.message.contains("plan-only"))
         XCTAssertTrue(
             FileManager.default.fileExists(
                 atPath: jobDir.appendingPathComponent("lowered.lisp").path))
+        XCTAssertFalse(
+            FileManager.default.fileExists(
+                atPath: jobDir.appendingPathComponent("result.json").path))
+    }
+
+    func testPlanOnlyReportsNoLearnableParamsWithoutFailing() throws {
+        let patch = workDir.appendingPathComponent("fixed.lisp")
+        try "(out (phasor 110) 0)\n".write(
+            to: patch, atomically: true, encoding: .utf8)
+        let target = workDir.appendingPathComponent("fixed-target.wav")
+        try MiniWav.write(url: target, samples: [Float](repeating: 0, count: 1024))
+        let seed = workDir.appendingPathComponent("fixed-seed.json")
+        try #"{"params":{}}"#.write(to: seed, atomically: true, encoding: .utf8)
+        let jobDir = workDir.appendingPathComponent("fixed-job")
+
+        let outcome = try runTrain([
+            "--patch", patch.path, "--target", target.path,
+            "--seed-params", seed.path, "--job-dir", jobDir.path,
+            "--pitch-hz", "110", "--plan-only",
+        ])
+
+        XCTAssertEqual(
+            outcome.exitStatus, 0,
+            "stderr: \(outcome.stderr); events: \(outcome.events)")
+        XCTAssertEqual(outcome.events.count, 1)
+        guard case .plan(let plan) = outcome.events.first else {
+            return XCTFail("plan-only must emit exactly one plan")
+        }
+        XCTAssertTrue(plan.learnable.isEmpty)
     }
 
     func testMockHostScriptAcceptsStream() throws {

@@ -13,12 +13,12 @@ public enum FakeTrainer {
     static let logEvery = 10
     static let checkpointEvery = 25
 
-    /// Runs the whole fake job: emits plan/stage/epoch/checkpoint events and
-    /// writes artifacts. Returns the terminal result event (the caller emits
-    /// it and writes result.json, so the terminal contract lives in one place).
+    /// Runs the fake job: emits plan/stage/epoch/checkpoint events and writes
+    /// artifacts, or stops successfully after plan for --plan-only. The
+    /// caller emits and persists a returned result completion.
     public static func run(
         options: TrainOptions, sink: TrainEventSink, jobDir: JobDir
-    ) throws -> ResultEvent {
+    ) throws -> TrainCompletion {
         let seed = try SeedParams.load(url: URL(fileURLWithPath: options.seedParamsPath))
         let epochs = options.epochs ?? defaultEpochs
 
@@ -37,6 +37,9 @@ public enum FakeTrainer {
             gateFrames: options.gateFrames ?? 8820,
             cropFrames: 32768)
         try sink.emit(.plan(plan))
+        if options.planOnly {
+            return .planOnly
+        }
         try sink.emit(.stage(StageEvent(name: "train", total: epochs)))
 
         let initLoss = syntheticLoss(epoch: 0, total: epochs)
@@ -56,7 +59,8 @@ public enum FakeTrainer {
                     .epoch(
                         EpochEvent(
                             epoch: epoch, total: epochs, loss: finalLoss,
-                            params: syntheticParams(seed: seed, epoch: epoch, total: epochs))))
+                            params: syntheticParams(seed: seed, epoch: epoch, total: epochs),
+                            steps: syntheticSteps(seed: seed, epoch: epoch, total: epochs))))
             }
             if epoch % checkpointEvery == 0 {
                 let wav = jobDir.epochWav(epoch)
@@ -73,12 +77,13 @@ public enum FakeTrainer {
             deltas[name] = ParamDelta(from: from, to: finalParams[name] ?? from)
         }
         let improvement = round6(100.0 * (initLoss - finalLoss) / initLoss)
-        return ResultEvent(
-            improvementPct: improvement,
-            absDistance: finalLoss,
-            basinCheck: "ok",
-            deltas: deltas,
-            finalWav: jobDir.finalWav.path)
+        return .result(
+            ResultEvent(
+                improvementPct: improvement,
+                absDistance: finalLoss,
+                basinCheck: "ok",
+                deltas: deltas,
+                finalWav: jobDir.finalWav.path))
     }
 
     // MARK: - Deterministic synthetics
@@ -96,6 +101,12 @@ public enum FakeTrainer {
             out[name] = round6(value + drift)
         }
         return out
+    }
+
+    static func syntheticSteps(seed: SeedParams, epoch: Int, total: Int) -> [String: Double] {
+        let progress = Double(epoch) / Double(max(total, 1))
+        let magnitude = round6(exp(-3.0 * progress))
+        return Dictionary(uniqueKeysWithValues: seed.params.keys.map { ($0, magnitude) })
     }
 
     static func previewSamples(epoch: Int) -> [Float] {

@@ -3,6 +3,8 @@ import XCTest
 @testable import DGenTrainProtocol
 
 final class FakeTrainerTests: XCTestCase {
+    private enum TestError: Error { case expectedResult }
+
     var workDir: URL!
 
     override func setUpWithError() throws {
@@ -13,6 +15,16 @@ final class FakeTrainerTests: XCTestCase {
 
     override func tearDownWithError() throws {
         try? FileManager.default.removeItem(at: workDir)
+    }
+
+    private func requireResult(
+        _ completion: TrainCompletion, file: StaticString = #filePath, line: UInt = #line
+    ) throws -> ResultEvent {
+        guard case .result(let result) = completion else {
+            XCTFail("expected result completion", file: file, line: line)
+            throw TestError.expectedResult
+        }
+        return result
     }
 
     func makeOptions(epochs: Int = 60) throws -> (TrainOptions, JobDir) {
@@ -36,7 +48,8 @@ final class FakeTrainerTests: XCTestCase {
     func testEventSequenceAndArtifacts() throws {
         let (options, jobDir) = try makeOptions(epochs: 60)
         let sink = CollectingEventSink()
-        let result = try FakeTrainer.run(options: options, sink: sink, jobDir: jobDir)
+        let result = try requireResult(
+            FakeTrainer.run(options: options, sink: sink, jobDir: jobDir))
 
         // Plan first, stage second.
         guard case .plan(let plan) = sink.events.first else {
@@ -61,6 +74,8 @@ final class FakeTrainerTests: XCTestCase {
             case .epoch(let e):
                 XCTAssertGreaterThan(e.epoch, lastEpoch)
                 XCTAssertLessThan(e.loss, lastLoss)
+                XCTAssertEqual(Set(e.steps?.keys.map { $0 } ?? []), Set(plan.learnable))
+                XCTAssertTrue(e.steps?.values.allSatisfy { (-1...1).contains($0) } == true)
                 lastEpoch = e.epoch
                 lastLoss = e.loss
             case .checkpoint(let c):
@@ -93,9 +108,11 @@ final class FakeTrainerTests: XCTestCase {
     func testDeterminism() throws {
         let (options, jobDir) = try makeOptions()
         let sinkA = CollectingEventSink()
-        let resultA = try FakeTrainer.run(options: options, sink: sinkA, jobDir: jobDir)
+        let resultA = try requireResult(
+            FakeTrainer.run(options: options, sink: sinkA, jobDir: jobDir))
         let sinkB = CollectingEventSink()
-        let resultB = try FakeTrainer.run(options: options, sink: sinkB, jobDir: jobDir)
+        let resultB = try requireResult(
+            FakeTrainer.run(options: options, sink: sinkB, jobDir: jobDir))
         XCTAssertEqual(sinkA.events, sinkB.events)
         XCTAssertEqual(resultA, resultB)
     }
@@ -123,8 +140,9 @@ final class FakeTrainerTests: XCTestCase {
 
     func testResultJSONMatchesStreamEncoding() throws {
         let (options, jobDir) = try makeOptions()
-        let result = try FakeTrainer.run(
-            options: options, sink: CollectingEventSink(), jobDir: jobDir)
+        let result = try requireResult(
+            FakeTrainer.run(
+                options: options, sink: CollectingEventSink(), jobDir: jobDir))
         try jobDir.writeResult(result)
         let fileLine = try String(contentsOf: jobDir.resultJSON, encoding: .utf8)
             .trimmingCharacters(in: .newlines)

@@ -3,18 +3,25 @@
 //
 //   - stdout is claimed before anything else runs; all other output paths
 //     are redirected to stderr.
-//   - The last stdout line is ALWAYS a result or error event.
-//   - Exit code 0 iff a result event was emitted; nonzero otherwise.
+//   - A full run ends with result or error. A successful --plan-only run
+//     ends after its plan event.
+//   - Exit code 0 iff a result was emitted or plan-only completed; nonzero
+//     otherwise.
 //   - Any thrown error becomes an error event + exit 1.
 //   - SIGTERM = cancel: default disposition (prompt death, no terminal
 //     event required, artifacts left in place) — deliberately no handler.
 
 import Foundation
 
+public enum TrainCompletion: Equatable {
+    case result(ResultEvent)
+    case planOnly
+}
+
 public enum TrainCommand {
     /// A trainer backend: emits progress events on the sink, writes
-    /// artifacts into the job dir, returns the terminal result.
-    public typealias Trainer = (TrainOptions, TrainEventSink, JobDir) throws -> ResultEvent
+    /// artifacts into the job dir, and reports how the successful run ended.
+    public typealias Trainer = (TrainOptions, TrainEventSink, JobDir) throws -> TrainCompletion
 
     /// Runs the subcommand with `arguments` = argv after the "train" word.
     /// `realTrainer` handles non-fake jobs (nil until Phase C is wired).
@@ -38,11 +45,21 @@ public enum TrainCommand {
             } else {
                 fail("real trainer not wired; use --fake-trainer")
             }
-            let result = try trainer(options, emitter, jobDir)
-            emitPoisonIfRequested("pre-result")
-            try jobDir.writeResult(result)
-            try emitter.emit(.result(result))
-            exit(0)
+            switch try trainer(options, emitter, jobDir) {
+            case .result(let result):
+                guard !options.planOnly else {
+                    fail("trainer returned a result for --plan-only")
+                }
+                emitPoisonIfRequested("pre-result")
+                try jobDir.writeResult(result)
+                try emitter.emit(.result(result))
+                exit(0)
+            case .planOnly:
+                guard options.planOnly else {
+                    fail("trainer stopped after planning without --plan-only")
+                }
+                exit(0)
+            }
         } catch let error as TrainProtocolError {
             fail(error.message)
         } catch {

@@ -15,7 +15,8 @@ final class EventCodingTests: XCTestCase {
         .epoch(
             EpochEvent(
                 epoch: 50, total: 300, loss: 0.104,
-                params: ["sinefm": 0.061, "ratio": 0.048])),
+                params: ["sinefm": 0.061, "ratio": 0.048],
+                steps: ["sinefm": 0.7, "ratio": -0.2])),
         .checkpoint(CheckpointEvent(epoch: 100, wav: "/tmp/job/epoch0100.wav")),
         .result(
             ResultEvent(
@@ -46,6 +47,17 @@ final class EventCodingTests: XCTestCase {
         for key in ["\"improvement_pct\"", "\"abs_distance\"", "\"basin_check\"", "\"final_wav\"", "\"deltas\"", "\"from\"", "\"to\"" ] {
             XCTAssertTrue(resultLine.contains(key), "result missing \(key): \(resultLine)")
         }
+        let epochLine = try TrainEventCoding.encodeLine(Self.sampleEvents[2])
+        XCTAssertTrue(epochLine.contains("\"steps\""), "epoch missing steps: \(epochLine)")
+    }
+
+    func testEpochWithoutStepsRemainsDecodable() throws {
+        let event = try TrainEventCoding.decodeLine(
+            #"{"epoch":50,"loss":0.104,"params":{"ratio":0.048},"total":300,"type":"epoch"}"#)
+        guard case .epoch(let epoch) = event else {
+            return XCTFail("expected epoch event")
+        }
+        XCTAssertNil(epoch.steps)
     }
 
     func testTypeDiscriminatorPresent() throws {

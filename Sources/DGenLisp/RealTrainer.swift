@@ -1,8 +1,8 @@
 // RealTrainer.swift — the non-fake `dgenlisp train` backend.
 //
 // Phase B: loads the target, runs the lowering pass, emits the real plan
-// event, writes lowered.lisp, and fails fast on unsupported nodes or
-// --plan-only. Phase C wires the E4 direction-mode trainer after the plan.
+// event, writes lowered.lisp, and either completes --plan-only successfully
+// or fails fast on unsupported nodes before training.
 
 import DGen
 import DGenLazy
@@ -12,7 +12,7 @@ import Foundation
 enum RealTrainer {
     static func run(
         options: TrainOptions, sink: TrainEventSink, jobDir: JobDir
-    ) throws -> ResultEvent {
+    ) throws -> TrainCompletion {
         let seed = try SeedParams.load(url: URL(fileURLWithPath: options.seedParamsPath))
         let patchURL = URL(fileURLWithPath: options.patchPath)
         let patchSource: String
@@ -55,6 +55,9 @@ enum RealTrainer {
             .data(using: .utf8)!
             .write(to: jobDir.renderLisp, options: .atomic)
 
+        if options.planOnly {
+            return .planOnly
+        }
         if !patchPlan.fatalUnsupported.isEmpty {
             let described = patchPlan.fatalUnsupported
                 .map { "\($0.name) (\($0.reason))" }
@@ -64,16 +67,13 @@ enum RealTrainer {
         guard !patchPlan.learnable.isEmpty else {
             throw TrainProtocolError("no learnable params (all frozen or unbounded)")
         }
-        if options.planOnly {
-            throw TrainProtocolError("plan-only: no training performed")
-        }
-
-        return try DirectionTrainer.train(
-            options: options,
-            patchPlan: patchPlan,
-            targetSamples: target.samples,
-            targetSampleRate: target.sampleRate,
-            sink: sink,
-            jobDir: jobDir)
+        return .result(
+            try DirectionTrainer.train(
+                options: options,
+                patchPlan: patchPlan,
+                targetSamples: target.samples,
+                targetSampleRate: target.sampleRate,
+                sink: sink,
+                jobDir: jobDir))
     }
 }

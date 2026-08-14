@@ -276,6 +276,7 @@ enum DirectionTrainer {
             // (Trainer.swift convention), per-param clip, bounds projection.
             let progress = Float(epoch - 1) / Float(max(epochs - 1, 1))
             let lr = transformedLR * (0.05 + 0.95 * 0.5 * (1 + cos(.pi * progress)))
+            var normalizedSteps: [String: Double] = [:]
             for (i, t) in transforms.enumerated() {
                 let gNatural = naturalGrads[i]
                 var g = gNatural * t.dNaturalDZ(z[i])
@@ -285,8 +286,16 @@ enum DirectionTrainer {
                 v[i] = 0.999 * v[i] + 0.001 * g * g
                 let mHat = m[i] / (1 - pow(0.9, Float(epoch)))
                 let vHat = v[i] / (1 - pow(0.999, Float(epoch)))
+                let previousZ = z[i]
                 z[i] -= lr * mHat / (vHat.squareRoot() + 1e-8)
                 z[i] = Swift.min(Swift.max(z[i], t.zMin), t.zMax)
+                // Adam's moment ratio already measures this update against
+                // the parameter's recent gradient history. Dividing the
+                // applied (post-projection) movement by the scheduled LR
+                // expresses it in that knob's own normalized coordinate.
+                let normalized = (z[i] - previousZ) / lr
+                normalizedSteps[t.name] = Double(
+                    Swift.min(Swift.max(normalized, -1), 1))
             }
             let optimizerMS = (CFAbsoluteTimeGetCurrent() - optimizerStart) * 1000
 
@@ -303,7 +312,8 @@ enum DirectionTrainer {
                         EpochEvent(
                             epoch: epoch, total: epochs, loss: Double(epochLoss),
                             params: naturalValues(z: z, transforms: transforms)
-                                .mapValues(Double.init))))
+                                .mapValues(Double.init),
+                            steps: normalizedSteps)))
             }
             if emitCheckpoints, epoch % checkpointEvery == 0, epoch < epochs {
                 // (cadence: --checkpoint-every, default 25)

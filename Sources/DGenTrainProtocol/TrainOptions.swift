@@ -29,8 +29,8 @@ public struct TrainOptions: Equatable {
     /// Optional true-SVF refinement after surrogate training.
     public var polishEpochs: Int = 0
 
-    /// Emit the plan event and stop (no GPU time). The job still terminates
-    /// with an error event ("plan-only"), never a result.
+    /// Emit the plan event and exit successfully (no GPU time and no result
+    /// event).
     public var planOnly: Bool = false
 
     // Hidden/testing knobs (not part of the host-facing contract).

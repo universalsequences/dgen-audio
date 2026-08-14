@@ -1,6 +1,6 @@
 // TrainEvents.swift — typed NDJSON event contract for `dgenlisp train`.
 //
-// Schema authority: eseq repo docs/patch-learn-spec.md §4 (rev 1).
+// Schema authority: eseq repo docs/patch-learn-spec.md §4 (rev 2).
 // One JSON object per line on stdout, each with a "type" discriminator.
 // This module is dependency-free (Foundation only) so the protocol layer
 // can be tested without Metal or the DGen graph runtime.
@@ -69,13 +69,22 @@ public struct EpochEvent: Codable, Equatable {
     public var epoch: Int
     public var total: Int
     public var loss: Double
+    /// Current parameter values in natural/knob units.
     public var params: [String: Double]
+    /// Applied post-Adam movement, normalized independently in each
+    /// parameter's transformed coordinate system. Optional so older
+    /// transcripts remain decodable.
+    public var steps: [String: Double]?
 
-    public init(epoch: Int, total: Int, loss: Double, params: [String: Double]) {
+    public init(
+        epoch: Int, total: Int, loss: Double, params: [String: Double],
+        steps: [String: Double]? = nil
+    ) {
         self.epoch = epoch
         self.total = total
         self.loss = loss
         self.params = params
+        self.steps = steps
     }
 }
 

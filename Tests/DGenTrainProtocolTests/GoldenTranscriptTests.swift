@@ -28,7 +28,10 @@ final class GoldenTranscriptTests: XCTestCase {
         let jobDir = try JobDir(path: jobDirPath)
 
         let sink = CollectingEventSink()
-        let result = try FakeTrainer.run(options: options, sink: sink, jobDir: jobDir)
+        let completion = try FakeTrainer.run(options: options, sink: sink, jobDir: jobDir)
+        guard case .result(let result) = completion else {
+            return XCTFail("full fake run must return a result")
+        }
 
         // Reconstruct the full stream exactly as the command emits it:
         // progress events then the terminal result line.

@@ -124,6 +124,19 @@ final class TrainE2ETests: XCTestCase {
         }
         XCTAssertEqual(stages, ["train", "basin-check"])
 
+        let epochEvents = events.compactMap { event -> EpochEvent? in
+            if case .epoch(let epoch) = event { return epoch } else { return nil }
+        }
+        XCTAssertFalse(epochEvents.isEmpty)
+        for epoch in epochEvents {
+            XCTAssertEqual(Set(epoch.params.keys), Set(plan.learnable))
+            XCTAssertTrue(epoch.params.values.allSatisfy { (0.05...1.0).contains($0) },
+                          "epoch params must be natural knob values: \(epoch.params)")
+            XCTAssertEqual(Set(epoch.steps?.keys.map { $0 } ?? []), Set(plan.learnable))
+            XCTAssertTrue(epoch.steps?.values.allSatisfy { (-1.0...1.0).contains($0) } == true,
+                          "epoch steps must be normalized: \(String(describing: epoch.steps))")
+        }
+
         // The seeded run must beat the honest cold midpoint restart here
         // (the seed is in the right neighborhood by construction).
         XCTAssertEqual(result.basinCheck, "ok")

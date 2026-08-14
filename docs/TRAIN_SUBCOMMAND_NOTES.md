@@ -37,7 +37,7 @@ res/shape quasi-degenerate direction. `--checkpoint-every N` supports
 short audible confirm runs.
 
 Status: Phases A–C landed (protocol layer, real plan event, E4 direction
-trainer). Companion to the eseq repo's `docs/patch-learn-spec.md` (rev 1).
+trainer). Companion to the eseq repo's `docs/patch-learn-spec.md` (rev 2).
 Items marked **SPEC-SYNC** need the spec updated to match (or the code
 changed after discussion).
 
@@ -63,9 +63,10 @@ changed after discussion).
    transformed-midpoint init) runs after the seeded run at the same epoch
    budget; `wrong_neighborhood` iff cold best < 0.75 x seeded best. Threshold
    was not pinned by the spec.
-5. **`--plan-only`** (extension): emits the real plan then terminates with an
-   `error` event ("plan-only: no training performed"), exit 1 — a `result`
-   is reserved for actual training. Useful as a host preflight.
+5. **`--plan-only`**: emits the real plan and exits 0 without a terminal
+   `result` event or GPU work. It returns successfully even when the verdict
+   has no learnable params or contains unsupported nodes, because surfacing
+   that verdict is the purpose of the host preflight.
 
 ## Known limitations / punts (filed here, not silently dropped)
 
