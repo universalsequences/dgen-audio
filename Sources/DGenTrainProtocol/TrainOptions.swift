@@ -33,6 +33,15 @@ public struct TrainOptions: Equatable {
     /// Optional true-SVF refinement after surrogate training.
     public var polishEpochs: Int = 0
 
+    /// Opt-in tensor-lane multistart search. Zero preserves the legacy
+    /// seeded + midpoint policy. Positive values are the number of cheap
+    /// forward candidates generated before short-horizon batched Adam.
+    public var multistartCandidates: Int = 0
+    public var multistartLanes: Int = 64
+    public var multistartBatch: Int = 256
+    public var multistartSteps: Int = 30
+    public var multistartSeed: Int = 1
+
     /// Emit the plan event and exit successfully (no GPU time and no result
     /// event).
     public var planOnly: Bool = false
@@ -71,6 +80,11 @@ public struct TrainOptions: Equatable {
         var surrogateWindow = 1024
         var surrogateHop = 256
         var polishEpochs = 0
+        var multistartCandidates = 0
+        var multistartLanes = 64
+        var multistartBatch = 256
+        var multistartSteps = 30
+        var multistartSeed = 1
         var fake = environment["DGENLISP_FAKE_TRAINER"] != nil
         var fakeFailAtEpoch: Int?
         var fakeEpochMs = 0
@@ -118,6 +132,11 @@ public struct TrainOptions: Equatable {
             case "--surrogate-window": surrogateWindow = try intValue(arg)
             case "--surrogate-hop": surrogateHop = try intValue(arg)
             case "--polish-epochs": polishEpochs = try intValue(arg)
+            case "--multistart-candidates": multistartCandidates = try intValue(arg)
+            case "--multistart-lanes": multistartLanes = try intValue(arg)
+            case "--multistart-batch": multistartBatch = try intValue(arg)
+            case "--multistart-steps": multistartSteps = try intValue(arg)
+            case "--multistart-seed": multistartSeed = try intValue(arg)
             case "--plan-only": planOnly = true
             case "--fake-trainer": fake = true
             case "--fake-fail-at-epoch": fakeFailAtEpoch = try intValue(arg)
@@ -145,6 +164,16 @@ public struct TrainOptions: Equatable {
         guard polishEpochs >= 0 else {
             throw TrainProtocolError("--polish-epochs must be >= 0")
         }
+        guard multistartCandidates >= 0 else {
+            throw TrainProtocolError("--multistart-candidates must be >= 0")
+        }
+        guard multistartLanes >= 2, multistartBatch >= 1, multistartSteps >= 1 else {
+            throw TrainProtocolError(
+                "--multistart-lanes must be >= 2 and --multistart-batch/--multistart-steps must be >= 1")
+        }
+        if multistartCandidates > 0 && multistartCandidates < multistartLanes {
+            throw TrainProtocolError("--multistart-candidates must be >= --multistart-lanes")
+        }
         if let reportEvery {
             guard reportEvery > 0 else {
                 throw TrainProtocolError("--report-every must be > 0")
@@ -165,6 +194,11 @@ public struct TrainOptions: Equatable {
         options.surrogateWindow = surrogateWindow
         options.surrogateHop = surrogateHop
         options.polishEpochs = polishEpochs
+        options.multistartCandidates = multistartCandidates
+        options.multistartLanes = multistartLanes
+        options.multistartBatch = multistartBatch
+        options.multistartSteps = multistartSteps
+        options.multistartSeed = multistartSeed
         options.planOnly = planOnly
         options.useFakeTrainer = fake
         options.fakeFailAtEpoch = fakeFailAtEpoch

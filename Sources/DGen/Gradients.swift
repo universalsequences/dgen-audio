@@ -723,6 +723,9 @@ extension LazyOp {
       return [g.n(.gradDeterministicPhasor, [gradOutput, sampleRate])]
 
     case .accum(_):
+      if DGenGradientConfig.detachAccumInputs {
+        return node.inputs.map { _ in nil }
+      }
       let gradIncrement = temporalIncrementGradient(
         graph: g,
         node: node,

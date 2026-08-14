@@ -116,7 +116,9 @@ func printUsage() {
                dgenlisp train --patch <dsp.lisp> --target <sample.wav> \\
                               --seed-params <seed.json> --job-dir <dir> \\
                               [--mode direction] [--epochs N] \\
-                              [--gate-frames N] [--pitch-hz F] [--plan-only]
+                              [--gate-frames N] [--pitch-hz F] [--plan-only] \\
+                              [--multistart-candidates N] [--multistart-lanes N] \\
+                              [--multistart-batch N] [--multistart-steps N]
 
         Options:
           -o, --output <dir>       Output directory (default: .)

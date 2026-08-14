@@ -50,6 +50,13 @@ struct OutputInfo {
   let modulatorSlot: Int?
 }
 
+struct TensorOutputInfo {
+  let channel: Int
+  let signal: SignalTensor
+  let name: String?
+  let modulatorSlot: Int?
+}
+
 struct InputInfo {
   let channel: Int
   let name: String?
@@ -80,18 +87,28 @@ class LispEvaluator {
   var macros: [String: MacroDefinition] = [:]
   var params: [ParamInfo] = []
   var outputs: [OutputInfo] = []
+  var tensorOutputs: [TensorOutputInfo] = []
   var inputs: [InputInfo] = []
   var tensors: [TensorInfo] = []
   var macroExpansionCounter: Int = 0
   let sourceDirectory: URL
   let reusesRegisteredParameters: Bool
+  /// When present, scalar patch parameters and state are lifted into this
+  /// lane dimension. Values are natural-unit parameter tensors supplied by
+  /// the multistart harness; patch source remains unchanged.
+  let batchLaneCount: Int?
+  let batchParameterValues: [String: EvalResult]
 
   init(
     sourceDirectory: URL = URL(fileURLWithPath: FileManager.default.currentDirectoryPath),
-    reusesRegisteredParameters: Bool = false
+    reusesRegisteredParameters: Bool = false,
+    batchLaneCount: Int? = nil,
+    batchParameterValues: [String: EvalResult] = [:]
   ) {
     self.sourceDirectory = sourceDirectory
     self.reusesRegisteredParameters = reusesRegisteredParameters
+    self.batchLaneCount = batchLaneCount
+    self.batchParameterValues = batchParameterValues
   }
 
   // MARK: - Top-level evaluation
@@ -112,6 +129,7 @@ class LispEvaluator {
       macros.removeAll()
       params.removeAll()
       outputs.removeAll()
+      tensorOutputs.removeAll()
       inputs.removeAll()
       tensors.removeAll()
       macroExpansionCounter = 0
@@ -316,6 +334,10 @@ class LispEvaluator {
     let attrs = try parseTrailingAttributes(elements, startIndex: 2, form: "make-history")
     if attrValue(attrs, "@shape") != nil {
       try makeTensorHistoryBinding(name: name, attrs: attrs, form: "make-history")
+      return .none
+    }
+    if let lanes = batchLaneCount {
+      tensorHistoryBindings[name] = TensorHistory(shape: [lanes])
       return .none
     }
     let history = Signal.history()
@@ -1183,8 +1205,16 @@ class LispEvaluator {
 
     switch promoteToValue(freqResult) {
     case .signal(let freq):
+      if let lanes = batchLaneCount {
+        return .signalTensor(
+          Signal.statefulPhasor(Tensor([Float](repeating: 1, count: lanes)) * freq, reset: reset))
+      }
       return .signal(Signal.phasor(freq, reset: reset))
     case .float(let freq):
+      if let lanes = batchLaneCount {
+        return .signalTensor(
+          Signal.statefulPhasor(Tensor([Float](repeating: freq, count: lanes)), reset: reset))
+      }
       return .signal(Signal.phasor(freq, reset: reset))
     case .tensor(let freqs):
       // Tensor frequencies lower to the stateful per-lane phasor
@@ -1451,6 +1481,35 @@ class LispEvaluator {
     let modulationResolvedSymbolName = attrValue(attributes, "@mod-resolved-symbol")
     let generatedModulatorSlot = Int(attrValue(attributes, "@modulator-slot") ?? "")
 
+    if let lanes = batchLaneCount {
+      guard let value = batchParameterValues[name] else {
+        throw LispError.invalidArgument(
+          "batch param '\(name)' requires a supplied [\(lanes)] tensor")
+      }
+      let shape: [Int]
+      switch value {
+      case .tensor(let tensor): shape = tensor.shape
+      case .signalTensor(let tensor): shape = tensor.shape
+      default: shape = []
+      }
+      guard shape == [lanes] else {
+        throw LispError.invalidArgument(
+          "batch param '\(name)' requires shape [\(lanes)], got \(shape)")
+      }
+      let info = ParamInfo(
+        name: name, cellId: nil, defaultValue: defaultVal, min: minVal, max: maxVal,
+        unit: unit, hidden: hidden, group: group, env: env, role: role,
+        generatedKind: generatedKind, generatedFor: generatedFor,
+        modulationMode: modulationMode, modulationDepthMin: modulationDepthMin,
+        modulationDepthMax: modulationDepthMax,
+        modulationActiveParamName: modulationActiveParamName,
+        modulationResolvedSymbolName: modulationResolvedSymbolName,
+        generatedModulatorSlot: generatedModulatorSlot)
+      params.append(info)
+      definitions[name] = value
+      return value
+    }
+
     let graph = LazyGraphContext.current
     let signal: Signal
     if reusesRegisteredParameters, let registered = graph.registeredSignalParameter(named: name) {
@@ -1515,7 +1574,7 @@ class LispEvaluator {
     guard args.count >= 1 else {
       throw LispError.invalidArgument("out requires at least 1 argument (signal)")
     }
-    let signal = try requireSignal(evaluateAST(args[0]))
+    let value = try evaluateAST(args[0])
 
     // Second arg is channel number (1-indexed)
     let channelLisp: Int
@@ -1531,12 +1590,32 @@ class LispEvaluator {
     let modulatorSlot = try parseOptionalPositiveIntAttribute(attributes, "@modulator")
     if let modulatorSlot,
       outputs.contains(where: { $0.modulatorSlot == modulatorSlot })
+        || tensorOutputs.contains(where: { $0.modulatorSlot == modulatorSlot })
     {
       throw LispError.invalidArgument("duplicate output @modulator slot \(modulatorSlot)")
     }
-    outputs.append(
-      OutputInfo(channel: channel, signal: signal, name: name, modulatorSlot: modulatorSlot)
-    )
+    switch value {
+    case .signalTensor(let signal):
+      tensorOutputs.append(
+        TensorOutputInfo(
+          channel: channel, signal: signal, name: name, modulatorSlot: modulatorSlot))
+    case .tensor(let tensor):
+      tensorOutputs.append(
+        TensorOutputInfo(
+          channel: channel, signal: SignalTensor.lift(tensor), name: name,
+          modulatorSlot: modulatorSlot))
+    default:
+      let signal = try requireSignal(value)
+      if let lanes = batchLaneCount {
+        let lifted = Tensor([Float](repeating: 1, count: lanes)) * signal
+        tensorOutputs.append(
+          TensorOutputInfo(
+            channel: channel, signal: lifted, name: name, modulatorSlot: modulatorSlot))
+      } else {
+        outputs.append(
+          OutputInfo(channel: channel, signal: signal, name: name, modulatorSlot: modulatorSlot))
+      }
+    }
 
     return .none
   }

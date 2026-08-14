@@ -19,6 +19,12 @@ public enum DGenGradientConfig {
   /// fixed by consolidateScalarBPTTBackwardBlocks. Kept as an opt-out
   /// for experiments that want pitch pinned.
   public static var detachPhasorFrequency: Bool = false
+
+  /// Stop-gradient through stateful accumulator controls. Useful when accum
+  /// is only a shared sample clock inside a tensor-lane training graph; its
+  /// suffix-scan adjoint otherwise creates a scalar temporal-gradient block
+  /// that cannot compose with the lane-parallel tensor-history backward yet.
+  public static var detachAccumInputs: Bool = false
 }
 
 /// Runtime knobs for spectral loss semantics.

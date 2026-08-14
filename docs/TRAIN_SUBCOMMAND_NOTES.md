@@ -14,6 +14,38 @@
   surrogate mode was determined to be broken; opt back in with
   `--filter-surrogate freq`.
 
+## Opt-in tensor-lane multistart (2026-08-14)
+
+`--multistart-candidates N` replaces the weak midpoint-only starting-point
+policy with a generic population stage before the two full trajectories.
+The population always includes the supplied seed and transformed midpoint,
+then seed jitters and transformed-coordinate stratified starts. Candidates
+are rendered in `--multistart-batch` lanes, ranked by an independent vDSP
+MR-STFT scorer, diversity-filtered to `--multistart-lanes`, and refined for
+`--multistart-steps` batched Adam steps. The seed and best post-horizon lane
+then receive full `--epochs` continuations (`train` and `global-candidate`).
+The lower-loss continuation supplies the final artifact only when this option
+is explicitly enabled. `multistart_report.json` preserves initial/post scores,
+correlation, source indices, winner, and timings.
+
+Korg1 smoke/feasibility result (65,536 frames, 34 trainable params, real dual
+SVF patch): 64 forward candidates -> 16 retained lanes -> 5 Adam steps
+completed end-to-end in 53 s including two one-epoch continuations/renders.
+Independent score improved from seed 0.5654 to 0.4812; the best population
+start was 0.4855. Initial/post correlation over retained lanes was 0.992 for
+this deliberately short horizon, so this run validates throughput and basin
+quality, not the bead's expected weak-correlation result at 20-50 steps.
+
+Current backend limitation: tensor phasor-frequency and shared `accum` suffix
+adjoints are detached during the batched short horizon. Their temporal-gradient
+read blocks are scheduled after tensor-history SVF BPTT consumers. Population
+forward ranking still varies those dimensions, and both full scalar
+continuations train them normally. Arithmetic, exp/log transforms, tan/tanh,
+clip/wrap/comparisons/gswitch, PolyBLEP, noise broadcast, analytic ADSR,
+phasors (forward), scalar-to-lane broadcasting, Lisp `make-history` SVFs,
+tensor spectral loss, and per-lane params are enabled. Param-dependent discrete
+selectors and lane-varying table gathers remain unsuitable.
+
 ## Post-landing findings (monologue-bass shakedown, 2026-08-13)
 
 Fitting a real eseq-style monologue patch to `Assets/monologue-bass.wav`

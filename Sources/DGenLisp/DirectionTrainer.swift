@@ -114,31 +114,44 @@ enum DirectionTrainer {
             jobDir: jobDir, out: jobDir.seededWav, frames: crop,
             sampleRate: targetSampleRate, options: options)
 
+        let multistart = options.multistartCandidates > 0
+            ? try BatchMultistart.search(
+                options: options, transforms: transforms, seedZ: seedZ,
+                nodes: patchPlan.loweredNodes, target: prepared,
+                sampleRate: targetSampleRate, crop: crop, sink: sink, jobDir: jobDir)
+            : nil
+
         let seeded = try runPhase(
             name: "train", initialZ: seedZ, epochs: epochs,
             transforms: transforms, patchPlan: patchPlan, target: prepared,
             sampleRate: targetSampleRate, crop: crop, options: options,
             sink: sink, jobDir: jobDir, emitCheckpoints: true)
 
-        let cold = try runPhase(
-            name: "basin-check", initialZ: coldZ, epochs: epochs,
+        let global = try runPhase(
+            name: multistart == nil ? "basin-check" : "global-candidate",
+            initialZ: multistart?.bestZ ?? coldZ, epochs: epochs,
             transforms: transforms, patchPlan: patchPlan, target: prepared,
             sampleRate: targetSampleRate, crop: crop, options: options,
             sink: sink, jobDir: jobDir, emitCheckpoints: false)
 
         let basinCheck =
-            cold.bestLoss < basinDecisiveRatio * seeded.bestLoss ? "wrong_neighborhood" : "ok"
+            global.bestLoss < basinDecisiveRatio * seeded.bestLoss ? "wrong_neighborhood" : "ok"
+
+        // Multistart is explicitly a global-fit opt-in, so its full-horizon
+        // continuation may win the final artifact. The report still records
+        // the local seed trajectory separately. Legacy direction mode keeps
+        // returning the seeded trajectory and uses midpoint only as a check.
+        var finalPhase = multistart != nil && global.bestLoss < seeded.bestLoss ? global : seeded
 
         // Optional handoff to the real recurrent SVF. Parameters are shared,
         // so no projection or decoding is required.
-        var finalPhase = seeded
         if options.polishEpochs > 0, options.filterSurrogate == "freq" {
             let trueSVFPlan = PatchPlan(
                 plan: patchPlan.plan, learnable: patchPlan.learnable,
                 fatalUnsupported: patchPlan.fatalUnsupported,
                 loweredNodes: patchPlan.renderNodes, renderNodes: patchPlan.renderNodes)
             finalPhase = try runPhase(
-                name: "polish", initialZ: seeded.bestZ,
+                name: "polish", initialZ: finalPhase.bestZ,
                 epochs: min(options.polishEpochs, 2000),
                 transforms: transforms, patchPlan: trueSVFPlan, target: prepared,
                 sampleRate: targetSampleRate, crop: crop, options: options,
