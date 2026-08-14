@@ -604,6 +604,8 @@ class LispEvaluator {
     // Effects
     case "biquad":
       return try evalBiquad(regularArgs, attributes: attributePairs)
+    case "svf-freq":
+      return try evalSVFFrequencySampled(regularArgs, attributes: attributePairs)
     case "compressor":
       return try evalCompressor(regularArgs, rawArgs: args, attributes: attributePairs)
     case "delay":
@@ -1300,6 +1302,30 @@ class LispEvaluator {
       let sig = try requireSignal(sigResult)
       return .signal(sig.biquad(cutoff: cutoff, resonance: q, gain: gain, mode: mode))
     }
+  }
+
+  private func evalSVFFrequencySampled(
+    _ args: [ASTNode], attributes: [(name: String, value: String)]
+  ) throws -> EvalResult {
+    guard args.count == 4 else {
+      throw LispError.invalidArgument("svf-freq requires input, cutoff, q, and mode")
+    }
+    let input = try requireSignal(evaluateAST(args[0]))
+    let cutoff = try requireSignal(evaluateAST(args[1]))
+    let q = try requireSignal(evaluateAST(args[2]))
+    let mode = try requireSignal(evaluateAST(args[3]))
+    let window = Int(attrValue(attributes, "@window") ?? "1024") ?? 0
+    let hop = Int(attrValue(attributes, "@hop") ?? "256") ?? 0
+    guard window >= 2, window.nonzeroBitCount == 1 else {
+      throw LispError.invalidArgument("svf-freq: @window must be a power of two >= 2")
+    }
+    guard hop > 0, hop <= window, window % hop == 0 else {
+      throw LispError.invalidArgument("svf-freq: @hop must be positive and divide @window")
+    }
+    return .signal(
+      svfFrequencySampled(
+        input, cutoff: cutoff, q: q, mode: mode,
+        window: window, hop: hop, sampleRate: DGenConfig.sampleRate))
   }
 
   private func evalDelay(_ args: [ASTNode], attributes: [(name: String, value: String)]) throws

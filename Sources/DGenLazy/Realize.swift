@@ -588,6 +588,24 @@ extension SignalTensor {
     }
 }
 
+extension LazyGraph {
+    /// Write each compiled kernel's source to `<dir>/kernel_<idx>.txt` for
+    /// offline inspection (profiling companion; Metal or C).
+    public func dumpKernelSources(to dir: String) {
+        guard let cached = fullCompilationCache else {
+            print("[dump] No compiled runtime — run backward() first")
+            return
+        }
+        try? FileManager.default.createDirectory(
+            atPath: dir, withIntermediateDirectories: true)
+        for (i, kernel) in cached.result.kernels.enumerated() {
+            let path = "\(dir)/kernel_\(i).txt"
+            try? kernel.source.write(toFile: path, atomically: true, encoding: .utf8)
+        }
+        print("[dump] Wrote \(cached.result.kernels.count) kernel sources to \(dir)")
+    }
+}
+
 // MARK: - GPU Kernel Profiling
 
 extension LazyGraph {

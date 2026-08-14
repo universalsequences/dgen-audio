@@ -26,6 +26,7 @@ public struct JobDir {
     }
 
     public var loweredLisp: URL { file("lowered.lisp") }
+    public var renderLisp: URL { file("render.lisp") }
     public var finalWav: URL { file("final.wav") }
     public var resultJSON: URL { file("result.json") }
 

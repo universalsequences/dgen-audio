@@ -48,7 +48,10 @@ extension TemporalityPass {
       .temporalGradStore, .temporalGradRead,
       .spectrumDelay(_, _, _, _, _),
       .spectrumDelayMod(_, _, _, _, _),
-      .overlapAdd(_, _, _, _, _):
+      .overlapAdd(_, _, _, _, _),
+      // Per-sample scalar gradient output: sums hop-window tape entries for
+      // every frame, so it must never be promoted to hop-rate scheduling.
+      .bufferViewGradRead(_, _):
       return true
     default:
       return false

@@ -51,6 +51,9 @@ enum RealTrainer {
         try TrainPlanner.loweredSource(patchPlan: patchPlan)
             .data(using: .utf8)!
             .write(to: jobDir.loweredLisp, options: .atomic)
+        try TrainPlanner.renderSource(patchPlan: patchPlan)
+            .data(using: .utf8)!
+            .write(to: jobDir.renderLisp, options: .atomic)
 
         if !patchPlan.fatalUnsupported.isEmpty {
             let described = patchPlan.fatalUnsupported

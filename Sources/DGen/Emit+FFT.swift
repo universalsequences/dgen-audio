@@ -104,9 +104,16 @@ extension LazyOp {
         // Only use if hop frame AND in bounds
         let validGrad = b.gswitch(isHopFrame, b.gswitch(inBounds, gradVal, zero), zero)
 
-        // Write to frame-indexed gradient tensor cell
+        // Write to frame-indexed gradient tensor cell. Hop-sliced cells hold
+        // one slot per hop (frameAwareCellHops); index by frame / hop.
         let iInt = b.cast(i, to: .int)
-        let writeIdx = frameInt * winSizeInt + iInt
+        let writeIdx: Expr
+        if let hop = g.frameAwareCellHops[gradInputCell], hop > 1 {
+          let slot = frameInt / b.intConstant(hop)
+          writeIdx = slot * winSizeInt + iInt
+        } else {
+          writeIdx = frameInt * winSizeInt + iInt
+        }
         _ = b.memoryWrite(gradInputCell, writeIdx, validGrad)
       }
       b.use(val: zero)
@@ -126,11 +133,18 @@ extension LazyOp {
       let bvFrameIdx = b.currentFrameIndex()
       let bvFrameInt = b.cast(bvFrameIdx, to: .int)
       let bvWinSizeInt = b.intConstant(windowSize)
+      // Hop-sliced grad cells hold one slot per hop; index by frame / hop.
+      let bvSlotInt: Expr
+      if let hop = g.frameAwareCellHops[gradCell], hop > 1 {
+        bvSlotInt = bvFrameInt / b.intConstant(hop)
+      } else {
+        bvSlotInt = bvFrameInt
+      }
 
       b.loop(windowSize) { j in
         let jInt = b.cast(j, to: .int)
         let gradElem = b.tensorRead(tensor, flatIdx: jInt, shape: tensor.shape)
-        let writeIdx = bvFrameInt * bvWinSizeInt + jInt
+        let writeIdx = bvSlotInt * bvWinSizeInt + jInt
         _ = b.memoryWrite(gradCell, writeIdx, gradElem)
       }
       b.use(val: b.constant(0.0))
@@ -144,20 +158,52 @@ extension LazyOp {
       let p = b.threadIndex()  // absolute sample position
       let bvrWinSizeInt = b.intConstant(windowSize)
       let bvrFrameCount = b.frameCount()
+      let bvrHop = g.frameAwareCellHops[gradCell] ?? 1
 
       let gradSum = b.float(0.0)
-      b.loop(windowSize) { i in
-        let iInt = b.cast(i, to: .int)
-        let iFloat = b.cast(i, to: .float)
+      if bvrHop > 1 {
+        // Hop-sliced tape: windows only exist at hop frames (multiples of hop).
+        // Sample p appears in hop windows w = ceil(p/hop)*hop + k*hop for
+        // w <= p + windowSize - 1. Iterate those slots directly. All index
+        // math stays in float (renderer idiom) with a final int cast, to
+        // avoid metal::min/select int-vs-float overload ambiguity.
+        let hopFloat = b.constant(Float(bvrHop))
+        let winFloat = b.constant(Float(windowSize))
+        let one = b.constant(1.0)
         let pFloat = b.cast(p, to: .float)
-        let w = pFloat + iFloat  // window frame index (float for comparisons)
-        let offsetInt = bvrWinSizeInt - b.intConstant(1) - iInt  // offset in that window
-        let clampedW = b.min(w, b.cast(bvrFrameCount, to: .float) - b.constant(1.0))
-        let idx = b.cast(clampedW, to: .int) * bvrWinSizeInt + offsetInt
-        let contrib = b.memoryRead(gradCell, idx)
-        let inBounds = w < b.cast(bvrFrameCount, to: .float)
-        let safeContrib = b.gswitch(inBounds, contrib, b.constant(0.0))
-        gradSum.accumulate(safeContrib)
+        let fcFloat = b.cast(bvrFrameCount, to: .float)
+        let firstSlot = b.floor((pFloat + hopFloat - one) / hopFloat)
+        let maxSlot = b.floor((fcFloat - one) / hopFloat)
+        let slotCount = windowSize / bvrHop + 1
+        b.loop(slotCount) { k in
+          let kFloat = b.cast(k, to: .float)
+          let slot = firstSlot + kFloat
+          let w = slot * hopFloat
+          let offset = winFloat - one - (w - pFloat)
+          let inWindow = w < pFloat + winFloat
+          let inBounds = w < fcFloat
+          // Clamp so out-of-range iterations read a valid address.
+          let clampedSlot = b.min(slot, maxSlot)
+          let clampedOffset = b.max(b.min(offset, winFloat - one), b.constant(0.0))
+          let idx = b.cast(clampedSlot * winFloat + clampedOffset, to: .int)
+          let contrib = b.memoryRead(gradCell, idx)
+          let safeContrib = b.gswitch(inWindow, b.gswitch(inBounds, contrib, b.constant(0.0)), b.constant(0.0))
+          gradSum.accumulate(safeContrib)
+        }
+      } else {
+        b.loop(windowSize) { i in
+          let iInt = b.cast(i, to: .int)
+          let iFloat = b.cast(i, to: .float)
+          let pFloat = b.cast(p, to: .float)
+          let w = pFloat + iFloat  // window frame index (float for comparisons)
+          let offsetInt = bvrWinSizeInt - b.intConstant(1) - iInt  // offset in that window
+          let clampedW = b.min(w, b.cast(bvrFrameCount, to: .float) - b.constant(1.0))
+          let idx = b.cast(clampedW, to: .int) * bvrWinSizeInt + offsetInt
+          let contrib = b.memoryRead(gradCell, idx)
+          let inBounds = w < b.cast(bvrFrameCount, to: .float)
+          let safeContrib = b.gswitch(inBounds, contrib, b.constant(0.0))
+          gradSum.accumulate(safeContrib)
+        }
       }
       b.use(val: gradSum.value)
 

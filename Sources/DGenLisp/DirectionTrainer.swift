@@ -3,8 +3,8 @@
 //
 // Loss: multi-resolution log-magnitude STFT L1 exactly as frozen in
 // SynthID SPEC.md §4 (windows 256-2048, hop w/4, normalize, +0.1 linear
-// term, log-eps 1e-3). No smoothing surrogates. Adam runs CPU-side in
-// transformed coordinates (log for wide positive ranges), with bounds
+// term, log-eps 1e-3). Training may substitute the frequency-sampled SVF
+// surrogate; rendering remains exact. Adam runs CPU-side in transformed coordinates (log for wide positive ranges), with bounds
 // projection and a global LR at 2x the legacy production tone LR per
 // BATCH_REFINE_FINDING.
 //
@@ -124,24 +124,40 @@ enum DirectionTrainer {
         let basinCheck =
             cold.bestLoss < basinDecisiveRatio * seeded.bestLoss ? "wrong_neighborhood" : "ok"
 
+        // Optional handoff to the real recurrent SVF. Parameters are shared,
+        // so no projection or decoding is required.
+        var finalPhase = seeded
+        if options.polishEpochs > 0, options.filterSurrogate == "freq" {
+            let trueSVFPlan = PatchPlan(
+                plan: patchPlan.plan, learnable: patchPlan.learnable,
+                fatalUnsupported: patchPlan.fatalUnsupported,
+                loweredNodes: patchPlan.renderNodes, renderNodes: patchPlan.renderNodes)
+            finalPhase = try runPhase(
+                name: "polish", initialZ: seeded.bestZ,
+                epochs: min(options.polishEpochs, 2000),
+                transforms: transforms, patchPlan: trueSVFPlan, target: prepared,
+                sampleRate: targetSampleRate, crop: crop, options: options,
+                sink: sink, jobDir: jobDir, emitCheckpoints: false)
+        }
+
         try renderViaSubprocess(
-            params: naturalValues(z: seeded.bestZ, transforms: transforms),
+            params: naturalValues(z: finalPhase.bestZ, transforms: transforms),
             jobDir: jobDir, out: jobDir.finalWav, frames: crop,
             sampleRate: targetSampleRate, options: options)
 
         var deltas: [String: ParamDelta] = [:]
-        let finalNatural = naturalValues(z: seeded.bestZ, transforms: transforms)
+        let finalNatural = naturalValues(z: finalPhase.bestZ, transforms: transforms)
         for p in patchPlan.learnable {
             deltas[p.name] = ParamDelta(
                 from: Double(p.seedValue), to: Double(finalNatural[p.name] ?? p.seedValue))
         }
         let improvement =
             seeded.initLoss > 0
-            ? 100.0 * Double(seeded.initLoss - seeded.bestLoss) / Double(seeded.initLoss)
+            ? 100.0 * Double(seeded.initLoss - finalPhase.bestLoss) / Double(seeded.initLoss)
             : 0
         return ResultEvent(
             improvementPct: improvement,
-            absDistance: Double(seeded.bestLoss),
+            absDistance: Double(finalPhase.bestLoss),
             basinCheck: basinCheck,
             deltas: deltas,
             finalWav: jobDir.finalWav.path)
@@ -195,12 +211,20 @@ enum DirectionTrainer {
             let lispEvalMS = (CFAbsoluteTimeGetCurrent() - evalStart) * 1000
 
             let graphBuildStart = CFAbsoluteTimeGetCurrent()
-            let targetSignal = Tensor(target).toSignal(maxFrames: crop)
+            let targetSignal = trainingTargetSignal(target, crop: crop, patchPlan: patchPlan)
             let loss = multiResolutionSpectralLoss(
                 synth: output, target: targetSignal, frames: crop)
             let graphBuildMS = (CFAbsoluteTimeGetCurrent() - graphBuildStart) * 1000
             let epochGraph = LazyGraphContext.current
             let lossValues = try loss.backward(frames: crop)
+            if epoch == 1,
+                ProcessInfo.processInfo.environment["DGENLISP_TRAIN_PROFILE"] == "1"
+            {
+                epochGraph.profileGPU(frames: crop)
+                if let dir = ProcessInfo.processInfo.environment["DGENLISP_TRAIN_KERNEL_DUMP"] {
+                    epochGraph.dumpKernelSources(to: dir)
+                }
+            }
             let epochLoss = lossValues.reduce(0, +)
             guard epochLoss.isFinite else {
                 throw TrainProtocolError("\(name) loss diverged (non-finite) at epoch \(epoch)")
@@ -315,7 +339,7 @@ enum DirectionTrainer {
             guard let output = outputSignal(evaluator: evaluator) else {
                 throw TrainProtocolError("no output")
             }
-            let targetSignal = Tensor(target).toSignal(maxFrames: crop)
+            let targetSignal = trainingTargetSignal(target, crop: crop, patchPlan: patchPlan)
             let loss = multiResolutionSpectralLoss(
                 synth: output, target: targetSignal, frames: crop)
             return try loss.realize(frames: crop).reduce(0, +)
@@ -343,7 +367,7 @@ enum DirectionTrainer {
         guard let output = outputSignal(evaluator: evaluator) else {
             throw TrainProtocolError("no output")
         }
-        let targetSignal = Tensor(target).toSignal(maxFrames: crop)
+        let targetSignal = trainingTargetSignal(target, crop: crop, patchPlan: patchPlan)
         let loss = multiResolutionSpectralLoss(synth: output, target: targetSignal, frames: crop)
         let lossValues = try loss.backward(frames: crop)
         FileHandle.standardError.write(
@@ -415,6 +439,43 @@ enum DirectionTrainer {
         (evaluator.outputs.first { $0.channel == 0 } ?? evaluator.outputs.first)?.signal
     }
 
+    private static func trainingTargetSignal(
+        _ target: [Float], crop: Int, patchPlan: PatchPlan
+    ) -> Signal {
+        guard containsSVFFrequencySampled(patchPlan.loweredNodes) else {
+            return Tensor(target).toSignal(maxFrames: crop)
+        }
+        let latency = (surrogateWindow(in: patchPlan.loweredNodes) ?? 1024) - 1
+        var delayed = [Float](repeating: 0, count: target.count)
+        if latency < target.count {
+            for i in latency..<target.count { delayed[i] = target[i - latency] }
+        }
+        return Tensor(delayed).toSignal(maxFrames: crop)
+    }
+
+    private static func containsSVFFrequencySampled(_ nodes: [ASTNode]) -> Bool {
+        nodes.contains { node in
+            guard case .list(let xs) = node else { return false }
+            if case .atom("svf-freq") = xs.first ?? .atom("") { return true }
+            return containsSVFFrequencySampled(xs)
+        }
+    }
+
+    private static func surrogateWindow(in nodes: [ASTNode]) -> Int? {
+        for node in nodes {
+            guard case .list(let xs) = node else { continue }
+            if case .atom("svf-freq") = xs.first ?? .atom("") {
+                for i in xs.indices where i + 1 < xs.count {
+                    if case .atom("@window") = xs[i], case .atom(let raw) = xs[i + 1] {
+                        return Int(raw)
+                    }
+                }
+            }
+            if let found = surrogateWindow(in: xs) { return found }
+        }
+        return nil
+    }
+
     static func naturalValues(z: [Float], transforms: [TransformedParam]) -> [String: Float] {
         var out: [String: Float] = [:]
         for (i, t) in transforms.enumerated() {
@@ -450,7 +511,7 @@ enum DirectionTrainer {
         process.executableURL = URL(fileURLWithPath: CommandLine.arguments[0])
         process.arguments = [
             "train-render",
-            "--patch", jobDir.loweredLisp.path,
+            "--patch", jobDir.renderLisp.path,
             "--params-json", paramsURL.path,
             "--out", out.path,
             "--frames", String(frames),

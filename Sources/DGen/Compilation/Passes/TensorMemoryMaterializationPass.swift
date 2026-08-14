@@ -64,12 +64,21 @@ extension TensorMemoryMaterializationPass {
         continue
       }
 
-      let allocSize = decision.needsFrameAwareAlloc ? tensorSize * frameCount : tensorSize
+      // Hop-based tensors only produce a value on hop boundaries, so one
+      // storage slot per hop suffices (addressing divides frameIdx by hop).
+      // Without this, hop-rate FFT/spectral intermediates would each demand
+      // tensorSize * frameCount floats and blow out GPU memory.
+      let hop = nodeId.flatMap { hopBasedNodes[$0]?.0 } ?? 1
+      let frameSlots = hop > 1 ? (frameCount + hop - 1) / hop : frameCount
+      let allocSize = decision.needsFrameAwareAlloc ? tensorSize * frameSlots : tensorSize
       let realCellId = graph.allocateLazyCell(lazyCellId, vectorWidth: allocSize)
       lazyToReal[lazyCellId] = realCellId
 
       if decision.needsFrameAwareAlloc {
-        graph.frameAwareCells[realCellId] = (tensorSize: tensorSize, frameCount: frameCount)
+        graph.frameAwareCells[realCellId] = (tensorSize: tensorSize, frameCount: frameSlots)
+        if hop > 1 {
+          graph.frameAwareCellHops[realCellId] = hop
+        }
       }
 
       graph.tensors[tensorId] = Tensor(
@@ -273,11 +282,12 @@ extension TensorMemoryMaterializationPass {
     let shouldAllocate = shouldMaterialize || needsFrameAwareAlloc
     if ProcessInfo.processInfo.environment["DGEN_DEBUG_TENSOR_ALLOC"] != nil {
       let op = nodeId.flatMap { graph.nodes[$0]?.op }.map { "\($0)" } ?? "?"
+      let hop = nodeId.flatMap { hopBasedNodes[$0]?.0 } ?? 1
       print(
         "TENSOR-ALLOC cell=\(lazyCellId) node=\(nodeId.map(String.init) ?? "-") op=\(op) "
           + "outbound=\(isOutbound) frameBased=\(isFrameBased) feedback=\(isInFeedbackLoop) "
           + "intraBlockFA=\(intraBlockFrameAwareCells.contains(lazyCellId)) "
-          + "materialize=\(shouldMaterialize) frameAware=\(needsFrameAwareAlloc)")
+          + "materialize=\(shouldMaterialize) frameAware=\(needsFrameAwareAlloc) hop=\(hop)")
     }
     return TensorAllocationDecision(
       shouldMaterialize: shouldAllocate,

@@ -805,8 +805,17 @@ extension LazyOp {
         // bufferView backward: convert tensor gradient → scalar gradient
         let windowSize = shape.reduce(1, *)
 
+        // Hop-based buffers only produce a window per hop, so the gradient
+        // tape needs one slot per hop, not per frame (see frameAwareCellHops).
+        let hopRate = g.nodeHopRate[node.id]
+        let hop = hopRate?.0 ?? 1
+        let gradSlots = hop > 1 ? (g.maxFrameCount + hop - 1) / hop : g.maxFrameCount
+
         // Allocate frame-indexed gradient cell
-        let gradCell = g.allocFrameAware(tensorSize: windowSize, frameCount: g.maxFrameCount)
+        let gradCell = g.allocFrameAware(tensorSize: windowSize, frameCount: gradSlots)
+        if hop > 1 {
+          g.frameAwareCellHops[gradCell] = hop
+        }
 
         // Phase 1: Store gradient tensor elements to frame-indexed cell
         let storeOp = g.n(
@@ -1281,8 +1290,17 @@ extension LazyOp {
         [gradOutput])
       g.addGradientSideEffect(storeOp)
 
-      // Phase 2: Gather into gradient tensor (frame-aware)
-      let gradInputCell = g.allocFrameAware(tensorSize: totalSize, frameCount: g.maxFrameCount)
+      // Phase 2: Gather into gradient tensor (frame-aware). The gathered
+      // gradient only exists on hop boundaries, so store one slot per hop
+      // and tag the gather (and the tensor read of its result) with the
+      // forward chain's hop rate so the whole backward tensor chain is
+      // scheduled hop-based instead of frame-based zero-padding.
+      let hopRate = findUpstreamHopRate(g, from: tensorInput)
+      let gradSlots = hopSize > 1 ? (g.maxFrameCount + hopSize - 1) / hopSize : g.maxFrameCount
+      let gradInputCell = g.allocFrameAware(tensorSize: totalSize, frameCount: gradSlots)
+      if hopSize > 1 {
+        g.frameAwareCellHops[gradInputCell] = hopSize
+      }
 
       let gatherOp = g.n(
         .overlapAddGradGather(
@@ -1294,6 +1312,10 @@ extension LazyOp {
       // Return gradient tensor sequenced after gather
       let sequencedGrad = createSequencedGradTensor(
         g, gradCell: gradInputCell, shape: shape, afterOp: gatherOp)
+      if let hopRate, hopRate.0 == hopSize {
+        g.nodeHopRate[gatherOp] = hopRate
+        g.nodeHopRate[sequencedGrad] = hopRate
+      }
       return [sequencedGrad]
 
     case .peek:
@@ -1415,6 +1437,25 @@ extension LazyOp {
 
   /// Create a tensor backed by gradCell and return a tensorRef sequenced after the given op.
   /// This ensures the gradient is computed before reading.
+  /// Walk up the graph from `start` looking for a node tagged with an explicit
+  /// hop rate (e.g. a hop-based bufferView). Used by backward construction to
+  /// inherit the forward chain's hop counter for hop-gated gradient scheduling.
+  private func findUpstreamHopRate(_ g: Graph, from start: NodeID) -> (Int, NodeID)? {
+    var visited: Set<NodeID> = []
+    var queue: [NodeID] = [start]
+    var steps = 0
+    while let current = queue.popLast() {
+      steps += 1
+      if steps > 4096 { return nil }
+      if !visited.insert(current).inserted { continue }
+      if let rate = g.nodeHopRate[current] { return rate }
+      if let node = g.nodes[current] {
+        queue.append(contentsOf: node.inputs)
+      }
+    }
+    return nil
+  }
+
   private func createSequencedGradTensor(
     _ g: Graph,
     gradCell: CellID,

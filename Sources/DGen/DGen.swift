@@ -57,6 +57,12 @@ open class Graph {
     /// Used for tensors with outbound dependencies that need tensorSize * frameCount cells.
     public var frameAwareCells: [CellID: (tensorSize: Int, frameCount: Int)] = [:]
 
+    /// Hop size for frame-aware cells produced by hop-based nodes. These cells
+    /// are only written/read on hop boundaries, so their storage holds one slot
+    /// per hop (frameAwareCells.frameCount is the slot count) and addressing
+    /// divides the frame index by this hop. Cells absent here use hop = 1.
+    public var frameAwareCellHops: [CellID: Int] = [:]
+
     /// Cells that persist data across frame iterations (circular buffers, ring buffers, etc.)
     /// These must not be shared with other cells during buffer reuse optimization.
     public var persistentCells: Set<CellID> = []

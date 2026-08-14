@@ -21,6 +21,14 @@ public struct TrainOptions: Equatable {
     /// (CPU; used by CI and machines without a GPU).
     public var backend: String = "metal"
 
+    /// Replace `(svf ...)` calls with the differentiable frequency-sampled
+    /// training surrogate. Rendering always keeps the real SVF.
+    public var filterSurrogate: String = "freq"
+    public var surrogateWindow: Int = 1024
+    public var surrogateHop: Int = 256
+    /// Optional true-SVF refinement after surrogate training.
+    public var polishEpochs: Int = 0
+
     /// Emit the plan event and stop (no GPU time). The job still terminates
     /// with an error event ("plan-only"), never a result.
     public var planOnly: Bool = false
@@ -54,6 +62,10 @@ public struct TrainOptions: Equatable {
         var pitchHz: Double?
         var planOnly = false
         var backend = "metal"
+        var filterSurrogate = "freq"
+        var surrogateWindow = 1024
+        var surrogateHop = 256
+        var polishEpochs = 0
         var fake = environment["DGENLISP_FAKE_TRAINER"] != nil
         var fakeFailAtEpoch: Int?
         var fakeEpochMs = 0
@@ -91,6 +103,15 @@ public struct TrainOptions: Equatable {
                 guard backend == "metal" || backend == "c" else {
                     throw TrainProtocolError("Invalid --backend: \(backend) (metal|c)")
                 }
+            case "--filter-surrogate":
+                filterSurrogate = try value(arg)
+                guard filterSurrogate == "freq" || filterSurrogate == "none" else {
+                    throw TrainProtocolError(
+                        "Invalid --filter-surrogate: \(filterSurrogate) (freq|none)")
+                }
+            case "--surrogate-window": surrogateWindow = try intValue(arg)
+            case "--surrogate-hop": surrogateHop = try intValue(arg)
+            case "--polish-epochs": polishEpochs = try intValue(arg)
             case "--plan-only": planOnly = true
             case "--fake-trainer": fake = true
             case "--fake-fail-at-epoch": fakeFailAtEpoch = try intValue(arg)
@@ -108,6 +129,16 @@ public struct TrainOptions: Equatable {
         guard mode == "direction" else {
             throw TrainProtocolError("Unsupported --mode: \(mode) (v1 supports only 'direction')")
         }
+        guard surrogateWindow >= 2 && surrogateWindow.nonzeroBitCount == 1 else {
+            throw TrainProtocolError("--surrogate-window must be a power of two >= 2")
+        }
+        guard surrogateHop > 0, surrogateHop <= surrogateWindow,
+              surrogateWindow % surrogateHop == 0 else {
+            throw TrainProtocolError("--surrogate-hop must be positive and divide --surrogate-window")
+        }
+        guard polishEpochs >= 0 else {
+            throw TrainProtocolError("--polish-epochs must be >= 0")
+        }
 
         var options = TrainOptions(
             patchPath: patchPath, targetPath: targetPath,
@@ -118,6 +149,10 @@ public struct TrainOptions: Equatable {
         options.checkpointEvery = checkpointEvery
         options.pitchHz = pitchHz
         options.backend = backend
+        options.filterSurrogate = filterSurrogate
+        options.surrogateWindow = surrogateWindow
+        options.surrogateHop = surrogateHop
+        options.polishEpochs = polishEpochs
         options.planOnly = planOnly
         options.useFakeTrainer = fake
         options.fakeFailAtEpoch = fakeFailAtEpoch

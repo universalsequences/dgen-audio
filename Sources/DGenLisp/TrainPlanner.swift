@@ -27,6 +27,9 @@ struct PatchPlan {
     /// Modulation-lowered AST with `(in ...)` inlets rewritten to the
     /// excitation convention — the graph training actually runs on.
     let loweredNodes: [ASTNode]
+    /// Excitation/modulation lowering only. Checkpoints and final renders use
+    /// these nodes so the real patch SVF is always rendered.
+    let renderNodes: [ASTNode]
 }
 
 enum TrainPlanner {
@@ -75,7 +78,12 @@ enum TrainPlanner {
             let lowered = try lowerModulation(in: nodes)
             rewrite = ExcitationLowering.drive(
                 nodes: lowered, pitchHz: pitchHz, gateFrames: gateFrames)
-            try evaluator.evaluate(nodes: rewrite.nodes)
+            let trainingNodes = options.filterSurrogate == "freq"
+                ? FilterSurrogateLowering.lower(
+                    nodes: rewrite.nodes, window: options.surrogateWindow,
+                    hop: options.surrogateHop)
+                : rewrite.nodes
+            try evaluator.evaluate(nodes: trainingNodes)
         } catch let error as LispError {
             throw TrainProtocolError("patch parse/eval failed: \(error.message)")
         }
@@ -148,7 +156,12 @@ enum TrainPlanner {
         return (
             PatchPlan(
                 plan: plan, learnable: learnable, fatalUnsupported: unsupported,
-                loweredNodes: rewrite.nodes),
+                loweredNodes: options.filterSurrogate == "freq"
+                    ? FilterSurrogateLowering.lower(
+                        nodes: rewrite.nodes, window: options.surrogateWindow,
+                        hop: options.surrogateHop)
+                    : rewrite.nodes,
+                renderNodes: rewrite.nodes),
             evaluator
         )
     }
@@ -169,5 +182,10 @@ enum TrainPlanner {
         header += "; excitation: pitch_hz=\(plan.pitchHz) gate_frames=\(plan.gateFrames) crop_frames=\(plan.cropFrames)\n"
         let body = patchPlan.loweredNodes.map(ExcitationLowering.printAST).joined(separator: "\n")
         return header + body + "\n"
+    }
+
+    /// Re-parseable excitation-lowered source used only by render subprocesses.
+    static func renderSource(patchPlan: PatchPlan) -> String {
+        patchPlan.renderNodes.map(ExcitationLowering.printAST).joined(separator: "\n") + "\n"
     }
 }

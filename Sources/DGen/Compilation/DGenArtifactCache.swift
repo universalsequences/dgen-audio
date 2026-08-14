@@ -170,6 +170,7 @@ extension Graph {
     lines.append("gradCarryCells=\(gradCarryCells.sorted { $0.key < $1.key }.map { "\($0.key):\($0.value)" }.joined(separator: ","))")
     lines.append("tensorGradCells=\(tensorGradCells.sorted { $0.key < $1.key }.map { "\($0.key):\($0.value)" }.joined(separator: ","))")
     lines.append("frameAwareCells=\(frameAwareCells.sorted { $0.key < $1.key }.map { "\($0.key):\($0.value.tensorSize):\($0.value.frameCount)" }.joined(separator: ","))")
+    lines.append("frameAwareCellHops=\(frameAwareCellHops.sorted { $0.key < $1.key }.map { "\($0.key):\($0.value)" }.joined(separator: ","))")
     lines.append("simdOptimizedConv2Ds=\(simdOptimizedConv2Ds.sorted())")
     lines.append("conv2dMaskCells=\(conv2dMaskCells.sorted { $0.key < $1.key }.map { "\($0.key):\($0.value)" }.joined(separator: ","))")
 
