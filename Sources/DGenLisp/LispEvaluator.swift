@@ -1322,35 +1322,35 @@ class LispEvaluator {
     guard args.count >= 1 else {
       throw LispError.invalidArgument("biquad requires at least 1 argument (signal)")
     }
-    let sigResult = try evaluateAST(args[0])
+    let input = try promoteToValue(evaluateAST(args[0]))
+    let cutoff = try promoteToValue(args.count >= 2
+      ? evaluateAST(args[1])
+      : .float(Float(attrValue(attributes, "@cutoff") ?? "1000") ?? 1000))
+    let resonance = try promoteToValue(args.count >= 3
+      ? evaluateAST(args[2])
+      : .float(Float(attrValue(attributes, "@q") ?? "0.707") ?? 0.707))
+    let gain = try promoteToValue(args.count >= 4
+      ? evaluateAST(args[3])
+      : .float(Float(attrValue(attributes, "@gain") ?? "0") ?? 0))
+    let mode = try promoteToValue(args.count >= 5
+      ? evaluateAST(args[4])
+      : .float(Float(attrValue(attributes, "@mode") ?? "0") ?? 0))
 
-    // Parse biquad params from remaining args or attributes — accept signals or floats
-    let cutoff: Signal =
-      args.count >= 2
-      ? try requireSignal(evaluateAST(args[1]))
-      : Signal.constant(Float(attrValue(attributes, "@cutoff") ?? "1000") ?? 1000)
-    let q: Signal =
-      args.count >= 3
-      ? try requireSignal(evaluateAST(args[2]))
-      : Signal.constant(Float(attrValue(attributes, "@q") ?? "0.707") ?? 0.707)
-    let gain: Signal =
-      args.count >= 4
-      ? try requireSignal(evaluateAST(args[3]))
-      : Signal.constant(Float(attrValue(attributes, "@gain") ?? "0") ?? 0)
-    let mode: Signal =
-      args.count >= 5
-      ? try requireSignal(evaluateAST(args[4]))
-      : Signal.constant(Float(attrValue(attributes, "@mode") ?? "0") ?? 0)
-
-    switch sigResult {
-    case .signal(let sig):
-      return .signal(sig.biquad(cutoff: cutoff, resonance: q, gain: gain, mode: mode))
-    case .signalTensor(let st):
-      return .signalTensor(st.biquad(cutoff: cutoff, resonance: q, gain: gain, mode: mode))
-    default:
-      let sig = try requireSignal(sigResult)
-      return .signal(sig.biquad(cutoff: cutoff, resonance: q, gain: gain, mode: mode))
+    let controls = [input, cutoff, resonance, gain, mode]
+    let shape = broadcastShapeOf(controls)
+    if !shape.isEmpty {
+      return .signalTensor(try asSignalTensor(input, shape: shape, op: "biquad").biquad(
+        cutoff: asSignalTensor(cutoff, shape: shape, op: "biquad cutoff"),
+        resonance: asSignalTensor(resonance, shape: shape, op: "biquad resonance"),
+        gain: asSignalTensor(gain, shape: shape, op: "biquad gain"),
+        mode: asSignalTensor(mode, shape: shape, op: "biquad mode")))
     }
+
+    return .signal(try asSignal(input, op: "biquad").biquad(
+      cutoff: asSignal(cutoff, op: "biquad cutoff"),
+      resonance: asSignal(resonance, op: "biquad resonance"),
+      gain: asSignal(gain, op: "biquad gain"),
+      mode: asSignal(mode, op: "biquad mode")))
   }
 
   private func evalSVFFrequencySampled(
@@ -2807,11 +2807,24 @@ class LispEvaluator {
       throw LispError.invalidArgument("selector requires at least 2 arguments (mode, options...)")
     }
 
-    let mode = try requireSignal(coerceToSignal(evaluateAST(args[0])))
-    let options = try args.dropFirst().map { arg -> Signal in
-      try requireSignal(coerceToSignal(evaluateAST(arg)))
+    let mode = try promoteToValue(evaluateAST(args[0]))
+    let options = try args.dropFirst().map { try promoteToValue(evaluateAST($0)) }
+    let values = [mode] + options
+    let domains = values.compactMap { numericDomain(of: $0) }
+    guard domains.count == values.count else {
+      throw LispError.typeError("selector: every operand must be numeric")
     }
-    return .signal(DGenLazy.selector(mode, options))
+    let domain = domains.dropFirst().reduce(domains[0], joinDomains)
+    if domain == .signalTensor {
+      let shape = broadcastShapeOf(values)
+      return .signalTensor(
+        DGenLazy.selector(
+          try asSignalTensor(mode, shape: shape, op: "selector"),
+          try options.map { try asSignalTensor($0, shape: shape, op: "selector") }))
+    }
+    let scalarMode = try requireSignal(coerceToSignal(mode))
+    let scalarOptions = try options.map { try requireSignal(coerceToSignal($0)) }
+    return .signal(DGenLazy.selector(scalarMode, scalarOptions))
   }
 
   private func evalModulatedParam(

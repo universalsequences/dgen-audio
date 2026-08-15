@@ -111,6 +111,9 @@ struct DDSPE2EConfig: Codable {
   var spectralHopDivisor: Int = 4
   var spectralWarmupSteps: Int = 100
   var spectralRampSteps: Int = 200
+  // 1e-8 reproduces the 2026-02 campaign baseline; ~1e-3 removes the
+  // empty-bin loss floor (see DGenSpectralConfig.logMagnitudeEpsilon).
+  var spectralLogEpsilon: Float = 1e-8
   var loudnessLossWeight: Float = 0.0
   var loudnessLossMode: LoudnessLossModeOption = .linearL2
   var loudnessLossWeightEnd: Float?
@@ -189,6 +192,7 @@ struct DDSPE2EConfig: Codable {
     case spectralHopDivisor
     case spectralWarmupSteps
     case spectralRampSteps
+    case spectralLogEpsilon
     case loudnessLossWeight
     case loudnessLossMode
     case loudnessLossWeightEnd
@@ -302,6 +306,7 @@ struct DDSPE2EConfig: Codable {
     spectralHopDivisor = try c.decodeIfPresent(Int.self, forKey: .spectralHopDivisor) ?? d.spectralHopDivisor
     spectralWarmupSteps = try c.decodeIfPresent(Int.self, forKey: .spectralWarmupSteps) ?? d.spectralWarmupSteps
     spectralRampSteps = try c.decodeIfPresent(Int.self, forKey: .spectralRampSteps) ?? d.spectralRampSteps
+    spectralLogEpsilon = try c.decodeIfPresent(Float.self, forKey: .spectralLogEpsilon) ?? d.spectralLogEpsilon
     loudnessLossWeight = try c.decodeIfPresent(Float.self, forKey: .loudnessLossWeight) ?? d.loudnessLossWeight
     loudnessLossMode = try c.decodeIfPresent(LoudnessLossModeOption.self, forKey: .loudnessLossMode)
       ?? d.loudnessLossMode
@@ -513,6 +518,9 @@ struct DDSPE2EConfig: Codable {
     if let value = options["spectral-ramp-steps"] {
       spectralRampSteps = try parseInt(value, key: "spectral-ramp-steps")
     }
+    if let value = options["spectral-log-epsilon"] {
+      spectralLogEpsilon = try parseFloat(value, key: "spectral-log-epsilon")
+    }
     if let value = options["loudness-weight"] {
       loudnessLossWeight = try parseFloat(value, key: "loudness-weight")
     }
@@ -718,6 +726,9 @@ struct DDSPE2EConfig: Codable {
     }
     guard spectralRampSteps >= 0 else {
       throw ConfigError.invalid("spectralRampSteps must be >= 0")
+    }
+    guard spectralLogEpsilon > 0 else {
+      throw ConfigError.invalid("spectralLogEpsilon must be > 0")
     }
     guard loudnessLossWeight >= 0 else {
       throw ConfigError.invalid("loudnessLossWeight must be >= 0")

@@ -70,6 +70,21 @@ final class TrainPlannerTests: XCTestCase {
         )
     }
 
+    func testPlanRetainsHostSeedForFrozenParameter() throws {
+        let source = """
+            (param osc1_pan @default -0.04 @min -1 @max 1)
+            (param gain @default 0.5 @min 0 @max 1)
+            (out gain 0)
+            """
+        let patchPlan = try plan(source, seed: ["osc1_pan": 0.72, "gain": 0.4])
+
+        XCTAssertEqual(
+            patchPlan.plan.frozen.first { $0.name == "osc1_pan" }?.reason,
+            TrainPlanner.reasonNoGradPath)
+        XCTAssertEqual(patchPlan.parameterValues["osc1_pan"], 0.72)
+        XCTAssertEqual(patchPlan.parameterValues["gain"], 0.4)
+    }
+
     // (b) param feeding a phasor frequency is learnable (the suffix-scan
     // adjoint composes with history BPTT since the scalar-recurrence
     // consolidation fix; no pitch-path freeze).

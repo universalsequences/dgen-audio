@@ -52,7 +52,23 @@ public class LazyGraph {
 
   /// Metal runtime (MTLLibrary + pipeline states) cached by kernel source hash.
   /// Persists across graph clears since identical topology produces identical kernels.
+  /// Bounded: each entry holds compiled pipeline states, and the AGX driver has a
+  /// per-process compiled-variants footprint limit, so unbounded growth (e.g. a
+  /// baked constant changing every step) eventually aborts the process.
   internal var runtimeCacheByKernelHash: [UInt64: LazyRuntime] = [:]
+  internal var runtimeCacheInsertionOrder: [UInt64] = []
+  internal static let runtimeCacheLimit = 8
+
+  internal func cacheRuntime(_ runtime: LazyRuntime, forKernelHash hash: UInt64) {
+    if runtimeCacheByKernelHash[hash] == nil {
+      runtimeCacheInsertionOrder.append(hash)
+      while runtimeCacheInsertionOrder.count > Self.runtimeCacheLimit {
+        let evicted = runtimeCacheInsertionOrder.removeFirst()
+        runtimeCacheByKernelHash.removeValue(forKey: evicted)
+      }
+    }
+    runtimeCacheByKernelHash[hash] = runtime
+  }
 
   /// Profiling data for the last execution.
   public internal(set) var lastExecutionTiming = LazyExecutionTiming()
@@ -254,9 +270,12 @@ public class LazyGraphContext {
     // never memory contents or parameter objects, may cross this boundary.
     let carriedRuntimeCache =
       preserveCompilationCaches ? (_current?.runtimeCacheByKernelHash ?? [:]) : [:]
+    let carriedRuntimeCacheOrder =
+      preserveCompilationCaches ? (_current?.runtimeCacheInsertionOrder ?? []) : []
     _current?.parameterRegistry.clear()
     let fresh = LazyGraph()
     fresh.runtimeCacheByKernelHash = carriedRuntimeCache
+    fresh.runtimeCacheInsertionOrder = carriedRuntimeCacheOrder
     fresh.timingEnabled = collectExecutionTiming
     _current = fresh
   }

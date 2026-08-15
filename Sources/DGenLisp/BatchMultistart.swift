@@ -36,7 +36,8 @@ enum BatchMultistart {
 
     static func search(
         options: TrainOptions, transforms: [DirectionTrainer.TransformedParam],
-        seedZ: [Float], nodes: [ASTNode], target: [Float], sampleRate: Float,
+        seedZ: [Float], parameterValues: [String: Float], nodes: [ASTNode],
+        target: [Float], sampleRate: Float,
         crop: Int, sink: TrainEventSink, jobDir: JobDir
     ) throws -> Result {
         let count = options.multistartCandidates
@@ -51,7 +52,8 @@ enum BatchMultistart {
 
         let forwardStart = Date()
         let initialScores = try score(
-            candidates: candidates, transforms: transforms, nodes: nodes,
+            candidates: candidates, transforms: transforms,
+            parameterValues: parameterValues, nodes: nodes,
             scorer: scorer, sampleRate: sampleRate, crop: crop,
             batchSize: forwardBatch, options: options)
         let forwardSeconds = Date().timeIntervalSince(forwardStart)
@@ -63,13 +65,15 @@ enum BatchMultistart {
         try sink.emit(.stage(StageEvent(name: "multistart", total: options.multistartSteps)))
         let refineStart = Date()
         let refined = try refine(
-            candidates: candidates, transforms: transforms, nodes: nodes,
+            candidates: candidates, transforms: transforms,
+            parameterValues: parameterValues, nodes: nodes,
             target: target, crop: crop, sampleRate: sampleRate,
             steps: options.multistartSteps, options: options)
         let refineSeconds = Date().timeIntervalSince(refineStart)
         let postStart = Date()
         let postScores = try score(
-            candidates: refined, transforms: transforms, nodes: nodes,
+            candidates: refined, transforms: transforms,
+            parameterValues: parameterValues, nodes: nodes,
             scorer: scorer, sampleRate: sampleRate, crop: crop,
             batchSize: laneCount, options: options)
         let postScoreSeconds = Date().timeIntervalSince(postStart)
@@ -137,11 +141,15 @@ enum BatchMultistart {
         return result
     }
 
-    private static func naturalTensors(
-        z: [Tensor], transforms: [DirectionTrainer.TransformedParam]
+    static func naturalTensors(
+        z: [Tensor], transforms: [DirectionTrainer.TransformedParam],
+        parameterValues: [String: Float], lanes: Int
     ) -> [String: EvalResult] {
-        var values: [String: EvalResult] = [:]
         let one = Signal.constant(1)
+        var values = parameterValues.mapValues { value in
+            EvalResult.signalTensor(
+                Tensor([Float](repeating: value, count: lanes)) * one)
+        }
         for (i, transform) in transforms.enumerated() {
             let frameValue = z[i] * one
             if transform.useLog {
@@ -155,12 +163,15 @@ enum BatchMultistart {
         return values
     }
 
-    private static func evaluate(
-        z: [Tensor], transforms: [DirectionTrainer.TransformedParam], nodes: [ASTNode]
+    static func evaluate(
+        z: [Tensor], transforms: [DirectionTrainer.TransformedParam],
+        parameterValues: [String: Float], nodes: [ASTNode], lanes: Int
     ) throws -> SignalTensor {
         let evaluator = LispEvaluator(
-            batchLaneCount: z[0].shape[0],
-            batchParameterValues: naturalTensors(z: z, transforms: transforms))
+            batchLaneCount: lanes,
+            batchParameterValues: naturalTensors(
+                z: z, transforms: transforms,
+                parameterValues: parameterValues, lanes: lanes))
         do { try evaluator.evaluate(nodes: nodes) }
         catch let error as LispError {
             throw TrainProtocolError("batched patch evaluation failed: \(error.message)")
@@ -173,7 +184,8 @@ enum BatchMultistart {
 
     static func score(
         candidates: [[Float]], transforms: [DirectionTrainer.TransformedParam],
-        nodes: [ASTNode], scorer: TrainSpectralScorer, sampleRate: Float, crop: Int,
+        parameterValues: [String: Float], nodes: [ASTNode],
+        scorer: TrainSpectralScorer, sampleRate: Float, crop: Int,
         batchSize: Int, options: TrainOptions,
         timing: ((Double, Double, Double) -> Void)? = nil
     ) throws -> [Float] {
@@ -192,7 +204,9 @@ enum BatchMultistart {
             let z = transforms.indices.map { d in
                 Tensor(batch.map { $0[d] }, requiresGrad: true)
             }
-            let output = try evaluate(z: z, transforms: transforms, nodes: nodes)
+            let output = try evaluate(
+                z: z, transforms: transforms, parameterValues: parameterValues,
+                nodes: nodes, lanes: batchSize)
             let flat = try output.realize(frames: crop)
             renderSeconds += Date().timeIntervalSince(renderStart)
             for lane in 0..<actualCount {
@@ -213,7 +227,8 @@ enum BatchMultistart {
 
     static func refine(
         candidates: [[Float]], transforms: [DirectionTrainer.TransformedParam],
-        nodes: [ASTNode], target: [Float], crop: Int, sampleRate: Float,
+        parameterValues: [String: Float], nodes: [ASTNode],
+        target: [Float], crop: Int, sampleRate: Float,
         steps: Int, options: TrainOptions
     ) throws -> [[Float]] {
         let lanes = candidates.count
@@ -225,7 +240,9 @@ enum BatchMultistart {
         let targetTensor = Tensor(target)
         let ones = Tensor([Float](repeating: 1, count: lanes))
         for step in 1...steps {
-            let output = try evaluate(z: z, transforms: transforms, nodes: nodes)
+            let output = try evaluate(
+                z: z, transforms: transforms, parameterValues: parameterValues,
+                nodes: nodes, lanes: lanes)
             let targetSignal = ones * targetTensor.toSignal(maxFrames: crop)
             let loss = DirectionTrainer.multiResolutionSpectralLoss(
                 synth: output, target: targetSignal, frames: crop)

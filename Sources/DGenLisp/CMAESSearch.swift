@@ -14,7 +14,8 @@ enum CMAESSearch {
 
     static func search(
         options: TrainOptions, transforms: [DirectionTrainer.TransformedParam],
-        seedZ: [Float], nodes: [ASTNode], target: [Float], sampleRate: Float,
+        seedZ: [Float], parameterValues: [String: Float], nodes: [ASTNode],
+        target: [Float], sampleRate: Float,
         crop: Int, sink: TrainEventSink, jobDir: JobDir
     ) throws -> Result {
         let dimension = transforms.count
@@ -65,7 +66,8 @@ enum CMAESSearch {
             var deinterleaveSeconds = 0.0
             var scoringSeconds = 0.0
             let scores = try BatchMultistart.score(
-                candidates: floatCandidates, transforms: transforms, nodes: nodes,
+                candidates: floatCandidates, transforms: transforms,
+                parameterValues: parameterValues, nodes: nodes,
                 scorer: scorer, sampleRate: sampleRate, crop: crop,
                 batchSize: batchSize, options: options
             ) { render, deinterleave, scoring in

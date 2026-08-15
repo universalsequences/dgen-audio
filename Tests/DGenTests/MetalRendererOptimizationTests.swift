@@ -212,6 +212,24 @@ final class MetalRendererOptimizationTests: XCTestCase {
     XCTAssertTrue(source.contains("memory[7] = m7;"))
   }
 
+  func testRoundEmitsAValidMetalFunctionCall() {
+    let context = IRContext(g: Graph())
+    let rounded = context.useVariable(src: nil, trackInValues: false)
+    let item = ScheduleItem(frameOrder: .parallel, temporality: .static_)
+    item.ops = [
+      UOp(op: .frameCount, value: .empty),
+      UOp(op: .beginRange(.constant(0, 0), .constant(0, 1)), value: .empty),
+      UOp(op: .round(.constant(0, 1.25)), value: rounded),
+      UOp(op: .endRange, value: .empty),
+    ]
+
+    let source = MetalRenderer().render(
+      name: "round_test", scheduleItem: item, ctx: context, graph: context.g,
+      totalMemorySlots: 1)
+
+    XCTAssertTrue(source.contains("metal::round(1.25)"), source)
+  }
+
   func testInputTapePreloadRejectsMultipleFrameLoops() {
     let context = IRContext(g: Graph())
     let input = context.useVariable(src: nil, trackInValues: false)

@@ -1216,6 +1216,29 @@ extension SignalTensor {
     return SignalTensor(nodeId: nodeId, graph: graph, shape: shape, requiresGrad: needsGrad)
   }
 
+  /// Biquad filter with per-element controls for every coefficient input.
+  /// Each control tensor must exactly match the audio tensor shape.
+  public func biquad(
+    cutoff: SignalTensor, resonance: SignalTensor,
+    gain: SignalTensor, mode: SignalTensor
+  ) -> SignalTensor {
+    precondition(
+      cutoff.shape == shape && resonance.shape == shape
+        && gain.shape == shape && mode.shape == shape,
+      "per-element biquad controls must match audio shape")
+
+    let nodeId = graph.graph.biquad(
+      self.nodeId, cutoff.nodeId, resonance.nodeId, gain.nodeId, mode.nodeId,
+      elementShape: shape)
+    let needsGrad = requiresGrad || cutoff.requiresGrad || resonance.requiresGrad
+      || gain.requiresGrad || mode.requiresGrad
+    if shape.count != 1 {
+      graph.unsupportedGradientNodes[nodeId] =
+        "tensor-shaped biquad backward is only validated for rank-1 [B] element shapes, got \(shape)"
+    }
+    return SignalTensor(nodeId: nodeId, graph: graph, shape: shape, requiresGrad: needsGrad)
+  }
+
   /// Biquad filter with Float parameters
   public func biquad(cutoff: Float, resonance: Float, gain: Float, mode: Int) -> SignalTensor {
     return biquad(

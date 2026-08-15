@@ -1,3 +1,4 @@
+import enum DGen.DGenSpectralConfig
 import DGenLazy
 import Foundation
 
@@ -37,6 +38,13 @@ enum TrainMode: String {
   case m2
 }
 
+enum BestCheckpointMetric: String {
+  /// Min training loss. Not comparable across steps when aux weights ramp.
+  case combined
+  /// Fixed CPU multi-scale spectral score of rendered audio vs target.
+  case spectral
+}
+
 struct TrainerOptions {
   var steps: Int
   var split: DatasetSplit
@@ -47,6 +55,8 @@ struct TrainerOptions {
   var renderEvery: Int = 0          // render audio snapshot every N steps (0 = disabled)
   var renderWavPath: String? = nil  // path to write rendered WAV (overwritten each time)
   var dumpControlsEvery: Int = 0    // dump decoder controls every N steps (0 = disabled)
+  var bestMetric: BestCheckpointMetric = .spectral
+  var bestEvalEvery: Int = 10  // evaluate the spectral selection metric every N steps
 }
 
 enum DDSPE2ETrainer {
@@ -85,6 +95,8 @@ enum DDSPE2ETrainer {
     options: TrainerOptions,
     logger: (String) -> Void
   ) throws {
+    DGenSpectralConfig.logMagnitudeEpsilon = config.spectralLogEpsilon
+    logger("[config] spectralLogEpsilon=\(config.spectralLogEpsilon)")
     switch options.mode {
     case .dry:
       try runDryStart(
@@ -358,6 +370,12 @@ enum DDSPE2ETrainer {
     var minStep = 0
     var bestModelSnapshots: [NamedTensorSnapshot]?
     var bestModelStep = 0
+    var bestSelectionScore = Float.infinity
+    let useSpectralSelection =
+      options.bestMetric == .spectral && !config.spectralWindowSizes.isEmpty
+    if options.bestMetric == .spectral && config.spectralWindowSizes.isEmpty {
+      logger("best-metric spectral requires --spectral-windows; falling back to combined")
+    }
     var noImproveSteps = 0
     var completedSteps = 0
     let earlyStopPatience = config.earlyStopPatience
@@ -400,6 +418,7 @@ enum DDSPE2ETrainer {
       var anyUnstable = false
       var lastEntry = splitEntries[order[0]]
       var lastChunkFeatureFrames = lastEntry.featureFrames
+      var lastChunkAudio: [Float] = []
       var stepLoadMs: Double = 0
       var stepGraphMs: Double = 0
       var stepBackwardMs: Double = 0
@@ -452,6 +471,7 @@ enum DDSPE2ETrainer {
 
         let chunk = try dataset.loadChunk(lastEntry)
         lastChunkFeatureFrames = chunk.f0Hz.count
+        lastChunkAudio = chunk.audio
         let tAfterLoad = CFAbsoluteTimeGetCurrent()
 
         var conditioningData = makeConditioningData(
@@ -642,7 +662,43 @@ enum DDSPE2ETrainer {
       let postClipGradStats = shouldLog ? summarizeGradients(params: model.parameters) : nil
       optimizer.step()
       optimizer.zeroGrad()
-      if improved {
+      if useSpectralSelection {
+        // Score the post-update model on the fixed spectral metric every
+        // bestEvalEvery steps (and on the final step). The combined training
+        // loss is not comparable across steps while aux weights ramp, so it
+        // must not drive checkpoint selection.
+        let isFinalStep = step == steps - 1
+        if step % max(1, options.bestEvalEvery) == 0 || isFinalStep {
+          do {
+            let evalControls = model.forward(features: featuresTensor)
+            let evalPrediction = DDSPSynth.renderSignal(
+              controls: evalControls,
+              tensors: synthTensors,
+              featureFrames: lastChunkFeatureFrames,
+              frameCount: frameCount,
+              numHarmonics: config.numHarmonics,
+              controlSmoothingMode: config.controlSmoothingMode
+            )
+            let samples = try evalPrediction.realize(frames: frameCount)
+            LazyGraphContext.current.clearComputationGraph()
+            if let score = BestCheckpointScorer.multiScaleSpectralScore(
+              prediction: samples,
+              target: lastChunkAudio,
+              windowSizes: config.spectralWindowSizes,
+              hopDivisor: config.spectralHopDivisor,
+              logEpsilon: config.spectralLogEpsilon
+            ), score < bestSelectionScore {
+              bestSelectionScore = score
+              bestModelSnapshots = model.snapshots()
+              bestModelStep = step
+              logger("step=\(step) bestSpectralScore=\(format(score)) (new best checkpoint)")
+            }
+          } catch {
+            LazyGraphContext.current.clearComputationGraph()
+            logger("step=\(step) best-metric eval warning: \(error)")
+          }
+        }
+      } else if improved {
         bestModelSnapshots = model.snapshots()
         bestModelStep = step
       }
@@ -798,6 +854,11 @@ enum DDSPE2ETrainer {
     let paddedFeatureFrames = ((firstChunkFeatureFrames + 7) / 8) * 8
 
     logger("Batched training: batchSize=\(B) featureFrames=\(firstChunkFeatureFrames) → padded=\(paddedFeatureFrames)")
+    if options.bestMetric == .spectral {
+      logger(
+        "best-metric spectral is not implemented for the batched path; "
+          + "selecting best checkpoint by combined training loss")
+    }
 
     // Pre-allocate batched tensors
     let featuresTensor = Tensor(
@@ -1562,7 +1623,7 @@ enum DDSPE2ETrainer {
     let maxEntropy = Float(Foundation.log(Double(max(1, numHarmonics))))
     let entropyGap = Tensor([maxEntropy]) - entropyMean  // [1], >= 0 when entropy below max
     let entropyPenalty = entropyGap.peek(Signal.constant(0.0))
-    return baseLoss + entropyPenalty * weight
+    return baseLoss + entropyPenalty * (Tensor([weight]).peek(Signal.constant(0.0)))
   }
 
   /// Concentration regularizer for softmax harmonic distributions.
@@ -1582,7 +1643,7 @@ enum DDSPE2ETrainer {
     let minConcentration = 1.0 / Float(max(1, numHarmonics))
     let concentrationGap = max(concentrationMean - Tensor([minConcentration]), 0.0)
     let concentrationPenalty = concentrationGap.peek(Signal.constant(0.0))
-    return baseLoss + concentrationPenalty * weight
+    return baseLoss + concentrationPenalty * (Tensor([weight]).peek(Signal.constant(0.0)))
   }
 
   private struct ControlSnapshot {

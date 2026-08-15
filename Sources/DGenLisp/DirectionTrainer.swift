@@ -110,19 +110,23 @@ enum DirectionTrainer {
         }
 
         try renderViaSubprocess(
-            params: naturalValues(z: seedZ, transforms: transforms),
+            params: renderValues(
+                z: seedZ, transforms: transforms,
+                parameterValues: patchPlan.parameterValues),
             jobDir: jobDir, out: jobDir.seededWav, frames: crop,
             sampleRate: targetSampleRate, options: options)
 
         let cma = options.search == "cma-es"
             ? try CMAESSearch.search(
                 options: options, transforms: transforms, seedZ: seedZ,
+                parameterValues: patchPlan.parameterValues,
                 nodes: patchPlan.loweredNodes, target: prepared,
                 sampleRate: targetSampleRate, crop: crop, sink: sink, jobDir: jobDir)
             : nil
         let multistart = cma == nil && options.multistartCandidates > 0
             ? try BatchMultistart.search(
                 options: options, transforms: transforms, seedZ: seedZ,
+                parameterValues: patchPlan.parameterValues,
                 nodes: patchPlan.loweredNodes, target: prepared,
                 sampleRate: targetSampleRate, crop: crop, sink: sink, jobDir: jobDir)
             : nil
@@ -154,7 +158,9 @@ enum DirectionTrainer {
             } else if options.cmaRefineMode == "batched" && starts.count > 1 {
                 try sink.emit(.stage(StageEvent(name: "cma-refine-batched", total: refineEpochs)))
                 let values = try BatchMultistart.refine(
-                    candidates: starts, transforms: transforms, nodes: patchPlan.loweredNodes,
+                    candidates: starts, transforms: transforms,
+                    parameterValues: patchPlan.parameterValues,
+                    nodes: patchPlan.loweredNodes,
                     target: prepared, crop: crop, sampleRate: targetSampleRate,
                     steps: refineEpochs, options: options)
                 refined = zip(values, preScores).map {
@@ -179,6 +185,7 @@ enum DirectionTrainer {
             func scores(_ candidates: [[Float]]) throws -> [Float] {
                 try BatchMultistart.score(
                     candidates: candidates, transforms: transforms,
+                    parameterValues: patchPlan.parameterValues,
                     nodes: patchPlan.loweredNodes, scorer: scorer,
                     sampleRate: targetSampleRate, crop: crop,
                     batchSize: min(candidates.count, max(
@@ -297,6 +304,7 @@ enum DirectionTrainer {
         if options.polishEpochs > 0, options.filterSurrogate == "freq" {
             let trueSVFPlan = PatchPlan(
                 plan: patchPlan.plan, learnable: patchPlan.learnable,
+                parameterValues: patchPlan.parameterValues,
                 fatalUnsupported: patchPlan.fatalUnsupported,
                 loweredNodes: patchPlan.renderNodes, renderNodes: patchPlan.renderNodes)
             finalPhase = try runPhase(
@@ -308,7 +316,9 @@ enum DirectionTrainer {
         }
 
         try renderViaSubprocess(
-            params: naturalValues(z: finalPhase.bestZ, transforms: transforms),
+            params: renderValues(
+                z: finalPhase.bestZ, transforms: transforms,
+                parameterValues: patchPlan.parameterValues),
             jobDir: jobDir, out: jobDir.finalWav, frames: crop,
             sampleRate: targetSampleRate, options: options)
 
@@ -367,6 +377,7 @@ enum DirectionTrainer {
         do {
             let evaluator = LispEvaluator(reusesRegisteredParameters: true)
             try evaluator.evaluate(nodes: patchPlan.loweredNodes)
+            try applyParameterValues(evaluator: evaluator, values: patchPlan.parameterValues)
         } catch let error as LispError {
             throw TrainProtocolError("parameter registration failed: \(error.message)")
         }
@@ -376,7 +387,8 @@ enum DirectionTrainer {
         for epoch in 1...epochs {
             let evalStart = CFAbsoluteTimeGetCurrent()
             let (paramSignals, output) = try evaluateTrainingPatch(
-                nodes: patchPlan.loweredNodes, transforms: transforms)
+                nodes: patchPlan.loweredNodes, transforms: transforms,
+                parameterValues: patchPlan.parameterValues)
             for (i, t) in transforms.enumerated() {
                 paramSignals[i].updateDataLazily(t.fromZ(z[i]))
             }
@@ -489,7 +501,9 @@ enum DirectionTrainer {
                 let wav = jobDir.epochWav(epoch)
                 do {
                     try renderViaSubprocess(
-                        params: naturalValues(z: z, transforms: transforms),
+                        params: renderValues(
+                            z: z, transforms: transforms,
+                            parameterValues: patchPlan.parameterValues),
                         jobDir: jobDir, out: wav, frames: crop,
                         sampleRate: sampleRate, options: options)
                     try sink.emit(.checkpoint(CheckpointEvent(epoch: epoch, wav: wav.path)))
@@ -507,11 +521,13 @@ enum DirectionTrainer {
     }
 
     private static func evaluateTrainingPatch(
-        nodes: [ASTNode], transforms: [TransformedParam]
+        nodes: [ASTNode], transforms: [TransformedParam],
+        parameterValues: [String: Float]
     ) throws -> (params: [Signal], output: Signal) {
         let evaluator = LispEvaluator(reusesRegisteredParameters: true)
         do {
             try evaluator.evaluate(nodes: nodes)
+            try applyParameterValues(evaluator: evaluator, values: parameterValues)
         } catch let error as LispError {
             throw TrainProtocolError("epoch re-evaluation failed: \(error.message)")
         }
@@ -552,6 +568,7 @@ enum DirectionTrainer {
             LazyGraphContext.reset()
             let evaluator = LispEvaluator()
             try evaluator.evaluate(nodes: patchPlan.loweredNodes)
+            try applyParameterValues(evaluator: evaluator, values: patchPlan.parameterValues)
             let signals = try learnableSignals(evaluator: evaluator, transforms: transforms)
             for (i, t) in transforms.enumerated() { signals[i].updateDataLazily(t.fromZ(z[i])) }
             guard let output = outputSignal(evaluator: evaluator) else {
@@ -580,6 +597,7 @@ enum DirectionTrainer {
         LazyGraphContext.reset()
         let evaluator = LispEvaluator()
         try evaluator.evaluate(nodes: patchPlan.loweredNodes)
+        try applyParameterValues(evaluator: evaluator, values: patchPlan.parameterValues)
         let signals = try learnableSignals(evaluator: evaluator, transforms: transforms)
         for (i, t) in transforms.enumerated() { signals[i].updateDataLazily(t.fromZ(seedZ[i])) }
         guard let output = outputSignal(evaluator: evaluator) else {
@@ -701,6 +719,26 @@ enum DirectionTrainer {
             out[t.name] = t.fromZ(z[i])
         }
         return out
+    }
+
+    static func renderValues(
+        z: [Float], transforms: [TransformedParam],
+        parameterValues: [String: Float]
+    ) -> [String: Float] {
+        parameterValues.merging(naturalValues(z: z, transforms: transforms)) { _, learned in
+            learned
+        }
+    }
+
+    static func applyParameterValues(
+        evaluator: LispEvaluator, values: [String: Float]
+    ) throws {
+        for (name, value) in values {
+            guard case .signal(let signal)? = evaluator.definitions[name] else {
+                throw TrainProtocolError("declared parameter '\(name)' missing after evaluation")
+            }
+            signal.updateDataLazily(value)
+        }
     }
 
     static func preparedTarget(_ samples: [Float], frames: Int) -> [Float] {

@@ -1368,7 +1368,7 @@ public class MetalRenderer: Renderer, UOpEmitter {
     case .sign(let a): return emitAssign(uop, "metal::sign(\(g(a)))", ctx)
     case .floor(let a): return emitAssign(uop, "metal::floor(\(g(a)))", ctx)
     case .ceil(let a): return emitAssign(uop, "metal::ceil(\(g(a)))", ctx)
-    case .round(let a): return emitAssign(uop, "metal::round\(g(a)))", ctx)
+    case .round(let a): return emitAssign(uop, "metal::round(\(g(a)))", ctx)
     case .noise(let cellId):
       // Xorshift32 PRNG - better spectral properties than LCG
       let state = activeScalarMemoryCells.contains(cellId) ? "m\(cellId)" : "memory[\(cellId)]"

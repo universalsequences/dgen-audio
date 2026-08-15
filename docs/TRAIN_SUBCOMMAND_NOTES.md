@@ -14,6 +14,24 @@
   surrogate mode was determined to be broken; opt back in with
   `--filter-surrogate freq`.
 
+## Frozen-parameter parity in tensor search (2026-08-14)
+
+Population evaluation now broadcasts every declared parameter into every tensor
+lane. Learnable parameters are replaced by candidate values; frozen parameters
+retain the host-supplied seed (or source default when absent). Previously the
+batch evaluator required a tensor for every declaration while the search only
+supplied learnable tensors, so a valid patch with an unreachable bounded param
+failed with `batch param '<name>' requires a supplied [B] tensor`. Scalar
+training and render subprocesses now use the same complete parameter map,
+avoiding a related silent fallback of frozen host values to source defaults.
+
+The shakedown patches also exposed independent generic tensor-path gaps:
+`selector` now lifts to elementwise `SignalTensor` evaluation; `biquad` lifts
+its input and all coefficient controls into a common lane shape; and Metal
+unary `round` emission now generates the valid `metal::round(x)` spelling. The
+real analog-bread-and-butter and verysimplesubtract Patch Learn snapshots both
+complete CMA search through the bundled executable after these fixes.
+
 ## Opt-in tensor-lane multistart (2026-08-14)
 
 `--multistart-candidates N` replaces the weak midpoint-only starting-point

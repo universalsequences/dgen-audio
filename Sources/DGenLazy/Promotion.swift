@@ -69,6 +69,15 @@ public func gswitch(_ cond: SignalTensor, _ a: SignalTensor, _ b: SignalTensor) 
     requiresGrad: a.requiresGrad || b.requiresGrad)
 }
 
+/// Elementwise 1-based multi-way selection over frame-varying tensors.
+public func selector(_ mode: SignalTensor, _ options: [SignalTensor]) -> SignalTensor {
+  let nodeId = mode.graph.node(.selector, [mode.nodeId] + options.map(\.nodeId))
+  let shape = options.reduce(mode.shape) { broadcastShape($0, $1.shape) }
+  return SignalTensor(
+    nodeId: nodeId, graph: mode.graph, shape: shape,
+    requiresGrad: mode.requiresGrad || options.contains(where: \.requiresGrad))
+}
+
 // MARK: - Shaping helpers
 
 extension SignalTensor {

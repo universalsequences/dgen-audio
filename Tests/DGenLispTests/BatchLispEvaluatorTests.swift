@@ -5,6 +5,61 @@ import XCTest
 @testable import DGenLisp
 
 final class BatchLispEvaluatorTests: XCTestCase {
+  func testBatchEvaluationBroadcastsFrozenSeedValuesAlongsideCandidateParams() throws {
+    DGenConfig.backend = .c
+    DGenConfig.sampleRate = 2_000
+    DGenConfig.maxFrameCount = 1
+    LazyGraphContext.reset()
+
+    let transform = DirectionTrainer.TransformedParam(
+      LearnableParam(name: "gain", min: 0, max: 1, seedValue: 0.5))
+    let nodes = try parseSource("""
+      (param fixed_gain @default 0.1 @min 0 @max 1)
+      (param mode @default 1 @min 0 @max 1)
+      (param gain @default 0.5 @min 0 @max 1)
+      (out (selector mode 0 (+ fixed_gain gain)) 1)
+      """)
+    let output = try BatchMultistart.evaluate(
+      z: [Tensor([0.0, 1.0], requiresGrad: true)],
+      transforms: [transform],
+      parameterValues: ["fixed_gain": 0.75, "mode": 2, "gain": 0.5],
+      nodes: nodes, lanes: 2)
+
+    let samples = try output.realize(frames: 1)
+    XCTAssertEqual(samples.count, 2)
+    XCTAssertEqual(samples[0], 0.75, accuracy: 1e-6)
+    XCTAssertEqual(samples[1], 1.75, accuracy: 1e-6)
+  }
+
+  func testBatchEvaluationLiftsBiquadInputAndAllControlsIntoLanes() throws {
+    DGenConfig.backend = .c
+    DGenConfig.sampleRate = 2_000
+    DGenConfig.maxFrameCount = 32
+    LazyGraphContext.reset()
+
+    let transforms = [
+      DirectionTrainer.TransformedParam(
+        LearnableParam(name: "cutoff", min: 50, max: 900, seedValue: 100)),
+      DirectionTrainer.TransformedParam(
+        LearnableParam(name: "resonance", min: 0.1, max: 10, seedValue: 0.5)),
+    ]
+    let nodes = try parseSource("""
+      (param cutoff @default 100 @min 50 @max 900)
+      (param resonance @default 0.5 @min 0.1 @max 10)
+      (def wave (phasor 100))
+      (out (biquad wave cutoff resonance 1 0) 1)
+      """)
+    let output = try BatchMultistart.evaluate(
+      z: [Tensor([0.1, 0.9], requiresGrad: true),
+          Tensor([0.2, 0.8], requiresGrad: true)],
+      transforms: transforms,
+      parameterValues: ["cutoff": 100, "resonance": 0.5],
+      nodes: nodes, lanes: 2)
+
+    XCTAssertEqual(output.shape, [2])
+    XCTAssertTrue(output.requiresGrad)
+  }
+
   func testScalarPatchLiftsParamsPhasorsHistoryAndOutputIntoLanes() throws {
     DGenConfig.backend = .c
     DGenConfig.sampleRate = 2_000

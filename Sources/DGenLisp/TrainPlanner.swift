@@ -22,6 +22,10 @@ struct LearnableParam {
 struct PatchPlan {
     let plan: PlanEvent
     let learnable: [LearnableParam]
+    /// Natural-unit seed value for every declared parameter, including frozen
+    /// parameters. Batched and scalar evaluation must hold these values fixed
+    /// rather than silently reverting them to source defaults.
+    let parameterValues: [String: Float]
     /// Non-empty means the job must fail fast right after emitting the plan.
     let fatalUnsupported: [ParamVerdict]
     /// Modulation-lowered AST with `(in ...)` inlets rewritten to the
@@ -103,7 +107,17 @@ enum TrainPlanner {
 
         var learnable: [LearnableParam] = []
         var frozen: [ParamVerdict] = []
+        var parameterValues: [String: Float] = [:]
         for param in evaluator.params {
+            let suppliedValue = seed.params[param.name].map(Float.init) ?? param.defaultValue
+            let seedValue: Float
+            if let minBound = param.min, let maxBound = param.max, minBound < maxBound {
+                seedValue = Swift.min(Swift.max(suppliedValue, minBound), maxBound)
+            } else {
+                seedValue = suppliedValue
+            }
+            parameterValues[param.name] = seedValue
+
             if param.generatedKind != nil {
                 frozen.append(ParamVerdict(name: param.name, reason: reasonGenerated))
                 continue
@@ -122,11 +136,10 @@ enum TrainPlanner {
                 frozen.append(ParamVerdict(name: param.name, reason: reasonMissingBounds))
                 continue
             }
-            let seedValue = seed.params[param.name].map(Float.init) ?? param.defaultValue
             learnable.append(
                 LearnableParam(
                     name: param.name, min: minBound, max: maxBound,
-                    seedValue: Swift.min(Swift.max(seedValue, minBound), maxBound)))
+                    seedValue: seedValue))
         }
 
         var unsupported = analysis.syncPhasorNodeIds.map {
@@ -152,8 +165,8 @@ enum TrainPlanner {
             cropFrames: cropFrames)
         return (
             PatchPlan(
-                plan: plan, learnable: learnable, fatalUnsupported: unsupported,
-                loweredNodes: trainingNodes,
+                plan: plan, learnable: learnable, parameterValues: parameterValues,
+                fatalUnsupported: unsupported, loweredNodes: trainingNodes,
                 renderNodes: rewrite.nodes),
             evaluator
         )

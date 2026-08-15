@@ -118,9 +118,24 @@ extension LazyGraph {
     func compile(frameCount: Int) throws -> ExecutionContext {
         lastExecutionTiming = LazyExecutionTiming()
 
-        // Use cached compilation if available and not dirty
+        // Use cached compilation if available and not dirty.
+        // Constant node values are baked into kernel source as literals, so the
+        // fingerprint must include them — node/tensor counts alone would reuse
+        // stale kernels when a rebuilt graph changes only a constant (e.g. a
+        // scheduled loss weight ramping across steps).
+        var constantsHash: UInt64 = 0
+        for (id, node) in graph.nodes {
+            if case let .constant(value) = node.op {
+                var h: UInt64 = 14695981039346656037
+                h ^= UInt64(bitPattern: Int64(id))
+                h &*= 1099511628211
+                h ^= UInt64(value.bitPattern)
+                h &*= 1099511628211
+                constantsHash &+= h  // commutative combine: no key sort needed
+            }
+        }
         let compileFingerprint =
-            "\(graph.nodes.count)|\(graph.tensors.count)|\(frameCount)|backend:\(DGenConfig.backend)|gemm:\(DGenConfig.gemmStrategy)|reuse:\(DGenConfig.enableBufferReuse)"
+            "\(graph.nodes.count)|\(graph.tensors.count)|\(constantsHash)|\(frameCount)|backend:\(DGenConfig.backend)|gemm:\(DGenConfig.gemmStrategy)|reuse:\(DGenConfig.enableBufferReuse)"
 
         if !isDirty, let cached = compilationCache, let runtime = runtimeCache,
            let fullCached = fullCompilationCache, fullCached.fingerprint == compileFingerprint {
@@ -190,7 +205,7 @@ extension LazyGraph {
             // Seed the cache after the first compile without paying for hashing
             // in ordinary single-shot execution.
             let cacheKey = kernelHash ?? kernelSourceHash(result.kernels)
-            runtimeCacheByKernelHash[cacheKey] = runtime
+            cacheRuntime(runtime, forKernelHash: cacheKey)
         }
 
         fullCompilationCache = (fingerprint: compileFingerprint, result: result, runtime: runtime)
