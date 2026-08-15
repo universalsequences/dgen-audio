@@ -325,18 +325,22 @@ result.
 
 ## Stopping and restart policy
 
-Stop on the first of:
+The configured generation count is the search budget, not a patience ceiling.
+A normal run evaluates every requested generation. It may stop early only when
+continuing the current optimizer state is invalid:
 
-- generation limit;
-- wall-clock budget;
-- target fitness;
-- no meaningful best-fitness improvement for 5 generations;
 - sigma/covariance collapse;
 - unrecoverable numerical failure.
 
-A first implementation may stop without restart. A follow-up may add IPOP-CMA
-restart behavior: restart from the all-time best or a broad immigrant mean with
-larger population. Restart policy must be explicit in artifacts.
+A flat best-fitness trace is not sufficient evidence of convergence: expensive,
+multimodal synthesis objectives routinely plateau before finding another basin.
+If budget-aware early stopping is added later, it must be explicit and
+configurable rather than silently overriding `--cma-generations`.
+
+A follow-up may add IPOP/BIPOP-CMA restart behavior. Restarts should consume the
+remaining generation budget, use freshly sampled populations, and keep retained
+elites outside covariance and step-size adaptation. Restart policy must be
+explicit in artifacts.
 
 ## Reporting and artifacts
 
@@ -349,7 +353,7 @@ Write `cma_es_report.json` containing:
   "dimension": 34,
   "population": 64,
   "generations_completed": 12,
-  "evaluations": 768,
+  "evaluations": 769,
   "seed": 1,
   "initial_sigma": 0.2,
   "stop_reason": "generation_limit",

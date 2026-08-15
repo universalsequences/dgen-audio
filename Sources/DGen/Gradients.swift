@@ -260,6 +260,20 @@ private func temporalIncrementGradient(
     shape: shape.isEmpty ? .scalar : .tensor(shape))
 }
 
+/// Build an exact zero gradient with the same value shape as `input`.
+///
+/// A scalar zero broadcasts correctly inside elementwise derivative expressions,
+/// but it is not a valid final gradient for a tensor parameter: tensor gradient
+/// accumulation requires an actual tensor node. Non-differentiable operations
+/// therefore need shape-preserving zeros rather than bare scalar constants.
+private func zeroGradient(_ g: Graph, matching input: NodeID) -> NodeID {
+  let zero = g.n(.constant(0.0), [])
+  guard let inputNode = g.nodes[input], case .tensor(let shape) = inputNode.shape else {
+    return zero
+  }
+  return g.n(.expand(shape), [zero])
+}
+
 extension LazyOp {
 
   /// Returns gradient NodeIDs for each input (nil = no gradient / non-differentiable).
@@ -339,8 +353,7 @@ extension LazyOp {
 
     case .mod:
       // d(fmod(a,b))/da ~ 1, d/db ~ 0 (for DSP wrapping)
-      let zero = g.n(.constant(0.0), [])
-      return [gradOutput, zero]
+      return [gradOutput, zeroGradient(g, matching: node.inputs[1])]
 
     case .pow:
       // d(x^y)/dx = y * x^(y-1) * grad
@@ -421,7 +434,7 @@ extension LazyOp {
 
     case .sign:
       // sign is not differentiable (zero gradient)
-      return [g.n(.constant(0.0), [])]
+      return [zeroGradient(g, matching: node.inputs[0])]
 
     case .sin:
       // d(sin(x))/dx = cos(x) * grad
@@ -491,13 +504,12 @@ extension LazyOp {
 
     case .floor, .ceil, .round:
       // Not differentiable, gradient = 0
-      return [g.n(.constant(0.0), [])]
+      return [zeroGradient(g, matching: node.inputs[0])]
 
     // MARK: Comparisons (non-differentiable)
 
     case .gt, .gte, .lt, .lte, .eq:
-      let zero = g.n(.constant(0.0), [])
-      return [zero, zero]
+      return node.inputs.map { zeroGradient(g, matching: $0) }
 
     // MARK: Control Flow
 
@@ -510,7 +522,7 @@ extension LazyOp {
       let zero = g.n(.constant(0.0), [])
       let gradX = g.n(.gswitch, [cond, gradOutput, zero])
       let gradY = g.n(.gswitch, [cond, zero, gradOutput])
-      return [zero, gradX, gradY]
+      return [zeroGradient(g, matching: cond), gradX, gradY]
 
     case .selector:
       // selector(mode, options...) -> gradient flows to selected option only.
@@ -521,7 +533,7 @@ extension LazyOp {
       let mode = node.inputs[0]
       let zero = g.n(.constant(0.0), [])
 
-      var grads: [NodeID?] = [zero]  // mode has zero gradient
+      var grads: [NodeID?] = [zeroGradient(g, matching: mode)]  // mode has zero gradient
       for i in 1..<node.inputs.count {
         let selectorValue = g.n(.constant(Float(i)), [])
         let isSelected = g.n(.eq, [mode, selectorValue])
@@ -534,8 +546,9 @@ extension LazyOp {
       // Host modulation routing is not part of the training surface.
       // Preserve gradient flow to the base parameter and treat active/depth lanes
       // as non-differentiable controls.
-      let zero = g.n(.constant(0.0), [])
-      return node.inputs.enumerated().map { index, _ in index == 0 ? gradOutput : zero }
+      return node.inputs.enumerated().map { index, input in
+        index == 0 ? gradOutput : zeroGradient(g, matching: input)
+      }
 
     case .mix:
       // mix(x, y, t) = x * (1-t) + y * t
@@ -1391,8 +1404,7 @@ extension LazyOp {
     // MARK: Logical ops (non-differentiable)
 
     case .and, .or, .xor:
-      let zero = g.n(.constant(0.0), [])
-      return [zero, zero]
+      return node.inputs.map { zeroGradient(g, matching: $0) }
 
     // MARK: Non-differentiable compute ops
 

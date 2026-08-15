@@ -340,17 +340,14 @@ final class SVFBPTTScratchTests: XCTestCase {
       print("DETUNE-MULTI \(name): autograd=\(auto) fd=\(fd) relErr=\(relErr)")
       if relErr > 0.05 { failures.append(name) }
     }
-    // KNOWN LIBRARY BUG (2026-07-22): a trainable statefulPhasor frequency
-    // corrupts gradients for UNRELATED params (all ~10x too small). Same
-    // family as the documented gradPhasor swept-frequency discrepancy, but
-    // this variant poisons the whole backward pass. Voices must keep
-    // trainable detune/frequency params out of statefulPhasor inputs (use
-    // closed-form phase offsets instead, e.g. wrap(phase - t*detune)).
-    XCTExpectFailure("trainable statefulPhasor frequency corrupts unrelated gradients") {
-      XCTAssertTrue(
-        failures.isEmpty,
-        "trainable phasor frequency corrupts other gradients: \(failures)")
-    }
+    // Fixed 2026-08-15: the phasor's temporalGradStore/Scan/Read tape used to
+    // split the scalar history recurrence across blocks (carry reads in one
+    // block, carry writes stranded after the scan), truncating BPTT and
+    // corrupting unrelated gradients ~10x too small. The fragmented layout is
+    // now rebuilt by the detached scalar BPTT consolidation in BlockFormation.
+    XCTAssertTrue(
+      failures.isEmpty,
+      "trainable phasor frequency corrupts other gradients: \(failures)")
   }
 
   func testFullVoiceManyTargetsGradients() throws {

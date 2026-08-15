@@ -30,34 +30,23 @@ enum CMAESSearch {
             epsilon: DirectionTrainer.logEpsilon)
         try sink.emit(.stage(StageEvent(name: "cma-es", total: options.cmaGenerations)))
 
-        var bestScore = Float.infinity
+        // The seed is an external baseline, not a member of the adaptive CMA
+        // population. Score and archive it independently so every candidate
+        // passed to `tell` remains a genuine draw from the optimizer.
+        let seedScore = try BatchMultistart.score(
+            candidates: [seedZ], transforms: transforms,
+            parameterValues: parameterValues, nodes: nodes,
+            scorer: scorer, sampleRate: sampleRate, crop: crop,
+            batchSize: 1, options: options)[0]
+        var bestScore = seedScore
         var bestZ = seedZ
-        var seedScore = Float.infinity
         var trace = [[String: Any]]()
-        var archive: [(z: [Float], score: Float)] = []
-        var evaluations = 0
-        var staleGenerations = 0
+        var archive: [(z: [Float], score: Float)] = [(seedZ, seedScore)]
+        var evaluations = 1
         var stopReason = "generation_limit"
 
         for generation in 0..<options.cmaGenerations {
-            var anchors = [[Double]]()
-            if generation == 0, population >= 8 {
-                // Deterministic diagonal strata are immigrants, not RNG draws,
-                // so they do not perturb resume sampling.
-                let immigrants = min(4, population - 4)
-                for i in 0..<immigrants {
-                    anchors.append((0..<dimension).map { d in
-                        (Double((i + d) % immigrants) + 0.5) / Double(immigrants)
-                    })
-                }
-            }
-            if generation == 0 {
-                anchors.append(seedZ.map(Double.init))
-                anchors.append([Double](repeating: 0.5, count: dimension))
-            }
-            anchors.append(bestZ.map(Double.init))
-            anchors.append(optimizer.mean.map(CMAES.reflect))
-            let candidates = optimizer.ask(anchors: anchors)
+            let candidates = optimizer.ask()
             if candidates.isEmpty { stopReason = optimizer.stopReason?.rawValue ?? "numerical_failure"; break }
             let floatCandidates = candidates.map { $0.values.map(Float.init) }
 
@@ -77,12 +66,6 @@ enum CMAESSearch {
             }
             let evaluationSeconds = Date().timeIntervalSince(evaluationStart)
             evaluations += scores.count
-            if generation == 0 {
-                // Seed is always the fourth-from-last anchor in generation 0.
-                if let index = candidates.indices.first(where: { candidates[$0].values == seedZ.map(Double.init) }) {
-                    seedScore = scores[index]
-                }
-            }
 
             let rankedIndices = candidates.indices.sorted {
                 let lhs = scores[$0].isFinite ? scores[$0] : .infinity
@@ -90,15 +73,10 @@ enum CMAESSearch {
                 return lhs == rhs ? candidates[$0].index < candidates[$1].index : lhs < rhs
             }
             let generationBest = scores[rankedIndices[0]]
-            let previousBest = bestScore
-            let tolerance = previousBest.isFinite
-                ? max(1e-7, abs(previousBest) * 1e-7) : 0
-            let meaningfulImprovement = generationBest < previousBest - tolerance
             if generationBest < bestScore {
                 bestScore = generationBest
                 bestZ = floatCandidates[rankedIndices[0]]
             }
-            staleGenerations = meaningfulImprovement ? 0 : staleGenerations + 1
             for index in rankedIndices.prefix(min(population / 2, 16)) where scores[index].isFinite {
                 archive.append((floatCandidates[index], scores[index]))
             }
@@ -141,10 +119,6 @@ enum CMAESSearch {
 
             if optimizer.stopReason != nil {
                 stopReason = optimizer.stopReason!.rawValue
-                break
-            }
-            if staleGenerations >= 5 {
-                stopReason = "no_improvement"
                 break
             }
         }

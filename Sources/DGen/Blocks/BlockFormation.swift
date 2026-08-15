@@ -598,12 +598,27 @@ public func bpttRecurrenceClosure(
 /// consumers of closure outputs have higher node IDs so they sit in blocks at
 /// or after the insertion point.
 public func consolidateTensorBPTTBackwardBlocks(g: Graph, blocks: [Block], ctx: IRContext) -> [Block] {
+  consolidateIsolatedBPTTBackwardBlocks(
+    g: g, blocks: blocks, ctx: ctx, carryCells: g.tensorGradCarryCells)
+}
+
+/// Core of `consolidateTensorBPTTBackwardBlocks`, generalized over the carry
+/// cells of one recurrence family. Scalar (`Signal.history()`) BPTT reuses it
+/// when its recurrence is fragmented by isolated-pass adjoints (see
+/// `consolidateScalarBPTTBackwardBlocks`): the carry reads land in one block
+/// and the carry writes in a block after a `temporalGradScan`, so neither
+/// block qualifies for the detached reverse-loop wrap and the recurrence is
+/// silently severed.
+func consolidateIsolatedBPTTBackwardBlocks(
+  g: Graph, blocks: [Block], ctx: IRContext, carryCells: Set<CellID>
+) -> [Block] {
   let debug = ProcessInfo.processInfo.environment["DGEN_DEBUG_BPTT_SPLIT"] != nil
-  guard let lastForwardId = g.lastForwardNodeId, !g.tensorGradCarryCells.isEmpty else {
+  guard let lastForwardId = g.lastForwardNodeId, !carryCells.isEmpty else {
     return blocks
   }
 
-  var closure = tensorBPTTRecurrenceClosure(g: g, lastForwardId: lastForwardId)
+  var closure = bpttRecurrenceClosure(
+    g: g, lastForwardId: lastForwardId, carryCells: carryCells)
   guard !closure.isEmpty else { return blocks }
 
   // True value edges only. seq carries a value on its second input; carry
@@ -680,7 +695,7 @@ public func consolidateTensorBPTTBackwardBlocks(g: Graph, blocks: [Block], ctx: 
     }
     for id in evicted {
       guard let node = g.nodes[id] else { continue }
-      if case .memoryWrite(let c) = node.op, g.tensorGradCarryCells.contains(c) {
+      if case .memoryWrite(let c) = node.op, carryCells.contains(c) {
         if debug {
           print("BPTT-CONSOLIDATE bail: eviction would remove carry write \(id)")
         }
@@ -868,12 +883,15 @@ public func consolidateTensorBPTTBackwardBlocks(g: Graph, blocks: [Block], ctx: 
   var afterBlocks = after
   let tailNodeSet = Set(tailFragments.flatMap { $0.nodes })
   let beforeNodeSet = Set(before.flatMap { $0.nodes })
+  // Forward deps matter here too: an `after` block can mix forward loss
+  // scalars with backward accumulates (fusion), and hoisting only the
+  // backward producers would schedule a tail node before its forward dep.
   var neededByTail = Set<NodeID>()
   var neededStack = Array(tailNodeSet)
   while let id = neededStack.popLast() {
     guard let node = g.nodes[id] else { continue }
     for dep in node.allDependencies
-    where dep > lastForwardId && !closure.contains(dep) && !tailNodeSet.contains(dep)
+    where !closure.contains(dep) && !tailNodeSet.contains(dep)
       && !beforeNodeSet.contains(dep)
     {
       if neededByTail.insert(dep).inserted { neededStack.append(dep) }
@@ -903,10 +921,32 @@ public func consolidateTensorBPTTBackwardBlocks(g: Graph, blocks: [Block], ctx: 
     afterBlocks = keptAfter
   }
 
-  // Order tail fragments by node ID (creation order is dependency order for
-  // backward nodes).
-  let tail = tailFragments.sorted {
-    ($0.nodes.min() ?? 0) < ($1.nodes.min() ?? 0)
+  // Order tail nodes by node ID (creation order is dependency order for
+  // backward nodes). Sorting whole fragments by their min ID is not enough:
+  // a fragment can mix low- and high-ID nodes (deferred leftovers of one
+  // original block), interleaving with another fragment's ID range so a
+  // consumer block sorts before its producer. Re-segment the global ID-sorted
+  // tail at fragment changes; each segment keeps its source fragment's
+  // metadata and the segments' disjoint ID intervals make min-ID order a
+  // valid topological order.
+  var tailFragmentOf: [NodeID: Int] = [:]
+  for (i, fragment) in tailFragments.enumerated() {
+    for nodeId in fragment.nodes { tailFragmentOf[nodeId] = i }
+  }
+  var tail: [Block] = []
+  for nodeId in tailFragments.flatMap({ $0.nodes }).sorted() {
+    guard let fragmentIdx = tailFragmentOf[nodeId] else { continue }
+    if var last = tail.last, tailFragmentOf[last.nodes.last ?? -1] == fragmentIdx {
+      last.nodes.append(nodeId)
+      tail[tail.count - 1] = last
+    } else {
+      var segment = Block(frameOrder: tailFragments[fragmentIdx].frameOrder)
+      segment.nodes = [nodeId]
+      segment.shape = tailFragments[fragmentIdx].shape
+      segment.temporality = tailFragments[fragmentIdx].temporality
+      segment.tensorIndex = tailFragments[fragmentIdx].tensorIndex
+      tail.append(segment)
+    }
   }
   let result = before + [bpttBlock] + tail + afterBlocks
   if debug {
@@ -959,6 +999,40 @@ public func consolidateScalarBPTTBackwardBlocks(g: Graph, blocks: [Block], ctx: 
   var nodeBlock: [NodeID: Int] = [:]
   for (i, block) in blocks.enumerated() {
     for nodeId in block.nodes { nodeBlock[nodeId] = i }
+  }
+
+  // A correct reverse loop needs every carry cell's backward read and write in
+  // the same block (that block then takes the detached reverse-loop wrap, or
+  // the inline host wrap below). Isolated-pass adjoints — a trainable phasor's
+  // temporalGradStore/Scan/Read tape — force block splits mid-recurrence in
+  // node-ID order, stranding the carry writes in a post-scan parallel block:
+  // the read-only block runs as a plain forward loop (recurrence truncated to
+  // garbage) and the write-only block races frame-parallel. Rebuild that
+  // layout with the same consolidation the tensor recurrence uses (sandwich
+  // eviction keeps post-tape consumers out of the reverse loop).
+  var readBlocks: [CellID: Set<Int>] = [:]
+  var writeBlocks: [CellID: Set<Int>] = [:]
+  for (id, node) in g.nodes where id > lastForwardId {
+    switch node.op {
+    case .memoryRead(let c) where scalarCarryCells.contains(c):
+      if let b = nodeBlock[id] { readBlocks[c, default: []].insert(b) }
+    case .memoryWrite(let c) where scalarCarryCells.contains(c):
+      if let b = nodeBlock[id] { writeBlocks[c, default: []].insert(b) }
+    default:
+      break
+    }
+  }
+  let recurrenceFragmented = scalarCarryCells.contains { cell in
+    let reads = readBlocks[cell] ?? []
+    let writes = writeBlocks[cell] ?? []
+    return !reads.isEmpty && !writes.isEmpty && reads != writes
+  }
+  if recurrenceFragmented {
+    if debug {
+      print("BPTT-SCALAR-CONSOLIDATE fragmented recurrence; using detached consolidation")
+    }
+    return consolidateIsolatedBPTTBackwardBlocks(
+      g: g, blocks: blocks, ctx: ctx, carryCells: scalarCarryCells)
   }
 
   // Host block: the last block whose forward half writes a scalar history cell

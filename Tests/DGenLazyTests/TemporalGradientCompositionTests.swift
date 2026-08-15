@@ -180,4 +180,103 @@ final class TemporalGradientCompositionTests: XCTestCase {
     let error = relativeError(autograd, fd)
     XCTAssertLessThan(error, 0.02, "autograd=\(autograd), fd=\(fd), relError=\(error)")
   }
+
+  // MARK: - Spectral (isolated-pass) composition — the Korg1 patch-learn shape
+  //
+  // With an inline MSE loss the backward recurrence shares its kernel with the
+  // forward history loop. A spectral loss inserts isolated-pass kernels, so the
+  // recurrence becomes a detached backward block — and a trainable phasor's
+  // temporalGradStore/Scan/Read tape used to split that block mid-recurrence
+  // (carry reads in one block, carry writes stranded after the scan),
+  // truncating the SVF BPTT and corrupting every filter-parameter gradient.
+  // L2 on linear magnitudes at 2 kHz keeps finite differences well-conditioned
+  // (the trainer's L1/log modes share the same backward block structure).
+
+  private let spectralSampleRate: Float = 2000.0
+
+  private func spectralSVF(_ input: Signal, cutoff: Signal) -> Signal {
+    svfLowpass(input, g: DGenLazy.tan(Signal.constant(Float.pi / spectralSampleRate) * cutoff))
+  }
+
+  private func spectralSVFLoss(cutoff: Signal, detune: Signal) -> Signal {
+    let student = spectralSVF(oscillator(detune: detune), cutoff: cutoff)
+    let teacher = spectralSVF(
+      oscillator(detune: Signal.constant(-7.0)), cutoff: Signal.constant(500.0))
+    return spectralLossFFT(
+      student, teacher, windowSize: 128, useHannWindow: true,
+      useLogMagnitude: false, lossMode: .l2, hop: 32, normalize: true)
+  }
+
+  /// Korg1 sandwich: a smooth envelope modulates BOTH the phasor frequency
+  /// (temporal tape path) and the SVF cutoff (per-frame path inside the BPTT
+  /// recurrence), so the envelope's gradient merges tape and recurrence
+  /// contributions.
+  private func envModulatedSpectralLoss(cutoff: Signal, pitchEnvAmount: Signal) -> Signal {
+    let t = Signal.accum(
+      Signal.constant(1.0 / spectralSampleRate), reset: 0.0, min: 0.0, max: 1000.0)
+    let env = DGenLazy.exp(t * -3.0)
+    let osc = DGenLazy.sin(
+      Signal.statefulPhasor(55.0 + env * pitchEnvAmount) * (2.0 * Float.pi))
+    let student = spectralSVF(osc, cutoff: cutoff + env * 40.0)
+    let teacher = spectralSVF(
+      oscillator(detune: Signal.constant(-7.0)), cutoff: Signal.constant(500.0))
+    return spectralLossFFT(
+      student, teacher, windowSize: 128, useHannWindow: true,
+      useLogMagnitude: false, lossMode: .l2, hop: 32, normalize: true)
+  }
+
+  func testTrainablePhasorComposesWithSVFSpectralGradient() throws {
+    DGenConfig.sampleRate = spectralSampleRate
+    let initialCutoff: Float = 300
+    LazyGraphContext.reset()
+    let cutoff = Signal.param(initialCutoff)
+    let frequencyDetune = Signal.param(detune)
+    let loss = spectralSVFLoss(cutoff: cutoff, detune: frequencyDetune)
+    _ = try loss.backward(frames: frames)
+
+    let cutoffFd = try finiteDifference(
+      spectralSVFLoss, parameter: initialCutoff, epsilon: 1.0)
+    let cutoffAuto = try XCTUnwrap(cutoff.grad?.data)
+    XCTAssertLessThan(
+      relativeError(cutoffAuto, cutoffFd), 0.02,
+      "cutoff: autograd=\(cutoffAuto), fd=\(cutoffFd)")
+
+    func detuneLoss(_ d: Signal, _ unused: Signal) -> Signal {
+      spectralSVFLoss(cutoff: Signal.constant(initialCutoff), detune: d)
+    }
+    let detuneFd = try finiteDifference(detuneLoss, parameter: detune, epsilon: 1e-2)
+    let detuneAuto = try XCTUnwrap(frequencyDetune.grad?.data)
+    XCTAssertLessThan(
+      relativeError(detuneAuto, detuneFd), 0.05,
+      "detune: autograd=\(detuneAuto), fd=\(detuneFd)")
+  }
+
+  func testEnvModulatedPhasorAndCutoffComposeWithSVFSpectralGradient() throws {
+    DGenConfig.sampleRate = spectralSampleRate
+    let initialCutoff: Float = 300
+    let initialAmount: Float = 12.0
+    LazyGraphContext.reset()
+    let cutoff = Signal.param(initialCutoff)
+    let amount = Signal.param(initialAmount)
+    let loss = envModulatedSpectralLoss(cutoff: cutoff, pitchEnvAmount: amount)
+    _ = try loss.backward(frames: frames)
+
+    func cutoffLoss(_ c: Signal, _ unused: Signal) -> Signal {
+      envModulatedSpectralLoss(cutoff: c, pitchEnvAmount: Signal.constant(initialAmount))
+    }
+    let cutoffFd = try finiteDifference(cutoffLoss, parameter: initialCutoff, epsilon: 1.0)
+    let cutoffAuto = try XCTUnwrap(cutoff.grad?.data)
+    XCTAssertLessThan(
+      relativeError(cutoffAuto, cutoffFd), 0.02,
+      "cutoff: autograd=\(cutoffAuto), fd=\(cutoffFd)")
+
+    func amountLoss(_ a: Signal, _ unused: Signal) -> Signal {
+      envModulatedSpectralLoss(cutoff: Signal.constant(initialCutoff), pitchEnvAmount: a)
+    }
+    let amountFd = try finiteDifference(amountLoss, parameter: initialAmount, epsilon: 1e-2)
+    let amountAuto = try XCTUnwrap(amount.grad?.data)
+    XCTAssertLessThan(
+      relativeError(amountAuto, amountFd), 0.05,
+      "pitchEnvAmount: autograd=\(amountAuto), fd=\(amountFd)")
+  }
 }

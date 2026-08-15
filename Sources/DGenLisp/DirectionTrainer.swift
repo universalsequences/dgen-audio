@@ -298,9 +298,32 @@ enum DirectionTrainer {
                 sink: sink, jobDir: jobDir, emitCheckpoints: false)
             basinCheck = global.bestLoss < basinDecisiveRatio * seeded.bestLoss
                 ? "wrong_neighborhood" : "ok"
-            finalPhase = multistart != nil && global.bestLoss < seeded.bestLoss
+            let candidate = multistart != nil && global.bestLoss < seeded.bestLoss
                 ? global : seeded
-            initialMetric = seeded.initLoss
+            // Canonical result metric: the same independent CPU log-MR-STFT
+            // scorer the CMA path reports. Adam's internal selection above
+            // still uses the GPU training loss (log + 0.1·linear), but
+            // abs_distance/improvement must be comparable across search
+            // modes, and a candidate that regresses the canonical score
+            // must not replace the seed.
+            let scorer = try TrainSpectralScorer(
+                target: prepared, windows: spectralWindows, epsilon: logEpsilon)
+            let scored = try BatchMultistart.score(
+                candidates: [seedZ, candidate.bestZ], transforms: transforms,
+                parameterValues: patchPlan.parameterValues,
+                nodes: patchPlan.loweredNodes, scorer: scorer,
+                sampleRate: targetSampleRate, crop: crop,
+                batchSize: 2, options: options)
+            let seedScore = scored[0]
+            let candidateScore = scored[1]
+            if candidateScore.isFinite && candidateScore <= seedScore {
+                finalPhase = PhaseResult(
+                    initLoss: seedScore, bestLoss: candidateScore, bestZ: candidate.bestZ)
+            } else {
+                finalPhase = PhaseResult(
+                    initLoss: seedScore, bestLoss: seedScore, bestZ: seedZ)
+            }
+            initialMetric = seedScore
         }
 
         // Optional handoff to the real recurrent SVF. Parameters are shared,

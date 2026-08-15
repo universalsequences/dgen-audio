@@ -69,9 +69,13 @@ struct CMAES: Codable {
         chiN = sqrt(n) * (1 - 1 / (4 * n) + 1 / (21 * n * n))
     }
 
-    /// Samples a generation and replaces trailing slots with anchors. Anchor
-    /// order is stable; if there are more anchors than slots, the last ones win.
-    mutating func ask(anchors: [[Double]] = []) -> [Candidate] {
+    /// Samples one complete generation from the optimizer distribution.
+    ///
+    /// Every returned candidate must remain a genuine draw from that
+    /// distribution: deterministic probes and retained elites may be scored by
+    /// callers, but feeding them to `tell` would bias the evolution paths,
+    /// covariance, and step-size adaptation.
+    mutating func ask() -> [Candidate] {
         guard stopReason == nil else { return [] }
         var result: [Candidate] = []
         result.reserveCapacity(population)
@@ -88,13 +92,6 @@ struct CMAES: Codable {
             let reflected = raw.map(Self.reflect)
             let count = zip(raw, reflected).reduce(0) { $0 + ($1.0 == $1.1 ? 0 : 1) }
             result.append(Candidate(index: index, values: reflected, reflectedCoordinates: count))
-        }
-        for (offset, anchor) in anchors.suffix(population).enumerated() {
-            guard anchor.count == dimension, anchor.allSatisfy(\.isFinite) else { continue }
-            let slot = population - min(anchors.count, population) + offset
-            let reflected = anchor.map(Self.reflect)
-            let count = zip(anchor, reflected).reduce(0) { $0 + ($1.0 == $1.1 ? 0 : 1) }
-            result[slot] = Candidate(index: slot, values: reflected, reflectedCoordinates: count)
         }
         return result
     }

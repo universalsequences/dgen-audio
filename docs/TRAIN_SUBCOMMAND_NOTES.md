@@ -1,5 +1,41 @@
 # `dgenlisp train` — implementation notes, deviations, punts
 
+## Fixes (2026-08-15) — Korg1 scalar phasor×history composition + canonical scoring
+
+- **Scalar phasor tape no longer severs history BPTT under spectral losses.**
+  With an isolated-pass loss (spectral MR-STFT), the scalar history recurrence
+  runs as a detached backward block wrapped in one reverse frame loop. A
+  trainable phasor's `temporalGradStore/Scan/Read` tape forced block splits in
+  node-ID order mid-recurrence: carry reads landed in one block (ran as a plain
+  forward loop — recurrence truncated) and carry writes in a frame-parallel
+  block after the scan. Every parameter whose gradient crossed a history filter
+  (SVF cutoff/resonance, drives, mix levels) came out ~10-100x too small with
+  unreliable sign; the Korg1 patch-learn Adam runs climbed instead of
+  descending. `consolidateScalarBPTTBackwardBlocks` now detects the fragmented
+  read/write layout and rebuilds it with the same detached consolidation the
+  tensor recurrence uses (sandwich eviction of post-tape consumers, tail
+  re-segmented into ID-contiguous runs, forward deps hoisted out of `after`
+  blocks). Regression coverage: `TemporalGradientCompositionTests`
+  `testTrainablePhasorComposesWithSVFSpectralGradient` /
+  `testEnvModulatedPhasorAndCutoffComposeWithSVFSpectralGradient`, and
+  `SVFBPTTScratchTests.testFullVoiceManyTargetsGradientsWithTrainableDetune`
+  (previously `XCTExpectFailure`).
+- **`abs_distance`/`improvement_pct` are canonical across search modes.** Both
+  the legacy and CMA paths now report the independent CPU log-MR-STFT scorer
+  (`TrainSpectralScorer`, log-magnitude only) for seed and final; a candidate
+  that regresses the canonical score never replaces the seed. Adam's internal
+  best-point selection still uses the GPU training loss (log + 0.1·linear
+  MR-STFT); the two are no longer conflated in results. Deviation #3 below is
+  historical.
+- **Known residual: FD sign checks on phase-shifting params are unreliable.**
+  The training loss is deterministically micro-jagged along any direction that
+  shifts waveform edges in time (oscillator pitch/detune, LFO rate/depth,
+  pulse width, analog drift): log-eps amplifies leakage changes in near-dead
+  bins, so the instantaneous derivative oscillates at sub-cent scale around
+  the macro trend. Autograd matches tight central FD (verified at ±0.01 cent)
+  but disagrees with the coarse ±0.5%-of-range fdcheck stencil on those
+  params. That is a loss-landscape property, not an adjoint bug.
+
 ## Policy changes (2026-08-14)
 
 - **Phasor frequency params are trainable** — the pitch-path freeze

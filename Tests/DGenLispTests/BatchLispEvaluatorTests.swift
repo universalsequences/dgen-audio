@@ -31,6 +31,30 @@ final class BatchLispEvaluatorTests: XCTestCase {
     XCTAssertEqual(samples[1], 1.75, accuracy: 1e-6)
   }
 
+  func testBatchBackwardPreservesTensorGradientThroughFloor() throws {
+    DGenConfig.backend = .metal
+    DGenConfig.sampleRate = 2_000
+    DGenConfig.maxFrameCount = 8
+    LazyGraphContext.reset()
+
+    let transform = DirectionTrainer.TransformedParam(
+      LearnableParam(name: "semitone", min: -12, max: 12, seedValue: 0))
+    let semitone = Tensor([0.25, 0.75], requiresGrad: true)
+    let nodes = try parseSource("""
+      (param semitone @default 0 @min -12 @max 12)
+      (out (floor semitone) 1)
+      """)
+    let output = try BatchMultistart.evaluate(
+      z: [semitone], transforms: [transform],
+      parameterValues: ["semitone": 0], nodes: nodes, lanes: 2)
+
+    let loss = (output * output).sum()
+    _ = try loss.backward(frames: 8)
+
+    let gradient = try XCTUnwrap(semitone.grad?.getData())
+    XCTAssertEqual(gradient, [0, 0])
+  }
+
   func testBatchEvaluationLiftsBiquadInputAndAllControlsIntoLanes() throws {
     DGenConfig.backend = .c
     DGenConfig.sampleRate = 2_000

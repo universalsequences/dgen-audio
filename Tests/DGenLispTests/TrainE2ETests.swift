@@ -168,6 +168,55 @@ final class TrainE2ETests: XCTestCase {
         XCTAssertEqual(stored, lines.last)
     }
 
+    func testCMAFlatObjectiveConsumesTheRequestedGenerationBudget() throws {
+        let patch = workDir.appendingPathComponent("flat-cma-patch.lisp")
+        try """
+            (def unused (param unused @default 0.3 @min 0.05 @max 1.0))
+            (out (+ (phasor 110.0) (* unused 0.0)) 0)
+            """.write(to: patch, atomically: true, encoding: .utf8)
+        let target = workDir.appendingPathComponent("flat-cma-target.wav")
+        let render = try runProcess([
+            "train-render", "--patch", patch.path,
+            "--out", target.path, "--frames", "4096", "--sample-rate", "44100",
+            "--backend", "metal",
+        ])
+        XCTAssertEqual(render.status, 0, "target render failed:\n\(render.stderr)")
+
+        let seed = workDir.appendingPathComponent("flat-cma-seed.json")
+        try #"{"params":{"unused":0.3}}"#.write(to: seed, atomically: true, encoding: .utf8)
+        let jobDir = workDir.appendingPathComponent("flat-cma-job")
+        let generations = 7
+        let outcome = try runProcess([
+            "train", "--patch", patch.path, "--target", target.path,
+            "--seed-params", seed.path, "--job-dir", jobDir.path,
+            "--mode", "direction", "--backend", "metal",
+            "--pitch-hz", "110", "--gate-frames", "4096",
+            "--search", "cma-es", "--cma-generations", String(generations),
+            "--cma-population", "8", "--local-epochs", "0",
+            "--cma-continue", "1", "--cma-refine-epochs", "0",
+            "--cma-final-epochs", "0",
+        ])
+        XCTAssertEqual(outcome.status, 0, "training failed:\n\(outcome.stderr.suffix(2000))")
+
+        var stage = ""
+        var progress = [OptimizationProgressEvent]()
+        for line in outcome.stdout.split(separator: "\n") {
+            switch try TrainEventCoding.decodeLine(String(line)) {
+            case .stage(let value): stage = value.name
+            case .optimizationProgress(let value) where stage == "cma-es":
+                progress.append(value)
+            default: break
+            }
+        }
+        XCTAssertEqual(progress.map(\.current), Array(1...generations))
+
+        let reportData = try Data(contentsOf: jobDir.appendingPathComponent("cma_es_report.json"))
+        let report = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: reportData) as? [String: Any])
+        XCTAssertEqual(report["generations_completed"] as? Int, generations)
+        XCTAssertEqual(report["stop_reason"] as? String, "generation_limit")
+    }
+
     func testCMAAndBatchedAdamStreamIncrementalProgress() throws {
         let patch = workDir.appendingPathComponent("progress-patch.lisp")
         try """
