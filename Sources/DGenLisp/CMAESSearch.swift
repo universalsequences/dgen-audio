@@ -133,6 +133,11 @@ enum CMAESSearch {
                 format: "[train] cma generation=%d best=%.6g all_best=%.6g sigma=%.4g reflected=%.3f forward=%.3fs update=%.3fms\n",
                 generation, generationBest, bestScore, optimizer.sigma,
                 Double(reflected) / Double(population * dimension), evaluationSeconds, updateMS).utf8))
+            try sink.emit(.optimizationProgress(OptimizationProgressEvent(
+                current: generation + 1, total: options.cmaGenerations,
+                losses: rankedIndices.prefix(5).compactMap {
+                    scores[$0].isFinite ? Double(scores[$0]) : nil
+                })))
 
             if optimizer.stopReason != nil {
                 stopReason = optimizer.stopReason!.rawValue

@@ -12,6 +12,8 @@ final class EventCodingTests: XCTestCase {
                 seedEcho: ["sinefm": 0.06, "ratio": 0.05],
                 pitchHz: 49.2, gateFrames: 8820, cropFrames: 32768)),
         .stage(StageEvent(name: "train", total: 300)),
+        .optimizationProgress(
+            OptimizationProgressEvent(current: 3, total: 12, losses: [0.031, 0.044, 0.052])),
         .epoch(
             EpochEvent(
                 epoch: 50, total: 300, loss: 0.104,
@@ -43,11 +45,15 @@ final class EventCodingTests: XCTestCase {
         for key in ["\"seed_echo\"", "\"pitch_hz\"", "\"gate_frames\"", "\"crop_frames\""] {
             XCTAssertTrue(planLine.contains(key), "plan missing \(key): \(planLine)")
         }
-        let resultLine = try TrainEventCoding.encodeLine(Self.sampleEvents[4])
+        let progressLine = try TrainEventCoding.encodeLine(Self.sampleEvents[2])
+        for key in ["\"current\"", "\"total\"", "\"losses\""] {
+            XCTAssertTrue(progressLine.contains(key), "optimization progress missing \(key): \(progressLine)")
+        }
+        let resultLine = try TrainEventCoding.encodeLine(Self.sampleEvents[5])
         for key in ["\"improvement_pct\"", "\"abs_distance\"", "\"basin_check\"", "\"seeded_wav\"", "\"final_wav\"", "\"deltas\"", "\"from\"", "\"to\"" ] {
             XCTAssertTrue(resultLine.contains(key), "result missing \(key): \(resultLine)")
         }
-        let epochLine = try TrainEventCoding.encodeLine(Self.sampleEvents[2])
+        let epochLine = try TrainEventCoding.encodeLine(Self.sampleEvents[3])
         XCTAssertTrue(epochLine.contains("\"steps\""), "epoch missing steps: \(epochLine)")
     }
 

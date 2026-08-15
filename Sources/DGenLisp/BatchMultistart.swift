@@ -229,7 +229,8 @@ enum BatchMultistart {
         candidates: [[Float]], transforms: [DirectionTrainer.TransformedParam],
         parameterValues: [String: Float], nodes: [ASTNode],
         target: [Float], crop: Int, sampleRate: Float,
-        steps: Int, options: TrainOptions
+        steps: Int, options: TrainOptions,
+        progress: ((Int, Float) throws -> Void)? = nil
     ) throws -> [[Float]] {
         let lanes = candidates.count
         DirectionTrainer.configureRuntime(options: options, sampleRate: sampleRate, crop: crop)
@@ -247,10 +248,14 @@ enum BatchMultistart {
             let loss = DirectionTrainer.multiResolutionSpectralLoss(
                 synth: output, target: targetSignal, frames: crop)
                 * Signal.constant(Float(lanes))
-            _ = try loss.backward(frames: crop)
-            let progress = Float(step - 1) / Float(max(steps - 1, 1))
+            let lossValues = try loss.backward(frames: crop)
+            let aggregateLoss = lossValues.reduce(0, +) / Float(lanes)
+            guard aggregateLoss.isFinite else {
+                throw TrainProtocolError("batched refinement loss diverged at epoch \(step)")
+            }
+            let scheduleProgress = Float(step - 1) / Float(max(steps - 1, 1))
             let lr = DirectionTrainer.transformedLR
-                * (0.05 + 0.95 * 0.5 * (1 + Foundation.cos(Float.pi * progress)))
+                * (0.05 + 0.95 * 0.5 * (1 + Foundation.cos(Float.pi * scheduleProgress)))
             for p in z.indices {
                 guard let gradients = z[p].grad?.getData(), let values = z[p].getData() else { continue }
                 var updated = values
@@ -265,6 +270,7 @@ enum BatchMultistart {
                 z[p].updateDataLazily(updated)
                 z[p].grad = nil
             }
+            try progress?(step, aggregateLoss)
         }
         let data = z.map { $0.getData() ?? [Float](repeating: 0.5, count: lanes) }
         return (0..<lanes).map { lane in data.map { $0[lane] } }

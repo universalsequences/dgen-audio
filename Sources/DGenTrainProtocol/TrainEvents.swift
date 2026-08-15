@@ -65,6 +65,20 @@ public struct StageEvent: Codable, Equatable {
     }
 }
 
+/// Incremental progress for non-scalar optimization stages. `losses` is
+/// ordered best-first when the stage has independently scored candidates.
+public struct OptimizationProgressEvent: Codable, Equatable {
+    public var current: Int
+    public var total: Int
+    public var losses: [Double]
+
+    public init(current: Int, total: Int, losses: [Double]) {
+        self.current = current
+        self.total = total
+        self.losses = losses
+    }
+}
+
 public struct EpochEvent: Codable, Equatable {
     public var epoch: Int
     public var total: Int
@@ -154,6 +168,7 @@ public struct ErrorEvent: Codable, Equatable {
 public enum TrainEvent: Equatable {
     case plan(PlanEvent)
     case stage(StageEvent)
+    case optimizationProgress(OptimizationProgressEvent)
     case epoch(EpochEvent)
     case checkpoint(CheckpointEvent)
     case result(ResultEvent)
@@ -163,6 +178,7 @@ public enum TrainEvent: Equatable {
         switch self {
         case .plan: return "plan"
         case .stage: return "stage"
+        case .optimizationProgress: return "optimization_progress"
         case .epoch: return "epoch"
         case .checkpoint: return "checkpoint"
         case .result: return "result"
@@ -188,6 +204,8 @@ extension TrainEvent: Codable {
         switch type {
         case "plan": self = .plan(try PlanEvent(from: decoder))
         case "stage": self = .stage(try StageEvent(from: decoder))
+        case "optimization_progress":
+            self = .optimizationProgress(try OptimizationProgressEvent(from: decoder))
         case "epoch": self = .epoch(try EpochEvent(from: decoder))
         case "checkpoint": self = .checkpoint(try CheckpointEvent(from: decoder))
         case "result": self = .result(try ResultEvent(from: decoder))
@@ -206,6 +224,7 @@ extension TrainEvent: Codable {
         switch self {
         case .plan(let p): try p.encode(to: encoder)
         case .stage(let p): try p.encode(to: encoder)
+        case .optimizationProgress(let p): try p.encode(to: encoder)
         case .epoch(let p): try p.encode(to: encoder)
         case .checkpoint(let p): try p.encode(to: encoder)
         case .result(let p): try p.encode(to: encoder)

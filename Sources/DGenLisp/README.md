@@ -76,8 +76,11 @@ Before training, the planner:
 
 The command writes progress as typed NDJSON events to stdout. Diagnostics go
 to stderr, so consumers can parse every stdout line as a train event. A normal
-run emits `plan`, `stage`, periodic `epoch`/`checkpoint`, and terminal `result`
-events. `--plan-only` stops after `plan`.
+run emits `plan`, `stage`, incremental `epoch`, `optimization_progress`, and
+`checkpoint` events, followed by terminal `result`. `optimization_progress`
+reports `current`, `total`, and losses: CMA-ES emits up to five best-first
+candidate losses per completed generation, while batched Adam emits its mean
+lane loss per completed epoch. `--plan-only` stops after `plan`.
 
 General artifacts under `--job-dir` include:
 

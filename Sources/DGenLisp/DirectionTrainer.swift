@@ -162,7 +162,11 @@ enum DirectionTrainer {
                     parameterValues: patchPlan.parameterValues,
                     nodes: patchPlan.loweredNodes,
                     target: prepared, crop: crop, sampleRate: targetSampleRate,
-                    steps: refineEpochs, options: options)
+                    steps: refineEpochs, options: options
+                ) { epoch, loss in
+                    try sink.emit(.optimizationProgress(OptimizationProgressEvent(
+                        current: epoch, total: refineEpochs, losses: [Double(loss)])))
+                }
                 refined = zip(values, preScores).map {
                     PhaseResult(initLoss: $1, bestLoss: .infinity, bestZ: $0)
                 }

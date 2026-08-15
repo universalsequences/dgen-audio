@@ -167,4 +167,58 @@ final class TrainE2ETests: XCTestCase {
             .trimmingCharacters(in: .newlines)
         XCTAssertEqual(stored, lines.last)
     }
+
+    func testCMAAndBatchedAdamStreamIncrementalProgress() throws {
+        let patch = workDir.appendingPathComponent("progress-patch.lisp")
+        try """
+            (def amp (param amp @default 0.3 @min 0.05 @max 1.0))
+            (out (* amp (phasor 110.0)) 0)
+            """.write(to: patch, atomically: true, encoding: .utf8)
+        let hidden = workDir.appendingPathComponent("progress-hidden.json")
+        try #"{"amp":0.8}"#.write(to: hidden, atomically: true, encoding: .utf8)
+        let target = workDir.appendingPathComponent("progress-target.wav")
+        let render = try runProcess([
+            "train-render", "--patch", patch.path, "--params-json", hidden.path,
+            "--out", target.path, "--frames", "8192", "--sample-rate", "44100",
+            "--backend", "metal",
+        ])
+        XCTAssertEqual(render.status, 0, "target render failed:\n\(render.stderr)")
+
+        let seed = workDir.appendingPathComponent("progress-seed.json")
+        try #"{"params":{"amp":0.3}}"#.write(to: seed, atomically: true, encoding: .utf8)
+        let outcome = try runProcess([
+            "train", "--patch", patch.path, "--target", target.path,
+            "--seed-params", seed.path,
+            "--job-dir", workDir.appendingPathComponent("progress-job").path,
+            "--mode", "direction", "--epochs", "2", "--backend", "metal",
+            "--pitch-hz", "110", "--gate-frames", "8192",
+            "--search", "cma-es", "--cma-generations", "2",
+            "--cma-population", "8", "--local-epochs", "0",
+            "--cma-continue", "2", "--cma-refine-epochs", "2",
+            "--cma-refine-mode", "batched", "--cma-final-epochs", "0",
+        ])
+        XCTAssertEqual(outcome.status, 0, "training failed:\n\(outcome.stderr.suffix(2000))")
+
+        var stage = ""
+        var cma = [OptimizationProgressEvent]()
+        var batched = [OptimizationProgressEvent]()
+        for line in outcome.stdout.split(separator: "\n") {
+            switch try TrainEventCoding.decodeLine(String(line)) {
+            case .stage(let value): stage = value.name
+            case .optimizationProgress(let value):
+                if stage == "cma-es" { cma.append(value) }
+                if stage == "cma-refine-batched" { batched.append(value) }
+            default: break
+            }
+        }
+        XCTAssertEqual(cma.map(\.current), [1, 2])
+        XCTAssertTrue(cma.allSatisfy {
+            !$0.losses.isEmpty && $0.losses.count <= 5
+                && $0.losses == $0.losses.sorted()
+        })
+        XCTAssertEqual(batched.map(\.current), [1, 2])
+        XCTAssertTrue(batched.allSatisfy {
+            $0.losses.count == 1 && $0.losses[0].isFinite
+        })
+    }
 }
