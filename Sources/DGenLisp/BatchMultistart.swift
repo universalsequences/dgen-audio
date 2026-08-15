@@ -206,16 +206,6 @@ enum BatchMultistart {
     ) throws -> [[Float]] {
         let lanes = candidates.count
         DirectionTrainer.configureRuntime(options: options, sampleRate: sampleRate, crop: crop)
-        // Tensor temporal-gradient reads are not yet ordered before consumers
-        // when they compose with tensor-history SVF BPTT. Keep frequency
-        // dimensions in the population search, but freeze their short-horizon
-        // gradients until that backend composition gap is closed.
-        DGenGradientConfig.detachPhasorFrequency = true
-        DGenGradientConfig.detachAccumInputs = true
-        defer {
-            DGenGradientConfig.detachPhasorFrequency = false
-            DGenGradientConfig.detachAccumInputs = false
-        }
         LazyGraphContext.reset()
         let z = transforms.indices.map { d in Tensor(candidates.map { $0[d] }, requiresGrad: true) }
         var m = [[Float]](repeating: [Float](repeating: 0, count: lanes), count: z.count)

@@ -23,7 +23,16 @@ extension LazyOp {
       let reset = b.value(inputs[1])
       _ = b.memoryWrite(resetCell, frameInt, reset)
 
-      if elementCount == 1 {
+      // A shape-[1] tensor phasor also has elementCount == 1, but its grad
+      // lives in tensor storage — the scalar fast path would read an unwritten
+      // scalar slot and silently store zeros.
+      let gradInputIsTensor: Bool
+      if case .tensor = g.nodes[node.inputs[0]]?.shape {
+        gradInputIsTensor = true
+      } else {
+        gradInputIsTensor = false
+      }
+      if elementCount == 1 && !gradInputIsTensor {
         _ = b.memoryWrite(gradCell, frameInt, b.value(inputs[0]))
       } else {
         _ = b.value(inputs[0])  // preserve the graph dependency

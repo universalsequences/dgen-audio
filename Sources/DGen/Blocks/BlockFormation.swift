@@ -603,14 +603,96 @@ public func consolidateTensorBPTTBackwardBlocks(g: Graph, blocks: [Block], ctx: 
     return blocks
   }
 
-  var stack: [NodeID] = []
-  for (id, node) in g.nodes where id > lastForwardId {
-    if case .memoryWrite(let c) = node.op, g.tensorGradCarryCells.contains(c) {
-      stack.append(id)
+  var closure = tensorBPTTRecurrenceClosure(g: g, lastForwardId: lastForwardId)
+  guard !closure.isEmpty else { return blocks }
+
+  // True value edges only. seq carries a value on its second input; carry
+  // memoryReads produce their value from memory and list grad side-effect
+  // writers purely for ordering; memoryWrite's value is its second input
+  // (the first is the ordering seq). Treating ordering edges as value deps
+  // here would make the recurrence look like it consumes its own consumers.
+  func valueDeps(_ node: Node) -> [NodeID] {
+    switch node.op {
+    case .seq where node.inputs.count == 2:
+      return [node.inputs[1]]
+    case .memoryRead:
+      return []
+    case .memoryWrite where node.inputs.count == 2:
+      return [node.inputs[1]]
+    default:
+      return node.allDependencies
     }
   }
-  let closure = tensorBPTTRecurrenceClosure(g: g, lastForwardId: lastForwardId)
-  guard !closure.isEmpty else { return blocks }
+
+  func transitiveClosureConsumers(_ closure: Set<NodeID>) -> Set<NodeID> {
+    var consumerAdjacency: [NodeID: [NodeID]] = [:]
+    for (id, node) in g.nodes where id > lastForwardId && !closure.contains(id) {
+      for dep in valueDeps(node) where dep > lastForwardId {
+        consumerAdjacency[dep, default: []].append(id)
+      }
+    }
+    var consumers = Set<NodeID>()
+    var stack = Array(closure)
+    while let id = stack.popLast() {
+      for consumer in consumerAdjacency[id] ?? [] where consumers.insert(consumer).inserted {
+        stack.append(consumer)
+      }
+    }
+    return consumers
+  }
+
+  // Fixed-point eviction: a closure node whose value dep is produced by a
+  // chain that itself consumes closure output cannot run inside the
+  // consolidated reverse loop. The canonical case is a trainable phasor
+  // feeding the recurrence: the phasor's temporalGradStore input is the
+  // per-frame grad computed inside the recurrence, so its temporalGradRead
+  // is only available after the reverse loop completes — yet the read's
+  // consumer (an add merging temporal and per-frame grad contributions) is a
+  // carry-read descendant the closure walk sweeps in. Evict such nodes (and
+  // their in-closure value descendants); they read the closure's per-frame
+  // outputs from frame-aware cells in later blocks. If eviction would remove
+  // a carry write the recurrence itself is entangled with the tape — bail to
+  // the unconsolidated layout rather than emit a broken recurrence.
+  while true {
+    let consumers = transitiveClosureConsumers(closure)
+    var evicted = Set<NodeID>()
+    for id in closure {
+      guard let node = g.nodes[id] else { continue }
+      if valueDeps(node).contains(where: {
+        $0 > lastForwardId && !closure.contains($0) && consumers.contains($0)
+      }) {
+        evicted.insert(id)
+      }
+    }
+    if evicted.isEmpty { break }
+    var inClosureConsumers: [NodeID: [NodeID]] = [:]
+    for id in closure {
+      guard let node = g.nodes[id] else { continue }
+      for dep in valueDeps(node) where closure.contains(dep) {
+        inClosureConsumers[dep, default: []].append(id)
+      }
+    }
+    var evictStack = Array(evicted)
+    while let id = evictStack.popLast() {
+      for consumer in inClosureConsumers[id] ?? [] where evicted.insert(consumer).inserted {
+        evictStack.append(consumer)
+      }
+    }
+    for id in evicted {
+      guard let node = g.nodes[id] else { continue }
+      if case .memoryWrite(let c) = node.op, g.tensorGradCarryCells.contains(c) {
+        if debug {
+          print("BPTT-CONSOLIDATE bail: eviction would remove carry write \(id)")
+        }
+        return blocks
+      }
+    }
+    if debug {
+      print("BPTT-CONSOLIDATE evicting post-tape consumers: \(evicted.sorted())")
+    }
+    closure.subtract(evicted)
+    guard !closure.isEmpty else { return blocks }
+  }
 
   // Forward nodes whose values the closure consumes: the consolidated block
   // must be inserted after the last block that produces any of them (block
@@ -640,12 +722,39 @@ public func consolidateTensorBPTTBackwardBlocks(g: Graph, blocks: [Block], ctx: 
   }
 
   // Backward deps of the closure that were cut out of it (boundary nodes) must
-  // run before the consolidated block, alongside its forward deps.
+  // run before the consolidated block, alongside its forward deps. This must be
+  // transitively closed over the backward partition: isolated-pass adjoints are
+  // multi-phase chains (temporalGradStore → temporalGradScan → temporalGradRead,
+  // spectralLossFFTBatchedGradSpec → GradIFFT → GradRead) and the closure only
+  // consumes the final read. If the intermediate phases are left out of
+  // beforeDeps, pass 1 defers them and the descendants walk then drags the read
+  // itself after the consolidated block — a consumer scheduled before its
+  // producer (insufficientInputs at emission).
+  //
+  // A chain ancestor that is itself (transitively) a consumer of a closure node
+  // (e.g. a temporalGradStore whose input is the per-frame grad produced inside
+  // the recurrence) cannot run before the consolidated block; hitting one while
+  // expanding a boundary dep means that dep's whole chain must run after the
+  // closure, so it must not be pulled into beforeDeps.
+  let closureConsumers = transitiveClosureConsumers(closure)
+
   var beforeDeps = forwardDeps
+  var boundaryStack: [NodeID] = []
   for id in closure {
     guard let node = g.nodes[id] else { continue }
-    for dep in node.allDependencies where dep > lastForwardId && !closure.contains(dep) {
-      beforeDeps.insert(dep)
+    for dep in node.allDependencies
+    where dep > lastForwardId && !closure.contains(dep) && !closureConsumers.contains(dep) {
+      boundaryStack.append(dep)
+    }
+  }
+  var visitedBoundary = Set<NodeID>()
+  while let id = boundaryStack.popLast() {
+    guard visitedBoundary.insert(id).inserted else { continue }
+    beforeDeps.insert(id)
+    guard let node = g.nodes[id] else { continue }
+    for dep in node.allDependencies
+    where dep > lastForwardId && !closure.contains(dep) && !closureConsumers.contains(dep) {
+      boundaryStack.append(dep)
     }
   }
 
@@ -749,12 +858,57 @@ public func consolidateTensorBPTTBackwardBlocks(g: Graph, blocks: [Block], ctx: 
     movedConsumers.append(movedBlock)
   }
 
-  // Moved and deferred fragments are all backward nodes; order them by node ID
-  // (creation order is dependency order for backward nodes).
-  let tail = (movedConsumers + deferredBackward).sorted {
+  // Tail blocks (moved consumers + deferred leftovers) run immediately after
+  // the consolidated block, ahead of `after`. Any backward producer of a tail
+  // node still sitting in `after` (e.g. the temporalGradStore/Scan phases of a
+  // deferred temporalGradRead) would then execute after its consumer. Hoist
+  // those producers into the tail; node-ID sorting below restores dependency
+  // order (backward IDs are created in dependency order).
+  var tailFragments = movedConsumers + deferredBackward
+  var afterBlocks = after
+  let tailNodeSet = Set(tailFragments.flatMap { $0.nodes })
+  let beforeNodeSet = Set(before.flatMap { $0.nodes })
+  var neededByTail = Set<NodeID>()
+  var neededStack = Array(tailNodeSet)
+  while let id = neededStack.popLast() {
+    guard let node = g.nodes[id] else { continue }
+    for dep in node.allDependencies
+    where dep > lastForwardId && !closure.contains(dep) && !tailNodeSet.contains(dep)
+      && !beforeNodeSet.contains(dep)
+    {
+      if neededByTail.insert(dep).inserted { neededStack.append(dep) }
+    }
+  }
+  if !neededByTail.isEmpty {
+    var keptAfter: [Block] = []
+    for block in afterBlocks {
+      let hoisted = block.nodes.filter { neededByTail.contains($0) }
+      if hoisted.isEmpty {
+        keptAfter.append(block)
+        continue
+      }
+      var hoistedBlock = Block(frameOrder: block.frameOrder)
+      hoistedBlock.nodes = hoisted
+      hoistedBlock.shape = block.shape
+      hoistedBlock.temporality = block.temporality
+      hoistedBlock.tensorIndex = block.tensorIndex
+      tailFragments.append(hoistedBlock)
+      let stay = block.nodes.filter { !neededByTail.contains($0) }
+      if !stay.isEmpty {
+        var stayBlock = block
+        stayBlock.nodes = stay
+        keptAfter.append(stayBlock)
+      }
+    }
+    afterBlocks = keptAfter
+  }
+
+  // Order tail fragments by node ID (creation order is dependency order for
+  // backward nodes).
+  let tail = tailFragments.sorted {
     ($0.nodes.min() ?? 0) < ($1.nodes.min() ?? 0)
   }
-  let result = before + [bpttBlock] + tail + after
+  let result = before + [bpttBlock] + tail + afterBlocks
   if debug {
     print(
       "BPTT-CONSOLIDATE nodes=\(bpttBlock.nodes.count) at=\(before.count) "

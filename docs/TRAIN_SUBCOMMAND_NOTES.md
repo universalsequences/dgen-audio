@@ -36,11 +36,25 @@ start was 0.4855. Initial/post correlation over retained lanes was 0.992 for
 this deliberately short horizon, so this run validates throughput and basin
 quality, not the bead's expected weak-correlation result at 20-50 steps.
 
-Current backend limitation: tensor phasor-frequency and shared `accum` suffix
-adjoints are detached during the batched short horizon. Their temporal-gradient
-read blocks are scheduled after tensor-history SVF BPTT consumers. Population
-forward ranking still varies those dimensions, and both full scalar
-continuations train them normally. Arithmetic, exp/log transforms, tan/tanh,
+Tensor phasor-frequency and shared `accum` suffix adjoints are trainable in
+the batched short horizon (the detach workaround is removed). The
+block-formation composition bug — temporal-gradient read blocks scheduled
+after their tensor-history SVF BPTT consumers — was fixed in
+`consolidateTensorBPTTBackwardBlocks`: transitive `beforeDeps` over multi-phase
+isolated-pass adjoint chains, dependency-ordered tail placement, and
+fixed-point eviction of "sandwich" nodes (a grad add that is both a carry-read
+descendant and a `temporalGradRead` consumer, where the read's store input is
+computed inside the recurrence — it must run after the reverse loop, reading
+the closure's per-frame outputs from frame-aware cells). A shape-[1] tensor
+phasor grad additionally required the tensor store path in
+`emitTemporalGradient` (the scalar `elementCount == 1` fast path silently
+stored zeros). Verified end-to-end: `benchmarks/train_monologue` multistart
+smoke (8 candidates → 2 lanes → 3 batched Adam steps → continuations)
+completes with phasor/accum grads live. Regression coverage:
+`Tests/DGenLazyTests/TensorTemporalGradientCompositionTests.swift` (B=2 tensor
+phasor + coupled TensorHistory SVF, MSE + batched spectral, accum clock,
+B=2-vs-B=1 lane parity, finite differences).
+Arithmetic, exp/log transforms, tan/tanh,
 clip/wrap/comparisons/gswitch, PolyBLEP, noise broadcast, analytic ADSR,
 phasors (forward), scalar-to-lane broadcasting, Lisp `make-history` SVFs,
 tensor spectral loss, and per-lane params are enabled. Param-dependent discrete
