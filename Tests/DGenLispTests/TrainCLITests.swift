@@ -206,6 +206,22 @@ final class TrainCLITests: XCTestCase {
         }
     }
 
+    func testCMAESOptionsAreAcceptedByTrainContract() throws {
+        let io = try makeInputs()
+        let outcome = try runTrain(standardArgs(io) + [
+            "--search", "cma-es", "--cma-generations", "4",
+            "--cma-population", "16", "--cma-sigma", "0.15",
+            "--cma-seed", "7", "--cma-forward-batch", "8",
+            "--cma-continue", "2", "--local-epochs", "0",
+            "--cma-refine-epochs", "0", "--cma-final-epochs", "12",
+            "--cma-refine-mode", "scalar",
+        ])
+        XCTAssertEqual(outcome.exitStatus, 0, outcome.stderr)
+        guard case .result = outcome.events.last else {
+            return XCTFail("expected terminal result")
+        }
+    }
+
     func testSigtermCancelsPromptlyWithoutTerminalEvent() throws {
         let io = try makeInputs()
         var args = standardArgs(io)

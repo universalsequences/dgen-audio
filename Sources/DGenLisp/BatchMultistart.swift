@@ -171,17 +171,22 @@ enum BatchMultistart {
         return output
     }
 
-    private static func score(
+    static func score(
         candidates: [[Float]], transforms: [DirectionTrainer.TransformedParam],
         nodes: [ASTNode], scorer: TrainSpectralScorer, sampleRate: Float, crop: Int,
-        batchSize: Int, options: TrainOptions
+        batchSize: Int, options: TrainOptions,
+        timing: ((Double, Double, Double) -> Void)? = nil
     ) throws -> [Float] {
         var scores = [Float](repeating: .infinity, count: candidates.count)
+        var renderSeconds = 0.0
+        var deinterleaveSeconds = 0.0
+        var scoringSeconds = 0.0
         var start = 0
         while start < candidates.count {
             let actualCount = min(batchSize, candidates.count - start)
             var batch = Array(candidates[start..<(start + actualCount)])
             while batch.count < batchSize { batch.append(batch.last!) }
+            let renderStart = Date()
             DirectionTrainer.configureRuntime(options: options, sampleRate: sampleRate, crop: crop)
             LazyGraphContext.reset()
             let z = transforms.indices.map { d in
@@ -189,17 +194,24 @@ enum BatchMultistart {
             }
             let output = try evaluate(z: z, transforms: transforms, nodes: nodes)
             let flat = try output.realize(frames: crop)
+            renderSeconds += Date().timeIntervalSince(renderStart)
             for lane in 0..<actualCount {
+                let deinterleaveStart = Date()
                 var audio = [Float](repeating: 0, count: crop)
                 for frame in 0..<crop { audio[frame] = flat[frame * batchSize + lane] }
-                scores[start + lane] = scorer.score(audio)
+                deinterleaveSeconds += Date().timeIntervalSince(deinterleaveStart)
+                let scoringStart = Date()
+                let value = audio.allSatisfy(\.isFinite) ? scorer.score(audio) : .infinity
+                scoringSeconds += Date().timeIntervalSince(scoringStart)
+                scores[start + lane] = value.isFinite ? value : .infinity
             }
             start += actualCount
         }
+        timing?(renderSeconds, deinterleaveSeconds, scoringSeconds)
         return scores
     }
 
-    private static func refine(
+    static func refine(
         candidates: [[Float]], transforms: [DirectionTrainer.TransformedParam],
         nodes: [ASTNode], target: [Float], crop: Int, sampleRate: Float,
         steps: Int, options: TrainOptions
@@ -241,7 +253,7 @@ enum BatchMultistart {
         return (0..<lanes).map { lane in data.map { $0[lane] } }
     }
 
-    private static func diverseSelection(
+    static func diverseSelection(
         candidates: [[Float]], scores: [Float], count: Int
     ) -> [Int] {
         var selected = Array(0..<min(2, count))

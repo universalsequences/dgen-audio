@@ -24,6 +24,178 @@ dgenlisp compile [<file.lisp>] [options]
 - `<name>.dylib` — Compiled shared library exporting the DGen host ABI v1 entry points
 - `<name>.json` — Manifest with params, I/O, memory layout (also printed to stdout)
 
+## Parameter Training
+
+Fit bounded continuous patch parameters to a target WAV with `dgenlisp train`.
+The seed file has the form `{"params":{"cutoff":1200,"gain":0.5}}`.
+Only reachable parameters declaring `@min` and `@max` participate.
+
+```bash
+dgenlisp train \
+  --patch patch.lisp \
+  --target target.wav \
+  --seed-params seed.json \
+  --job-dir runs/my-fit
+```
+
+Training currently supports the `direction` mode and requires the Metal
+backend. The target is loaded as mono, peak-normalized to 0.9, and cropped or
+zero-padded to the planned frame count. Pitch and gate duration are estimated
+from the target unless supplied explicitly.
+
+Before training, the planner:
+
+1. parses the patch and applies the training excitation/lowering policy;
+2. classifies bounded, reachable parameters as learnable or frozen;
+3. emits a typed `plan` event and writes `lowered.lisp` and `render.lisp`;
+4. trains in normalized `[0,1]` coordinates, using logarithmic coordinates for
+   wide positive ranges;
+5. compares renders with a multi-resolution spectral objective; and
+6. writes the selected parameters and final render to the job directory.
+
+### Training options
+
+| Flag | Description | Default |
+|------|-------------|---------|
+| `--patch <file>` | DGenLisp patch to fit | required |
+| `--target <file>` | Target WAV; multichannel files are mono-summed | required |
+| `--seed-params <file>` | Initial parameter JSON | required |
+| `--job-dir <dir>` | Directory for all trainer artifacts | required |
+| `--mode direction` | Training mode; only `direction` is currently supported | `direction` |
+| `--epochs <N>` | Adam epochs for each full local trajectory | `300` |
+| `--gate-frames <N>` | Excitation gate duration in samples | inferred from target |
+| `--pitch-hz <value>` | Excitation pitch | estimated from target |
+| `--checkpoint-every <N>` | Preview WAV cadence | `25` |
+| `--report-every <N>` | NDJSON epoch-event cadence | `10` |
+| `--backend metal\|c` | Compute backend; full training currently requires Metal | `metal` |
+| `--plan-only` | Emit the lowering verdict and exit without training | off |
+| `--filter-surrogate none\|freq` | Replace SVFs with the experimental frequency-sampled training surrogate | `none` |
+| `--surrogate-window <N>` | Power-of-two surrogate FFT window | `1024` |
+| `--surrogate-hop <N>` | Surrogate hop, which must divide the window | `256` |
+| `--polish-epochs <N>` | True-SVF Adam epochs after surrogate training | `0` |
+
+The command writes progress as typed NDJSON events to stdout. Diagnostics go
+to stderr, so consumers can parse every stdout line as a train event. A normal
+run emits `plan`, `stage`, periodic `epoch`/`checkpoint`, and terminal `result`
+events. `--plan-only` stops after `plan`.
+
+General artifacts under `--job-dir` include:
+
+- `lowered.lisp` — the patch actually used by the training graph
+- `render.lisp` — the exact patch used for previews and final rendering
+- `seeded.wav` — render of the supplied seed
+- `epochNNNN.wav` — optional checkpoint renders
+- `final.wav` — selected final render
+- `result.json` — terminal result event
+
+### Search modes
+
+The default `--search legacy` runs one Adam trajectory from the supplied seed
+and a second trajectory from the transformed midpoint. The midpoint trajectory
+is a basin check; legacy mode still returns the user's seeded trajectory.
+
+`--search cma-es` performs tensor-batched, gradient-free global search and can
+optionally run an independent local fallback, short top-K Adam refinement, and
+a long winner-only Adam continuation. Every handoff uses the independent
+forward spectral score, and an Adam result that regresses keeps its input.
+
+### CMA-ES options
+
+| Flag | Description | Default |
+|------|-------------|---------|
+| `--search legacy\|cma-es` | Select the global-search policy | `legacy` |
+| `--cma-generations <N>` | Maximum CMA generations | `12` |
+| `--cma-population <N>` | Candidates per generation; `0` selects `max(32, 4 + floor(3*log(D)))` | `0` (automatic) |
+| `--cma-sigma <value>` | Initial standard deviation as a fraction of each transformed parameter range | `0.20` |
+| `--cma-seed <N>` | Deterministic optimizer RNG seed | `1` |
+| `--cma-forward-batch <N>` | Tensor lanes per render chunk; `0` uses the population size | `0` (automatic) |
+| `--local-epochs <N>` | Independent Adam fallback from the user's seed; `0` disables it | value of `--epochs` |
+| `--cma-continue <K>` | Diverse global candidates eligible for short Adam refinement | `3` |
+| `--cma-refine-epochs <N>` | Short Adam epochs per continued candidate; `0` disables top-K refinement | value of `--epochs` |
+| `--cma-refine-mode auto\|scalar\|batched` | Top-K refinement execution mode | `auto` |
+| `--cma-final-epochs <N>` | Long scalar Adam continuation of the independently selected global winner | `0` |
+
+### CMA-ES pipeline modes
+
+All stages are independently configurable. These recipes map directly to
+useful product/GUI modes:
+
+```bash
+# CMA only: no gradients
+--search cma-es --local-epochs 0 \
+--cma-refine-epochs 0 --cma-final-epochs 0
+
+# CMA + local fallback
+--search cma-es --local-epochs 300 \
+--cma-refine-epochs 0 --cma-final-epochs 0
+
+# CMA + short top-K polish
+--search cma-es --local-epochs 0 \
+--cma-continue 8 --cma-refine-epochs 5 \
+--cma-refine-mode batched --cma-final-epochs 0
+
+# CMA + short top-K polish + long winner training
+--search cma-es --local-epochs 0 \
+--cma-continue 8 --cma-refine-epochs 5 \
+--cma-refine-mode batched --cma-final-epochs 300
+```
+
+The full pipeline is:
+
+```text
+optional local seed Adam ───────────────────────────────┐
+                                                        ├─ final selection
+CMA search → optional top-K Adam → select global winner │
+                                  → optional final Adam ┘
+```
+
+The pre-Adam candidate is retained at both refinement boundaries. The local
+fallback competes only at final selection and never changes CMA sampling.
+
+For CMA-only fitting without gradient refinement:
+
+```bash
+dgenlisp train \
+  --patch patch.lisp \
+  --target target.wav \
+  --seed-params seed.json \
+  --job-dir runs/cma-only \
+  --search cma-es \
+  --local-epochs 0 \
+  --cma-refine-epochs 0 \
+  --cma-final-epochs 0
+```
+
+CMA runs write these artifacts under `--job-dir`:
+
+- `final.wav` — independently selected final render
+- `cma_es_report.json` — generation trace and separate local/global outcomes
+- `cma_es_state.json` — serialized optimizer state
+- `cma_best_generation_*.json` — best candidate retained from each generation
+
+The complete algorithm, coordinate transformation, fitness, and artifact
+schema are documented in [`docs/DGENLISP_CMA_ES_SPEC.md`](../../docs/DGENLISP_CMA_ES_SPEC.md).
+
+### Experimental multistart baseline
+
+The older one-shot tensor-lane multistart remains available as an experimental
+baseline when `--search legacy` is selected:
+
+| Flag | Description | Default |
+|------|-------------|---------|
+| `--multistart-candidates <N>` | Initial stratified candidates; `0` disables multistart | `0` |
+| `--multistart-lanes <N>` | Diverse candidates retained for batched Adam | `64` |
+| `--multistart-batch <N>` | Forward-render chunk size | `256` |
+| `--multistart-steps <N>` | Short batched Adam horizon | `30` |
+| `--multistart-seed <N>` | Deterministic population seed | `1` |
+
+A multistart run writes `multistart_report.json`. `--multistart-candidates`
+must be at least `--multistart-lanes` when enabled. CMA-ES takes precedence if
+`--search cma-es` and multistart flags are both supplied.
+
+Implementation caveats and protocol details are tracked in
+[`docs/TRAIN_SUBCOMMAND_NOTES.md`](../../docs/TRAIN_SUBCOMMAND_NOTES.md).
+
 ## Language Reference
 
 ### Comments

@@ -13,9 +13,9 @@ The intended product pipeline is:
 ```text
 user seed + declared parameter bounds
   -> tensor-batched CMA-ES basin search
-  -> retain local seed and several global candidates
-  -> optional scalar Adam refinement
-  -> independently score and report local versus global outcomes
+  -> retain the supplied seed and several global candidates
+  -> optional local, top-K, and winner-only Adam refinement
+  -> independently score and report enabled local versus global outcomes
 ```
 
 CMA-ES is the primary basin finder. Gradients become an optional final polish,
@@ -59,7 +59,8 @@ Complete gradients remain available as the final local-polish stage.
    with isolated recurrent state per lane.
 3. Learn coupled parameter directions such as drive/gain,
    cutoff/envelope-amount, and resonance/shape.
-4. Always preserve and separately report the user's local seed outcome.
+4. Always preserve and report the user's supplied seed score; separately run
+   and report its local Adam trajectory when `--local-epochs` is nonzero.
 5. Optionally refine the best global candidates with complete-gradient scalar
    or tensor-batched Adam.
 6. Make runs deterministic and leave a complete artifact trail.
@@ -89,9 +90,11 @@ dgenlisp train ...
   --cma-sigma 0.20
   --cma-seed 1
   --cma-forward-batch 64
+  --local-epochs 300
   --cma-continue 3
   --cma-refine-epochs 50
   --cma-refine-mode auto
+  --cma-final-epochs 0
 ```
 
 Defaults when `--search cma-es` is selected:
@@ -103,9 +106,11 @@ Defaults when `--search cma-es` is selected:
 | `--cma-sigma` | 0.20 | Initial standard deviation in normalized transformed coordinates |
 | `--cma-seed` | 1 | Deterministic random seed |
 | `--cma-forward-batch` | population size, capped by safe memory policy | Tensor lanes per render |
-| `--cma-continue` | 3 | Number of global candidates receiving scalar continuation |
-| `--cma-refine-epochs` | value of `--epochs` | Adam epochs per continued candidate; zero disables refinement |
+| `--local-epochs` | value of `--epochs` | Independent seeded Adam fallback; zero disables it |
+| `--cma-continue` | 3 | Number of diverse global candidates receiving short continuation |
+| `--cma-refine-epochs` | value of `--epochs` | Adam epochs per continued candidate; zero disables top-K refinement |
 | `--cma-refine-mode` | `auto` | `scalar`, `batched`, or occupancy-aware automatic selection |
+| `--cma-final-epochs` | 0 | Long scalar Adam continuation of the selected global winner; zero disables it |
 
 `--search legacy` preserves seeded+midpoint behavior. The existing
 `--multistart-candidates` prototype remains an experimental baseline until CMA
@@ -292,12 +297,17 @@ must not be presented as GPU-only throughput.
 
 After CMA terminates:
 
-1. Preserve the user's scalar seeded trajectory.
+1. Optionally preserve an independent scalar seeded trajectory for
+   `--local-epochs`; zero gives a genuinely gradient-free CMA-only run.
 2. Select `--cma-continue K` globally best candidates with a diversity floor.
-3. Run each through the normal scalar `DirectionTrainer` for
-   `--cma-refine-epochs`.
-4. Score all final renders with the independent fitness metric.
-5. Report:
+3. Optionally run each through scalar or batched Adam for
+   `--cma-refine-epochs` and independently reject regressions.
+4. Independently select the global winner.
+5. Optionally run that winner through scalar Adam for
+   `--cma-final-epochs`, again retaining its pre-Adam input on regression.
+6. Independently compare the global winner with the local fallback, when
+   enabled.
+7. Report:
    - original seed;
    - locally refined seed;
    - CMA best before Adam;

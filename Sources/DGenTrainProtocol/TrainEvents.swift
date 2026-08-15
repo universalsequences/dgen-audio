@@ -103,7 +103,7 @@ public struct ResultEvent: Codable, Equatable {
     public var improvementPct: Double
     /// Always reported alongside the percentage (corrected-baseline lesson).
     public var absDistance: Double
-    /// "ok" | "wrong_neighborhood"
+    /// "ok" | "wrong_neighborhood" | "not_run" (local fallback disabled)
     public var basinCheck: String
     public var deltas: [String: ParamDelta]
     public var seededWav: String

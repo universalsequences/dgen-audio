@@ -118,7 +118,12 @@ func printUsage() {
                               [--mode direction] [--epochs N] \\
                               [--gate-frames N] [--pitch-hz F] [--plan-only] \\
                               [--multistart-candidates N] [--multistart-lanes N] \\
-                              [--multistart-batch N] [--multistart-steps N]
+                              [--multistart-batch N] [--multistart-steps N] \\
+                              [--search legacy|cma-es] [--cma-generations N] \\
+                              [--cma-population N] [--cma-sigma F] [--cma-seed N] \\
+                              [--cma-forward-batch N] [--cma-continue N] \\
+                              [--local-epochs N] [--cma-refine-epochs N] \\
+                              [--cma-final-epochs N] [--cma-refine-mode MODE]
 
         Options:
           -o, --output <dir>       Output directory (default: .)

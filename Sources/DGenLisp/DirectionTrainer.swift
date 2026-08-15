@@ -114,34 +114,183 @@ enum DirectionTrainer {
             jobDir: jobDir, out: jobDir.seededWav, frames: crop,
             sampleRate: targetSampleRate, options: options)
 
-        let multistart = options.multistartCandidates > 0
+        let cma = options.search == "cma-es"
+            ? try CMAESSearch.search(
+                options: options, transforms: transforms, seedZ: seedZ,
+                nodes: patchPlan.loweredNodes, target: prepared,
+                sampleRate: targetSampleRate, crop: crop, sink: sink, jobDir: jobDir)
+            : nil
+        let multistart = cma == nil && options.multistartCandidates > 0
             ? try BatchMultistart.search(
                 options: options, transforms: transforms, seedZ: seedZ,
                 nodes: patchPlan.loweredNodes, target: prepared,
                 sampleRate: targetSampleRate, crop: crop, sink: sink, jobDir: jobDir)
             : nil
 
-        let seeded = try runPhase(
-            name: "train", initialZ: seedZ, epochs: epochs,
-            transforms: transforms, patchPlan: patchPlan, target: prepared,
-            sampleRate: targetSampleRate, crop: crop, options: options,
-            sink: sink, jobDir: jobDir, emitCheckpoints: true)
+        var finalPhase: PhaseResult
+        let basinCheck: String
+        let initialMetric: Float
 
-        let global = try runPhase(
-            name: multistart == nil ? "basin-check" : "global-candidate",
-            initialZ: multistart?.bestZ ?? coldZ, epochs: epochs,
-            transforms: transforms, patchPlan: patchPlan, target: prepared,
-            sampleRate: targetSampleRate, crop: crop, options: options,
-            sink: sink, jobDir: jobDir, emitCheckpoints: false)
+        if let cma {
+            // The local fallback is independently configurable. Zero enables
+            // a genuinely gradient-free CMA-only run.
+            let localEpochs = min(options.localEpochs ?? epochs, 2000)
+            let local = localEpochs > 0 ? try runPhase(
+                name: "train", initialZ: seedZ, epochs: localEpochs,
+                transforms: transforms, patchPlan: patchPlan, target: prepared,
+                sampleRate: targetSampleRate, crop: crop, options: options,
+                sink: sink, jobDir: jobDir, emitCheckpoints: true) : nil
 
-        let basinCheck =
-            global.bestLoss < basinDecisiveRatio * seeded.bestLoss ? "wrong_neighborhood" : "ok"
+            let refineEpochs = min(options.cmaRefineEpochs ?? epochs, 2000)
+            let starts = options.cmaContinue == 0
+                ? [cma.bestZ] : Array(cma.elites.prefix(options.cmaContinue))
+            let preScores = options.cmaContinue == 0
+                ? [cma.bestScore] : Array(cma.eliteScores.prefix(options.cmaContinue))
+            var refined: [PhaseResult]
+            if refineEpochs == 0 {
+                refined = zip(starts, preScores).map {
+                    PhaseResult(initLoss: $1, bestLoss: $1, bestZ: $0)
+                }
+            } else if options.cmaRefineMode == "batched" && starts.count > 1 {
+                try sink.emit(.stage(StageEvent(name: "cma-refine-batched", total: refineEpochs)))
+                let values = try BatchMultistart.refine(
+                    candidates: starts, transforms: transforms, nodes: patchPlan.loweredNodes,
+                    target: prepared, crop: crop, sampleRate: targetSampleRate,
+                    steps: refineEpochs, options: options)
+                refined = zip(values, preScores).map {
+                    PhaseResult(initLoss: $1, bestLoss: .infinity, bestZ: $0)
+                }
+            } else {
+                refined = []
+                for (index, start) in starts.enumerated() {
+                    refined.append(try runPhase(
+                        name: "cma-refine-\(index + 1)", initialZ: start,
+                        epochs: refineEpochs, transforms: transforms,
+                        patchPlan: patchPlan, target: prepared,
+                        sampleRate: targetSampleRate, crop: crop, options: options,
+                        sink: sink, jobDir: jobDir, emitCheckpoints: false))
+                }
+            }
 
-        // Multistart is explicitly a global-fit opt-in, so its full-horizon
-        // continuation may win the final artifact. The report still records
-        // the local seed trajectory separately. Legacy direction mode keeps
-        // returning the seeded trajectory and uses midpoint only as a check.
-        var finalPhase = multistart != nil && global.bestLoss < seeded.bestLoss ? global : seeded
+            // Every handoff is selected with the independent forward scorer;
+            // neither short nor winner-only Adam may replace a better input.
+            let scorer = try TrainSpectralScorer(
+                target: prepared, windows: spectralWindows, epsilon: logEpsilon)
+            func scores(_ candidates: [[Float]]) throws -> [Float] {
+                try BatchMultistart.score(
+                    candidates: candidates, transforms: transforms,
+                    nodes: patchPlan.loweredNodes, scorer: scorer,
+                    sampleRate: targetSampleRate, crop: crop,
+                    batchSize: min(candidates.count, max(
+                        1, options.cmaForwardBatch > 0
+                            ? options.cmaForwardBatch : candidates.count)),
+                    options: options)
+            }
+
+            let packed = (local.map { [$0.bestZ] } ?? []) + refined.map(\.bestZ)
+            let independent = try scores(packed)
+            let localScore = local == nil ? nil : independent[0]
+            let globalOffset = local == nil ? 0 : 1
+            var accepted = [PhaseResult]()
+            var continued = [[String: Any]]()
+            for index in refined.indices {
+                let post = independent[index + globalOffset]
+                let pre = preScores[index]
+                let keepPost = post.isFinite && post <= pre
+                accepted.append(keepPost
+                    ? PhaseResult(initLoss: pre, bestLoss: post, bestZ: refined[index].bestZ)
+                    : PhaseResult(initLoss: pre, bestLoss: pre, bestZ: starts[index]))
+                continued.append([
+                    "index": index,
+                    "pre_score": pre.isFinite ? Double(pre) : NSNull(),
+                    "post_score": post.isFinite ? Double(post) : NSNull(),
+                    "selected": keepPost ? "post_adam" : "pre_adam",
+                ])
+            }
+            let winnerIndex = accepted.indices.min {
+                accepted[$0].bestLoss == accepted[$1].bestLoss
+                    ? $0 < $1 : accepted[$0].bestLoss < accepted[$1].bestLoss
+            } ?? 0
+            var globalWinner = accepted[winnerIndex]
+            let beforeFinal = globalWinner
+            var finalRefinement: [String: Any] = [
+                "epochs": options.cmaFinalEpochs, "selected": "not_run",
+            ]
+            if options.cmaFinalEpochs > 0 {
+                let trained = try runPhase(
+                    name: "cma-final", initialZ: globalWinner.bestZ,
+                    epochs: min(options.cmaFinalEpochs, 2000),
+                    transforms: transforms, patchPlan: patchPlan, target: prepared,
+                    sampleRate: targetSampleRate, crop: crop, options: options,
+                    sink: sink, jobDir: jobDir, emitCheckpoints: false)
+                let postFinal = try scores([trained.bestZ])[0]
+                let keepFinal = postFinal.isFinite && postFinal <= beforeFinal.bestLoss
+                if keepFinal {
+                    globalWinner = PhaseResult(
+                        initLoss: beforeFinal.bestLoss, bestLoss: postFinal,
+                        bestZ: trained.bestZ)
+                }
+                finalRefinement = [
+                    "epochs": min(options.cmaFinalEpochs, 2000),
+                    "pre_score": beforeFinal.bestLoss.isFinite
+                        ? Double(beforeFinal.bestLoss) : NSNull(),
+                    "post_score": postFinal.isFinite ? Double(postFinal) : NSNull(),
+                    "selected": keepFinal ? "post_adam" : "pre_adam",
+                ]
+            }
+
+            if let local, let localScore {
+                let scoredLocal = PhaseResult(
+                    initLoss: local.initLoss, bestLoss: localScore, bestZ: local.bestZ)
+                finalPhase = localScore <= globalWinner.bestLoss ? scoredLocal : globalWinner
+                basinCheck = globalWinner.bestLoss < basinDecisiveRatio * localScore
+                    ? "wrong_neighborhood" : "ok"
+            } else {
+                finalPhase = globalWinner
+                basinCheck = "not_run"
+            }
+            initialMetric = cma.seedScore
+
+            var report = cma.report
+            report["continued_candidates"] = continued
+            report["final_refinement"] = finalRefinement
+            if let local, let localScore {
+                report["local_seed_outcome"] = [
+                    "enabled": true,
+                    "epochs": localEpochs,
+                    "score": localScore.isFinite ? Double(localScore) : NSNull(),
+                    "z": local.bestZ.map(Double.init),
+                ] as [String: Any]
+            } else {
+                report["local_seed_outcome"] = [
+                    "enabled": false, "epochs": 0,
+                ] as [String: Any]
+            }
+            report["global_outcome"] = [
+                "score": globalWinner.bestLoss.isFinite
+                    ? Double(globalWinner.bestLoss) : NSNull(),
+                "z": globalWinner.bestZ.map(Double.init),
+                "selected_final": finalPhase.bestZ == globalWinner.bestZ,
+            ] as [String: Any]
+            try CMAESSearch.writeReport(report, jobDir: jobDir)
+        } else {
+            let seeded = try runPhase(
+                name: "train", initialZ: seedZ, epochs: epochs,
+                transforms: transforms, patchPlan: patchPlan, target: prepared,
+                sampleRate: targetSampleRate, crop: crop, options: options,
+                sink: sink, jobDir: jobDir, emitCheckpoints: true)
+            let global = try runPhase(
+                name: multistart == nil ? "basin-check" : "global-candidate",
+                initialZ: multistart?.bestZ ?? coldZ, epochs: epochs,
+                transforms: transforms, patchPlan: patchPlan, target: prepared,
+                sampleRate: targetSampleRate, crop: crop, options: options,
+                sink: sink, jobDir: jobDir, emitCheckpoints: false)
+            basinCheck = global.bestLoss < basinDecisiveRatio * seeded.bestLoss
+                ? "wrong_neighborhood" : "ok"
+            finalPhase = multistart != nil && global.bestLoss < seeded.bestLoss
+                ? global : seeded
+            initialMetric = seeded.initLoss
+        }
 
         // Optional handoff to the real recurrent SVF. Parameters are shared,
         // so no projection or decoding is required.
@@ -170,8 +319,8 @@ enum DirectionTrainer {
                 from: Double(p.seedValue), to: Double(finalNatural[p.name] ?? p.seedValue))
         }
         let improvement =
-            seeded.initLoss > 0
-            ? 100.0 * Double(seeded.initLoss - finalPhase.bestLoss) / Double(seeded.initLoss)
+            initialMetric.isFinite && initialMetric > 0
+            ? 100.0 * Double(initialMetric - finalPhase.bestLoss) / Double(initialMetric)
             : 0
         return ResultEvent(
             improvementPct: improvement,

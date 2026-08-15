@@ -42,6 +42,24 @@ public struct TrainOptions: Equatable {
     public var multistartSteps: Int = 30
     public var multistartSeed: Int = 1
 
+    /// Global-search policy. `legacy` preserves seeded + midpoint training.
+    public var search: String = "legacy"
+    public var cmaGenerations: Int = 12
+    /// Zero selects the dimension-derived default.
+    public var cmaPopulation: Int = 0
+    public var cmaSigma: Double = 0.20
+    public var cmaSeed: Int = 1
+    /// Zero selects the population size.
+    public var cmaForwardBatch: Int = 0
+    public var cmaContinue: Int = 3
+    /// nil selects --epochs; zero disables top-K Adam refinement.
+    public var cmaRefineEpochs: Int?
+    public var cmaRefineMode: String = "auto"
+    /// nil selects --epochs; zero disables the independent local fallback.
+    public var localEpochs: Int?
+    /// Long scalar Adam continuation applied only to the selected global winner.
+    public var cmaFinalEpochs: Int = 0
+
     /// Emit the plan event and exit successfully (no GPU time and no result
     /// event).
     public var planOnly: Bool = false
@@ -85,6 +103,17 @@ public struct TrainOptions: Equatable {
         var multistartBatch = 256
         var multistartSteps = 30
         var multistartSeed = 1
+        var search = "legacy"
+        var cmaGenerations = 12
+        var cmaPopulation = 0
+        var cmaSigma = 0.20
+        var cmaSeed = 1
+        var cmaForwardBatch = 0
+        var cmaContinue = 3
+        var cmaRefineEpochs: Int?
+        var cmaRefineMode = "auto"
+        var localEpochs: Int?
+        var cmaFinalEpochs = 0
         var fake = environment["DGENLISP_FAKE_TRAINER"] != nil
         var fakeFailAtEpoch: Int?
         var fakeEpochMs = 0
@@ -137,6 +166,22 @@ public struct TrainOptions: Equatable {
             case "--multistart-batch": multistartBatch = try intValue(arg)
             case "--multistart-steps": multistartSteps = try intValue(arg)
             case "--multistart-seed": multistartSeed = try intValue(arg)
+            case "--search": search = try value(arg)
+            case "--cma-generations": cmaGenerations = try intValue(arg)
+            case "--cma-population": cmaPopulation = try intValue(arg)
+            case "--cma-sigma":
+                let raw = try value(arg)
+                guard let parsed = Double(raw) else {
+                    throw TrainProtocolError("Invalid number for --cma-sigma: \(raw)")
+                }
+                cmaSigma = parsed
+            case "--cma-seed": cmaSeed = try intValue(arg)
+            case "--cma-forward-batch": cmaForwardBatch = try intValue(arg)
+            case "--cma-continue": cmaContinue = try intValue(arg)
+            case "--cma-refine-epochs": cmaRefineEpochs = try intValue(arg)
+            case "--cma-refine-mode": cmaRefineMode = try value(arg)
+            case "--local-epochs": localEpochs = try intValue(arg)
+            case "--cma-final-epochs": cmaFinalEpochs = try intValue(arg)
             case "--plan-only": planOnly = true
             case "--fake-trainer": fake = true
             case "--fake-fail-at-epoch": fakeFailAtEpoch = try intValue(arg)
@@ -174,6 +219,18 @@ public struct TrainOptions: Equatable {
         if multistartCandidates > 0 && multistartCandidates < multistartLanes {
             throw TrainProtocolError("--multistart-candidates must be >= --multistart-lanes")
         }
+        guard search == "legacy" || search == "cma-es" else {
+            throw TrainProtocolError("Invalid --search: \(search) (legacy|cma-es)")
+        }
+        guard cmaGenerations >= 1, cmaPopulation == 0 || cmaPopulation >= 4,
+              cmaSigma.isFinite, cmaSigma > 0, cmaForwardBatch >= 0,
+              cmaContinue >= 0, (cmaRefineEpochs ?? 0) >= 0,
+              (localEpochs ?? 0) >= 0, cmaFinalEpochs >= 0 else {
+            throw TrainProtocolError("invalid CMA-ES numeric option")
+        }
+        guard ["auto", "scalar", "batched"].contains(cmaRefineMode) else {
+            throw TrainProtocolError("Invalid --cma-refine-mode: \(cmaRefineMode) (auto|scalar|batched)")
+        }
         if let reportEvery {
             guard reportEvery > 0 else {
                 throw TrainProtocolError("--report-every must be > 0")
@@ -199,6 +256,17 @@ public struct TrainOptions: Equatable {
         options.multistartBatch = multistartBatch
         options.multistartSteps = multistartSteps
         options.multistartSeed = multistartSeed
+        options.search = search
+        options.cmaGenerations = cmaGenerations
+        options.cmaPopulation = cmaPopulation
+        options.cmaSigma = cmaSigma
+        options.cmaSeed = cmaSeed
+        options.cmaForwardBatch = cmaForwardBatch
+        options.cmaContinue = cmaContinue
+        options.cmaRefineEpochs = cmaRefineEpochs
+        options.cmaRefineMode = cmaRefineMode
+        options.localEpochs = localEpochs
+        options.cmaFinalEpochs = cmaFinalEpochs
         options.planOnly = planOnly
         options.useFakeTrainer = fake
         options.fakeFailAtEpoch = fakeFailAtEpoch
