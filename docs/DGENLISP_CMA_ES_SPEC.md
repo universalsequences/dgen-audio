@@ -42,12 +42,14 @@ unmodified complicated Lisp patch can be evaluated as independent candidates:
 - best score after five Adam steps: 0.4812.
 
 At this operating point, thousands of forward fitness evaluations cost about
-the same as a handful of batched backward steps. Forward evaluation also
-supports the complete phasor + SVF topology, while tensor temporal-gradient
-composition currently requires detaching phasor and accumulator adjoints.
+the same as a handful of batched backward steps. Forward and backward now both
+support the complete phasor + SVF topology after `cd3aa3b`; the earlier tensor
+temporal-gradient detach workaround has been removed and composition is pinned
+by `TensorTemporalGradientCompositionTests`.
 
-A covariance-adapting forward optimizer is therefore potentially both faster
-and more globally effective than using Adam to discover basins.
+A covariance-adapting forward optimizer is therefore attractive because of
+its search economics and global behavior, not because gradients are incomplete.
+Complete gradients remain available as the final local-polish stage.
 
 ## Goals
 
@@ -58,8 +60,8 @@ and more globally effective than using Adam to discover basins.
 3. Learn coupled parameter directions such as drive/gain,
    cutoff/envelope-amount, and resonance/shape.
 4. Always preserve and separately report the user's local seed outcome.
-5. Optionally refine the best global candidates with the normal scalar trainer,
-   where complete temporal gradients work.
+5. Optionally refine the best global candidates with complete-gradient scalar
+   or tensor-batched Adam.
 6. Make runs deterministic and leave a complete artifact trail.
 7. Compare against seeded+midpoint and random/stratified multistart at equal
    wall-clock and equal forward-evaluation budgets.
@@ -89,6 +91,7 @@ dgenlisp train ...
   --cma-forward-batch 64
   --cma-continue 3
   --cma-refine-epochs 50
+  --cma-refine-mode auto
 ```
 
 Defaults when `--search cma-es` is selected:
@@ -101,7 +104,8 @@ Defaults when `--search cma-es` is selected:
 | `--cma-seed` | 1 | Deterministic random seed |
 | `--cma-forward-batch` | population size, capped by safe memory policy | Tensor lanes per render |
 | `--cma-continue` | 3 | Number of global candidates receiving scalar continuation |
-| `--cma-refine-epochs` | value of `--epochs` | Scalar Adam epochs per continued candidate; zero disables refinement |
+| `--cma-refine-epochs` | value of `--epochs` | Adam epochs per continued candidate; zero disables refinement |
+| `--cma-refine-mode` | `auto` | `scalar`, `batched`, or occupancy-aware automatic selection |
 
 `--search legacy` preserves seeded+midpoint behavior. The existing
 `--multistart-candidates` prototype remains an experimental baseline until CMA
@@ -300,9 +304,11 @@ After CMA terminates:
    - each CMA candidate after Adam;
    - globally selected final result.
 
-Scalar refinement is intentional in v1. It supports complete phasor + SVF
-and accumulator + SVF temporal gradients. Batched Adam can replace it after
-the tensor temporal-gradient composition blocker is fixed and validated.
+Both refinement paths support complete phasor + SVF and accumulator + SVF
+temporal gradients after `cd3aa3b`. Use scalar refinement for a small top-K;
+use tensor-batched refinement when enough diverse elites/restarts can be packed
+to amortize backward execution. Selection must still use the independent
+forward fitness, not the reduced batched training loss.
 
 If refinement is disabled, CMA's best candidate is still a valid final product
 result.
@@ -464,7 +470,7 @@ it is a goal, not an extrapolated result.
 
 - Add `--search cma-es` and options.
 - Preserve local seed versus global candidate semantics.
-- Add top-K scalar continuation and final independent selection.
+- Add top-K scalar/batched continuation and final independent selection.
 - Support cancellation and wall-clock limits.
 
 ### M4 — Product decision benchmark
