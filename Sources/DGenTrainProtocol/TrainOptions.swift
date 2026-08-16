@@ -236,6 +236,13 @@ public struct TrainOptions: Equatable {
                 throw TrainProtocolError("--report-every must be > 0")
             }
         }
+        if let checkpointEvery {
+            // Used directly as a modulus; zero would trap the process with no
+            // terminal event instead of the contracted error event + exit 1.
+            guard checkpointEvery > 0 else {
+                throw TrainProtocolError("--checkpoint-every must be > 0")
+            }
+        }
 
         var options = TrainOptions(
             patchPath: patchPath, targetPath: targetPath,

@@ -128,8 +128,8 @@ public struct AudioFile {
             let chunkDataStart = offset + 8
 
             if chunkId == "fmt " {
-                guard chunkSize >= 16 else {
-                    throw AudioFileError.invalidFormat("fmt chunk too small")
+                guard chunkSize >= 16, chunkDataStart + 16 <= data.count else {
+                    throw AudioFileError.invalidFormat("fmt chunk truncated")
                 }
                 audioFormat = readUInt16(from: data, at: chunkDataStart)
                 numChannels = readUInt16(from: data, at: chunkDataStart + 2)
@@ -153,8 +153,30 @@ public struct AudioFile {
         guard foundData else { throw AudioFileError.invalidFormat("No data chunk found") }
         guard numChannels >= 1 else { throw AudioFileError.invalidFormat("Invalid channel count") }
 
+        // The declared data size is untrusted: truncated files and streaming
+        // encoders (which write 0 or 0xFFFFFFFF as a placeholder) would drive a
+        // bogus allocation and read past the end of the buffer. Clamp before
+        // anything sizes an allocation or an offset.
+        guard dataOffset < data.count else {
+            throw AudioFileError.invalidFormat("data chunk offset past end of file")
+        }
+        let availableBytes = data.count - dataOffset
+        if dataSize > availableBytes { dataSize = availableBytes }
+
         let channels = Int(numChannels)
         var samples: [Float]
+
+        /// Floor the payload to whole frames so `totalSamples == framesCount *
+        /// channels` exactly (otherwise the fill loop indexes past the array).
+        func usableSamples(bytesPerSample: Int) throws -> (total: Int, frames: Int) {
+            let frameBytes = channels * bytesPerSample
+            let usableBytes = (dataSize / frameBytes) * frameBytes
+            guard usableBytes > 0 else {
+                throw AudioFileError.invalidFormat("data chunk has no complete frames")
+            }
+            let total = usableBytes / bytesPerSample
+            return (total, total / channels)
+        }
 
         switch audioFormat {
         case 1:  // PCM integer
@@ -162,15 +184,15 @@ public struct AudioFile {
                 throw AudioFileError.unsupportedFormat("PCM \(bitsPerSample)-bit (only 16-bit and 24-bit supported)")
             }
             let bytesPerSample = Int(bitsPerSample / 8)
-            let totalSamples = dataSize / bytesPerSample
-            let framesCount = totalSamples / channels
+            let (totalSamples, framesCount) = try usableSamples(bytesPerSample: bytesPerSample)
             samples = [Float](repeating: 0, count: framesCount * channels)
 
             data.withUnsafeBytes { buf in
                 for i in 0..<totalSamples {
                     let byteOffset = dataOffset + i * bytesPerSample
                     if bitsPerSample == 16 {
-                        let raw = buf.load(fromByteOffset: byteOffset, as: Int16.self).littleEndian
+                        let raw = buf.loadUnaligned(fromByteOffset: byteOffset, as: Int16.self)
+                            .littleEndian
                         samples[i] = Float(raw) / 32768.0
                     } else {
                         let b0 = Int32(buf[byteOffset])
@@ -189,13 +211,15 @@ public struct AudioFile {
             guard bitsPerSample == 32 else {
                 throw AudioFileError.unsupportedFormat("Float \(bitsPerSample)-bit (only 32-bit supported)")
             }
-            let totalSamples = dataSize / 4
-            let framesCount = totalSamples / channels
+            let (totalSamples, framesCount) = try usableSamples(bytesPerSample: 4)
             samples = [Float](repeating: 0, count: framesCount * channels)
 
             data.withUnsafeBytes { buf in
                 for i in 0..<totalSamples {
-                    samples[i] = buf.load(fromByteOffset: dataOffset + i * 4, as: Float.self)
+                    let bits = buf.loadUnaligned(
+                        fromByteOffset: dataOffset + i * 4, as: UInt32.self
+                    ).littleEndian
+                    samples[i] = Float(bitPattern: bits)
                 }
             }
 
@@ -223,15 +247,17 @@ public struct AudioFile {
 
     // MARK: - Binary Helpers
 
+    // Chunk walking only preserves 2-byte alignment, so every raw load in the
+    // WAV path must be unaligned (aligned `load` traps in debug builds).
     static func readUInt32(from data: Data, at offset: Int) -> UInt32 {
         data.withUnsafeBytes { buf in
-            buf.load(fromByteOffset: offset, as: UInt32.self).littleEndian
+            buf.loadUnaligned(fromByteOffset: offset, as: UInt32.self).littleEndian
         }
     }
 
     static func readUInt16(from data: Data, at offset: Int) -> UInt16 {
         data.withUnsafeBytes { buf in
-            buf.load(fromByteOffset: offset, as: UInt16.self).littleEndian
+            buf.loadUnaligned(fromByteOffset: offset, as: UInt16.self).littleEndian
         }
     }
 }

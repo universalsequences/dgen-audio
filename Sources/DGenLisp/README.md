@@ -115,7 +115,7 @@ forward spectral score, and an Adam result that regresses keeps its input.
 | `--local-epochs <N>` | Independent Adam fallback from the user's seed; `0` disables it | value of `--epochs` |
 | `--cma-continue <K>` | Diverse global candidates eligible for short Adam refinement | `3` |
 | `--cma-refine-epochs <N>` | Short Adam epochs per continued candidate; `0` disables top-K refinement | value of `--epochs` |
-| `--cma-refine-mode auto\|scalar\|batched` | Top-K refinement execution mode | `auto` |
+| `--cma-refine-mode auto\|scalar\|batched` | Top-K refinement execution mode; `auto` uses the lane-parallel batched path only when `--cma-continue` >= 8, scalar otherwise (resolved mode is logged and reported as `refine_mode`) | `auto` |
 | `--cma-final-epochs <N>` | Long scalar Adam continuation of the independently selected global winner | `0` |
 
 ### CMA-ES pipeline modes

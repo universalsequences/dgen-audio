@@ -133,7 +133,7 @@ enum DirectionTrainer {
 
         var finalPhase: PhaseResult
         let basinCheck: String
-        let initialMetric: Float
+        var initialMetric: Float
 
         if let cma {
             // The local fallback is independently configurable. Zero enables
@@ -150,12 +150,17 @@ enum DirectionTrainer {
                 ? [cma.bestZ] : Array(cma.elites.prefix(options.cmaContinue))
             let preScores = options.cmaContinue == 0
                 ? [cma.bestScore] : Array(cma.eliteScores.prefix(options.cmaContinue))
+            // "auto" is occupancy-aware: the lane-parallel path only pays off
+            // once there are enough lanes to fill the GPU.
+            let batchedRefine = starts.count > 1 && (
+                options.cmaRefineMode == "batched"
+                    || (options.cmaRefineMode == "auto" && starts.count >= 8))
             var refined: [PhaseResult]
             if refineEpochs == 0 {
                 refined = zip(starts, preScores).map {
                     PhaseResult(initLoss: $1, bestLoss: $1, bestZ: $0)
                 }
-            } else if options.cmaRefineMode == "batched" && starts.count > 1 {
+            } else if batchedRefine {
                 try sink.emit(.stage(StageEvent(name: "cma-refine-batched", total: refineEpochs)))
                 let values = try BatchMultistart.refine(
                     candidates: starts, transforms: transforms,
@@ -174,7 +179,7 @@ enum DirectionTrainer {
                 refined = []
                 for (index, start) in starts.enumerated() {
                     refined.append(try runPhase(
-                        name: "cma-refine-\(index + 1)", initialZ: start,
+                        name: "cma-refine-scalar-\(index + 1)", initialZ: start,
                         epochs: refineEpochs, transforms: transforms,
                         patchPlan: patchPlan, target: prepared,
                         sampleRate: targetSampleRate, crop: crop, options: options,
@@ -264,6 +269,7 @@ enum DirectionTrainer {
 
             var report = cma.report
             report["continued_candidates"] = continued
+            report["refine_mode"] = batchedRefine ? "batched" : "scalar"
             report["final_refinement"] = finalRefinement
             if let local, let localScore {
                 report["local_seed_outcome"] = [
@@ -334,12 +340,37 @@ enum DirectionTrainer {
                 parameterValues: patchPlan.parameterValues,
                 fatalUnsupported: patchPlan.fatalUnsupported,
                 loweredNodes: patchPlan.renderNodes, renderNodes: patchPlan.renderNodes)
-            finalPhase = try runPhase(
-                name: "polish", initialZ: finalPhase.bestZ,
+            let prePolish = finalPhase
+            let trained = try runPhase(
+                name: "polish", initialZ: prePolish.bestZ,
                 epochs: min(options.polishEpochs, 2000),
                 transforms: transforms, patchPlan: trueSVFPlan, target: prepared,
                 sampleRate: targetSampleRate, crop: crop, options: options,
                 sink: sink, jobDir: jobDir, emitCheckpoints: false)
+            // runPhase reports the GPU training loss, which is not comparable to
+            // the canonical CPU log-MR-STFT scorer used everywhere else. Re-score
+            // seed / pre-polish / polished on the TRUE-SVF render nodes (the
+            // surrogate lowering renders different audio) and only accept an
+            // improvement, mirroring the cma-final guard above.
+            let polishScorer = try TrainSpectralScorer(
+                target: prepared, windows: spectralWindows, epsilon: logEpsilon)
+            let polishScores = try BatchMultistart.score(
+                candidates: [seedZ, prePolish.bestZ, trained.bestZ], transforms: transforms,
+                parameterValues: patchPlan.parameterValues,
+                nodes: patchPlan.renderNodes, scorer: polishScorer,
+                sampleRate: targetSampleRate, crop: crop,
+                batchSize: 3, options: options)
+            let seedScoreOnRenderNodes = polishScores[0]
+            let preScore = polishScores[1]
+            let postScore = polishScores[2]
+            let keepPolish = postScore.isFinite && postScore <= preScore
+            finalPhase = keepPolish
+                ? PhaseResult(initLoss: preScore, bestLoss: postScore, bestZ: trained.bestZ)
+                : PhaseResult(initLoss: preScore, bestLoss: preScore, bestZ: prePolish.bestZ)
+            initialMetric = seedScoreOnRenderNodes
+            FileHandle.standardError.write(Data(String(
+                format: "[train] polish pre=%.6g post=%.6g selected=%@\n",
+                preScore, postScore, keepPolish ? "post_polish" : "pre_polish").utf8))
         }
 
         try renderViaSubprocess(
@@ -523,7 +554,7 @@ enum DirectionTrainer {
                                 .mapValues(Double.init),
                             steps: normalizedSteps)))
             }
-            if emitCheckpoints, epoch % checkpointEvery == 0, epoch < epochs {
+            if emitCheckpoints, checkpointEvery > 0, epoch % checkpointEvery == 0, epoch < epochs {
                 // (cadence: --checkpoint-every, default 25)
                 let wav = jobDir.epochWav(epoch)
                 do {

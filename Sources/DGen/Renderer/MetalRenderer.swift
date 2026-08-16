@@ -246,14 +246,28 @@ public class MetalRenderer: Renderer, UOpEmitter {
       var fixedWriteCells = Set<CellID>()
       var writeIndices = Set<Int>()
       var eligible = true
+      // "Last frame wins" only reproduces the serial result when the write runs
+      // on EVERY frame. A write under a beginIf/beginHopCheck may not, so any
+      // conditionally executed fixed-address write disqualifies the rewrite.
+      // Element loops (beginForLoop/beginParallelRange) are not conditionals:
+      // a constant-offset write inside one still executes each frame.
+      var conditionalDepth = 0
 
       for (bodyIndex, uop) in body.enumerated() {
         switch uop.op {
         case .load(let cell), .memoryRead(let cell, _), .simdBroadcastLoad(let cell, _),
           .simdgroupLoad(let cell, _, _, _):
           readCells.insert(cell)
+        case .beginIf, .beginHopCheck:
+          conditionalDepth += 1
+        case .endIf, .endHopCheck:
+          conditionalDepth = max(0, conditionalDepth - 1)
         case .memoryWrite(let cell, let offset, _):
           guard case .constant = offset else {
+            eligible = false
+            continue
+          }
+          if conditionalDepth > 0 {
             eligible = false
             continue
           }
@@ -290,6 +304,7 @@ public class MetalRenderer: Renderer, UOpEmitter {
           break
         }
       }
+      if conditionalDepth != 0 { eligible = false }
 
       guard eligible, !fixedWriteCells.isEmpty,
         fixedWriteCells.isDisjoint(with: readCells)

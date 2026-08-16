@@ -1646,6 +1646,16 @@ private func peelHopTensorRuns(
   _ block: Block, graph: Graph, hopBasedNodes: [NodeID: (Int, NodeID)]
 ) -> [(block: Block, peeled: Bool)] {
   guard !hopBasedNodes.isEmpty else { return [(block, false)] }
+  // A sequential block is one kernel with its own `for frame` loop. Splitting it
+  // turns a single interleaved frame loop into several full passes over all
+  // frames, which destroys any recurrence A(f) -> B(f) -> A(f+1) carried by the
+  // nodes left behind — even when the peeled node itself is pure tensor math.
+  // Refuse to split any multi-node block that carries cross-frame state.
+  if block.nodes.count > 1,
+    block.nodes.contains(where: { !(graph.nodes[$0]?.op.persistentStateCellIds.isEmpty ?? true) })
+  {
+    return [(block, false)]
+  }
   var result: [(block: Block, peeled: Bool)] = []
   var run: [NodeID] = []
   var runPeeled = false

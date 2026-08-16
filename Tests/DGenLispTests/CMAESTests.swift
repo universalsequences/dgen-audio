@@ -63,6 +63,29 @@ final class CMAESTests: XCTestCase {
         XCTAssertGreaterThan(cma.conditionNumber, 10, "optimizer should adapt non-spherical covariance")
     }
 
+    /// Elite selection must not hand back the same point twice: the CMA archive
+    /// clusters tightly as it converges, and the multistart-specific "always
+    /// keep indices 0 and 1" convention bypasses the diversity floor.
+    func testDiverseSelectionKeepsOnlyMandatoryWithoutFloor() {
+        let candidates: [[Float]] = [
+            [0.5, 0.5],        // best
+            [0.5, 0.5001],     // near-duplicate of the best
+            [0.9, 0.1],        // genuinely different
+            [0.1, 0.9],
+        ]
+        let scores: [Float] = [1.0, 1.0001, 2.0, 3.0]
+        let elites = BatchMultistart.diverseSelection(
+            candidates: candidates, scores: scores, count: 3, mandatory: [0]
+        ).map { candidates[$0] }
+
+        XCTAssertEqual(elites.count, 3)
+        XCTAssertEqual(elites[0], candidates[0])
+        XCTAssertFalse(
+            elites.contains(candidates[1]),
+            "near-duplicate of the best must be rejected by the diversity floor")
+        XCTAssertEqual(Set(elites.map(\.description)).count, elites.count, "elites must be distinct")
+    }
+
     private func sphere(_ x: [Double]) -> Double { x.reduce(0) { $0 + $1 * $1 } }
     private func squaredDistance(_ a: [Double], _ b: [Double]) -> Double {
         zip(a, b).reduce(0) { $0 + ($1.0 - $1.1) * ($1.0 - $1.1) }

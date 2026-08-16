@@ -1096,7 +1096,15 @@ public class CRenderer: Renderer {
       if uop.isSimd, frameIndexOverride == nil {
         let id = extractVarId(uop.value)
         varEmittedTypes[id] = .int_
-        return "int t\(id) = i; float32x4_t simd\(id) = vaddq_f32(vdupq_n_f32((float)i), (float32x4_t){0.0f, 1.0f, 2.0f, 3.0f});"
+        // Inside a width-4 element loop (`beginParallelRange` names its counter
+        // `simd<id>` exactly when incr == 4) the lanes are tensor elements, so
+        // the frame index is lane-uniform; only frame-lane SIMD wants the ramp.
+        let elementLanes = parallelRangeVarStack.last?.hasPrefix("simd") == true
+        let vec =
+          elementLanes
+          ? "vdupq_n_f32((float)i)"
+          : "vaddq_f32(vdupq_n_f32((float)i), (float32x4_t){0.0f, 1.0f, 2.0f, 3.0f})"
+        return "int t\(id) = i; float32x4_t simd\(id) = \(vec);"
       }
       // Use i for C scalar blocks, matching Metal's behavior.
       return emitAssign(uop, frameIndexOverride ?? "i", ctx)

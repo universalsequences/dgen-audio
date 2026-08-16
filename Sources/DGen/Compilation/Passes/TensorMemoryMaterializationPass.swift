@@ -76,9 +76,7 @@ extension TensorMemoryMaterializationPass {
 
       if decision.needsFrameAwareAlloc {
         graph.frameAwareCells[realCellId] = (tensorSize: tensorSize, frameCount: frameSlots)
-        if hop > 1 {
-          graph.frameAwareCellHops[realCellId] = hop
-        }
+        graph.frameAwareCellHops[realCellId] = hop > 1 ? hop : nil
       }
 
       graph.tensors[tensorId] = Tensor(

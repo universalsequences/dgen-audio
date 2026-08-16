@@ -102,6 +102,11 @@ struct CMAES: Codable {
             stopReason = .numericalFailure
             return
         }
+        // Snapshot everything this update mutates: on a numerical failure we
+        // roll back so the serialized optimizer state stays finite and
+        // self-consistent (JSONEncoder throws on non-finite values, which would
+        // turn the intended graceful stop into an aborted job).
+        let snapshot = (mean, sigma, covariance, ps, pc, generation)
         let oldMean = mean
         var selectedSteps = [[Double]]()
         selectedSteps.reserveCapacity(mu)
@@ -155,6 +160,7 @@ struct CMAES: Codable {
         sigma *= exp((cs / damping) * (psNorm / chiN - 1))
         generation += 1
         guard sigma.isFinite, sigma > 1e-16, covariance.allSatisfy(\.isFinite) else {
+            (mean, sigma, covariance, ps, pc, generation) = snapshot
             stopReason = .numericalFailure
             return
         }

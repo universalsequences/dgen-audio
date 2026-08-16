@@ -829,9 +829,7 @@ extension LazyOp {
 
         // Allocate frame-indexed gradient cell
         let gradCell = g.allocFrameAware(tensorSize: windowSize, frameCount: gradSlots)
-        if hop > 1 {
-          g.frameAwareCellHops[gradCell] = hop
-        }
+        g.frameAwareCellHops[gradCell] = hop > 1 ? hop : nil
 
         // Phase 1: Store gradient tensor elements to frame-indexed cell
         let storeOp = g.n(
@@ -1311,12 +1309,13 @@ extension LazyOp {
       // and tag the gather (and the tensor read of its result) with the
       // forward chain's hop rate so the whole backward tensor chain is
       // scheduled hop-based instead of frame-based zero-padding.
+      // The tape layout, the writer and the reader must all agree: only slice
+      // per-hop when the upstream chain actually runs at this hop rate.
       let hopRate = findUpstreamHopRate(g, from: tensorInput)
-      let gradSlots = hopSize > 1 ? (g.maxFrameCount + hopSize - 1) / hopSize : g.maxFrameCount
+      let hopGated = hopSize > 1 && hopRate?.0 == hopSize
+      let gradSlots = hopGated ? (g.maxFrameCount + hopSize - 1) / hopSize : g.maxFrameCount
       let gradInputCell = g.allocFrameAware(tensorSize: totalSize, frameCount: gradSlots)
-      if hopSize > 1 {
-        g.frameAwareCellHops[gradInputCell] = hopSize
-      }
+      g.frameAwareCellHops[gradInputCell] = hopGated ? hopSize : nil
 
       let gatherOp = g.n(
         .overlapAddGradGather(
@@ -1328,7 +1327,7 @@ extension LazyOp {
       // Return gradient tensor sequenced after gather
       let sequencedGrad = createSequencedGradTensor(
         g, gradCell: gradInputCell, shape: shape, afterOp: gatherOp)
-      if let hopRate, hopRate.0 == hopSize {
+      if hopGated, let hopRate {
         g.nodeHopRate[gatherOp] = hopRate
         g.nodeHopRate[sequencedGrad] = hopRate
       }
@@ -1461,7 +1460,11 @@ extension LazyOp {
     var steps = 0
     while let current = queue.popLast() {
       steps += 1
-      if steps > 4096 { return nil }
+      if steps > 65536 {
+        assertionFailure(
+          "findUpstreamHopRate: search bail-out after \(steps) steps; hop scheduling lost")
+        return nil
+      }
       if !visited.insert(current).inserted { continue }
       if let rate = g.nodeHopRate[current] { return rate }
       if let node = g.nodes[current] {

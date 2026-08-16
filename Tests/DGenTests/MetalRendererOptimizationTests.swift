@@ -38,6 +38,59 @@ final class MetalRendererOptimizationTests: XCTestCase {
     XCTAssertTrue(kernel.source.contains("memory[7 + (int)0.0]"))
   }
 
+  /// "Last frame wins" is only equivalent when the write runs on every frame.
+  /// A hop-gated write does not, so the serial frame loop must be retained.
+  func testHopGatedWritePreventsFrameParallelization() {
+    let context = IRContext(g: Graph())
+    let frameValue = context.useVariable(src: nil, trackInValues: false)
+    let counter = context.useVariable(src: nil, trackInValues: false)
+    let writeResult = context.useVariable(src: nil, trackInValues: false)
+    let item = ScheduleItem(frameOrder: .sequential, temporality: .frameBased)
+    item.dispatchMode = .singleThreaded
+    item.ops = [
+      UOp(op: .frameCount, value: .empty),
+      UOp(op: .beginRange(.constant(0, 0), .constant(0, 1)), value: .empty),
+      UOp(op: .beginLoop(frameCount, 1), value: .empty),
+      UOp(op: .frameIndex, value: frameValue, scalarType: .int),
+      UOp(op: .beginHopCheck(counter), value: .empty),
+      UOp(op: .memoryWrite(7, .constant(0, 0), frameValue), value: writeResult),
+      UOp(op: .endHopCheck, value: .empty),
+      UOp(op: .endLoop, value: .empty),
+      UOp(op: .endRange, value: .empty),
+    ]
+
+    let kernel = compile(item, context: context)
+
+    XCTAssertEqual(kernel.dispatchMode, .singleThreaded)
+    XCTAssertTrue(kernel.source.contains("for (uint i = 0; i < frameCount"))
+  }
+
+  /// Same rule for a plain conditional region around the write.
+  func testConditionalWritePreventsFrameParallelization() {
+    let context = IRContext(g: Graph())
+    let frameValue = context.useVariable(src: nil, trackInValues: false)
+    let condition = context.useVariable(src: nil, trackInValues: false)
+    let writeResult = context.useVariable(src: nil, trackInValues: false)
+    let item = ScheduleItem(frameOrder: .sequential, temporality: .frameBased)
+    item.dispatchMode = .singleThreaded
+    item.ops = [
+      UOp(op: .frameCount, value: .empty),
+      UOp(op: .beginRange(.constant(0, 0), .constant(0, 1)), value: .empty),
+      UOp(op: .beginLoop(frameCount, 1), value: .empty),
+      UOp(op: .frameIndex, value: frameValue, scalarType: .int),
+      UOp(op: .beginIf(condition), value: .empty),
+      UOp(op: .memoryWrite(7, .constant(0, 0), frameValue), value: writeResult),
+      UOp(op: .endIf, value: .empty),
+      UOp(op: .endLoop, value: .empty),
+      UOp(op: .endRange, value: .empty),
+    ]
+
+    let kernel = compile(item, context: context)
+
+    XCTAssertEqual(kernel.dispatchMode, .singleThreaded)
+    XCTAssertTrue(kernel.source.contains("for (uint i = 0; i < frameCount"))
+  }
+
   func testReadWriteStatePreventsFrameParallelization() {
     let context = IRContext(g: Graph())
     let prior = context.useVariable(src: nil, trackInValues: false)

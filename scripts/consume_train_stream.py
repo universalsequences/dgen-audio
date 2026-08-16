@@ -6,7 +6,8 @@ strictly validates the protocol:
 
   - every stdout line is valid JSON with a known "type" and the exact
     required keys for that type (unknown type or malformed JSON = failure)
-  - the first event is "plan"
+  - the first event is "plan", except for a pre-plan failure which is a single
+    "error" event
   - exactly one terminal event ("result" or "error"), and it is the last line
   - exit code is 0 iff the terminal event was "result"
   - artifact paths referenced by checkpoint/result events exist on disk and
@@ -23,18 +24,24 @@ import json
 import os
 import subprocess
 import sys
+import threading
+from collections import deque
 from typing import NoReturn
 
 REQUIRED_KEYS = {
     "plan": {"type", "learnable", "frozen", "unsupported", "seed_echo",
              "pitch_hz", "gate_frames", "crop_frames"},
     "stage": {"type", "name", "total"},
-    "epoch": {"type", "epoch", "total", "loss", "params", "steps"},
+    "optimization_progress": {"type", "current", "total", "losses"},
+    "epoch": {"type", "epoch", "total", "loss", "params"},
     "checkpoint": {"type", "epoch", "wav"},
     "result": {"type", "improvement_pct", "abs_distance", "basin_check",
                "deltas", "final_wav", "seeded_wav"},
     "error": {"type", "message"},
 }
+
+# Keys that may be absent (JSONEncoder omits nil), but are accepted when present.
+OPTIONAL_KEYS = {"epoch": {"steps"}}
 
 TERMINAL = {"result", "error"}
 
@@ -64,6 +71,19 @@ def main():
         stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, bufsize=1)
 
     assert proc.stdout is not None and proc.stderr is not None
+
+    # The CLI routes everything that is not a protocol event to stderr (compile
+    # diagnostics, render subprocesses, CMA generation lines). Draining it only
+    # after the stdout loop deadlocks once the 64 KiB pipe buffer fills.
+    stderr_lines = deque(maxlen=200)
+
+    def _drain_stderr():
+        for l in proc.stderr:
+            stderr_lines.append(l)
+
+    drain = threading.Thread(target=_drain_stderr, daemon=True)
+    drain.start()
+
     events = []
     for line in proc.stdout:  # live, line-by-line
         line = line.rstrip("\n")
@@ -81,17 +101,21 @@ def main():
         missing = REQUIRED_KEYS[etype] - set(obj.keys())
         if missing:
             fail(f"{etype} event missing keys {sorted(missing)}: {line!r}")
-        extra = set(obj.keys()) - REQUIRED_KEYS[etype]
+        extra = set(obj.keys()) - REQUIRED_KEYS[etype] - OPTIONAL_KEYS.get(etype, set())
         if extra:
             fail(f"{etype} event has unexpected keys {sorted(extra)}: {line!r}")
         events.append(obj)
 
     proc.wait()
-    stderr_tail = proc.stderr.read()[-2000:]
+    drain.join(timeout=5)
+    stderr_tail = "".join(stderr_lines)[-2000:]
 
     if not events:
         fail(f"no events on stdout (exit {proc.returncode}); stderr tail:\n{stderr_tail}")
-    if events[0]["type"] != "plan":
+    # Failures before planning (bad flags, unreadable patch/target, pitch
+    # estimation) legitimately stream a single error event and nothing else.
+    preplan_failure = len(events) == 1 and events[0]["type"] == "error"
+    if events[0]["type"] != "plan" and not preplan_failure:
         fail(f"first event must be plan, got {events[0]['type']}")
 
     terminals = [e for e in events if e["type"] in TERMINAL]
@@ -105,6 +129,10 @@ def main():
         fail(f"result emitted but exit code is {proc.returncode}")
     if terminal["type"] == "error" and proc.returncode == 0:
         fail("error emitted but exit code is 0")
+    if terminal["type"] == "error":
+        # Protocol-clean failure: surface the CLI's own message rather than
+        # replacing it with a validator diagnostic.
+        print(f"CLI error (protocol-clean): {terminal['message']}", file=sys.stderr)
 
     # Artifact checks.
     def check_artifact(path, label):

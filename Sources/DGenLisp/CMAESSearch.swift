@@ -91,8 +91,8 @@ enum CMAESSearch {
                 "best": jsonNumber(generationBest),
                 "median": jsonNumber(finiteScores.isEmpty ? .infinity : finiteScores[finiteScores.count / 2]),
                 "mean": jsonNumber(finiteScores.isEmpty ? .infinity : finiteScores.reduce(0, +) / Float(finiteScores.count)),
-                "sigma": optimizer.sigma,
-                "condition_number": optimizer.conditionNumber,
+                "sigma": jsonNumber(optimizer.sigma),
+                "condition_number": jsonNumber(optimizer.conditionNumber),
                 "reflected_fraction": Double(reflected) / Double(population * dimension),
                 // `forward_seconds` is retained for report-schema v1 and is
                 // explicitly the whole population evaluation, not GPU-only.
@@ -123,13 +123,18 @@ enum CMAESSearch {
             }
         }
 
-        archive.append((bestZ, bestScore))
+        // No explicit append of (bestZ, bestScore): the generation winner is
+        // always inside the top min(population/2, 16) archived above (population
+        // >= 4 is validated at parse time), and if no generation ever improved
+        // then bestZ == seedZ == archive[0].z. Appending it again would put an
+        // exact duplicate at indices 0/1 of the sorted archive.
         archive.sort { $0.score == $1.score ? lexicographic($0.z, $1.z) : $0.score < $1.score }
         let candidateVectors = archive.map(\.z)
         let archiveScores = archive.map(\.score)
         let eliteCount = min(max(options.cmaContinue, 1), candidateVectors.count)
         let eliteIndices = BatchMultistart.diverseSelection(
-            candidates: candidateVectors, scores: archiveScores, count: eliteCount)
+            candidates: candidateVectors, scores: archiveScores, count: eliteCount,
+            mandatory: [0])
         let elites = eliteIndices.map { candidateVectors[$0] }
         let eliteScores = eliteIndices.map { archiveScores[$0] }
         let bestParams = DirectionTrainer.naturalValues(z: bestZ, transforms: transforms)
@@ -164,6 +169,12 @@ enum CMAESSearch {
 
     private static func jsonNumber(_ value: Float) -> Any {
         value.isFinite ? Double(value) : NSNull()
+    }
+
+    /// JSONSerialization aborts the process (rather than throwing) on
+    /// non-finite doubles, so raw optimizer state must be sanitized too.
+    private static func jsonNumber(_ value: Double) -> Any {
+        value.isFinite ? value : NSNull()
     }
 
     private static func lexicographic(_ a: [Float], _ b: [Float]) -> Bool {

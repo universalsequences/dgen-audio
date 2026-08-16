@@ -184,6 +184,9 @@ public class LazyGraph {
     // 3. Clear lazy cell state (will be recreated for new tensors)
     graph.lazyCells.removeAll()
     graph.frameAwareCells.removeAll()
+    // Keyed by cell IDs that resetCounters() recycles from 0, so stale hop tags
+    // would silently re-address unrelated tensors on the next epoch.
+    graph.frameAwareCellHops.removeAll()
     graph.cellAllocationSizes.removeAll()
 
     // 4. Clear persistent cells and gradient side effects
@@ -191,6 +194,7 @@ public class LazyGraph {
     graph.parameterCells.removeAll()
     graph.gradientSideEffects.removeAll()
     graph.tensorGradCells.removeAll()
+    graph.tensorGradCarryCells.removeAll()
     graph.gradCarryCells.removeAll()
     graph.lastForwardNodeId = nil
     graph.simdOptimizedConv2Ds.removeAll()

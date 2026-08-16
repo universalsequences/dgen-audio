@@ -276,10 +276,16 @@ enum BatchMultistart {
         return (0..<lanes).map { lane in data.map { $0[lane] } }
     }
 
+    /// `mandatory` entries are force-kept without the diversity floor. The
+    /// multistart default keeps index 0 (the seed) and index 1 (the 0.5
+    /// midpoint); other callers (e.g. the CMA elite archive) must pass their
+    /// own, since force-keeping index 1 of a converged archive can pick a
+    /// near-duplicate of index 0.
     static func diverseSelection(
-        candidates: [[Float]], scores: [Float], count: Int
+        candidates: [[Float]], scores: [Float], count: Int,
+        mandatory: [Int] = [0, 1]
     ) -> [Int] {
-        var selected = Array(0..<min(2, count))
+        var selected = Array(mandatory.prefix(count).filter { candidates.indices.contains($0) })
         let ranked = scores.indices.sorted { scores[$0] < scores[$1] }
         for index in ranked where selected.count < count && !selected.contains(index) {
             let distance = selected.map { other -> Float in

@@ -109,7 +109,7 @@ Defaults when `--search cma-es` is selected:
 | `--local-epochs` | value of `--epochs` | Independent seeded Adam fallback; zero disables it |
 | `--cma-continue` | 3 | Number of diverse global candidates receiving short continuation |
 | `--cma-refine-epochs` | value of `--epochs` | Adam epochs per continued candidate; zero disables top-K refinement |
-| `--cma-refine-mode` | `auto` | `scalar`, `batched`, or occupancy-aware automatic selection |
+| `--cma-refine-mode` | `auto` | `scalar`, `batched`, or `auto` (occupancy-aware: resolves to `batched` when at least 8 candidates are continued, `scalar` otherwise); the resolved mode is reported as `refine_mode` |
 | `--cma-final-epochs` | 0 | Long scalar Adam continuation of the selected global winner; zero disables it |
 
 `--search legacy` preserves seeded+midpoint behavior. The existing

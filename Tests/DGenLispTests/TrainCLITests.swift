@@ -332,5 +332,86 @@ final class TrainCLITests: XCTestCase {
         process.waitUntilExit()
         let text = String(data: data, encoding: .utf8) ?? ""
         XCTAssertEqual(process.terminationStatus, 0, "mock host rejected the stream:\n\(text)")
+        XCTAssertTrue(text.contains("terminal=result"), "mock host did not validate a result:\n\(text)")
+    }
+
+    /// The reference host must accept every event type the CLI can emit — the
+    /// fake trainer never produces `optimization_progress`, so a canned
+    /// transcript is the only thing that catches a stale REQUIRED_KEYS table.
+    /// Also covers `epoch` without the optional `steps` key.
+    func testMockHostScriptAcceptsAllEventTypes() throws {
+        let script = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent().deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .appendingPathComponent("scripts/consume_train_stream.py")
+        guard FileManager.default.fileExists(atPath: script.path) else {
+            throw XCTSkip("consume_train_stream.py not found at \(script.path)")
+        }
+        guard FileManager.default.fileExists(atPath: "/usr/bin/python3") else {
+            throw XCTSkip("python3 unavailable")
+        }
+
+        let jobDir = workDir.appendingPathComponent("canned-job")
+        try FileManager.default.createDirectory(at: jobDir, withIntermediateDirectories: true)
+        let transcript = [
+            #"{"type":"plan","learnable":[],"frozen":[],"unsupported":[],"seed_echo":{},"pitch_hz":110.0,"gate_frames":1,"crop_frames":1}"#,
+            #"{"type":"stage","name":"cma-es","total":2}"#,
+            #"{"type":"optimization_progress","current":1,"total":2,"losses":[1.0]}"#,
+            #"{"type":"epoch","epoch":0,"total":1,"loss":1.0,"params":{}}"#,
+            #"{"type":"error","message":"canned failure"}"#,
+        ]
+        let fake = workDir.appendingPathComponent("fake_emitter.sh")
+        let body = transcript.map { "echo '\($0)'" }.joined(separator: "\n")
+        try "#!/bin/sh\n\(body)\nexit 1\n".write(to: fake, atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes(
+            [.posixPermissions: 0o755], ofItemAtPath: fake.path)
+
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/python3")
+        process.arguments = [script.path, fake.path, "train", "--job-dir", jobDir.path]
+        let out = Pipe()
+        process.standardOutput = out
+        process.standardError = out
+        try process.run()
+        let data = out.fileHandleForReading.readDataToEndOfFile()
+        process.waitUntilExit()
+        let text = String(data: data, encoding: .utf8) ?? ""
+        XCTAssertEqual(process.terminationStatus, 0, "mock host rejected the transcript:\n\(text)")
+        XCTAssertTrue(text.contains("terminal=error"), text)
+    }
+
+    /// A failure before planning legitimately streams a single `error` event;
+    /// the host must surface the CLI's message rather than calling it a
+    /// protocol violation.
+    func testMockHostScriptAcceptsPrePlanErrorOnlyStream() throws {
+        let script = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent().deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .appendingPathComponent("scripts/consume_train_stream.py")
+        guard FileManager.default.fileExists(atPath: script.path) else {
+            throw XCTSkip("consume_train_stream.py not found at \(script.path)")
+        }
+        guard FileManager.default.fileExists(atPath: "/usr/bin/python3") else {
+            throw XCTSkip("python3 unavailable")
+        }
+
+        let io = try makeInputs()
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/python3")
+        process.arguments = [
+            script.path, dgenlispBinary.path, "train",
+            "--patch", io.patch.path, "--target", io.target.path,
+            "--seed-params", io.seed.path, "--job-dir", io.jobDir.path,
+            "--not-a-real-flag",
+        ]
+        let out = Pipe()
+        process.standardOutput = out
+        process.standardError = out
+        try process.run()
+        let data = out.fileHandleForReading.readDataToEndOfFile()
+        process.waitUntilExit()
+        let text = String(data: data, encoding: .utf8) ?? ""
+        XCTAssertEqual(process.terminationStatus, 0, "mock host rejected an error-only stream:\n\(text)")
+        XCTAssertTrue(text.contains("CLI error (protocol-clean)"), text)
     }
 }

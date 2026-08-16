@@ -704,6 +704,52 @@ final class TensorFFTTests: XCTestCase {
       analytical: analyticalGrad, numerical: numGrad, label: "OverlapAdd Gradient")
   }
 
+  /// Regression: the buffer is frame-rate (no hop) while overlapAdd synthesizes
+  /// at hop 4, so `findUpstreamHopRate` finds no matching hop tag. The gradient
+  /// tape must then stay frame-addressed — hop-slicing it while the gather stays
+  /// frame-based let the non-hop frames' zeros overwrite the real gradient, and
+  /// every parameter gradient came back exactly 0.
+  func testOverlapAddGradientNumericalUntaggedHop() throws {
+    let N = 8
+    let hop = 4
+    let sr: Float = 2048.0
+    let freq: Float = 256.0
+    let totalFrames = N + 4 * hop
+    let epsilon: Float = 1e-3
+
+    DGenConfig.sampleRate = sr
+    defer { DGenConfig.sampleRate = 44100.0 }
+
+    let baseScale = [Float](repeating: 2.0, count: N)
+
+    func loss(_ scaleData: [Float]) throws -> Float {
+      LazyGraphContext.reset()
+      let twoPi = Float(2.0 * Float.pi)
+      let flat = cos(Signal.phasor(freq) * twoPi).buffer(size: N).reshape([N])
+      let output = (flat * Tensor.param([N], data: scaleData)).overlapAdd(hop: hop)
+      let squared = output * output
+      return try squared.realize(frames: totalFrames).reduce(0, +)
+    }
+
+    LazyGraphContext.reset()
+    let twoPi = Float(2.0 * Float.pi)
+    let flat = cos(Signal.phasor(freq) * twoPi).buffer(size: N).reshape([N])
+    let scale = Tensor.param([N], data: baseScale)
+    let output = (flat * scale).overlapAdd(hop: hop)
+    let squared = output * output
+    _ = try squared.backward(frames: totalFrames)
+    let analyticalGrad = scale.grad!.getData()!
+
+    XCTAssertTrue(
+      analyticalGrad.contains { Swift.abs($0) > 1e-4 },
+      "untagged-hop overlapAdd produced an all-zero gradient: \(analyticalGrad)")
+
+    let numGrad = try numericalGradient(
+      count: N, epsilon: epsilon, lossAt: loss, baseData: baseScale)
+    assertGradientDirectionsMatch(
+      analytical: analyticalGrad, numerical: numGrad, label: "OverlapAdd Gradient (untagged hop)")
+  }
+
   func testFFTIFFTOverlapAddGradientNumerical() throws {
     // Finite difference check: buffer → FFT → IFFT → scale → overlapAdd → squared loss
     let N = 16
