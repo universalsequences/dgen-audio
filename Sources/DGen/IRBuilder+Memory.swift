@@ -121,11 +121,35 @@ extension IRBuilder {
     return cast(slotIdx * intConstant(tensorSize) + elemIdx, to: .int)
   }
 
+  /// Zero a hop-sliced **adjoint** read on frames that are not hop ticks.
+  ///
+  /// Hop-sliced storage holds one slot per hop, and `frameAwareOffset` maps
+  /// every frame in a hop onto that one slot. For a forward tensor that is the
+  /// intended "hold" semantics. For a gradient tape it is wrong: the frames
+  /// between ticks were discarded by the forward, so their adjoint is zero, and
+  /// holding replays the tick's adjoint `hop` times into any consumer that
+  /// integrates over audio frames. See `Graph.frameAwareCellScatter`.
+  ///
+  /// The tick test matches `overlapAddGradGather`'s (`frame % hop == 0`); inside
+  /// a hop-gated block it is always true, so this costs nothing there.
+  private func scatterMaskedRead(cellId: CellID, frameIdx: Expr, value: Expr) -> Expr {
+    guard let hop = ctx.g.frameAwareCellHops[cellId], hop > 1,
+      ctx.g.frameAwareCellScatter.contains(cellId)
+    else { return value }
+    let zero = constant(0.0)
+    let frameFloat = cast(frameIdx, to: .float)
+    let hopFloat = constant(Float(hop))
+    let isTick = (frameFloat - floor(frameFloat / hopFloat) * hopFloat) == zero
+    return gswitch(isTick, value, zero)
+  }
+
   /// Read from a frame-aware tensor using the current thread's frame index.
   /// Accesses `memory[cellId + frameIdx * tensorSize + elemIdx]`.
   /// Used for tensors that need per-frame storage to enable cross-block parallelism.
   public func frameAwareTensorRead(cellId: CellID, tensorSize: Int, elemIdx: Expr) -> Expr {
-    return memoryRead(cellId, frameAwareOffset(cellId: cellId, frameIdx: frameIndex(nodeId), tensorSize: tensorSize, elemIdx: elemIdx))
+    let frameIdx = frameIndex(nodeId)
+    let value = memoryRead(cellId, frameAwareOffset(cellId: cellId, frameIdx: frameIdx, tensorSize: tensorSize, elemIdx: elemIdx))
+    return scatterMaskedRead(cellId: cellId, frameIdx: frameIdx, value: value)
   }
 
   /// Read from a frame-aware tensor with an explicit frame index.
@@ -133,7 +157,8 @@ extension IRBuilder {
   public func frameAwareTensorRead(cellId: CellID, tensorSize: Int, frameIdx: Expr, elemIdx: Expr)
     -> Expr
   {
-    return memoryRead(cellId, frameAwareOffset(cellId: cellId, frameIdx: frameIdx, tensorSize: tensorSize, elemIdx: elemIdx))
+    let value = memoryRead(cellId, frameAwareOffset(cellId: cellId, frameIdx: frameIdx, tensorSize: tensorSize, elemIdx: elemIdx))
+    return scatterMaskedRead(cellId: cellId, frameIdx: frameIdx, value: value)
   }
 
   /// Write to a frame-aware tensor using the current thread's frame index.

@@ -14,6 +14,9 @@ final class FilteredNoiseFDTrajectoryTests: XCTestCase {
 
   override func setUp() {
     super.setUp()
+    // Other suites leave the C backend selected; these graphs are spectral
+    // BPTT, which only the Metal backend compiles.
+    DGenConfig.backend = .metal
     DGenConfig.maxFrameCount = frameCount
     LazyGraphContext.reset()
   }
@@ -111,16 +114,11 @@ final class FilteredNoiseFDTrajectoryTests: XCTestCase {
     return Tensor(rows)
   }
 
-  /// KNOWN FAILING as of the `spectralFilter` hoist. The forward output is
-  /// unchanged to 1e-5 (see `SpectralFilterHoistTests`), but the *gradient*
-  /// changed, because neither the old per-hop formulation nor the hoisted one
-  /// receives a correct gradient here: BPTT is broken for a frame-rate operand
-  /// multiplying into a hop-gated region. `HopGatedSpectralGradientTests` pins
-  /// that bug with a finite-difference proof on a four-node graph. The old
-  /// formulation's (equally wrong) direction happened to correlate better with
-  /// the true one and reached ~0.018; the hoisted one plateaus at ~0.059.
-  /// The threshold below is deliberately left untouched — it should go green by
-  /// fixing hop-gated BPTT, not by widening the gate.
+  /// This was the end-to-end symptom of hop-gated BPTT being wrong for a
+  /// frame-rate operand: the run used to plateau around 0.059 (and ~0.018 under
+  /// the pre-hoist formulation, whose equally wrong direction happened to
+  /// correlate better). With hop-sliced adjoint tapes no longer replayed at
+  /// frame rate it converges to ~0.003.
   func testLearnsMagnitudeTrajectoryFromAudio() throws {
     let featureFrames = 4
     let noiseData = makeNoise(count: frameCount, seed: 6789)
@@ -171,14 +169,10 @@ final class FilteredNoiseFDTrajectoryTests: XCTestCase {
       finalLoss, initialLoss * 0.8,
       "audio error should fall; got \(initialLoss) -> \(finalLoss)")
 
-    // What it should achieve, and did before the hoist. Blocked on the
-    // hop-gated BPTT bug: measured against finite differences, the gradient
-    // w.r.t. magnitudes is ~37° off the true gradient (cosine 0.80) — still a
-    // descent direction, but not the steepest one, so convergence depends on
-    // how well the wrong direction happens to correlate. Fixing hop-gated BPTT
-    // should turn this into an unexpected pass.
-    XCTExpectFailure("hop-gated BPTT gradient is wrong; see HopGatedSpectralGradientTests") {
-      XCTAssertLessThan(finalLoss, initialLoss * 0.3)
-    }
+    // Convergence on the true gradient. This gate used to be unreachable
+    // (the run plateaued around 0.059) because hop-sliced adjoint tapes were
+    // replayed at frame rate — see `Graph.frameAwareCellScatter` and
+    // `HopGatedGradientFDMatrixTests`.
+    XCTAssertLessThan(finalLoss, initialLoss * 0.3)
   }
 }

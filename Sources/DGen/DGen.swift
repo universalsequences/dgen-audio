@@ -63,6 +63,21 @@ open class Graph {
     /// divides the frame index by this hop. Cells absent here use hop = 1.
     public var frameAwareCellHops: [CellID: Int] = [:]
 
+    /// Hop-sliced cells whose frame-rate reads must **zero-fill** between hop
+    /// ticks instead of holding the tick's value.
+    ///
+    /// A forward hop-sliced tensor is a held signal: `x(frame) = slot[frame/hop]`
+    /// for every frame, so holding is what the reader wants. An *adjoint* stored
+    /// the same way is not. It carries `dLoss/dy(tick)`, and the frames between
+    /// ticks are exactly the ones whose value the forward discarded — their
+    /// adjoint is identically zero. Holding instead replays the tick's adjoint
+    /// `hop` times, so anything downstream that integrates an adjoint over audio
+    /// frames (`sampleGradWrite`, `peekGradWrite`, `selectRowGradWrite`) sums
+    /// `hop` spurious copies, each weighted by the wrong control interpolation.
+    ///
+    /// Populated for gradient-subgraph cells only (see `lastForwardNodeId`).
+    public var frameAwareCellScatter: Set<CellID> = []
+
     /// Cells that persist data across frame iterations (circular buffers, ring buffers, etc.)
     /// These must not be shared with other cells during buffer reuse optimization.
     public var persistentCells: Set<CellID> = []

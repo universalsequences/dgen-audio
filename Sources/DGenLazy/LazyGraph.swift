@@ -187,6 +187,7 @@ public class LazyGraph {
     // Keyed by cell IDs that resetCounters() recycles from 0, so stale hop tags
     // would silently re-address unrelated tensors on the next epoch.
     graph.frameAwareCellHops.removeAll()
+    graph.frameAwareCellScatter.removeAll()
     graph.cellAllocationSizes.removeAll()
 
     // 4. Clear persistent cells and gradient side effects
