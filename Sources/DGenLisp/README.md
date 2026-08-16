@@ -484,6 +484,8 @@ The other constructors build tensors from a fill rather than from assets:
 (ones [d1,d2,...])           ; all-ones tensor
 (full [d1,d2,...] value)     ; filled with constant
 (randn [d1,d2,...])          ; random normal
+(iota n)                     ; index ramp [0, 1, ... n-1]
+(iota n start step)          ; ramp from start, e.g. (iota 4 10 0.5) -> [10 10.5 11 11.5]
 ```
 
 The DGenLisp read convention is `(peek tensor index channel)`, so 2D buffers use
