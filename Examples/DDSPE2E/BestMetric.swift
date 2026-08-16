@@ -1,3 +1,4 @@
+import Accelerate
 import Foundation
 
 /// Fixed CPU-side selection metric for best-checkpoint tracking.
@@ -11,7 +12,138 @@ import Foundation
 enum BestCheckpointScorer {
 
   /// Lower is better. Returns nil if no usable window size fits the signal.
+  ///
+  /// Uses vDSP: this runs inside the training loop, and a naive Swift FFT here
+  /// cost ~1s per evaluation — a ~40% tax on step time at the default cadence.
+  /// `referenceScore` is the same metric written plainly, kept as the
+  /// differential oracle for `BestMetricTests`.
   static func multiScaleSpectralScore(
+    prediction: [Float],
+    target: [Float],
+    windowSizes: [Int],
+    hopDivisor: Int,
+    logEpsilon: Float
+  ) -> Float? {
+    let n = min(prediction.count, target.count)
+    let usable = windowSizes.filter { $0 > 1 && $0 <= n && $0 & ($0 - 1) == 0 }
+    guard !usable.isEmpty, n > 0 else { return nil }
+
+    var total: Float = 0
+    for w in usable {
+      guard let setup = fftSetup(forWindow: w) else { continue }
+      let hop = max(1, w / max(1, hopDivisor))
+      let window = hannWindow(w)
+      let half = w / 2
+      let numBins = half + 1
+      let epsSq = logEpsilon * logEpsilon
+
+      var predMag = [Float](repeating: 0, count: numBins)
+      var targetMag = [Float](repeating: 0, count: numBins)
+      var linSum: Float = 0
+      var logSum: Float = 0
+      var count = 0
+
+      var start = 0
+      while start + w <= n {
+        magnitudes(
+          of: prediction, at: start, window: window, setup: setup, log2n: log2Size(w),
+          into: &predMag)
+        magnitudes(
+          of: target, at: start, window: window, setup: setup, log2n: log2Size(w),
+          into: &targetMag)
+
+        for b in 0..<numBins {
+          let p = predMag[b]
+          let t = targetMag[b]
+          linSum += Swift.abs(sqrtf(p) - sqrtf(t))
+          logSum += Swift.abs(0.5 * logf(p + epsSq) - 0.5 * logf(t + epsSq))
+        }
+        count += numBins
+        start += hop
+      }
+      if count > 0 {
+        total += (linSum + logSum) / Float(count)
+      }
+    }
+    return total / Float(usable.count)
+  }
+
+  // MARK: - vDSP plumbing
+
+  // Single-threaded use inside the training loop; setups and windows are cached
+  // because creating them per frame dominates the measurement.
+  private static var setups: [Int: FFTSetup] = [:]
+  private static var windows: [Int: [Float]] = [:]
+
+  private static func log2Size(_ w: Int) -> vDSP_Length {
+    vDSP_Length(round(log2(Double(w))))
+  }
+
+  private static func fftSetup(forWindow w: Int) -> FFTSetup? {
+    if let existing = setups[w] { return existing }
+    guard let created = vDSP_create_fftsetup(log2Size(w), FFTRadix(kFFTRadix2)) else {
+      return nil
+    }
+    setups[w] = created
+    return created
+  }
+
+  private static func hannWindow(_ w: Int) -> [Float] {
+    if let existing = windows[w] { return existing }
+    let values = (0..<w).map { i in
+      Float(0.5 * (1.0 - Foundation.cos(2.0 * Double.pi * Double(i) / Double(w))))
+    }
+    windows[w] = values
+    return values
+  }
+
+  /// Squared magnitudes of one windowed frame, in `out` (length w/2 + 1).
+  private static func magnitudes(
+    of samples: [Float],
+    at offset: Int,
+    window: [Float],
+    setup: FFTSetup,
+    log2n: vDSP_Length,
+    into out: inout [Float]
+  ) {
+    let w = window.count
+    let half = w / 2
+    var windowed = [Float](repeating: 0, count: w)
+    samples.withUnsafeBufferPointer { buffer in
+      let base = buffer.baseAddress! + offset
+      vDSP_vmul(base, 1, window, 1, &windowed, 1, vDSP_Length(w))
+    }
+
+    var real = [Float](repeating: 0, count: half)
+    var imag = [Float](repeating: 0, count: half)
+    real.withUnsafeMutableBufferPointer { realPtr in
+      imag.withUnsafeMutableBufferPointer { imagPtr in
+        var split = DSPSplitComplex(realp: realPtr.baseAddress!, imagp: imagPtr.baseAddress!)
+        windowed.withUnsafeBufferPointer { input in
+          input.baseAddress!.withMemoryRebound(to: DSPComplex.self, capacity: half) { typed in
+            vDSP_ctoz(typed, 2, &split, 1, vDSP_Length(half))
+          }
+        }
+        vDSP_fft_zrip(setup, &split, 1, log2n, FFTDirection(FFT_FORWARD))
+      }
+    }
+
+    // vDSP packs DC in real[0] and Nyquist in imag[0], and scales results by 2.
+    let scale: Float = 0.5
+    out[0] = (real[0] * scale) * (real[0] * scale)
+    out[half] = (imag[0] * scale) * (imag[0] * scale)
+    for k in 1..<half {
+      let re = real[k] * scale
+      let im = imag[k] * scale
+      out[k] = re * re + im * im
+    }
+  }
+
+  // MARK: - Reference implementation (test oracle)
+
+  /// Same metric, written plainly. Not used in training — kept so the vDSP path
+  /// has something to be checked against.
+  static func referenceScore(
     prediction: [Float],
     target: [Float],
     windowSizes: [Int],
@@ -38,7 +170,6 @@ enum BestCheckpointScorer {
 
       var start = 0
       while start + w <= n {
-        // prediction spectrum
         for i in 0..<w {
           re[i] = prediction[start + i] * hann[i]
           im[i] = 0
@@ -48,7 +179,6 @@ enum BestCheckpointScorer {
         for b in 0..<numBins {
           predMag[b] = re[b] * re[b] + im[b] * im[b]
         }
-        // target spectrum
         for i in 0..<w {
           re[i] = target[start + i] * hann[i]
           im[i] = 0
@@ -56,12 +186,8 @@ enum BestCheckpointScorer {
         fftInPlace(re: &re, im: &im)
         for b in 0..<numBins {
           let tMagSq = re[b] * re[b] + im[b] * im[b]
-          let pMag = Foundation.sqrtf(predMag[b])
-          let tMag = Foundation.sqrtf(tMagSq)
-          linSum += Swift.abs(pMag - tMag)
-          let pLog = 0.5 * Foundation.logf(predMag[b] + epsSq)
-          let tLog = 0.5 * Foundation.logf(tMagSq + epsSq)
-          logSum += Swift.abs(pLog - tLog)
+          linSum += Swift.abs(sqrtf(predMag[b]) - sqrtf(tMagSq))
+          logSum += Swift.abs(0.5 * logf(predMag[b] + epsSq) - 0.5 * logf(tMagSq + epsSq))
         }
         count += numBins
         start += hop
@@ -78,7 +204,6 @@ enum BestCheckpointScorer {
     let n = re.count
     guard n > 1 else { return }
 
-    // Bit-reversal permutation
     var j = 0
     for i in 0..<(n - 1) {
       if i < j {
