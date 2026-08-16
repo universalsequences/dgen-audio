@@ -64,8 +64,13 @@ run_train() {
   "$BIN" train "$@" --run-name "$run_name" 2>&1 | tee "$log_path"
 }
 
+# 1e-8 reproduces the 2026-02 campaign; SPECTRAL_LOG_EPSILON=1e-3 removes the
+# empty-bin loss floor (docs/DDSP_REVIVAL_SPEC.md R0).
+SPECTRAL_LOG_EPSILON="${SPECTRAL_LOG_EPSILON:-1e-8}"
+
 TRAIN_COMMON=(
   --cache "$CACHE"
+  --spectral-log-epsilon "$SPECTRAL_LOG_EPSILON"
   --mode m2
   --split train
   --shuffle false

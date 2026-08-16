@@ -111,15 +111,21 @@ extension IRBuilder {
 
   /// Compute the linear memory offset for frame-aware storage: `frameIdx * tensorSize + elemIdx`.
   /// Result is cast to int for use as a memory index.
-  private func frameAwareOffset(frameIdx: Expr, tensorSize: Int, elemIdx: Expr) -> Expr {
-    return cast(frameIdx * intConstant(tensorSize) + elemIdx, to: .int)
+  private func frameAwareOffset(cellId: CellID, frameIdx: Expr, tensorSize: Int, elemIdx: Expr) -> Expr {
+    // Hop-based cells store one slot per hop; all accesses happen on hop
+    // boundaries, so frameIdx / hop is a dense, consistent slot index.
+    var slotIdx = frameIdx
+    if let hop = ctx.g.frameAwareCellHops[cellId], hop > 1 {
+      slotIdx = cast(frameIdx, to: .int) / intConstant(hop)
+    }
+    return cast(slotIdx * intConstant(tensorSize) + elemIdx, to: .int)
   }
 
   /// Read from a frame-aware tensor using the current thread's frame index.
   /// Accesses `memory[cellId + frameIdx * tensorSize + elemIdx]`.
   /// Used for tensors that need per-frame storage to enable cross-block parallelism.
   public func frameAwareTensorRead(cellId: CellID, tensorSize: Int, elemIdx: Expr) -> Expr {
-    return memoryRead(cellId, frameAwareOffset(frameIdx: frameIndex(nodeId), tensorSize: tensorSize, elemIdx: elemIdx))
+    return memoryRead(cellId, frameAwareOffset(cellId: cellId, frameIdx: frameIndex(nodeId), tensorSize: tensorSize, elemIdx: elemIdx))
   }
 
   /// Read from a frame-aware tensor with an explicit frame index.
@@ -127,7 +133,7 @@ extension IRBuilder {
   public func frameAwareTensorRead(cellId: CellID, tensorSize: Int, frameIdx: Expr, elemIdx: Expr)
     -> Expr
   {
-    return memoryRead(cellId, frameAwareOffset(frameIdx: frameIdx, tensorSize: tensorSize, elemIdx: elemIdx))
+    return memoryRead(cellId, frameAwareOffset(cellId: cellId, frameIdx: frameIdx, tensorSize: tensorSize, elemIdx: elemIdx))
   }
 
   /// Write to a frame-aware tensor using the current thread's frame index.
@@ -135,7 +141,7 @@ extension IRBuilder {
   public func frameAwareTensorWrite(cellId: CellID, tensorSize: Int, elemIdx: Expr, value: Expr)
     -> Expr
   {
-    return memoryWrite(cellId, frameAwareOffset(frameIdx: frameIndex(nodeId), tensorSize: tensorSize, elemIdx: elemIdx), value)
+    return memoryWrite(cellId, frameAwareOffset(cellId: cellId, frameIdx: frameIndex(nodeId), tensorSize: tensorSize, elemIdx: elemIdx), value)
   }
 
   /// Write to a frame-aware tensor with an explicit frame index.
@@ -143,7 +149,7 @@ extension IRBuilder {
   public func frameAwareTensorWrite(
     cellId: CellID, tensorSize: Int, frameIdx: Expr, elemIdx: Expr, value: Expr
   ) -> Expr {
-    return memoryWrite(cellId, frameAwareOffset(frameIdx: frameIdx, tensorSize: tensorSize, elemIdx: elemIdx), value)
+    return memoryWrite(cellId, frameAwareOffset(cellId: cellId, frameIdx: frameIdx, tensorSize: tensorSize, elemIdx: elemIdx), value)
   }
 
   // MARK: - I/O

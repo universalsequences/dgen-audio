@@ -1,4 +1,5 @@
 import DGenLazy
+import DGenTrainProtocol
 import Darwin
 import Foundation
 

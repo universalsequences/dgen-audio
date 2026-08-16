@@ -1,0 +1,232 @@
+# `dgenlisp train` — implementation notes, deviations, punts
+
+## Fixes (2026-08-15) — Korg1 scalar phasor×history composition + canonical scoring
+
+- **Scalar phasor tape no longer severs history BPTT under spectral losses.**
+  With an isolated-pass loss (spectral MR-STFT), the scalar history recurrence
+  runs as a detached backward block wrapped in one reverse frame loop. A
+  trainable phasor's `temporalGradStore/Scan/Read` tape forced block splits in
+  node-ID order mid-recurrence: carry reads landed in one block (ran as a plain
+  forward loop — recurrence truncated) and carry writes in a frame-parallel
+  block after the scan. Every parameter whose gradient crossed a history filter
+  (SVF cutoff/resonance, drives, mix levels) came out ~10-100x too small with
+  unreliable sign; the Korg1 patch-learn Adam runs climbed instead of
+  descending. `consolidateScalarBPTTBackwardBlocks` now detects the fragmented
+  read/write layout and rebuilds it with the same detached consolidation the
+  tensor recurrence uses (sandwich eviction of post-tape consumers, tail
+  re-segmented into ID-contiguous runs, forward deps hoisted out of `after`
+  blocks). Regression coverage: `TemporalGradientCompositionTests`
+  `testTrainablePhasorComposesWithSVFSpectralGradient` /
+  `testEnvModulatedPhasorAndCutoffComposeWithSVFSpectralGradient`, and
+  `SVFBPTTScratchTests.testFullVoiceManyTargetsGradientsWithTrainableDetune`
+  (previously `XCTExpectFailure`).
+- **`abs_distance`/`improvement_pct` are canonical across search modes.** Both
+  the legacy and CMA paths now report the independent CPU log-MR-STFT scorer
+  (`TrainSpectralScorer`, log-magnitude only) for seed and final; a candidate
+  that regresses the canonical score never replaces the seed. Adam's internal
+  best-point selection still uses the GPU training loss (log + 0.1·linear
+  MR-STFT); the two are no longer conflated in results. Deviation #3 below is
+  historical.
+- **Known residual: FD sign checks on phase-shifting params are unreliable.**
+  The training loss is deterministically micro-jagged along any direction that
+  shifts waveform edges in time (oscillator pitch/detune, LFO rate/depth,
+  pulse width, analog drift): log-eps amplifies leakage changes in near-dead
+  bins, so the instantaneous derivative oscillates at sub-cent scale around
+  the macro trend. Autograd matches tight central FD (verified at ±0.01 cent)
+  but disagrees with the coarse ±0.5%-of-range fdcheck stencil on those
+  params. That is a loss-landscape property, not an adjoint bug.
+
+## Policy changes (2026-08-14)
+
+- **Phasor frequency params are trainable** — the pitch-path freeze
+  (value-level stop-gradient via `DGenGradientConfig.detachPhasorFrequency`
+  plus the `pitch-path-detached` plan verdict) is removed. The corruption it
+  guarded against was a block-formation bug: the phasor suffix-scan adjoint
+  severed the scalar BPTT recurrence when composed with coupled-history
+  filters (~30x wrong coupled-param gradients). Fixed by
+  `consolidateScalarBPTTBackwardBlocks` (see
+  `TemporalGradientCompositionTests`); deviation #2 below is historical.
+- **`--filter-surrogate` defaults to `none`** — the frequency-sampled SVF
+  surrogate mode was determined to be broken; opt back in with
+  `--filter-surrogate freq`.
+
+## Frozen-parameter parity in tensor search (2026-08-14)
+
+Population evaluation now broadcasts every declared parameter into every tensor
+lane. Learnable parameters are replaced by candidate values; frozen parameters
+retain the host-supplied seed (or source default when absent). Previously the
+batch evaluator required a tensor for every declaration while the search only
+supplied learnable tensors, so a valid patch with an unreachable bounded param
+failed with `batch param '<name>' requires a supplied [B] tensor`. Scalar
+training and render subprocesses now use the same complete parameter map,
+avoiding a related silent fallback of frozen host values to source defaults.
+
+The shakedown patches also exposed independent generic tensor-path gaps:
+`selector` now lifts to elementwise `SignalTensor` evaluation; `biquad` lifts
+its input and all coefficient controls into a common lane shape; and Metal
+unary `round` emission now generates the valid `metal::round(x)` spelling. The
+real analog-bread-and-butter and verysimplesubtract Patch Learn snapshots both
+complete CMA search through the bundled executable after these fixes.
+
+## Opt-in tensor-lane multistart (2026-08-14)
+
+`--multistart-candidates N` replaces the weak midpoint-only starting-point
+policy with a generic population stage before the two full trajectories.
+The population always includes the supplied seed and transformed midpoint,
+then seed jitters and transformed-coordinate stratified starts. Candidates
+are rendered in `--multistart-batch` lanes, ranked by an independent vDSP
+MR-STFT scorer, diversity-filtered to `--multistart-lanes`, and refined for
+`--multistart-steps` batched Adam steps. The seed and best post-horizon lane
+then receive full `--epochs` continuations (`train` and `global-candidate`).
+The lower-loss continuation supplies the final artifact only when this option
+is explicitly enabled. `multistart_report.json` preserves initial/post scores,
+correlation, source indices, winner, and timings.
+
+Korg1 smoke/feasibility result (65,536 frames, 34 trainable params, real dual
+SVF patch): 64 forward candidates -> 16 retained lanes -> 5 Adam steps
+completed end-to-end in 53 s including two one-epoch continuations/renders.
+Independent score improved from seed 0.5654 to 0.4812; the best population
+start was 0.4855. Initial/post correlation over retained lanes was 0.992 for
+this deliberately short horizon, so this run validates throughput and basin
+quality, not the bead's expected weak-correlation result at 20-50 steps.
+
+Tensor phasor-frequency and shared `accum` suffix adjoints are trainable in
+the batched short horizon (the detach workaround is removed). The
+block-formation composition bug — temporal-gradient read blocks scheduled
+after their tensor-history SVF BPTT consumers — was fixed in
+`consolidateTensorBPTTBackwardBlocks`: transitive `beforeDeps` over multi-phase
+isolated-pass adjoint chains, dependency-ordered tail placement, and
+fixed-point eviction of "sandwich" nodes (a grad add that is both a carry-read
+descendant and a `temporalGradRead` consumer, where the read's store input is
+computed inside the recurrence — it must run after the reverse loop, reading
+the closure's per-frame outputs from frame-aware cells). A shape-[1] tensor
+phasor grad additionally required the tensor store path in
+`emitTemporalGradient` (the scalar `elementCount == 1` fast path silently
+stored zeros). Verified end-to-end: `benchmarks/train_monologue` multistart
+smoke (8 candidates → 2 lanes → 3 batched Adam steps → continuations)
+completes with phasor/accum grads live. Regression coverage:
+`Tests/DGenLazyTests/TensorTemporalGradientCompositionTests.swift` (B=2 tensor
+phasor + coupled TensorHistory SVF, MSE + batched spectral, accum clock,
+B=2-vs-B=1 lane parity, finite differences).
+Arithmetic, exp/log transforms, tan/tanh,
+clip/wrap/comparisons/gswitch, PolyBLEP, noise broadcast, analytic ADSR,
+phasors (forward), scalar-to-lane broadcasting, Lisp `make-history` SVFs,
+tensor spectral loss, and per-lane params are enabled. Param-dependent discrete
+selectors and lane-varying table gathers remain unsuitable.
+
+## Post-landing findings (monologue-bass shakedown, 2026-08-13)
+
+Fitting a real eseq-style monologue patch to `Assets/monologue-bass.wav`
+surfaced and fixed, in order:
+
+1. **Modulated-param machinery**: `@modulator` inlets must stay input
+   inlets (silent = no modulation); `@mod` params are stripped before
+   lowering (`(mod x)` == `x` with silent modulators) because their
+   generated kernels miscompile in the training pipeline.
+2. **Pitch detach is value-level, not edge-level**: gradient is blocked
+   into any node used as a phasor frequency input, at every use —
+   otherwise Adam's normalized steps walk tuning params audibly off pitch
+   on residual PolyBLEP-dt gradients (vco2_interval drifted -12 -> -11.22
+   semitones before this fix).
+3. **Coordinates**: all params train range-normalized ([0,1], log-space
+   for wide positive ranges), LR 5e-3 = 0.5% of range/step; raw natural
+   coordinates left wide knobs untrainable and narrow knobs hot. A phase
+   stops after 3 all-zero-gradient epochs (zero-amplitude dead-start trap).
+4. **THE big one — history-write BPTT truncation (library bug, fixed in
+   Sources/DGen/Gradients.swift)**: unconsumed `historyWrite` nodes were
+   pruned from the reverse walk, so the temporal carry never flowed into
+   the written expression. Any lisp-built state filter (`(write-history ...)`
+   statement form) got truncated coefficient gradients — the SVF macro's
+   cutoff gradient was SIGN-FLIPPED vs finite difference. Swift voices had
+   dodged this via the pass-through-write idiom (biquad B1 bug class).
+   History writes are now always-live backward roots. Reproducers +
+   verification via the `DGENLISP_TRAIN_FDCHECK=<params|all>` env harness
+   in DirectionTrainer (runs FD vs autograd through the real trainer loss,
+   then stops).
+
+Result on the monologue patch after all fixes: 26.9% improvement,
+abs 4.10 (from 5.61), basin ok, deltas musically coherent; residual is
+extra resonant-sweep character vs the cleaner target — the known
+res/shape quasi-degenerate direction. `--checkpoint-every N` supports
+short audible confirm runs.
+
+Status: Phases A–C landed (protocol layer, real plan event, E4 direction
+trainer). Companion to the eseq repo's `docs/patch-learn-spec.md` (rev 2).
+Items marked **SPEC-SYNC** need the spec updated to match (or the code
+changed after discussion).
+
+## Spec deviations (flag loudly)
+
+1. **SPEC-SYNC — per-group LRs**: spec §7 says "Adam with per-group LRs in
+   transformed coordinates". Generic lisp patches have arbitrary param names,
+   so there are no groups to key off. v1 uses a single global transformed-
+   coordinate LR of 2e-2 (= 2x the legacy production toneLR, the
+   BATCH_REFINE_FINDING recommendation), log-reparam for params with
+   `min > 0 && max/min >= 8`, per-param grad clip 1.0, cosine decay, bounds
+   projection. Grouping could later come from `@group`/`@unit` attributes.
+2. **SPEC-SYNC — unsupported element schema**: spec §4 shows
+   `"unsupported":[]` without an element shape. Implemented as
+   `{name, reason}` (same as frozen). Also used for inlets outside the
+   excitation convention (reason `input-not-in-excitation-convention`).
+3. **SPEC-SYNC — abs_distance source**: v1 reports the best training loss
+   (MR-STFT, frozen SPEC.md §4 config) as `abs_distance`, not an independent
+   CPU-scorer re-evaluation. Porting `CPUSpectralScorer` (BasinSearch.swift,
+   vDSP) into the shared target would give the independent number; the host's
+   own round-trip verification (spec §8) is the real defense either way.
+4. **Basin check is serial, not background**: the cold restart (deterministic
+   transformed-midpoint init) runs after the seeded run at the same epoch
+   budget; `wrong_neighborhood` iff cold best < 0.75 x seeded best. Threshold
+   was not pinned by the spec.
+5. **`--plan-only`**: emits the real plan and exits 0 without a terminal
+   `result` event or GPU work. It returns successfully even when the verdict
+   has no learnable params or contains unsupported nodes, because surfacing
+   that verdict is the purpose of the host preflight.
+
+## Known limitations / punts (filed here, not silently dropped)
+
+- **C backend cannot train**: spectral-loss BPTT kernels fail to compile on
+  the C backend (`use of undeclared identifier 'tape'` — the C renderer never
+  declares the tape buffer this configuration needs; same family as the
+  pre-existing `testShrinkWithScalarOp` C failure). `train --backend c`
+  reports the compile error as a protocol-clean error event. Training and the
+  E2E test are Metal-only; the protocol layer (Phase A) and plan layer
+  (Phase B) are Metal-free. `train-render` (forward only) works on both
+  backends.
+- **Per-epoch recompile**: each epoch does `LazyGraphContext.reset()` +
+  re-evaluate + full Metal recompile (~0.5 s/epoch at 8192 frames). Correct
+  by construction (no stale-nodeId class of bugs) but well above the
+  ~0.27 s/epoch production trainer. Fix later by fingerprint-caching across
+  resets or reusing one graph per phase.
+- **Stereo targets**: mono-summed via `AudioFile.load(mono: true)` (spec §9
+  open question; pick made explicit here).
+- **Poly patches**: nothing voice-aware; the patch is evaluated exactly once
+  (1 voice). Spec §9 open question stands.
+- **Ring mod is not detected**: only phasor-sync (reset driven by another
+  oscillator) is refused. Ring mod is multiplication of oscillators and is
+  indistinguishable from legitimate AM at graph level; per the feasibility
+  doc it stays a declared non-goal rather than a detected refusal.
+- **Tensor/batched phasors**: the freeze analysis walks scalar `.phasor`
+  nodes. Tensor-lane phasors (batch lowering) are not classified — fine for
+  v1 single-voice patches.
+- **Checkpoint renders spawn `train-render`**: realize() must not interleave
+  with backward() in one process (SPEC.md §5 hard-won rule), so preview WAVs
+  re-invoke the executable on `lowered.lisp`. A failed render skips the
+  checkpoint event (logged to stderr) rather than killing the job; the final
+  render failing IS fatal.
+- **`in` channel-only inlets**: inlets are matched by `@name`
+  (gate/trigger/pitch/velocity). Unnamed `(in N)` inlets are refused; a
+  channel-number convention could be added if eseq patches rely on it.
+
+## Test map
+
+- `Tests/DGenTrainProtocolTests` — Metal-free: event round-trip/goldens,
+  fake-trainer transcript golden (`Fixtures/fake_transcript.golden.ndjson`,
+  regenerate with `DGEN_UPDATE_GOLDEN=1`), excitation measurement on
+  synthesized drum/sustained assets.
+- `Tests/DGenLispTests/TrainCLITests.swift` — subprocess protocol tests:
+  happy path, poisoned stdout, crash path, SIGTERM, plan-only, and the
+  Python mock host (`scripts/consume_train_stream.py`).
+- `Tests/DGenLispTests/TrainPlannerTests.swift` — lowering verdict incl.
+  macro transparency and inlet rewriting.
+- `Tests/DGenLispTests/TrainE2ETests.swift` — Metal-gated rung-1-style
+  self-consistency run through the real trainer.

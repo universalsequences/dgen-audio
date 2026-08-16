@@ -322,6 +322,10 @@ public class TensorHistory {
   /// Cell ID for the history buffer
   public var cellId: CellID { buffer.cellId }
 
+  /// Whether reads participate in BPTT. Stateful batched voices need this
+  /// even though the read itself has no trainable leaf.
+  public let requiresGrad: Bool
+
   /// Create a tensor history buffer
   /// - Parameters:
   ///   - shape: Shape of the tensor to store
@@ -330,10 +334,13 @@ public class TensorHistory {
   ///     / FDTD sims). Use the hop value for STFT-style per-bin spectral dynamics
   ///     (per-bin compressor, spectral freeze, temporal blur) inside an FFT region.
   ///   - data: Optional initial data
-  public init(shape: Shape, hop: Int? = nil, data: [Float]? = nil) {
+  public init(
+    shape: Shape, hop: Int? = nil, data: [Float]? = nil, requiresGrad: Bool = false
+  ) {
     let graph = LazyGraphContext.current
     self.graph = graph
     self.shape = shape
+    self.requiresGrad = requiresGrad
     self.buffer = graph.graph.tensorHistoryBuffer(shape: shape, hop: hop, data: data)
   }
 
@@ -341,7 +348,8 @@ public class TensorHistory {
   /// Returns a SignalTensor (varies per frame)
   public func read() -> SignalTensor {
     let nodeId = graph.graph.tensorHistoryRead(buffer)
-    return SignalTensor(nodeId: nodeId, graph: graph, shape: shape, requiresGrad: false)
+    return SignalTensor(
+      nodeId: nodeId, graph: graph, shape: shape, requiresGrad: requiresGrad)
   }
 
   /// Write new state to the history buffer

@@ -9,6 +9,22 @@ public enum DGenGradientConfig {
   /// Can be enabled for experiments via `DGEN_FAST_PEEKROW_GRAD=1`.
   public static var useFastPeekRowGradReduce: Bool =
     (ProcessInfo.processInfo.environment["DGEN_FAST_PEEKROW_GRAD"] == "1")
+
+  /// `true`: stop-gradient at every phasor frequency input. The forward
+  /// graph is unchanged (pitch modulation still sounds), but no gradient
+  /// flows through oscillator frequency. Off by default: the historical
+  /// cross-param corruption (a trainable phasor frequency corrupting a
+  /// coupled-history param's gradient ~30x) was a block-formation bug —
+  /// the phasor's suffix-scan tape severed the scalar BPTT recurrence —
+  /// fixed by consolidateScalarBPTTBackwardBlocks. Kept as an opt-out
+  /// for experiments that want pitch pinned.
+  public static var detachPhasorFrequency: Bool = false
+
+  /// Stop-gradient through stateful accumulator controls. Useful when accum
+  /// is only a shared sample clock inside a tensor-lane training graph; its
+  /// suffix-scan adjoint otherwise creates a scalar temporal-gradient block
+  /// that cannot compose with the lane-parallel tensor-history backward yet.
+  public static var detachAccumInputs: Bool = false
 }
 
 /// Runtime knobs for spectral loss semantics.

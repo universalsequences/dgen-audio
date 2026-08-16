@@ -17,6 +17,12 @@ extension GraphPrepPasses {
       let hasScalarInput = node.inputs.contains { scalarSet.contains($0) }
       guard hasScalarInput else { continue }
       for inputId in node.inputs where !simdSafeNodes.contains(inputId) {
+        if ProcessInfo.processInfo.environment["DGEN_DEBUG_SCALAR_HOP"] != nil,
+          !scalarSet.contains(inputId), let inputNode = graph.nodes[inputId],
+          case .tensor = inputNode.shape
+        {
+          print("[scalar-hop] seq-propagated id=\(inputId) op=\(inputNode.op) via seq=\(nodeId)")
+        }
         scalarSet.insert(inputId)
       }
     }

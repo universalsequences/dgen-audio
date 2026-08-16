@@ -57,11 +57,51 @@ extension Graph {
     var grads: [NodeID: NodeID] = [:]
     gradientSideEffects = []
 
+    // Detached-pitch policy: any node used as a phasor frequency input is a
+    // gradient sink at EVERY use, not just at the phasor edge. The same
+    // value node typically also feeds pitch-derived side computations
+    // (e.g. the PolyBLEP transition width dt = freq/samplerate); training
+    // on those residual gradients lets Adam's normalized steps walk tuning
+    // params audibly off pitch with no corrective signal.
+    var frequencySinks: Set<NodeID> = []
+    if DGenGradientConfig.detachPhasorFrequency,
+      ProcessInfo.processInfo.environment["DGEN_NO_FREQ_SINKS"] == nil
+    {
+      for (_, node) in nodes {
+        switch node.op {
+        case .phasor, .deterministicPhasor:
+          frequencySinks.formUnion(node.inputs)
+        default:
+          break
+        }
+      }
+    }
+
     // Seed: gradient of loss w.r.t. itself = 1.0
     grads[loss] = n(.constant(1.0), [])
 
+    // History writes are temporal side effects: their stored value affects
+    // the loss through FUTURE frames' historyRead even when the write
+    // node's own output is unconsumed (the natural `(write-history ...)`
+    // statement form). The reverse walk would prune such nodes, their
+    // backward would never read the gradient carry cell, and the temporal
+    // recursion would silently truncate — wrong-sign coefficient gradients
+    // for any state filter not written in the pass-through-consuming idiom
+    // (docs/BIQUAD_BPTT_GRADIENT_BUG.md, SVF lisp-macro reproducer).
+    // Treat every pure historyWrite as an additional backward root with a
+    // zero seed; consumed writes just add their downstream gradient on top.
+    var historyWriteRoots: [NodeID] = []
+    for (id, node) in nodes {
+      if case .historyWrite = node.op { historyWriteRoots.append(id) }
+    }
+    historyWriteRoots.sort()
+    for writeId in historyWriteRoots where grads[writeId] == nil {
+      grads[writeId] = n(.constant(0.0), [])
+    }
+
     // Walk in reverse topological order
-    let reverseOrder = reverseTopologicalOrder(from: loss, targets: targets)
+    let reverseOrder = reverseTopologicalOrder(
+      from: [loss] + historyWriteRoots, targets: targets)
     for nodeId in reverseOrder {
       guard let upstreamGrad = grads[nodeId],
         let node = nodes[nodeId]
@@ -82,6 +122,7 @@ extension Graph {
       // Accumulate gradients (as graph nodes, not values!)
       for (inputId, grad) in zip(node.inputs, inputGrads) {
         guard let grad = grad else { continue }
+        if frequencySinks.contains(inputId) { continue }
 
         if let existing = grads[inputId] {
           grads[inputId] = n(.add, [existing, grad])
@@ -114,11 +155,11 @@ extension Graph {
   }
 
   /// Compute reverse topological order from loss, only including nodes on paths to targets.
-  private func reverseTopologicalOrder(from root: NodeID, targets: Set<NodeID>) -> [NodeID] {
+  private func reverseTopologicalOrder(from roots: [NodeID], targets: Set<NodeID>) -> [NodeID] {
     // First, find which nodes are on paths to targets
     var onTargetPath: [NodeID: Bool] = [:]
 
-    for nodeId in topologicalOrder(from: root) {
+    for nodeId in topologicalOrder(from: roots) {
       guard let node = nodes[nodeId] else { continue }
       // historyRead counts as a target: its accumulated gradient is the BPTT
       // temporal carry. Without this, historyWrite nodes whose input is a
@@ -133,14 +174,14 @@ extension Graph {
     }
 
     // Now collect nodes in topological order, filtering to target paths
-    let topo = topologicalOrder(from: root).filter { onTargetPath[$0] == true }
+    let topo = topologicalOrder(from: roots).filter { onTargetPath[$0] == true }
 
     // Return reversed
     return topo.reversed()
   }
 
-  /// Standard topological sort from a root node.
-  private func topologicalOrder(from root: NodeID) -> [NodeID] {
+  /// Standard topological sort from one or more root nodes.
+  private func topologicalOrder(from roots: [NodeID]) -> [NodeID] {
     var visited = Set<NodeID>()
     var order: [NodeID] = []
 
@@ -156,7 +197,9 @@ extension Graph {
       order.append(nodeId)
     }
 
-    visit(root)
+    for root in roots {
+      visit(root)
+    }
     return order
   }
 }
@@ -215,6 +258,20 @@ private func temporalIncrementGradient(
       scaleBySampleRate: scaleBySampleRate),
     [scan],
     shape: shape.isEmpty ? .scalar : .tensor(shape))
+}
+
+/// Build an exact zero gradient with the same value shape as `input`.
+///
+/// A scalar zero broadcasts correctly inside elementwise derivative expressions,
+/// but it is not a valid final gradient for a tensor parameter: tensor gradient
+/// accumulation requires an actual tensor node. Non-differentiable operations
+/// therefore need shape-preserving zeros rather than bare scalar constants.
+private func zeroGradient(_ g: Graph, matching input: NodeID) -> NodeID {
+  let zero = g.n(.constant(0.0), [])
+  guard let inputNode = g.nodes[input], case .tensor(let shape) = inputNode.shape else {
+    return zero
+  }
+  return g.n(.expand(shape), [zero])
 }
 
 extension LazyOp {
@@ -296,8 +353,7 @@ extension LazyOp {
 
     case .mod:
       // d(fmod(a,b))/da ~ 1, d/db ~ 0 (for DSP wrapping)
-      let zero = g.n(.constant(0.0), [])
-      return [gradOutput, zero]
+      return [gradOutput, zeroGradient(g, matching: node.inputs[1])]
 
     case .pow:
       // d(x^y)/dx = y * x^(y-1) * grad
@@ -378,7 +434,7 @@ extension LazyOp {
 
     case .sign:
       // sign is not differentiable (zero gradient)
-      return [g.n(.constant(0.0), [])]
+      return [zeroGradient(g, matching: node.inputs[0])]
 
     case .sin:
       // d(sin(x))/dx = cos(x) * grad
@@ -448,13 +504,12 @@ extension LazyOp {
 
     case .floor, .ceil, .round:
       // Not differentiable, gradient = 0
-      return [g.n(.constant(0.0), [])]
+      return [zeroGradient(g, matching: node.inputs[0])]
 
     // MARK: Comparisons (non-differentiable)
 
     case .gt, .gte, .lt, .lte, .eq:
-      let zero = g.n(.constant(0.0), [])
-      return [zero, zero]
+      return node.inputs.map { zeroGradient(g, matching: $0) }
 
     // MARK: Control Flow
 
@@ -467,7 +522,7 @@ extension LazyOp {
       let zero = g.n(.constant(0.0), [])
       let gradX = g.n(.gswitch, [cond, gradOutput, zero])
       let gradY = g.n(.gswitch, [cond, zero, gradOutput])
-      return [zero, gradX, gradY]
+      return [zeroGradient(g, matching: cond), gradX, gradY]
 
     case .selector:
       // selector(mode, options...) -> gradient flows to selected option only.
@@ -478,7 +533,7 @@ extension LazyOp {
       let mode = node.inputs[0]
       let zero = g.n(.constant(0.0), [])
 
-      var grads: [NodeID?] = [zero]  // mode has zero gradient
+      var grads: [NodeID?] = [zeroGradient(g, matching: mode)]  // mode has zero gradient
       for i in 1..<node.inputs.count {
         let selectorValue = g.n(.constant(Float(i)), [])
         let isSelected = g.n(.eq, [mode, selectorValue])
@@ -491,8 +546,9 @@ extension LazyOp {
       // Host modulation routing is not part of the training surface.
       // Preserve gradient flow to the base parameter and treat active/depth lanes
       // as non-differentiable controls.
-      let zero = g.n(.constant(0.0), [])
-      return node.inputs.enumerated().map { index, _ in index == 0 ? gradOutput : zero }
+      return node.inputs.enumerated().map { index, input in
+        index == 0 ? gradOutput : zeroGradient(g, matching: input)
+      }
 
     case .mix:
       // mix(x, y, t) = x * (1-t) + y * t
@@ -657,6 +713,11 @@ extension LazyOp {
     // MARK: Stateful Operations
 
     case .phasor(_):
+      if DGenGradientConfig.detachPhasorFrequency {
+        // Stop-gradient policy (see DGenGradientConfig): identity forward,
+        // no gradient through the frequency (or reset) input.
+        return [nil, nil]
+      }
       let gradFreq = temporalIncrementGradient(
         graph: g,
         node: node,
@@ -666,12 +727,18 @@ extension LazyOp {
       return [gradFreq, zero]
 
     case .deterministicPhasor:
+      if DGenGradientConfig.detachPhasorFrequency {
+        return node.inputs.map { _ in nil }
+      }
       // d(phase)/d(freq) = frameIndex / sampleRate
       // Similar to phasor but stateless
       let sampleRate = g.n(.hostSampleRate, [])
       return [g.n(.gradDeterministicPhasor, [gradOutput, sampleRate])]
 
     case .accum(_):
+      if DGenGradientConfig.detachAccumInputs {
+        return node.inputs.map { _ in nil }
+      }
       let gradIncrement = temporalIncrementGradient(
         graph: g,
         node: node,
@@ -754,8 +821,15 @@ extension LazyOp {
         // bufferView backward: convert tensor gradient → scalar gradient
         let windowSize = shape.reduce(1, *)
 
+        // Hop-based buffers only produce a window per hop, so the gradient
+        // tape needs one slot per hop, not per frame (see frameAwareCellHops).
+        let hopRate = g.nodeHopRate[node.id]
+        let hop = hopRate?.0 ?? 1
+        let gradSlots = hop > 1 ? (g.maxFrameCount + hop - 1) / hop : g.maxFrameCount
+
         // Allocate frame-indexed gradient cell
-        let gradCell = g.allocFrameAware(tensorSize: windowSize, frameCount: g.maxFrameCount)
+        let gradCell = g.allocFrameAware(tensorSize: windowSize, frameCount: gradSlots)
+        g.frameAwareCellHops[gradCell] = hop > 1 ? hop : nil
 
         // Phase 1: Store gradient tensor elements to frame-indexed cell
         let storeOp = g.n(
@@ -1230,8 +1304,18 @@ extension LazyOp {
         [gradOutput])
       g.addGradientSideEffect(storeOp)
 
-      // Phase 2: Gather into gradient tensor (frame-aware)
-      let gradInputCell = g.allocFrameAware(tensorSize: totalSize, frameCount: g.maxFrameCount)
+      // Phase 2: Gather into gradient tensor (frame-aware). The gathered
+      // gradient only exists on hop boundaries, so store one slot per hop
+      // and tag the gather (and the tensor read of its result) with the
+      // forward chain's hop rate so the whole backward tensor chain is
+      // scheduled hop-based instead of frame-based zero-padding.
+      // The tape layout, the writer and the reader must all agree: only slice
+      // per-hop when the upstream chain actually runs at this hop rate.
+      let hopRate = findUpstreamHopRate(g, from: tensorInput)
+      let hopGated = hopSize > 1 && hopRate?.0 == hopSize
+      let gradSlots = hopGated ? (g.maxFrameCount + hopSize - 1) / hopSize : g.maxFrameCount
+      let gradInputCell = g.allocFrameAware(tensorSize: totalSize, frameCount: gradSlots)
+      g.frameAwareCellHops[gradInputCell] = hopGated ? hopSize : nil
 
       let gatherOp = g.n(
         .overlapAddGradGather(
@@ -1243,6 +1327,10 @@ extension LazyOp {
       // Return gradient tensor sequenced after gather
       let sequencedGrad = createSequencedGradTensor(
         g, gradCell: gradInputCell, shape: shape, afterOp: gatherOp)
+      if hopGated, let hopRate {
+        g.nodeHopRate[gatherOp] = hopRate
+        g.nodeHopRate[sequencedGrad] = hopRate
+      }
       return [sequencedGrad]
 
     case .peek:
@@ -1315,8 +1403,7 @@ extension LazyOp {
     // MARK: Logical ops (non-differentiable)
 
     case .and, .or, .xor:
-      let zero = g.n(.constant(0.0), [])
-      return [zero, zero]
+      return node.inputs.map { zeroGradient(g, matching: $0) }
 
     // MARK: Non-differentiable compute ops
 
@@ -1364,6 +1451,29 @@ extension LazyOp {
 
   /// Create a tensor backed by gradCell and return a tensorRef sequenced after the given op.
   /// This ensures the gradient is computed before reading.
+  /// Walk up the graph from `start` looking for a node tagged with an explicit
+  /// hop rate (e.g. a hop-based bufferView). Used by backward construction to
+  /// inherit the forward chain's hop counter for hop-gated gradient scheduling.
+  private func findUpstreamHopRate(_ g: Graph, from start: NodeID) -> (Int, NodeID)? {
+    var visited: Set<NodeID> = []
+    var queue: [NodeID] = [start]
+    var steps = 0
+    while let current = queue.popLast() {
+      steps += 1
+      if steps > 65536 {
+        assertionFailure(
+          "findUpstreamHopRate: search bail-out after \(steps) steps; hop scheduling lost")
+        return nil
+      }
+      if !visited.insert(current).inserted { continue }
+      if let rate = g.nodeHopRate[current] { return rate }
+      if let node = g.nodes[current] {
+        queue.append(contentsOf: node.inputs)
+      }
+    }
+    return nil
+  }
+
   private func createSequencedGradTensor(
     _ g: Graph,
     gradCell: CellID,

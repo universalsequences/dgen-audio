@@ -2149,6 +2149,10 @@ final class CTensorOpsTests: XCTestCase {
                 print("=== Chained Shrink - Generated Source ===")
                 print(cResult.source)
 
+                XCTAssertGreaterThanOrEqual(
+                        cResult.totalMemorySlots, data.count,
+                        "Runtime memory must cover the complete injectable source tensor")
+
                 let cRuntime = CCompiledKernel(
                         source: cResult.source,
                         cellAllocations: cResult.cellAllocations,

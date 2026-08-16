@@ -610,6 +610,78 @@ final class SpectralTensorUpgradeTests: XCTestCase {
     try compileOutputs(e, frames: 4)
   }
 
+  func testAcceleratedSpectralFeedbackPatchCompilesToC() throws {
+    let e = try evaluator(
+      """
+      (def input (in 1))
+      (def win (sqrt (hann 16)))
+      (def frame (* (reshape (buffer input 16 4) @shape [16]) win))
+      (def (re im) (fft frame @N 16 @backend accelerated))
+      (def mag (sqrt (+ (* re re) (* im im))))
+
+      (def fold-idx
+        (tensor @shape [16] @data [0 1 2 3 4 5 6 7 8 7 6 5 4 3 2 1]))
+      (def fold-norm
+        (tensor @shape [16] @data [0 0.125 0.25 0.375 0.5 0.625 0.75 0.875 1 0.875 0.75 0.625 0.5 0.375 0.25 0.125]))
+      (def bin-sign
+        (tensor @shape [16] @data [0 1 1 1 1 1 1 1 0 -1 -1 -1 -1 -1 -1 -1]))
+      (def phase-adv
+        (tensor @shape [16] @data [0 0.4 0.8 1.2 1.6 2 2.4 2.8 3.2 -2.8 -2.4 -2 -1.6 -1.2 -0.8 -0.4]))
+
+      (def freeze-h (hop-hold (in 2) 4))
+      (def drift-s (hop-hold (+ 1 (* (in 3) 0.01)) 4))
+      (def bloom-h (hop-hold (+ 0.25 (* 0 (in 4))) 4))
+
+      (make-history bloom-mag @shape [16] @hop 4)
+      (def prev (read-history bloom-mag))
+      (def drift-idx (* fold-idx drift-s))
+      (def idx-lo (floor drift-idx))
+      (def idx-frac (- drift-idx idx-lo))
+      (def drifted
+        (+ (* (gather prev idx-lo) (- 1 idx-frac))
+           (* (gather prev (+ idx-lo 1)) idx-frac)))
+      (def blur-k (tensor @shape [3] @data [0.25 0.5 0.25]))
+      (def diffused
+        (+ (* (- 1 bloom-h) drifted) (* bloom-h (conv1d drifted blur-k))))
+      (def gain (exp (* -0.1 (+ 1 fold-norm))))
+      (def next-mag (max (* mag (- 1 freeze-h)) (* diffused gain)))
+      (write-history bloom-mag next-mag)
+      (def cloud-mag (hop-hold next-mag 4))
+
+      (make-history bloom-phase @shape [16] @hop 4)
+      (def ph-prev (read-history bloom-phase))
+      (def jit (* (gather (noise @size 16 @hop 4) fold-idx) bin-sign 0.1))
+      (def ph-next (wrap (+ ph-prev phase-adv jit) 0 twopi))
+      (write-history bloom-phase ph-next)
+      (def ph (hop-hold ph-next 4))
+
+      (def wet-re (* cloud-mag (cos ph)))
+      (def wet-im (* cloud-mag (sin ph)))
+      (def wet
+        (overlap-add (* (ifft wet-re wet-im @N 16 @backend accelerated) win) 4))
+      (out wet 1)
+      """)
+
+    let result = try compilePatch(
+      graph: LazyGraphContext.current,
+      outputs: e.outputs,
+      options: CompilerOptions(
+        outputDir: tempDir.path,
+        name: "accelerated-spectral-feedback",
+        sampleRate: 8,
+        maxFrames: 32,
+        voiceCount: 1,
+        skipInlineAudit: true,
+        debug: false
+      ))
+
+    XCTAssertFalse(
+      result.cSource.split(separator: "\n").contains {
+        $0.contains("int t") && $0.contains("vdivq_f32")
+      })
+    XCTAssertTrue(FileManager.default.fileExists(atPath: result.dylibPath))
+  }
+
   func testBendingMetalStylePlateGraphCompiles() throws {
     let e = try evaluator(
       """

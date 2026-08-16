@@ -50,6 +50,13 @@ struct OutputInfo {
   let modulatorSlot: Int?
 }
 
+struct TensorOutputInfo {
+  let channel: Int
+  let signal: SignalTensor
+  let name: String?
+  let modulatorSlot: Int?
+}
+
 struct InputInfo {
   let channel: Int
   let name: String?
@@ -80,13 +87,28 @@ class LispEvaluator {
   var macros: [String: MacroDefinition] = [:]
   var params: [ParamInfo] = []
   var outputs: [OutputInfo] = []
+  var tensorOutputs: [TensorOutputInfo] = []
   var inputs: [InputInfo] = []
   var tensors: [TensorInfo] = []
   var macroExpansionCounter: Int = 0
   let sourceDirectory: URL
+  let reusesRegisteredParameters: Bool
+  /// When present, scalar patch parameters and state are lifted into this
+  /// lane dimension. Values are natural-unit parameter tensors supplied by
+  /// the multistart harness; patch source remains unchanged.
+  let batchLaneCount: Int?
+  let batchParameterValues: [String: EvalResult]
 
-  init(sourceDirectory: URL = URL(fileURLWithPath: FileManager.default.currentDirectoryPath)) {
+  init(
+    sourceDirectory: URL = URL(fileURLWithPath: FileManager.default.currentDirectoryPath),
+    reusesRegisteredParameters: Bool = false,
+    batchLaneCount: Int? = nil,
+    batchParameterValues: [String: EvalResult] = [:]
+  ) {
     self.sourceDirectory = sourceDirectory
+    self.reusesRegisteredParameters = reusesRegisteredParameters
+    self.batchLaneCount = batchLaneCount
+    self.batchParameterValues = batchParameterValues
   }
 
   // MARK: - Top-level evaluation
@@ -97,6 +119,21 @@ class LispEvaluator {
   }
 
   func evaluate(nodes: [ASTNode]) throws {
+    if reusesRegisteredParameters {
+      // Every non-parameter value belongs to the computation graph generation
+      // in which it was built. Never let those stale node IDs leak into a
+      // re-evaluation after backward() has cleared that generation.
+      definitions.removeAll()
+      historyBindings.removeAll()
+      tensorHistoryBindings.removeAll()
+      macros.removeAll()
+      params.removeAll()
+      outputs.removeAll()
+      tensorOutputs.removeAll()
+      inputs.removeAll()
+      tensors.removeAll()
+      macroExpansionCounter = 0
+    }
     for node in nodes {
       let _ = try evaluateAST(node)
     }
@@ -297,6 +334,10 @@ class LispEvaluator {
     let attrs = try parseTrailingAttributes(elements, startIndex: 2, form: "make-history")
     if attrValue(attrs, "@shape") != nil {
       try makeTensorHistoryBinding(name: name, attrs: attrs, form: "make-history")
+      return .none
+    }
+    if let lanes = batchLaneCount {
+      tensorHistoryBindings[name] = TensorHistory(shape: [lanes])
       return .none
     }
     let history = Signal.history()
@@ -604,6 +645,8 @@ class LispEvaluator {
     // Effects
     case "biquad":
       return try evalBiquad(regularArgs, attributes: attributePairs)
+    case "svf-freq":
+      return try evalSVFFrequencySampled(regularArgs, attributes: attributePairs)
     case "compressor":
       return try evalCompressor(regularArgs, rawArgs: args, attributes: attributePairs)
     case "delay":
@@ -1162,8 +1205,16 @@ class LispEvaluator {
 
     switch promoteToValue(freqResult) {
     case .signal(let freq):
+      if let lanes = batchLaneCount {
+        return .signalTensor(
+          Signal.statefulPhasor(Tensor([Float](repeating: 1, count: lanes)) * freq, reset: reset))
+      }
       return .signal(Signal.phasor(freq, reset: reset))
     case .float(let freq):
+      if let lanes = batchLaneCount {
+        return .signalTensor(
+          Signal.statefulPhasor(Tensor([Float](repeating: freq, count: lanes)), reset: reset))
+      }
       return .signal(Signal.phasor(freq, reset: reset))
     case .tensor(let freqs):
       // Tensor frequencies lower to the stateful per-lane phasor
@@ -1271,35 +1322,59 @@ class LispEvaluator {
     guard args.count >= 1 else {
       throw LispError.invalidArgument("biquad requires at least 1 argument (signal)")
     }
-    let sigResult = try evaluateAST(args[0])
+    let input = try promoteToValue(evaluateAST(args[0]))
+    let cutoff = try promoteToValue(args.count >= 2
+      ? evaluateAST(args[1])
+      : .float(Float(attrValue(attributes, "@cutoff") ?? "1000") ?? 1000))
+    let resonance = try promoteToValue(args.count >= 3
+      ? evaluateAST(args[2])
+      : .float(Float(attrValue(attributes, "@q") ?? "0.707") ?? 0.707))
+    let gain = try promoteToValue(args.count >= 4
+      ? evaluateAST(args[3])
+      : .float(Float(attrValue(attributes, "@gain") ?? "0") ?? 0))
+    let mode = try promoteToValue(args.count >= 5
+      ? evaluateAST(args[4])
+      : .float(Float(attrValue(attributes, "@mode") ?? "0") ?? 0))
 
-    // Parse biquad params from remaining args or attributes — accept signals or floats
-    let cutoff: Signal =
-      args.count >= 2
-      ? try requireSignal(evaluateAST(args[1]))
-      : Signal.constant(Float(attrValue(attributes, "@cutoff") ?? "1000") ?? 1000)
-    let q: Signal =
-      args.count >= 3
-      ? try requireSignal(evaluateAST(args[2]))
-      : Signal.constant(Float(attrValue(attributes, "@q") ?? "0.707") ?? 0.707)
-    let gain: Signal =
-      args.count >= 4
-      ? try requireSignal(evaluateAST(args[3]))
-      : Signal.constant(Float(attrValue(attributes, "@gain") ?? "0") ?? 0)
-    let mode: Signal =
-      args.count >= 5
-      ? try requireSignal(evaluateAST(args[4]))
-      : Signal.constant(Float(attrValue(attributes, "@mode") ?? "0") ?? 0)
-
-    switch sigResult {
-    case .signal(let sig):
-      return .signal(sig.biquad(cutoff: cutoff, resonance: q, gain: gain, mode: mode))
-    case .signalTensor(let st):
-      return .signalTensor(st.biquad(cutoff: cutoff, resonance: q, gain: gain, mode: mode))
-    default:
-      let sig = try requireSignal(sigResult)
-      return .signal(sig.biquad(cutoff: cutoff, resonance: q, gain: gain, mode: mode))
+    let controls = [input, cutoff, resonance, gain, mode]
+    let shape = broadcastShapeOf(controls)
+    if !shape.isEmpty {
+      return .signalTensor(try asSignalTensor(input, shape: shape, op: "biquad").biquad(
+        cutoff: asSignalTensor(cutoff, shape: shape, op: "biquad cutoff"),
+        resonance: asSignalTensor(resonance, shape: shape, op: "biquad resonance"),
+        gain: asSignalTensor(gain, shape: shape, op: "biquad gain"),
+        mode: asSignalTensor(mode, shape: shape, op: "biquad mode")))
     }
+
+    return .signal(try asSignal(input, op: "biquad").biquad(
+      cutoff: asSignal(cutoff, op: "biquad cutoff"),
+      resonance: asSignal(resonance, op: "biquad resonance"),
+      gain: asSignal(gain, op: "biquad gain"),
+      mode: asSignal(mode, op: "biquad mode")))
+  }
+
+  private func evalSVFFrequencySampled(
+    _ args: [ASTNode], attributes: [(name: String, value: String)]
+  ) throws -> EvalResult {
+    guard args.count == 4 else {
+      throw LispError.invalidArgument("svf-freq requires input, cutoff, q, and mode")
+    }
+    let input = try requireSignal(evaluateAST(args[0]))
+    let cutoff = try requireSignal(evaluateAST(args[1]))
+    let q = try requireSignal(evaluateAST(args[2]))
+    let mode = try requireSignal(evaluateAST(args[3]))
+    let window = Int(attrValue(attributes, "@window") ?? "1024") ?? 0
+    let hop = Int(attrValue(attributes, "@hop") ?? "256") ?? 0
+    guard window >= 2, window.nonzeroBitCount == 1 else {
+      throw LispError.invalidArgument("svf-freq: @window must be a power of two >= 2")
+    }
+    guard hop > 0, hop <= window, window % hop == 0 else {
+      throw LispError.invalidArgument("svf-freq: @hop must be positive and divide @window")
+    }
+    return .signal(
+      svfFrequencySampled(
+        input, cutoff: cutoff, q: q, mode: mode,
+        window: window, hop: hop, sampleRate: DGenConfig.sampleRate))
   }
 
   private func evalDelay(_ args: [ASTNode], attributes: [(name: String, value: String)]) throws
@@ -1406,7 +1481,46 @@ class LispEvaluator {
     let modulationResolvedSymbolName = attrValue(attributes, "@mod-resolved-symbol")
     let generatedModulatorSlot = Int(attrValue(attributes, "@modulator-slot") ?? "")
 
-    let signal = Signal.param(defaultVal, min: minVal, max: maxVal)
+    if let lanes = batchLaneCount {
+      guard let value = batchParameterValues[name] else {
+        throw LispError.invalidArgument(
+          "batch param '\(name)' requires a supplied [\(lanes)] tensor")
+      }
+      let shape: [Int]
+      switch value {
+      case .tensor(let tensor): shape = tensor.shape
+      case .signalTensor(let tensor): shape = tensor.shape
+      default: shape = []
+      }
+      guard shape == [lanes] else {
+        throw LispError.invalidArgument(
+          "batch param '\(name)' requires shape [\(lanes)], got \(shape)")
+      }
+      let info = ParamInfo(
+        name: name, cellId: nil, defaultValue: defaultVal, min: minVal, max: maxVal,
+        unit: unit, hidden: hidden, group: group, env: env, role: role,
+        generatedKind: generatedKind, generatedFor: generatedFor,
+        modulationMode: modulationMode, modulationDepthMin: modulationDepthMin,
+        modulationDepthMax: modulationDepthMax,
+        modulationActiveParamName: modulationActiveParamName,
+        modulationResolvedSymbolName: modulationResolvedSymbolName,
+        generatedModulatorSlot: generatedModulatorSlot)
+      params.append(info)
+      definitions[name] = value
+      return value
+    }
+
+    let graph = LazyGraphContext.current
+    let signal: Signal
+    if reusesRegisteredParameters, let registered = graph.registeredSignalParameter(named: name) {
+      registered.refresh()
+      signal = registered
+    } else {
+      signal = Signal.param(defaultVal, min: minVal, max: maxVal)
+      if reusesRegisteredParameters {
+        graph.registerParameter(signal, named: name)
+      }
+    }
 
     let info = ParamInfo(
       name: name,
@@ -1460,7 +1574,7 @@ class LispEvaluator {
     guard args.count >= 1 else {
       throw LispError.invalidArgument("out requires at least 1 argument (signal)")
     }
-    let signal = try requireSignal(evaluateAST(args[0]))
+    let value = try evaluateAST(args[0])
 
     // Second arg is channel number (1-indexed)
     let channelLisp: Int
@@ -1476,12 +1590,32 @@ class LispEvaluator {
     let modulatorSlot = try parseOptionalPositiveIntAttribute(attributes, "@modulator")
     if let modulatorSlot,
       outputs.contains(where: { $0.modulatorSlot == modulatorSlot })
+        || tensorOutputs.contains(where: { $0.modulatorSlot == modulatorSlot })
     {
       throw LispError.invalidArgument("duplicate output @modulator slot \(modulatorSlot)")
     }
-    outputs.append(
-      OutputInfo(channel: channel, signal: signal, name: name, modulatorSlot: modulatorSlot)
-    )
+    switch value {
+    case .signalTensor(let signal):
+      tensorOutputs.append(
+        TensorOutputInfo(
+          channel: channel, signal: signal, name: name, modulatorSlot: modulatorSlot))
+    case .tensor(let tensor):
+      tensorOutputs.append(
+        TensorOutputInfo(
+          channel: channel, signal: SignalTensor.lift(tensor), name: name,
+          modulatorSlot: modulatorSlot))
+    default:
+      let signal = try requireSignal(value)
+      if let lanes = batchLaneCount {
+        let lifted = Tensor([Float](repeating: 1, count: lanes)) * signal
+        tensorOutputs.append(
+          TensorOutputInfo(
+            channel: channel, signal: lifted, name: name, modulatorSlot: modulatorSlot))
+      } else {
+        outputs.append(
+          OutputInfo(channel: channel, signal: signal, name: name, modulatorSlot: modulatorSlot))
+      }
+    }
 
     return .none
   }
@@ -2673,11 +2807,24 @@ class LispEvaluator {
       throw LispError.invalidArgument("selector requires at least 2 arguments (mode, options...)")
     }
 
-    let mode = try requireSignal(coerceToSignal(evaluateAST(args[0])))
-    let options = try args.dropFirst().map { arg -> Signal in
-      try requireSignal(coerceToSignal(evaluateAST(arg)))
+    let mode = try promoteToValue(evaluateAST(args[0]))
+    let options = try args.dropFirst().map { try promoteToValue(evaluateAST($0)) }
+    let values = [mode] + options
+    let domains = values.compactMap { numericDomain(of: $0) }
+    guard domains.count == values.count else {
+      throw LispError.typeError("selector: every operand must be numeric")
     }
-    return .signal(DGenLazy.selector(mode, options))
+    let domain = domains.dropFirst().reduce(domains[0], joinDomains)
+    if domain == .signalTensor {
+      let shape = broadcastShapeOf(values)
+      return .signalTensor(
+        DGenLazy.selector(
+          try asSignalTensor(mode, shape: shape, op: "selector"),
+          try options.map { try asSignalTensor($0, shape: shape, op: "selector") }))
+    }
+    let scalarMode = try requireSignal(coerceToSignal(mode))
+    let scalarOptions = try options.map { try requireSignal(coerceToSignal($0)) }
+    return .signal(DGenLazy.selector(scalarMode, scalarOptions))
   }
 
   private func evalModulatedParam(

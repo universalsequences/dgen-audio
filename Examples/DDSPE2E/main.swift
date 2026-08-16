@@ -1,5 +1,8 @@
 import Foundation
 
+// Line-buffer stdout even when piped (tee/logs) so training progress streams live.
+setvbuf(stdout, nil, _IOLBF, 0)
+
 do {
   try DDSPE2EMain.run()
 } catch {
@@ -117,6 +120,10 @@ struct DDSPE2EMain {
     let renderEvery = Int(options["render-every"] ?? "0") ?? 0
     let renderWavPath = options["render-wav"]
     let dumpControlsEvery = Int(options["dump-controls-every"] ?? "0") ?? 0
+    let bestMetric =
+      BestCheckpointMetric(rawValue: (options["best-metric"] ?? "spectral").lowercased())
+      ?? .spectral
+    let bestEvalEvery = max(1, Int(options["best-eval-every"] ?? "10") ?? 10)
     let initCheckpointPath = options["init-checkpoint"]
     let rawKernelDump = options["kernel-dump"]
 
@@ -156,7 +163,9 @@ struct DDSPE2EMain {
         profileKernelsStep: profileStep,
         renderEvery: renderEvery,
         renderWavPath: renderWavPath,
-        dumpControlsEvery: dumpControlsEvery
+        dumpControlsEvery: dumpControlsEvery,
+        bestMetric: bestMetric,
+        bestEvalEvery: bestEvalEvery
       ),
       logger: log
     )
@@ -711,6 +720,9 @@ struct DDSPE2EMain {
       --spectral-hop-divisor <int>
       --spectral-warmup-steps <int>
       --spectral-ramp-steps <int>
+      --spectral-log-epsilon <float>   (1e-8 = 2026-02 baseline; 1e-3 removes empty-bin loss floor)
+      --best-metric <spectral|combined>  (checkpoint selection; spectral = fixed CPU MR-STFT score, default)
+      --best-eval-every <int>          (spectral selection eval cadence in steps, default 10)
       --loudness-weight <float>
       --loudness-loss-mode <linear-l2|db-l1>
       --loudness-weight-end <float>

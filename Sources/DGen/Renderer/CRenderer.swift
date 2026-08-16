@@ -515,7 +515,12 @@ public class CRenderer: Renderer {
       return emitAssign(uop, expr, ctx)
 
     case .div(let a, let b):
-      if uop.scalarType == .int && !uop.isSimd {
+      // Integer values remain lane-uniform scalar temporaries even when the
+      // enclosing tensor element loop is NEON-upgraded. The SIMD legality pass
+      // only permits integer division when both operands are uniform, so using
+      // scalar names here is both correct and avoids declaring `int` from a
+      // float32x4_t expression.
+      if uop.scalarType == .int {
         return emitAssign(uop, "\(gi(a)) / \(gi(b))", ctx)
       }
       // Strength-reduce division by constant to multiply by reciprocal
@@ -534,7 +539,8 @@ public class CRenderer: Renderer {
       }
 
     case .mod(let a, let b):
-      if uop.scalarType == .int && !uop.isSimd {
+      // Same lane-uniform rule as integer division above.
+      if uop.scalarType == .int {
         return emitAssign(uop, "\(gi(a)) % \(gi(b))", ctx)
       }
       // Fast modulo for constant denominator: a - floor(a / b) * b
@@ -987,15 +993,15 @@ public class CRenderer: Renderer {
         return emitAssign(uop, "memory[\(cell)]", ctx)
       }
     case .loadTape(let val, let offset):
-      // loadTape reads from global tape buffer with bounds checking
-      // In C, this is handled at compile-time (no runtime bounds check for now)
-      let varId = g(val)  // The signal/variable to load from
-      if uop.isSimd {
-        // SIMD: load 4 consecutive frames from tape starting at [offset + i]
-        return emitAssign(uop, "vld1q_f32(&tape[\(varId)][\(g(offset))])", ctx)
-      } else {
-        return emitAssign(uop, "tape[\(varId)][\(g(offset))]", ctx)
-      }
+      // C globals are emitted as one `t<id>` frame array per variable; there is
+      // no Metal-style two-dimensional `tape` argument in the C ABI.
+      let sourceId = extractVarId(val)
+      let source = "t\(sourceId)"
+      let rawOffset = emitScalarLazy(offset, ctx: ctx)
+      let index = "(isfinite(\(rawOffset)) ? (int)\(rawOffset) : 0)"
+      let bounded =
+        "(\(index) < 0 || \(index) >= frameCount) ? 0.0f : \(source)[\(index)]"
+      return emitAssign(uop, bounded, ctx)
     case .beginIf(let cond): return "if (\(g(cond))) {"
     case .endIf: return "}"
 
@@ -1084,9 +1090,24 @@ public class CRenderer: Renderer {
       return "int _frameIndex = (int)(\(expr));"
 
     case .frameIndex:
-      // Use i for C scalar blocks, matching Metal's behavior
-      let baseIdx = "i"
-      return emitAssign(uop, frameIndexOverride ?? baseIdx, ctx)
+      // SIMD signal math needs the four actual frame numbers, not a reference
+      // to an undeclared `simd<id>` alias of the scalar loop counter. Keep the
+      // scalar alias too for address arithmetic in mixed scalar/SIMD blocks.
+      if uop.isSimd, frameIndexOverride == nil {
+        let id = extractVarId(uop.value)
+        varEmittedTypes[id] = .int_
+        // Inside a width-4 element loop (`beginParallelRange` names its counter
+        // `simd<id>` exactly when incr == 4) the lanes are tensor elements, so
+        // the frame index is lane-uniform; only frame-lane SIMD wants the ramp.
+        let elementLanes = parallelRangeVarStack.last?.hasPrefix("simd") == true
+        let vec =
+          elementLanes
+          ? "vdupq_n_f32((float)i)"
+          : "vaddq_f32(vdupq_n_f32((float)i), (float32x4_t){0.0f, 1.0f, 2.0f, 3.0f})"
+        return "int t\(id) = i; float32x4_t simd\(id) = \(vec);"
+      }
+      // Use i for C scalar blocks, matching Metal's behavior.
+      return emitAssign(uop, frameIndexOverride ?? "i", ctx)
 
     case .identity(let a):
       let expr = uop.isSimd ? "\(g(a))" : "\(gi(a))"

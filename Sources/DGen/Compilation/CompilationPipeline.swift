@@ -163,13 +163,31 @@ public struct CompilationPipeline {
     }
 
     let context = IRContext(g: graph)
+    // Node-level temporality only depends on the graph, so it is computed
+    // before block formation: hop classification lets block formation peel
+    // hop-rate tensor math out of sequential scalar blocks (see
+    // peelHopTensorRuns) instead of discovering the classification only
+    // after blocks are frozen.
+    let nodeTemporality = timings.measure("inferTemporality") {
+      TemporalityPass.inferTemporality(graph: graph, sortedNodes: prep.sortedNodes)
+    }
+    // The hop-tensor peel targets Metal's dispatch model (per-frame threads +
+    // block-level hop guard). The C renderer's SIMD lowering cannot consume the
+    // peeled parallel blocks (undeclared simd temps), so C keeps the pre-peel
+    // layout.
+    let peelHopNodes = backend == .metal ? nodeTemporality.hopBasedNodes : [:]
     var finalBlocks = buildInitialBlocks(
       graph: graph, sortedNodes: prep.sortedNodes, scalarNodeSet: finalScalarSet, context: context,
+      hopBasedNodes: peelHopNodes,
       timings: &timings)
 
-    let temporalityResult = inferAndAssignTemporality(
-      graph: graph,
-      sortedNodes: prep.sortedNodes,
+    if backend == .metal {
+      promoteFrameIndependentSumBlocks(&finalBlocks, graph: graph)
+      promoteParallelBufferViewWriteBlocks(&finalBlocks, graph: graph)
+    }
+
+    let temporalityResult = assignTemporality(
+      nodeTemporality,
       blocks: &finalBlocks,
       context: context,
       timings: &timings
@@ -343,6 +361,7 @@ public struct CompilationPipeline {
   /// Builds executable blocks before temporality-aware rewrites.
   private static func buildInitialBlocks(
     graph: Graph, sortedNodes: [NodeID], scalarNodeSet: Set<NodeID>, context: IRContext,
+    hopBasedNodes: [NodeID: (Int, NodeID)],
     timings: inout PipelineTimings
   ) -> [Block] {
     let blocks = timings.measure("determineBlocks") {
@@ -359,7 +378,7 @@ public struct CompilationPipeline {
     }
 
     let separatedBlocks = timings.measure("tensorBlocks") {
-      determineTensorBlocks(fusedBlocks, graph, context)
+      determineTensorBlocks(fusedBlocks, graph, context, hopBasedNodes: hopBasedNodes)
     }
 
     var finalBlocks = separatedBlocks.compactMap { $0 }
@@ -368,6 +387,7 @@ public struct CompilationPipeline {
     }
     forceSequentialHopHistoryBlocks(&finalBlocks, graph: graph)
     finalBlocks = consolidateTensorBPTTBackwardBlocks(g: graph, blocks: finalBlocks, ctx: context)
+    finalBlocks = consolidateScalarBPTTBackwardBlocks(g: graph, blocks: finalBlocks, ctx: context)
     return finalBlocks
   }
 
@@ -418,15 +438,11 @@ public struct CompilationPipeline {
     }
   }
 
-  /// Infers temporality and assigns block temporality metadata.
-  private static func inferAndAssignTemporality(
-    graph: Graph, sortedNodes: [NodeID], blocks: inout [Block], context: IRContext,
+  /// Assigns block temporality metadata from a precomputed node-temporality result.
+  private static func assignTemporality(
+    _ temporalityResult: TemporalityResult, blocks: inout [Block], context: IRContext,
     timings: inout PipelineTimings
   ) -> BlockTemporalityResult {
-    let temporalityResult = timings.measure("inferTemporality") {
-      TemporalityPass.inferTemporality(graph: graph, sortedNodes: sortedNodes)
-    }
-
     timings.measure("assignTemporality") {
       TemporalityPass.assignBlockTemporality(
         blocks: &blocks,
@@ -437,7 +453,7 @@ public struct CompilationPipeline {
     }
     if ProcessInfo.processInfo.environment["DGEN_DEBUG_TEMPORALITY"] != nil {
       for (bi, block) in blocks.enumerated() {
-        let kinds = block.nodes.compactMap { nid in graph.nodes[nid].map { n in "\(nid):\(n.op)" } }
+        let kinds = block.nodes.compactMap { nid in context.g.nodes[nid].map { n in "\(nid):\(n.op)" } }
         let frame = block.nodes.filter { temporalityResult.frameBasedNodes.contains($0) }
         FileHandle.standardError.write(
           "[temporality] block \(bi) \(block.temporality) frameNodes=\(frame) ops=\(kinds)\n"
@@ -495,7 +511,12 @@ public struct CompilationPipeline {
 
     if ProcessInfo.processInfo.environment["DGEN_DEBUG_BLOCKS"] != nil {
       for (i, block) in blocks.enumerated() {
-        let ops = block.nodes.map { "\($0):\(graph.nodes[$0].map { String(describing: $0.op) } ?? "?")" }
+        let showDeps = ProcessInfo.processInfo.environment["DGEN_DEBUG_BLOCK_DEPS"] != nil
+        let ops = block.nodes.map { id -> String in
+          let base = "\(id):\(graph.nodes[id].map { String(describing: $0.op) } ?? "?")"
+          guard showDeps, let n = graph.nodes[id] else { return base }
+          return base + "<-\(n.allDependencies)"
+        }
         print(
           "[Blocks] #\(i) frameOrder=\(block.frameOrder) shape=\(block.shape.map(String.init(describing:)) ?? "nil") tensorIndex=\(block.tensorIndex != nil) temporality=\(block.temporality) nodes=\(ops)"
         )

@@ -35,9 +35,17 @@ final class SpectralLossOrderingScratchTests: XCTestCase {
   func testOrderingAgainstOfflineReplica() throws {
     let root = "/Users/alecresende/code/swift/dgen/output/monologue_bass"
     let scratch = "/private/tmp/claude-501/-Users-alecresende-code-swift-dgen/e7b2e321-319c-4904-a7d7-537ce36ef6a1/scratchpad"
-    let target = try load("\(root)/mono_rung2_target.wav")
-    let start = try load("\(scratch)/e10_start.wav")
-    let polished = try load("\(scratch)/p3_03.wav")
+    let paths = [
+      "\(root)/mono_rung2_target.wav",
+      "\(scratch)/e10_start.wav",
+      "\(scratch)/p3_03.wav",
+    ]
+    guard paths.allSatisfy({ FileManager.default.fileExists(atPath: $0) }) else {
+      throw XCTSkip("scratch audio fixtures are not available on this machine")
+    }
+    let target = try load(paths[0])
+    let start = try load(paths[1])
+    let polished = try load(paths[2])
     for smooth in [false, true] {
       let ls = try gpuLoss(start, target, smooth: smooth)
       let lp = try gpuLoss(polished, target, smooth: smooth)

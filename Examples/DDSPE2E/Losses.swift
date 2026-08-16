@@ -3,6 +3,15 @@ import DGenLazy
 import Foundation
 
 enum DDSPTrainingLosses {
+  /// Lift a scheduled weight into a data-backed scalar signal. Tensor data is
+  /// uploaded as memory rather than baked into kernel source, so per-step
+  /// weight schedules (warmup/ramp) reuse the compiled kernels instead of
+  /// recompiling — baking them as literals both forced a recompile per changed
+  /// step and accumulated Metal pipeline variants until the AGX driver's
+  /// compiled-variants footprint limit.
+  private static func scheduledWeight(_ value: Float) -> Signal {
+    DGenLazy.Tensor([value]).peek(Signal.constant(0.0))
+  }
   static func fullLoss(
     prediction: Signal,
     target: Signal,
@@ -28,7 +37,7 @@ enum DDSPTrainingLosses {
     var hasTerm = false
 
     if mseWeight > 0 {
-      total = total + mse(prediction, target) * mseWeight
+      total = total + mse(prediction, target) * scheduledWeight(mseWeight)
       hasTerm = true
     }
 
@@ -42,7 +51,7 @@ enum DDSPTrainingLosses {
             prediction, target, windowSize: w, lossMode: lossMode, hop: hop, normalize: true)
       }
       spec = spec * (1.0 / Float(usableWindows.count))
-      total = total + spec * spectralWeight
+      total = total + spec * scheduledWeight(spectralWeight)
       hasTerm = true
     }
 
@@ -57,7 +66,7 @@ enum DDSPTrainingLosses {
             hop: hop, normalize: true)
       }
       specLog = specLog * (1.0 / Float(usableWindows.count))
-      total = total + specLog * spectralLogmagWeight
+      total = total + specLog * scheduledWeight(spectralLogmagWeight)
       hasTerm = true
     }
 
@@ -91,7 +100,7 @@ enum DDSPTrainingLosses {
       }
       // Ensure a rank-1 tensor before peek; mean() can become a scalar lazy node.
       let envLoss = (DGenLazy.Tensor([0.0]) + envLossTensor).peek(Signal.constant(0.0))
-      total = total + envLoss * loudnessWeight
+      total = total + envLoss * scheduledWeight(loudnessWeight)
       hasTerm = true
     }
 
@@ -106,7 +115,7 @@ enum DDSPTrainingLosses {
       let excess = max(noiseGain - harmonicGain * targetRatio, 0.0)
       let penaltyTensor = (excess * excess).mean()
       let penalty = (DGenLazy.Tensor([0.0]) + penaltyTensor).peek(Signal.constant(0.0))
-      total = total + penalty * noiseDominanceWeight
+      total = total + penalty * scheduledWeight(noiseDominanceWeight)
       hasTerm = true
     }
 
@@ -143,7 +152,7 @@ enum DDSPTrainingLosses {
     if mseWeight > 0 {
       let diff = prediction - target
       let batchMSE = (diff * diff).sum() * (1.0 / Float(batchSize))
-      total = total + batchMSE * mseWeight
+      total = total + batchMSE * scheduledWeight(mseWeight)
       hasTerm = true
     }
 
@@ -157,7 +166,7 @@ enum DDSPTrainingLosses {
             prediction, target, windowSize: w, lossMode: lossMode, hop: hop, normalize: true)
       }
       spec = spec * (1.0 / Float(usableWindows.count))
-      total = total + spec * spectralWeight
+      total = total + spec * scheduledWeight(spectralWeight)
       hasTerm = true
     }
 
@@ -172,7 +181,7 @@ enum DDSPTrainingLosses {
             hop: hop, normalize: true)
       }
       specLog = specLog * (1.0 / Float(usableWindows.count))
-      total = total + specLog * spectralLogmagWeight
+      total = total + specLog * scheduledWeight(spectralLogmagWeight)
       hasTerm = true
     }
 
@@ -206,7 +215,7 @@ enum DDSPTrainingLosses {
       }
       // Ensure a rank-1 tensor before peek; mean() can become a scalar lazy node.
       let envLoss = (DGenLazy.Tensor([0.0]) + envLossTensor).peek(Signal.constant(0.0))
-      total = total + envLoss * loudnessWeight
+      total = total + envLoss * scheduledWeight(loudnessWeight)
       hasTerm = true
     }
 
@@ -218,7 +227,7 @@ enum DDSPTrainingLosses {
       let excess = max(noiseGain - harmonicGain * targetRatio, 0.0)
       let penaltyTensor = (excess * excess).mean()
       let penalty = (DGenLazy.Tensor([0.0]) + penaltyTensor).peek(Signal.constant(0.0))
-      total = total + penalty * noiseDominanceWeight
+      total = total + penalty * scheduledWeight(noiseDominanceWeight)
       hasTerm = true
     }
 

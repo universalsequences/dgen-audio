@@ -1,4 +1,5 @@
 dyld_stub_binder
+___sincosf_stret
 _atan2f
 _atanf
 _bzero
@@ -15,6 +16,7 @@ _log10f
 _logf
 _memcpy
 _memset
+_memset_pattern16
 _powf
 _roundf
 _sinf

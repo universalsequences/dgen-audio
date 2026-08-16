@@ -22,6 +22,10 @@ class ParameterRegistry {
   /// Gradient accumulation cells for signals (nodeId -> cellId)
   var signalGradCells: [NodeID: CellID] = [:]
 
+  /// Lisp parameters keyed by their declared name. Unlike computed values,
+  /// these intentionally survive computation-graph clears within a phase.
+  var namedSignals: [String: Signal] = [:]
+
   func register(_ tensor: Tensor) {
     if tensor.requiresGrad && !tensors.contains(where: { $0.nodeId == tensor.nodeId }) {
       tensors.append(tensor)
@@ -34,11 +38,16 @@ class ParameterRegistry {
     }
   }
 
+  func isNamed(_ signal: Signal) -> Bool {
+    namedSignals.values.contains { $0 === signal }
+  }
+
   func clear() {
     tensors.removeAll()
     signals.removeAll()
     tensorGradCells.removeAll()
     signalGradCells.removeAll()
+    namedSignals.removeAll()
   }
 }
 
@@ -59,6 +68,17 @@ extension LazyGraph {
 
   func registerParameter(_ signal: Signal) {
     parameterRegistry.register(signal)
+  }
+
+  /// Register and retrieve named scalar parameters for graph-building clients
+  /// which re-evaluate the same program after `backward()` clears the graph.
+  public func registerParameter(_ signal: Signal, named name: String) {
+    parameterRegistry.namedSignals[name] = signal
+    parameterRegistry.register(signal)
+  }
+
+  public func registeredSignalParameter(named name: String) -> Signal? {
+    parameterRegistry.namedSignals[name]
   }
 
   /// Compute gradients for all registered parameters

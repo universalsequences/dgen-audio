@@ -60,14 +60,18 @@ let package = Package(
         ),
         .executableTarget(
             name: "SynthID",
-            dependencies: ["DGenLazy", "DGen"],
+            dependencies: ["DGenLazy", "DGen", "DGenTrainProtocol"],
             path: "Examples/SynthID",
             exclude: ["SPEC.md", "FDCHECK_FINDING.md", "RUNG1_REMAINING.md", "RUNG2_STATUS.md", "RUNG3_STATUS.md", "RUNG3_BLOCKER.md", "scripts", "targets"]
         ),
         .executableTarget(
             name: "DGenLisp",
-            dependencies: ["DGenLazy"],
+            dependencies: ["DGenLazy", "DGenTrainProtocol"],
             path: "Sources/DGenLisp"
+        ),
+        .target(
+            name: "DGenTrainProtocol",
+            path: "Sources/DGenTrainProtocol"
         ),
         .target(
             name: "DGenLazy",
@@ -85,8 +89,14 @@ let package = Package(
         ),
         .testTarget(
             name: "DGenLispTests",
-            dependencies: ["DGenLisp", "DGenLazy"],
+            dependencies: ["DGenLisp", "DGenLazy", "DGenTrainProtocol"],
             path: "Tests/DGenLispTests"
+        ),
+        .testTarget(
+            name: "DGenTrainProtocolTests",
+            dependencies: ["DGenTrainProtocol"],
+            path: "Tests/DGenTrainProtocolTests",
+            resources: [.copy("Fixtures")]
         ),
     ]
 )

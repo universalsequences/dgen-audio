@@ -615,9 +615,7 @@ final class ConvolutionReverbTests: XCTestCase {
     let totalFrames = N + 8 * hop
     var resultsByBackend: [String: [Float]] = [:]
 
-    // C backend has a pre-existing SIMD codegen issue with complex vocoder spectral
-    // processing (int loop counter assigned to float32x4_t). Skip C until fixed.
-    for ext in ["metal"] {
+    for ext in ["c", "metal"] {
       DGenConfig.backend = ext == "c" ? .c : .metal
       DGenConfig.kernelOutputPath = "/tmp/test_vocoder_windowed.\(ext)"
       defer { DGenConfig.kernelOutputPath = nil }

@@ -232,9 +232,10 @@ func remapVectorMemorySlots(
     nextInjectableSlot += allocSize
   }
   reservedRange = nextInjectableSlot
-  if enableBufferReuse {
-    nextAvailableSlot = max(nextAvailableSlot, reservedRange)
-  }
+  // Injectable tensor data occupies real memory even when reuse is disabled.
+  // Advancing only in reuse mode under-allocated graphs whose tensor view reads
+  // a small slice of a larger initialized tensor (for example chained shrink).
+  nextAvailableSlot = max(nextAvailableSlot, reservedRange)
 
   // Greedy interval-based allocation for reuse-eligible cells.
   // freeRegions tracks allocated regions that may become available for reuse.

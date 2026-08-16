@@ -7,6 +7,10 @@ final class OptimizerTests: XCTestCase {
 
   override func setUp() {
     super.setUp()
+    // Do not inherit the backend or debug output path from an earlier suite.
+    // These optimizer expectations exercise the Metal training path.
+    DGenConfig.backend = .metal
+    DGenConfig.kernelOutputPath = nil
     DGenConfig.maxFrameCount = 4096
     LazyGraphContext.reset()
   }

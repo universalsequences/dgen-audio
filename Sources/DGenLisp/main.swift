@@ -14,7 +14,23 @@
 //   -                        Read from stdin (also default if no file given)
 
 import DGenLazy
+import DGenTrainProtocol
 import Foundation
+
+// The train subcommand has its own protocol-owning argument parser and
+// never returns (it owns stdout and the exit code). Route before the
+// compile-oriented parser can touch the arguments.
+if CommandLine.arguments.count > 1 && CommandLine.arguments[1] == "train" {
+    TrainCommand.run(
+        arguments: Array(CommandLine.arguments.dropFirst(2)),
+        realTrainer: RealTrainer.run
+    )
+}
+// Hidden render helper spawned by the trainer (realize() must not share a
+// process with backward()).
+if CommandLine.arguments.count > 1 && CommandLine.arguments[1] == "train-render" {
+    TrainRenderCommand.run(arguments: Array(CommandLine.arguments.dropFirst(2)))
+}
 
 // MARK: - Argument parsing
 
@@ -97,6 +113,17 @@ func parseArgs(_ args: [String]) -> CLIArgs {
 func printUsage() {
     let usage = """
         Usage: dgenlisp compile [<file.lisp>] [options]
+               dgenlisp train --patch <dsp.lisp> --target <sample.wav> \\
+                              --seed-params <seed.json> --job-dir <dir> \\
+                              [--mode direction] [--epochs N] \\
+                              [--gate-frames N] [--pitch-hz F] [--plan-only] \\
+                              [--multistart-candidates N] [--multistart-lanes N] \\
+                              [--multistart-batch N] [--multistart-steps N] \\
+                              [--search legacy|cma-es] [--cma-generations N] \\
+                              [--cma-population N] [--cma-sigma F] [--cma-seed N] \\
+                              [--cma-forward-batch N] [--cma-continue N] \\
+                              [--local-epochs N] [--cma-refine-epochs N] \\
+                              [--cma-final-epochs N] [--cma-refine-mode MODE]
 
         Options:
           -o, --output <dir>       Output directory (default: .)

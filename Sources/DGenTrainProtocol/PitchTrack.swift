@@ -1,40 +1,55 @@
 import Foundation
 
-struct PitchPoint: Codable {
-  var time: Float
-  var hz: Float
-  var confidence: Float
+public struct PitchPoint: Codable {
+  public init(time: Float, hz: Float, confidence: Float) {
+    self.time = time; self.hz = hz; self.confidence = confidence
+  }
+  public var time: Float
+  public var hz: Float
+  public var confidence: Float
 }
 
-struct PitchFit: Codable {
-  var fStart: Float
-  var fEnd: Float
-  var pitchDecay: Float
+public struct PitchFit: Codable {
+  public init(fStart: Float, fEnd: Float, pitchDecay: Float, error: Float?) {
+    self.fStart = fStart; self.fEnd = fEnd; self.pitchDecay = pitchDecay; self.error = error
+  }
+  public var fStart: Float
+  public var fEnd: Float
+  public var pitchDecay: Float
   /// Mean-square contour fit error, or nil when the signal has too few usable
   /// pitch points. Optional keeps fallback diagnostics JSON-encodable.
-  var error: Float?
+  public var error: Float?
 }
 
 /// Profile-dependent search ranges for pitch contour extraction/fitting.
 /// `.tr808` matches every literal that was previously hardcoded in this file
 /// exactly, so passing it explicitly (or relying on the default parameter)
 /// changes nothing about 808 behavior.
-struct PitchSearchProfile {
-  var contourMinHz: Float
-  var contourMaxHz: Float
-  var tailMinHz: Float
-  var tailMaxHz: Float
-  var candidateMaxHz: Float
-  var highRidgeHz: Float
-  var fEndRange: ClosedRange<Float>
-  var pitchDecayRange: ClosedRange<Float>
+public struct PitchSearchProfile {
+  public init(contourMinHz: Float, contourMaxHz: Float, tailMinHz: Float, tailMaxHz: Float,
+              candidateMaxHz: Float, highRidgeHz: Float, fEndRange: ClosedRange<Float>,
+              pitchDecayRange: ClosedRange<Float>, fStartRange: ClosedRange<Float>) {
+    self.contourMinHz = contourMinHz; self.contourMaxHz = contourMaxHz
+    self.tailMinHz = tailMinHz; self.tailMaxHz = tailMaxHz
+    self.candidateMaxHz = candidateMaxHz; self.highRidgeHz = highRidgeHz
+    self.fEndRange = fEndRange; self.pitchDecayRange = pitchDecayRange
+    self.fStartRange = fStartRange
+  }
+  public var contourMinHz: Float
+  public var contourMaxHz: Float
+  public var tailMinHz: Float
+  public var tailMaxHz: Float
+  public var candidateMaxHz: Float
+  public var highRidgeHz: Float
+  public var fEndRange: ClosedRange<Float>
+  public var pitchDecayRange: ClosedRange<Float>
   /// Bounds the fStart amplitude search in `fit(points:)`. Not part of the
   /// original design's field list, but required for correctness: without a
   /// profile-aware cap here, the 808-derived 80...180 Hz literal silently
   /// clips the 909 fit (measured fStart ~= 247 Hz) at 180 Hz.
-  var fStartRange: ClosedRange<Float>
+  public var fStartRange: ClosedRange<Float>
 
-  static let tr808 = PitchSearchProfile(
+  public static let tr808 = PitchSearchProfile(
     contourMinHz: 50, contourMaxHz: 300,
     tailMinHz: 30, tailMaxHz: 70,
     candidateMaxHz: 300,
@@ -43,7 +58,7 @@ struct PitchSearchProfile {
     pitchDecayRange: -80...(-15),
     fStartRange: 80...180)
 
-  static let tr909 = PitchSearchProfile(
+  public static let tr909 = PitchSearchProfile(
     contourMinHz: 50, contourMaxHz: 450,
     tailMinHz: 30, tailMaxHz: 70,
     candidateMaxHz: 450,
@@ -53,11 +68,11 @@ struct PitchSearchProfile {
     fStartRange: 150...400)
 }
 
-enum PitchTrack {
+public enum PitchTrack {
   // Window must cover ~2 periods of minHz (44100/30 = 1470-sample lag needs
   // >= 4096-sample windows); 1024 windows cannot correlate the 35-60 Hz fEnd
   // band at all and latch onto spurious high-frequency peaks.
-  static func extract(
+  public static func extract(
     samples: [Float],
     sampleRate: Float,
     windowSize: Int = 4096,
@@ -132,7 +147,7 @@ enum PitchTrack {
   /// quasi-stationary sine at fEnd for hundreds of milliseconds. Long-window
   /// autocorrelation there is far more reliable than any point of the swept
   /// contour (sub-1% vs several %).
-  static func tailFEnd(
+  public static func tailFEnd(
     samples: [Float],
     sampleRate: Float,
     minHz: Float = 30,
@@ -157,7 +172,7 @@ enum PitchTrack {
     return PitchPoint(time: Float(startAt) / sampleRate, hz: median, confidence: confidence)
   }
 
-  static func fit(
+  public static func fit(
     points: [PitchPoint],
     fEndRange: ClosedRange<Float>? = nil,
     fEndStep: Float = 0.5,
@@ -225,7 +240,7 @@ enum PitchTrack {
     return best
   }
 
-  static func fit(
+  public static func fit(
     samples: [Float],
     sampleRate: Float,
     profile: PitchSearchProfile = .tr808

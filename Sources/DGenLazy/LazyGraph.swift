@@ -5,6 +5,19 @@
 
 import DGen
 
+/// Timing for the most recent lazy compilation/execution. This is intentionally
+/// lightweight so CLI clients can report profiling without enabling verbose DGen debug output.
+public struct LazyExecutionTiming {
+  public internal(set) var compilationMS: Double = 0
+  public internal(set) var runtimeCreationMS: Double = 0
+  public internal(set) var executionMS: Double = 0
+  public internal(set) var fullCompilationCacheHit = false
+  public internal(set) var runtimeCacheHit = false
+  public internal(set) var kernelSourceHashes: [UInt64] = []
+
+  public init() {}
+}
+
 /// Weak reference wrapper for tracking tensors/signals without preventing deallocation
 internal class WeakRef<T: AnyObject> {
   weak var value: T?
@@ -39,7 +52,27 @@ public class LazyGraph {
 
   /// Metal runtime (MTLLibrary + pipeline states) cached by kernel source hash.
   /// Persists across graph clears since identical topology produces identical kernels.
-  internal var runtimeCacheByKernelHash: [Int: LazyRuntime] = [:]
+  /// Bounded: each entry holds compiled pipeline states, and the AGX driver has a
+  /// per-process compiled-variants footprint limit, so unbounded growth (e.g. a
+  /// baked constant changing every step) eventually aborts the process.
+  internal var runtimeCacheByKernelHash: [UInt64: LazyRuntime] = [:]
+  internal var runtimeCacheInsertionOrder: [UInt64] = []
+  internal static let runtimeCacheLimit = 8
+
+  internal func cacheRuntime(_ runtime: LazyRuntime, forKernelHash hash: UInt64) {
+    if runtimeCacheByKernelHash[hash] == nil {
+      runtimeCacheInsertionOrder.append(hash)
+      while runtimeCacheInsertionOrder.count > Self.runtimeCacheLimit {
+        let evicted = runtimeCacheInsertionOrder.removeFirst()
+        runtimeCacheByKernelHash.removeValue(forKey: evicted)
+      }
+    }
+    runtimeCacheByKernelHash[hash] = runtime
+  }
+
+  /// Profiling data for the last execution.
+  public internal(set) var lastExecutionTiming = LazyExecutionTiming()
+  internal var timingEnabled = false
 
   /// Full compilation cache keyed by graph fingerprint (node count, tensor count, frame count).
   /// Skips both DGen compilation and runtime creation when topology is unchanged across epochs.
@@ -151,6 +184,9 @@ public class LazyGraph {
     // 3. Clear lazy cell state (will be recreated for new tensors)
     graph.lazyCells.removeAll()
     graph.frameAwareCells.removeAll()
+    // Keyed by cell IDs that resetCounters() recycles from 0, so stale hop tags
+    // would silently re-address unrelated tensors on the next epoch.
+    graph.frameAwareCellHops.removeAll()
     graph.cellAllocationSizes.removeAll()
 
     // 4. Clear persistent cells and gradient side effects
@@ -158,6 +194,7 @@ public class LazyGraph {
     graph.parameterCells.removeAll()
     graph.gradientSideEffects.removeAll()
     graph.tensorGradCells.removeAll()
+    graph.tensorGradCarryCells.removeAll()
     graph.gradCarryCells.removeAll()
     graph.lastForwardNodeId = nil
     graph.simdOptimizedConv2Ds.removeAll()
@@ -186,7 +223,13 @@ public class LazyGraph {
     }
     signals = signals.filter { $0.value != nil }
     for ref in signals {
-      ref.value?.refresh()
+      guard let signal = ref.value else { continue }
+      // Re-entrant Lisp evaluation must recreate params at their original AST
+      // position so node/cell ordering stays identical to a fresh evaluation.
+      // evalParam refreshes these named survivors on demand.
+      if !parameterRegistry.isNamed(signal) {
+        signal.refresh()
+      }
     }
   }
 }
@@ -196,6 +239,17 @@ public class LazyGraph {
 /// Thread-local default graph for implicit graph management
 /// Each thread gets its own graph to avoid concurrency issues
 public class LazyGraphContext {
+  /// Opt-in cache carry-over for workloads which deliberately rebuild an identical
+  /// topology in fresh graphs. Disabled by default so compile and test callers keep
+  /// reset's historical isolation semantics.
+  public static var preserveCompilationCaches = false
+
+  /// Enables detailed timing/hash collection for the current graph. Hashing very
+  /// large generated kernels is deliberately skipped unless this is enabled.
+  public static var collectExecutionTiming = false {
+    didSet { _current?.timingEnabled = collectExecutionTiming }
+  }
+
   /// The current default graph (thread-local via static)
   /// Internal so DGenConfig.didSet can propagate changes
   internal static var _current: LazyGraph?
@@ -204,6 +258,7 @@ public class LazyGraphContext {
   public static var current: LazyGraph {
     if _current == nil {
       _current = LazyGraph()
+      _current?.timingEnabled = collectExecutionTiming
     }
     return _current!
   }
@@ -215,8 +270,17 @@ public class LazyGraphContext {
 
   /// Reset to a fresh graph
   public static func reset() {
-    // Clear the parameter registry when resetting graph
+    // Clear the parameter registry when resetting graph. Only compiled artifacts,
+    // never memory contents or parameter objects, may cross this boundary.
+    let carriedRuntimeCache =
+      preserveCompilationCaches ? (_current?.runtimeCacheByKernelHash ?? [:]) : [:]
+    let carriedRuntimeCacheOrder =
+      preserveCompilationCaches ? (_current?.runtimeCacheInsertionOrder ?? []) : []
     _current?.parameterRegistry.clear()
-    _current = LazyGraph()
+    let fresh = LazyGraph()
+    fresh.runtimeCacheByKernelHash = carriedRuntimeCache
+    fresh.runtimeCacheInsertionOrder = carriedRuntimeCacheOrder
+    fresh.timingEnabled = collectExecutionTiming
+    _current = fresh
   }
 }

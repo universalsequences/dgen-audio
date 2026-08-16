@@ -13,11 +13,15 @@ public func partitionIntoBlocks(
     let isScalar = scalar.contains(nodeId)
     let frameOrder: FrameOrder = isScalar ? .sequential : .parallel
 
-    // Special handling for output nodes - they go in the same block as their dependencies
+    // Special handling for output nodes - they go in the same block as their dependencies.
+    // Value inputs only: temporality analysis now runs before block formation, so
+    // temporalDependencies (hop counters, position deps) are already populated here —
+    // following them would drag the output into the counter's (much earlier) block,
+    // ahead of its value producer.
     if let node = g.nodes[nodeId], case .output = node.op {
       // Find the block containing the first dependency
       var targetBlockIdx = -1
-      for inputID in node.allDependencies {
+      for inputID in node.inputs {
         for (blockIdx, block) in blocks.enumerated() {
           if block.nodes.contains(inputID) {
             targetBlockIdx = blockIdx
@@ -91,6 +95,95 @@ public func fuseBlocks(_ blocks: [Block]) -> [Block] {
     }
   }
   return fused
+}
+
+/// Promote scalar tensor-reduction blocks that are independent across frames.
+///
+/// Backward broadcast gradients commonly lower to `sum(tensor) -> scalar math`.
+/// A `seq` ordering edge can conservatively classify that whole block as
+/// sequential even though each frame reads a disjoint frame-aware tensor slice.
+/// On Metal, leaving such a block sequential makes one GPU thread perform every
+/// tensor reduction for every frame.  Keep this intentionally narrow: the block
+/// must start with `sum` and contain only pure scalar arithmetic. Feedback
+/// membership does not disqualify it: blocks are kernel boundaries, so all of
+/// the reduction's inputs have already been materialized before this kernel and
+/// its only cross-frame writes are the compiler-managed output tape.
+public func promoteFrameIndependentSumBlocks(_ blocks: inout [Block], graph: Graph) {
+  func isPureScalarMath(_ op: LazyOp) -> Bool {
+    switch op {
+    case .sum,
+      .constant,
+      .add, .sub, .div, .mul, .neg,
+      .abs, .sign, .sin, .cos, .tan, .atan, .tanh, .exp, .log, .log10, .sqrt,
+      .atan2, .gt, .gte, .lte, .lt, .eq, .gswitch, .mix, .pow,
+      .floor, .ceil, .round, .mod, .min, .max, .and, .or, .xor:
+      return true
+    default:
+      return false
+    }
+  }
+
+  for index in blocks.indices where blocks[index].frameOrder == .sequential {
+    let nodeIds = blocks[index].nodes
+    guard let firstId = nodeIds.first,
+      let first = graph.nodes[firstId],
+      case .sum = first.op,
+      nodeIds.allSatisfy({ id in graph.nodes[id].map { isPureScalarMath($0.op) } ?? false })
+    else { continue }
+
+    blocks[index].frameOrder = .parallel
+  }
+}
+
+/// Promote the producer kernel for a circular `bufferView` to one thread per
+/// frame. `bufferView` deliberately allocates `maxFrameCount + windowSize - 1`
+/// slots, and its write position advances once per frame, so the writes within
+/// one render call are disjoint even when the surrounding signal math was swept
+/// into the sequential set by the position accumulator's ordering edge.
+///
+/// Infer the special write from the tensor's sliding-window transform instead
+/// of accepting arbitrary memory writes: dynamic offsets in delay lines and
+/// gradient stores can alias and must remain serial.
+public func promoteParallelBufferViewWriteBlocks(_ blocks: inout [Block], graph: Graph) {
+  func isPureScalarMath(_ op: LazyOp) -> Bool {
+    switch op {
+    case .constant,
+      .add, .sub, .div, .mul, .neg,
+      .abs, .sign, .sin, .cos, .tan, .atan, .tanh, .exp, .log, .log10, .sqrt,
+      .atan2, .gt, .gte, .lte, .lt, .eq, .gswitch, .mix, .pow,
+      .floor, .ceil, .round, .mod, .min, .max, .and, .or, .xor:
+      return true
+    default:
+      return false
+    }
+  }
+
+  func isBufferViewWrite(_ node: Node) -> Bool {
+    guard case .memoryWrite(let cellId) = node.op,
+      node.inputs.count == 2,
+      let tensorId = graph.cellToTensor[cellId],
+      let tensor = graph.tensors[tensorId]
+    else { return false }
+
+    let offsetNode = node.inputs[0]
+    return tensor.transforms.contains { transform in
+      if case .slidingWindow(_, _, let positionNode) = transform {
+        return positionNode == offsetNode
+      }
+      return false
+    }
+  }
+
+  for index in blocks.indices where blocks[index].frameOrder == .sequential {
+    let nodes = blocks[index].nodes.compactMap { graph.nodes[$0] }
+    let writes = nodes.filter(isBufferViewWrite)
+    guard writes.count == 1,
+      nodes.count == blocks[index].nodes.count,
+      nodes.allSatisfy({ isPureScalarMath($0.op) || isBufferViewWrite($0) })
+    else { continue }
+
+    blocks[index].frameOrder = .parallel
+  }
 }
 
 /// Isolate special passes into their own blocks to prevent unsafe fusion.
@@ -395,6 +488,19 @@ public func splitReduceBlocks(g: Graph, blocks: [Block]) -> [Block] {
 /// ordering chains) and read their tensor inputs from frame-aware cells in
 /// later blocks.
 public func tensorBPTTRecurrenceClosure(g: Graph, lastForwardId: NodeID) -> Set<NodeID> {
+  bpttRecurrenceClosure(g: g, lastForwardId: lastForwardId, carryCells: g.tensorGradCarryCells)
+}
+
+/// Generalized form of `tensorBPTTRecurrenceClosure` over an arbitrary set of
+/// gradient carry cells. Scalar (`Signal.history()`) BPTT needs the same
+/// closure: when the reverse-time arithmetic between a carry read and its carry
+/// write is scattered across blocks, the recurrence is severed (the carry write
+/// re-emitted at the reverse loop bottom cannot see a grad input produced in a
+/// later block) and per-frame gradients computed outside the reverse loop read
+/// only the last reverse iteration's value.
+public func bpttRecurrenceClosure(
+  g: Graph, lastForwardId: NodeID, carryCells: Set<CellID>
+) -> Set<NodeID> {
   func isBoundary(_ id: NodeID) -> Bool {
     guard let node = g.nodes[id] else { return true }
     switch node.op {
@@ -432,9 +538,9 @@ public func tensorBPTTRecurrenceClosure(g: Graph, lastForwardId: NodeID) -> Set<
   var carryReads: [NodeID] = []
   for (id, node) in g.nodes where id > lastForwardId {
     switch node.op {
-    case .memoryWrite(let c) where g.tensorGradCarryCells.contains(c):
+    case .memoryWrite(let c) where carryCells.contains(c):
       seeds.append(id)
-    case .memoryRead(let c) where g.tensorGradCarryCells.contains(c):
+    case .memoryRead(let c) where carryCells.contains(c):
       seeds.append(id)
       carryReads.append(id)
     default:
@@ -492,19 +598,116 @@ public func tensorBPTTRecurrenceClosure(g: Graph, lastForwardId: NodeID) -> Set<
 /// consumers of closure outputs have higher node IDs so they sit in blocks at
 /// or after the insertion point.
 public func consolidateTensorBPTTBackwardBlocks(g: Graph, blocks: [Block], ctx: IRContext) -> [Block] {
+  consolidateIsolatedBPTTBackwardBlocks(
+    g: g, blocks: blocks, ctx: ctx, carryCells: g.tensorGradCarryCells)
+}
+
+/// Core of `consolidateTensorBPTTBackwardBlocks`, generalized over the carry
+/// cells of one recurrence family. Scalar (`Signal.history()`) BPTT reuses it
+/// when its recurrence is fragmented by isolated-pass adjoints (see
+/// `consolidateScalarBPTTBackwardBlocks`): the carry reads land in one block
+/// and the carry writes in a block after a `temporalGradScan`, so neither
+/// block qualifies for the detached reverse-loop wrap and the recurrence is
+/// silently severed.
+func consolidateIsolatedBPTTBackwardBlocks(
+  g: Graph, blocks: [Block], ctx: IRContext, carryCells: Set<CellID>
+) -> [Block] {
   let debug = ProcessInfo.processInfo.environment["DGEN_DEBUG_BPTT_SPLIT"] != nil
-  guard let lastForwardId = g.lastForwardNodeId, !g.tensorGradCarryCells.isEmpty else {
+  guard let lastForwardId = g.lastForwardNodeId, !carryCells.isEmpty else {
     return blocks
   }
 
-  var stack: [NodeID] = []
-  for (id, node) in g.nodes where id > lastForwardId {
-    if case .memoryWrite(let c) = node.op, g.tensorGradCarryCells.contains(c) {
-      stack.append(id)
+  var closure = bpttRecurrenceClosure(
+    g: g, lastForwardId: lastForwardId, carryCells: carryCells)
+  guard !closure.isEmpty else { return blocks }
+
+  // True value edges only. seq carries a value on its second input; carry
+  // memoryReads produce their value from memory and list grad side-effect
+  // writers purely for ordering; memoryWrite's value is its second input
+  // (the first is the ordering seq). Treating ordering edges as value deps
+  // here would make the recurrence look like it consumes its own consumers.
+  func valueDeps(_ node: Node) -> [NodeID] {
+    switch node.op {
+    case .seq where node.inputs.count == 2:
+      return [node.inputs[1]]
+    case .memoryRead:
+      return []
+    case .memoryWrite where node.inputs.count == 2:
+      return [node.inputs[1]]
+    default:
+      return node.allDependencies
     }
   }
-  let closure = tensorBPTTRecurrenceClosure(g: g, lastForwardId: lastForwardId)
-  guard !closure.isEmpty else { return blocks }
+
+  func transitiveClosureConsumers(_ closure: Set<NodeID>) -> Set<NodeID> {
+    var consumerAdjacency: [NodeID: [NodeID]] = [:]
+    for (id, node) in g.nodes where id > lastForwardId && !closure.contains(id) {
+      for dep in valueDeps(node) where dep > lastForwardId {
+        consumerAdjacency[dep, default: []].append(id)
+      }
+    }
+    var consumers = Set<NodeID>()
+    var stack = Array(closure)
+    while let id = stack.popLast() {
+      for consumer in consumerAdjacency[id] ?? [] where consumers.insert(consumer).inserted {
+        stack.append(consumer)
+      }
+    }
+    return consumers
+  }
+
+  // Fixed-point eviction: a closure node whose value dep is produced by a
+  // chain that itself consumes closure output cannot run inside the
+  // consolidated reverse loop. The canonical case is a trainable phasor
+  // feeding the recurrence: the phasor's temporalGradStore input is the
+  // per-frame grad computed inside the recurrence, so its temporalGradRead
+  // is only available after the reverse loop completes — yet the read's
+  // consumer (an add merging temporal and per-frame grad contributions) is a
+  // carry-read descendant the closure walk sweeps in. Evict such nodes (and
+  // their in-closure value descendants); they read the closure's per-frame
+  // outputs from frame-aware cells in later blocks. If eviction would remove
+  // a carry write the recurrence itself is entangled with the tape — bail to
+  // the unconsolidated layout rather than emit a broken recurrence.
+  while true {
+    let consumers = transitiveClosureConsumers(closure)
+    var evicted = Set<NodeID>()
+    for id in closure {
+      guard let node = g.nodes[id] else { continue }
+      if valueDeps(node).contains(where: {
+        $0 > lastForwardId && !closure.contains($0) && consumers.contains($0)
+      }) {
+        evicted.insert(id)
+      }
+    }
+    if evicted.isEmpty { break }
+    var inClosureConsumers: [NodeID: [NodeID]] = [:]
+    for id in closure {
+      guard let node = g.nodes[id] else { continue }
+      for dep in valueDeps(node) where closure.contains(dep) {
+        inClosureConsumers[dep, default: []].append(id)
+      }
+    }
+    var evictStack = Array(evicted)
+    while let id = evictStack.popLast() {
+      for consumer in inClosureConsumers[id] ?? [] where evicted.insert(consumer).inserted {
+        evictStack.append(consumer)
+      }
+    }
+    for id in evicted {
+      guard let node = g.nodes[id] else { continue }
+      if case .memoryWrite(let c) = node.op, carryCells.contains(c) {
+        if debug {
+          print("BPTT-CONSOLIDATE bail: eviction would remove carry write \(id)")
+        }
+        return blocks
+      }
+    }
+    if debug {
+      print("BPTT-CONSOLIDATE evicting post-tape consumers: \(evicted.sorted())")
+    }
+    closure.subtract(evicted)
+    guard !closure.isEmpty else { return blocks }
+  }
 
   // Forward nodes whose values the closure consumes: the consolidated block
   // must be inserted after the last block that produces any of them (block
@@ -534,12 +737,39 @@ public func consolidateTensorBPTTBackwardBlocks(g: Graph, blocks: [Block], ctx: 
   }
 
   // Backward deps of the closure that were cut out of it (boundary nodes) must
-  // run before the consolidated block, alongside its forward deps.
+  // run before the consolidated block, alongside its forward deps. This must be
+  // transitively closed over the backward partition: isolated-pass adjoints are
+  // multi-phase chains (temporalGradStore → temporalGradScan → temporalGradRead,
+  // spectralLossFFTBatchedGradSpec → GradIFFT → GradRead) and the closure only
+  // consumes the final read. If the intermediate phases are left out of
+  // beforeDeps, pass 1 defers them and the descendants walk then drags the read
+  // itself after the consolidated block — a consumer scheduled before its
+  // producer (insufficientInputs at emission).
+  //
+  // A chain ancestor that is itself (transitively) a consumer of a closure node
+  // (e.g. a temporalGradStore whose input is the per-frame grad produced inside
+  // the recurrence) cannot run before the consolidated block; hitting one while
+  // expanding a boundary dep means that dep's whole chain must run after the
+  // closure, so it must not be pulled into beforeDeps.
+  let closureConsumers = transitiveClosureConsumers(closure)
+
   var beforeDeps = forwardDeps
+  var boundaryStack: [NodeID] = []
   for id in closure {
     guard let node = g.nodes[id] else { continue }
-    for dep in node.allDependencies where dep > lastForwardId && !closure.contains(dep) {
-      beforeDeps.insert(dep)
+    for dep in node.allDependencies
+    where dep > lastForwardId && !closure.contains(dep) && !closureConsumers.contains(dep) {
+      boundaryStack.append(dep)
+    }
+  }
+  var visitedBoundary = Set<NodeID>()
+  while let id = boundaryStack.popLast() {
+    guard visitedBoundary.insert(id).inserted else { continue }
+    beforeDeps.insert(id)
+    guard let node = g.nodes[id] else { continue }
+    for dep in node.allDependencies
+    where dep > lastForwardId && !closure.contains(dep) && !closureConsumers.contains(dep) {
+      boundaryStack.append(dep)
     }
   }
 
@@ -643,18 +873,258 @@ public func consolidateTensorBPTTBackwardBlocks(g: Graph, blocks: [Block], ctx: 
     movedConsumers.append(movedBlock)
   }
 
-  // Moved and deferred fragments are all backward nodes; order them by node ID
-  // (creation order is dependency order for backward nodes).
-  let tail = (movedConsumers + deferredBackward).sorted {
-    ($0.nodes.min() ?? 0) < ($1.nodes.min() ?? 0)
+  // Tail blocks (moved consumers + deferred leftovers) run immediately after
+  // the consolidated block, ahead of `after`. Any backward producer of a tail
+  // node still sitting in `after` (e.g. the temporalGradStore/Scan phases of a
+  // deferred temporalGradRead) would then execute after its consumer. Hoist
+  // those producers into the tail; node-ID sorting below restores dependency
+  // order (backward IDs are created in dependency order).
+  var tailFragments = movedConsumers + deferredBackward
+  var afterBlocks = after
+  let tailNodeSet = Set(tailFragments.flatMap { $0.nodes })
+  let beforeNodeSet = Set(before.flatMap { $0.nodes })
+  // Forward deps matter here too: an `after` block can mix forward loss
+  // scalars with backward accumulates (fusion), and hoisting only the
+  // backward producers would schedule a tail node before its forward dep.
+  var neededByTail = Set<NodeID>()
+  var neededStack = Array(tailNodeSet)
+  while let id = neededStack.popLast() {
+    guard let node = g.nodes[id] else { continue }
+    for dep in node.allDependencies
+    where !closure.contains(dep) && !tailNodeSet.contains(dep)
+      && !beforeNodeSet.contains(dep)
+    {
+      if neededByTail.insert(dep).inserted { neededStack.append(dep) }
+    }
   }
-  let result = before + [bpttBlock] + tail + after
+  if !neededByTail.isEmpty {
+    var keptAfter: [Block] = []
+    for block in afterBlocks {
+      let hoisted = block.nodes.filter { neededByTail.contains($0) }
+      if hoisted.isEmpty {
+        keptAfter.append(block)
+        continue
+      }
+      var hoistedBlock = Block(frameOrder: block.frameOrder)
+      hoistedBlock.nodes = hoisted
+      hoistedBlock.shape = block.shape
+      hoistedBlock.temporality = block.temporality
+      hoistedBlock.tensorIndex = block.tensorIndex
+      tailFragments.append(hoistedBlock)
+      let stay = block.nodes.filter { !neededByTail.contains($0) }
+      if !stay.isEmpty {
+        var stayBlock = block
+        stayBlock.nodes = stay
+        keptAfter.append(stayBlock)
+      }
+    }
+    afterBlocks = keptAfter
+  }
+
+  // Order tail nodes by node ID (creation order is dependency order for
+  // backward nodes). Sorting whole fragments by their min ID is not enough:
+  // a fragment can mix low- and high-ID nodes (deferred leftovers of one
+  // original block), interleaving with another fragment's ID range so a
+  // consumer block sorts before its producer. Re-segment the global ID-sorted
+  // tail at fragment changes; each segment keeps its source fragment's
+  // metadata and the segments' disjoint ID intervals make min-ID order a
+  // valid topological order.
+  var tailFragmentOf: [NodeID: Int] = [:]
+  for (i, fragment) in tailFragments.enumerated() {
+    for nodeId in fragment.nodes { tailFragmentOf[nodeId] = i }
+  }
+  var tail: [Block] = []
+  for nodeId in tailFragments.flatMap({ $0.nodes }).sorted() {
+    guard let fragmentIdx = tailFragmentOf[nodeId] else { continue }
+    if var last = tail.last, tailFragmentOf[last.nodes.last ?? -1] == fragmentIdx {
+      last.nodes.append(nodeId)
+      tail[tail.count - 1] = last
+    } else {
+      var segment = Block(frameOrder: tailFragments[fragmentIdx].frameOrder)
+      segment.nodes = [nodeId]
+      segment.shape = tailFragments[fragmentIdx].shape
+      segment.temporality = tailFragments[fragmentIdx].temporality
+      segment.tensorIndex = tailFragments[fragmentIdx].tensorIndex
+      tail.append(segment)
+    }
+  }
+  let result = before + [bpttBlock] + tail + afterBlocks
   if debug {
     print(
       "BPTT-CONSOLIDATE nodes=\(bpttBlock.nodes.count) at=\(before.count) "
         + "moved=\(movedConsumers.map { $0.nodes.count }) "
         + "deferred=\(deferredBackward.map { $0.nodes.count }) "
         + "shape=\(String(describing: bpttBlock.shape)) temporality=\(bpttBlock.temporality)")
+  }
+  return result
+}
+
+/// Consolidate the scalar (`Signal.history()`) BPTT recurrence into the block
+/// that owns the corresponding forward history writes.
+///
+/// `wrapWithBPTTLoops` turns that block into a forward frame loop followed by a
+/// single reverse frame loop; every per-frame adjoint of the history recurrence
+/// must be emitted inside that reverse loop. Default block formation can strand
+/// part of the recurrence in later blocks — an isolated-pass op such as
+/// `temporalGradStore` (a trainable phasor's suffix-scan adjoint) forces a block
+/// split in node-ID order, and the reverse topological walk can emit those tape
+/// nodes before the history-gradient arithmetic finishes. Two failures follow:
+///
+/// 1. The carry-cell writes re-emitted at the reverse loop bottom cannot see a
+///    grad input produced in a later block, so the write is silently dropped and
+///    the recurrence never advances.
+/// 2. Per-frame gradients computed in a later frame-parallel block read
+///    loop-scope values that only hold the final reverse iteration's value,
+///    inflating unrelated parameter gradients.
+///
+/// This pass hoists the whole recurrence closure (carry reads, carry writes and
+/// the value-connected backward arithmetic between them — see
+/// `bpttRecurrenceClosure`) into the host block, keeping isolated-pass tape ops
+/// (`temporalGradStore` / `temporalGradScan` / `temporalGradRead`) and grad
+/// accumulates outside it as closure boundaries.
+///
+/// Conservative by design: if any value dependency of the closure is produced in
+/// a block after the host, the layout is left untouched.
+public func consolidateScalarBPTTBackwardBlocks(g: Graph, blocks: [Block], ctx: IRContext) -> [Block]
+{
+  let debug = ProcessInfo.processInfo.environment["DGEN_DEBUG_BPTT_SPLIT"] != nil
+  guard let lastForwardId = g.lastForwardNodeId else { return blocks }
+  let scalarCarryCells = Set(g.gradCarryCells.values).subtracting(g.tensorGradCarryCells)
+  guard !scalarCarryCells.isEmpty else { return blocks }
+
+  let closure = bpttRecurrenceClosure(
+    g: g, lastForwardId: lastForwardId, carryCells: scalarCarryCells)
+  guard !closure.isEmpty else { return blocks }
+
+  var nodeBlock: [NodeID: Int] = [:]
+  for (i, block) in blocks.enumerated() {
+    for nodeId in block.nodes { nodeBlock[nodeId] = i }
+  }
+
+  // A correct reverse loop needs every carry cell's backward read and write in
+  // the same block (that block then takes the detached reverse-loop wrap, or
+  // the inline host wrap below). Isolated-pass adjoints — a trainable phasor's
+  // temporalGradStore/Scan/Read tape — force block splits mid-recurrence in
+  // node-ID order, stranding the carry writes in a post-scan parallel block:
+  // the read-only block runs as a plain forward loop (recurrence truncated to
+  // garbage) and the write-only block races frame-parallel. Rebuild that
+  // layout with the same consolidation the tensor recurrence uses (sandwich
+  // eviction keeps post-tape consumers out of the reverse loop).
+  var readBlocks: [CellID: Set<Int>] = [:]
+  var writeBlocks: [CellID: Set<Int>] = [:]
+  for (id, node) in g.nodes where id > lastForwardId {
+    switch node.op {
+    case .memoryRead(let c) where scalarCarryCells.contains(c):
+      if let b = nodeBlock[id] { readBlocks[c, default: []].insert(b) }
+    case .memoryWrite(let c) where scalarCarryCells.contains(c):
+      if let b = nodeBlock[id] { writeBlocks[c, default: []].insert(b) }
+    default:
+      break
+    }
+  }
+  let recurrenceFragmented = scalarCarryCells.contains { cell in
+    let reads = readBlocks[cell] ?? []
+    let writes = writeBlocks[cell] ?? []
+    return !reads.isEmpty && !writes.isEmpty && reads != writes
+  }
+  if recurrenceFragmented {
+    if debug {
+      print("BPTT-SCALAR-CONSOLIDATE fragmented recurrence; using detached consolidation")
+    }
+    return consolidateIsolatedBPTTBackwardBlocks(
+      g: g, blocks: blocks, ctx: ctx, carryCells: scalarCarryCells)
+  }
+
+  // Host block: the last block whose forward half writes a scalar history cell
+  // whose gradient flows through one of these carry cells. That is the block
+  // `blockHasPassThroughHistoryWriteWithCarry` selects for BPTT wrapping.
+  let carriedHistoryCells = Set(
+    g.gradCarryCells.filter { scalarCarryCells.contains($0.value) }.map { $0.key })
+  var hostIdxOpt: Int? = nil
+  for (idx, block) in blocks.enumerated() {
+    let ownsHistory = block.nodes.contains { nodeId in
+      guard nodeId <= lastForwardId, let node = g.nodes[nodeId] else { return false }
+      guard case .historyWrite(let cell) = node.op else { return false }
+      return carriedHistoryCells.contains(cell) && g.cellToTensor[cell] == nil
+    }
+    if ownsHistory { hostIdxOpt = idx }
+  }
+  guard let hostIdx = hostIdxOpt else { return blocks }
+  // Only the scalar sequential BPTT layout is handled here; anything else keeps
+  // its existing (tensor / detached) emission path.
+  guard blocks[hostIdx].frameOrder == .sequential else { return blocks }
+
+  let strayClosureNodes = closure.filter { nodeBlock[$0] != hostIdx }
+  guard !strayClosureNodes.isEmpty else { return blocks }
+
+  // Value dependencies of the closure must already be available at the host
+  // block; otherwise hoisting would move a consumer before its producer.
+  for nodeId in closure {
+    guard let node = g.nodes[nodeId] else { continue }
+    for dep in node.inputs where !closure.contains(dep) {
+      if let depBlock = nodeBlock[dep], depBlock > hostIdx {
+        if debug {
+          print(
+            "BPTT-SCALAR-CONSOLIDATE skipped: node \(nodeId) depends on \(dep) "
+              + "in block \(depBlock) after host \(hostIdx)")
+        }
+        return blocks
+      }
+    }
+  }
+
+  // Backward consumers of closure values that currently live before the host
+  // block have to move after it.
+  var consumers: [NodeID: [NodeID]] = [:]
+  for (id, node) in g.nodes where id > lastForwardId {
+    for dep in node.inputs { consumers[dep, default: []].append(id) }
+  }
+  var descendants = Set<NodeID>()
+  var stack = Array(closure)
+  while let id = stack.popLast() {
+    for consumer in consumers[id] ?? [] where !closure.contains(consumer) {
+      if descendants.insert(consumer).inserted { stack.append(consumer) }
+    }
+  }
+
+  var result: [Block] = []
+  var movedFragments: [Block] = []
+  for (idx, block) in blocks.enumerated() {
+    if idx == hostIdx {
+      var host = block
+      let forwardPart = block.nodes.filter { $0 <= lastForwardId }
+      let backwardPart = Set(block.nodes.filter { $0 > lastForwardId }).union(closure)
+      // Backward node IDs are created in dependency order, so ID order is a
+      // valid topological order for the reverse-loop body.
+      host.nodes = forwardPart + backwardPart.sorted()
+      result.append(host)
+      result.append(contentsOf: movedFragments.sorted { ($0.nodes.min() ?? 0) < ($1.nodes.min() ?? 0) })
+      movedFragments.removeAll()
+      continue
+    }
+    var rest = block.nodes.filter { !closure.contains($0) }
+    if idx < hostIdx {
+      let moved = rest.filter { descendants.contains($0) }
+      if !moved.isEmpty {
+        rest = rest.filter { !descendants.contains($0) }
+        var movedBlock = Block(frameOrder: block.frameOrder)
+        movedBlock.nodes = moved
+        movedBlock.shape = block.shape
+        movedBlock.temporality = block.temporality
+        movedBlock.tensorIndex = block.tensorIndex
+        movedFragments.append(movedBlock)
+      }
+    }
+    guard !rest.isEmpty else { continue }
+    var remainder = block
+    remainder.nodes = rest
+    result.append(remainder)
+  }
+
+  if debug {
+    print(
+      "BPTT-SCALAR-CONSOLIDATE host=\(hostIdx) hoisted=\(strayClosureNodes.sorted()) "
+        + "moved=\(descendants.sorted())")
   }
   return result
 }
@@ -1079,10 +1549,34 @@ private func isAcceleratedFFTOp(_ op: LazyOp) -> Bool {
   return false
 }
 
-/// Splits a sequential block so each accelerated FFT/IFFT node sits alone in
-/// its own block (shape/tensorIndex cleared — the op self-iterates). Non-FFT
-/// runs keep the original block's properties and ordering.
-private func splitOutAcceleratedFFTNodes(_ block: Block, graph: Graph) -> [Block] {
+/// Returns true when a node fused into a sequential block should be isolated
+/// into its own block so TemporalityPass can give it hop-rate scheduling:
+/// accelerated FFT/IFFT, and hop-tagged self-iterating grad ops
+/// (bufferViewGradStore, overlapAddGradGather, ...) whose per-window element
+/// loops would otherwise run inside the frame loop on every frame — `hop`×
+/// redundant work gated only by an in-loop select. Isolated, the block-level
+/// hop guard skips the loop on non-hop frames entirely. These ops exchange
+/// data through memory cells / per-frame globals, so a kernel boundary is
+/// safe.
+private func isIsolatableHopSerialOp(
+  _ nodeId: NodeID, graph: Graph, hopBasedNodes: [NodeID: (Int, NodeID)]
+) -> Bool {
+  guard let node = graph.nodes[nodeId] else { return false }
+  if isAcceleratedFFTOp(node.op) { return true }
+  guard hopBasedNodes[nodeId] != nil else { return false }
+  guard node.op.emitsInternalIteration else { return false }
+  // Per-sample outputs must stay in the frame loop.
+  if TemporalityPass.isIntrinsicallyFrameBased(node.op) { return false }
+  return true
+}
+
+/// Splits a sequential block so each accelerated FFT/IFFT node (and each
+/// hop-tagged self-iterating grad op, see `isIsolatableHopSerialOp`) sits
+/// alone in its own block (shape/tensorIndex cleared — the op self-iterates).
+/// Other runs keep the original block's properties and ordering.
+private func splitOutAcceleratedFFTNodes(
+  _ block: Block, graph: Graph, hopBasedNodes: [NodeID: (Int, NodeID)]
+) -> [Block] {
   guard block.nodes.count > 1 else { return [block] }
   var result: [Block] = []
   var run: [NodeID] = []
@@ -1094,7 +1588,7 @@ private func splitOutAcceleratedFFTNodes(_ block: Block, graph: Graph) -> [Block
     run = []
   }
   for nodeId in block.nodes {
-    if let node = graph.nodes[nodeId], isAcceleratedFFTOp(node.op) {
+    if isIsolatableHopSerialOp(nodeId, graph: graph, hopBasedNodes: hopBasedNodes) {
       flushRun()
       var fftBlock = block
       fftBlock.nodes = [nodeId]
@@ -1109,51 +1603,150 @@ private func splitOutAcceleratedFFTNodes(_ block: Block, graph: Graph) -> [Block
   return result
 }
 
-func determineTensorBlocks(_ blocks: [Block], _ graph: Graph, _ ctx: IRContext) -> [Block] {
+/// Returns true when a node is safe to peel out of a sequential block into a
+/// hop-gated parallel block: hop-classified pure tensor math with no
+/// frame-serial state.
+///
+/// Feedback-cluster / seq-scalar propagation can sweep hop-rate tensor chains
+/// (e.g. the svf-freq mask backward) into sequential scalar blocks, where they
+/// re-run identically on all `hop` frames of each span, serially, instead of
+/// once per hop across parallel threads. Those chains read and write
+/// hop-sliced frame-aware cells, so every frame of a span computes the same
+/// values — peeling them into a hop-gated parallel block preserves semantics.
+/// Stateful ops (history/accum/latch/noise), raw memory ops, reduces, and
+/// self-iterating ops must keep their original schedule: genuine cross-frame
+/// state can only flow through them, never through pure tensor math.
+private func isPeelableHopTensorNode(
+  _ nodeId: NodeID, graph: Graph, hopBasedNodes: [NodeID: (Int, NodeID)]
+) -> Bool {
+  guard hopBasedNodes[nodeId] != nil else { return false }
+  guard let node = graph.nodes[nodeId] else { return false }
+  guard case .tensor = node.shape else { return false }
+  switch node.op {
+  case .historyRead, .historyWrite, .historyReadWrite, .accum, .latch,
+    .tensorNoise, .hopTensorNoise, .spectrumDelay, .spectrumDelayMod, .delayLine,
+    .memoryRead, .memoryWrite, .memoryAccumulate, .tensorAccumulate,
+    .tensorRef, .seq, .conv2d, .gemmSmall:
+    return false
+  default:
+    break
+  }
+  if node.op.emitsInternalIteration { return false }
+  if node.op.isSelfDispatchedGemm { return false }
+  if isReductionOp(node.op) { return false }
+  return true
+}
+
+/// Splits a sequential block into alternating runs: maximal contiguous runs of
+/// peelable hop-tensor nodes become parallel blocks (so TemporalityPass gives
+/// them hop-based scheduling and emission gives them per-frame threads with the
+/// hop guard outside the element loops), everything else keeps the original
+/// sequential order and frameOrder.
+private func peelHopTensorRuns(
+  _ block: Block, graph: Graph, hopBasedNodes: [NodeID: (Int, NodeID)]
+) -> [(block: Block, peeled: Bool)] {
+  guard !hopBasedNodes.isEmpty else { return [(block, false)] }
+  // A sequential block is one kernel with its own `for frame` loop. Splitting it
+  // turns a single interleaved frame loop into several full passes over all
+  // frames, which destroys any recurrence A(f) -> B(f) -> A(f+1) carried by the
+  // nodes left behind — even when the peeled node itself is pure tensor math.
+  // Refuse to split any multi-node block that carries cross-frame state.
+  if block.nodes.count > 1,
+    block.nodes.contains(where: { !(graph.nodes[$0]?.op.persistentStateCellIds.isEmpty ?? true) })
+  {
+    return [(block, false)]
+  }
+  var result: [(block: Block, peeled: Bool)] = []
+  var run: [NodeID] = []
+  var runPeeled = false
+  func flush() {
+    guard !run.isEmpty else { return }
+    var b = makeTensorGroupingBlock(from: block)
+    b.frameOrder = runPeeled ? .parallel : block.frameOrder
+    b.nodes = run
+    result.append((b, runPeeled))
+    run = []
+  }
+  for nodeId in block.nodes {
+    let peelable = isPeelableHopTensorNode(nodeId, graph: graph, hopBasedNodes: hopBasedNodes)
+    if peelable != runPeeled {
+      flush()
+      runPeeled = peelable
+    }
+    run.append(nodeId)
+  }
+  flush()
+  return result
+}
+
+/// The pre-peel sequential-block handling: FFT isolation + scalar/tensor
+/// grouping splits.
+private func determineSequentialBlockParts(
+  _ block: Block, graph: Graph, ctx: IRContext,
+  hopBasedNodes: [NodeID: (Int, NodeID)]
+) -> [Block] {
+  var determined: [Block] = []
+  // Accelerated FFT/IFFT nodes (and hop-tagged self-iterating grad ops)
+  // fused into a scalar block alongside frame-rate neighbors (overlapAdd
+  // output taps, waveshapers, ...) would inherit the block's frameBased
+  // temporality and run the transform once per FRAME instead of once per
+  // hop — catastrophically expensive. The parallel path already isolates
+  // self-iterating ops (groupRegularTensorBlock); do the same minimal
+  // isolation here so TemporalityPass can give the transform its own
+  // hop-rate block.
+  let parts = splitOutAcceleratedFFTNodes(block, graph: graph, hopBasedNodes: hopBasedNodes)
+  if parts.count > 1 {
+    for part in parts {
+      if part.nodes.count == 1,
+        isIsolatableHopSerialOp(part.nodes[0], graph: graph, hopBasedNodes: hopBasedNodes)
+      {
+        determined.append(part)
+      } else {
+        var split = splitScalarBlockForTensorGrouping(part, graph: graph, ctx: ctx)
+        for i in split.indices {
+          clearWastedTensorLoopMetadata(&split[i], graph: graph)
+        }
+        determined.append(contentsOf: split)
+      }
+    }
+    return determined
+  }
+  var split = splitScalarBlockForTensorGrouping(block, graph: graph, ctx: ctx)
+  // Scalar blocks that happen to "own" a tensorRef (e.g. bufferView's write
+  // block, [memoryWrite, tensorRef]) inherit the tensorRef's shape here.
+  // Without this sweep, `wrapBodyUOpsWithTensorLoopIfNeeded` wraps the
+  // scalar memoryWrite in `parallelRange(tensorSize)` — a dead inner loop
+  // that executes the same per-frame write hundreds of times.
+  //
+  // Scalar prefixes always strip when they contain no per-element work.
+  // The parallel tensor-suffix also strips when every node there is
+  // self-iterating (hopTensorNoise / FFT-family / overlapAdd) — the
+  // combined `determineVectorPlan` + `hasSIMDBlockers` check keeps
+  // SIMD-4 promotion from firing on blocks with internal scalar loops.
+  for i in split.indices {
+    clearWastedTensorLoopMetadata(&split[i], graph: graph)
+  }
+  determined.append(contentsOf: split)
+  return determined
+}
+
+func determineTensorBlocks(
+  _ blocks: [Block], _ graph: Graph, _ ctx: IRContext,
+  hopBasedNodes: [NodeID: (Int, NodeID)] = [:]
+) -> [Block] {
   var determined: [Block] = []
 
   for block in blocks {
     if block.frameOrder == .sequential {
-      // Accelerated FFT/IFFT nodes fused into a scalar block alongside
-      // frame-rate neighbors (overlapAdd output taps, waveshapers, ...) would
-      // inherit the block's frameBased temporality and run the transform once
-      // per FRAME instead of once per hop — catastrophically expensive. The
-      // parallel path already isolates self-iterating ops
-      // (groupRegularTensorBlock); do the same minimal isolation here so
-      // TemporalityPass can give the transform its own hop-rate block.
-      let parts = splitOutAcceleratedFFTNodes(block, graph: graph)
-      if parts.count > 1 {
-        for part in parts {
-          if part.nodes.count == 1, let node = graph.nodes[part.nodes[0]],
-            isAcceleratedFFTOp(node.op)
-          {
-            determined.append(part)
-          } else {
-            var split = splitScalarBlockForTensorGrouping(part, graph: graph, ctx: ctx)
-            for i in split.indices {
-              clearWastedTensorLoopMetadata(&split[i], graph: graph)
-            }
-            determined.append(contentsOf: split)
-          }
+      for (part, peeled) in peelHopTensorRuns(block, graph: graph, hopBasedNodes: hopBasedNodes) {
+        if peeled {
+          determined.append(contentsOf: groupRegularTensorBlock(part, graph: graph, ctx: ctx))
+        } else {
+          determined.append(
+            contentsOf: determineSequentialBlockParts(
+              part, graph: graph, ctx: ctx, hopBasedNodes: hopBasedNodes))
         }
-        continue
       }
-      var split = splitScalarBlockForTensorGrouping(block, graph: graph, ctx: ctx)
-      // Scalar blocks that happen to "own" a tensorRef (e.g. bufferView's write
-      // block, [memoryWrite, tensorRef]) inherit the tensorRef's shape here.
-      // Without this sweep, `wrapBodyUOpsWithTensorLoopIfNeeded` wraps the
-      // scalar memoryWrite in `parallelRange(tensorSize)` — a dead inner loop
-      // that executes the same per-frame write hundreds of times.
-      //
-      // Scalar prefixes always strip when they contain no per-element work.
-      // The parallel tensor-suffix also strips when every node there is
-      // self-iterating (hopTensorNoise / FFT-family / overlapAdd) — the
-      // combined `determineVectorPlan` + `hasSIMDBlockers` check keeps
-      // SIMD-4 promotion from firing on blocks with internal scalar loops.
-      for i in split.indices {
-        clearWastedTensorLoopMetadata(&split[i], graph: graph)
-      }
-      determined.append(contentsOf: split)
       continue
     }
     determined.append(contentsOf: groupRegularTensorBlock(block, graph: graph, ctx: ctx))

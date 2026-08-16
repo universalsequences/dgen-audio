@@ -498,6 +498,17 @@ public func findSequentialNodes(_ g: Graph, feedbackClusters: [[NodeID]], backen
   // Remove SIMD-safe nodes from scalar set - these use atomics and are safe for parallel execution
   scalar.subtract(simdSafe)
 
+  if ProcessInfo.processInfo.environment["DGEN_DEBUG_SCALAR_HOP"] != nil {
+    let clusterNodes = Set(feedbackClusters.flatMap { $0 })
+    for id in scalar.sorted() {
+      guard let node = g.nodes[id] else { continue }
+      guard case .tensor = node.shape else { continue }
+      print(
+        "[scalar-hop] id=\(id) op=\(node.op) hopTag=\(g.nodeHopRate[id] != nil) "
+          + "feedback=\(clusterNodes.contains(id))")
+    }
+  }
+
   return scalar
 }
 
