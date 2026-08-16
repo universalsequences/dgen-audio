@@ -1090,9 +1090,16 @@ public class CRenderer: Renderer {
       return "int _frameIndex = (int)(\(expr));"
 
     case .frameIndex:
-      // Use i for C scalar blocks, matching Metal's behavior
-      let baseIdx = "i"
-      return emitAssign(uop, frameIndexOverride ?? baseIdx, ctx)
+      // SIMD signal math needs the four actual frame numbers, not a reference
+      // to an undeclared `simd<id>` alias of the scalar loop counter. Keep the
+      // scalar alias too for address arithmetic in mixed scalar/SIMD blocks.
+      if uop.isSimd, frameIndexOverride == nil {
+        let id = extractVarId(uop.value)
+        varEmittedTypes[id] = .int_
+        return "int t\(id) = i; float32x4_t simd\(id) = vaddq_f32(vdupq_n_f32((float)i), (float32x4_t){0.0f, 1.0f, 2.0f, 3.0f});"
+      }
+      // Use i for C scalar blocks, matching Metal's behavior.
+      return emitAssign(uop, frameIndexOverride ?? "i", ctx)
 
     case .identity(let a):
       let expr = uop.isSimd ? "\(g(a))" : "\(gi(a))"
