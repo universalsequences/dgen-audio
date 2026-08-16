@@ -76,9 +76,10 @@ def main():
     # diagnostics, render subprocesses, CMA generation lines). Draining it only
     # after the stdout loop deadlocks once the 64 KiB pipe buffer fills.
     stderr_lines = deque(maxlen=200)
+    stderr_pipe = proc.stderr
 
     def _drain_stderr():
-        for l in proc.stderr:
+        for l in stderr_pipe:
             stderr_lines.append(l)
 
     drain = threading.Thread(target=_drain_stderr, daemon=True)
