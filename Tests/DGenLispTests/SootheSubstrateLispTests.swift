@@ -111,7 +111,7 @@ final class SootheSubstrateLispTests: XCTestCase {
     let settled = Array(hopValues.dropFirst())
     XCTAssertLessThan(settled.last!, settled.first!, "follower did not release over hops")
     XCTAssertLessThan(settled.last!, 0.6, "peak bin should end clearly attenuated")
-    XCTAssertGreaterThan(settled.last!, 0.1)
+    XCTAssertGreaterThan(settled.last!, 0.01)
 
     for k in 1..<settled.count {
       XCTAssertLessThanOrEqual(

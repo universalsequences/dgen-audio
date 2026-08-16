@@ -230,7 +230,10 @@ public class CCompiledKernel: CompiledKernelRuntime {
   ) {
     self.source = source
     self.cellAllocations = cellAllocations
-    self.memorySize = memorySize
+    // CRenderer emits against the same 1024-slot safety floor. Direct runtime
+    // construction must honor it too; otherwise small graphs allocate less
+    // memory than their generated kernel contract advertises.
+    self.memorySize = max(memorySize, 1024)
     self.defaultHostSampleRate = defaultHostSampleRate
   }
 

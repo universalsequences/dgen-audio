@@ -29,10 +29,10 @@ REQUIRED_KEYS = {
     "plan": {"type", "learnable", "frozen", "unsupported", "seed_echo",
              "pitch_hz", "gate_frames", "crop_frames"},
     "stage": {"type", "name", "total"},
-    "epoch": {"type", "epoch", "total", "loss", "params"},
+    "epoch": {"type", "epoch", "total", "loss", "params", "steps"},
     "checkpoint": {"type", "epoch", "wav"},
     "result": {"type", "improvement_pct", "abs_distance", "basin_check",
-               "deltas", "final_wav"},
+               "deltas", "final_wav", "seeded_wav"},
     "error": {"type", "message"},
 }
 
@@ -118,7 +118,8 @@ def main():
             check_artifact(e["wav"], "checkpoint")
     if terminal["type"] == "result":
         check_artifact(terminal["final_wav"], "result")
-        for name in ("lowered.lisp", "final.wav", "result.json"):
+        check_artifact(terminal["seeded_wav"], "result seed")
+        for name in ("lowered.lisp", "seeded.wav", "final.wav", "result.json"):
             if not os.path.isfile(os.path.join(job_dir, name)):
                 fail(f"job dir missing required artifact {name}")
         with open(os.path.join(job_dir, "result.json")) as f:

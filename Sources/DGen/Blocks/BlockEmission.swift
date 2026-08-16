@@ -36,6 +36,10 @@ private func containsSIMDBlockers(_ uops: [UOp], backend: Backend) -> Bool {
     case .broadcastAccess:
       // Metal handles broadcast access fine with per-thread execution
       if case .c = backend { return true }
+    case .loadTape:
+      // A tape offset may vary by lane. NEON has no gather load, so C must
+      // render these blocks scalar unless a contiguous-lane proof is added.
+      if case .c = backend { return true }
     default:
       break
     }
@@ -338,11 +342,32 @@ private func emitBlockBodyUOps(
 ///   - backend: Target backend controlling SIMD constraints.
 /// - Returns: Tuple with frame order, vector width, and tensor-loop increment.
 private func determineVectorPlan(
-  bodyUops: [UOp], block: Block, backend: Backend
+  bodyUops: [UOp], block: Block, graph: Graph, backend: Backend
 ) -> (frameOrder: FrameOrder, vectorWidth: Int, simdIncrement: Int) {
+  // View markers can be emitted as shape-transition setup rather than body UOps.
+  // Check the graph nodes as well: C's four-wide load assumes contiguous lanes,
+  // which is false for shrink/transpose/pad views even when the body only shows
+  // the downstream elementwise operation.
+  let hasCViewNode = backend == .c && block.nodes.contains { nodeId in
+    guard let node = graph.nodes[nodeId] else { return false }
+    switch node.op {
+    case .reshape, .transpose, .shrink, .pad:
+      return true
+    default:
+      // View-only nodes may be represented as shape-transition setup and omitted
+      // from block.nodes. Inspect each compute node's tensor inputs as well.
+      return node.inputs.contains { inputId in
+        graph.nodeToTensor[inputId]
+          .flatMap { graph.tensors[$0] }
+          .map { !$0.transforms.isEmpty }
+          ?? false
+      }
+    }
+  }
+
   // Analyze emitted UOps to determine if SIMD is safe.
   // SIMD is safe if: tensor block + size divisible by 4 + no SIMD blockers + not frame-based.
-  let hasSIMDBlockers = containsSIMDBlockers(bodyUops, backend: backend)
+  let hasSIMDBlockers = hasCViewNode || containsSIMDBlockers(bodyUops, backend: backend)
 
   let canUseSIMD: Bool
   if backend == .c, case .hopBased = block.temporality {
@@ -534,7 +559,8 @@ public func emitBlockUOps(
     emittedNodes: &emittedNodes)
   var bodyUops = bodyEmission.uops
 
-  let vectorPlan = determineVectorPlan(bodyUops: bodyUops, block: block, backend: backend)
+  let vectorPlan = determineVectorPlan(
+    bodyUops: bodyUops, block: block, graph: g, backend: backend)
   applyVectorWidth(vectorPlan.vectorWidth, to: &bodyUops)
 
   var uops = wrapBodyUOpsWithTensorLoopIfNeeded(

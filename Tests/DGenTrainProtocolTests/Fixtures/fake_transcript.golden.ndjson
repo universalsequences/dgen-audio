@@ -8,4 +8,4 @@
 {"epoch":50,"loss":0.04073,"params":{"ratio":0.141792,"sinefm":0.151792},"steps":{"ratio":0.082085,"sinefm":0.082085},"total":60,"type":"epoch"}
 {"epoch":50,"type":"checkpoint","wav":"<job-dir>/epoch0050.wav"}
 {"epoch":60,"loss":0.029425,"params":{"ratio":0.145021,"sinefm":0.155021},"steps":{"ratio":0.049787,"sinefm":0.049787},"total":60,"type":"epoch"}
-{"abs_distance":0.029425,"basin_check":"ok","deltas":{"ratio":{"from":0.05,"to":0.145021},"sinefm":{"from":0.06,"to":0.155021}},"final_wav":"<job-dir>/final.wav","improvement_pct":91.871547,"type":"result"}
+{"abs_distance":0.029425,"basin_check":"ok","deltas":{"ratio":{"from":0.05,"to":0.145021},"sinefm":{"from":0.06,"to":0.155021}},"final_wav":"<job-dir>/final.wav","improvement_pct":91.871547,"seeded_wav":"<job-dir>/seeded.wav","type":"result"}

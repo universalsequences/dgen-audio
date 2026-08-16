@@ -993,15 +993,15 @@ public class CRenderer: Renderer {
         return emitAssign(uop, "memory[\(cell)]", ctx)
       }
     case .loadTape(let val, let offset):
-      // loadTape reads from global tape buffer with bounds checking
-      // In C, this is handled at compile-time (no runtime bounds check for now)
-      let varId = g(val)  // The signal/variable to load from
-      if uop.isSimd {
-        // SIMD: load 4 consecutive frames from tape starting at [offset + i]
-        return emitAssign(uop, "vld1q_f32(&tape[\(varId)][\(g(offset))])", ctx)
-      } else {
-        return emitAssign(uop, "tape[\(varId)][\(g(offset))]", ctx)
-      }
+      // C globals are emitted as one `t<id>` frame array per variable; there is
+      // no Metal-style two-dimensional `tape` argument in the C ABI.
+      let sourceId = extractVarId(val)
+      let source = "t\(sourceId)"
+      let rawOffset = emitScalarLazy(offset, ctx: ctx)
+      let index = "(isfinite(\(rawOffset)) ? (int)\(rawOffset) : 0)"
+      let bounded =
+        "(\(index) < 0 || \(index) >= frameCount) ? 0.0f : \(source)[\(index)]"
+      return emitAssign(uop, bounded, ctx)
     case .beginIf(let cond): return "if (\(g(cond))) {"
     case .endIf: return "}"
 

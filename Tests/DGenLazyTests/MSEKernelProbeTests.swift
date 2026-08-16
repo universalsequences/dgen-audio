@@ -13,7 +13,7 @@ final class MSEKernelProbeTests: XCTestCase {
     LazyGraphContext.reset()
   }
 
-  func testMSEScalarGradientScalesWithFrameCount() throws {
+  func testMSEScalarGradientIsNormalizedAcrossFrameCounts() throws {
     func gradForFrames(_ frames: Int) throws -> Float {
       LazyGraphContext.reset()
       let p = Signal.param(0.5)
@@ -26,10 +26,10 @@ final class MSEKernelProbeTests: XCTestCase {
     let g128 = try gradForFrames(128)
     let ratio = g128 / g64
 
-    // Current behavior: MSE is per-frame (a-b)^2 and gradients are accumulated across frames.
-    XCTAssertEqual(g64, 64.0, accuracy: 0.5)
-    XCTAssertEqual(g128, 128.0, accuracy: 1.0)
-    XCTAssertEqual(ratio, 2.0, accuracy: 0.1)
+    // MSE is a mean, so changing the number of frames must not scale a scalar parameter's gradient.
+    XCTAssertEqual(g64, 1.0, accuracy: 0.01)
+    XCTAssertEqual(g128, 1.0, accuracy: 0.01)
+    XCTAssertEqual(ratio, 1.0, accuracy: 0.01)
   }
 
   func testMSEPhasorKernelDumpProbe() throws {

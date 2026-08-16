@@ -83,9 +83,6 @@ final class HarmonicE2EKernelTests: XCTestCase {
       && kernelSource.contains("for (uint i = 0; i < t")
       && kernelSource.contains("frameCount + _frameIndex")
 
-    XCTExpectFailure(
-      "Known issue: actual HarmonicE2E backward graph serializes frameCount * 64 work in one thread."
-    )
     XCTAssertFalse(
       hasPathologicalSerialization,
       "Actual HarmonicE2E graph should avoid serializing frameCount * 64 work in one thread. See \(kernelPath)."
