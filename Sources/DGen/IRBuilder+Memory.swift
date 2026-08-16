@@ -109,26 +109,68 @@ extension IRBuilder {
 
   // MARK: - Frame-Aware Tensor Ops
 
-  /// Compute the linear memory offset for frame-aware storage: `frameIdx * tensorSize + elemIdx`.
-  /// Result is cast to int for use as a memory index.
-  private func frameAwareOffset(cellId: CellID, frameIdx: Expr, tensorSize: Int, elemIdx: Expr) -> Expr {
-    // Hop-based cells store one slot per hop; all accesses happen on hop
-    // boundaries, so frameIdx / hop is a dense, consistent slot index.
-    var slotIdx = frameIdx
-    if let hop = ctx.g.frameAwareCellHops[cellId], hop > 1 {
-      slotIdx = cast(frameIdx, to: .int) / intConstant(hop)
-    }
-    return cast(slotIdx * intConstant(tensorSize) + elemIdx, to: .int)
+  /// Map an audio **frame** index to the **slot** index of a frame-aware cell.
+  ///
+  /// This is the single source of truth for frame-aware addressing. A cell is
+  /// normally allocated one slot per frame, so slot == frame. But a *hop-sliced*
+  /// cell (one produced by a hop-based node — see `Graph.frameAwareCellHops` and
+  /// `TensorMemoryMaterializationPass`) is allocated only `ceil(frames / hop)`
+  /// slots, because its value only changes on hop boundaries. Its slot index is
+  /// therefore `frame / hop`.
+  ///
+  /// **Every emitter that builds a frame-aware memory offset by hand MUST route
+  /// its frame index through this function.** Writing `frameIdx * tensorSize`
+  /// directly is silently wrong on a hop-sliced cell in two compounding ways:
+  /// the writer and the reader disagree about where a frame lives, and the
+  /// writer runs `hop`× past the end of the shortened allocation, corrupting
+  /// whatever cell was laid out after it. Prefer `frameAwareBase` (or the
+  /// `frameAwareTensorRead`/`Write` wrappers) over calling this directly.
+  ///
+  /// The returned expression keeps `frameIdx`'s scalar type, so it is a drop-in
+  /// replacement inside either integer or float offset arithmetic.
+  public func frameAwareSlotIndex(cellId: CellID, frameIdx: Expr) -> Expr {
+    guard let hop = ctx.g.frameAwareCellHops[cellId], hop > 1 else { return frameIdx }
+    let slot = cast(frameIdx, to: .int) / intConstant(hop)
+    return frameIdx.scalarType == .int ? slot : cast(slot, to: .float)
   }
 
-  /// Zero a hop-sliced **adjoint** read on frames that are not hop ticks.
+  /// The base memory offset of `frameIdx`'s slice within a frame-aware cell:
+  /// `slotIndex(frameIdx) * tensorSize`. Add the element index to address an
+  /// individual element. Hop-aware via `frameAwareSlotIndex`.
+  public func frameAwareBase(cellId: CellID, frameIdx: Expr, tensorSize: Int) -> Expr {
+    let slotIdx = frameAwareSlotIndex(cellId: cellId, frameIdx: frameIdx)
+    return slotIdx * intConstant(tensorSize)
+  }
+
+  /// As `frameAwareBase`, but keeps the multiplication in float arithmetic for
+  /// emitters whose surrounding offset math is float-typed.
+  ///
+  /// The non-sliced case deliberately emits `frameIdx * <float const>` with no
+  /// intervening cast: these offsets sit inside NEON-upgradeable element loops,
+  /// and an extra int->float cast UOp there defeats the vectorizer's pattern
+  /// match and produces invalid C.
+  public func frameAwareBaseFloat(cellId: CellID, frameIdx: Expr, tensorSize: Int) -> Expr {
+    guard (ctx.g.frameAwareCellHops[cellId] ?? 1) > 1 else {
+      return frameIdx * constant(Float(tensorSize))
+    }
+    let slotIdx = frameAwareSlotIndex(cellId: cellId, frameIdx: cast(frameIdx, to: .int))
+    return cast(slotIdx, to: .float) * constant(Float(tensorSize))
+  }
+
+  /// Compute the linear memory offset for frame-aware storage: `slotIdx * tensorSize + elemIdx`.
+  /// Result is cast to int for use as a memory index.
+  private func frameAwareOffset(cellId: CellID, frameIdx: Expr, tensorSize: Int, elemIdx: Expr) -> Expr {
+    return cast(frameAwareBase(cellId: cellId, frameIdx: frameIdx, tensorSize: tensorSize) + elemIdx, to: .int)
+  }
+
+  /// Zero a hop-sliced read on frames that are not hop ticks.
   ///
   /// Hop-sliced storage holds one slot per hop, and `frameAwareOffset` maps
-  /// every frame in a hop onto that one slot. For a forward tensor that is the
-  /// intended "hold" semantics. For a gradient tape it is wrong: the frames
-  /// between ticks were discarded by the forward, so their adjoint is zero, and
-  /// holding replays the tick's adjoint `hop` times into any consumer that
-  /// integrates over audio frames. See `Graph.frameAwareCellScatter`.
+  /// every frame in a hop onto that one slot, which would otherwise "hold" the
+  /// tick's value across the whole hop. A hop-sliced value is defined only on
+  /// its tick — the frames in between were never computed (forward) or were
+  /// discarded by the forward (adjoint) — so a frame-rate reader must see zero.
+  /// See `Graph.frameAwareCellScatter` for the full argument.
   ///
   /// The tick test matches `overlapAddGradGather`'s (`frame % hop == 0`); inside
   /// a hop-gated block it is always true, so this costs nothing there.

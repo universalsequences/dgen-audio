@@ -122,16 +122,16 @@ final class HopGatedSpectralGradientTests: XCTestCase {
     }
   }
 
-  /// Known failure, and a different defect from the one above: with no
-  /// frame-rate node anywhere the loss itself is only evaluated on hop ticks
-  /// and the whole backward chain is hop-scheduled. Marked strict so fixing it
-  /// surfaces as a loud "unexpected pass".
+  /// With no frame-rate node anywhere, the loss itself is only evaluated on hop
+  /// ticks and the whole backward chain is hop-scheduled.
+  ///
+  /// This was a known failure while hop-sliced forward cells *held* their tick
+  /// value across the hop: differentiating that hold would have required the
+  /// backward pass to sum frame-rate adjoints over each hop group, which nothing
+  /// did. Once hop-sliced forward reads zero-fill between ticks (see
+  /// `Graph.frameAwareCellScatter`) there is no hold to differentiate, and
+  /// forward and backward agree.
   func testFullyHopScheduledGraphGradient() throws {
-    XCTExpectFailure(
-      "known DGen bug, separate from hop-gated operand BPTT: when every node "
-        + "including the loss is scheduled at hop rate, the backward chain returns "
-        + "a gradient unrelated to the true one (reproduces without sampleRow too)"
-    )
     let (auto, fd) = try gradients(hop: N, frameRateIndex: false)
     XCTAssertLessThan(
       relativeError(auto, fd), 1e-3,

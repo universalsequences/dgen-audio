@@ -72,7 +72,6 @@ extension LazyOp {
       // Read rowIndex input and floor it
       let rowIndex = try b.readInput(node, inputs, at: 1)
       let numRowsFloat = b.constant(Float(numRows))
-      let numColsFloat = b.constant(Float(numCols))
       let zero = b.constant(0.0)
 
       // Wrap rowIndex using modulo for wrapping behavior, then floor
@@ -89,8 +88,9 @@ extension LazyOp {
       _ = b.memoryWrite(rowIdxCell, b.cast(frameIdx, to: .int), floorIndex)
 
       // Write each gradient element to frame-indexed position
-      // Layout: gradWriteCell[frame * numCols + col]
-      let frameBase = frameIdx * numColsFloat
+      // Layout: gradWriteCell[slot(frame) * numCols + col]
+      let frameBase = b.frameAwareBaseFloat(
+        cellId: gradWriteCell, frameIdx: frameIdx, tensorSize: numCols)
       b.parallelRange(numCols) { colIdx in
         let colIdxFloat = b.cast(colIdx, to: .float)
         // Read gradient element from gradOutput tensor
@@ -129,7 +129,9 @@ extension LazyOp {
           let frameFloat = b.cast(frameIdx, to: .float)
           let selectedRow = b.memoryRead(rowIdxCell, b.cast(frameIdx, to: .int))
           let isMatch = b.abs(selectedRow - rowFloat) < b.constant(0.5)
-          let readPos = frameFloat * numColsFloat + colFloat
+          let readPos =
+            b.frameAwareBaseFloat(
+              cellId: gradWriteCell, frameIdx: frameFloat, tensorSize: numCols) + colFloat
           let gradValue = b.memoryRead(gradWriteCell, b.cast(readPos, to: .int))
           let contribution = b.gswitch(isMatch, gradValue, zero)
           gradSum.accumulate(contribution)
@@ -163,7 +165,6 @@ extension LazyOp {
       let remainingSize = remainingShape.reduce(1, *)
       let rowIndex = try b.readInput(node, inputs, at: 1)
       let numRowsFloat = b.constant(Float(numRows))
-      let remainingSizeFloat = b.constant(Float(remainingSize))
       let zero = b.constant(0.0)
       let one = b.constant(1.0)
 
@@ -179,9 +180,15 @@ extension LazyOp {
       let frac = positiveIndex - floorIndex
       let oneMinusFrac = one - frac
 
-      // Use currentFrameIndex for correct frame index in frame-aware tensor blocks
+      // Use currentFrameIndex for correct frame index in frame-aware tensor blocks.
+      // The scratch tape and the output tensor are distinct cells and may be
+      // sliced differently (the output can be hop-sliced while the scratch tape
+      // is not), so each gets its own base via `frameAwareBaseFloat`.
       let frameIdx = b.currentFrameIndex()
-      let frameBase = frameIdx * remainingSizeFloat
+      let scratchBase = b.frameAwareBaseFloat(
+        cellId: scratchCell, frameIdx: frameIdx, tensorSize: remainingSize)
+      let outBase = b.frameAwareBaseFloat(
+        cellId: outTensor.cellId, frameIdx: frameIdx, tensorSize: remainingSize)
 
       // Use block's tensor index - each thread handles ONE element of remainingShape
       let elemIdx = b.value(loopIdx, scalarType: .int)
@@ -196,12 +203,11 @@ extension LazyOp {
       // Interpolate: (1 - frac) * floor + frac * ceil
       let interpolated = oneMinusFrac * floorValue + frac * ceilValue
       let elemIdxFloat = b.cast(elemIdx, to: .float)
-      let writePos = frameBase + elemIdxFloat
-      _ = b.memoryWrite(scratchCell, b.cast(writePos, to: .int), interpolated)
+      _ = b.memoryWrite(scratchCell, b.cast(scratchBase + elemIdxFloat, to: .int), interpolated)
 
       // Write to output tensor with appropriate addressing
       if ctx.frameAwareTensorCells.contains(outTensor.cellId) {
-        _ = b.memoryWrite(outTensor.cellId, b.cast(writePos, to: .int), interpolated)
+        _ = b.memoryWrite(outTensor.cellId, b.cast(outBase + elemIdxFloat, to: .int), interpolated)
       } else {
         _ = b.memoryWrite(outTensor.cellId, b.cast(elemIdx, to: .int), interpolated)
       }
@@ -236,7 +242,6 @@ extension LazyOp {
       // Read index and compute interpolation params
       let rowIndex = try b.readInput(node, inputs, at: 1)
       let numRowsFloat = b.constant(Float(numRows))
-      let remainingSizeFloat = b.constant(Float(remainingSize))
       let zero = b.constant(0.0)
       let one = b.constant(1.0)
 
@@ -257,24 +262,31 @@ extension LazyOp {
       let ceilSlot = frameIdx + b.constant(Float(maxFrameCount))
       _ = b.memoryWrite(rowIdxCell, b.cast(ceilSlot, to: .int), ceilWrapped)
 
-      // Write weighted gradients for floor and ceil
+      // Write weighted gradients for floor and ceil.
+      // The incoming adjoint tensor and the two grad tapes are distinct cells
+      // and may be sliced differently, so each frame base is resolved per cell.
       let oneMinusFrac = one - frac
-      let frameBase = frameIdx * remainingSizeFloat
+      let floorBase = b.frameAwareBaseFloat(
+        cellId: floorGradCell, frameIdx: frameIdx, tensorSize: remainingSize)
+      let ceilBase = b.frameAwareBaseFloat(
+        cellId: ceilGradCell, frameIdx: frameIdx, tensorSize: remainingSize)
+      let gradReadBase = gradCellId.map {
+        b.frameAwareBaseFloat(cellId: $0, frameIdx: frameIdx, tensorSize: remainingSize)
+      }
 
       b.parallelRange(remainingSize) { elemIdx in
         let elemIdxFloat = b.cast(elemIdx, to: .float)
         let gradValue: Expr
-        if let cellId = gradCellId {
-          let readPos = frameBase + elemIdxFloat
+        if let cellId = gradCellId, let gradReadBase {
+          let readPos = gradReadBase + elemIdxFloat
           gradValue = b.memoryRead(cellId, b.cast(readPos, to: .int))
         } else {
           gradValue = scalarGrad
         }
-        let writePos = frameBase + elemIdxFloat
         let floorGrad = gradValue * oneMinusFrac
-        _ = b.memoryWrite(floorGradCell, b.cast(writePos, to: .int), floorGrad)
+        _ = b.memoryWrite(floorGradCell, b.cast(floorBase + elemIdxFloat, to: .int), floorGrad)
         let ceilGrad = gradValue * frac
-        _ = b.memoryWrite(ceilGradCell, b.cast(writePos, to: .int), ceilGrad)
+        _ = b.memoryWrite(ceilGradCell, b.cast(ceilBase + elemIdxFloat, to: .int), ceilGrad)
       }
 
       b.use(val: zero)
@@ -307,13 +319,20 @@ extension LazyOp {
           let frameFloat = b.cast(frameIdx, to: .float)
           let elemFloat = b.cast(elemIdx, to: .float)
           let inBounds = frameFloat < frameCount
-          let readPos = frameFloat * remainingSizeFloat + elemFloat
+          // Grad tapes are addressed by slot, which equals the frame unless the
+          // tape is hop-sliced (`frameAwareCellHops`).
+          let floorReadPos =
+            b.frameAwareBaseFloat(
+              cellId: floorGradCell, frameIdx: frameFloat, tensorSize: remainingSize) + elemFloat
+          let ceilReadPos =
+            b.frameAwareBaseFloat(
+              cellId: ceilGradCell, frameIdx: frameFloat, tensorSize: remainingSize) + elemFloat
 
           // Floor contribution
           let floorRowRaw = b.memoryRead(rowIdxCell, b.cast(frameIdx, to: .int))
           let floorRowRounded = b.floor(floorRowRaw + b.constant(0.5))
           let floorRow = b.min(b.max(floorRowRounded, zero), maxRow)
-          let floorGrad = b.memoryRead(floorGradCell, b.cast(readPos, to: .int))
+          let floorGrad = b.memoryRead(floorGradCell, b.cast(floorReadPos, to: .int))
           let floorContrib = b.gswitch(inBounds > zero, floorGrad, zero)
           let floorDest = floorRow * remainingSizeFloat + elemFloat
           _ = b.memoryAccumulate(gradCell, b.cast(floorDest, to: .int), floorContrib)
@@ -323,7 +342,7 @@ extension LazyOp {
           let ceilRowRaw = b.memoryRead(rowIdxCell, b.cast(ceilSlot, to: .int))
           let ceilRowRounded = b.floor(ceilRowRaw + b.constant(0.5))
           let ceilRow = b.min(b.max(ceilRowRounded, zero), maxRow)
-          let ceilGrad = b.memoryRead(ceilGradCell, b.cast(readPos, to: .int))
+          let ceilGrad = b.memoryRead(ceilGradCell, b.cast(ceilReadPos, to: .int))
           let ceilContrib = b.gswitch(inBounds > zero, ceilGrad, zero)
           let ceilDest = ceilRow * remainingSizeFloat + elemFloat
           _ = b.memoryAccumulate(gradCell, b.cast(ceilDest, to: .int), ceilContrib)
@@ -341,12 +360,17 @@ extension LazyOp {
           b.loop(maxFrameCount) { frameIdx in
             let frameFloat = b.cast(frameIdx, to: .float)
             let inBounds = frameFloat < frameCount
-            let readPos = frameFloat * remainingSizeFloat + elemFloat
+            let floorReadPos =
+              b.frameAwareBaseFloat(
+                cellId: floorGradCell, frameIdx: frameFloat, tensorSize: remainingSize) + elemFloat
+            let ceilReadPos =
+              b.frameAwareBaseFloat(
+                cellId: ceilGradCell, frameIdx: frameFloat, tensorSize: remainingSize) + elemFloat
 
             // Floor row contribution
             let floorRow = b.memoryRead(rowIdxCell, b.cast(frameIdx, to: .int))
             let isFloorMatch = b.abs(floorRow - rowFloat) < b.constant(0.5)
-            let floorGrad = b.memoryRead(floorGradCell, b.cast(readPos, to: .int))
+            let floorGrad = b.memoryRead(floorGradCell, b.cast(floorReadPos, to: .int))
             let floorValid = inBounds * isFloorMatch
             let floorContrib = b.gswitch(floorValid > zero, floorGrad, zero)
             gradSum.accumulate(floorContrib)
@@ -355,7 +379,7 @@ extension LazyOp {
             let ceilSlot = frameFloat + maxFrameCountFloat
             let ceilRow = b.memoryRead(rowIdxCell, b.cast(ceilSlot, to: .int))
             let isCeilMatch = b.abs(ceilRow - rowFloat) < b.constant(0.5)
-            let ceilGrad = b.memoryRead(ceilGradCell, b.cast(readPos, to: .int))
+            let ceilGrad = b.memoryRead(ceilGradCell, b.cast(ceilReadPos, to: .int))
             let ceilValid = inBounds * isCeilMatch
             let ceilContrib = b.gswitch(ceilValid > zero, ceilGrad, zero)
             gradSum.accumulate(ceilContrib)

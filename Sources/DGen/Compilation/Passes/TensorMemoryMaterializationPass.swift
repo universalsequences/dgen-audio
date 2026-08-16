@@ -96,10 +96,11 @@ extension TensorMemoryMaterializationPass {
       if decision.needsFrameAwareAlloc {
         graph.frameAwareCells[realCellId] = (tensorSize: tensorSize, frameCount: frameSlots)
         graph.frameAwareCellHops[realCellId] = hop > 1 ? hop : nil
-        // Hop-sliced adjoints are live only on hop ticks; a frame-rate reader
-        // must see zero in between rather than the held tick value. See
-        // `Graph.frameAwareCellScatter`.
-        if hop > 1, isGradientNode {
+        // A hop-sliced value is live only on hop ticks; a frame-rate reader must
+        // see zero in between rather than the held tick value. See
+        // `Graph.frameAwareCellScatter` — this holds for forward tensors and
+        // adjoints alike, and is what keeps the two mutually consistent.
+        if hop > 1 {
           graph.frameAwareCellScatter.insert(realCellId)
         }
       }

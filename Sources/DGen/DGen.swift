@@ -66,16 +66,27 @@ open class Graph {
     /// Hop-sliced cells whose frame-rate reads must **zero-fill** between hop
     /// ticks instead of holding the tick's value.
     ///
-    /// A forward hop-sliced tensor is a held signal: `x(frame) = slot[frame/hop]`
-    /// for every frame, so holding is what the reader wants. An *adjoint* stored
-    /// the same way is not. It carries `dLoss/dy(tick)`, and the frames between
-    /// ticks are exactly the ones whose value the forward discarded — their
-    /// adjoint is identically zero. Holding instead replays the tick's adjoint
-    /// `hop` times, so anything downstream that integrates an adjoint over audio
-    /// frames (`sampleGradWrite`, `peekGradWrite`, `selectRowGradWrite`) sums
-    /// `hop` spurious copies, each weighted by the wrong control interpolation.
+    /// A hop-sliced value is defined only on its hop tick. `frameAwareOffset`
+    /// maps every frame in a hop onto the single stored slot, which would make a
+    /// frame-rate reader see the tick's value *held* across the whole hop. That
+    /// is wrong in both directions:
     ///
-    /// Populated for gradient-subgraph cells only (see `lastForwardNodeId`).
+    /// - **Adjoint**: it carries `dLoss/dy(tick)`, and the frames between ticks
+    ///   are exactly the ones whose value the forward discarded — their adjoint
+    ///   is identically zero. Holding replays the tick's adjoint `hop` times, so
+    ///   anything that integrates an adjoint over audio frames
+    ///   (`sampleGradWrite`, `peekGradWrite`, `selectRowGradWrite`) sums `hop`
+    ///   spurious copies, each weighted by the wrong control interpolation.
+    /// - **Forward**: a hop-gated tensor (`TensorHistory(hop:)`,
+    ///   `make-history @hop`) advances once per hop; a frame-rate consumer reads
+    ///   0 between ticks. That is the contract pinned by
+    ///   `TensorHistoryHopGatingTests` / `HistoryHopGatingTests`, and it is what
+    ///   keeps forward and backward mutually consistent — the adjoint of a
+    ///   zero-filled read is itself a zero-filled read, whereas differentiating
+    ///   a hold would require summing frame adjoints over each hop group.
+    ///
+    /// Populated for every hop-sliced frame-aware cell. The mask costs nothing
+    /// inside a hop-gated block, where `frame % hop == 0` always holds.
     public var frameAwareCellScatter: Set<CellID> = []
 
     /// Cells that persist data across frame iterations (circular buffers, ring buffers, etc.)

@@ -523,33 +523,14 @@ final class FilterTableLispTests: XCTestCase {
       """)
   }
 
-  // MARK: - 9. Known-broken: live controls
+  // MARK: - 9. Live controls
 
-  /// The same patch with *live* (signal) controls currently renders wrong audio.
-  /// This is not a flaw in the construction above — it is an upstream
-  /// regression in hop-sliced frame-aware tensor storage, bisected to commit
-  /// 1db7025 ("svf surrugate attempt"), which taught
-  /// `TensorMemoryMaterializationPass` to allocate one slot per hop for
-  /// hop-based tensors and to address them as `frameIdx / hop` in
-  /// `IRBuilder.frameAwareOffset`, but left the other frame-aware offset
-  /// computations (the elementwise/shape-transition writers in `Emit+Tensor` and
-  /// friends) still writing at `frameIdx * tensorSize`. Writers and readers
-  /// therefore disagree by a factor of `hop`, and the writes run past the
-  /// shortened allocation.
-  ///
-  /// Reverting the `hop` computation in `TensorMemoryMaterializationPass` to a
-  /// constant 1 makes this test — and the old `DGenTests.FilterTableTests`, which
-  /// is red at HEAD for the same reason — pass exactly.
-  ///
-  /// Left in place, skipped, so it turns green the moment the storage bug is
-  /// fixed rather than being silently forgotten.
+  /// The same patch driven by *live* (signal) controls must render the same audio
+  /// as the frozen-constant build. This pins the hop-sliced frame-aware storage
+  /// path: with live controls the table read lands in a hop-gated block whose
+  /// output cell is hop-sliced, so writer and reader must agree on the
+  /// frame -> slot mapping (`IRBuilder.frameAwareSlotIndex`).
   func testLiveControlsMatchFrozenControls() throws {
-    throw XCTSkip(
-      "blocked on hop-sliced frame-aware tensor storage (regressed in 1db7025); see doc comment")
-
-    // swift-format-ignore
-    // (unreachable until the skip is removed)
-    /*
     let frozen = try renderFrozen(frame: 1)
 
     LazyGraphContext.reset()
@@ -567,6 +548,5 @@ final class FilterTableLispTests: XCTestCase {
     for n in steady {
       XCTAssertEqual(Double(live[n]), Double(frozen[n]), accuracy: 1e-4)
     }
-    */
   }
 }

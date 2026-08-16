@@ -21,11 +21,12 @@ extension LazyOp {
       // Frame-aware offset: if input/output cells cross block boundaries in a
       // frame/hop-based block, their memory is laid out as frameIdx * tensorSize + elemIdx.
       let inFrameOffset: Expr? = ctx.frameAwareTensorCells.contains(inTensor.cellId)
-        ? b.currentFrameIndex() * b.intConstant(inLen)
+        ? b.frameAwareBase(
+          cellId: inTensor.cellId, frameIdx: b.currentFrameIndex(), tensorSize: inLen)
         : nil
       let outLen = outShape.reduce(1, *)
       let outFrameOffset: Expr? = ctx.frameAwareTensorCells.contains(outCell)
-        ? b.currentFrameIndex() * b.intConstant(outLen)
+        ? b.frameAwareBase(cellId: outCell, frameIdx: b.currentFrameIndex(), tensorSize: outLen)
         : nil
 
       b.parallelRange(outLen) { flatIdx in
@@ -75,10 +76,11 @@ extension LazyOp {
 
       // Frame-aware cells are laid out as frameIdx * total + elemIdx.
       let inFrameOffset: Expr? = ctx.frameAwareTensorCells.contains(inTensor.cellId)
-        ? b.currentFrameIndex() * b.intConstant(total)
+        ? b.frameAwareBase(
+          cellId: inTensor.cellId, frameIdx: b.currentFrameIndex(), tensorSize: total)
         : nil
       let outFrameOffset: Expr? = ctx.frameAwareTensorCells.contains(outCell)
-        ? b.currentFrameIndex() * b.intConstant(total)
+        ? b.frameAwareBase(cellId: outCell, frameIdx: b.currentFrameIndex(), tensorSize: total)
         : nil
 
       b.parallelRange(numRows) { rowFlat in
@@ -115,7 +117,7 @@ extension LazyOp {
       let sourceCount = sourceShape.reduce(1, *)
       let outCount = outShape.reduce(1, *)
       let outFrameOffset: Expr? = ctx.frameAwareTensorCells.contains(outCell)
-        ? b.currentFrameIndex() * b.intConstant(outCount)
+        ? b.frameAwareBase(cellId: outCell, frameIdx: b.currentFrameIndex(), tensorSize: outCount)
         : nil
 
       b.parallelRange(outCount) { flatIdx in
@@ -165,9 +167,11 @@ extension LazyOp {
       let convOutFrameSize = g.frameAwareCells[outCell]?.tensorSize
       let convFrameIdx: Expr? =
         (convInFrameSize != nil || convOutFrameSize != nil) ? b.currentFrameIndex() : nil
-      func convWithFrameOffset(_ offset: Expr, frameSize: Int?) -> Expr {
+      func convWithFrameOffset(_ offset: Expr, cellId: CellID, frameSize: Int?) -> Expr {
         guard let frameSize, let convFrameIdx else { return offset }
-        return b.cast(convFrameIdx * b.intConstant(frameSize) + offset, to: .int)
+        return b.cast(
+          b.frameAwareBase(cellId: cellId, frameIdx: convFrameIdx, tensorSize: frameSize) + offset,
+          to: .int)
       }
 
       b.parallelRange(outShape.reduce(1, *)) { flatIdx in
@@ -191,7 +195,9 @@ extension LazyOp {
             let inVal = b.gswitch(
               inBounds,
               b.memoryRead(
-                inTensor.cellId, convWithFrameOffset(safeIdx, frameSize: convInFrameSize)),
+                inTensor.cellId,
+                convWithFrameOffset(
+                  safeIdx, cellId: inTensor.cellId, frameSize: convInFrameSize)),
               b.constant(0))
 
             let kMemIdx = b.tensorMemoryIndex(
@@ -202,7 +208,8 @@ extension LazyOp {
           }
         }
         _ = b.memoryWrite(
-          outCell, convWithFrameOffset(flatInt, frameSize: convOutFrameSize), acc.value)
+          outCell, convWithFrameOffset(flatInt, cellId: outCell, frameSize: convOutFrameSize),
+          acc.value)
       }
 
     case .sum:
@@ -210,9 +217,10 @@ extension LazyOp {
         let acc = b.float(0.0)
         // Use currentFrameIndex for correct behavior in frame-aware tensor blocks
         let frameIdx = b.currentFrameIndex()
-        let sizeExpr = b.constant(Float(scratch.tensorSize))
+        let frameBase = b.frameAwareBaseFloat(
+          cellId: scratch.cellId, frameIdx: frameIdx, tensorSize: scratch.tensorSize)
         b.loop(scratch.tensorSize) { i in
-          let idx = frameIdx * sizeExpr + b.cast(i, to: .float)
+          let idx = frameBase + b.cast(i, to: .float)
           let val = b.memoryRead(scratch.cellId, b.cast(idx, to: .int))
           acc.accumulate(val)
         }
@@ -800,9 +808,9 @@ extension LazyOp {
       let readPosB2: Expr
       if ctx.frameAwareTensorCells.contains(cellId) {
         // Frame-aware tensor: add frameIndex * tensorSize to read positions
-        let tensorSizeFloat = b.constant(Float(channelSize * numChannels))
         let frameIdx = b.currentFrameIndex()
-        let frameBase = frameIdx * tensorSizeFloat
+        let frameBase = b.frameAwareBaseFloat(
+          cellId: cellId, frameIdx: frameIdx, tensorSize: channelSize * numChannels)
         readPosA1 = frameBase + posA1
         readPosA2 = frameBase + posA2
         readPosB1 = frameBase + posB1
@@ -864,7 +872,8 @@ extension LazyOp {
       if isFrameAware {
         // Frame-aware output: write to frame-indexed position (integer arithmetic)
         let frameIdx = b.currentFrameIndex()
-        let frameBase = frameIdx * b.intConstant(size)
+        let frameBase = b.frameAwareBase(
+          cellId: outTensor.cellId, frameIdx: frameIdx, tensorSize: size)
         let writePos = frameBase + b.cast(idx, to: .int)
         _ = b.memoryWrite(outTensor.cellId, writePos, scalarVal)
       } else {
