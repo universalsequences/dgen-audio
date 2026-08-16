@@ -721,6 +721,10 @@ struct DDSPE2EMain {
       --spectral-warmup-steps <int>
       --spectral-ramp-steps <int>
       --spectral-log-epsilon <float>   (1e-8 = 2026-02 baseline; 1e-3 removes empty-bin loss floor)
+      --noise-filter-mode <fir|fd>     (fd = paper's frequency-sampled filter; batch-size 1 only)
+      --noise-fd-fft-size <int>        (power of two, default 128)
+      --noise-fd-hop <int>             (default 32)
+      --noise-fd-ir-length <int>       (must be < fft size, default 64)
       --best-metric <spectral|combined>  (checkpoint selection; spectral = fixed CPU MR-STFT score, default)
       --best-eval-every <int>          (spectral selection eval cadence in steps, default 10)
       --loudness-weight <float>

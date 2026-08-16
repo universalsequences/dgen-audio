@@ -28,6 +28,14 @@ enum DecoderBackbone: String, Codable {
   case transformer
 }
 
+/// How the noise branch applies its learned response.
+/// `fir`: time-domain taps (the DDSPE2E shortcut).
+/// `fd`: the paper's frequency-sampled filter (see NoiseFD.swift).
+enum NoiseFilterMode: String, Codable {
+  case fir
+  case fd
+}
+
 enum SpectralLossModeOption: String, Codable {
   case l2
   case l1
@@ -92,6 +100,25 @@ struct DDSPE2EConfig: Codable {
   var harmonicConcentrationRampSteps: Int = 0
   var enableNoiseFilter: Bool = false
   var noiseFilterSize: Int = 15
+  var noiseFilterMode: NoiseFilterMode = .fir
+  var noiseFDFFTSize: Int = 128
+  var noiseFDHop: Int = 32
+  var noiseFDIRLength: Int = 64
+
+  /// Width of the decoder's noise-filter head. In `fd` mode the head predicts a
+  /// half-spectrum magnitude per bin, so its size is fixed by the FFT size.
+  var noiseFilterOutputSize: Int {
+    noiseFilterMode == .fd ? noiseFDFFTSize / 2 + 1 : max(2, noiseFilterSize)
+  }
+
+  var noiseFilterSettings: DDSPSynth.NoiseFilterSettings {
+    DDSPSynth.NoiseFilterSettings(
+      mode: noiseFilterMode,
+      fftSize: noiseFDFFTSize,
+      hop: noiseFDHop,
+      irLength: noiseFDIRLength
+    )
+  }
   var learningRate: Float = 0.001
   var lrSchedule: LRSchedule = .cosine
   var lrMin: Float = 1e-5
@@ -173,6 +200,10 @@ struct DDSPE2EConfig: Codable {
     case harmonicConcentrationRampSteps
     case enableNoiseFilter
     case noiseFilterSize
+    case noiseFilterMode
+    case noiseFDFFTSize
+    case noiseFDHop
+    case noiseFDIRLength
     case learningRate
     case lrSchedule
     case lrMin
@@ -284,6 +315,12 @@ struct DDSPE2EConfig: Codable {
       try c.decodeIfPresent(Bool.self, forKey: .enableNoiseFilter) ?? d.enableNoiseFilter
     noiseFilterSize =
       try c.decodeIfPresent(Int.self, forKey: .noiseFilterSize) ?? d.noiseFilterSize
+    noiseFilterMode =
+      try c.decodeIfPresent(NoiseFilterMode.self, forKey: .noiseFilterMode) ?? d.noiseFilterMode
+    noiseFDFFTSize = try c.decodeIfPresent(Int.self, forKey: .noiseFDFFTSize) ?? d.noiseFDFFTSize
+    noiseFDHop = try c.decodeIfPresent(Int.self, forKey: .noiseFDHop) ?? d.noiseFDHop
+    noiseFDIRLength =
+      try c.decodeIfPresent(Int.self, forKey: .noiseFDIRLength) ?? d.noiseFDIRLength
     learningRate = try c.decodeIfPresent(Float.self, forKey: .learningRate) ?? d.learningRate
     lrSchedule = try c.decodeIfPresent(LRSchedule.self, forKey: .lrSchedule) ?? d.lrSchedule
     lrMin = try c.decodeIfPresent(Float.self, forKey: .lrMin) ?? d.lrMin
@@ -449,6 +486,21 @@ struct DDSPE2EConfig: Codable {
     }
     if let value = options["noise-filter-size"] {
       noiseFilterSize = try parseInt(value, key: "noise-filter-size")
+    }
+    if let value = options["noise-filter-mode"] {
+      guard let mode = NoiseFilterMode(rawValue: value.lowercased()) else {
+        throw ConfigError.invalid("noise-filter-mode must be one of: fir, fd")
+      }
+      noiseFilterMode = mode
+    }
+    if let value = options["noise-fd-fft-size"] {
+      noiseFDFFTSize = try parseInt(value, key: "noise-fd-fft-size")
+    }
+    if let value = options["noise-fd-hop"] {
+      noiseFDHop = try parseInt(value, key: "noise-fd-hop")
+    }
+    if let value = options["noise-fd-ir-length"] {
+      noiseFDIRLength = try parseInt(value, key: "noise-fd-ir-length")
     }
     if let value = options["lr"] {
       learningRate = try parseFloat(value, key: "lr")
@@ -676,6 +728,19 @@ struct DDSPE2EConfig: Codable {
     }
     guard harmonicConcentrationRampSteps >= 0 else {
       throw ConfigError.invalid("harmonicConcentrationRampSteps must be >= 0")
+    }
+    if noiseFilterMode == .fd {
+      guard noiseFDFFTSize > 1, noiseFDFFTSize & (noiseFDFFTSize - 1) == 0 else {
+        throw ConfigError.invalid("noiseFDFFTSize must be a power of two > 1")
+      }
+      guard noiseFDHop > 0, noiseFDHop <= noiseFDFFTSize else {
+        throw ConfigError.invalid("noiseFDHop must be in 1...noiseFDFFTSize")
+      }
+      guard noiseFDIRLength > 1, noiseFDIRLength < noiseFDFFTSize else {
+        throw ConfigError.invalid(
+          "noiseFDIRLength must be > 1 and < noiseFDFFTSize (a bounded IR is what "
+            + "prevents circular-convolution time aliasing)")
+      }
     }
     guard noiseFilterSize > 1 else {
       throw ConfigError.invalid("noiseFilterSize must be > 1")

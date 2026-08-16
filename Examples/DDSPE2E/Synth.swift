@@ -163,13 +163,24 @@ enum DDSPSynth {
     return harmonicOut
   }
 
+  /// How the noise branch renders its learned response.
+  struct NoiseFilterSettings {
+    var mode: NoiseFilterMode = .fir
+    var fftSize: Int = 128
+    var hop: Int = 32
+    var irLength: Int = 64
+
+    static let fir = NoiseFilterSettings()
+  }
+
   static func renderSignal(
     controls: DecoderControls,
     tensors: PreallocatedTensors,
     featureFrames: Int,
     frameCount: Int,
     numHarmonics: Int,
-    controlSmoothingMode: ControlSmoothingMode
+    controlSmoothingMode: ControlSmoothingMode,
+    noiseSettings: NoiseFilterSettings = .fir
   ) -> Signal {
     let featureMaxIndex = Float(max(0, featureFrames - 1))
     let frameDenom = Float(max(1, frameCount - 1))
@@ -227,11 +238,24 @@ enum DDSPSynth {
       return harmonicOut
     }
 
-    let firSize = noiseFilter.shape[1]
     let noiseExcitation = Signal.noise()
-    let filterTaps = noiseFilter.peekRow(playhead)              // [firSize] learned per frame
-    let noiseBuffer = noiseExcitation.buffer(size: firSize).reshape([firSize])
-    let filteredNoise = (noiseBuffer * filterTaps).sum()
+    let filteredNoise: Signal
+    switch noiseSettings.mode {
+    case .fir:
+      let firSize = noiseFilter.shape[1]
+      let filterTaps = noiseFilter.peekRow(playhead)            // [firSize] learned per frame
+      let noiseBuffer = noiseExcitation.buffer(size: firSize).reshape([firSize])
+      filteredNoise = (noiseBuffer * filterTaps).sum()
+    case .fd:
+      filteredNoise = FilteredNoiseFD.render(
+        magnitudes: noiseFilter,                                // [frames, nBins] magnitudes
+        noise: noiseExcitation,
+        framePosition: playhead,
+        fftSize: noiseSettings.fftSize,
+        hop: noiseSettings.hop,
+        irLength: noiseSettings.irLength
+      )
+    }
     // Keep noise path active for all frames (no hard UV gate).
     let noiseOut = filteredNoise * noiseGain
     return harmonicOut + noiseOut

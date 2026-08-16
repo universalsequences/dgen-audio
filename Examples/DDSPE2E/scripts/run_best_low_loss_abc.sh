@@ -68,9 +68,20 @@ run_train() {
 # empty-bin loss floor (docs/DDSP_REVIVAL_SPEC.md R0).
 SPECTRAL_LOG_EPSILON="${SPECTRAL_LOG_EPSILON:-1e-8}"
 
+# Noise branch: fir = time-domain taps (legacy), fd = paper's frequency-sampled
+# filter (docs/DDSP_REVIVAL_SPEC.md R2). fd requires batch size 1.
+NOISE_FILTER_MODE="${NOISE_FILTER_MODE:-fir}"
+NOISE_FD_FFT_SIZE="${NOISE_FD_FFT_SIZE:-128}"
+NOISE_FD_HOP="${NOISE_FD_HOP:-32}"
+NOISE_FD_IR_LENGTH="${NOISE_FD_IR_LENGTH:-64}"
+
 TRAIN_COMMON=(
   --cache "$CACHE"
   --spectral-log-epsilon "$SPECTRAL_LOG_EPSILON"
+  --noise-filter-mode "$NOISE_FILTER_MODE"
+  --noise-fd-fft-size "$NOISE_FD_FFT_SIZE"
+  --noise-fd-hop "$NOISE_FD_HOP"
+  --noise-fd-ir-length "$NOISE_FD_IR_LENGTH"
   --mode m2
   --split train
   --shuffle false

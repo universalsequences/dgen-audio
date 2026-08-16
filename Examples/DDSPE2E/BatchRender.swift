@@ -112,7 +112,8 @@ enum DDSPE2EBatchRenderer {
         featureFrames: rawFeatureFrames,
         frameCount: frameCount,
         numHarmonics: config.numHarmonics,
-        controlSmoothingMode: config.controlSmoothingMode
+        controlSmoothingMode: config.controlSmoothingMode,
+          noiseSettings: config.noiseFilterSettings
       )
       let samples = try prediction.realize(frames: frameCount)
       LazyGraphContext.current.clearComputationGraph()

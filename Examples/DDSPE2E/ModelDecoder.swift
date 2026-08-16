@@ -88,7 +88,7 @@ final class DDSPDecoderModel {
     self.softmaxGainMinDB = config.softmaxGainMinDB
     self.softmaxGainMaxDB = config.softmaxGainMaxDB
     self.enableNoiseFilter = config.enableNoiseFilter
-    self.noiseFilterSize = max(2, config.noiseFilterSize)
+    self.noiseFilterSize = config.noiseFilterOutputSize
 
     var rng = SeededGenerator(seed: config.seed)
 
@@ -170,9 +170,11 @@ final class DDSPDecoderModel {
     self.b_hgain.minBound = -8.0
     self.b_noise.minBound = -8.0
 
-    // Learned FIR filter: [hiddenSize → noiseFilterSize], sigmoid → positive taps in (0,1)
+    // Learned noise response: [hiddenSize → noiseFilterOutputSize], sigmoid →
+    // positive values in (0,1). In `fir` mode these are time-domain taps; in
+    // `fd` mode they are half-spectrum magnitudes.
     if config.enableNoiseFilter {
-      let K = max(2, config.noiseFilterSize)
+      let K = config.noiseFilterOutputSize
       self.W_filter = Tensor.param(
         [hiddenSize, K],
         data: Self.randomArray(count: hiddenSize * K, scale: 0.05, rng: &rng))

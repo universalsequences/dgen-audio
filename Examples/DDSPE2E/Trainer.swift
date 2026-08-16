@@ -97,6 +97,19 @@ enum DDSPE2ETrainer {
   ) throws {
     DGenSpectralConfig.logMagnitudeEpsilon = config.spectralLogEpsilon
     logger("[config] spectralLogEpsilon=\(config.spectralLogEpsilon)")
+    if config.noiseFilterMode == .fd {
+      // The batched renderer has no frequency-domain noise path; letting it run
+      // would silently feed half-spectrum magnitudes to the FIR tap code.
+      guard config.batchSize <= 1 else {
+        throw CLIError.invalid(
+          "noise-filter-mode fd is not implemented for batch-size > 1 "
+            + "(got \(config.batchSize)); use batch-size 1")
+      }
+      logger(
+        "[config] noise filter: frequency-sampled (fftSize=\(config.noiseFDFFTSize) "
+          + "hop=\(config.noiseFDHop) irLength=\(config.noiseFDIRLength) "
+          + "bins=\(config.noiseFilterOutputSize))")
+    }
     switch options.mode {
     case .dry:
       try runDryStart(
@@ -512,7 +525,8 @@ enum DDSPE2ETrainer {
           featureFrames: chunk.f0Hz.count,
           frameCount: frameCount,
           numHarmonics: config.numHarmonics,
-          controlSmoothingMode: config.controlSmoothingMode
+          controlSmoothingMode: config.controlSmoothingMode,
+          noiseSettings: config.noiseFilterSettings
         )
         let target = targetTensor.toSignal(maxFrames: frameCount)
         var loss = DDSPTrainingLosses.fullLoss(
@@ -677,7 +691,8 @@ enum DDSPE2ETrainer {
               featureFrames: lastChunkFeatureFrames,
               frameCount: frameCount,
               numHarmonics: config.numHarmonics,
-              controlSmoothingMode: config.controlSmoothingMode
+              controlSmoothingMode: config.controlSmoothingMode,
+          noiseSettings: config.noiseFilterSettings
             )
             let samples = try evalPrediction.realize(frames: frameCount)
             LazyGraphContext.current.clearComputationGraph()
@@ -717,7 +732,8 @@ enum DDSPE2ETrainer {
             featureFrames: lastChunkFeatureFrames,
             frameCount: frameCount,
             numHarmonics: config.numHarmonics,
-            controlSmoothingMode: config.controlSmoothingMode
+            controlSmoothingMode: config.controlSmoothingMode,
+          noiseSettings: config.noiseFilterSettings
           )
           let samples = try renderPrediction.realize(frames: frameCount)
           LazyGraphContext.current.clearComputationGraph()
@@ -1225,7 +1241,8 @@ enum DDSPE2ETrainer {
             featureFrames: chunks[0].f0Hz.count,
             frameCount: frameCount,
             numHarmonics: K,
-            controlSmoothingMode: config.controlSmoothingMode
+            controlSmoothingMode: config.controlSmoothingMode,
+          noiseSettings: config.noiseFilterSettings
           )
           let samples = try renderPrediction.realize(frames: frameCount)
           LazyGraphContext.current.clearComputationGraph()
