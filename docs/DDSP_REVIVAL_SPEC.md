@@ -113,6 +113,46 @@ Interpretation: pass ⇒ the 2026-02 stall is fully explained by since-fixed
 defects; proceed. Fail ⇒ the residual is model-class or optimization-shape;
 diagnose before building anything new.
 
+**RESULT (2026-08-15/16): PASSED, decisively.**
+
+- eps=1e-3, spectral-only probe: `7.63e-4 → 8.02e-5` = **89.5% reduction**,
+  whole chain in ~15 min (the 2026-02 campaign peaked at ~28% over days).
+- eps=1e-8 baseline, directly comparable to the historical best of
+  `2.3486e-4`: **`9.948e-5`**, i.e. 2.36× better on the identical metric with
+  no schedule retuning. The gradient fixes alone account for the old stall.
+- Perceptual: the trained render is indistinguishable from the target by ear —
+  the first perceptually convincing DDSP resynthesis in this repo. Renders and
+  target are in `runs/listen_r0/`.
+- Loss-to-perception calibration on this clip (eps=1e-3): ~3.6e-4 sounds like
+  noise, ~8e-5 sounds like the target. The knee is steep; small absolute
+  differences are large perceptual ones.
+
+Two systemic bugs were found and fixed while running R0, both of which had
+silently corrupted the 2026-02 campaign:
+
+1. **Stale-constant compile cache** (`Sources/DGenLazy/Realize.swift`): the
+   compile fingerprint keyed only on node/tensor counts, so a rebuilt graph
+   that changed only a constant reused stale kernels with the old literal
+   baked in. Every scheduled weight ramp in the old campaign was therefore
+   fictional (stage A's "ramp to 0.05" actually trained at 0.00125 forever).
+   Fixed by hashing constant values into the fingerprint; pinned by
+   `Tests/DGenLazyTests/CompilationCacheTests.swift`. Making ramps real then
+   hit the AGX driver's compiled-variants limit, so scheduled weights are now
+   data-backed (`Tensor([w]).peek(...)`) instead of baked literals, and the
+   runtime cache is FIFO-bounded.
+2. **Ramp-blind best-checkpoint selection**: `model_best` was chosen by
+   minimum *combined scheduled* loss, which is not comparable across steps
+   while weights ramp. It selected step 10 of 500 and the pipeline then
+   polished a near-random model to noise while discarding the excellent one.
+   Fixed with a schedule-independent CPU MR-STFT scorer
+   (`Examples/DDSPE2E/BestMetric.swift`, `--best-metric spectral`, default).
+   Its ranking matches listening tests: exact-sounding 0.67, noise 2.98,
+   near-random 4.89. Not yet ported to the batched path (logs a warning).
+
+R1 is **folded** — R0 passed perceptually with the full decoder on real audio,
+which strictly dominates R1's synthetic no-network recovery. R1 existed as a
+fallback diagnostic for an ambiguous R0 failure that did not occur.
+
 ### R1 — Harmonic branch parameter recovery (synthetic, no network)
 
 Ground-truth harmonic synth (K=32–64 harmonics, known per-frame amplitudes,
@@ -138,6 +178,31 @@ audio. Gate: magnitude-trajectory recovery + fdcheck on a small config.
 
 Deliverable: a reusable `Synth.filteredNoiseFD(...)` alongside the existing
 time-domain FIR branch, plus an A/B on the R0 probe clip.
+
+**Piece 1 (operator + gate): DONE 2026-08-16.**
+`Examples/DDSPE2E/NoiseFD.swift` implements the full paper path — half-spectrum
+magnitudes → constant mirror matmul → zero-phase IR via `tensorIFFT` → wrapped
+Hann IR window (bounds IR length, which is what prevents circular-convolution
+time aliasing) → `tensorFFT` → per-bin complex multiply against the windowed
+noise frame → `tensorIFFT` → `overlapAdd`.
+
+Gates, all passing:
+- `Tests/DGenLazyTests/FilteredNoiseFDTests.swift` — static per-bin magnitude
+  recovery through `tensorFFT`/`tensorIFFT`; loss collapses >100×, every bin
+  within 0.05. Confirms the differentiable FFT path carries gradients.
+- `Tests/DGenLazyTests/FilteredNoiseFDTrajectoryTests.swift` — (a) forward
+  check that a lowpass response passes far less first-difference energy than a
+  highpass one; (b) learning a per-frame magnitude *trajectory* from audio
+  error alone: `0.080 → 0.018` (77.5%), monotone.
+
+Two findings worth carrying into piece 2:
+- The output is **linear in the magnitude parameters**, so waveform MSE is
+  convex but ill-conditioned: a fixed step overshoots near the optimum and the
+  loss drifts back up. Mild LR decay fixes it; expect the same sensitivity when
+  the decoder drives these controls.
+- A brickwall target is **not representable** by a bounded-length windowed IR,
+  and trying to fit one produces a plateau that looks like an optimizer
+  failure. Targets and expectations must respect the IR-length budget.
 
 ### R3 — Decoder-driven harmonic+noise on one real clip
 
