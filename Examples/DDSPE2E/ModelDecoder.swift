@@ -67,6 +67,9 @@ final class DDSPDecoderModel {
   let W_filter: Tensor?
   let b_filter: Tensor?
 
+  // Learned reverb wet-tail IR (nil when reverbMode is off)
+  let reverbIR: Tensor?
+
   private static let ln10Over20: Float = 0.11512925464970229  // ln(10)/20
 
   init(config: DDSPE2EConfig) {
@@ -183,6 +186,21 @@ final class DDSPDecoderModel {
       self.W_filter = nil
       self.b_filter = nil
     }
+
+    // Learned reverb IR: a global (not decoder-predicted) trainable wet tail,
+    // per the DDSP paper. Init: small noise under an exponential decay so the
+    // reverb starts nearly dry but every tap has a nonzero gradient path.
+    if config.reverbMode == .learned {
+      let L = config.reverbIRLength
+      let noise = Self.randomArray(count: L, scale: 1.0, rng: &rng)
+      var taps = [Float](repeating: 0, count: L)
+      for l in 0..<L {
+        taps[l] = 0.01 * noise[l] * Foundation.exp(-4.0 * Float(l) / Float(max(1, L)))
+      }
+      self.reverbIR = Tensor.param([L], data: taps)
+    } else {
+      self.reverbIR = nil
+    }
   }
 
   var parameters: [any LazyValue] {
@@ -208,6 +226,9 @@ final class DDSPDecoderModel {
     params.append(contentsOf: [W_harm, b_harm, W_hgain, b_hgain, W_noise, b_noise])
     if let wf = W_filter, let bf = b_filter {
       params.append(contentsOf: [wf, bf])
+    }
+    if let rev = reverbIR {
+      params.append(rev)
     }
     return params
   }
@@ -323,6 +344,9 @@ final class DDSPDecoderModel {
     if let wf = W_filter, let bf = b_filter {
       snaps.append(contentsOf: [snapshot("W_filter", wf), snapshot("b_filter", bf)])
     }
+    if let rev = reverbIR {
+      snaps.append(snapshot("reverb_ir", rev))
+    }
     return snaps
   }
 
@@ -365,6 +389,9 @@ final class DDSPDecoderModel {
     if let wf = W_filter, let bf = b_filter {
       loadTensor(wf, from: byName["W_filter"])
       loadTensor(bf, from: byName["b_filter"])
+    }
+    if let rev = reverbIR {
+      loadTensor(rev, from: byName["reverb_ir"])
     }
   }
 

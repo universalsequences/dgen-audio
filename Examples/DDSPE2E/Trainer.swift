@@ -110,6 +110,18 @@ enum DDSPE2ETrainer {
           + "hop=\(config.noiseFDHop) irLength=\(config.noiseFDIRLength) "
           + "bins=\(config.noiseFilterOutputSize))")
     }
+    if config.reverbMode == .learned {
+      // The batched renderer has no reverb path.
+      guard config.batchSize <= 1 else {
+        throw CLIError.invalid(
+          "reverb learned is not implemented for batch-size > 1 "
+            + "(got \(config.batchSize)); use batch-size 1")
+      }
+      logger(
+        "[config] reverb: learned (fftSize=\(config.reverbFFTSize) hop=\(config.reverbHop) "
+          + "irLength=\(config.reverbIRLength) latency=\(spectralConvolveLatency(fftSize: config.reverbFFTSize)) samples; "
+          + "targets are shifted by the latency)")
+    }
     switch options.mode {
     case .dry:
       try runDryStart(
@@ -204,6 +216,21 @@ enum DDSPE2ETrainer {
 
     logger("Dry training scaffold complete")
     logger("Wrote summary and placeholder checkpoint")
+  }
+
+  /// The learned reverb delays its output by a fixed
+  /// `spectralConvolveLatency(fftSize:)` samples (dry path included). Shift the
+  /// training/eval target by the same amount so prediction and target stay
+  /// sample-aligned.
+  static func reverbDelayedTarget(_ audio: [Float], config: DDSPE2EConfig) -> [Float] {
+    guard config.reverbMode == .learned else { return audio }
+    let d = spectralConvolveLatency(fftSize: config.reverbFFTSize)
+    guard d > 0 else { return audio }
+    var shifted = [Float](repeating: 0, count: audio.count)
+    if d < audio.count {
+      for n in d..<audio.count { shifted[n] = audio[n - d] }
+    }
+    return shifted
   }
 
   static func runDecoderOnlyTraining(
@@ -541,7 +568,7 @@ enum DDSPE2ETrainer {
           conditioningData.append(contentsOf: [Float](repeating: 0, count: paddingRows))
         }
         featuresTensor.updateDataLazily(conditioningData)
-        targetTensor.updateDataLazily(chunk.audio)
+        targetTensor.updateDataLazily(reverbDelayedTarget(chunk.audio, config: config))
         let loudnessTargetData = makeLoudnessTargetData(
           loudnessDB: chunk.loudnessDB,
           paddedFrames: paddedFeatureFrames
@@ -570,7 +597,9 @@ enum DDSPE2ETrainer {
           frameCount: frameCount,
           numHarmonics: config.numHarmonics,
           controlSmoothingMode: config.controlSmoothingMode,
-          noiseSettings: config.noiseFilterSettings
+          noiseSettings: config.noiseFilterSettings,
+          reverbSettings: config.reverbSettings,
+          reverbIR: model.reverbIR
         )
         let target = targetTensor.toSignal(maxFrames: frameCount)
         var loss = DDSPTrainingLosses.fullLoss(
@@ -745,13 +774,15 @@ enum DDSPE2ETrainer {
               frameCount: frameCount,
               numHarmonics: config.numHarmonics,
               controlSmoothingMode: config.controlSmoothingMode,
-          noiseSettings: config.noiseFilterSettings
+          noiseSettings: config.noiseFilterSettings,
+              reverbSettings: config.reverbSettings,
+              reverbIR: model.reverbIR
             )
             let samples = try evalPrediction.realize(frames: frameCount)
             LazyGraphContext.current.clearComputationGraph()
             if let score = BestCheckpointScorer.multiScaleSpectralScore(
               prediction: samples,
-              target: fixedEvalChunk?.audio ?? lastChunkAudio,
+              target: reverbDelayedTarget(fixedEvalChunk?.audio ?? lastChunkAudio, config: config),
               windowSizes: config.spectralWindowSizes,
               hopDivisor: config.spectralHopDivisor,
               logEpsilon: config.spectralLogEpsilon
@@ -786,7 +817,9 @@ enum DDSPE2ETrainer {
             frameCount: frameCount,
             numHarmonics: config.numHarmonics,
             controlSmoothingMode: config.controlSmoothingMode,
-          noiseSettings: config.noiseFilterSettings
+          noiseSettings: config.noiseFilterSettings,
+            reverbSettings: config.reverbSettings,
+            reverbIR: model.reverbIR
           )
           let samples = try renderPrediction.realize(frames: frameCount)
           LazyGraphContext.current.clearComputationGraph()

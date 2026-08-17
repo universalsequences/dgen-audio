@@ -296,6 +296,48 @@ Do NOT use `partitionedSpectralConvolve`/`acceleratedFFT` (forward-only).
 Start with short IRs (≤0.5 s); gate on a known-IR recovery task before joining
 the full model.
 
+**RESULT (2026-08-17): PASSED.** Operator: `Sources/DGenLazy/LearnedReverb.swift`
+(`spectralConvolve` + `learnedReverb`); gate: `LearnedReverbTests`.
+
+- Construction: masking each `buffer(N, hop)` frame to its oldest `hop`
+  samples makes blocks tile the input exactly, so FFT × IR-spectrum × IFFT ×
+  overlap-add is *exact* linear convolution (no window, no time-aliasing) when
+  `hop + irLength - 1 <= fftSize`, with fixed latency `fftSize - 1`. Forward
+  pinned against CPU direct convolution to 7e-7. The IR's own spectrum is a
+  constant DFT **matmul** (linear, same numbers as pad+tensorFFT) — see bug 2.
+- FD gradient check (N=32, hop∈{1,8}, L=8, 2 kHz): cosine **0.9999999**, max
+  rel err **1.2e-5**.
+- Known-IR recovery (echoes + exp decay, L=128, N=256, hop=64, 16 kHz,
+  multi-scale spectral eps=1e-3 + weighted MSE): loss **645 → 0.52 (1230x)**,
+  recovered-vs-true IR cosine **0.9984**. Spectral-only also collapses (92x)
+  but log-magnitudes are phase-blind and leave tap signs/positions
+  under-determined (cosine 0.63) — the MSE term supplies phase.
+- Integration: `--reverb learned|off` (+ `--reverb-ir-length/fft-size/hop`) in
+  DDSPE2E; IR is a global trainable param (`reverb_ir` in checkpoints); batch>1
+  rejected like fd mode; trainer shifts targets by the operator latency. The
+  `off` path is **bit-identical** to pre-change (6-step fixed-batch run: every
+  loss and gradient norm matches to the last digit).
+- E2E synthetic-reverb demo (dry TinySOL flute × known echo IR → wet, 600-step
+  single-chunk): learned-reverb run reaches selection score **2.315** vs
+  **2.652** for `--reverb off` on the same wet target (off plateaus by step 20;
+  learned improves monotonically to the end). The jointly-trained IR does not
+  isolate the exact echo taps on a quasi-stationary tone — the decoder absorbs
+  comb coloration (identifiability, not gradients; those are FD-proven).
+
+Two engine bugs found en route (both new, ladder keeps paying):
+
+1. **`overlapAdd` backward off-by-a-window at index 0** (Emit+FFT.swift):
+   the gather read window index 0's adjoint from `gradOut[t + windowSize]`
+   instead of `gradOut[t]` — a fossil of an older read-before-scatter forward.
+   Invisible until now because every consumer applies a Hann synthesis window
+   with `w[0] == 0`. Fixed; uniform `offset(i) = i`.
+2. **Static `tensorFFT` chains mis-propagate frame-varying adjoints** — a
+   `Tensor.param → tensorFFT → (× streaming SignalTensor)` graph returns
+   deterministically wrong parameter gradients on both Metal *and* C (so a
+   backward-graph defect, not a race); pad/matmul-derived chains are correct.
+   Pinned as expected-failures in `StaticTensorFrameGradProbeTests`; the
+   reverb sidesteps it via the DFT matmul. Open engine bug.
+
 ### R6 — Multi-clip training (small dataset)
 
 Scale R3(+R4/R5) from single-clip overfit to a small TinySOL subset

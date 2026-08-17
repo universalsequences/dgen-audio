@@ -163,6 +163,16 @@ enum DDSPSynth {
     return harmonicOut
   }
 
+  /// Whether and how the synth output passes through the learned reverb.
+  struct ReverbSettings {
+    var mode: ReverbMode = .off
+    var fftSize: Int = 1_024
+    var hop: Int = 256
+    var irLength: Int = 512
+
+    static let off = ReverbSettings()
+  }
+
   /// How the noise branch renders its learned response.
   struct NoiseFilterSettings {
     var mode: NoiseFilterMode = .fir
@@ -180,7 +190,9 @@ enum DDSPSynth {
     frameCount: Int,
     numHarmonics: Int,
     controlSmoothingMode: ControlSmoothingMode,
-    noiseSettings: NoiseFilterSettings = .fir
+    noiseSettings: NoiseFilterSettings = .fir,
+    reverbSettings: ReverbSettings = .off,
+    reverbIR: Tensor? = nil
   ) -> Signal {
     let featureMaxIndex = Float(max(0, featureFrames - 1))
     let frameDenom = Float(max(1, frameCount - 1))
@@ -237,9 +249,19 @@ enum DDSPSynth {
     let noiseGainRaw = noiseGainFrames.peek(playhead, channel: Signal.constant(0.0))
     let noiseGain = noiseGainRaw
 
+    // Learned reverb wraps whatever the synth produced. The dry path rides
+    // through the convolution as a fixed unit tap, so dry and wet share the
+    // operator's fftSize-1 sample latency; the trainer shifts the target to
+    // match (see Trainer.reverbDelayedTarget).
+    func applyReverb(_ dry: Signal) -> Signal {
+      guard reverbSettings.mode == .learned, let ir = reverbIR else { return dry }
+      return learnedReverb(
+        dry, ir: ir, fftSize: reverbSettings.fftSize, hop: reverbSettings.hop)
+    }
+
     guard let noiseFilter = controls.noiseFilter else {
       _ = noiseGain
-      return harmonicOut
+      return applyReverb(harmonicOut)
     }
 
     let noiseExcitation = Signal.noise()
@@ -262,7 +284,7 @@ enum DDSPSynth {
     }
     // Keep noise path active for all frames (no hard UV gate).
     let noiseOut = filteredNoise * noiseGain
-    return harmonicOut + noiseOut
+    return applyReverb(harmonicOut + noiseOut)
   }
 
   /// Applies Nyquist masking and (for distribution-like heads) renormalization.

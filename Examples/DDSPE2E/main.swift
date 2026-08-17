@@ -725,6 +725,10 @@ struct DDSPE2EMain {
       --noise-fd-fft-size <int>        (power of two, default 128)
       --noise-fd-hop <int>             (default 32)
       --noise-fd-ir-length <int>       (must be < fft size, default 64)
+      --reverb <learned|off>           (default off; trainable IR convolution on the synth output)
+      --reverb-ir-length <int>         (wet-tail taps, default 512; hop + taps - 1 must fit fft size)
+      --reverb-fft-size <int>          (power of two, default 1024)
+      --reverb-hop <int>               (default 256)
       --best-metric <spectral|combined>  (checkpoint selection; spectral = fixed CPU MR-STFT score, default)
       --best-eval-every <int>          (spectral selection eval cadence in steps, default 10)
       --loudness-weight <float>

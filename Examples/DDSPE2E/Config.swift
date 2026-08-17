@@ -36,6 +36,13 @@ enum NoiseFilterMode: String, Codable {
   case fd
 }
 
+/// Whether the synth output passes through a trainable convolution reverb
+/// (the DDSP paper's learned IR). See Sources/DGenLazy/LearnedReverb.swift.
+enum ReverbMode: String, Codable {
+  case off
+  case learned
+}
+
 enum SpectralLossModeOption: String, Codable {
   case l2
   case l1
@@ -104,11 +111,24 @@ struct DDSPE2EConfig: Codable {
   var noiseFDFFTSize: Int = 128
   var noiseFDHop: Int = 32
   var noiseFDIRLength: Int = 64
+  var reverbMode: ReverbMode = .off
+  var reverbIRLength: Int = 512
+  var reverbFFTSize: Int = 1_024
+  var reverbHop: Int = 256
 
   /// Width of the decoder's noise-filter head. In `fd` mode the head predicts a
   /// half-spectrum magnitude per bin, so its size is fixed by the FFT size.
   var noiseFilterOutputSize: Int {
     noiseFilterMode == .fd ? noiseFDFFTSize / 2 + 1 : max(2, noiseFilterSize)
+  }
+
+  var reverbSettings: DDSPSynth.ReverbSettings {
+    DDSPSynth.ReverbSettings(
+      mode: reverbMode,
+      fftSize: reverbFFTSize,
+      hop: reverbHop,
+      irLength: reverbIRLength
+    )
   }
 
   var noiseFilterSettings: DDSPSynth.NoiseFilterSettings {
@@ -204,6 +224,10 @@ struct DDSPE2EConfig: Codable {
     case noiseFDFFTSize
     case noiseFDHop
     case noiseFDIRLength
+    case reverbMode
+    case reverbIRLength
+    case reverbFFTSize
+    case reverbHop
     case learningRate
     case lrSchedule
     case lrMin
@@ -321,6 +345,10 @@ struct DDSPE2EConfig: Codable {
     noiseFDHop = try c.decodeIfPresent(Int.self, forKey: .noiseFDHop) ?? d.noiseFDHop
     noiseFDIRLength =
       try c.decodeIfPresent(Int.self, forKey: .noiseFDIRLength) ?? d.noiseFDIRLength
+    reverbMode = try c.decodeIfPresent(ReverbMode.self, forKey: .reverbMode) ?? d.reverbMode
+    reverbIRLength = try c.decodeIfPresent(Int.self, forKey: .reverbIRLength) ?? d.reverbIRLength
+    reverbFFTSize = try c.decodeIfPresent(Int.self, forKey: .reverbFFTSize) ?? d.reverbFFTSize
+    reverbHop = try c.decodeIfPresent(Int.self, forKey: .reverbHop) ?? d.reverbHop
     learningRate = try c.decodeIfPresent(Float.self, forKey: .learningRate) ?? d.learningRate
     lrSchedule = try c.decodeIfPresent(LRSchedule.self, forKey: .lrSchedule) ?? d.lrSchedule
     lrMin = try c.decodeIfPresent(Float.self, forKey: .lrMin) ?? d.lrMin
@@ -501,6 +529,21 @@ struct DDSPE2EConfig: Codable {
     }
     if let value = options["noise-fd-ir-length"] {
       noiseFDIRLength = try parseInt(value, key: "noise-fd-ir-length")
+    }
+    if let value = options["reverb"] {
+      guard let mode = ReverbMode(rawValue: value.lowercased()) else {
+        throw ConfigError.invalid("reverb must be one of: learned, off")
+      }
+      reverbMode = mode
+    }
+    if let value = options["reverb-ir-length"] {
+      reverbIRLength = try parseInt(value, key: "reverb-ir-length")
+    }
+    if let value = options["reverb-fft-size"] {
+      reverbFFTSize = try parseInt(value, key: "reverb-fft-size")
+    }
+    if let value = options["reverb-hop"] {
+      reverbHop = try parseInt(value, key: "reverb-hop")
     }
     if let value = options["lr"] {
       learningRate = try parseFloat(value, key: "lr")
@@ -744,6 +787,22 @@ struct DDSPE2EConfig: Codable {
     }
     guard noiseFilterSize > 1 else {
       throw ConfigError.invalid("noiseFilterSize must be > 1")
+    }
+    if reverbMode == .learned {
+      guard reverbFFTSize > 1, reverbFFTSize & (reverbFFTSize - 1) == 0 else {
+        throw ConfigError.invalid("reverbFFTSize must be a power of two > 1")
+      }
+      guard reverbHop >= 1, reverbHop <= reverbFFTSize else {
+        throw ConfigError.invalid("reverbHop must be in 1...reverbFFTSize")
+      }
+      guard reverbIRLength > 1, reverbHop + reverbIRLength - 1 <= reverbFFTSize else {
+        throw ConfigError.invalid(
+          "Require reverbHop + reverbIRLength - 1 <= reverbFFTSize (exact overlap-add "
+            + "convolution needs the block+IR to fit the FFT frame without wraparound)")
+      }
+      guard reverbFFTSize < chunkSize else {
+        throw ConfigError.invalid("reverbFFTSize must be < chunkSize (its latency shifts the target)")
+      }
     }
     guard learningRate > 0 else {
       throw ConfigError.invalid("learningRate must be > 0")
