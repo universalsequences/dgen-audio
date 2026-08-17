@@ -204,6 +204,51 @@ Two findings worth carrying into piece 2:
   and trying to fit one produces a plateau that looks like an optimizer
   failure. Targets and expectations must respect the IR-length budget.
 
+**Piece 2 (synth wiring + A/B): DONE 2026-08-16** (commit 9f1ac4e).
+`--noise-filter-mode fir|fd` (plus `--noise-fd-{fft-size,hop,ir-length}`) wires
+the frequency-sampled branch into the trainer, reusing the decoder's existing
+sigmoid noise head sized to the bin count. FIR path verified bit-identical
+after the refactor. The batched renderer has no fd path; training rejects
+batch-size > 1 in fd mode. The operator was subsequently generalized into
+`spectralFilter` (a438a7c): the magnitude→response chain is linear, so it
+collapses to one constant `[nBins, fftSize]` CPU matrix — exact, and it
+removes both per-hop transforms.
+
+**RESULT (2026-08-16): R2 CLOSED.** The paper's frequency-sampled method was
+faithfully built, gated, and measured — and found **not to be the better
+engineering choice at this scale**. FIR stays the default; FD stays available
+behind the flag.
+
+Fair A/B on the R0 overfit clip (post hop-gated-gradient fixes 1572b8d +
+f9b5af4; the pre-fix comparison was invalid — FD's hop=32 path had corrupted
+adjoints while FIR's hop=1 path did not):
+
+| | probe loss | selection score |
+|---|---|---|
+| FIR (baseline) | 8.023e-5 | 0.660 |
+| FD, correct gradient | 8.632e-5 | 0.677 |
+| FD, broken gradient | 9.080e-5 | 0.759 |
+
+Fixing the gradient bought FD ~5% (about half its deficit), confirming the bug
+was a real handicap — but on a correct gradient FD still trails the 15-tap
+time-domain FIR by ~7.6% at ~2.5x the per-step compute.
+
+Flute A/B (breathy material, FD's best-case): partial — the FD chain was
+stopped twice for machine contention. At the matched stage-A step 499, FIR
+selection score 0.746 vs FD 1.623 (2.2x worse), FD stage B essentially flat
+through step 190. Not a clean verdict (FD ran FIR-tuned LRs and a loud
+near-allpass sigmoid-0.5 init it must first suppress), but consistent with the
+overfit-clip result.
+
+This answers the February roadmap's question ("graduate to option 2 if
+frequency resolution is insufficient"): frequency resolution is **not**
+insufficient at this scale. If FD deserves a fairer shake later, the one
+experiment worth running is its own init and LR — in particular a negative
+`b_filter` bias so the noise branch starts quiet — a five-minute change and
+one chain. The natural hybrid follow-up: frequency-domain *parameterization*
+with time-domain *rendering*, keeping the paper's insight about what the
+network should control without convolving in the frequency domain.
+
 ### R3 — Decoder-driven harmonic+noise on one real clip
 
 Full DDSP autoencoder minus z-encoder minus reverb: (f0, loudness) features →
@@ -213,6 +258,27 @@ sustained monophonic clip (TinySOL, as before).
 
 Gate: >50% spectral loss reduction AND qualitative listen check (use the
 `listen` skill) — the SynthID lesson: gate on sound, not parameters.
+
+**RESULT (2026-08-17): PASSED.** The banked `flute_fir` A/B/C chain already
+satisfied R3's definition — (f0, loudness) → transformer decoder (2 layers,
+d_model 64) → 64-harmonic bank + 15-tap FIR noise, real flute clip
+(`.ddsp_cache_flute`, chunk_00000000), spectral loss only:
+
+- Numeric gate: `6.251e-4 → 8.787e-5` = **85.9% reduction** (≫50%).
+- Listen gate: best checkpoint rendered
+  (`runs/listen_r3_flute/`) and A/B'd against the target — **confirmed by ear
+  "sounds pretty much the same."** Analysis agrees: fundamental exact at
+  369.1 Hz, all harmonics on-grid, every band 0–8 kHz within ±0.5 dB, RMS
+  envelope tracks segment-by-segment including the breath dip, harmonic
+  energy fraction 0.993 vs target 0.999.
+
+Two non-blocking observations: the render carries a +0.018 DC offset
+(target +0.0003) — the synth emits a small 0 Hz component worth a highpass or
+head-bias check eventually; and the target's vibrato/breath sidebands (split
+peaks at 740/758 Hz) come out as single peaks — the classic DDSP smoothing
+signature, slightly more static than the real flute.
+
+The transformer suffices ⇒ **R4 is skippable** per its own criterion.
 
 ### R4 — Recurrent core (micro-GRU) [optional if R3 transformer suffices]
 
@@ -237,6 +303,39 @@ Scale R3(+R4/R5) from single-clip overfit to a small TinySOL subset
 model" is back on the table — but by now every component below it has a passed
 gate, so residuals are attributable. Batched lanes can serve as data
 parallelism here (B = clips) if wall-clock demands it.
+
+**RESULT (2026-08-17): PASSED.** Dataset: `.ddsp_cache_flute_r6` — 18 TinySOL
+flute ordinario clips (C4–B5 at mf, plus pp/ff at C4 and G5), 216 chunks,
+194 train / 22 val. Chain: the R3 recipe with `SHUFFLE=true FIXED_BATCH=false`
+(new script env overrides), 2000/800/800 steps, batch 1, eps=1e-3, FIR noise.
+
+- Numeric: pinned-eval-chunk selection score `2.86 → 1.09` = **62% reduction**.
+- Val (all 22 chunks, CPU MR-STFT): mean **1.452**, worst 1.838 — on the
+  calibrated scale where "exact" ≈ 0.67 (R3 overfit 0.736) and "noise" ≈ 2.98.
+- Listen gate (best/typical/worst val pairs, `runs/listen_r6/`): **passed by
+  ear** — best (F5) "pretty spot on"; typical (D5) "a tiny bit brighter than
+  the original"; worst pair's *target* (G5 ff) itself has wild pitch
+  fluctuations, i.e. the hardest material is hard for a reason.
+
+Two systemic fixes landed while running R6, both worth keeping in mind:
+
+1. **Shuffle-blind best-checkpoint selection** (Trainer.swift): the spectral
+   scorer evaluated the *current* training chunk, which changes every step
+   under shuffle — scores were incomparable across steps and selection would
+   freeze on whichever chunk scored easiest. Selection is now pinned to one
+   fixed chunk (first entry of the split) whenever training is shuffled
+   multi-chunk. Same disease as the ramp-blind selection bug from R0, new
+   vector.
+2. **f0 clamped to 500 Hz** (Synth.swift, non-batched render path): every
+   note above 500 Hz trained *and* rendered at exactly 500 Hz — the first R6
+   run's val scores split cleanly at the octave-4/5 boundary (2.2–2.6 ≈ noise
+   for octave 5). Now clamps to Nyquist; harmonic aliasing was already
+   handled by the downstream Nyquist mask. This clamp was live through R0–R3
+   but never bit because that material sat below 500 Hz.
+
+Known residuals (not gate-blocking): slight brightness excess on typical
+val material; per-note vibrato/breath micro-structure smoothed (the classic
+DDSP signature, also seen at R3).
 
 Out-of-ladder / later: z-encoder (paper M5), CREPE-quality f0, timbre
 transfer demos.
