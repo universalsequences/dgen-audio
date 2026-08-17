@@ -195,7 +195,11 @@ enum DDSPSynth {
     let playheadMaxSafe = max(0.0, featureMaxIndex - 1e-4)
     let playhead = playheadRaw.clip(0.0, Double(playheadMaxSafe))
 
-    let f0 = min(max(tensors.f0.peek(playhead), 20.0), 500.0)
+    // Sanitize f0 only; harmonics above Nyquist are masked downstream. A tighter
+    // cap here silently pins high notes (a 500 Hz cap rendered every octave-5
+    // flute note at exactly 500 Hz).
+    let nyquistCap = Double(DGenConfig.sampleRate * 0.5)
+    let f0 = min(max(tensors.f0.peek(playhead), 20.0), nyquistCap)
     let uv = tensors.uv.peek(playhead).clip(0.0, 1.0)
 
     let harmonicAmpsFrames: Tensor

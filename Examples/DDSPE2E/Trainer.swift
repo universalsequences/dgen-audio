@@ -389,6 +389,50 @@ enum DDSPE2ETrainer {
     if options.bestMetric == .spectral && config.spectralWindowSizes.isEmpty {
       logger("best-metric spectral requires --spectral-windows; falling back to combined")
     }
+
+    // Under shuffled multi-chunk training the "current" chunk differs from
+    // step to step, so spectral selection scores on it are not comparable and
+    // best-checkpoint selection would freeze on whichever chunk scores easiest.
+    // Score every eval on one fixed chunk instead (first entry of the split,
+    // stable order — independent of the shuffle).
+    struct FixedEvalChunk {
+      let id: String
+      let audio: [Float]
+      let featureFrames: Int
+      let conditioning: [Float]
+      let paddedF0: [Float]
+      let paddedUV: [Float]
+    }
+    var fixedEvalChunk: FixedEvalChunk?
+    if useSpectralSelection, !config.fixedBatch, splitEntries.count > 1 {
+      let entry = splitEntries[0]
+      let chunk = try dataset.loadChunk(entry)
+      var conditioning = makeConditioningData(
+        f0Hz: chunk.f0Hz,
+        loudnessDB: chunk.loudnessDB,
+        uvMask: chunk.uvMask
+      )
+      let paddingRows = paddedFeatureFrames * conditioningFeatureCount - conditioning.count
+      if paddingRows > 0 {
+        conditioning.append(contentsOf: [Float](repeating: 0, count: paddingRows))
+      }
+      var paddedF0 = chunk.f0Hz
+      var paddedUV = chunk.uvMask
+      let framePadding = paddedFeatureFrames - paddedF0.count
+      if framePadding > 0 {
+        paddedF0.append(contentsOf: [Float](repeating: 0, count: framePadding))
+        paddedUV.append(contentsOf: [Float](repeating: 0, count: framePadding))
+      }
+      fixedEvalChunk = FixedEvalChunk(
+        id: entry.id,
+        audio: chunk.audio,
+        featureFrames: chunk.f0Hz.count,
+        conditioning: conditioning,
+        paddedF0: paddedF0,
+        paddedUV: paddedUV
+      )
+      logger("spectral best-checkpoint selection pinned to fixed eval chunk \(entry.id)")
+    }
     var noImproveSteps = 0
     var completedSteps = 0
     let earlyStopPatience = config.earlyStopPatience
@@ -684,11 +728,20 @@ enum DDSPE2ETrainer {
         let isFinalStep = step == steps - 1
         if step % max(1, options.bestEvalEvery) == 0 || isFinalStep {
           do {
+            // With a fixed eval chunk, re-upload its features/synth data; the
+            // next training step re-uploads its own chunk, so nothing needs
+            // restoring. (A same-step --render-every snapshot would render the
+            // eval chunk — cosmetic, debug-only.)
+            if let evalChunk = fixedEvalChunk {
+              featuresTensor.updateDataLazily(evalChunk.conditioning)
+              synthTensors.updateChunkData(
+                f0Frames: evalChunk.paddedF0, uvFrames: evalChunk.paddedUV)
+            }
             let evalControls = model.forward(features: featuresTensor)
             let evalPrediction = DDSPSynth.renderSignal(
               controls: evalControls,
               tensors: synthTensors,
-              featureFrames: lastChunkFeatureFrames,
+              featureFrames: fixedEvalChunk?.featureFrames ?? lastChunkFeatureFrames,
               frameCount: frameCount,
               numHarmonics: config.numHarmonics,
               controlSmoothingMode: config.controlSmoothingMode,
@@ -698,7 +751,7 @@ enum DDSPE2ETrainer {
             LazyGraphContext.current.clearComputationGraph()
             if let score = BestCheckpointScorer.multiScaleSpectralScore(
               prediction: samples,
-              target: lastChunkAudio,
+              target: fixedEvalChunk?.audio ?? lastChunkAudio,
               windowSizes: config.spectralWindowSizes,
               hopDivisor: config.spectralHopDivisor,
               logEpsilon: config.spectralLogEpsilon

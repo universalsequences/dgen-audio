@@ -71,6 +71,10 @@ SPECTRAL_LOG_EPSILON="${SPECTRAL_LOG_EPSILON:-1e-8}"
 # Noise branch: fir = time-domain taps (legacy), fd = paper's frequency-sampled
 # filter (docs/DDSP_REVIVAL_SPEC.md R2). fd requires batch size 1.
 NOISE_FILTER_MODE="${NOISE_FILTER_MODE:-fir}"
+
+# Multi-clip training (docs/DDSP_REVIVAL_SPEC.md R6): SHUFFLE=true FIXED_BATCH=false
+SHUFFLE="${SHUFFLE:-false}"
+FIXED_BATCH="${FIXED_BATCH:-true}"
 NOISE_FD_FFT_SIZE="${NOISE_FD_FFT_SIZE:-128}"
 NOISE_FD_HOP="${NOISE_FD_HOP:-32}"
 NOISE_FD_IR_LENGTH="${NOISE_FD_IR_LENGTH:-64}"
@@ -84,8 +88,8 @@ TRAIN_COMMON=(
   --noise-fd-ir-length "$NOISE_FD_IR_LENGTH"
   --mode m2
   --split train
-  --shuffle false
-  --fixed-batch true
+  --shuffle "$SHUFFLE"
+  --fixed-batch "$FIXED_BATCH"
   --seed "$SEED"
   --batch-size 1
   --grad-accum-steps 1
