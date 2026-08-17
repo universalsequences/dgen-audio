@@ -17,6 +17,7 @@ final class IotaLispTests: XCTestCase {
   }
 
   override func tearDownWithError() throws {
+    DGenConfig.maxFrameCount = 4096
     if let tempDir { try? FileManager.default.removeItem(at: tempDir) }
     try super.tearDownWithError()
   }
