@@ -489,9 +489,37 @@ bash Examples/DDSPE2E/scripts/run_flute_clarinet.sh
 
 Enable this path with `--reference-conditioning true`. During a counterfactual
 batch-render audit, `--reference-instrument-index 0|1` chooses a clarinet or
-flute reference while preserving identical target controls. The current
-averaged-MFCC experiment is an explicitly documented failed R8 baseline; see
-`docs/DDSP_REVIVAL_SPEC.md` before extending it.
+flute reference while preserving identical target controls. The averaged-MFCC
+experiment (`--reference-encoder averaged`, the default) is an explicitly
+documented failed R8 baseline; see `docs/DDSP_REVIVAL_SPEC.md` before
+extending it.
+
+`--reference-encoder temporal` is the second R8 attempt: each reference is
+represented as `--reference-time-frames` × `--reference-mel-bins` log-mel
+frames (cached when present, otherwise computed from the chunk audio, so old
+caches keep working) and encoded by a per-frame MLP with learned attention
+pooling into one `z`. Besides per-layer FiLM, `z` adds direct residuals to
+the harmonic, gain, noise, and noise-filter heads. Checkpoint selection then
+scores each pinned held-out chunk with both its same-instrument and a
+crossed-instrument reference and minimizes
+`correct − referenceSeparationWeight · (crossed − correct)`, so a
+reference-blind model cannot be selected:
+
+```bash
+bash Examples/DDSPE2E/scripts/run_flute_clarinet_mfff_temporal.sh
+```
+
+For the listening gate, `render-reference-triplets` writes, per held-out
+target, `TARGET` plus one `PREDICTED_USING_<INSTRUMENT>_REFERENCE` render per
+instrument from identical f0/loudness controls, with a manifest recording the
+exact reference chunk used for each prediction:
+
+```bash
+swift run DDSPE2E render-reference-triplets \
+  --cache .ddsp_cache_flute_clarinet_mfff \
+  --init-checkpoint runs/<run>/checkpoints/model_best.json \
+  --split val --count 6 --output runs/<run>_triplets
+```
 
 ## Voice-to-Instrument Transfer
 
@@ -560,6 +588,11 @@ Notes:
 - `--reference-features <int>` (default: `16`; cached reference descriptor width)
 - `--reference-latent <int>` (default: `16`; learned `z` width)
 - `--reference-classification-weight <float>` (default: `0.1`)
+- `--reference-encoder <averaged|temporal>` (default: `averaged`)
+- `--reference-time-frames <int>` (default: `16`; temporal mode)
+- `--reference-mel-bins <int>` (default: `48`; temporal mode)
+- `--reference-encoder-hidden <int>` (default: `64`; temporal mode)
+- `--reference-separation-weight <float>` (default: `1.0`; checkpoint-selection margin)
 - `--max-chunks-per-file <int>` (default: unset)
 - `--shuffle <true|false>` (default: `true`)
 - `--fixed-batch <true|false>` (default: `false`)

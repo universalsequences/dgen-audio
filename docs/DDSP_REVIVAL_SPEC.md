@@ -464,6 +464,89 @@ time-varying learned spectrogram encoder
 rather than an averaged handcrafted MFCC vector, plus reference-sensitive
 checkpoint selection; simply scaling the first run is not justified.
 
+**SECOND REFERENCE ATTEMPT (2026-08-18): temporal encoder built, campaign
+running.** `--reference-encoder temporal` replaces the averaged-MFCC
+bottleneck with:
+
+- **Representation:** 16 log-mel frames × 48 bins per reference chunk
+  (`FeatureExtractor.timbreLogMelFrames`), uniformly covering attack→sustain,
+  chunk-mean log energy subtracted (level lives in target loudness), tanh
+  bounded. New caches store the frames (`timbreFrames`/`timbreFrameCount`/
+  `timbreMelBins`, all optional); loaders compute them on the fly from cached
+  audio for existing caches (`referenceTimbreFrames`), so the mf/ff caches
+  are usable without re-preprocessing.
+- **Encoder:** per-frame MLP (48→64→64, tanh) → learned attention pool over
+  time → tanh z (`DDSPDecoderModel.encodeReferenceLatent`, [1, 32]). Params
+  checkpoint under `ref_tenc_*`.
+- **Injection:** the per-layer FiLM path is kept (z-row expanded per frame),
+  and z additionally feeds direct residuals into the harmonic logits,
+  harmonic gain, noise gain, and noise-filter logits (`ref_z*_W`), so
+  conditioning does not depend on FiLM alone and references shift controls
+  from step 0 (verified by test: swapping references changes harmonic amps
+  at init).
+- **Reference-sensitive selection:** every pinned eval chunk is scored with
+  its same-instrument reference AND a crossed-instrument reference;
+  selection minimizes `correct − w·(crossed − correct)`
+  (`--reference-separation-weight`, default 1). Both terms are logged
+  (`refEval correct=… crossed=… sep=…`), so a reference-blind checkpoint
+  (sep≈0) can no longer win on reconstruction alone.
+- **Gate artifact:** `render-reference-triplets` renders, per held-out
+  target, `TARGET` + `PREDICTED_USING_<INSTRUMENT>_REFERENCE` per instrument
+  from identical f0/loudness controls, with a manifest recording the exact
+  reference chunk/source/instrument per render (no more "REFERENCE_FLUTE"
+  naming ambiguity).
+
+Compatibility: averaged mode, single-instrument mode, and no-reference mode
+are code-path-unchanged; old caches/configs/checkpoints decode (pinned by
+`DDSPE2EReferenceEncoderTests`).
+
+**RESULTS (2026-08-18): gate NOT passed, but the failure was root-caused and
+moved twice.** Two full A/B/C chains (3000/800/400) on the mf/ff cache:
+
+*Run 1 (temporal encoder, joint training):* collapsed exactly like the
+averaged attempt — separation margin grew to +0.07 by step 100, then decayed
+to ~0 after step 800; triplet gate 1/6 correct-reference wins, predictions
+differing by only ~2% RMS. Diagnosis chain (all tooling kept):
+
+- `debug-reference-z` (new subcommand: per-instrument latent separation,
+  classifier accuracy, raw-feature separation, `--dump` for probes): z was
+  never instrument-separable at ANY checkpoint (separation ratio ~0.5, val
+  classifier at chance, train only 72% after 4200 weight-1.0 steps).
+- A linear logistic probe on the identical raw 16×48 log-mel input reaches
+  **100% train and 100% val accuracy** — the representation is sufficient;
+  the failure is training dynamics (reconstruction gradient drowns the
+  classification gradient through the shared encoder).
+- FD check of the encoder gradient (pinned test): the backward is *correct*;
+  an apparent mismatch was float32 FD quantization (grads ~1e-5 at init —
+  the classifier's 0.05 init scale shrinks the whole upstream signal). The
+  attention bias has an exactly-zero gradient (softmax shift invariance).
+
+*Fix:* `--reference-pretrain-steps` (classification-only pretraining of
+encoder+classifier, own Adam — the main optimizer's positional moment
+buffers mis-index on partial-grad steps — batch-8 grad accumulation,
+`--reference-pretrain-lr` 3e-3) + `--reference-encoder-freeze`. 800 pretrain
+steps: class loss 0.69→0.09, z separation ratio 0.51→**2.34**, val
+classifier 11/13.
+
+*Run 2 (pretrained + frozen encoder):* the collapse is **fixed** — the
+separation margin stays positive (+0.045..+0.061) through all of stage A and
+reference-swapped predictions now differ by 13–23% RMS. But the triplet gate
+still fails (2/6 correct wins) for a *new, narrower* reason: the decoder
+applies only a small constant timbre tilt. Harmonic analysis: clarinet-G4
+target has H2 −29 dB / H3 +3 dB, flute-A4 target has H2 +2.6 dB, while BOTH
+predictions sit at H2 ≈ −13 dB with the clarinet reference moving H2/H3 a
+mere ~2 dB; renders are also ~4–5 dB quiet and centroid-dull (average-timbre
+solution). Stage B/C added nothing (B's margin went slightly negative);
+stage A's best (sel 1.320) is the checkpoint of record.
+
+**Diagnosed bottleneck for the next attempt: conditioning-path dynamic
+range.** The z→harmonic residual is tanh-bounded z × 0.1-scale weights into
+exp-sigmoid logits, and FiLM gamma is tanh×0.5 — a few dB of swing, where
+flute↔clarinet needs H2 to swing ~30 dB. Since exp-sigmoid logits are
+log-amplitude, the fix is cheap: unbounded/large-scale per-harmonic z
+residuals (±3 logits ≈ ±26 dB) and/or a wider FiLM gamma bound. Do NOT
+re-run at scale before widening this path.
+
 Out-of-ladder / later: CREPE-quality f0 and broader timbre transfer demos.
 
 ## Non-goals for v1

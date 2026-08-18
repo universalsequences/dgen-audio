@@ -388,11 +388,22 @@ enum DDSPE2ETrainer {
         count: paddedFeatureFrames
       )
     )
-    let referenceTensor: Tensor? = config.referenceConditioning
-      ? Tensor([[Float]](
+    let referenceTensor: Tensor?
+    if config.referenceConditioning {
+      switch config.referenceEncoderMode {
+      case .averaged:
+        referenceTensor = Tensor([[Float]](
           repeating: [Float](repeating: 0, count: config.referenceFeatureSize),
           count: paddedFeatureFrames))
-      : nil
+      case .temporal:
+        // [timeFrames, melBins] log-mel frames for the learned temporal encoder.
+        referenceTensor = Tensor([[Float]](
+          repeating: [Float](repeating: 0, count: config.referenceMelBins),
+          count: config.referenceTimeFrames))
+      }
+    } else {
+      referenceTensor = nil
+    }
     let sourceReferenceEntries = Dictionary(grouping: splitEntries, by: \.sourceFile).values.map {
       let sorted = $0.sorted { $0.startSample < $1.startSample }
       return sorted[sorted.count / 2]
@@ -407,18 +418,41 @@ enum DDSPE2ETrainer {
       guard !candidates.isEmpty else { return nil }
       return candidates[Int(offset % UInt64(candidates.count))]
     }
-    func paddedReferenceData(_ descriptor: [Float]?) -> [Float] {
-      var row = Array((descriptor ?? []).prefix(config.referenceFeatureSize))
-      if row.count < config.referenceFeatureSize {
-        row += [Float](repeating: 0, count: config.referenceFeatureSize - row.count)
-      }
-      return Array(repeating: row, count: paddedFeatureFrames).flatMap { $0 }
+    func crossedReferenceEntry(for target: CachedChunkEntry, offset: UInt64) -> CachedChunkEntry? {
+      guard config.referenceConditioning else { return nil }
+      let targetInstrument = target.instrumentIndex ?? 0
+      let candidates = referenceEntriesByInstrument
+        .filter { $0.key != targetInstrument }
+        .values.flatMap { $0 }
+        .sorted { $0.id < $1.id }
+      guard !candidates.isEmpty else { return nil }
+      return candidates[Int(offset % UInt64(candidates.count))]
     }
+    func referenceData(from chunk: CachedChunk?) -> [Float] {
+      switch config.referenceEncoderMode {
+      case .averaged:
+        var row = Array((chunk?.timbreFeatures ?? []).prefix(config.referenceFeatureSize))
+        if row.count < config.referenceFeatureSize {
+          row += [Float](repeating: 0, count: config.referenceFeatureSize - row.count)
+        }
+        return Array(repeating: row, count: paddedFeatureFrames).flatMap { $0 }
+      case .temporal:
+        guard let chunk else {
+          return [Float](
+            repeating: 0, count: config.referenceTimeFrames * config.referenceMelBins)
+        }
+        return referenceTimbreFrames(chunk: chunk, config: config)
+      }
+    }
+    // Averaged mode replicates the reference per frame so the classifier sees
+    // [frames, C] logits; the temporal encoder emits one z → [1, C] logits.
+    let classTargetRows =
+      config.referenceEncoderMode == .temporal ? 1 : paddedFeatureFrames
     let referenceClassTargetTensor: Tensor? = config.referenceConditioning
       && config.numInstruments > 1
       ? Tensor([[Float]](
           repeating: [Float](repeating: 0, count: config.numInstruments),
-          count: paddedFeatureFrames))
+          count: classTargetRows))
       : nil
     let targetTensor = Tensor([Float](repeating: 0, count: frameCount))
     let loudnessTargetTensor = Tensor([[Float]](repeating: [0.0], count: paddedFeatureFrames))
@@ -474,6 +508,9 @@ enum DDSPE2ETrainer {
       let paddedF0: [Float]
       let paddedUV: [Float]
       let reference: [Float]
+      /// Reference from a different instrument than the target (nil when the
+      /// dataset has only one instrument). Used to score reference separation.
+      let referenceCrossed: [Float]?
     }
     var fixedEvalChunks = [FixedEvalChunk]()
     if useSpectralSelection, !config.fixedBatch, splitEntries.count > 1 {
@@ -513,6 +550,9 @@ enum DDSPE2ETrainer {
         }
         let refEntry = referenceEntry(for: entry, offset: UInt64(fixedEvalChunks.count))
         let refChunk = try refEntry.map { try dataset.loadChunk($0) }
+        let crossedEntry = crossedReferenceEntry(
+          for: entry, offset: UInt64(fixedEvalChunks.count))
+        let crossedChunk = try crossedEntry.map { try dataset.loadChunk($0) }
         fixedEvalChunks.append(FixedEvalChunk(
           id: entry.id,
           audio: chunk.audio,
@@ -520,7 +560,8 @@ enum DDSPE2ETrainer {
           conditioning: conditioning,
           paddedF0: paddedF0,
           paddedUV: paddedUV,
-          reference: paddedReferenceData(refChunk?.timbreFeatures)
+          reference: referenceData(from: refChunk),
+          referenceCrossed: crossedChunk.map { referenceData(from: $0) }
         ))
       }
       logger(
@@ -528,6 +569,95 @@ enum DDSPE2ETrainer {
           + fixedEvalChunks.map(\.id).joined(separator: ",")
       )
     }
+
+    // Classification-only pretraining of the temporal reference encoder.
+    // Joint training lets the synth-reconstruction gradient drown the
+    // classification gradient (z never becomes instrument-separable even
+    // though a linear probe on the raw log-mel input reaches 100%); training
+    // encoder+classifier alone first breaks that cycle. Uses its own Adam:
+    // the main optimizer's moment buffers are indexed positionally and would
+    // mis-align if its first step saw gradients on a mid-list subset.
+    if config.referencePretrainSteps > 0,
+      config.referenceConditioning,
+      config.referenceEncoderMode == .temporal,
+      config.numInstruments > 1,
+      let referenceTensor,
+      let referenceClassTargetTensor
+    {
+      logger(
+        "[pretrain] reference encoder: \(config.referencePretrainSteps) "
+          + "classification-only steps")
+      let pretrainOptimizer = Adam(
+        params: model.referencePretrainParameters, lr: config.referencePretrainLR)
+      var pretrainRng = SeededGenerator(seed: config.seed &+ 0x9E37)
+      var recentLosses = [Float]()
+      // Single-sample cross-entropy steps are too noisy to separate the
+      // latent; accumulate a small batch per optimizer step.
+      let pretrainBatch = 8
+      pretrainLoop: for pretrainStep in 0..<config.referencePretrainSteps {
+        var accumGrads: [Int: [Float]] = [:]
+        var batchLoss: Float = 0
+        for _ in 0..<pretrainBatch {
+          let entry = splitEntries[Int(pretrainRng.next() % UInt64(splitEntries.count))]
+          let chunk = try dataset.loadChunk(entry)
+          referenceTensor.updateDataLazily(referenceData(from: chunk))
+          let selected = min(max(0, entry.instrumentIndex ?? 0), config.numInstruments - 1)
+          var classData = [Float](repeating: 0, count: classTargetRows * config.numInstruments)
+          for row in 0..<classTargetRows {
+            classData[row * config.numInstruments + selected] = 1
+          }
+          referenceClassTargetTensor.updateDataLazily(classData)
+          guard let lossTensor = model.referenceClassificationLossTensor(
+            reference: referenceTensor, target: referenceClassTargetTensor)
+          else {
+            logger("[pretrain] model lacks temporal encoder or classifier; skipping")
+            break pretrainLoop
+          }
+          let lossSignal = lossTensor.peek(Signal.constant(0.0))
+          let lossValues = try lossSignal.backward(frames: 1)
+          batchLoss += lossValues.first ?? Float.nan
+          for (i, param) in model.referencePretrainParameters.enumerated() {
+            if let tensor = param as? Tensor, let gradData = tensor.grad?.getData() {
+              if accumGrads[i] == nil {
+                accumGrads[i] = gradData
+              } else {
+                for j in 0..<min(gradData.count, accumGrads[i]!.count) {
+                  accumGrads[i]![j] += gradData[j]
+                }
+              }
+            }
+          }
+        }
+        let invBatch = 1.0 / Float(pretrainBatch)
+        for (i, param) in model.referencePretrainParameters.enumerated() {
+          if let tensor = param as? Tensor, let gradTensor = tensor.grad,
+            var averaged = accumGrads[i]
+          {
+            for j in 0..<averaged.count { averaged[j] *= invBatch }
+            gradTensor.updateDataLazily(averaged)
+          }
+        }
+        _ = sanitizeAndClipGradients(
+          params: model.referencePretrainParameters,
+          clip: config.gradClip,
+          mode: config.gradClipMode,
+          gradScale: 1.0
+        )
+        pretrainOptimizer.step()
+        pretrainOptimizer.zeroGrad()
+        recentLosses.append(batchLoss * invBatch)
+        if recentLosses.count > 50 { recentLosses.removeFirst() }
+        if pretrainStep % 50 == 0 || pretrainStep == config.referencePretrainSteps - 1 {
+          let meanLoss = recentLosses.reduce(0, +) / Float(recentLosses.count)
+          logger(
+            "[pretrain] step=\(pretrainStep) classLoss(mean\(recentLosses.count))=\(format(meanLoss))")
+        }
+      }
+    }
+    if config.referenceEncoderFreeze {
+      logger("[config] temporal reference encoder frozen during synth training")
+    }
+
     var noImproveSteps = 0
     var completedSteps = 0
     let earlyStopPatience = config.earlyStopPatience
@@ -647,12 +777,12 @@ enum DDSPE2ETrainer {
         if let referenceTensor {
           let refEntry = referenceEntry(for: lastEntry, offset: rng.next())
           let refChunk = try refEntry.map { try dataset.loadChunk($0) }
-          referenceTensor.updateDataLazily(paddedReferenceData(refChunk?.timbreFeatures))
+          referenceTensor.updateDataLazily(referenceData(from: refChunk))
           if let referenceClassTargetTensor {
             let selected = min(max(0, refEntry?.instrumentIndex ?? 0), config.numInstruments - 1)
             var classData = [Float](
-              repeating: 0, count: paddedFeatureFrames * config.numInstruments)
-            for row in 0..<paddedFeatureFrames {
+              repeating: 0, count: classTargetRows * config.numInstruments)
+            for row in 0..<classTargetRows {
               classData[row * config.numInstruments + selected] = 1
             }
             referenceClassTargetTensor.updateDataLazily(classData)
@@ -741,6 +871,15 @@ enum DDSPE2ETrainer {
         let tAfterGraph = CFAbsoluteTimeGetCurrent()
 
         let lossValues = try loss.backward(frames: frameCount)
+        if config.referenceEncoderFreeze {
+          // Zero encoder grads before accumulation so joint training cannot
+          // collapse the pretrained, instrument-separable latent.
+          for tensor in model.temporalEncoderParameters {
+            if let gradTensor = tensor.grad, let count = tensor.getData()?.count {
+              gradTensor.updateDataLazily([Float](repeating: 0, count: count))
+            }
+          }
+        }
         let tAfterBackward = CFAbsoluteTimeGetCurrent()
 
         if shouldDumpControls(step: step, every: options.dumpControlsEvery), accumIdx == gradAccum - 1 {
@@ -866,34 +1005,54 @@ enum DDSPE2ETrainer {
             // step uploads its own data, so no restoration is needed.
             let evalChunks = fixedEvalChunks.isEmpty ? [] : fixedEvalChunks
             var scores = [Float]()
+            var crossedScores = [Float]()
             for evalChunk in evalChunks {
               featuresTensor.updateDataLazily(evalChunk.conditioning)
-              referenceTensor?.updateDataLazily(evalChunk.reference)
               synthTensors.updateChunkData(
                 f0Frames: evalChunk.paddedF0, uvFrames: evalChunk.paddedUV)
-              let evalControls = model.forward(
-                features: featuresTensor, reference: referenceTensor)
-              let evalPrediction = DDSPSynth.renderSignal(
-                controls: evalControls,
-                tensors: synthTensors,
-                featureFrames: evalChunk.featureFrames,
-                frameCount: frameCount,
-                numHarmonics: config.numHarmonics,
-                controlSmoothingMode: config.controlSmoothingMode,
-                noiseSettings: config.noiseFilterSettings,
-                reverbSettings: config.reverbSettings,
-                reverbIR: model.reverbIR
-              )
-              let samples = try evalPrediction.realize(frames: frameCount)
-              LazyGraphContext.current.clearComputationGraph()
-              if let score = BestCheckpointScorer.multiScaleSpectralScore(
-                prediction: samples,
-                target: reverbDelayedTarget(evalChunk.audio, config: config),
-                windowSizes: config.spectralWindowSizes,
-                hopDivisor: config.spectralHopDivisor,
-                logEpsilon: config.spectralLogEpsilon
-              ) {
-                scores.append(score)
+              // Score with the same-instrument reference and, when the dataset
+              // has more than one instrument, again with a crossed-instrument
+              // reference. Selection must reward both reconstruction AND the
+              // correct reference beating the crossed one — reconstruction-only
+              // selection can pick a checkpoint that ignores references.
+              var referenceVariants: [(data: [Float]?, crossed: Bool)] = [
+                (evalChunk.reference, false)
+              ]
+              if referenceTensor != nil, let crossed = evalChunk.referenceCrossed {
+                referenceVariants.append((crossed, true))
+              }
+              for variant in referenceVariants {
+                if let data = variant.data {
+                  referenceTensor?.updateDataLazily(data)
+                }
+                let evalControls = model.forward(
+                  features: featuresTensor, reference: referenceTensor)
+                let evalPrediction = DDSPSynth.renderSignal(
+                  controls: evalControls,
+                  tensors: synthTensors,
+                  featureFrames: evalChunk.featureFrames,
+                  frameCount: frameCount,
+                  numHarmonics: config.numHarmonics,
+                  controlSmoothingMode: config.controlSmoothingMode,
+                  noiseSettings: config.noiseFilterSettings,
+                  reverbSettings: config.reverbSettings,
+                  reverbIR: model.reverbIR
+                )
+                let samples = try evalPrediction.realize(frames: frameCount)
+                LazyGraphContext.current.clearComputationGraph()
+                if let score = BestCheckpointScorer.multiScaleSpectralScore(
+                  prediction: samples,
+                  target: reverbDelayedTarget(evalChunk.audio, config: config),
+                  windowSizes: config.spectralWindowSizes,
+                  hopDivisor: config.spectralHopDivisor,
+                  logEpsilon: config.spectralLogEpsilon
+                ) {
+                  if variant.crossed {
+                    crossedScores.append(score)
+                  } else {
+                    scores.append(score)
+                  }
+                }
               }
             }
             // fixedEvalChunks is populated for shuffled multi-chunk training.
@@ -925,11 +1084,21 @@ enum DDSPE2ETrainer {
               }
             }
             if !scores.isEmpty {
-              let score = scores.reduce(0, +) / Float(scores.count)
+              let correctMean = scores.reduce(0, +) / Float(scores.count)
+              var score = correctMean
+              if !crossedScores.isEmpty {
+                let crossedMean = crossedScores.reduce(0, +) / Float(crossedScores.count)
+                let separation = crossedMean - correctMean
+                score = correctMean - config.referenceSeparationWeight * separation
+                logger(
+                  "step=\(step) refEval correct=\(format(correctMean)) "
+                    + "crossed=\(format(crossedMean)) sep=\(format(separation)) "
+                    + "sel=\(format(score))")
+              }
               if score < bestSelectionScore {
                 bestSelectionScore = score
-              bestModelSnapshots = model.snapshots()
-              bestModelStep = step
+                bestModelSnapshots = model.snapshots()
+                bestModelStep = step
                 logger("step=\(step) bestSpectralScore=\(format(score)) (new best checkpoint)")
               }
             }

@@ -61,10 +61,27 @@ final class DDSPDecoderModel {
   private let transformerInputB: Tensor?
   private let transformerLayers: [TransformerLayerParams]
   let referenceConditioning: Bool
+  let referenceEncoderMode: ReferenceEncoderMode
   let referenceFeatureSize: Int
   let referenceLatentSize: Int
+  let referenceTimeFrames: Int
+  let referenceMelBins: Int
   private let referenceEncoderW: Tensor?
   private let referenceEncoderB: Tensor?
+  // Temporal reference encoder: per-frame MLP → attention pool → z.
+  private let temporalEncW1: Tensor?
+  private let temporalEncB1: Tensor?
+  private let temporalEncW2: Tensor?
+  private let temporalEncB2: Tensor?
+  private let temporalAttnW: Tensor?
+  private let temporalAttnB: Tensor?
+  private let temporalZW: Tensor?
+  private let temporalZB: Tensor?
+  // Direct z→control residuals so conditioning does not depend on FiLM alone.
+  private let zHarmW: Tensor?
+  private let zHGainW: Tensor?
+  private let zNoiseW: Tensor?
+  private let zFilterW: Tensor?
   private let referenceFiLMLayers: [ReferenceFiLMParams]
   private let referenceClassifierW: Tensor?
   private let referenceClassifierB: Tensor?
@@ -111,8 +128,11 @@ final class DDSPDecoderModel {
     self.enableNoiseFilter = config.enableNoiseFilter
     self.noiseFilterSize = config.noiseFilterOutputSize
     self.referenceConditioning = config.referenceConditioning
+    self.referenceEncoderMode = config.referenceEncoderMode
     self.referenceFeatureSize = config.referenceFeatureSize
     self.referenceLatentSize = config.referenceLatentSize
+    self.referenceTimeFrames = config.referenceTimeFrames
+    self.referenceMelBins = config.referenceMelBins
 
     var rng = SeededGenerator(seed: config.seed)
 
@@ -181,16 +201,71 @@ final class DDSPDecoderModel {
     self.transformerLayers = trLayers
 
     if config.referenceConditioning {
-      let encoderScale: Float = sqrt(2.0 / Float(max(1, config.referenceFeatureSize))) * 0.5
-      self.referenceEncoderW = Tensor.param(
-        [config.referenceFeatureSize, config.referenceLatentSize],
-        data: Self.randomArray(
-          count: config.referenceFeatureSize * config.referenceLatentSize,
-          scale: encoderScale,
-          rng: &rng))
-      self.referenceEncoderB = Tensor.param(
-        [1, config.referenceLatentSize],
-        data: [Float](repeating: 0, count: config.referenceLatentSize))
+      switch config.referenceEncoderMode {
+      case .averaged:
+        let encoderScale: Float = sqrt(2.0 / Float(max(1, config.referenceFeatureSize))) * 0.5
+        self.referenceEncoderW = Tensor.param(
+          [config.referenceFeatureSize, config.referenceLatentSize],
+          data: Self.randomArray(
+            count: config.referenceFeatureSize * config.referenceLatentSize,
+            scale: encoderScale,
+            rng: &rng))
+        self.referenceEncoderB = Tensor.param(
+          [1, config.referenceLatentSize],
+          data: [Float](repeating: 0, count: config.referenceLatentSize))
+        self.temporalEncW1 = nil
+        self.temporalEncB1 = nil
+        self.temporalEncW2 = nil
+        self.temporalEncB2 = nil
+        self.temporalAttnW = nil
+        self.temporalAttnB = nil
+        self.temporalZW = nil
+        self.temporalZB = nil
+        self.zHarmW = nil
+        self.zHGainW = nil
+        self.zNoiseW = nil
+        self.zFilterW = nil
+      case .temporal:
+        self.referenceEncoderW = nil
+        self.referenceEncoderB = nil
+        let mel = max(1, config.referenceMelBins)
+        let encHidden = max(1, config.referenceEncoderHidden)
+        let latent = max(1, config.referenceLatentSize)
+        let enc1Scale: Float = sqrt(2.0 / Float(mel)) * 0.5
+        let enc2Scale: Float = sqrt(2.0 / Float(encHidden)) * 0.5
+        self.temporalEncW1 = Tensor.param(
+          [mel, encHidden],
+          data: Self.randomArray(count: mel * encHidden, scale: enc1Scale, rng: &rng))
+        self.temporalEncB1 = Tensor.param(
+          [1, encHidden], data: [Float](repeating: 0, count: encHidden))
+        self.temporalEncW2 = Tensor.param(
+          [encHidden, encHidden],
+          data: Self.randomArray(count: encHidden * encHidden, scale: enc2Scale, rng: &rng))
+        self.temporalEncB2 = Tensor.param(
+          [1, encHidden], data: [Float](repeating: 0, count: encHidden))
+        self.temporalAttnW = Tensor.param(
+          [encHidden, 1], data: Self.randomArray(count: encHidden, scale: 0.2, rng: &rng))
+        self.temporalAttnB = Tensor.param([1, 1], data: [0.0])
+        self.temporalZW = Tensor.param(
+          [encHidden, latent],
+          data: Self.randomArray(count: encHidden * latent, scale: enc2Scale, rng: &rng))
+        self.temporalZB = Tensor.param(
+          [1, latent], data: [Float](repeating: 0, count: latent))
+        self.zHarmW = Tensor.param(
+          [latent, config.numHarmonics],
+          data: Self.randomArray(count: latent * config.numHarmonics, scale: 0.1, rng: &rng))
+        self.zHGainW = Tensor.param(
+          [latent, 1], data: Self.randomArray(count: latent, scale: 0.1, rng: &rng))
+        self.zNoiseW = Tensor.param(
+          [latent, 1], data: Self.randomArray(count: latent, scale: 0.1, rng: &rng))
+        if config.enableNoiseFilter {
+          let K = config.noiseFilterOutputSize
+          self.zFilterW = Tensor.param(
+            [latent, K], data: Self.randomArray(count: latent * K, scale: 0.1, rng: &rng))
+        } else {
+          self.zFilterW = nil
+        }
+      }
       var film = [ReferenceFiLMParams]()
       for _ in 0..<numLayers {
         film.append(ReferenceFiLMParams(
@@ -222,6 +297,18 @@ final class DDSPDecoderModel {
     } else {
       self.referenceEncoderW = nil
       self.referenceEncoderB = nil
+      self.temporalEncW1 = nil
+      self.temporalEncB1 = nil
+      self.temporalEncW2 = nil
+      self.temporalEncB2 = nil
+      self.temporalAttnW = nil
+      self.temporalAttnB = nil
+      self.temporalZW = nil
+      self.temporalZB = nil
+      self.zHarmW = nil
+      self.zHGainW = nil
+      self.zNoiseW = nil
+      self.zFilterW = nil
       self.referenceFiLMLayers = []
       self.referenceClassifierW = nil
       self.referenceClassifierB = nil
@@ -291,8 +378,21 @@ final class DDSPDecoderModel {
         ])
       }
     }
-    if let w = referenceEncoderW, let b = referenceEncoderB {
-      params.append(contentsOf: [w, b])
+    if referenceConditioning {
+      if let w = referenceEncoderW, let b = referenceEncoderB {
+        params.append(contentsOf: [w, b])
+      }
+      if let w1 = temporalEncW1, let b1 = temporalEncB1,
+        let w2 = temporalEncW2, let b2 = temporalEncB2,
+        let wa = temporalAttnW, let ba = temporalAttnB,
+        let wz = temporalZW, let bz = temporalZB
+      {
+        params.append(contentsOf: [w1, b1, w2, b2, wa, ba, wz, bz])
+        if let zh = zHarmW { params.append(zh) }
+        if let zg = zHGainW { params.append(zg) }
+        if let zn = zNoiseW { params.append(zn) }
+        if let zf = zFilterW { params.append(zf) }
+      }
       for film in referenceFiLMLayers {
         params.append(contentsOf: [film.W_gamma, film.b_gamma, film.W_beta, film.b_beta])
       }
@@ -317,12 +417,15 @@ final class DDSPDecoderModel {
     featureFrames: Int? = nil
   ) -> DecoderControls {
     let referenceLatent: Tensor?
-    if referenceConditioning,
-      let reference,
-      let w = referenceEncoderW,
-      let b = referenceEncoderB
-    {
-      referenceLatent = tanh((reference * 4.0).matmul(w) + b)
+    if referenceConditioning, let reference {
+      if let w = referenceEncoderW, let b = referenceEncoderB {
+        referenceLatent = tanh((reference * 4.0).matmul(w) + b)
+      } else if let z = encodeReferenceLatent(reference) {
+        // One z [1, latent] per reference; use sites broadcast it per frame.
+        referenceLatent = z
+      } else {
+        referenceLatent = nil
+      }
     } else {
       referenceLatent = nil
     }
@@ -344,8 +447,12 @@ final class DDSPDecoderModel {
     // - normalized: softplus amplitudes normalized per frame + softplus gain
     // - softmax-db: softmax amplitudes + bounded dB gain mapped back to linear
     // - exp-sigmoid: DDSP-like positive controls; synth path handles Nyquist-aware renorm
-    let harmLogits = hidden.matmul(W_harm) + b_harm
-    let hGainLogits = hidden.matmul(W_hgain) + b_hgain
+    var harmLogits = hidden.matmul(W_harm) + b_harm
+    var hGainLogits = hidden.matmul(W_hgain) + b_hgain
+    if let latent = referenceLatent {
+      if let zh = zHarmW { harmLogits = harmLogits + latent.matmul(zh) }
+      if let zg = zHGainW { hGainLogits = hGainLogits + latent.matmul(zg) }
+    }
     let harmonicAmps: Tensor
     let harmonicGain: Tensor
     switch harmonicHeadMode {
@@ -379,13 +486,19 @@ final class DDSPDecoderModel {
     }
 
     // broadband noise gain [F,1]
-    let nGainLogits = hidden.matmul(W_noise) + b_noise
+    var nGainLogits = hidden.matmul(W_noise) + b_noise
+    if let latent = referenceLatent, let zn = zNoiseW {
+      nGainLogits = nGainLogits + latent.matmul(zn)
+    }
     let noiseGain = harmonicHeadMode == .expSigmoid ? Self.expSigmoid(nGainLogits) : sigmoid(nGainLogits)
 
     // learned FIR filter taps [F,K] — sigmoid keeps taps positive in (0,1)
     var noiseFilter: Tensor? = nil
     if enableNoiseFilter, let wf = W_filter, let bf = b_filter {
-      let filterLogits = hidden.matmul(wf) + bf
+      var filterLogits = hidden.matmul(wf) + bf
+      if let latent = referenceLatent, let zf = zFilterW {
+        filterLogits = filterLogits + latent.matmul(zf)
+      }
       noiseFilter = sigmoid(filterLogits)
     }
 
@@ -406,6 +519,52 @@ final class DDSPDecoderModel {
       harmonicHeadMode: harmonicHeadMode,
       referenceClassLogits: referenceClassLogits
     )
+  }
+
+  /// Temporal encoder weights, for freezing during synth training.
+  var temporalEncoderParameters: [Tensor] {
+    [temporalEncW1, temporalEncB1, temporalEncW2, temporalEncB2,
+     temporalAttnW, temporalAttnB, temporalZW, temporalZB].compactMap { $0 }
+  }
+
+  /// Params updated by classification-only reference pretraining: the
+  /// temporal encoder plus the auxiliary instrument classifier.
+  var referencePretrainParameters: [any LazyValue] {
+    var params: [any LazyValue] = temporalEncoderParameters
+    if let cw = referenceClassifierW, let cb = referenceClassifierB {
+      params.append(contentsOf: [cw, cb])
+    }
+    return params
+  }
+
+  /// Cross-entropy of the auxiliary classifier on one reference, shape [1].
+  /// Used by classification-only pretraining; nil unless the model has both
+  /// the temporal encoder and the classifier.
+  func referenceClassificationLossTensor(reference: Tensor, target: Tensor) -> Tensor? {
+    guard let z = encodeReferenceLatent(reference),
+      let cw = referenceClassifierW, let cb = referenceClassifierB
+    else { return nil }
+    let logits = z.matmul(cw) + cb
+    let probabilities = logits.softmax(axis: 1)
+    return -(target * (probabilities + 1e-6).log()).sum(axis: 1)
+  }
+
+  /// Temporal reference encoder: [T, melBins] log-mel frames → z [1, latent].
+  /// Per-frame MLP, learned attention pooling over time, tanh-bounded latent.
+  /// Returns nil unless the model was built with the temporal encoder mode.
+  func encodeReferenceLatent(_ reference: Tensor) -> Tensor? {
+    guard let w1 = temporalEncW1, let b1 = temporalEncB1,
+      let w2 = temporalEncW2, let b2 = temporalEncB2,
+      let wa = temporalAttnW, let ba = temporalAttnB,
+      let wz = temporalZW, let bz = temporalZB
+    else { return nil }
+    let frames = reference.shape[0]
+    var h = tanh(reference.matmul(w1) + b1)
+    h = tanh(h.matmul(w2) + b2)
+    let scores = (h.matmul(wa) + ba).reshape([1, frames])
+    let weights = scores.softmax(axis: 1)
+    let pooled = weights.matmul(h)
+    return tanh(pooled.matmul(wz) + bz)
   }
 
   func snapshots() -> [NamedTensorSnapshot] {
@@ -440,8 +599,26 @@ final class DDSPDecoderModel {
         ])
       }
     }
-    if let w = referenceEncoderW, let b = referenceEncoderB {
-      snaps.append(contentsOf: [snapshot("ref_encoder_W", w), snapshot("ref_encoder_b", b)])
+    if referenceConditioning {
+      if let w = referenceEncoderW, let b = referenceEncoderB {
+        snaps.append(contentsOf: [snapshot("ref_encoder_W", w), snapshot("ref_encoder_b", b)])
+      }
+      if let w1 = temporalEncW1, let b1 = temporalEncB1,
+        let w2 = temporalEncW2, let b2 = temporalEncB2,
+        let wa = temporalAttnW, let ba = temporalAttnB,
+        let wz = temporalZW, let bz = temporalZB
+      {
+        snaps.append(contentsOf: [
+          snapshot("ref_tenc_W1", w1), snapshot("ref_tenc_b1", b1),
+          snapshot("ref_tenc_W2", w2), snapshot("ref_tenc_b2", b2),
+          snapshot("ref_tenc_Wattn", wa), snapshot("ref_tenc_battn", ba),
+          snapshot("ref_tenc_Wz", wz), snapshot("ref_tenc_bz", bz),
+        ])
+        if let zh = zHarmW { snaps.append(snapshot("ref_zharm_W", zh)) }
+        if let zg = zHGainW { snaps.append(snapshot("ref_zhgain_W", zg)) }
+        if let zn = zNoiseW { snaps.append(snapshot("ref_znoise_W", zn)) }
+        if let zf = zFilterW { snaps.append(snapshot("ref_zfilter_W", zf)) }
+      }
       for (i, film) in referenceFiLMLayers.enumerated() {
         let prefix = "ref_film_l\(i+1)"
         snaps.append(contentsOf: [
@@ -500,9 +677,29 @@ final class DDSPDecoderModel {
         loadTensor(layer.ln2Beta, from: byName["\(prefix)_ln2_b"])
       }
     }
-    if let w = referenceEncoderW, let b = referenceEncoderB {
-      loadTensor(w, from: byName["ref_encoder_W"])
-      loadTensor(b, from: byName["ref_encoder_b"])
+    if referenceConditioning {
+      if let w = referenceEncoderW, let b = referenceEncoderB {
+        loadTensor(w, from: byName["ref_encoder_W"])
+        loadTensor(b, from: byName["ref_encoder_b"])
+      }
+      if let w1 = temporalEncW1, let b1 = temporalEncB1,
+        let w2 = temporalEncW2, let b2 = temporalEncB2,
+        let wa = temporalAttnW, let ba = temporalAttnB,
+        let wz = temporalZW, let bz = temporalZB
+      {
+        loadTensor(w1, from: byName["ref_tenc_W1"])
+        loadTensor(b1, from: byName["ref_tenc_b1"])
+        loadTensor(w2, from: byName["ref_tenc_W2"])
+        loadTensor(b2, from: byName["ref_tenc_b2"])
+        loadTensor(wa, from: byName["ref_tenc_Wattn"])
+        loadTensor(ba, from: byName["ref_tenc_battn"])
+        loadTensor(wz, from: byName["ref_tenc_Wz"])
+        loadTensor(bz, from: byName["ref_tenc_bz"])
+        if let zh = zHarmW { loadTensor(zh, from: byName["ref_zharm_W"]) }
+        if let zg = zHGainW { loadTensor(zg, from: byName["ref_zhgain_W"]) }
+        if let zn = zNoiseW { loadTensor(zn, from: byName["ref_znoise_W"]) }
+        if let zf = zFilterW { loadTensor(zf, from: byName["ref_zfilter_W"]) }
+      }
       for (i, film) in referenceFiLMLayers.enumerated() {
         let prefix = "ref_film_l\(i+1)"
         loadTensor(film.W_gamma, from: byName["\(prefix)_Wg"])
@@ -569,8 +766,15 @@ final class DDSPDecoderModel {
   private func applyReferenceFiLM(_ hidden: Tensor, latent: Tensor?, layer: Int) -> Tensor {
     guard let latent, layer < referenceFiLMLayers.count else { return hidden }
     let film = referenceFiLMLayers[layer]
-    let gamma = tanh(latent.matmul(film.W_gamma) + film.b_gamma) * 0.5
-    let beta = tanh(latent.matmul(film.W_beta) + film.b_beta)
+    var gamma = tanh(latent.matmul(film.W_gamma) + film.b_gamma) * 0.5
+    var beta = tanh(latent.matmul(film.W_beta) + film.b_beta)
+    // A temporal-encoder latent is [1, latent]; expand its FiLM rows to every
+    // hidden frame for the elementwise modulation below.
+    let rows = hidden.shape[0]
+    if gamma.shape[0] != rows {
+      gamma = gamma.expand([rows, hiddenSize])
+      beta = beta.expand([rows, hiddenSize])
+    }
     return hidden * (1.0 + gamma) + beta
   }
 

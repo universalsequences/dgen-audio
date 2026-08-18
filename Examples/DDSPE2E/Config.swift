@@ -43,6 +43,15 @@ enum ReverbMode: String, Codable {
   case learned
 }
 
+/// How the reference audio is summarized for the timbre encoder.
+/// `averaged`: one time-averaged MFCC-style vector (the first R8 attempt).
+/// `temporal`: multiple log-mel frames through a learned attention-pooled
+/// encoder, preserving attack/noise/spectral-envelope dynamics.
+enum ReferenceEncoderMode: String, Codable {
+  case averaged
+  case temporal
+}
+
 enum SpectralLossModeOption: String, Codable {
   case l2
   case l1
@@ -96,6 +105,27 @@ struct DDSPE2EConfig: Codable {
   var referenceFeatureSize: Int = 16
   var referenceLatentSize: Int = 16
   var referenceClassificationWeight: Float = 0.1
+  var referenceEncoderMode: ReferenceEncoderMode = .averaged
+  /// Temporal-mode reference representation: referenceTimeFrames log-mel
+  /// frames × referenceMelBins bins, not averaged across time.
+  var referenceTimeFrames: Int = 16
+  var referenceMelBins: Int = 48
+  var referenceEncoderHidden: Int = 64
+  /// Checkpoint selection: weight on the crossed-minus-correct reference
+  /// score margin. 0 reproduces reconstruction-only selection.
+  var referenceSeparationWeight: Float = 1.0
+  /// Classification-only steps that train the temporal encoder + classifier
+  /// before synth training. Joint training lets the reconstruction gradient
+  /// drown the classification gradient (z never separates even though a
+  /// linear probe on the raw log-mel input reaches 100%); pretraining breaks
+  /// that cycle.
+  var referencePretrainSteps: Int = 0
+  /// Learning rate for classification-only pretraining (the synth LR is far
+  /// too small for a plain cross-entropy objective).
+  var referencePretrainLR: Float = 1e-3
+  /// Freeze the temporal encoder during synth training so joint training
+  /// cannot collapse a pretrained, instrument-separable z.
+  var referenceEncoderFreeze: Bool = false
   var modelHiddenSize: Int = 32
   var modelNumLayers: Int = 1
   var decoderBackbone: DecoderBackbone = .transformer
@@ -218,6 +248,14 @@ struct DDSPE2EConfig: Codable {
     case referenceFeatureSize
     case referenceLatentSize
     case referenceClassificationWeight
+    case referenceEncoderMode
+    case referenceTimeFrames
+    case referenceMelBins
+    case referenceEncoderHidden
+    case referenceSeparationWeight
+    case referencePretrainSteps
+    case referencePretrainLR
+    case referenceEncoderFreeze
     case modelHiddenSize
     case modelNumLayers
     case decoderBackbone
@@ -326,6 +364,24 @@ struct DDSPE2EConfig: Codable {
     referenceClassificationWeight =
       try c.decodeIfPresent(Float.self, forKey: .referenceClassificationWeight)
       ?? d.referenceClassificationWeight
+    referenceEncoderMode =
+      try c.decodeIfPresent(ReferenceEncoderMode.self, forKey: .referenceEncoderMode)
+      ?? d.referenceEncoderMode
+    referenceTimeFrames =
+      try c.decodeIfPresent(Int.self, forKey: .referenceTimeFrames) ?? d.referenceTimeFrames
+    referenceMelBins =
+      try c.decodeIfPresent(Int.self, forKey: .referenceMelBins) ?? d.referenceMelBins
+    referenceEncoderHidden =
+      try c.decodeIfPresent(Int.self, forKey: .referenceEncoderHidden) ?? d.referenceEncoderHidden
+    referenceSeparationWeight =
+      try c.decodeIfPresent(Float.self, forKey: .referenceSeparationWeight)
+      ?? d.referenceSeparationWeight
+    referencePretrainSteps =
+      try c.decodeIfPresent(Int.self, forKey: .referencePretrainSteps) ?? d.referencePretrainSteps
+    referencePretrainLR =
+      try c.decodeIfPresent(Float.self, forKey: .referencePretrainLR) ?? d.referencePretrainLR
+    referenceEncoderFreeze =
+      try c.decodeIfPresent(Bool.self, forKey: .referenceEncoderFreeze) ?? d.referenceEncoderFreeze
     modelHiddenSize = try c.decodeIfPresent(Int.self, forKey: .modelHiddenSize) ?? d.modelHiddenSize
     modelNumLayers = try c.decodeIfPresent(Int.self, forKey: .modelNumLayers) ?? d.modelNumLayers
     decoderBackbone = try c.decodeIfPresent(DecoderBackbone.self, forKey: .decoderBackbone)
@@ -476,6 +532,34 @@ struct DDSPE2EConfig: Codable {
     if let value = options["reference-classification-weight"] {
       referenceClassificationWeight = try parseFloat(
         value, key: "reference-classification-weight")
+    }
+    if let value = options["reference-encoder"] {
+      guard let mode = ReferenceEncoderMode(rawValue: value.lowercased()) else {
+        throw ConfigError.invalid(
+          "Invalid reference encoder for --reference-encoder: \(value) (expected averaged|temporal)")
+      }
+      referenceEncoderMode = mode
+    }
+    if let value = options["reference-time-frames"] {
+      referenceTimeFrames = try parseInt(value, key: "reference-time-frames")
+    }
+    if let value = options["reference-mel-bins"] {
+      referenceMelBins = try parseInt(value, key: "reference-mel-bins")
+    }
+    if let value = options["reference-encoder-hidden"] {
+      referenceEncoderHidden = try parseInt(value, key: "reference-encoder-hidden")
+    }
+    if let value = options["reference-separation-weight"] {
+      referenceSeparationWeight = try parseFloat(value, key: "reference-separation-weight")
+    }
+    if let value = options["reference-pretrain-steps"] {
+      referencePretrainSteps = try parseInt(value, key: "reference-pretrain-steps")
+    }
+    if let value = options["reference-pretrain-lr"] {
+      referencePretrainLR = try parseFloat(value, key: "reference-pretrain-lr")
+    }
+    if let value = options["reference-encoder-freeze"] {
+      referenceEncoderFreeze = parseBool(value)
     }
     if let value = options["model-hidden"] {
       modelHiddenSize = try parseInt(value, key: "model-hidden")
@@ -784,6 +868,24 @@ struct DDSPE2EConfig: Codable {
     }
     guard referenceClassificationWeight >= 0 else {
       throw ConfigError.invalid("referenceClassificationWeight must be >= 0")
+    }
+    guard referenceTimeFrames > 0 else {
+      throw ConfigError.invalid("referenceTimeFrames must be > 0")
+    }
+    guard referenceMelBins > 0 else {
+      throw ConfigError.invalid("referenceMelBins must be > 0")
+    }
+    guard referenceEncoderHidden > 0 else {
+      throw ConfigError.invalid("referenceEncoderHidden must be > 0")
+    }
+    guard referenceSeparationWeight >= 0 else {
+      throw ConfigError.invalid("referenceSeparationWeight must be >= 0")
+    }
+    guard referencePretrainSteps >= 0 else {
+      throw ConfigError.invalid("referencePretrainSteps must be >= 0")
+    }
+    guard referencePretrainLR > 0 else {
+      throw ConfigError.invalid("referencePretrainLR must be > 0")
     }
     guard modelHiddenSize > 0 else {
       throw ConfigError.invalid("modelHiddenSize must be > 0")

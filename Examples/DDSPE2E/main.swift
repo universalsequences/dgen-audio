@@ -38,6 +38,10 @@ struct DDSPE2EMain {
       try handleProbeSmoothing(options)
     case "render-checkpoint-batch":
       try handleRenderCheckpointBatch(options)
+    case "render-reference-triplets":
+      try DDSPE2EBatchRenderer.runReferenceTriplets(options: options, logger: log)
+    case "debug-reference-z":
+      try DDSPE2EBatchRenderer.runReferenceZDebug(options: options, logger: log)
     case "transfer":
       try handleTransfer(options)
     default:
@@ -666,6 +670,7 @@ struct DDSPE2EMain {
       train --cache <cache-dir> [--runs-dir <dir>] [--run-name <name>] [--steps N] [--split train|val] [--mode dry|m2] [--config <json>] [overrides]
       probe-smoothing --cache <cache-dir> [--split train|val] [--index N] [--output <dir>] [--config <json>] [--init-checkpoint <path>] [overrides]
       render-checkpoint-batch --cache <cache-dir> --init-checkpoint <path> [--split train|val] [--batch-size N] [--output <dir>] [--config <json>] [overrides]
+      render-reference-triplets --cache <cache-dir> --init-checkpoint <path> [--split train|val] [--count N] [--output <dir>] [--config <json>] [overrides]
       transfer --input <voice.wav> --init-checkpoint <path> [--transpose 12] [--loudness-offset-db 0] [--output <dir>] [--config <json>]
 
     Common overrides:

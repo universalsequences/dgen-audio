@@ -44,6 +44,34 @@ struct CachedChunk: Codable {
   /// Pitch-reduced audio descriptor for reference-conditioned timbre encoding.
   /// Optional so caches created before R8 remain readable.
   var timbreFeatures: [Float]?
+  /// Time-varying log-mel reference frames, row-major
+  /// [timbreFrameCount, timbreMelBins]. Optional so older caches remain
+  /// readable; loaders fall back to computing frames from `audio`.
+  var timbreFrames: [Float]?
+  var timbreFrameCount: Int?
+  var timbreMelBins: Int?
+}
+
+/// Returns [config.referenceTimeFrames × config.referenceMelBins] log-mel
+/// frames for a reference chunk, preferring cached frames with matching
+/// dimensions and computing them from the chunk audio otherwise (which keeps
+/// pre-temporal caches usable without re-preprocessing).
+func referenceTimbreFrames(chunk: CachedChunk, config: DDSPE2EConfig) -> [Float] {
+  if let frames = chunk.timbreFrames,
+    chunk.timbreFrameCount == config.referenceTimeFrames,
+    chunk.timbreMelBins == config.referenceMelBins,
+    frames.count == config.referenceTimeFrames * config.referenceMelBins
+  {
+    return frames
+  }
+  return FeatureExtractor.timbreLogMelFrames(
+    samples: chunk.audio,
+    sampleRate: chunk.sampleRate,
+    frameSize: config.frameSize,
+    frameHop: config.frameHop,
+    timeFrames: config.referenceTimeFrames,
+    melBins: config.referenceMelBins
+  )
 }
 
 enum DatasetError: Error, CustomStringConvertible {
@@ -167,6 +195,15 @@ enum DatasetPreprocessor {
           count: config.referenceFeatureSize
         )
 
+        let timbreFrames = FeatureExtractor.timbreLogMelFrames(
+          samples: chunk,
+          sampleRate: config.sampleRate,
+          frameSize: config.frameSize,
+          frameHop: config.frameHop,
+          timeFrames: config.referenceTimeFrames,
+          melBins: config.referenceMelBins
+        )
+
         let id = String(format: "chunk_%08d", chunkIndex)
         let chunkFileName = "\(id).json"
         let chunkFileURL = chunksDir.appendingPathComponent(chunkFileName)
@@ -183,7 +220,10 @@ enum DatasetPreprocessor {
           f0Hz: features.f0Hz,
           loudnessDB: features.loudnessDB,
           uvMask: features.uvMask,
-          timbreFeatures: timbreFeatures
+          timbreFeatures: timbreFeatures,
+          timbreFrames: timbreFrames,
+          timbreFrameCount: config.referenceTimeFrames,
+          timbreMelBins: config.referenceMelBins
         )
 
         try writeJSON(chunkRecord, to: chunkFileURL)
