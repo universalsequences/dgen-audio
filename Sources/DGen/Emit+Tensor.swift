@@ -233,6 +233,17 @@ extension LazyOp {
         if let s = inputs.first { b.use(val: b.value(s)) }
         return
       }
+
+      // Fused `(sum (* a b))`: read both operands directly in one reduction
+      // loop — the materialized product and its second accumulation pass
+      // disappear. Approved by SumOfMulFusionPass (C backend, same-shape
+      // operands, matching hop gating, cross-block-safe operand reads).
+      if let plan = ctx.fusedSumOfMulPlans[nodeId] {
+        emitFusedSumOfMul(
+          b: b, ctx: ctx, aTensor: plan.aTensor, bTensor: plan.bTensor, shape: plan.shape)
+        return
+      }
+
       let acc = b.float(0.0)
       b.loop(shape.reduce(1, *)) { i in
         let val = b.tensorRead(inTensor, flatIdx: i, shape: shape)
@@ -951,4 +962,98 @@ extension LazyOp {
     default: break
     }
   }
+}
+
+// MARK: - Fused sum-of-mul reduction
+
+/// A tensor that is exactly a circular sliding-window view over a 1D ring
+/// buffer: flat element `j` reads `ring[(pos - count + 1 + j) mod bufSize]`.
+private struct CircularWindowAccess {
+  let cellId: CellID
+  let bufSize: Int
+  let posLazy: Lazy
+}
+
+/// Matches the circular-window shape emitFusedSumOfMul can span-split:
+/// the first transform is a circular-mode `slidingWindow` covering all `count`
+/// elements (every non-window dimension is 1), any remaining transforms are
+/// pure reshapes, and the base ring cell is persistent (not frame-aware).
+private func matchCircularWindow(
+  _ tensor: Tensor, count: Int, ctx: IRContext
+) -> CircularWindowAccess? {
+  guard count > 0,
+    case .slidingWindow(let windowSize, let inputShape, let positionNode)? =
+      tensor.transforms.first,
+    let posNode = positionNode,
+    windowSize == count,
+    tensor.shape.reduce(1, *) == count
+  else { return nil }
+  for transform in tensor.transforms.dropFirst() {
+    guard case .reshape = transform else { return nil }
+  }
+  let bufSize = inputShape.last ?? 0
+  guard bufSize >= windowSize, inputShape.reduce(1, *) == bufSize else { return nil }
+  guard !ctx.frameAwareTensorCells.contains(tensor.cellId) else { return nil }
+  guard tensor.offset == 0 else { return nil }
+  guard let posLazy = ctx.values[posNode] else { return nil }
+  return CircularWindowAccess(cellId: tensor.cellId, bufSize: bufSize, posLazy: posLazy)
+}
+
+private func hasSlidingWindowTransform(_ tensor: Tensor) -> Bool {
+  tensor.transforms.contains {
+    if case .slidingWindow = $0 { return true }
+    return false
+  }
+}
+
+/// Fused `(sum (* a b))`: one reduction loop reading both operands directly.
+/// When one operand is a circular sliding-window view, the window start is
+/// hoisted out of the loop and the reduction splits into two contiguous spans,
+/// eliminating the per-element ring modulo — both spans stay affine so clang's
+/// -O3/-ffast-math auto-vectorization applies.
+private func emitFusedSumOfMul(
+  b: IRBuilder, ctx: IRContext, aTensor: Tensor, bTensor: Tensor, shape: [Int]
+) {
+  let count = shape.reduce(1, *)
+  let acc = b.float(0.0)
+
+  let ringA = matchCircularWindow(aTensor, count: count, ctx: ctx)
+  let ring = ringA ?? matchCircularWindow(bTensor, count: count, ctx: ctx)
+  let other = ringA != nil ? bTensor : aTensor
+
+  if let ring, !hasSlidingWindowTransform(other) {
+    // Window element j reads ring[(pos - count + 1 + j) mod bufSize]. With
+    // pos ∈ [0, bufSize) and count ≤ bufSize, (pos - count + 1 + bufSize) ≥ 1,
+    // so one added bufSize makes the start modulo non-negative.
+    let pos = b.cast(b.value(ring.posLazy), to: .int)
+    let w = b.intConstant(count)
+    let size = b.intConstant(ring.bufSize)
+    let start = (pos - w + b.intConstant(1) + size) % size
+    let tail = size - start
+    let span1 = b.gswitch(tail < w, tail, w)  // min(tail, count): span until wrap
+    b.loop(count: span1) { j in
+      let rv = b.memoryRead(ring.cellId, start + j)
+      let ov = b.tensorRead(other, flatIdx: j, shape: shape)
+      acc.accumulate(rv * ov)
+    }
+    let span2 = w - span1
+    b.loop(count: span2) { j in
+      let rv = b.memoryRead(ring.cellId, j)
+      let ov = b.tensorRead(other, flatIdx: span1 + j, shape: shape)
+      acc.accumulate(rv * ov)
+    }
+    // Publish through an identity so the node's (possibly cross-block global)
+    // value variable is written once after the loops — accumulating directly
+    // into a global array element would alias `memory` and block clang from
+    // keeping the reduction in a register / vectorizing it.
+    b.use(val: acc.value + b.constant(0.0))
+    return
+  }
+
+  b.loop(count) { j in
+    let av = b.tensorRead(aTensor, flatIdx: j, shape: shape)
+    let bv = b.tensorRead(bTensor, flatIdx: j, shape: shape)
+    acc.accumulate(av * bv)
+  }
+  b.use(val: acc.value + b.constant(0.0))
 }

@@ -61,6 +61,44 @@ extension TensorMemoryMaterializationPass {
       let lazyCellId = tensor.cellId
       let nodeId = liveness.cellToNode[lazyCellId]
 
+      // Latch output aliasing (C backend): a tensor latch already maintains a
+      // persistent per-element state cell that holds exactly the value every
+      // consumer wants — fresh on capture frames, held otherwise. When all
+      // consumers live in the producing block (not outbound), point the output
+      // tensor at the state cell instead of allocating a frame-major copy that
+      // emission would rewrite every frame (4MB/block for a [2048] latch).
+      // Cross-block consumers replay frames from their own loop and need the
+      // per-frame copy, as do gradient tapes and hop-sliced (scatter) latches.
+      if let nodeId,
+        let node = graph.nodes[nodeId],
+        case .latch(let stateCell) = node.op,
+        backend == .c,
+        graph.lastForwardNodeId == nil,
+        tensor.transforms.isEmpty,
+        !graph.materializeNodes.contains(nodeId),
+        !liveness.outboundCells.contains(lazyCellId),
+        hopBasedNodes[nodeId] == nil,
+        node.inputs.count == 2,
+        isScalarShaped(graph.nodes[node.inputs[1]]),
+        (graph.cellAllocationSizes[stateCell] ?? 1) == tensorSize
+      {
+        graph.lazyCells.remove(lazyCellId)
+        lazyToReal[lazyCellId] = stateCell
+        graph.tensors[tensorId] = Tensor(
+          id: tensor.id,
+          shape: tensor.shape,
+          cellId: stateCell,
+          data: tensor.data,
+          baseShape: tensor.baseShape,
+          baseStrides: tensor.baseStrides,
+          transforms: tensor.transforms,
+          isLazy: false,
+          materialize: tensor.materialize
+        )
+        graph.cellToTensor[stateCell] = tensorId
+        continue
+      }
+
       let decision = decideTensorAllocation(
         graph: graph,
         lazyCellId: lazyCellId,
@@ -120,6 +158,13 @@ extension TensorMemoryMaterializationPass {
     }
 
     patchViewCellIds(graph: graph, lazyToReal: lazyToReal)
+  }
+
+  /// True when a node exists and is scalar-shaped (missing shape counts as scalar).
+  private static func isScalarShaped(_ node: Node?) -> Bool {
+    guard let node else { return false }
+    if case .tensor = node.shape ?? .scalar { return false }
+    return true
   }
 
   /// Computes liveness facts used by allocation decisioning.

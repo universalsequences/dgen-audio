@@ -35,7 +35,10 @@ private func emitRegion(
   let activeTensorNodes =
     region.isSkipped
     ? []
-    : region.tensorNodes.filter { !ctx.skippedTensorComputeNodes.contains($0) }
+    : region.tensorNodes.filter {
+      !ctx.skippedTensorComputeNodes.contains($0)
+        && !ctx.crossBlockSkippedTensorNodes.contains($0)
+    }
 
   if !activeTensorNodes.isEmpty {
     // When parallelElemIdx is provided, each thread handles one element — no loop needed.
@@ -57,6 +60,22 @@ private func emitRegion(
       ctx.frameAwareTensorFrameIndex = nil
       defer {
         ctx.frameAwareTensorFrameIndex = savedFrame
+      }
+
+      // Capture-frame gating: when the region's only compute node is a tensor
+      // latch whose output tensor aliases its persistent state cell (consumers
+      // read the cell directly — see TensorMemoryMaterializationPass), the
+      // whole element loop runs only on frames where the scalar cond fires.
+      // Between captures the cell simply holds, which is exactly the latch
+      // semantics the per-element gswitch implemented every frame.
+      let gatedLatch = gatableAliasedLatch(
+        region: region, activeTensorNodes: activeTensorNodes, ctx: ctx, g: g)
+      if let (latchNodeId, condLazy) = gatedLatch {
+        ctx.gatedLatchNodes.insert(latchNodeId)
+        let gate = IRBuilder(ctx: ctx, nodeId: latchNodeId)
+        let cond = gate.value(condLazy) > gate.constant(0.0)
+        gate.ops.append(UOp(op: .beginIf(cond.lazy), value: ctx.useVariable(src: nil)))
+        uops.append(contentsOf: gate.ops)
       }
 
       if !region.isConvOnly {
@@ -82,6 +101,11 @@ private func emitRegion(
         let endLoop = UOp(op: .endLoop, value: .empty)
         uops.append(endLoop)
       }
+
+      if let (latchNodeId, _) = gatedLatch {
+        uops.append(UOp(op: .endIf, value: ctx.useVariable(src: nil)))
+        ctx.gatedLatchNodes.remove(latchNodeId)
+      }
     }
   }
 
@@ -91,6 +115,27 @@ private func emitRegion(
 
   ctx.clearTensorRegisters()
   return uops
+}
+
+/// Returns the (latch node, scalar cond Lazy) when a region's element loop can be
+/// gated to capture frames: the region is a plain element loop whose only
+/// non-view compute node is a tensor latch aliased to its state cell, with a
+/// scalar cond whose value is already available. The aliasing guarantees no
+/// per-frame output copy exists that a downstream frame would read back.
+private func gatableAliasedLatch(
+  region: EmissionRegion, activeTensorNodes: [NodeID], ctx: IRContext, g: Graph
+) -> (NodeID, Lazy)? {
+  guard !region.isConvOnly else { return nil }
+  let computeNodes = activeTensorNodes.filter { !(g.nodes[$0]?.op.isViewOnly ?? false) }
+  guard computeNodes.count == 1,
+    let latchNodeId = computeNodes.first,
+    let latchNode = g.nodes[latchNodeId],
+    case .latch(let stateCell) = latchNode.op,
+    latchNode.inputs.count == 2,
+    g.nodeToTensor[latchNodeId].flatMap({ g.tensors[$0] })?.cellId == stateCell,
+    let condLazy = ctx.values[latchNode.inputs[1]]
+  else { return nil }
+  return (latchNodeId, condLazy)
 }
 
 /// Emit UOps for a scalar block with shape transitions (e.g., conv2d in feedback loop).

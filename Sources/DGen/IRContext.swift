@@ -74,6 +74,27 @@ public class IRContext {
   /// into downstream reductions.
   public var skippedTensorComputeNodes: Set<NodeID> = []
 
+  /// Cross-block fused `(sum (* a b))` plans, keyed by the `sum` node.
+  /// Populated by SumOfMulFusionPass after tensor materialization; `.sum`
+  /// emission reads both operands directly in one reduction loop instead of
+  /// reading the materialized product.
+  public struct FusedSumOfMulPlan {
+    public let aTensor: Tensor
+    public let bTensor: Tensor
+    public let shape: [Int]
+  }
+  public var fusedSumOfMulPlans: [NodeID: FusedSumOfMulPlan] = [:]
+
+  /// Tensor compute nodes skipped for the whole compilation (not per block):
+  /// producers whose every consumer is a fused `sum` that reads the operands
+  /// inline. Checked alongside `skippedTensorComputeNodes` during emission.
+  public var crossBlockSkippedTensorNodes: Set<NodeID> = []
+
+  /// Tensor `latch` nodes whose element loop is wrapped in an `if (cond > 0)`
+  /// gate by the region emitter. Their emission stores the captured value
+  /// unconditionally (the region-level gate replaces the per-element gswitch).
+  public var gatedLatchNodes: Set<NodeID> = []
+
   /// Check if a node is part of a frame-dependent tensor chain
   public func isPartOfFrameTensorChain(_ nodeId: NodeID) -> Bool {
     return frameTensorChainNodes.contains(nodeId)
