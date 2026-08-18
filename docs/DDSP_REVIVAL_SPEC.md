@@ -379,12 +379,96 @@ Known residuals (not gate-blocking): slight brightness excess on typical
 val material; per-note vibrato/breath micro-structure smoothed (the classic
 DDSP signature, also seen at R3).
 
-Out-of-ladder / later: z-encoder (paper M5), CREPE-quality f0, timbre
-transfer demos.
+### R7 — Chromatic, multi-dynamic flute
+
+**RESULT (2026-08-17): PASSED.** The preparation script selects all 37
+TinySOL flute ordinario pitches from C4 through C7 at pp/mf/ff: 111 clips and
+1,349 chunks (1,201 train / 148 val). The split is grouped by source recording
+(99 train / 12 val), eliminating R6's overlapping-chunk train/val leakage. A
+12-source held-out pinned set drives checkpoint selection.
+
+Two preprocessing corrections are required for this rung and are now wired
+into `prepare_flute_multidynamics.sh`: one dataset-wide normalization gain
+preserves the 13 dB pp→mf and 9 dB mf→ff separation, and `maxF0=2400` plus
+fundamental-aware autocorrelation peak selection covers C7 without subharmonic
+octave errors. The A/B/C launch script uses the R6 model/loss recipe for
+10k/3k/2k steps.
+
+Held-out selection score fell from 6.83 to 0.78 (about 89%). The 12-source
+listening set in `runs/flute_multidynamics_listen/pairs/` passed by ear across
+register and dynamics: pitch and timbre closely match every target. Predictions
+add subtle breath-like modulation absent from the deliberately flat TinySOL
+sustains; this sounds natural, but is a learned performance prior rather than
+literal envelope reproduction.
+
+### R8 — Reference-conditioned timbre (`z`)
+
+**STATUS (2026-08-17): PIVOTED AFTER ONE-HOT FAILURE.** The first balanced
+cache uses TinySOL flute and Bb clarinet over the identical C4-G6 chromatic
+range at pp/mf/ff: 192 source clips and 2,390 chunks (2,146 train / 244 val),
+with source-grouped splits and 10 balanced pinned validation sources.
+
+The initial one-hot selector proof (3,000/800/400 steps) reduced held-out score
+from 7.29 to 1.40 without instability, but **failed the listening gate**:
+selector swaps changed level slightly while flute and clarinet remained
+perceptually identical. The decoder inferred source identity from f0/loudness
+microstructure or learned an averaged woodwind and mostly ignored the label.
+Listening evidence is in `runs/flute_clarinet_proof_listen/pairs/`.
+
+The replacement rung follows the paper's `z` idea and receives no instrument
+label. Each training item is a pair of *different* recordings from the same
+instrument: target audio supplies reconstruction f0/loudness and loss, while a
+reference recording supplies a pitch-reduced spectral descriptor to a learned
+timbre encoder. Its `z` conditions the temporal decoder deeply (FiLM or
+conditional normalization), preventing the weak-input-column failure. Different
+pitch/dynamic reference pairing is mandatory so `z` cannot copy target note
+content.
+
+Two-instrument gate: with identical target f0/loudness, swapping only a held-out
+flute versus clarinet reference must create unmistakably different timbres and
+each same-instrument reference must beat the cross-instrument reference against
+the target metric. If passed, graduate unchanged to all 14 TinySOL instruments;
+instrument labels remain data-loader-only pairing metadata, never model inputs.
+
+**FIRST REFERENCE ATTEMPT (2026-08-17): GATE NOT YET PASSED.** Implemented
+MFCC-style cached reference descriptors, a trainable `z` projection, per-layer
+FiLM in the transformer, different-source same-instrument pairing, canonical
+sustained-note target controls to remove identity leakage, and an auxiliary
+reference classifier. The complete 3,000/800/400 run reached held-out spectral
+score 1.43. Reference swaps are now live (mean 6.3% relative RMS difference;
+some examples 22%), but the correct reference won only 9/20 held-out spectral
+comparisons and average correct-reference score was slightly worse than crossed
+reference (1.379 vs 1.369). Therefore the automatic 14-instrument graduation
+was deliberately stopped. Listening evidence is in
+`runs/flute_clarinet_reference_listen/pairs/`. A separate matched raw-source
+audit in `runs/flute_clarinet_target_audit/` passed by ear overall: flute and
+clarinet target timbres are clearly different at mf/ff, while some pp pairs are
+substantially more similar. Dataset separability is therefore adequate but
+strongly dynamic-dependent. An mf/ff-only curriculum proof is now running on
+128 source clips / 1,620 chunks (1,460 train, 160 validation); pp was held out
+entirely. **This mf/ff listening gate also failed:** on clarinet targets, the
+clarinet-reference and flute-reference predictions are perceptually the same
+and both remain far from the real clarinet target. The renderer was audited and
+uses genuinely different reference chunks/descriptors, so this is model
+conditioning collapse rather than a mislabeled or duplicated-reference bug.
+Do not graduate or extend this averaged-descriptor architecture. A clarinet-only
+mf/ff control run (64 sources, 826 chunks) completed: held-out spectral score
+fell from 5.85 to 1.47 (75% reduction) in Stage A; later fine-tuning did not
+improve it. Held-out source-distinct pairs are in
+`runs/clarinet_mfff_solo_listen/pairs/`. **The listening gate passed:** several
+predictions are nearly exact and the remainder are clearly clarinet, with only
+some loss of brightness. This proves the decoder/synth can represent clarinet;
+the multi-instrument failure is isolated to reference encoding/conditioning,
+not synthesis capacity. The next attempt needs a richer
+time-varying learned spectrogram encoder
+rather than an averaged handcrafted MFCC vector, plus reference-sensitive
+checkpoint selection; simply scaling the first run is not justified.
+
+Out-of-ladder / later: CREPE-quality f0 and broader timbre transfer demos.
 
 ## Non-goals for v1
 
-- z-encoder and timbre transfer (defer until R6 passes).
+- None for the `z` encoder: it is now the active R8 rung after R7 passed.
 - Polyphony.
 - Real-time inference.
 - Matching the paper's exact dataset scale (NSynth); TinySOL subset suffices

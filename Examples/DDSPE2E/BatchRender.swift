@@ -2,13 +2,14 @@ import DGenLazy
 import Foundation
 
 enum DDSPE2EBatchRenderer {
-  private static let conditioningFeatureCount = 5
-
   private struct RenderManifestEntry: Codable {
     let batchIndex: Int
     let chunkID: String
     let sourceFile: String
     let wavPath: String
+    let referenceChunkID: String?
+    let referenceSourceFile: String?
+    let referenceInstrumentIndex: Int?
   }
 
   private struct RenderManifest: Codable {
@@ -37,6 +38,8 @@ enum DDSPE2EBatchRenderer {
 
     let split = DatasetSplit(rawValue: (options["split"] ?? "train").lowercased()) ?? .train
     let requestedBatchSize = max(1, Int(options["batch-size"] ?? "\(max(1, config.batchSize))") ?? max(1, config.batchSize))
+    let instrumentOverride = options["instrument-index"].flatMap(Int.init)
+    let referenceInstrumentOverride = options["reference-instrument-index"].flatMap(Int.init)
     let outputPath = options["output"] ?? "runs/batch_render_\(timestampString())"
     let outputDir = URL(fileURLWithPath: outputPath, isDirectory: true)
     try FileManager.default.createDirectory(at: outputDir, withIntermediateDirectories: true)
@@ -62,6 +65,7 @@ enum DDSPE2EBatchRenderer {
     LazyGraphContext.reset()
 
     let model = DDSPDecoderModel(config: config)
+    let conditioningFeatureCount = model.inputSize
     let checkpoint = try CheckpointStore.readModelState(from: URL(fileURLWithPath: checkpointPath))
     model.loadSnapshots(checkpoint.params)
     logger("Loaded model checkpoint: \(checkpointPath) (step=\(checkpoint.step))")
@@ -71,6 +75,10 @@ enum DDSPE2EBatchRenderer {
 
     for (batchIndex, entry) in selectedEntries.enumerated() {
       let chunk = try dataset.loadChunk(entry)
+      let selectedInstrument = instrumentOverride ?? chunk.instrumentIndex ?? 0
+      logger(
+        "Rendering \(entry.id) with instrumentIndex=\(selectedInstrument) "
+          + "(source instrumentIndex=\(chunk.instrumentIndex ?? 0))")
       let frameCount = max(config.chunkSize, 1)
       let rawFeatureFrames = chunk.f0Hz.count
       let paddedFeatureFrames = ((rawFeatureFrames + 7) / 8) * 8
@@ -81,16 +89,47 @@ enum DDSPE2EBatchRenderer {
           count: paddedFeatureFrames
         )
       )
+      let modelFeatures = config.referenceConditioning
+        ? FeatureExtractor.canonicalReferenceControls(
+            features: ChunkFeatures(
+              f0Hz: chunk.f0Hz, loudnessDB: chunk.loudnessDB, uvMask: chunk.uvMask),
+            sourceFile: chunk.sourceFile)
+        : ChunkFeatures(f0Hz: chunk.f0Hz, loudnessDB: chunk.loudnessDB, uvMask: chunk.uvMask)
       var conditioning = makeConditioningData(
-        f0Hz: chunk.f0Hz,
-        loudnessDB: chunk.loudnessDB,
-        uvMask: chunk.uvMask
+        f0Hz: modelFeatures.f0Hz,
+        loudnessDB: modelFeatures.loudnessDB,
+        uvMask: modelFeatures.uvMask,
+        instrumentIndex: selectedInstrument,
+        numInstruments: config.referenceConditioning ? 1 : config.numInstruments
       )
       let condPad = paddedFeatureFrames * conditioningFeatureCount - conditioning.count
       if condPad > 0 {
         conditioning.append(contentsOf: [Float](repeating: 0, count: condPad))
       }
       featuresTensor.updateDataLazily(conditioning)
+
+      var referenceTensor: Tensor? = nil
+      var selectedReferenceEntry: CachedChunkEntry? = nil
+      if config.referenceConditioning {
+        let referenceEntry = splitEntries.first {
+          ($0.instrumentIndex ?? 0) == (referenceInstrumentOverride ?? entry.instrumentIndex ?? 0)
+            && $0.sourceFile != entry.sourceFile
+        } ?? splitEntries.first {
+          ($0.instrumentIndex ?? 0) == (referenceInstrumentOverride ?? entry.instrumentIndex ?? 0)
+        }
+        guard let referenceEntry else {
+          throw CLIError.invalid("No matching reference chunk for \(entry.id)")
+        }
+        selectedReferenceEntry = referenceEntry
+        let referenceChunk = try dataset.loadChunk(referenceEntry)
+        var row = Array((referenceChunk.timbreFeatures ?? []).prefix(config.referenceFeatureSize))
+        if row.count < config.referenceFeatureSize {
+          row += [Float](repeating: 0, count: config.referenceFeatureSize - row.count)
+        }
+        referenceTensor = Tensor(Array(repeating: row, count: paddedFeatureFrames))
+        logger(
+          "  reference=\(referenceEntry.id) instrumentIndex=\(referenceEntry.instrumentIndex ?? 0)")
+      }
 
       let synthTensors = DDSPSynth.PreallocatedTensors(
         featureFrames: paddedFeatureFrames,
@@ -105,7 +144,7 @@ enum DDSPE2EBatchRenderer {
       }
       synthTensors.updateChunkData(f0Frames: paddedF0, uvFrames: paddedUV)
 
-      let controls = model.forward(features: featuresTensor)
+      let controls = model.forward(features: featuresTensor, reference: referenceTensor)
       let prediction = DDSPSynth.renderSignal(
         controls: controls,
         tensors: synthTensors,
@@ -128,7 +167,10 @@ enum DDSPE2EBatchRenderer {
           batchIndex: batchIndex,
           chunkID: entry.id,
           sourceFile: entry.sourceFile,
-          wavPath: wavURL.path
+          wavPath: wavURL.path,
+          referenceChunkID: selectedReferenceEntry?.id,
+          referenceSourceFile: selectedReferenceEntry?.sourceFile,
+          referenceInstrumentIndex: selectedReferenceEntry?.instrumentIndex
         )
       )
     }
@@ -166,12 +208,15 @@ enum DDSPE2EBatchRenderer {
   private static func makeConditioningData(
     f0Hz: [Float],
     loudnessDB: [Float],
-    uvMask: [Float]
+    uvMask: [Float],
+    instrumentIndex: Int?,
+    numInstruments: Int
   ) -> [Float] {
     let n = min(f0Hz.count, min(loudnessDB.count, uvMask.count))
-    if n == 0 { return [Float](repeating: 0, count: conditioningFeatureCount) }
+    let width = 5 + (numInstruments > 1 ? numInstruments : 0)
+    if n == 0 { return [Float](repeating: 0, count: width) }
     var flat = [Float]()
-    flat.reserveCapacity(n * conditioningFeatureCount)
+    flat.reserveCapacity(n * width)
     var prevF0Norm: Float = 0
     var prevLoudNorm: Float = 0
     for i in 0..<n {
@@ -186,6 +231,10 @@ enum DDSPE2EBatchRenderer {
       flat.append(uv)
       flat.append(deltaF0)
       flat.append(deltaLoud)
+      if numInstruments > 1 {
+        let selected = min(max(0, instrumentIndex ?? 0), numInstruments - 1)
+        for index in 0..<numInstruments { flat.append(index == selected ? 1 : 0) }
+      }
       prevF0Norm = f0Norm
       prevLoudNorm = loudNorm
     }

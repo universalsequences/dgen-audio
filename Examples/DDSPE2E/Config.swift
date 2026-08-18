@@ -66,10 +66,20 @@ struct DDSPE2EConfig: Codable {
   var silenceRMS: Float = 0.0005
   var voicedThreshold: Float = 0.3
 
+  /// Per-file peak normalization target. Set to 0 to preserve source levels,
+  /// which is required when absolute dynamics are part of the conditioning.
   var peakNormalizeTo: Float = 0.99
+  /// Apply one peak gain computed over the dataset instead of independently
+  /// normalizing each recording. This preserves relative dynamic levels.
+  var normalizeAcrossDataset: Bool = false
 
   var trainSplit: Float = 0.9
   var shuffleChunks: Bool = true
+  /// Derive an instrument label from each WAV's top-level input subdirectory.
+  var labelByTopLevelDirectory: Bool = false
+  /// Keep every chunk from one source recording in the same split. This avoids
+  /// overlap leakage when chunkHop < chunkSize.
+  var splitBySourceFile: Bool = false
   var fixedBatch: Bool = false
 
   var seed: UInt64 = 1337
@@ -77,6 +87,15 @@ struct DDSPE2EConfig: Codable {
   var maxChunksPerFile: Int?
 
   // M2 decoder-only model/training parameters
+  /// Number of timbres represented by one decoder. Values > 1 append a
+  /// one-hot instrument selector to every conditioning frame.
+  var numInstruments: Int = 1
+  /// Encode a separate audio reference descriptor into a latent timbre code.
+  /// Instrument labels are used only by the loader to choose reference pairs.
+  var referenceConditioning: Bool = false
+  var referenceFeatureSize: Int = 16
+  var referenceLatentSize: Int = 16
+  var referenceClassificationWeight: Float = 0.1
   var modelHiddenSize: Int = 32
   var modelNumLayers: Int = 1
   var decoderBackbone: DecoderBackbone = .transformer
@@ -185,12 +204,20 @@ struct DDSPE2EConfig: Codable {
     case silenceRMS
     case voicedThreshold
     case peakNormalizeTo
+    case normalizeAcrossDataset
     case trainSplit
     case shuffleChunks
+    case labelByTopLevelDirectory
+    case splitBySourceFile
     case fixedBatch
     case seed
     case maxFiles
     case maxChunksPerFile
+    case numInstruments
+    case referenceConditioning
+    case referenceFeatureSize
+    case referenceLatentSize
+    case referenceClassificationWeight
     case modelHiddenSize
     case modelNumLayers
     case decoderBackbone
@@ -276,12 +303,29 @@ struct DDSPE2EConfig: Codable {
     silenceRMS = try c.decodeIfPresent(Float.self, forKey: .silenceRMS) ?? d.silenceRMS
     voicedThreshold = try c.decodeIfPresent(Float.self, forKey: .voicedThreshold) ?? d.voicedThreshold
     peakNormalizeTo = try c.decodeIfPresent(Float.self, forKey: .peakNormalizeTo) ?? d.peakNormalizeTo
+    normalizeAcrossDataset =
+      try c.decodeIfPresent(Bool.self, forKey: .normalizeAcrossDataset) ?? d.normalizeAcrossDataset
     trainSplit = try c.decodeIfPresent(Float.self, forKey: .trainSplit) ?? d.trainSplit
     shuffleChunks = try c.decodeIfPresent(Bool.self, forKey: .shuffleChunks) ?? d.shuffleChunks
+    labelByTopLevelDirectory =
+      try c.decodeIfPresent(Bool.self, forKey: .labelByTopLevelDirectory)
+      ?? d.labelByTopLevelDirectory
+    splitBySourceFile =
+      try c.decodeIfPresent(Bool.self, forKey: .splitBySourceFile) ?? d.splitBySourceFile
     fixedBatch = try c.decodeIfPresent(Bool.self, forKey: .fixedBatch) ?? d.fixedBatch
     seed = try c.decodeIfPresent(UInt64.self, forKey: .seed) ?? d.seed
     maxFiles = try c.decodeIfPresent(Int.self, forKey: .maxFiles)
     maxChunksPerFile = try c.decodeIfPresent(Int.self, forKey: .maxChunksPerFile)
+    numInstruments = try c.decodeIfPresent(Int.self, forKey: .numInstruments) ?? d.numInstruments
+    referenceConditioning =
+      try c.decodeIfPresent(Bool.self, forKey: .referenceConditioning) ?? d.referenceConditioning
+    referenceFeatureSize =
+      try c.decodeIfPresent(Int.self, forKey: .referenceFeatureSize) ?? d.referenceFeatureSize
+    referenceLatentSize =
+      try c.decodeIfPresent(Int.self, forKey: .referenceLatentSize) ?? d.referenceLatentSize
+    referenceClassificationWeight =
+      try c.decodeIfPresent(Float.self, forKey: .referenceClassificationWeight)
+      ?? d.referenceClassificationWeight
     modelHiddenSize = try c.decodeIfPresent(Int.self, forKey: .modelHiddenSize) ?? d.modelHiddenSize
     modelNumLayers = try c.decodeIfPresent(Int.self, forKey: .modelNumLayers) ?? d.modelNumLayers
     decoderBackbone = try c.decodeIfPresent(DecoderBackbone.self, forKey: .decoderBackbone)
@@ -404,11 +448,34 @@ struct DDSPE2EConfig: Codable {
     if let value = options["normalize-to"] {
       peakNormalizeTo = try parseFloat(value, key: "normalize-to")
     }
+    if let value = options["global-normalize"] {
+      normalizeAcrossDataset = parseBool(value)
+    }
     if let value = options["train-split"] { trainSplit = try parseFloat(value, key: "train-split") }
+    if let value = options["split-by-source"] { splitBySourceFile = parseBool(value) }
     if let value = options["seed"] { seed = try parseUInt64(value, key: "seed") }
+    if let value = options["label-by-top-level"] {
+      labelByTopLevelDirectory = parseBool(value)
+    }
     if let value = options["max-files"] { maxFiles = try parseInt(value, key: "max-files") }
     if let value = options["max-chunks-per-file"] {
       maxChunksPerFile = try parseInt(value, key: "max-chunks-per-file")
+    }
+    if let value = options["instruments"] {
+      numInstruments = try parseInt(value, key: "instruments")
+    }
+    if let value = options["reference-conditioning"] {
+      referenceConditioning = parseBool(value)
+    }
+    if let value = options["reference-features"] {
+      referenceFeatureSize = try parseInt(value, key: "reference-features")
+    }
+    if let value = options["reference-latent"] {
+      referenceLatentSize = try parseInt(value, key: "reference-latent")
+    }
+    if let value = options["reference-classification-weight"] {
+      referenceClassificationWeight = try parseFloat(
+        value, key: "reference-classification-weight")
     }
     if let value = options["model-hidden"] {
       modelHiddenSize = try parseInt(value, key: "model-hidden")
@@ -703,8 +770,20 @@ struct DDSPE2EConfig: Codable {
     guard voicedThreshold >= 0, voicedThreshold <= 1 else {
       throw ConfigError.invalid("voicedThreshold must be in [0, 1]")
     }
-    guard peakNormalizeTo > 0 else {
-      throw ConfigError.invalid("peakNormalizeTo must be > 0")
+    guard peakNormalizeTo >= 0 else {
+      throw ConfigError.invalid("peakNormalizeTo must be >= 0 (0 disables normalization)")
+    }
+    guard numInstruments >= 1 else {
+      throw ConfigError.invalid("numInstruments must be >= 1")
+    }
+    guard referenceFeatureSize > 0 else {
+      throw ConfigError.invalid("referenceFeatureSize must be > 0")
+    }
+    guard referenceLatentSize > 0 else {
+      throw ConfigError.invalid("referenceLatentSize must be > 0")
+    }
+    guard referenceClassificationWeight >= 0 else {
+      throw ConfigError.invalid("referenceClassificationWeight must be >= 0")
     }
     guard modelHiddenSize > 0 else {
       throw ConfigError.invalid("modelHiddenSize must be > 0")

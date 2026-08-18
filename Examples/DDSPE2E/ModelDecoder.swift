@@ -7,12 +7,20 @@ struct DecoderControls {
   var noiseGain: Tensor         // [frames, 1]
   var noiseFilter: Tensor?      // [frames, noiseFilterSize] — nil when noise filter disabled
   var harmonicHeadMode: HarmonicHeadMode
+  var referenceClassLogits: Tensor?
 }
 
 struct NamedTensorSnapshot: Codable {
   var name: String
   var shape: [Int]
   var data: [Float]
+}
+
+private struct ReferenceFiLMParams {
+  let W_gamma: Tensor
+  let b_gamma: Tensor
+  let W_beta: Tensor
+  let b_beta: Tensor
 }
 
 private struct TransformerLayerParams {
@@ -31,7 +39,7 @@ private struct TransformerLayerParams {
 }
 
 final class DDSPDecoderModel {
-  let inputSize: Int = 5
+  let inputSize: Int
   let decoderBackbone: DecoderBackbone
   let hiddenSize: Int
   let numLayers: Int
@@ -52,6 +60,14 @@ final class DDSPDecoderModel {
   private let transformerInputW: Tensor?
   private let transformerInputB: Tensor?
   private let transformerLayers: [TransformerLayerParams]
+  let referenceConditioning: Bool
+  let referenceFeatureSize: Int
+  let referenceLatentSize: Int
+  private let referenceEncoderW: Tensor?
+  private let referenceEncoderB: Tensor?
+  private let referenceFiLMLayers: [ReferenceFiLMParams]
+  private let referenceClassifierW: Tensor?
+  private let referenceClassifierB: Tensor?
 
   // Heads
   let W_harm: Tensor
@@ -73,6 +89,8 @@ final class DDSPDecoderModel {
   private static let ln10Over20: Float = 0.11512925464970229  // ln(10)/20
 
   init(config: DDSPE2EConfig) {
+    self.inputSize = 5 + (!config.referenceConditioning && config.numInstruments > 1
+      ? config.numInstruments : 0)
     self.decoderBackbone = config.decoderBackbone
     switch config.decoderBackbone {
     case .mlp:
@@ -92,6 +110,9 @@ final class DDSPDecoderModel {
     self.softmaxGainMaxDB = config.softmaxGainMaxDB
     self.enableNoiseFilter = config.enableNoiseFilter
     self.noiseFilterSize = config.noiseFilterOutputSize
+    self.referenceConditioning = config.referenceConditioning
+    self.referenceFeatureSize = config.referenceFeatureSize
+    self.referenceLatentSize = config.referenceLatentSize
 
     var rng = SeededGenerator(seed: config.seed)
 
@@ -159,6 +180,53 @@ final class DDSPDecoderModel {
     self.transformerInputB = trInputB
     self.transformerLayers = trLayers
 
+    if config.referenceConditioning {
+      let encoderScale: Float = sqrt(2.0 / Float(max(1, config.referenceFeatureSize))) * 0.5
+      self.referenceEncoderW = Tensor.param(
+        [config.referenceFeatureSize, config.referenceLatentSize],
+        data: Self.randomArray(
+          count: config.referenceFeatureSize * config.referenceLatentSize,
+          scale: encoderScale,
+          rng: &rng))
+      self.referenceEncoderB = Tensor.param(
+        [1, config.referenceLatentSize],
+        data: [Float](repeating: 0, count: config.referenceLatentSize))
+      var film = [ReferenceFiLMParams]()
+      for _ in 0..<numLayers {
+        film.append(ReferenceFiLMParams(
+          W_gamma: Tensor.param(
+            [config.referenceLatentSize, hiddenSize],
+            data: Self.randomArray(
+              count: config.referenceLatentSize * hiddenSize, scale: 0.2, rng: &rng)),
+          b_gamma: Tensor.param([1, hiddenSize], data: [Float](repeating: 0, count: hiddenSize)),
+          W_beta: Tensor.param(
+            [config.referenceLatentSize, hiddenSize],
+            data: Self.randomArray(
+              count: config.referenceLatentSize * hiddenSize, scale: 0.2, rng: &rng)),
+          b_beta: Tensor.param([1, hiddenSize], data: [Float](repeating: 0, count: hiddenSize))
+        ))
+      }
+      self.referenceFiLMLayers = film
+      if config.numInstruments > 1 {
+        self.referenceClassifierW = Tensor.param(
+          [config.referenceLatentSize, config.numInstruments],
+          data: Self.randomArray(
+            count: config.referenceLatentSize * config.numInstruments, scale: 0.05, rng: &rng))
+        self.referenceClassifierB = Tensor.param(
+          [1, config.numInstruments],
+          data: [Float](repeating: 0, count: config.numInstruments))
+      } else {
+        self.referenceClassifierW = nil
+        self.referenceClassifierB = nil
+      }
+    } else {
+      self.referenceEncoderW = nil
+      self.referenceEncoderB = nil
+      self.referenceFiLMLayers = []
+      self.referenceClassifierW = nil
+      self.referenceClassifierB = nil
+    }
+
     self.W_harm = Tensor.param([hiddenSize, numHarmonics], data: Self.randomArray(
       count: hiddenSize * numHarmonics, scale: 0.06, rng: &rng))
     self.b_harm = Tensor.param([1, numHarmonics], data: [Float](repeating: 0.0, count: numHarmonics))
@@ -223,6 +291,15 @@ final class DDSPDecoderModel {
         ])
       }
     }
+    if let w = referenceEncoderW, let b = referenceEncoderB {
+      params.append(contentsOf: [w, b])
+      for film in referenceFiLMLayers {
+        params.append(contentsOf: [film.W_gamma, film.b_gamma, film.W_beta, film.b_beta])
+      }
+      if let cw = referenceClassifierW, let cb = referenceClassifierB {
+        params.append(contentsOf: [cw, cb])
+      }
+    }
     params.append(contentsOf: [W_harm, b_harm, W_hgain, b_hgain, W_noise, b_noise])
     if let wf = W_filter, let bf = b_filter {
       params.append(contentsOf: [wf, bf])
@@ -233,13 +310,33 @@ final class DDSPDecoderModel {
     return params
   }
 
-  func forward(features: Tensor, batchSize: Int = 1, featureFrames: Int? = nil) -> DecoderControls {
+  func forward(
+    features: Tensor,
+    reference: Tensor? = nil,
+    batchSize: Int = 1,
+    featureFrames: Int? = nil
+  ) -> DecoderControls {
+    let referenceLatent: Tensor?
+    if referenceConditioning,
+      let reference,
+      let w = referenceEncoderW,
+      let b = referenceEncoderB
+    {
+      referenceLatent = tanh((reference * 4.0).matmul(w) + b)
+    } else {
+      referenceLatent = nil
+    }
+
     let hidden: Tensor
     switch decoderBackbone {
     case .mlp:
-      hidden = forwardMLP(features: features)
+      hidden = forwardMLP(features: features, referenceLatent: referenceLatent)
     case .transformer:
-      hidden = forwardTransformer(features: features, batchSize: batchSize, featureFrames: featureFrames)
+      hidden = forwardTransformer(
+        features: features,
+        referenceLatent: referenceLatent,
+        batchSize: batchSize,
+        featureFrames: featureFrames)
     }
 
     // Harmonic head:
@@ -292,12 +389,22 @@ final class DDSPDecoderModel {
       noiseFilter = sigmoid(filterLogits)
     }
 
+    let referenceClassLogits: Tensor?
+    if let latent = referenceLatent,
+      let classifierW = referenceClassifierW,
+      let classifierB = referenceClassifierB
+    {
+      referenceClassLogits = latent.matmul(classifierW) + classifierB
+    } else {
+      referenceClassLogits = nil
+    }
     return DecoderControls(
       harmonicAmps: harmonicAmps,
       harmonicGain: harmonicGain,
       noiseGain: noiseGain,
       noiseFilter: noiseFilter,
-      harmonicHeadMode: harmonicHeadMode
+      harmonicHeadMode: harmonicHeadMode,
+      referenceClassLogits: referenceClassLogits
     )
   }
 
@@ -331,6 +438,19 @@ final class DDSPDecoderModel {
           snapshot("\(prefix)_ln2_g", layer.ln2Gamma),
           snapshot("\(prefix)_ln2_b", layer.ln2Beta),
         ])
+      }
+    }
+    if let w = referenceEncoderW, let b = referenceEncoderB {
+      snaps.append(contentsOf: [snapshot("ref_encoder_W", w), snapshot("ref_encoder_b", b)])
+      for (i, film) in referenceFiLMLayers.enumerated() {
+        let prefix = "ref_film_l\(i+1)"
+        snaps.append(contentsOf: [
+          snapshot("\(prefix)_Wg", film.W_gamma), snapshot("\(prefix)_bg", film.b_gamma),
+          snapshot("\(prefix)_Wb", film.W_beta), snapshot("\(prefix)_bb", film.b_beta),
+        ])
+      }
+      if let cw = referenceClassifierW, let cb = referenceClassifierB {
+        snaps.append(contentsOf: [snapshot("ref_classifier_W", cw), snapshot("ref_classifier_b", cb)])
       }
     }
     snaps.append(contentsOf: [
@@ -378,6 +498,21 @@ final class DDSPDecoderModel {
         loadTensor(layer.ln1Beta, from: byName["\(prefix)_ln1_b"])
         loadTensor(layer.ln2Gamma, from: byName["\(prefix)_ln2_g"])
         loadTensor(layer.ln2Beta, from: byName["\(prefix)_ln2_b"])
+      }
+    }
+    if let w = referenceEncoderW, let b = referenceEncoderB {
+      loadTensor(w, from: byName["ref_encoder_W"])
+      loadTensor(b, from: byName["ref_encoder_b"])
+      for (i, film) in referenceFiLMLayers.enumerated() {
+        let prefix = "ref_film_l\(i+1)"
+        loadTensor(film.W_gamma, from: byName["\(prefix)_Wg"])
+        loadTensor(film.b_gamma, from: byName["\(prefix)_bg"])
+        loadTensor(film.W_beta, from: byName["\(prefix)_Wb"])
+        loadTensor(film.b_beta, from: byName["\(prefix)_bb"])
+      }
+      if let cw = referenceClassifierW, let cb = referenceClassifierB {
+        loadTensor(cw, from: byName["ref_classifier_W"])
+        loadTensor(cb, from: byName["ref_classifier_b"])
       }
     }
     loadTensor(W_harm, from: byName["W_harm"])
@@ -431,15 +566,29 @@ final class DDSPDecoderModel {
     return positive + correction
   }
 
-  private func forwardMLP(features: Tensor) -> Tensor {
+  private func applyReferenceFiLM(_ hidden: Tensor, latent: Tensor?, layer: Int) -> Tensor {
+    guard let latent, layer < referenceFiLMLayers.count else { return hidden }
+    let film = referenceFiLMLayers[layer]
+    let gamma = tanh(latent.matmul(film.W_gamma) + film.b_gamma) * 0.5
+    let beta = tanh(latent.matmul(film.W_beta) + film.b_beta)
+    return hidden * (1.0 + gamma) + beta
+  }
+
+  private func forwardMLP(features: Tensor, referenceLatent: Tensor?) -> Tensor {
     var hidden = features
     for i in 0..<numLayers {
       hidden = tanh(hidden.matmul(trunkWeights[i]) + trunkBiases[i])
+      hidden = applyReferenceFiLM(hidden, latent: referenceLatent, layer: i)
     }
     return hidden
   }
 
-  private func forwardTransformer(features: Tensor, batchSize: Int, featureFrames: Int?) -> Tensor {
+  private func forwardTransformer(
+    features: Tensor,
+    referenceLatent: Tensor?,
+    batchSize: Int,
+    featureFrames: Int?
+  ) -> Tensor {
     guard let wIn = transformerInputW, let bIn = transformerInputB else {
       return features
     }
@@ -453,13 +602,14 @@ final class DDSPDecoderModel {
         featureFrames: featureFrames
       )
     }
-    for layer in transformerLayers {
+    for (index, layer) in transformerLayers.enumerated() {
       hidden = transformerBlock(
         hidden,
         layer: layer,
         batchSize: batchSize,
         featureFrames: featureFrames
       )
+      hidden = applyReferenceFiLM(hidden, latent: referenceLatent, layer: index)
     }
     return hidden
   }
