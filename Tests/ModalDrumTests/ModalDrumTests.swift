@@ -64,6 +64,49 @@ final class ModalDrumTests: XCTestCase {
     XCTAssertGreaterThan(gains[1], gains[2] * 10)
   }
 
+  /// The envelope only sets the shape; the bank must also start at the
+  /// target's level, and must do so independently of K or the sweep is
+  /// comparing initialization loudness instead of model capacity. Checked by
+  /// rendering the actual synth, not by replaying the closed form the warm
+  /// start uses.
+  func testWarmStartLevelMatchesRenderedTargetIndependentlyOfModeCount() throws {
+    var config = ModalDrumConfig()
+    let duration: Float = 0.25
+    let tau: Float = 0.15
+    config.frames = Int(duration * config.sampleRate)
+    let frames = config.frames
+    // Noise-ish broadband target so every grid frequency gets some envelope.
+    var state: UInt64 = 12_345
+    let samples = (0..<frames).map { _ -> Float in
+      state = state &* 6_364_136_223_846_793_005 &+ 1_442_695_040_888_963_407
+      return (Float((state >> 40) & 0xFFFFFF) / Float(0xFFFFFF)) * 0.6 - 0.3
+    }
+    func rms(_ x: [Float]) -> Float { sqrt(x.reduce(0) { $0 + $1 * $1 } / Float(max(1, x.count))) }
+    let targetRMS = rms(samples)
+
+    for modes in [32, 128] {
+      let frequencies = modalFrequencyGrid(count: modes)
+      let gains = RealSnareFitter.spectralEnvelopeWarmStart(
+        samples: samples, frequencies: frequencies, sampleRate: config.sampleRate,
+        decaySeconds: tau, durationSeconds: duration)
+      XCTAssertLessThanOrEqual(gains.max() ?? 0, 0.9)
+
+      var patch = flatInitialPatch(modes: modes)
+      patch.gains = gains
+      patch.decaySeconds = [Float](repeating: tau, count: modes)
+      config.applyRuntime()
+      LazyGraphContext.reset()
+      let params = ModalDrumParameters(patch: patch, trainable: false)
+      let rendered = try ModalDrumSynth.render(
+        params: params, frequencies: Tensor(frequencies), includeModal: true, includeNoise: false
+      ).realize(frames: frames)
+
+      XCTAssertEqual(
+        rms(rendered), targetRMS, accuracy: targetRMS * 0.3,
+        "warm-start level drifts from the target at K=\(modes)")
+    }
+  }
+
   func testSelfRenderIsDeterministic() throws {
     var config = ModalDrumConfig()
     config.frames = 256

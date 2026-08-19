@@ -4,6 +4,7 @@ import Foundation
 
 struct ModalScoreCalibration: Codable, Equatable {
   var selfScore: Float
+  var silenceScore: Float
   var whiteNoiseScore: Float
   var wrongSnareScore: Float
   var numericGate: Float
@@ -48,26 +49,37 @@ enum RealSnareFitter {
   /// Calibrates the independent score on percussion. Exact self-comparison is
   /// necessarily zero, so the automatic gate is one third below the nearest
   /// negative control: a passing fit must be at least 1.5x closer to the target
-  /// than either white noise or the wrong snare.
+  /// than any of the controls.
+  ///
+  /// Silence is one of those controls deliberately. On a 0.75 s percussion
+  /// window most frames are decayed tail, which compresses this metric hard:
+  /// measured on the prepared corpus a *wrong snare* scores ~0.21 and pure
+  /// silence only ~0.34, so a gate derived from the loud controls alone can
+  /// sit above "render nothing". Including silence in the negative set makes
+  /// the gate un-gameable by an empty render by construction, and records the
+  /// metric's real dynamic range on this material.
   static func calibrate(
     target: [Float], wrongSnare: [Float], config: ModalDrumConfig
   ) throws -> ModalScoreCalibration {
     let white = deterministicWhiteNoise(
       count: target.count, rms: rms(target), seed: config.seed)
+    let silence = [Float](repeating: 0, count: target.count)
     guard
       let selfScore = score(target, target, config),
+      let silenceScore = score(silence, target, config),
       let whiteScore = score(white, target, config),
       let wrongScore = score(wrongSnare, target, config)
     else {
       throw RealSnareFitError.invalidInput("audio is too short for the MR-STFT windows")
     }
-    let nearestNegative = min(whiteScore, wrongScore)
+    let nearestNegative = min(silenceScore, min(whiteScore, wrongScore))
     return ModalScoreCalibration(
       selfScore: selfScore,
+      silenceScore: silenceScore,
       whiteNoiseScore: whiteScore,
       wrongSnareScore: wrongScore,
       numericGate: selfScore + (nearestNegative - selfScore) / 1.5,
-      gateDerivation: "self + (min(whiteNoise, wrongSnare) - self) / 1.5")
+      gateDerivation: "self + (min(silence, whiteNoise, wrongSnare) - self) / 1.5")
   }
 
   static func runSweep(
@@ -138,8 +150,19 @@ enum RealSnareFitter {
     return summary
   }
 
+  /// Per-mode gains warm-started from the target's spectral envelope, then
+  /// scaled so the *summed* bank starts at the target's level.
+  ///
+  /// The envelope alone only fixes the shape. Without the scale step every
+  /// mode near the spectral peak starts at the 0.9 cap, so the initial render
+  /// overshoots (measured: peak 2.11 and 2.8x target RMS at K=32) and
+  /// overshoots harder as K grows — which would bias the K sweep against large
+  /// K for a reason that has nothing to do with model capacity. The closed
+  /// form is exact for this synth: for y = sum_k g_k sin(2 pi f_k t) e^(-t/tau),
+  /// mean square = (sum_k g_k^2 / 2) * (tau / 2T) * (1 - e^(-2T/tau)).
   static func spectralEnvelopeWarmStart(
-    samples: [Float], frequencies: [Float], sampleRate: Float
+    samples: [Float], frequencies: [Float], sampleRate: Float,
+    decaySeconds: Float = 0.15, durationSeconds: Float = 0.75
   ) -> [Float] {
     guard !samples.isEmpty, !frequencies.isEmpty else { return [] }
     let analysisCount = min(samples.count, 8_192)
@@ -157,7 +180,14 @@ enum RealSnareFitter {
       magnitudes[frequencyIndex] = Float(sqrt(re * re + im * im))
     }
     let peak = max(magnitudes.max() ?? 0, 1e-12)
-    return magnitudes.map { min(0.9, max(0.005, 0.9 * $0 / peak)) }
+    let shape = magnitudes.map { max(0.005, $0 / peak) }
+    let tau = max(1e-4, decaySeconds)
+    let duration = max(1e-4, durationSeconds)
+    let envelopeMeanSquare =
+      (tau / (2 * duration)) * (1 - Foundation.exp(-2 * duration / tau))
+    let unitMeanSquare = shape.reduce(0) { $0 + $1 * $1 } / 2 * envelopeMeanSquare
+    let scale = rms(samples) / max(Foundation.sqrt(unitMeanSquare), 1e-12)
+    return shape.map { min(0.9, max(1e-4, scale * $0)) }
   }
 
   private static func fit(
@@ -179,7 +209,9 @@ enum RealSnareFitter {
     let frequenciesData = modalFrequencyGrid(count: config.modes)
     var initial = flatInitialPatch(modes: config.modes)
     initial.gains = spectralEnvelopeWarmStart(
-      samples: target, frequencies: frequenciesData, sampleRate: config.sampleRate)
+      samples: target, frequencies: frequenciesData, sampleRate: config.sampleRate,
+      decaySeconds: initial.decaySeconds.first ?? 0.15,
+      durationSeconds: Float(config.frames) / config.sampleRate)
     if !includesNoise { initial.noiseGain = 0.00001 }
 
     LazyGraphContext.reset()

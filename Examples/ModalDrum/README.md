@@ -65,10 +65,13 @@ spectral envelope, modal decay starts at 150 ms, FIR taps are lowpass-like, and
 noise decay starts at 80 ms. `--high-mode-l1` controls the gain budget above
 6 kHz (default `1e-3`); noise decay remains hard-bounded to 10–250 ms.
 
-`calibration.json` records target-vs-self, target-vs-RMS-matched white noise,
-and target-vs-wrong-snare CPU MR-STFT scores. Since exact self distance is
-zero, the automatic numeric gate requires a fit to be 1.5x closer than the
-nearest negative control. Use `--gate SCORE` to record a stricter externally
+`calibration.json` records target-vs-self, target-vs-silence,
+target-vs-RMS-matched white noise, and target-vs-wrong-snare CPU MR-STFT
+scores. Since exact self distance is zero, the automatic numeric gate requires
+a fit to be 1.5x closer than the nearest negative control. Silence is one of
+those controls on purpose: on a 0.75 s percussion window most frames are
+decayed tail, so silence scores only ~1.6x worse than a wrong snare and a gate
+derived from the loud controls alone would be passable by rendering nothing. Use `--gate SCORE` to record a stricter externally
 chosen calibration gate.
 
 Each `kNNN_modal_only` / `kNNN_modal_noise` directory contains `loss.csv`, a
@@ -77,3 +80,7 @@ best patch, wall-clock time, and branch energy fractions. The top-level
 `summary.json` records the smallest passing K and whether the noise branch beat
 modal-only at every K. The listen gate is intentionally left `PENDING`: A/B
 `full.wav` against `target.wav`, then audition the solo branches before M2.
+
+Measured results for the first target — calibration table, K sweep, noise
+ablation, lambda sweep, listen gate and the residual diagnosis — are recorded
+in `M1_FINDING.md`.
