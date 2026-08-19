@@ -14,6 +14,7 @@ struct ModalDrumConfig: Codable {
   var linearSpectralWeight: Float = 1
   var logSpectralWeight: Float = 1
   var loudnessWeight: Float = 0.01
+  var highModeL1Weight: Float = 1e-3
   var logMagnitudeEpsilon: Float = 1e-3
   var renderEvery = 50
   var checkpointEvery = 50

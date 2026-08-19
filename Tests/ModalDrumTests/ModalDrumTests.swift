@@ -30,6 +30,40 @@ final class ModalDrumTests: XCTestCase {
     XCTAssertTrue(ModalRanges.noiseTau.contains(recovered.noiseDecaySeconds))
   }
 
+  func testRealSnareCalibrationDerivesConcreteGateFromNegativeControls() throws {
+    var config = ModalDrumConfig()
+    config.spectralWindows = [64, 128]
+    let count = 512
+    let target = (0..<count).map { i in
+      Float(sin(2 * Double.pi * 440 * Double(i) / Double(config.sampleRate)))
+    }
+    let wrong = (0..<count).map { i in
+      Float(sin(2 * Double.pi * 880 * Double(i) / Double(config.sampleRate)))
+    }
+    let calibration = try RealSnareFitter.calibrate(
+      target: target, wrongSnare: wrong, config: config)
+    XCTAssertEqual(calibration.selfScore, 0, accuracy: 1e-6)
+    XCTAssertGreaterThan(calibration.whiteNoiseScore, calibration.selfScore)
+    XCTAssertGreaterThan(calibration.wrongSnareScore, calibration.selfScore)
+    XCTAssertGreaterThan(calibration.numericGate, calibration.selfScore)
+    XCTAssertLessThan(
+      calibration.numericGate, min(calibration.whiteNoiseScore, calibration.wrongSnareScore))
+  }
+
+  func testSpectralEnvelopeWarmStartFindsDominantGridFrequency() {
+    let sampleRate: Float = 44_100
+    let frequencies: [Float] = [220, 440, 880]
+    let samples = (0..<8_192).map { i in
+      Float(sin(2 * Double.pi * 440 * Double(i) / Double(sampleRate)))
+    }
+    let gains = RealSnareFitter.spectralEnvelopeWarmStart(
+      samples: samples, frequencies: frequencies, sampleRate: sampleRate)
+    XCTAssertEqual(gains.count, frequencies.count)
+    XCTAssertEqual(gains.max(), gains[1])
+    XCTAssertGreaterThan(gains[1], gains[0] * 10)
+    XCTAssertGreaterThan(gains[1], gains[2] * 10)
+  }
+
   func testSelfRenderIsDeterministic() throws {
     var config = ModalDrumConfig()
     config.frames = 256

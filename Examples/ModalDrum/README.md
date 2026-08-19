@@ -1,6 +1,6 @@
-# ModalDrum M0
+# ModalDrum
 
-Closed-form modal-bank + filtered-noise synthetic recovery from
+Closed-form modal-bank + filtered-noise recovery and real-snare fitting from
 `docs/MODAL_SNARE_SPEC.md`.
 
 ## Corpus preparation
@@ -47,3 +47,33 @@ Artifacts are written below the selected run directory:
 Use `--kernel-dump PATH` on `train` to retain generated kernels for the
 frame-parallel audit. `--no-loudness` disables the small 256-sample frame-RMS
 L1 auxiliary if a configuration makes it unstable.
+
+## M1 real-snare sweep
+
+Choose two different accepted files from the prepared corpus and run:
+
+```bash
+swift run ModalDrum fit-real \
+  --target datasets/snares-prepared/snare-a.wav \
+  --wrong-snare datasets/snares-prepared/snare-b.wav \
+  --k 32,64,128 --steps 300 --out runs/modal_m1
+```
+
+M1 enforces the spec's fixed 0.75-second, 44.1 kHz input contract. For every K
+it runs modal-only and modal+noise fits. Gains are warm-started from the target
+spectral envelope, modal decay starts at 150 ms, FIR taps are lowpass-like, and
+noise decay starts at 80 ms. `--high-mode-l1` controls the gain budget above
+6 kHz (default `1e-3`); noise decay remains hard-bounded to 10–250 ms.
+
+`calibration.json` records target-vs-self, target-vs-RMS-matched white noise,
+and target-vs-wrong-snare CPU MR-STFT scores. Since exact self distance is
+zero, the automatic numeric gate requires a fit to be 1.5x closer than the
+nearest negative control. Use `--gate SCORE` to record a stricter externally
+chosen calibration gate.
+
+Each `kNNN_modal_only` / `kNNN_modal_noise` directory contains `loss.csv`, a
+best checkpoint, periodic previews, `full.wav`, `modal.wav`, `noise.wav`, the
+best patch, wall-clock time, and branch energy fractions. The top-level
+`summary.json` records the smallest passing K and whether the noise branch beat
+modal-only at every K. The listen gate is intentionally left `PENDING`: A/B
+`full.wav` against `target.wav`, then audition the solo branches before M2.

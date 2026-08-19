@@ -57,7 +57,8 @@ enum ModalDrumTrainer {
         config: config)
       // Canonicalize the shell/wire split: lightly budget modal gains above 6 kHz.
       let highModePenalty = (params.gains * highModeMask).sum() * (1 / Float(max(1, config.modes)))
-      let highModeLoss = (Tensor([0.0]) + highModePenalty * 0.001).peek(Signal.constant(0))
+      let highModeLoss = (Tensor([0.0]) + highModePenalty * config.highModeL1Weight).peek(
+        Signal.constant(0))
       loss = loss + highModeLoss
 
       let values = try loss.backward(frames: config.frames)
