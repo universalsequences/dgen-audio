@@ -57,4 +57,23 @@ final class ModalDrumTests: XCTestCase {
     XCTAssertEqual(samples[0], 0, accuracy: 1e-6)
     XCTAssertTrue(samples.allSatisfy(\.isFinite))
   }
+
+  /// The envelope time base must span the whole render without wrapping; a 1 Hz
+  /// phasor silently re-attacked the drum once per second.
+  func testEnvelopeDoesNotRestartOnLongRenders() throws {
+    var config = ModalDrumConfig()
+    config.frames = 88_200  // 2 seconds at 44.1 kHz
+    config.modes = 8
+    let samples = try ModalDrumTrainer.render(
+      patch: knownModalPatch(modes: config.modes), config: config)
+    XCTAssertEqual(samples.count, config.frames)
+    func rms(_ start: Int) -> Float {
+      let slice = samples[start..<Swift.min(start + 500, samples.count)]
+      return (slice.reduce(0) { $0 + $1 * $1 } / Float(slice.count)).squareRoot()
+    }
+    let before = rms(43_000)
+    for start in stride(from: 43_500, to: 88_000, by: 500) {
+      XCTAssertLessThanOrEqual(rms(start), before * 1.05, "re-attack near frame \(start)")
+    }
+  }
 }

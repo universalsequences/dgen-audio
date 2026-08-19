@@ -28,6 +28,14 @@ struct ModalDrumConfig: Codable {
   }
 }
 
+/// Runtime defaults for `ModalDrumSynth.render`, read from the active DGen
+/// configuration so every render derives its non-wrapping envelope time base
+/// from the frame count it is actually compiled for.
+enum ModalRuntime {
+  static var frames: Int { DGenConfig.maxFrameCount }
+  static var sampleRate: Float { DGenConfig.sampleRate }
+}
+
 struct ModalPatch: Codable, Equatable {
   var gains: [Float]
   var decaySeconds: [Float]

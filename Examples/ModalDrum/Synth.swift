@@ -70,20 +70,30 @@ enum ModalDrumSynth {
   /// Closed-form training synth. The modal oscillator uses deterministicPhasor,
   /// whose phase is computed directly from the frame index; consequently the
   /// modal branch has no history cells and compiles frame-parallel.
+  ///
+  /// The envelope time base is a phasor running at `sampleRate / (2 * frames)`,
+  /// so its ramp spans [0, 0.5) over the whole render and never wraps; the
+  /// `timeScale` factor converts that ramp back to seconds. Using a 1 Hz phasor
+  /// instead would silently re-attack the whole drum once per second.
   static func render(
     params: ModalDrumParameters,
     frequencies: Tensor,
+    frames: Int = ModalRuntime.frames,
+    sampleRate: Float = ModalRuntime.sampleRate,
     includeModal: Bool = true,
     includeNoise: Bool = true
   ) -> Signal {
     var output = Signal.constant(0)
+    let renderFrames = Float(max(1, frames))
+    let rampFrequency = sampleRate / (2 * renderFrames)
+    let timeScale = 2 * renderFrames / sampleRate
 
     if includeModal {
       let phase = Signal.phasor(frequencies)
       let modeTime = Signal.phasor(
-        Tensor([Float](repeating: 1.0, count: frequencies.shape.reduce(1, *))))
+        Tensor([Float](repeating: rampFrequency, count: frequencies.shape.reduce(1, *))))
       let sines = sin(phase * (2 * Float.pi))
-      let envelope = (modeTime * (1.0 / params.modeTaus) * -1.0).exp()
+      let envelope = (modeTime * (timeScale / params.modeTaus) * -1.0).exp()
       output = output + (sines * envelope * params.gains).sum()
     }
 
@@ -91,8 +101,8 @@ enum ModalDrumSynth {
       precondition(params.firTaps.shape == [firSize])
       let noiseBuffer = Signal.noise().buffer(size: firSize).reshape([firSize])
       let filtered = (noiseBuffer * params.firTaps).sum()
-      let noiseTime = Signal.phasor(Tensor([1.0]))  // t seconds for M0 renders (< 1 second)
-      let noiseEnvelope = (noiseTime * (1.0 / params.noiseTau) * -1.0).exp().sum()
+      let noiseTime = Signal.phasor(Tensor([rampFrequency]))
+      let noiseEnvelope = (noiseTime * (timeScale / params.noiseTau) * -1.0).exp().sum()
       let gain = params.noiseGain.peek(Signal.constant(0))
       output = output + filtered * noiseEnvelope * gain
     }
