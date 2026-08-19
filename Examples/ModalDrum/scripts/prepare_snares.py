@@ -22,43 +22,83 @@ HIGHPASS_HZ = 30.0
 PEAK_TARGET = 0.99
 
 
-def read_wav(path: Path) -> tuple[list[float], dict]:
-    with wave.open(str(path), "rb") as wav:
-        channels = wav.getnchannels()
-        width = wav.getsampwidth()
-        rate = wav.getframerate()
-        frames = wav.getnframes()
-        compression = wav.getcomptype()
-        raw = wav.readframes(frames)
-    if compression != "NONE" or width not in (1, 2, 3, 4):
-        raise ValueError(f"unsupported WAV encoding (compression={compression}, width={width})")
+FORMAT_PCM = 1
+FORMAT_FLOAT = 3
+FORMAT_EXTENSIBLE = 0xFFFE
+
+
+def read_riff(path: Path) -> tuple[int, int, int, int, bytes]:
+    """Parse a RIFF/WAVE file into (format code, channels, rate, byte width, data)."""
+    blob = path.read_bytes()
+    if len(blob) < 12 or blob[:4] != b"RIFF" or blob[8:12] != b"WAVE":
+        raise ValueError("not a RIFF/WAVE file")
+    fmt = None
+    data = None
+    offset = 12
+    while offset + 8 <= len(blob):
+        chunk_id = blob[offset:offset + 4]
+        size = struct.unpack_from("<I", blob, offset + 4)[0]
+        body = blob[offset + 8:offset + 8 + size]
+        if chunk_id == b"fmt " and len(body) >= 16:
+            fmt = body
+        elif chunk_id == b"data":
+            data = body
+        offset += 8 + size + (size & 1)
+    if fmt is None or data is None:
+        raise ValueError("missing fmt or data chunk")
+
+    code, channels, rate, _, _, bits = struct.unpack_from("<HHIIHH", fmt, 0)
+    if code == FORMAT_EXTENSIBLE:
+        if len(fmt) < 26:
+            raise ValueError("truncated WAVE_FORMAT_EXTENSIBLE header")
+        # The sub-format GUID opens with the real format code.
+        code = struct.unpack_from("<H", fmt, 24)[0]
+    if code not in (FORMAT_PCM, FORMAT_FLOAT):
+        raise ValueError(f"unsupported WAV format code {code}")
+    if bits % 8 or bits == 0:
+        raise ValueError(f"unsupported bit depth {bits}")
+    width = bits // 8
+    if code == FORMAT_PCM and width not in (1, 2, 3, 4):
+        raise ValueError(f"unsupported PCM sample width {width}")
+    if code == FORMAT_FLOAT and width not in (4, 8):
+        raise ValueError(f"unsupported float sample width {width}")
     if channels < 1 or rate < 1:
         raise ValueError("invalid channel count or sample rate")
+    return code, channels, rate, width, data
 
-    scale = float(1 << (8 * width - 1))
+
+def decode_sample(code: int, width: int, chunk: bytes) -> tuple[float, bool]:
+    """Return one sample in [-1, 1] plus whether it sits at full scale."""
+    if code == FORMAT_FLOAT:
+        value = struct.unpack("<f" if width == 4 else "<d", chunk)[0]
+        if value != value or value in (math.inf, -math.inf):
+            raise ValueError("non-finite float sample")
+        return value, abs(value) >= 1.0
+    if width == 1:
+        integer = chunk[0] - 128
+    else:
+        integer = int.from_bytes(chunk, "little", signed=True)
+    limit = 1 << (8 * width - 1)
+    return integer / float(limit), integer in (-limit, limit - 1)
+
+
+def read_wav(path: Path) -> tuple[list[float], dict]:
+    code, channels, rate, width, raw = read_riff(path)
+    frames = len(raw) // (channels * width)
+
     samples: list[float] = []
     clipped_frames = 0
     clipped_run = max_clipped_run = 0
     offset = 0
     for _ in range(frames):
-        values = []
+        total = 0.0
         frame_clipped = False
         for _ in range(channels):
-            chunk = raw[offset:offset + width]
+            value, full_scale = decode_sample(code, width, raw[offset:offset + width])
             offset += width
-            if width == 1:
-                integer = chunk[0] - 128
-                full_scale = integer in (-128, 127)
-            elif width == 3:
-                integer = int.from_bytes(chunk, "little", signed=True)
-                full_scale = integer in (-(1 << 23), (1 << 23) - 1)
-            else:
-                integer = int.from_bytes(chunk, "little", signed=True)
-                limit = 1 << (8 * width - 1)
-                full_scale = integer in (-limit, limit - 1)
             frame_clipped = frame_clipped or full_scale
-            values.append(integer / scale)
-        samples.append(sum(values) / channels)
+            total += value
+        samples.append(total / channels)
         if frame_clipped:
             clipped_frames += 1
             clipped_run += 1
@@ -71,6 +111,7 @@ def read_wav(path: Path) -> tuple[list[float], dict]:
         "source_channels": channels,
         "source_frames": frames,
         "source_sample_width_bits": width * 8,
+        "source_format": "float" if code == FORMAT_FLOAT else "pcm",
         "clipped_frame_count": clipped_frames,
         "max_clipped_run": max_clipped_run,
     }
@@ -175,7 +216,7 @@ def prepare_file(source: Path, relative: Path, destination: Path) -> dict:
     entry = {"source": relative.as_posix(), "output": None}
     try:
         mono, metadata = read_wav(source)
-    except (EOFError, ValueError, wave.Error) as error:
+    except (EOFError, ValueError, struct.error) as error:
         entry.update({"decision": "rejected", "reason": "invalid_wav", "reasons": ["invalid_wav"],
                       "error": str(error)})
         return entry
@@ -242,6 +283,10 @@ def main() -> None:
         parser.error(f"input is not a directory: {source}")
     if output == source:
         parser.error("input and output directories must differ")
+    # The output directory is replaced wholesale, so it must not contain the corpus.
+    if output in source.parents:
+        parser.error(f"output directory {output} contains the input directory; "
+                     "choose an output path outside the corpus")
 
     excluded = [output]
     files = []

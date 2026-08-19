@@ -11,12 +11,17 @@ Prepare a directory of WAV files before fitting real snares:
 Examples/ModalDrum/scripts/prepare_snares.sh path/to/raw-snares datasets/snares-prepared
 ```
 
-The script recursively processes PCM WAVs, writes accepted clips as 0.75-second
+The script recursively processes WAVs (PCM, IEEE float, and
+`WAVE_FORMAT_EXTENSIBLE`), writes accepted clips as 0.75-second
 44.1 kHz mono WAVs, and records every acceptance or rejection in
 `manifest.json`. Re-running the command replaces the output deterministically.
 The manifest includes source format, original peak, onset/crop offset,
 normalization gain, and rejection reasons. Files with sustained RMS re-rise
 after 300 ms, DC offset, clipping, or silence are rejected.
+
+The output directory is replaced wholesale on every run, so it must be a
+dedicated path outside the corpus (the script refuses an output directory that
+contains the input).
 
 ## M0 synthetic recovery
 
