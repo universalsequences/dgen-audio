@@ -1,7 +1,24 @@
 # ModalDrum M0
 
 Closed-form modal-bank + filtered-noise synthetic recovery from
-`docs/MODAL_SNARE_SPEC.md` M0.
+`docs/MODAL_SNARE_SPEC.md`.
+
+## Corpus preparation
+
+Prepare a directory of WAV files before fitting real snares:
+
+```bash
+Examples/ModalDrum/scripts/prepare_snares.sh path/to/raw-snares datasets/snares-prepared
+```
+
+The script recursively processes PCM WAVs, writes accepted clips as 0.75-second
+44.1 kHz mono WAVs, and records every acceptance or rejection in
+`manifest.json`. Re-running the command replaces the output deterministically.
+The manifest includes source format, original peak, onset/crop offset,
+normalization gain, and rejection reasons. Files with sustained RMS re-rise
+after 300 ms, DC offset, clipping, or silence are rejected.
+
+## M0 synthetic recovery
 
 ```bash
 swift run ModalDrum fdcheck --out runs/modal_m0_fd

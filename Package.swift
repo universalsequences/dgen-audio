@@ -69,7 +69,7 @@ let package = Package(
             name: "ModalDrum",
             dependencies: ["DGenLazy"],
             path: "Examples/ModalDrum",
-            exclude: ["README.md"]
+            exclude: ["README.md", "scripts"]
         ),
         .executableTarget(
             name: "DGenLisp",
