@@ -12,6 +12,11 @@ STEPS_A="${STEPS_A:-3000}"
 STEPS_B="${STEPS_B:-800}"
 STEPS_C="${STEPS_C:-400}"
 PRETRAIN_STEPS="${PRETRAIN_STEPS:-800}"
+# z→control dynamic range (R8 third attempt): at Z_SCALE=1 the tanh-bounded z
+# through 0.1-scale residual weights reaches only ~2 dB of harmonic swing;
+# flute↔clarinet H2 contrast needs ~30 dB (±3 exp-sigmoid logits ≈ ±26 dB).
+Z_SCALE="${Z_SCALE:-8}"
+FILM_GAMMA="${FILM_GAMMA:-1.0}"
 
 [[ -f "$CACHE/manifest.json" ]] || { echo "Missing $CACHE/manifest.json" >&2; exit 1; }
 [[ -x "$BIN" ]] || swift build -c debug --product DDSPE2E
@@ -22,6 +27,7 @@ common=(
   --reference-time-frames 16 --reference-mel-bins 48 --reference-encoder-hidden 64
   --reference-latent 32 --reference-classification-weight 1.0
   --reference-separation-weight 1.0 --reference-encoder-freeze true
+  --reference-z-scale "$Z_SCALE" --reference-film-gamma "$FILM_GAMMA"
   --shuffle true --fixed-batch false --seed 1 --batch-size 1 --grad-accum-steps 1
   --grad-clip 1 --clip-mode element --normalize-grad-by-frames false --mse-weight 0
   --spectral-weight 1 --spectral-logmag-weight 1 --spectral-loss-mode l1

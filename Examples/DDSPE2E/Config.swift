@@ -126,6 +126,19 @@ struct DDSPE2EConfig: Codable {
   /// Freeze the temporal encoder during synth training so joint training
   /// cannot collapse a pretrained, instrument-separable z.
   var referenceEncoderFreeze: Bool = false
+  /// Multiplier on the direct z→control shape residuals (harmonic logits,
+  /// noise gain, noise filter — NOT harmonic gain, which stays ×1 so a
+  /// reference cannot override the frame-wise loudness control). At 1.0 the
+  /// tanh-bounded z through 0.1-scale weights yields only ~2 dB of
+  /// reference-driven harmonic swing; flute↔clarinet H2 contrast needs
+  /// ~30 dB (±3 exp-sigmoid logits ≈ ±26 dB). Larger values widen the
+  /// reachable range AND amplify gradients into the residual weights,
+  /// countering reconstruction-gradient starvation.
+  var referenceZResidualScale: Float = 1.0
+  /// Bound on the FiLM gamma tanh (hidden * (1 + gamma) + beta). The original
+  /// 0.5 caps per-channel gain modulation at ±50%; 1.0 lets a reference fully
+  /// null or double a channel.
+  var referenceFiLMGammaScale: Float = 0.5
   var modelHiddenSize: Int = 32
   var modelNumLayers: Int = 1
   var decoderBackbone: DecoderBackbone = .transformer
@@ -256,6 +269,8 @@ struct DDSPE2EConfig: Codable {
     case referencePretrainSteps
     case referencePretrainLR
     case referenceEncoderFreeze
+    case referenceZResidualScale
+    case referenceFiLMGammaScale
     case modelHiddenSize
     case modelNumLayers
     case decoderBackbone
@@ -382,6 +397,12 @@ struct DDSPE2EConfig: Codable {
       try c.decodeIfPresent(Float.self, forKey: .referencePretrainLR) ?? d.referencePretrainLR
     referenceEncoderFreeze =
       try c.decodeIfPresent(Bool.self, forKey: .referenceEncoderFreeze) ?? d.referenceEncoderFreeze
+    referenceZResidualScale =
+      try c.decodeIfPresent(Float.self, forKey: .referenceZResidualScale)
+      ?? d.referenceZResidualScale
+    referenceFiLMGammaScale =
+      try c.decodeIfPresent(Float.self, forKey: .referenceFiLMGammaScale)
+      ?? d.referenceFiLMGammaScale
     modelHiddenSize = try c.decodeIfPresent(Int.self, forKey: .modelHiddenSize) ?? d.modelHiddenSize
     modelNumLayers = try c.decodeIfPresent(Int.self, forKey: .modelNumLayers) ?? d.modelNumLayers
     decoderBackbone = try c.decodeIfPresent(DecoderBackbone.self, forKey: .decoderBackbone)
@@ -560,6 +581,12 @@ struct DDSPE2EConfig: Codable {
     }
     if let value = options["reference-encoder-freeze"] {
       referenceEncoderFreeze = parseBool(value)
+    }
+    if let value = options["reference-z-scale"] {
+      referenceZResidualScale = try parseFloat(value, key: "reference-z-scale")
+    }
+    if let value = options["reference-film-gamma"] {
+      referenceFiLMGammaScale = try parseFloat(value, key: "reference-film-gamma")
     }
     if let value = options["model-hidden"] {
       modelHiddenSize = try parseInt(value, key: "model-hidden")
@@ -886,6 +913,12 @@ struct DDSPE2EConfig: Codable {
     }
     guard referencePretrainLR > 0 else {
       throw ConfigError.invalid("referencePretrainLR must be > 0")
+    }
+    guard referenceZResidualScale > 0 else {
+      throw ConfigError.invalid("referenceZResidualScale must be > 0")
+    }
+    guard referenceFiLMGammaScale > 0 else {
+      throw ConfigError.invalid("referenceFiLMGammaScale must be > 0")
     }
     guard modelHiddenSize > 0 else {
       throw ConfigError.invalid("modelHiddenSize must be > 0")

@@ -547,6 +547,64 @@ log-amplitude, the fix is cheap: unbounded/large-scale per-harmonic z
 residuals (±3 logits ≈ ±26 dB) and/or a wider FiLM gamma bound. Do NOT
 re-run at scale before widening this path.
 
+*Run 3 (widened path, 2026-08-18): major progress — 4/6 gate wins, odd/even
+flips correctly — one narrow defect left.* New knobs `--reference-z-scale`
+(multiplier on all four z→control residuals; also amplifies gradients into
+the residual weights) and `--reference-film-gamma` (FiLM gamma tanh bound,
+was hardcoded 0.5); both default to old behavior, checkpoints unaffected
+(pinned: scale 8 widens the swap swing >2×, legacy configs decode to
+defaults). Campaign `flute_clarinet_mfff_tref3` at Z_SCALE=8, FILM_GAMMA=1.0:
+
+- Separation margin at the checkpoint of record: **+0.40..+0.42** (~8× run
+  2), swap-RMS 26–291% (run 2: 13–23%). Stage B/C again added nothing —
+  stage A's best is the weights of record
+  (`runs/flute_clarinet_mfff_tref3_stageC/checkpoints/model_best.json`,
+  which is stage A's best passed through).
+- Log-mel distance gate: correct reference wins **4/6** (all 3 clarinet
+  targets + the mf flute). The clarinet reference now flips odd/even the
+  right way: clarinet-G4 target H3−H2 = +34 dB; clarinet-ref prediction
+  +14 dB (correct direction), flute-ref prediction −5 dB (flute-like
+  rolloff). The dynamic-range hypothesis is confirmed.
+- The 2 losses are both **ff flutes**, and the cause is specific: flute-ref
+  predictions collapse to a fixed *soft* flute template — H1 pinned at
+  −41.5..−42.4 dB across every case regardless of target level (ff-F#6
+  target H1 is −17.7, i.e. ~24 dB under-shoot). The per-reference constant
+  `zHGainW` residual (×8) is overriding the frame-wise loudness control, so
+  a reference now sets absolute level instead of timbre.
+
+**Next lever: decouple level from timbre in the z path** — drop `zHGainW`
+from the widened scale (keep it ×1 or remove it; loudness is already an
+input control) while keeping the per-harmonic/noise/filter residuals wide,
+then re-run. Shape (odd/even, rolloff) is what z should own; gain is not.
+
+*Run 4 (gain residual decoupled, 2026-08-18): loudness fixed, contrast
+shrank — still 4/6.* `zHGainW` now always ×1 (code, not a flag). Campaign
+`flute_clarinet_mfff_tref4`:
+
+- The soft-template bug is gone: predicted H1 tracks target level (−33..−36
+  dB vs tref3's pinned −41.5) and reconstruction improved (correct 1.362 vs
+  1.418).
+- But without the level cheat the separation margin drops to +0.13..+0.15
+  and swap-RMS back to 13–26%; the odd/even flip survives in direction but
+  weakens (clarinet-ref H3−H2 = +7.7 dB vs tref3's +14; flute-ref ≈ 0).
+  Gate: 4/6 again, with narrower distance margins than tref3.
+- The telling dynamic, visible in both runs: **separation erodes
+  monotonically during joint training** (tref3 stage A: sep +0.4 early →
+  ~0 by step 2999; tref4: +0.14 → +0.03..0.14 noisy decline; stages B/C
+  never improve sel — every checkpoint of record is an early-stage-A
+  snapshot). The residual weights are trainable, and same-instrument-pair
+  reconstruction keeps shrinking reference-driven contrast toward the
+  instrument-average solution. Widening the path raised the ceiling; it did
+  not change the force pulling contrast down.
+
+**Diagnosed next lever: make separation a *training* objective, not just a
+checkpoint-selection criterion** — e.g. an explicit crossed-reference
+penalty in the loss (render with the wrong-instrument reference, penalize
+similarity to the target / reward the correct-vs-crossed margin), or
+freeze/EMA the residual weights after an early high-contrast point. The
+paper-style fallback (autoencode z from the *target*, swap at eval) also
+remains on the table.
+
 Out-of-ladder / later: CREPE-quality f0 and broader timbre transfer demos.
 
 ## Non-goals for v1

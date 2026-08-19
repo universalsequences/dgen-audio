@@ -593,6 +593,13 @@ Notes:
 - `--reference-mel-bins <int>` (default: `48`; temporal mode)
 - `--reference-encoder-hidden <int>` (default: `64`; temporal mode)
 - `--reference-separation-weight <float>` (default: `1.0`; checkpoint-selection margin)
+- `--reference-z-scale <float>` (default: `1.0`; multiplier on the direct z→control
+  shape residuals: harmonic logits, noise gain, noise filter — harmonic gain stays
+  ×1 so a reference can't override the loudness control. At 1.0 the tanh-bounded z
+  reaches only ~2 dB of harmonic swing; larger values widen range and amplify
+  gradients into the residual weights)
+- `--reference-film-gamma <float>` (default: `0.5`; FiLM gamma tanh bound —
+  `hidden * (1 + gamma) + beta`)
 - `--max-chunks-per-file <int>` (default: unset)
 - `--shuffle <true|false>` (default: `true`)
 - `--fixed-batch <true|false>` (default: `false`)

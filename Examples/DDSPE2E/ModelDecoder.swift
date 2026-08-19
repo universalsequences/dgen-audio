@@ -66,6 +66,10 @@ final class DDSPDecoderModel {
   let referenceLatentSize: Int
   let referenceTimeFrames: Int
   let referenceMelBins: Int
+  /// Multiplier on the z→control residuals; widens reference-driven dynamic
+  /// range (a scale-only config knob, not a weight — checkpoints unaffected).
+  let referenceZResidualScale: Float
+  let referenceFiLMGammaScale: Float
   private let referenceEncoderW: Tensor?
   private let referenceEncoderB: Tensor?
   // Temporal reference encoder: per-frame MLP → attention pool → z.
@@ -133,6 +137,8 @@ final class DDSPDecoderModel {
     self.referenceLatentSize = config.referenceLatentSize
     self.referenceTimeFrames = config.referenceTimeFrames
     self.referenceMelBins = config.referenceMelBins
+    self.referenceZResidualScale = config.referenceZResidualScale
+    self.referenceFiLMGammaScale = config.referenceFiLMGammaScale
 
     var rng = SeededGenerator(seed: config.seed)
 
@@ -450,8 +456,16 @@ final class DDSPDecoderModel {
     var harmLogits = hidden.matmul(W_harm) + b_harm
     var hGainLogits = hidden.matmul(W_hgain) + b_hgain
     if let latent = referenceLatent {
-      if let zh = zHarmW { harmLogits = harmLogits + latent.matmul(zh) }
-      if let zg = zHGainW { hGainLogits = hGainLogits + latent.matmul(zg) }
+      if let zh = zHarmW {
+        harmLogits = harmLogits + latent.matmul(zh) * referenceZResidualScale
+      }
+      // Gain residual deliberately stays at ×1: a widened per-reference
+      // constant gain overrides the frame-wise loudness control (tref3: all
+      // flute-ref renders pinned ~24 dB under an ff target). z owns spectral
+      // shape; level belongs to the loudness input.
+      if let zg = zHGainW {
+        hGainLogits = hGainLogits + latent.matmul(zg)
+      }
     }
     let harmonicAmps: Tensor
     let harmonicGain: Tensor
@@ -488,7 +502,7 @@ final class DDSPDecoderModel {
     // broadband noise gain [F,1]
     var nGainLogits = hidden.matmul(W_noise) + b_noise
     if let latent = referenceLatent, let zn = zNoiseW {
-      nGainLogits = nGainLogits + latent.matmul(zn)
+      nGainLogits = nGainLogits + latent.matmul(zn) * referenceZResidualScale
     }
     let noiseGain = harmonicHeadMode == .expSigmoid ? Self.expSigmoid(nGainLogits) : sigmoid(nGainLogits)
 
@@ -497,7 +511,7 @@ final class DDSPDecoderModel {
     if enableNoiseFilter, let wf = W_filter, let bf = b_filter {
       var filterLogits = hidden.matmul(wf) + bf
       if let latent = referenceLatent, let zf = zFilterW {
-        filterLogits = filterLogits + latent.matmul(zf)
+        filterLogits = filterLogits + latent.matmul(zf) * referenceZResidualScale
       }
       noiseFilter = sigmoid(filterLogits)
     }
@@ -766,7 +780,7 @@ final class DDSPDecoderModel {
   private func applyReferenceFiLM(_ hidden: Tensor, latent: Tensor?, layer: Int) -> Tensor {
     guard let latent, layer < referenceFiLMLayers.count else { return hidden }
     let film = referenceFiLMLayers[layer]
-    var gamma = tanh(latent.matmul(film.W_gamma) + film.b_gamma) * 0.5
+    var gamma = tanh(latent.matmul(film.W_gamma) + film.b_gamma) * referenceFiLMGammaScale
     var beta = tanh(latent.matmul(film.W_beta) + film.b_beta)
     // A temporal-encoder latent is [1, latent]; expand its FiLM rows to every
     // hidden frame for the elementwise modulation below.

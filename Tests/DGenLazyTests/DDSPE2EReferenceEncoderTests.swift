@@ -199,6 +199,58 @@ final class DDSPE2EReferenceEncoderTests: XCTestCase {
       "swapping the reference must change harmonic amplitudes even at initialization")
   }
 
+  func testConfigDecodesWithoutDynamicRangeKeysUsesDefaults() throws {
+    let legacyConfigJSON = """
+      { "referenceConditioning": true, "referenceEncoderMode": "temporal" }
+      """
+    let config = try JSONDecoder().decode(DDSPE2EConfig.self, from: Data(legacyConfigJSON.utf8))
+    XCTAssertEqual(config.referenceZResidualScale, 1.0)
+    XCTAssertEqual(config.referenceFiLMGammaScale, 0.5)
+  }
+
+  /// The R8 dynamic-range lever: a larger z-residual scale must widen how much
+  /// a reference swap moves the harmonic amplitudes, and a wider FiLM gamma
+  /// bound must change the forward output. Both models share a seed so the
+  /// only difference is the scale knobs.
+  func testZResidualScaleWidensReferenceSwing() throws {
+    func swapDiff(zScale: Float, filmGamma: Float, seed: UInt64) throws -> Float {
+      var config = makeTemporalConfig(seed: seed)
+      config.referenceZResidualScale = zScale
+      config.referenceFiLMGammaScale = filmGamma
+      let model = DDSPDecoderModel(config: config)
+      let featureRows: [[Float]] = [
+        [0.1, 0.3, 1.0, 0.0, 0.0],
+        [0.2, 0.4, 1.0, 0.1, 0.1],
+        [0.3, 0.5, 1.0, 0.1, 0.1],
+      ]
+      // Tensors after each graph clear (see CLAUDE.md).
+      let refA = referenceTensor(seedValue: 0.0, config: config)
+      let ampsA = try model.forward(features: Tensor(featureRows), reference: refA)
+        .harmonicAmps.realize()
+      LazyGraphContext.current.clearComputationGraph()
+      let refB = referenceTensor(seedValue: 2.5, config: config)
+      let ampsB = try model.forward(features: Tensor(featureRows), reference: refB)
+        .harmonicAmps.realize()
+      LazyGraphContext.current.clearComputationGraph()
+      var diff: Float = 0
+      for i in 0..<ampsA.count { diff += abs(ampsA[i] - ampsB[i]) }
+      XCTAssertTrue(ampsA.allSatisfy { $0.isFinite })
+      XCTAssertTrue(ampsB.allSatisfy { $0.isFinite })
+      return diff
+    }
+
+    let narrow = try swapDiff(zScale: 1.0, filmGamma: 0.5, seed: 21)
+    let wide = try swapDiff(zScale: 8.0, filmGamma: 0.5, seed: 21)
+    XCTAssertGreaterThan(
+      wide, narrow * 2.0,
+      "z residual scale 8 must widen the reference-swap swing well beyond scale 1")
+
+    let wideGamma = try swapDiff(zScale: 1.0, filmGamma: 1.0, seed: 21)
+    XCTAssertGreaterThan(
+      abs(wideGamma - narrow), 1e-6,
+      "widening the FiLM gamma bound must change the reference-driven output")
+  }
+
   // MARK: Gradient correctness
 
   /// FD-checks the classification-loss gradient through the temporal encoder
