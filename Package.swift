@@ -12,6 +12,7 @@ let package = Package(
         .executable(name: "BendingMetal", targets: ["BendingMetal"]),
         .executable(name: "TrainKick808", targets: ["TrainKick808"]),
         .executable(name: "SynthID", targets: ["SynthID"]),
+        .executable(name: "ModalDrum", targets: ["ModalDrum"]),
         .executable(name: "DGenLisp", targets: ["DGenLisp"]),
         .library(name: "DGen", targets: ["DGen"]),
         .library(name: "DGenLazy", targets: ["DGenLazy"]),
@@ -65,6 +66,12 @@ let package = Package(
             exclude: ["SPEC.md", "FDCHECK_FINDING.md", "RUNG1_REMAINING.md", "RUNG2_STATUS.md", "RUNG3_STATUS.md", "RUNG3_BLOCKER.md", "scripts", "targets"]
         ),
         .executableTarget(
+            name: "ModalDrum",
+            dependencies: ["DGenLazy"],
+            path: "Examples/ModalDrum",
+            exclude: ["README.md"]
+        ),
+        .executableTarget(
             name: "DGenLisp",
             dependencies: ["DGenLazy", "DGenTrainProtocol"],
             path: "Sources/DGenLisp"
@@ -86,6 +93,11 @@ let package = Package(
             name: "DGenLazyTests",
             dependencies: ["DGenLazy", "DGen", "DDSPE2E", "HarmonicE2E"],
             path: "Tests/DGenLazyTests"
+        ),
+        .testTarget(
+            name: "ModalDrumTests",
+            dependencies: ["ModalDrum", "DGenLazy"],
+            path: "Tests/ModalDrumTests"
         ),
         .testTarget(
             name: "DGenLispTests",
