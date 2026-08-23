@@ -1,3 +1,5 @@
+#if canImport(Metal)
+
 import XCTest
 
 @testable import DGen
@@ -850,3 +852,5 @@ final class ViewOpsTests: XCTestCase {
     XCTAssertEqual(gradMax, 4032.0, accuracy: 100.0, "Gradient max should be ~4032, not ~98000")
   }
 }
+
+#endif  // canImport(Metal)

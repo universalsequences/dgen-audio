@@ -74,7 +74,12 @@ final class StaticTensorFrameGradProbeTests: XCTestCase {
   }
 
   func testFFTProductGradient() throws {
+#if canImport(Darwin)
     XCTExpectFailure("static tensorFFT chain mis-propagates frame-varying adjoints (R5 finding)")
+#else
+    // swift-corelibs-xctest has no XCTExpectFailure; skip this known-failing probe.
+    throw XCTSkip("static tensorFFT chain mis-propagates frame-varying adjoints (R5 finding)")
+#endif
     let n = N
     let half = N / 2
     try runCase("fft") { h in
@@ -84,7 +89,12 @@ final class StaticTensorFrameGradProbeTests: XCTestCase {
   }
 
   func testFFTProductGradientCBackend() throws {
+#if canImport(Darwin)
     XCTExpectFailure("static tensorFFT chain mis-propagates frame-varying adjoints (R5 finding)")
+#else
+    // swift-corelibs-xctest has no XCTExpectFailure; skip this known-failing probe.
+    throw XCTSkip("static tensorFFT chain mis-propagates frame-varying adjoints (R5 finding)")
+#endif
     DGenConfig.backend = .c
     defer { DGenConfig.backend = .metal }
     let n = N

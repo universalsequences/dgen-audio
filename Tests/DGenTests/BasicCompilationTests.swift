@@ -38,6 +38,7 @@ final class BasicCompilationTests: XCTestCase {
         XCTAssertFalse(compilationResult.source.isEmpty)
     }
 
+#if canImport(Metal)
     func testBiquadMetalEqualsC() throws {
         // Build a biquad lowpass graph and compare Metal vs C
         let g = Graph()
@@ -194,4 +195,5 @@ final class BasicCompilationTests: XCTestCase {
             XCTAssertEqual(outM[i], outC[i], accuracy: tol, "Mismatch at sample \(i)")
         }
     }
+#endif  // canImport(Metal)
 }

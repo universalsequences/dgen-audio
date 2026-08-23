@@ -8,6 +8,7 @@ final class SpectralLossGradientTests: XCTestCase {
 
   /// Test that FFT-based spectralLoss computes the forward pass correctly
   /// Note: spectralLossFFT only supports Metal backend
+#if canImport(Metal)
   func testSpectralLossFFTForwardPass() throws {
     let g = Graph()
 
@@ -122,6 +123,7 @@ final class SpectralLossGradientTests: XCTestCase {
       finalLoss, 50.0,
       "Same frequency signals should have lower spectral loss than different frequencies")
   }
+#endif  // canImport(Metal)
 
   // MARK: - Hann Window Tests
 
@@ -156,6 +158,7 @@ final class SpectralLossGradientTests: XCTestCase {
 
   /// Test spectral loss with and without Hann window
   /// Note: spectralLossFFT only supports Metal backend
+#if canImport(Metal)
   func testSpectralLossWithAndWithoutHannWindow() throws {
 
     for useHann in [true, false] {
@@ -211,6 +214,7 @@ final class SpectralLossGradientTests: XCTestCase {
     }
 
   }
+#endif  // canImport(Metal)
 
   // MARK: - Gradient Tests
 
@@ -239,6 +243,7 @@ final class SpectralLossGradientTests: XCTestCase {
 
   /// Test numerical gradient verification - verifies gradient direction is correct
   /// This test uses the actual training context to verify gradients point in the right direction
+#if canImport(Metal)
   func testSpectralLossGradientNumerical() throws {
 
     // Test that gradient direction is correct by checking a step in the gradient direction
@@ -482,6 +487,7 @@ final class SpectralLossGradientTests: XCTestCase {
 
     return outputBuffer[frameCount - 1]
   }
+#endif  // canImport(Metal)
 
   // MARK: - Compilation Tests
 
@@ -578,6 +584,7 @@ final class SpectralLossGradientTests: XCTestCase {
   /// Test MLP -> peekRow -> Harmonic Synth with Spectral Loss
   /// This is the spectral loss equivalent of testMLPPeekRowHarmonicSynth_TeacherStudent
   /// for speed comparison
+#if canImport(Metal)
   func testMLPPeekRowHarmonicSynth_SpectralLoss() throws {
     let frameCount = 512
     let controlFrames = 64
@@ -1009,4 +1016,5 @@ final class SpectralLossGradientTests: XCTestCase {
     )
 
   }
+#endif  // canImport(Metal)
 }

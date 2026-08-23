@@ -1,3 +1,4 @@
+import Foundation
 import DGen
 import XCTest
 
@@ -317,7 +318,7 @@ final class MatmulKernelTests: XCTestCase {
     optimizer.zeroGrad()
 
     // Timed epochs
-    let start = CFAbsoluteTimeGetCurrent()
+    let start = Date().timeIntervalSinceReferenceDate
     for _ in 0..<epochs {
       let spectrogram = Tensor(spectrogramData).reshape([numWindows, numBins])
       let target = Tensor(pattern).reshape([numWindows, 1])
@@ -335,7 +336,7 @@ final class MatmulKernelTests: XCTestCase {
       optimizer.step()
       optimizer.zeroGrad()
     }
-    let elapsed = CFAbsoluteTimeGetCurrent() - start
+    let elapsed = Date().timeIntervalSinceReferenceDate - start
 
     let msPerStep = (elapsed / Double(epochs)) * 1000
     print("\n=== Attention Step Benchmark ===")

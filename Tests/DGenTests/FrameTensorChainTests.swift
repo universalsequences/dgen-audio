@@ -1,3 +1,5 @@
+#if canImport(Metal)
+
 import XCTest
 
 @testable import DGen
@@ -165,3 +167,5 @@ final class FrameTensorChainTests: XCTestCase {
         XCTAssertTrue(hasNonZeroGrads, "Should have non-zero gradients")
     }
 }
+
+#endif  // canImport(Metal)
