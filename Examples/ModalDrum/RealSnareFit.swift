@@ -89,7 +89,9 @@ enum RealSnareFitter {
     config input: ModalDrumConfig,
     runDirectory: URL,
     numericGateOverride: Float? = nil,
-    kernelDumpPath: String? = nil
+    kernelDumpPath: String? = nil,
+    runModalOnly: Bool = true,
+    initialPatch: ModalPatch? = nil
   ) throws -> RealSnareSweepSummary {
     var config = input
     config.frames = Int((0.75 * config.sampleRate).rounded())
@@ -114,7 +116,7 @@ enum RealSnareFitter {
     }
     var fits: [RealSnareFitResult] = []
     for k in modes {
-      for includesNoise in [false, true] {
+      for includesNoise in runModalOnly ? [false, true] : [true] {
         var fitConfig = config
         fitConfig.modes = k
         let name = String(format: "k%03d_%@", k, includesNoise ? "modal_noise" : "modal_only")
@@ -123,7 +125,7 @@ enum RealSnareFitter {
         let fit = try fit(
           target: target, config: fitConfig, includesNoise: includesNoise,
           numericGate: calibration.numericGate, runDirectory: directory,
-          kernelDumpPath: dump)
+          kernelDumpPath: dump, initialPatch: initialPatch)
         fits.append(fit)
       }
     }
@@ -196,7 +198,8 @@ enum RealSnareFitter {
     includesNoise: Bool,
     numericGate: Float,
     runDirectory: URL,
-    kernelDumpPath: String?
+    kernelDumpPath: String?,
+    initialPatch suppliedInitialPatch: ModalPatch?
   ) throws -> RealSnareFitResult {
     let started = Date()
     for path in [
@@ -207,11 +210,17 @@ enum RealSnareFitter {
     }
     config.applyRuntime(kernelOutputPath: kernelDumpPath)
     let frequenciesData = modalFrequencyGrid(count: config.modes)
-    var initial = flatInitialPatch(modes: config.modes)
-    initial.gains = spectralEnvelopeWarmStart(
-      samples: target, frequencies: frequenciesData, sampleRate: config.sampleRate,
-      decaySeconds: initial.decaySeconds.first ?? 0.15,
-      durationSeconds: Float(config.frames) / config.sampleRate)
+    var initial = suppliedInitialPatch ?? flatInitialPatch(modes: config.modes)
+    guard initial.gains.count == config.modes, initial.decaySeconds.count == config.modes else {
+      throw RealSnareFitError.invalidInput(
+        "the initial patch has \(initial.gains.count) modes; expected \(config.modes)")
+    }
+    if suppliedInitialPatch == nil {
+      initial.gains = spectralEnvelopeWarmStart(
+        samples: target, frequencies: frequenciesData, sampleRate: config.sampleRate,
+        decaySeconds: initial.decaySeconds.first ?? 0.15,
+        durationSeconds: Float(config.frames) / config.sampleRate)
+    }
     if !includesNoise { initial.noiseGain = 0.00001 }
 
     LazyGraphContext.reset()

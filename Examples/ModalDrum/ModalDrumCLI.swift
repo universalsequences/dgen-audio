@@ -53,7 +53,8 @@ private func usage() {
       swift run ModalDrum train [--steps N] [--frames N] [--modes K] [--out runs/modal_m0]
       swift run ModalDrum render-target [--frames N] [--modes K] [--out target.wav]
       swift run ModalDrum fit-real --target prepared.wav --wrong-snare other.wav \
-        [--k 32,64,128] [--steps N] [--gate SCORE] [--out runs/modal_m1]
+        [--k 32,64,128] [--steps N] [--gate SCORE] [--noise-only] \
+        [--initial-patch best_params.json] [--out runs/modal_m1]
 
     fit-real requires prepared, mono-compatible 44.1 kHz WAVs of exactly 0.75 s.
     It calibrates the CPU MR-STFT score, sweeps K, runs the modal/noise ablation,
@@ -107,12 +108,16 @@ enum ModalDrumMain {
         Int($0.trimmingCharacters(in: .whitespaces))
       }
       let root = URL(fileURLWithPath: opts["out"] ?? "runs/modal_m1", isDirectory: true)
+      let initialPatch = try opts["initial-patch"].map {
+        try JSONDecoder().decode(ModalPatch.self, from: Data(contentsOf: URL(fileURLWithPath: $0)))
+      }
       let summary = try RealSnareFitter.runSweep(
         targetURL: URL(fileURLWithPath: targetPath),
         wrongSnareURL: URL(fileURLWithPath: wrongPath),
         modeCounts: modes, config: config, runDirectory: root,
         numericGateOverride: opts["gate"].flatMap(Float.init),
-        kernelDumpPath: opts["kernel-dump"])
+        kernelDumpPath: opts["kernel-dump"], runModalOnly: opts["noise-only"] != "true",
+        initialPatch: initialPatch)
       print("numeric gate=\(summary.calibration.numericGate)")
       let passingK = summary.smallestPassingModes.map(String.init) ?? "none"
       print("smallest passing K=\(passingK)")

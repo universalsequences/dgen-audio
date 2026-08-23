@@ -7,8 +7,16 @@ final class ModalDrumParameters {
   let firTaps: Tensor
   let rawNoiseGain: Tensor
   let rawNoiseTau: Tensor
+  let noiseTailFIRTaps: Tensor
+  let rawNoiseTailGain: Tensor
+  let rawNoiseTailTau: Tensor
 
-  var all: [any LazyValue] { [rawGains, rawModeTaus, firTaps, rawNoiseGain, rawNoiseTau] }
+  var all: [any LazyValue] {
+    [
+      rawGains, rawModeTaus, firTaps, rawNoiseGain, rawNoiseTau,
+      noiseTailFIRTaps, rawNoiseTailGain, rawNoiseTailTau,
+    ]
+  }
 
   init(patch: ModalPatch, trainable: Bool) {
     precondition(patch.gains.count == patch.decaySeconds.count)
@@ -20,18 +28,29 @@ final class ModalDrumParameters {
     let taus = patch.decaySeconds.map { ModalRanges.raw(for: $0, in: ModalRanges.modeTau) }
     let ng = [logit(patch.noiseGain)]
     let nt = [ModalRanges.raw(for: patch.noiseDecaySeconds, in: ModalRanges.noiseTau)]
+    let tailNG = [logit(patch.noiseTailGain)]
+    let tailNT = [
+      ModalRanges.raw(for: patch.noiseTailDecaySeconds, in: ModalRanges.noiseTailTau)
+    ]
     if trainable {
       rawGains = Tensor.param([gains.count], data: gains)
       rawModeTaus = Tensor.param([taus.count], data: taus)
       firTaps = Tensor.param([patch.firTaps.count], data: patch.firTaps)
       rawNoiseGain = Tensor.param([1], data: ng)
       rawNoiseTau = Tensor.param([1], data: nt)
+      noiseTailFIRTaps = Tensor.param(
+        [patch.noiseTailFIRTaps.count], data: patch.noiseTailFIRTaps)
+      rawNoiseTailGain = Tensor.param([1], data: tailNG)
+      rawNoiseTailTau = Tensor.param([1], data: tailNT)
     } else {
       rawGains = Tensor(gains)
       rawModeTaus = Tensor(taus)
       firTaps = Tensor(patch.firTaps)
       rawNoiseGain = Tensor(ng)
       rawNoiseTau = Tensor(nt)
+      noiseTailFIRTaps = Tensor(patch.noiseTailFIRTaps)
+      rawNoiseTailGain = Tensor(tailNG)
+      rawNoiseTailTau = Tensor(tailNT)
     }
   }
 
@@ -39,6 +58,10 @@ final class ModalDrumParameters {
   var modeTaus: Tensor { ModalRanges.logMapped(rawModeTaus, range: ModalRanges.modeTau) }
   var noiseGain: Tensor { rawNoiseGain.sigmoid() }
   var noiseTau: Tensor { ModalRanges.logMapped(rawNoiseTau, range: ModalRanges.noiseTau) }
+  var noiseTailGain: Tensor { rawNoiseTailGain.sigmoid() }
+  var noiseTailTau: Tensor {
+    ModalRanges.logMapped(rawNoiseTailTau, range: ModalRanges.noiseTailTau)
+  }
 
   func naturalPatch() -> ModalPatch {
     func sigmoid(_ x: Float) -> Float { 1 / (1 + Foundation.exp(-x)) }
@@ -53,13 +76,19 @@ final class ModalDrumParameters {
       decaySeconds: (rawModeTaus.getData() ?? []).map { mapped($0, ModalRanges.modeTau) },
       firTaps: firTaps.getData() ?? [],
       noiseGain: sigmoid((rawNoiseGain.getData() ?? [0])[0]),
-      noiseDecaySeconds: mapped((rawNoiseTau.getData() ?? [0])[0], ModalRanges.noiseTau))
+      noiseDecaySeconds: mapped((rawNoiseTau.getData() ?? [0])[0], ModalRanges.noiseTau),
+      noiseTailFIRTaps: noiseTailFIRTaps.getData() ?? [],
+      noiseTailGain: sigmoid((rawNoiseTailGain.getData() ?? [0])[0]),
+      noiseTailDecaySeconds: mapped(
+        (rawNoiseTailTau.getData() ?? [0])[0], ModalRanges.noiseTailTau))
   }
 
   func rawGroups() -> [(name: String, tensor: Tensor)] {
     [
       ("g", rawGains), ("log_tau", rawModeTaus), ("fir", firTaps),
       ("noise_gain", rawNoiseGain), ("noise_log_tau", rawNoiseTau),
+      ("noise_tail_fir", noiseTailFIRTaps), ("noise_tail_gain", rawNoiseTailGain),
+      ("noise_tail_log_tau", rawNoiseTailTau),
     ]
   }
 }
@@ -99,12 +128,20 @@ enum ModalDrumSynth {
 
     if includeNoise {
       precondition(params.firTaps.shape == [firSize])
+      precondition(params.noiseTailFIRTaps.shape == [firSize])
+      // Both layers filter the same deterministic wire excitation. Separate
+      // FIRs and ordered decay ranges let the transient crack and the sizzle
+      // tail learn different spectra without introducing a second RNG stream.
       let noiseBuffer = Signal.noise().buffer(size: firSize).reshape([firSize])
-      let filtered = (noiseBuffer * params.firTaps).sum()
+      let crack = (noiseBuffer * params.firTaps).sum()
+      let tail = (noiseBuffer * params.noiseTailFIRTaps).sum()
       let noiseTime = Signal.phasor(Tensor([rampFrequency]))
-      let noiseEnvelope = (noiseTime * (timeScale / params.noiseTau) * -1.0).exp().sum()
-      let gain = params.noiseGain.peek(Signal.constant(0))
-      output = output + filtered * noiseEnvelope * gain
+      let crackEnvelope = (noiseTime * (timeScale / params.noiseTau) * -1.0).exp().sum()
+      let tailEnvelope =
+        (noiseTime * (timeScale / params.noiseTailTau) * -1.0).exp().sum()
+      let crackGain = params.noiseGain.peek(Signal.constant(0))
+      let tailGain = params.noiseTailGain.peek(Signal.constant(0))
+      output = output + crack * crackEnvelope * crackGain + tail * tailEnvelope * tailGain
     }
     return output
   }

@@ -37,7 +37,10 @@ enum ModalFDChecker {
       })
     var results: [ModalFDGroupResult] = []
 
-    for group in ["g", "log_tau", "fir", "noise_gain", "noise_log_tau"] {
+    for group in [
+      "g", "log_tau", "fir", "noise_gain", "noise_log_tau",
+      "noise_tail_fir", "noise_tail_gain", "noise_tail_log_tau",
+    ] {
       guard let values = baseRaw[group] else { continue }
       var fd = [Float](repeating: 0, count: values.count)
       for index in values.indices {
@@ -59,7 +62,7 @@ enum ModalFDChecker {
 
     let report = ModalFDCheckReport(
       epsilon: epsilon, frames: config.frames, groups: results,
-      passed: results.count == 5 && results.allSatisfy { $0.cosine > 0.999 })
+      passed: results.count == 8 && results.allSatisfy { $0.cosine > 0.999 })
     if let outputURL {
       let encoder = JSONEncoder()
       encoder.outputFormatting = [.prettyPrinted, .sortedKeys]

@@ -28,6 +28,12 @@ final class ModalDrumTests: XCTestCase {
     }
     XCTAssertEqual(recovered.noiseDecaySeconds, patch.noiseDecaySeconds, accuracy: 1e-5)
     XCTAssertTrue(ModalRanges.noiseTau.contains(recovered.noiseDecaySeconds))
+    XCTAssertEqual(recovered.noiseTailFIRTaps, patch.noiseTailFIRTaps)
+    XCTAssertEqual(recovered.noiseTailGain, patch.noiseTailGain, accuracy: 1e-5)
+    XCTAssertEqual(
+      recovered.noiseTailDecaySeconds, patch.noiseTailDecaySeconds, accuracy: 1e-5)
+    XCTAssertTrue(ModalRanges.noiseTailTau.contains(recovered.noiseTailDecaySeconds))
+    XCTAssertLessThan(ModalRanges.noiseTau.upperBound, ModalRanges.noiseTailTau.upperBound)
   }
 
   func testRealSnareCalibrationDerivesConcreteGateFromNegativeControls() throws {

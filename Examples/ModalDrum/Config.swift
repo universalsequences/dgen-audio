@@ -43,11 +43,17 @@ struct ModalPatch: Codable, Equatable {
   var firTaps: [Float]
   var noiseGain: Float
   var noiseDecaySeconds: Float
+  var noiseTailFIRTaps: [Float]
+  var noiseTailGain: Float
+  var noiseTailDecaySeconds: Float
 }
 
 enum ModalRanges {
   static let modeTau: ClosedRange<Float> = 0.005...2.0
-  static let noiseTau: ClosedRange<Float> = 0.010...0.250
+  // Keep the two wire layers ordered by construction: the first captures the
+  // crack while the second is free to retain a spectrally different tail.
+  static let noiseTau: ClosedRange<Float> = 0.005...0.050
+  static let noiseTailTau: ClosedRange<Float> = 0.020...0.250
 
   static func raw(for value: Float, in range: ClosedRange<Float>) -> Float {
     let lo = Foundation.log(range.lowerBound)
@@ -90,8 +96,14 @@ func knownModalPatch(modes: Int) -> ModalPatch {
     firTaps: [
       0.02, 0.04, 0.07, 0.11, 0.16, 0.20, 0.16, 0.11, 0.07, 0.04, 0.02, -0.01, -0.02, -0.01, 0,
     ],
-    noiseGain: 0.24,
-    noiseDecaySeconds: 0.075)
+    noiseGain: 0.18,
+    noiseDecaySeconds: 0.018,
+    noiseTailFIRTaps: [
+      0, -0.01, -0.02, -0.01, 0.02, 0.08, 0.14, 0.20, 0.14, 0.08, 0.02, -0.01, -0.02,
+      -0.01, 0,
+    ],
+    noiseTailGain: 0.10,
+    noiseTailDecaySeconds: 0.090)
 }
 
 func flatInitialPatch(modes: Int) -> ModalPatch {
@@ -99,6 +111,9 @@ func flatInitialPatch(modes: Int) -> ModalPatch {
     gains: [Float](repeating: 0.20, count: modes),
     decaySeconds: [Float](repeating: 0.15, count: modes),
     firTaps: [0, 0, 0.02, 0.05, 0.10, 0.16, 0.22, 0.16, 0.10, 0.05, 0.02, 0, 0, 0, 0],
-    noiseGain: 0.10,
-    noiseDecaySeconds: 0.08)
+    noiseGain: 0.08,
+    noiseDecaySeconds: 0.018,
+    noiseTailFIRTaps: [Float](repeating: 0, count: ModalDrumSynth.firSize),
+    noiseTailGain: 0.10,
+    noiseTailDecaySeconds: 0.080)
 }
