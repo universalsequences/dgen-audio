@@ -56,7 +56,12 @@ public class CLazyRuntime: LazyRuntime {
     ) throws {
         self.cellAllocations = cellAllocations
         self.memorySize = max(memorySize, 1024)
-        self.outputsSize = frameCount
+        // The C backend emits frame loops that step 4 frames at a time and store
+        // whole `vst1q_f32` vectors, so a call with `frameCount % 4 != 0` writes
+        // up to 3 float lanes past frame `frameCount - 1`. Round the buffer up to
+        // the SIMD group so that tail is inside the allocation. (Real OOB on every
+        // platform; macOS's size-class allocator merely absorbed it silently.)
+        self.outputsSize = (frameCount + 3) & ~3
 
         // Concatenate all kernel sources into a single C file
         let combinedSource = kernels.map { $0.source }.joined(separator: "\n\n")
