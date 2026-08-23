@@ -5,6 +5,12 @@ import XCTest
 @testable import DGenLisp
 
 final class BatchLispEvaluatorTests: XCTestCase {
+  override func tearDown() {
+    DGenConfig.maxFrameCount = 4096
+    DGenConfig.backend = .metal
+    super.tearDown()
+  }
+
   func testBatchEvaluationBroadcastsFrozenSeedValuesAlongsideCandidateParams() throws {
     DGenConfig.backend = .c
     DGenConfig.sampleRate = 2_000

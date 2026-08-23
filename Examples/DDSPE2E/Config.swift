@@ -28,6 +28,30 @@ enum DecoderBackbone: String, Codable {
   case transformer
 }
 
+/// How the noise branch applies its learned response.
+/// `fir`: time-domain taps (the DDSPE2E shortcut).
+/// `fd`: the paper's frequency-sampled filter (see NoiseFD.swift).
+enum NoiseFilterMode: String, Codable {
+  case fir
+  case fd
+}
+
+/// Whether the synth output passes through a trainable convolution reverb
+/// (the DDSP paper's learned IR). See Sources/DGenLazy/LearnedReverb.swift.
+enum ReverbMode: String, Codable {
+  case off
+  case learned
+}
+
+/// How the reference audio is summarized for the timbre encoder.
+/// `averaged`: one time-averaged MFCC-style vector (the first R8 attempt).
+/// `temporal`: multiple log-mel frames through a learned attention-pooled
+/// encoder, preserving attack/noise/spectral-envelope dynamics.
+enum ReferenceEncoderMode: String, Codable {
+  case averaged
+  case temporal
+}
+
 enum SpectralLossModeOption: String, Codable {
   case l2
   case l1
@@ -51,10 +75,20 @@ struct DDSPE2EConfig: Codable {
   var silenceRMS: Float = 0.0005
   var voicedThreshold: Float = 0.3
 
+  /// Per-file peak normalization target. Set to 0 to preserve source levels,
+  /// which is required when absolute dynamics are part of the conditioning.
   var peakNormalizeTo: Float = 0.99
+  /// Apply one peak gain computed over the dataset instead of independently
+  /// normalizing each recording. This preserves relative dynamic levels.
+  var normalizeAcrossDataset: Bool = false
 
   var trainSplit: Float = 0.9
   var shuffleChunks: Bool = true
+  /// Derive an instrument label from each WAV's top-level input subdirectory.
+  var labelByTopLevelDirectory: Bool = false
+  /// Keep every chunk from one source recording in the same split. This avoids
+  /// overlap leakage when chunkHop < chunkSize.
+  var splitBySourceFile: Bool = false
   var fixedBatch: Bool = false
 
   var seed: UInt64 = 1337
@@ -62,6 +96,49 @@ struct DDSPE2EConfig: Codable {
   var maxChunksPerFile: Int?
 
   // M2 decoder-only model/training parameters
+  /// Number of timbres represented by one decoder. Values > 1 append a
+  /// one-hot instrument selector to every conditioning frame.
+  var numInstruments: Int = 1
+  /// Encode a separate audio reference descriptor into a latent timbre code.
+  /// Instrument labels are used only by the loader to choose reference pairs.
+  var referenceConditioning: Bool = false
+  var referenceFeatureSize: Int = 16
+  var referenceLatentSize: Int = 16
+  var referenceClassificationWeight: Float = 0.1
+  var referenceEncoderMode: ReferenceEncoderMode = .averaged
+  /// Temporal-mode reference representation: referenceTimeFrames log-mel
+  /// frames × referenceMelBins bins, not averaged across time.
+  var referenceTimeFrames: Int = 16
+  var referenceMelBins: Int = 48
+  var referenceEncoderHidden: Int = 64
+  /// Checkpoint selection: weight on the crossed-minus-correct reference
+  /// score margin. 0 reproduces reconstruction-only selection.
+  var referenceSeparationWeight: Float = 1.0
+  /// Classification-only steps that train the temporal encoder + classifier
+  /// before synth training. Joint training lets the reconstruction gradient
+  /// drown the classification gradient (z never separates even though a
+  /// linear probe on the raw log-mel input reaches 100%); pretraining breaks
+  /// that cycle.
+  var referencePretrainSteps: Int = 0
+  /// Learning rate for classification-only pretraining (the synth LR is far
+  /// too small for a plain cross-entropy objective).
+  var referencePretrainLR: Float = 1e-3
+  /// Freeze the temporal encoder during synth training so joint training
+  /// cannot collapse a pretrained, instrument-separable z.
+  var referenceEncoderFreeze: Bool = false
+  /// Multiplier on the direct z→control shape residuals (harmonic logits,
+  /// noise gain, noise filter — NOT harmonic gain, which stays ×1 so a
+  /// reference cannot override the frame-wise loudness control). At 1.0 the
+  /// tanh-bounded z through 0.1-scale weights yields only ~2 dB of
+  /// reference-driven harmonic swing; flute↔clarinet H2 contrast needs
+  /// ~30 dB (±3 exp-sigmoid logits ≈ ±26 dB). Larger values widen the
+  /// reachable range AND amplify gradients into the residual weights,
+  /// countering reconstruction-gradient starvation.
+  var referenceZResidualScale: Float = 1.0
+  /// Bound on the FiLM gamma tanh (hidden * (1 + gamma) + beta). The original
+  /// 0.5 caps per-channel gain modulation at ±50%; 1.0 lets a reference fully
+  /// null or double a channel.
+  var referenceFiLMGammaScale: Float = 0.5
   var modelHiddenSize: Int = 32
   var modelNumLayers: Int = 1
   var decoderBackbone: DecoderBackbone = .transformer
@@ -92,6 +169,38 @@ struct DDSPE2EConfig: Codable {
   var harmonicConcentrationRampSteps: Int = 0
   var enableNoiseFilter: Bool = false
   var noiseFilterSize: Int = 15
+  var noiseFilterMode: NoiseFilterMode = .fir
+  var noiseFDFFTSize: Int = 128
+  var noiseFDHop: Int = 32
+  var noiseFDIRLength: Int = 64
+  var reverbMode: ReverbMode = .off
+  var reverbIRLength: Int = 512
+  var reverbFFTSize: Int = 1_024
+  var reverbHop: Int = 256
+
+  /// Width of the decoder's noise-filter head. In `fd` mode the head predicts a
+  /// half-spectrum magnitude per bin, so its size is fixed by the FFT size.
+  var noiseFilterOutputSize: Int {
+    noiseFilterMode == .fd ? noiseFDFFTSize / 2 + 1 : max(2, noiseFilterSize)
+  }
+
+  var reverbSettings: DDSPSynth.ReverbSettings {
+    DDSPSynth.ReverbSettings(
+      mode: reverbMode,
+      fftSize: reverbFFTSize,
+      hop: reverbHop,
+      irLength: reverbIRLength
+    )
+  }
+
+  var noiseFilterSettings: DDSPSynth.NoiseFilterSettings {
+    DDSPSynth.NoiseFilterSettings(
+      mode: noiseFilterMode,
+      fftSize: noiseFDFFTSize,
+      hop: noiseFDHop,
+      irLength: noiseFDIRLength
+    )
+  }
   var learningRate: Float = 0.001
   var lrSchedule: LRSchedule = .cosine
   var lrMin: Float = 1e-5
@@ -138,12 +247,30 @@ struct DDSPE2EConfig: Codable {
     case silenceRMS
     case voicedThreshold
     case peakNormalizeTo
+    case normalizeAcrossDataset
     case trainSplit
     case shuffleChunks
+    case labelByTopLevelDirectory
+    case splitBySourceFile
     case fixedBatch
     case seed
     case maxFiles
     case maxChunksPerFile
+    case numInstruments
+    case referenceConditioning
+    case referenceFeatureSize
+    case referenceLatentSize
+    case referenceClassificationWeight
+    case referenceEncoderMode
+    case referenceTimeFrames
+    case referenceMelBins
+    case referenceEncoderHidden
+    case referenceSeparationWeight
+    case referencePretrainSteps
+    case referencePretrainLR
+    case referenceEncoderFreeze
+    case referenceZResidualScale
+    case referenceFiLMGammaScale
     case modelHiddenSize
     case modelNumLayers
     case decoderBackbone
@@ -173,6 +300,14 @@ struct DDSPE2EConfig: Codable {
     case harmonicConcentrationRampSteps
     case enableNoiseFilter
     case noiseFilterSize
+    case noiseFilterMode
+    case noiseFDFFTSize
+    case noiseFDHop
+    case noiseFDIRLength
+    case reverbMode
+    case reverbIRLength
+    case reverbFFTSize
+    case reverbHop
     case learningRate
     case lrSchedule
     case lrMin
@@ -221,12 +356,53 @@ struct DDSPE2EConfig: Codable {
     silenceRMS = try c.decodeIfPresent(Float.self, forKey: .silenceRMS) ?? d.silenceRMS
     voicedThreshold = try c.decodeIfPresent(Float.self, forKey: .voicedThreshold) ?? d.voicedThreshold
     peakNormalizeTo = try c.decodeIfPresent(Float.self, forKey: .peakNormalizeTo) ?? d.peakNormalizeTo
+    normalizeAcrossDataset =
+      try c.decodeIfPresent(Bool.self, forKey: .normalizeAcrossDataset) ?? d.normalizeAcrossDataset
     trainSplit = try c.decodeIfPresent(Float.self, forKey: .trainSplit) ?? d.trainSplit
     shuffleChunks = try c.decodeIfPresent(Bool.self, forKey: .shuffleChunks) ?? d.shuffleChunks
+    labelByTopLevelDirectory =
+      try c.decodeIfPresent(Bool.self, forKey: .labelByTopLevelDirectory)
+      ?? d.labelByTopLevelDirectory
+    splitBySourceFile =
+      try c.decodeIfPresent(Bool.self, forKey: .splitBySourceFile) ?? d.splitBySourceFile
     fixedBatch = try c.decodeIfPresent(Bool.self, forKey: .fixedBatch) ?? d.fixedBatch
     seed = try c.decodeIfPresent(UInt64.self, forKey: .seed) ?? d.seed
     maxFiles = try c.decodeIfPresent(Int.self, forKey: .maxFiles)
     maxChunksPerFile = try c.decodeIfPresent(Int.self, forKey: .maxChunksPerFile)
+    numInstruments = try c.decodeIfPresent(Int.self, forKey: .numInstruments) ?? d.numInstruments
+    referenceConditioning =
+      try c.decodeIfPresent(Bool.self, forKey: .referenceConditioning) ?? d.referenceConditioning
+    referenceFeatureSize =
+      try c.decodeIfPresent(Int.self, forKey: .referenceFeatureSize) ?? d.referenceFeatureSize
+    referenceLatentSize =
+      try c.decodeIfPresent(Int.self, forKey: .referenceLatentSize) ?? d.referenceLatentSize
+    referenceClassificationWeight =
+      try c.decodeIfPresent(Float.self, forKey: .referenceClassificationWeight)
+      ?? d.referenceClassificationWeight
+    referenceEncoderMode =
+      try c.decodeIfPresent(ReferenceEncoderMode.self, forKey: .referenceEncoderMode)
+      ?? d.referenceEncoderMode
+    referenceTimeFrames =
+      try c.decodeIfPresent(Int.self, forKey: .referenceTimeFrames) ?? d.referenceTimeFrames
+    referenceMelBins =
+      try c.decodeIfPresent(Int.self, forKey: .referenceMelBins) ?? d.referenceMelBins
+    referenceEncoderHidden =
+      try c.decodeIfPresent(Int.self, forKey: .referenceEncoderHidden) ?? d.referenceEncoderHidden
+    referenceSeparationWeight =
+      try c.decodeIfPresent(Float.self, forKey: .referenceSeparationWeight)
+      ?? d.referenceSeparationWeight
+    referencePretrainSteps =
+      try c.decodeIfPresent(Int.self, forKey: .referencePretrainSteps) ?? d.referencePretrainSteps
+    referencePretrainLR =
+      try c.decodeIfPresent(Float.self, forKey: .referencePretrainLR) ?? d.referencePretrainLR
+    referenceEncoderFreeze =
+      try c.decodeIfPresent(Bool.self, forKey: .referenceEncoderFreeze) ?? d.referenceEncoderFreeze
+    referenceZResidualScale =
+      try c.decodeIfPresent(Float.self, forKey: .referenceZResidualScale)
+      ?? d.referenceZResidualScale
+    referenceFiLMGammaScale =
+      try c.decodeIfPresent(Float.self, forKey: .referenceFiLMGammaScale)
+      ?? d.referenceFiLMGammaScale
     modelHiddenSize = try c.decodeIfPresent(Int.self, forKey: .modelHiddenSize) ?? d.modelHiddenSize
     modelNumLayers = try c.decodeIfPresent(Int.self, forKey: .modelNumLayers) ?? d.modelNumLayers
     decoderBackbone = try c.decodeIfPresent(DecoderBackbone.self, forKey: .decoderBackbone)
@@ -284,6 +460,16 @@ struct DDSPE2EConfig: Codable {
       try c.decodeIfPresent(Bool.self, forKey: .enableNoiseFilter) ?? d.enableNoiseFilter
     noiseFilterSize =
       try c.decodeIfPresent(Int.self, forKey: .noiseFilterSize) ?? d.noiseFilterSize
+    noiseFilterMode =
+      try c.decodeIfPresent(NoiseFilterMode.self, forKey: .noiseFilterMode) ?? d.noiseFilterMode
+    noiseFDFFTSize = try c.decodeIfPresent(Int.self, forKey: .noiseFDFFTSize) ?? d.noiseFDFFTSize
+    noiseFDHop = try c.decodeIfPresent(Int.self, forKey: .noiseFDHop) ?? d.noiseFDHop
+    noiseFDIRLength =
+      try c.decodeIfPresent(Int.self, forKey: .noiseFDIRLength) ?? d.noiseFDIRLength
+    reverbMode = try c.decodeIfPresent(ReverbMode.self, forKey: .reverbMode) ?? d.reverbMode
+    reverbIRLength = try c.decodeIfPresent(Int.self, forKey: .reverbIRLength) ?? d.reverbIRLength
+    reverbFFTSize = try c.decodeIfPresent(Int.self, forKey: .reverbFFTSize) ?? d.reverbFFTSize
+    reverbHop = try c.decodeIfPresent(Int.self, forKey: .reverbHop) ?? d.reverbHop
     learningRate = try c.decodeIfPresent(Float.self, forKey: .learningRate) ?? d.learningRate
     lrSchedule = try c.decodeIfPresent(LRSchedule.self, forKey: .lrSchedule) ?? d.lrSchedule
     lrMin = try c.decodeIfPresent(Float.self, forKey: .lrMin) ?? d.lrMin
@@ -339,11 +525,68 @@ struct DDSPE2EConfig: Codable {
     if let value = options["normalize-to"] {
       peakNormalizeTo = try parseFloat(value, key: "normalize-to")
     }
+    if let value = options["global-normalize"] {
+      normalizeAcrossDataset = parseBool(value)
+    }
     if let value = options["train-split"] { trainSplit = try parseFloat(value, key: "train-split") }
+    if let value = options["split-by-source"] { splitBySourceFile = parseBool(value) }
     if let value = options["seed"] { seed = try parseUInt64(value, key: "seed") }
+    if let value = options["label-by-top-level"] {
+      labelByTopLevelDirectory = parseBool(value)
+    }
     if let value = options["max-files"] { maxFiles = try parseInt(value, key: "max-files") }
     if let value = options["max-chunks-per-file"] {
       maxChunksPerFile = try parseInt(value, key: "max-chunks-per-file")
+    }
+    if let value = options["instruments"] {
+      numInstruments = try parseInt(value, key: "instruments")
+    }
+    if let value = options["reference-conditioning"] {
+      referenceConditioning = parseBool(value)
+    }
+    if let value = options["reference-features"] {
+      referenceFeatureSize = try parseInt(value, key: "reference-features")
+    }
+    if let value = options["reference-latent"] {
+      referenceLatentSize = try parseInt(value, key: "reference-latent")
+    }
+    if let value = options["reference-classification-weight"] {
+      referenceClassificationWeight = try parseFloat(
+        value, key: "reference-classification-weight")
+    }
+    if let value = options["reference-encoder"] {
+      guard let mode = ReferenceEncoderMode(rawValue: value.lowercased()) else {
+        throw ConfigError.invalid(
+          "Invalid reference encoder for --reference-encoder: \(value) (expected averaged|temporal)")
+      }
+      referenceEncoderMode = mode
+    }
+    if let value = options["reference-time-frames"] {
+      referenceTimeFrames = try parseInt(value, key: "reference-time-frames")
+    }
+    if let value = options["reference-mel-bins"] {
+      referenceMelBins = try parseInt(value, key: "reference-mel-bins")
+    }
+    if let value = options["reference-encoder-hidden"] {
+      referenceEncoderHidden = try parseInt(value, key: "reference-encoder-hidden")
+    }
+    if let value = options["reference-separation-weight"] {
+      referenceSeparationWeight = try parseFloat(value, key: "reference-separation-weight")
+    }
+    if let value = options["reference-pretrain-steps"] {
+      referencePretrainSteps = try parseInt(value, key: "reference-pretrain-steps")
+    }
+    if let value = options["reference-pretrain-lr"] {
+      referencePretrainLR = try parseFloat(value, key: "reference-pretrain-lr")
+    }
+    if let value = options["reference-encoder-freeze"] {
+      referenceEncoderFreeze = parseBool(value)
+    }
+    if let value = options["reference-z-scale"] {
+      referenceZResidualScale = try parseFloat(value, key: "reference-z-scale")
+    }
+    if let value = options["reference-film-gamma"] {
+      referenceFiLMGammaScale = try parseFloat(value, key: "reference-film-gamma")
     }
     if let value = options["model-hidden"] {
       modelHiddenSize = try parseInt(value, key: "model-hidden")
@@ -449,6 +692,36 @@ struct DDSPE2EConfig: Codable {
     }
     if let value = options["noise-filter-size"] {
       noiseFilterSize = try parseInt(value, key: "noise-filter-size")
+    }
+    if let value = options["noise-filter-mode"] {
+      guard let mode = NoiseFilterMode(rawValue: value.lowercased()) else {
+        throw ConfigError.invalid("noise-filter-mode must be one of: fir, fd")
+      }
+      noiseFilterMode = mode
+    }
+    if let value = options["noise-fd-fft-size"] {
+      noiseFDFFTSize = try parseInt(value, key: "noise-fd-fft-size")
+    }
+    if let value = options["noise-fd-hop"] {
+      noiseFDHop = try parseInt(value, key: "noise-fd-hop")
+    }
+    if let value = options["noise-fd-ir-length"] {
+      noiseFDIRLength = try parseInt(value, key: "noise-fd-ir-length")
+    }
+    if let value = options["reverb"] {
+      guard let mode = ReverbMode(rawValue: value.lowercased()) else {
+        throw ConfigError.invalid("reverb must be one of: learned, off")
+      }
+      reverbMode = mode
+    }
+    if let value = options["reverb-ir-length"] {
+      reverbIRLength = try parseInt(value, key: "reverb-ir-length")
+    }
+    if let value = options["reverb-fft-size"] {
+      reverbFFTSize = try parseInt(value, key: "reverb-fft-size")
+    }
+    if let value = options["reverb-hop"] {
+      reverbHop = try parseInt(value, key: "reverb-hop")
     }
     if let value = options["lr"] {
       learningRate = try parseFloat(value, key: "lr")
@@ -608,8 +881,44 @@ struct DDSPE2EConfig: Codable {
     guard voicedThreshold >= 0, voicedThreshold <= 1 else {
       throw ConfigError.invalid("voicedThreshold must be in [0, 1]")
     }
-    guard peakNormalizeTo > 0 else {
-      throw ConfigError.invalid("peakNormalizeTo must be > 0")
+    guard peakNormalizeTo >= 0 else {
+      throw ConfigError.invalid("peakNormalizeTo must be >= 0 (0 disables normalization)")
+    }
+    guard numInstruments >= 1 else {
+      throw ConfigError.invalid("numInstruments must be >= 1")
+    }
+    guard referenceFeatureSize > 0 else {
+      throw ConfigError.invalid("referenceFeatureSize must be > 0")
+    }
+    guard referenceLatentSize > 0 else {
+      throw ConfigError.invalid("referenceLatentSize must be > 0")
+    }
+    guard referenceClassificationWeight >= 0 else {
+      throw ConfigError.invalid("referenceClassificationWeight must be >= 0")
+    }
+    guard referenceTimeFrames > 0 else {
+      throw ConfigError.invalid("referenceTimeFrames must be > 0")
+    }
+    guard referenceMelBins > 0 else {
+      throw ConfigError.invalid("referenceMelBins must be > 0")
+    }
+    guard referenceEncoderHidden > 0 else {
+      throw ConfigError.invalid("referenceEncoderHidden must be > 0")
+    }
+    guard referenceSeparationWeight >= 0 else {
+      throw ConfigError.invalid("referenceSeparationWeight must be >= 0")
+    }
+    guard referencePretrainSteps >= 0 else {
+      throw ConfigError.invalid("referencePretrainSteps must be >= 0")
+    }
+    guard referencePretrainLR > 0 else {
+      throw ConfigError.invalid("referencePretrainLR must be > 0")
+    }
+    guard referenceZResidualScale > 0 else {
+      throw ConfigError.invalid("referenceZResidualScale must be > 0")
+    }
+    guard referenceFiLMGammaScale > 0 else {
+      throw ConfigError.invalid("referenceFiLMGammaScale must be > 0")
     }
     guard modelHiddenSize > 0 else {
       throw ConfigError.invalid("modelHiddenSize must be > 0")
@@ -677,8 +986,37 @@ struct DDSPE2EConfig: Codable {
     guard harmonicConcentrationRampSteps >= 0 else {
       throw ConfigError.invalid("harmonicConcentrationRampSteps must be >= 0")
     }
+    if noiseFilterMode == .fd {
+      guard noiseFDFFTSize > 1, noiseFDFFTSize & (noiseFDFFTSize - 1) == 0 else {
+        throw ConfigError.invalid("noiseFDFFTSize must be a power of two > 1")
+      }
+      guard noiseFDHop > 0, noiseFDHop <= noiseFDFFTSize else {
+        throw ConfigError.invalid("noiseFDHop must be in 1...noiseFDFFTSize")
+      }
+      guard noiseFDIRLength > 1, noiseFDIRLength < noiseFDFFTSize else {
+        throw ConfigError.invalid(
+          "noiseFDIRLength must be > 1 and < noiseFDFFTSize (a bounded IR is what "
+            + "prevents circular-convolution time aliasing)")
+      }
+    }
     guard noiseFilterSize > 1 else {
       throw ConfigError.invalid("noiseFilterSize must be > 1")
+    }
+    if reverbMode == .learned {
+      guard reverbFFTSize > 1, reverbFFTSize & (reverbFFTSize - 1) == 0 else {
+        throw ConfigError.invalid("reverbFFTSize must be a power of two > 1")
+      }
+      guard reverbHop >= 1, reverbHop <= reverbFFTSize else {
+        throw ConfigError.invalid("reverbHop must be in 1...reverbFFTSize")
+      }
+      guard reverbIRLength > 1, reverbHop + reverbIRLength - 1 <= reverbFFTSize else {
+        throw ConfigError.invalid(
+          "Require reverbHop + reverbIRLength - 1 <= reverbFFTSize (exact overlap-add "
+            + "convolution needs the block+IR to fit the FFT frame without wraparound)")
+      }
+      guard reverbFFTSize < chunkSize else {
+        throw ConfigError.invalid("reverbFFTSize must be < chunkSize (its latency shifts the target)")
+      }
     }
     guard learningRate > 0 else {
       throw ConfigError.invalid("learningRate must be > 0")

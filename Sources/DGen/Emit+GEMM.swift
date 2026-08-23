@@ -92,10 +92,12 @@ extension LazyOp {
       func emitFrameMac(_ frameIdx: Expr) {
         let leftFrameBase =
           leftIsFrameAware
-          ? frameIdx * b.intConstant(M * K) : b.intConstant(0)
+          ? b.frameAwareBase(cellId: leftCell, frameIdx: frameIdx, tensorSize: M * K)
+          : b.intConstant(0)
         let rightFrameBase =
           rightIsFrameAware
-          ? frameIdx * b.intConstant(K * N) : b.intConstant(0)
+          ? b.frameAwareBase(cellId: rightCell, frameIdx: frameIdx, tensorSize: K * N)
+          : b.intConstant(0)
         emitTileMac(leftFrameBase: leftFrameBase, rightFrameBase: rightFrameBase)
       }
 
@@ -133,7 +135,8 @@ extension LazyOp {
       // Standard per-frame GEMM: z is frame index.
       func frameBase(cell: CellID, tensorSize: Int) -> Expr {
         ctx.frameAwareTensorCells.contains(cell)
-          ? zIndex * b.intConstant(tensorSize) : b.intConstant(0)
+          ? b.frameAwareBase(cellId: cell, frameIdx: zIndex, tensorSize: tensorSize)
+          : b.intConstant(0)
       }
       let leftFrameBase = frameBase(cell: leftCell, tensorSize: M * K)
       let rightFrameBase = frameBase(cell: rightCell, tensorSize: K * N)
@@ -273,9 +276,13 @@ extension LazyOp {
 
       func emitFrameMac(_ frameIdx: Expr) {
         let leftFrameBase =
-          leftIsFrameAware ? frameIdx * b.intConstant(M * K) : b.intConstant(0)
+          leftIsFrameAware
+          ? b.frameAwareBase(cellId: leftCell, frameIdx: frameIdx, tensorSize: M * K)
+          : b.intConstant(0)
         let rightFrameBase =
-          rightIsFrameAware ? frameIdx * b.intConstant(K * N) : b.intConstant(0)
+          rightIsFrameAware
+          ? b.frameAwareBase(cellId: rightCell, frameIdx: frameIdx, tensorSize: K * N)
+          : b.intConstant(0)
         emitKLoopMac(leftFrameBase: leftFrameBase, rightFrameBase: rightFrameBase)
       }
 
@@ -312,9 +319,18 @@ extension LazyOp {
       b.simdgroupStore(acc, cellId: outCell, offset: cOffset, stride: N)
     } else {
       // Per-frame mode: z is FRAME index.
-      let leftFrameBase = leftIsFrameAware ? zIndex * b.intConstant(M * K) : b.intConstant(0)
-      let rightFrameBase = rightIsFrameAware ? zIndex * b.intConstant(K * N) : b.intConstant(0)
-      let outFrameBase = outIsFrameAware ? zIndex * b.intConstant(M * N) : b.intConstant(0)
+      let leftFrameBase =
+        leftIsFrameAware
+        ? b.frameAwareBase(cellId: leftCell, frameIdx: zIndex, tensorSize: M * K)
+        : b.intConstant(0)
+      let rightFrameBase =
+        rightIsFrameAware
+        ? b.frameAwareBase(cellId: rightCell, frameIdx: zIndex, tensorSize: K * N)
+        : b.intConstant(0)
+      let outFrameBase =
+        outIsFrameAware
+        ? b.frameAwareBase(cellId: outCell, frameIdx: zIndex, tensorSize: M * N)
+        : b.intConstant(0)
 
       emitKLoopMac(leftFrameBase: leftFrameBase, rightFrameBase: rightFrameBase)
 

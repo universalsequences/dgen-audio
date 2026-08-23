@@ -38,6 +38,12 @@ struct DDSPE2EMain {
       try handleProbeSmoothing(options)
     case "render-checkpoint-batch":
       try handleRenderCheckpointBatch(options)
+    case "render-reference-triplets":
+      try DDSPE2EBatchRenderer.runReferenceTriplets(options: options, logger: log)
+    case "debug-reference-z":
+      try DDSPE2EBatchRenderer.runReferenceZDebug(options: options, logger: log)
+    case "transfer":
+      try handleTransfer(options)
     default:
       throw CLIError.invalid("Unknown command: \(command)")
     }
@@ -124,6 +130,7 @@ struct DDSPE2EMain {
       BestCheckpointMetric(rawValue: (options["best-metric"] ?? "spectral").lowercased())
       ?? .spectral
     let bestEvalEvery = max(1, Int(options["best-eval-every"] ?? "10") ?? 10)
+    let bestEvalChunks = max(1, Int(options["best-eval-chunks"] ?? "1") ?? 1)
     let initCheckpointPath = options["init-checkpoint"]
     let rawKernelDump = options["kernel-dump"]
 
@@ -165,7 +172,8 @@ struct DDSPE2EMain {
         renderWavPath: renderWavPath,
         dumpControlsEvery: dumpControlsEvery,
         bestMetric: bestMetric,
-        bestEvalEvery: bestEvalEvery
+        bestEvalEvery: bestEvalEvery,
+        bestEvalChunks: bestEvalChunks
       ),
       logger: log
     )
@@ -603,6 +611,10 @@ struct DDSPE2EMain {
     try DDSPE2EBatchRenderer.run(options: options, logger: log)
   }
 
+  private static func handleTransfer(_ options: [String: String]) throws {
+    try DDSPE2ETransfer.run(options: options, logger: log)
+  }
+
   private static func resolveKernelDumpPath(rawValue: String?, runDir: URL) -> String? {
     guard let rawValue else { return nil }
     if rawValue == "true" {
@@ -658,6 +670,8 @@ struct DDSPE2EMain {
       train --cache <cache-dir> [--runs-dir <dir>] [--run-name <name>] [--steps N] [--split train|val] [--mode dry|m2] [--config <json>] [overrides]
       probe-smoothing --cache <cache-dir> [--split train|val] [--index N] [--output <dir>] [--config <json>] [--init-checkpoint <path>] [overrides]
       render-checkpoint-batch --cache <cache-dir> --init-checkpoint <path> [--split train|val] [--batch-size N] [--output <dir>] [--config <json>] [overrides]
+      render-reference-triplets --cache <cache-dir> --init-checkpoint <path> [--split train|val] [--count N] [--output <dir>] [--config <json>] [overrides]
+      transfer --input <voice.wav> --init-checkpoint <path> [--transpose 12] [--loudness-offset-db 0] [--output <dir>] [--config <json>]
 
     Common overrides:
       --sample-rate <float>
@@ -721,6 +735,14 @@ struct DDSPE2EMain {
       --spectral-warmup-steps <int>
       --spectral-ramp-steps <int>
       --spectral-log-epsilon <float>   (1e-8 = 2026-02 baseline; 1e-3 removes empty-bin loss floor)
+      --noise-filter-mode <fir|fd>     (fd = paper's frequency-sampled filter; batch-size 1 only)
+      --noise-fd-fft-size <int>        (power of two, default 128)
+      --noise-fd-hop <int>             (default 32)
+      --noise-fd-ir-length <int>       (must be < fft size, default 64)
+      --reverb <learned|off>           (default off; trainable IR convolution on the synth output)
+      --reverb-ir-length <int>         (wet-tail taps, default 512; hop + taps - 1 must fit fft size)
+      --reverb-fft-size <int>          (power of two, default 1024)
+      --reverb-hop <int>               (default 256)
       --best-metric <spectral|combined>  (checkpoint selection; spectral = fixed CPU MR-STFT score, default)
       --best-eval-every <int>          (spectral selection eval cadence in steps, default 10)
       --loudness-weight <float>
@@ -748,7 +770,7 @@ struct DDSPE2EMain {
       --auto-abc-min-delta <float> (default: max(1e-7, --early-stop-min-delta))
       --auto-abc-preset <baseline|best-low-loss> (default: baseline)
       --batch-size <int> (used by render-checkpoint-batch to choose how many items to render)
-      --output <dir> (used by probe-smoothing / render-checkpoint-batch)
+      --output <dir> (used by probe-smoothing / render-checkpoint-batch / transfer)
 
     Examples:
       swift run DDSPE2E dump-config --output ddsp_config.json
@@ -758,6 +780,7 @@ struct DDSPE2EMain {
       swift run DDSPE2E train --cache .ddsp_cache --steps 1 --kernel-dump
       swift run DDSPE2E probe-smoothing --cache .ddsp_cache --split train --index 0 --output /tmp/ddsp_smoothing_probe
       swift run DDSPE2E render-checkpoint-batch --cache .ddsp_cache --init-checkpoint runs/<run>/checkpoints/model_best.json --batch-size 8 --output /tmp/ddsp_batch_render
+      swift run DDSPE2E transfer --input voice.wav --init-checkpoint runs/<run>/checkpoints/model_best.json --transpose 12 --output runs/voice_to_flute
     """
     print(text)
   }

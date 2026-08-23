@@ -44,6 +44,20 @@ swift run DDSPE2E preprocess \
 swift run DDSPE2E inspect-cache --cache .ddsp_cache_tinysol --limit 5
 ```
 
+For the DDSP revival's multi-dynamic flute rung, prepare the exact TinySOL
+C4-C7 chromatic ordinario set at pp/mf/ff, then launch the R6 A/B/C recipe:
+
+```bash
+bash Examples/DDSPE2E/scripts/prepare_flute_multidynamics.sh
+bash Examples/DDSPE2E/scripts/run_flute_multidynamics.sh
+```
+
+The preparation deliberately uses one dataset-wide normalization gain
+(`--global-normalize true`) to preserve relative dynamics while retaining the
+R6 numerical scale, `--max-f0 2400` to cover C7, and `--split-by-source true` to keep overlapping
+chunks from the same recording in one split. The training script defaults to 10k/3k/2k steps; `STEPS_A`,
+`STEPS_B`, and `STEPS_C` can override these.
+
 4. Dry run (pipeline sanity):
 
 ```bash
@@ -461,6 +475,70 @@ By default, training uses the legacy harmonic head behavior.
 - `--control-smoothing fir` (default): frame-domain FIR smoothing (`pad + conv2d`) before sampling controls at audio rate
 - `--control-smoothing off`: no smoothing
 
+## Reference-Conditioned Training
+
+For the flute/clarinet proof, top-level input directories provide pairing and
+auxiliary-classification labels. A different recording from the same instrument
+supplies cached timbre features to a learned `z` projection; the label itself is
+not an inference input:
+
+```bash
+bash Examples/DDSPE2E/scripts/prepare_flute_clarinet.sh
+bash Examples/DDSPE2E/scripts/run_flute_clarinet.sh
+```
+
+Enable this path with `--reference-conditioning true`. During a counterfactual
+batch-render audit, `--reference-instrument-index 0|1` chooses a clarinet or
+flute reference while preserving identical target controls. The averaged-MFCC
+experiment (`--reference-encoder averaged`, the default) is an explicitly
+documented failed R8 baseline; see `docs/DDSP_REVIVAL_SPEC.md` before
+extending it.
+
+`--reference-encoder temporal` is the second R8 attempt: each reference is
+represented as `--reference-time-frames` × `--reference-mel-bins` log-mel
+frames (cached when present, otherwise computed from the chunk audio, so old
+caches keep working) and encoded by a per-frame MLP with learned attention
+pooling into one `z`. Besides per-layer FiLM, `z` adds direct residuals to
+the harmonic, gain, noise, and noise-filter heads. Checkpoint selection then
+scores each pinned held-out chunk with both its same-instrument and a
+crossed-instrument reference and minimizes
+`correct − referenceSeparationWeight · (crossed − correct)`, so a
+reference-blind model cannot be selected:
+
+```bash
+bash Examples/DDSPE2E/scripts/run_flute_clarinet_mfff_temporal.sh
+```
+
+For the listening gate, `render-reference-triplets` writes, per held-out
+target, `TARGET` plus one `PREDICTED_USING_<INSTRUMENT>_REFERENCE` render per
+instrument from identical f0/loudness controls, with a manifest recording the
+exact reference chunk used for each prediction:
+
+```bash
+swift run DDSPE2E render-reference-triplets \
+  --cache .ddsp_cache_flute_clarinet_mfff \
+  --init-checkpoint runs/<run>/checkpoints/model_best.json \
+  --split val --count 6 --output runs/<run>_triplets
+```
+
+## Voice-to-Instrument Transfer
+
+A trained single-instrument decoder does not need voice training. Extract voice
+controls and render them through the instrument checkpoint:
+
+```bash
+swift run DDSPE2E transfer \
+  --input voice.wav \
+  --init-checkpoint runs/<flute-run>/checkpoints/model_best.json \
+  --transpose 12 \
+  --output runs/voice_to_flute
+```
+
+`--transpose` shifts extracted f0 in semitones (voice-to-flute typically needs
+`+12`). `--loudness-offset-db` shifts the input loudness contour without
+flattening its expression. Long inputs are rendered as overlapping chunks and
+crossfaded.
+
 ## Commands
 
 - `dump-config --output <path>`
@@ -468,6 +546,7 @@ By default, training uses the legacy harmonic head behavior.
 - `inspect-cache --cache <cache-dir> [--split train|val] [--limit N]`
 - `train --cache <cache-dir> [--runs-dir <dir>] [--run-name <name>] [--steps N] [--split train|val] [--mode dry|m2] [--config <json>] [overrides]`
 - `render-checkpoint-batch --cache <cache-dir> --init-checkpoint <path> [--split train|val] [--batch-size N] [--output <dir>] [--config <json>] [overrides]`
+- `transfer --input <voice.wav> --init-checkpoint <path> [--transpose N] [--loudness-offset-db N] [--output <dir>] [--config <json>]`
 
 ### Render A Fixed Batch From A Checkpoint
 
@@ -497,10 +576,30 @@ Notes:
 - `--max-f0 <float>` (default: `1000`)
 - `--silence-rms <float>` (default: `0.0005`)
 - `--voiced-threshold <float>` (default: `0.3`)
-- `--normalize-to <float>` (default: `0.99`)
+- `--normalize-to <float>` (default: `0.99`; `0` disables peak normalization)
+- `--global-normalize <true|false>` (default: `false`; one dataset-wide gain preserves relative levels)
 - `--train-split <float>` (default: `0.9`)
+- `--split-by-source <true|false>` (default: `false`; prevents source/chunk leakage)
 - `--seed <uint64>` (default: `1337`)
 - `--max-files <int>` (default: unset)
+- `--label-by-top-level <true|false>` (default: `false`; derive instrument labels during preprocessing)
+- `--instruments <int>` (default: `1`; appends one-hot conditioning unless reference conditioning is active)
+- `--reference-conditioning <true|false>` (default: `false`)
+- `--reference-features <int>` (default: `16`; cached reference descriptor width)
+- `--reference-latent <int>` (default: `16`; learned `z` width)
+- `--reference-classification-weight <float>` (default: `0.1`)
+- `--reference-encoder <averaged|temporal>` (default: `averaged`)
+- `--reference-time-frames <int>` (default: `16`; temporal mode)
+- `--reference-mel-bins <int>` (default: `48`; temporal mode)
+- `--reference-encoder-hidden <int>` (default: `64`; temporal mode)
+- `--reference-separation-weight <float>` (default: `1.0`; checkpoint-selection margin)
+- `--reference-z-scale <float>` (default: `1.0`; multiplier on the direct z→control
+  shape residuals: harmonic logits, noise gain, noise filter — harmonic gain stays
+  ×1 so a reference can't override the loudness control. At 1.0 the tanh-bounded z
+  reaches only ~2 dB of harmonic swing; larger values widen range and amplify
+  gradients into the residual weights)
+- `--reference-film-gamma <float>` (default: `0.5`; FiLM gamma tanh bound —
+  `hidden * (1 + gamma) + beta`)
 - `--max-chunks-per-file <int>` (default: unset)
 - `--shuffle <true|false>` (default: `true`)
 - `--fixed-batch <true|false>` (default: `false`)
@@ -552,6 +651,7 @@ Notes:
 - `--mse-weight <float>` (default: `1.0`)
 - `--log-every <int>` (default: `10`)
 - `--checkpoint-every <int>` (default: `100`)
+- `--best-eval-chunks <int>` (train only; default: `1`; averages source-distinct fixed chunks)
 - `--kernel-dump [path]` (train only; use `true` to write to `<run-dir>/kernels.metal`)
 - `--init-checkpoint <model-checkpoint-json>` (train only; initializes model weights from a saved checkpoint)
 - `--dump-controls-every <int>` (train only; default: `0`, disabled)

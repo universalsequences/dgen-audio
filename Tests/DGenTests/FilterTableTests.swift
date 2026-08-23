@@ -89,6 +89,7 @@ final class FilterTableTests: XCTestCase {
             "row 0 is a silent filter kernel, so the pre-switch steady region should be silent")
 
         let passedRegionPeak = output[(switchFrame + N)..<totalFrames].map { abs($0) }.max() ?? 0.0
+
         XCTAssertGreaterThan(
             passedRegionPeak, 0.5,
             "row 1 is an impulse filter kernel, so the post-switch steady region should pass input")

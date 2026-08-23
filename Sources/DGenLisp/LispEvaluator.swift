@@ -674,6 +674,8 @@ class LispEvaluator {
       return try evalTensorCreate(regularArgs, fill: .full)
     case "randn":
       return try evalTensorCreate(regularArgs, fill: .randn)
+    case "iota":
+      return try evalIota(regularArgs)
     case "tensor-param":
       return try evalTensorParam(regularArgs, attributes: attributePairs)
     // DEPRECATED hidden alias of `tensor-param` (undocumented; kept for old sources only).
@@ -1968,6 +1970,27 @@ class LispEvaluator {
     case .randn:
       return .tensor(Tensor.randn(shape))
     }
+  }
+
+  /// `(iota count)` -> `[0, 1, ... count-1]`, `(iota count start step)` -> a ramp.
+  /// Sugar for the index ramp needed to enumerate positions (FFT bins, table
+  /// samples) so a per-element read position can be computed arithmetically.
+  private func evalIota(_ args: [ASTNode]) throws -> EvalResult {
+    guard args.count == 1 || args.count == 3 else {
+      throw LispError.invalidArgument(
+        "iota requires (iota count) or (iota count start step)")
+    }
+    let count = Int(try requireFloat(evaluateAST(args[0])))
+    guard count > 0 else {
+      throw LispError.invalidArgument("iota count must be > 0 (got \(count))")
+    }
+    var start: Float = 0
+    var step: Float = 1
+    if args.count == 3 {
+      start = try requireFloat(evaluateAST(args[1]))
+      step = try requireFloat(evaluateAST(args[2]))
+    }
+    return .tensor(Tensor((0..<count).map { start + Float($0) * step }))
   }
 
   private func evalTensorParam(_ args: [ASTNode], attributes: [(name: String, value: String)])

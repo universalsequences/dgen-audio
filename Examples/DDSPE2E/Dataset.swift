@@ -10,6 +10,7 @@ struct CachedChunkEntry: Codable {
   var id: String
   var split: DatasetSplit
   var sourceFile: String
+  var instrumentIndex: Int?
   var sourceSampleRate: Float
   var startSample: Int
   var chunkSamples: Int
@@ -25,12 +26,14 @@ struct CachedDatasetManifest: Codable {
   var chunkCount: Int
   var trainCount: Int
   var valCount: Int
+  var instrumentNames: [String]?
   var entries: [CachedChunkEntry]
 }
 
 struct CachedChunk: Codable {
   var id: String
   var sourceFile: String
+  var instrumentIndex: Int?
   var sourceSampleRate: Float
   var sampleRate: Float
   var startSample: Int
@@ -38,6 +41,37 @@ struct CachedChunk: Codable {
   var f0Hz: [Float]
   var loudnessDB: [Float]
   var uvMask: [Float]
+  /// Pitch-reduced audio descriptor for reference-conditioned timbre encoding.
+  /// Optional so caches created before R8 remain readable.
+  var timbreFeatures: [Float]?
+  /// Time-varying log-mel reference frames, row-major
+  /// [timbreFrameCount, timbreMelBins]. Optional so older caches remain
+  /// readable; loaders fall back to computing frames from `audio`.
+  var timbreFrames: [Float]?
+  var timbreFrameCount: Int?
+  var timbreMelBins: Int?
+}
+
+/// Returns [config.referenceTimeFrames × config.referenceMelBins] log-mel
+/// frames for a reference chunk, preferring cached frames with matching
+/// dimensions and computing them from the chunk audio otherwise (which keeps
+/// pre-temporal caches usable without re-preprocessing).
+func referenceTimbreFrames(chunk: CachedChunk, config: DDSPE2EConfig) -> [Float] {
+  if let frames = chunk.timbreFrames,
+    chunk.timbreFrameCount == config.referenceTimeFrames,
+    chunk.timbreMelBins == config.referenceMelBins,
+    frames.count == config.referenceTimeFrames * config.referenceMelBins
+  {
+    return frames
+  }
+  return FeatureExtractor.timbreLogMelFrames(
+    samples: chunk.audio,
+    sampleRate: chunk.sampleRate,
+    frameSize: config.frameSize,
+    frameHop: config.frameHop,
+    timeFrames: config.referenceTimeFrames,
+    melBins: config.referenceMelBins
+  )
 }
 
 enum DatasetError: Error, CustomStringConvertible {
@@ -76,6 +110,34 @@ enum DatasetPreprocessor {
 
     logger("Found \(wavFiles.count) wav files")
 
+    let instrumentNames: [String]
+    if config.labelByTopLevelDirectory {
+      instrumentNames = Array(Set(wavFiles.map {
+        topLevelComponent(of: relativePath(of: $0, root: inputRoot))
+      })).sorted()
+    } else {
+      instrumentNames = ["default"]
+    }
+    let instrumentIndices = Dictionary(
+      uniqueKeysWithValues: instrumentNames.enumerated().map { ($0.element, $0.offset) })
+    if config.labelByTopLevelDirectory {
+      let labels = instrumentNames.enumerated().map { "\($0.offset)=\($0.element)" }.joined(separator: ", ")
+      logger("Instrument labels: \(labels)")
+    }
+
+    var datasetGain: Float?
+    if config.normalizeAcrossDataset, config.peakNormalizeTo > 0 {
+      var datasetPeak: Float = 0
+      for fileURL in wavFiles {
+        let (samples, _) = try AudioFile.load(url: fileURL, mono: true)
+        for sample in samples { datasetPeak = max(datasetPeak, abs(sample)) }
+      }
+      if datasetPeak > 0 {
+        datasetGain = config.peakNormalizeTo / datasetPeak
+        logger("Global peak normalization: peak=\(datasetPeak) gain=\(datasetGain!)")
+      }
+    }
+
     var entries = [CachedChunkEntry]()
     entries.reserveCapacity(wavFiles.count * 8)
 
@@ -83,6 +145,9 @@ enum DatasetPreprocessor {
 
     for (fileIndex, fileURL) in wavFiles.enumerated() {
       let relative = relativePath(of: fileURL, root: inputRoot)
+      let instrumentName = config.labelByTopLevelDirectory
+        ? topLevelComponent(of: relative) : instrumentNames[0]
+      let instrumentIndex = instrumentIndices[instrumentName] ?? 0
       logger("[\(fileIndex + 1)/\(wavFiles.count)] \(relative)")
 
       let (rawSamples, sourceRate) = try AudioFile.load(url: fileURL, mono: true)
@@ -91,7 +156,11 @@ enum DatasetPreprocessor {
         sourceRate: sourceRate,
         targetRate: config.sampleRate
       )
-      samples = normalizePeak(samples, peakTarget: config.peakNormalizeTo)
+      if let datasetGain {
+        samples = samples.map { $0 * datasetGain }
+      } else {
+        samples = normalizePeak(samples, peakTarget: config.peakNormalizeTo)
+      }
 
       let starts = chunkStartIndices(
         sampleCount: samples.count,
@@ -117,6 +186,24 @@ enum DatasetPreprocessor {
           config: config
         )
 
+        let timbreFeatures = FeatureExtractor.timbreDescriptor(
+          samples: chunk,
+          sampleRate: config.sampleRate,
+          features: features,
+          frameSize: config.frameSize,
+          frameHop: config.frameHop,
+          count: config.referenceFeatureSize
+        )
+
+        let timbreFrames = FeatureExtractor.timbreLogMelFrames(
+          samples: chunk,
+          sampleRate: config.sampleRate,
+          frameSize: config.frameSize,
+          frameHop: config.frameHop,
+          timeFrames: config.referenceTimeFrames,
+          melBins: config.referenceMelBins
+        )
+
         let id = String(format: "chunk_%08d", chunkIndex)
         let chunkFileName = "\(id).json"
         let chunkFileURL = chunksDir.appendingPathComponent(chunkFileName)
@@ -125,13 +212,18 @@ enum DatasetPreprocessor {
         let chunkRecord = CachedChunk(
           id: id,
           sourceFile: relative,
+          instrumentIndex: instrumentIndex,
           sourceSampleRate: sourceRate,
           sampleRate: config.sampleRate,
           startSample: start,
           audio: chunk,
           f0Hz: features.f0Hz,
           loudnessDB: features.loudnessDB,
-          uvMask: features.uvMask
+          uvMask: features.uvMask,
+          timbreFeatures: timbreFeatures,
+          timbreFrames: timbreFrames,
+          timbreFrameCount: config.referenceTimeFrames,
+          timbreMelBins: config.referenceMelBins
         )
 
         try writeJSON(chunkRecord, to: chunkFileURL)
@@ -140,6 +232,7 @@ enum DatasetPreprocessor {
           id: id,
           split: .train,
           sourceFile: relative,
+          instrumentIndex: instrumentIndex,
           sourceSampleRate: sourceRate,
           startSample: start,
           chunkSamples: chunk.count,
@@ -157,7 +250,13 @@ enum DatasetPreprocessor {
       throw DatasetError.invalid("No chunks were generated. Check chunk size/hop and audio length")
     }
 
-    assignSplits(entries: &entries, trainSplit: config.trainSplit, seed: config.seed, shuffle: config.shuffleChunks)
+    assignSplits(
+      entries: &entries,
+      trainSplit: config.trainSplit,
+      seed: config.seed,
+      shuffle: config.shuffleChunks,
+      groupBySourceFile: config.splitBySourceFile
+    )
 
     let trainCount = entries.filter { $0.split == .train }.count
     let valCount = entries.count - trainCount
@@ -170,6 +269,7 @@ enum DatasetPreprocessor {
       chunkCount: entries.count,
       trainCount: trainCount,
       valCount: valCount,
+      instrumentNames: instrumentNames,
       entries: entries
     )
 
@@ -178,6 +278,11 @@ enum DatasetPreprocessor {
 
     logger("Wrote manifest: \(manifestURL.path)")
     logger("Chunks: total=\(entries.count) train=\(trainCount) val=\(valCount)")
+    if config.splitBySourceFile {
+      let trainSources = Set(entries.filter { $0.split == .train }.map(\.sourceFile)).count
+      let valSources = Set(entries.filter { $0.split == .val }.map(\.sourceFile)).count
+      logger("Source-grouped split: trainFiles=\(trainSources) valFiles=\(valSources)")
+    }
 
     return manifest
   }
@@ -245,9 +350,28 @@ enum DatasetPreprocessor {
     entries: inout [CachedChunkEntry],
     trainSplit: Float,
     seed: UInt64,
-    shuffle: Bool
+    shuffle: Bool,
+    groupBySourceFile: Bool
   ) {
     guard !entries.isEmpty else { return }
+
+    if groupBySourceFile {
+      var sources = Array(Set(entries.map(\.sourceFile)).sorted())
+      if shuffle {
+        var rng = SeededGenerator(seed: seed)
+        sources.shuffle(using: &rng)
+      }
+
+      var trainSourceCount = Int((Float(sources.count) * trainSplit).rounded(.down))
+      trainSourceCount = max(1, min(sources.count - 1, trainSourceCount))
+      if sources.count == 1 { trainSourceCount = 1 }
+      let trainSources = Set(sources.prefix(trainSourceCount))
+
+      for index in entries.indices {
+        entries[index].split = trainSources.contains(entries[index].sourceFile) ? .train : .val
+      }
+      return
+    }
 
     var indices = Array(entries.indices)
     if shuffle {
@@ -257,9 +381,7 @@ enum DatasetPreprocessor {
 
     var trainCount = Int((Float(entries.count) * trainSplit).rounded(.down))
     trainCount = max(1, min(entries.count - 1, trainCount))
-    if entries.count == 1 {
-      trainCount = 1
-    }
+    if entries.count == 1 { trainCount = 1 }
 
     for (position, index) in indices.enumerated() {
       entries[index].split = position < trainCount ? .train : .val
@@ -271,6 +393,10 @@ enum DatasetPreprocessor {
     encoder.outputFormatting = [.sortedKeys]
     let data = try encoder.encode(value)
     try data.write(to: url)
+  }
+
+  private static func topLevelComponent(of relativePath: String) -> String {
+    relativePath.split(separator: "/").first.map(String.init) ?? "default"
   }
 
   private static func relativePath(of url: URL, root: URL) -> String {
@@ -306,6 +432,7 @@ enum DatasetPreprocessor {
   }
 
   private static func normalizePeak(_ samples: [Float], peakTarget: Float) -> [Float] {
+    guard peakTarget > 0 else { return samples }
     guard let peak = samples.map({ abs($0) }).max(), peak > 0 else {
       return samples
     }

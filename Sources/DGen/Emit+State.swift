@@ -233,11 +233,68 @@ extension LazyOp {
         // Tensor latch: read inputs from tensors, use indexed state
         // Mark as requiring scalar execution - latch state updates sample-by-sample
 
-        let value = try b.readInput(node, inputs, at: 0)
-        let cond = try b.readInput(node, inputs, at: 1)
-        let idx = b.value(tensorIndex, scalarType: .int)
+        // Output-aliased latch: TensorMemoryMaterializationPass pointed the
+        // output tensor at the persistent state cell, so consumers read the
+        // cell directly and no frame-major output copy exists.
+        let outputAliasesState =
+          g.nodeToTensor[nodeId].flatMap({ g.tensors[$0] })?.cellId == cellId
 
+        if ctx.gatedLatchNodes.contains(nodeId) {
+          // The region emitter wrapped this element loop in `if (cond > 0)`:
+          // the loop only runs on capture frames, so store unconditionally.
+          let value = try b.readInput(node, inputs, at: 0)
+          let idx = b.value(tensorIndex, scalarType: .int)
+          _ = b.memoryWrite(cellId, b.cast(idx, to: .int), value)
+          ctx.values[nodeId] = .empty
+          return
+        }
+
+        let idx = b.value(tensorIndex, scalarType: .int)
         let zero = b.constant(0.0)
+        let cond = try b.readInput(node, inputs, at: 1)
+
+        if outputAliasesState {
+          // Aliased output: the persistent cell IS the output. Only capture
+          // frames need any work — the value read (often a hop-gated
+          // producer's scratch) and the store happen inside the gate, and
+          // clang unswitches the loop-invariant condition out of the loop.
+          try b.if_(cond > zero) {
+            let value = try b.readInput(node, inputs, at: 0)
+            _ = b.memoryWrite(cellId, b.cast(idx, to: .int), value)
+          }
+          ctx.values[nodeId] = .empty
+          return
+        }
+
+        // Separate output tensor. When it is a memory-backed frame-aware cell,
+        // gate the work per frame: capture frames store value into both the
+        // state cell and the output slice; held frames copy the cell into the
+        // output slice (fresh-on-trigger / held-otherwise semantics, same as
+        // the gswitch form, minus the per-frame value read and cell rewrite).
+        // clang unswitches the loop-invariant cond into two clean loops.
+        if let outTensor = g.nodeToTensor[nodeId].flatMap({ g.tensors[$0] }),
+          ctx.outboundTensorCells.contains(outTensor.cellId),
+          ctx.frameAwareTensorCells.contains(outTensor.cellId),
+          let (outSize, _) = g.frameAwareCells[outTensor.cellId]
+        {
+          try b.if_(cond > zero) {
+            let value = try b.readInput(node, inputs, at: 0)
+            _ = b.memoryWrite(cellId, b.cast(idx, to: .int), value)
+            _ = b.frameAwareTensorWrite(
+              cellId: outTensor.cellId, tensorSize: outSize, elemIdx: idx, value: value)
+          }
+          b.if_(cond <= zero) {
+            let held = b.memoryRead(cellId, b.cast(idx, to: .int))
+            _ = b.frameAwareTensorWrite(
+              cellId: outTensor.cellId, tensorSize: outSize, elemIdx: idx, value: held)
+          }
+          ctx.values[nodeId] = .empty
+          return
+        }
+
+        // Fallback (register-consumed or non-frame-aware output): original
+        // branchless form.
+        let value = try b.readInput(node, inputs, at: 0)
 
         // Load current latched value from indexed position
         let latched = b.memoryRead(cellId, b.cast(idx, to: .int))

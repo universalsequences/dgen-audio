@@ -3,7 +3,6 @@ import Foundation
 
 enum DDSPE2ESmoothingProbe {
   private static let firTaps: [Float] = [0.1, 0.2, 0.4, 0.2, 0.1]
-  private static let conditioningFeatureCount = 5
 
   static func run(options: [String: String], logger: (String) -> Void) throws {
     guard let cache = options["cache"] else {
@@ -34,10 +33,13 @@ enum DDSPE2ESmoothingProbe {
       throw CLIError.invalid("Selected chunk has no valid frames")
     }
 
+    let conditioningFeatureCount = 5 + (config.numInstruments > 1 ? config.numInstruments : 0)
     let conditioning = makeConditioningData(
       f0Hz: Array(chunk.f0Hz.prefix(frameCount)),
       loudnessDB: Array(chunk.loudnessDB.prefix(frameCount)),
-      uvMask: Array(chunk.uvMask.prefix(frameCount))
+      uvMask: Array(chunk.uvMask.prefix(frameCount)),
+      instrumentIndex: chunk.instrumentIndex,
+      numInstruments: config.numInstruments
     )
     let features = Tensor(
       [[Float]](repeating: [Float](repeating: 0, count: conditioningFeatureCount), count: frameCount)
@@ -159,12 +161,15 @@ enum DDSPE2ESmoothingProbe {
   private static func makeConditioningData(
     f0Hz: [Float],
     loudnessDB: [Float],
-    uvMask: [Float]
+    uvMask: [Float],
+    instrumentIndex: Int?,
+    numInstruments: Int
   ) -> [Float] {
     let n = min(f0Hz.count, min(loudnessDB.count, uvMask.count))
-    if n == 0 { return [Float](repeating: 0, count: conditioningFeatureCount) }
+    let width = 5 + (numInstruments > 1 ? numInstruments : 0)
+    if n == 0 { return [Float](repeating: 0, count: width) }
     var flat = [Float]()
-    flat.reserveCapacity(n * conditioningFeatureCount)
+    flat.reserveCapacity(n * width)
     var prevF0Norm: Float = 0
     var prevLoudNorm: Float = 0
     for i in 0..<n {
@@ -179,6 +184,10 @@ enum DDSPE2ESmoothingProbe {
       flat.append(uv)
       flat.append(deltaF0)
       flat.append(deltaLoud)
+      if numInstruments > 1 {
+        let selected = min(max(0, instrumentIndex ?? 0), numInstruments - 1)
+        for index in 0..<numInstruments { flat.append(index == selected ? 1 : 0) }
+      }
       prevF0Norm = f0Norm
       prevLoudNorm = loudNorm
     }

@@ -1316,6 +1316,11 @@ extension LazyOp {
       let gradSlots = hopGated ? (g.maxFrameCount + hopSize - 1) / hopSize : g.maxFrameCount
       let gradInputCell = g.allocFrameAware(tensorSize: totalSize, frameCount: gradSlots)
       g.frameAwareCellHops[gradInputCell] = hopGated ? hopSize : nil
+      // This tape is the head of the backward chain and holds one adjoint per
+      // hop tick. overlapAdd only consumed the tick frames, so the adjoint on
+      // every other frame is zero — a frame-rate reader must not hold the
+      // tick's value forward. See `Graph.frameAwareCellScatter`.
+      if hopGated { g.frameAwareCellScatter.insert(gradInputCell) }
 
       let gatherOp = g.n(
         .overlapAddGradGather(

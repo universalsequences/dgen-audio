@@ -163,13 +163,36 @@ enum DDSPSynth {
     return harmonicOut
   }
 
+  /// Whether and how the synth output passes through the learned reverb.
+  struct ReverbSettings {
+    var mode: ReverbMode = .off
+    var fftSize: Int = 1_024
+    var hop: Int = 256
+    var irLength: Int = 512
+
+    static let off = ReverbSettings()
+  }
+
+  /// How the noise branch renders its learned response.
+  struct NoiseFilterSettings {
+    var mode: NoiseFilterMode = .fir
+    var fftSize: Int = 128
+    var hop: Int = 32
+    var irLength: Int = 64
+
+    static let fir = NoiseFilterSettings()
+  }
+
   static func renderSignal(
     controls: DecoderControls,
     tensors: PreallocatedTensors,
     featureFrames: Int,
     frameCount: Int,
     numHarmonics: Int,
-    controlSmoothingMode: ControlSmoothingMode
+    controlSmoothingMode: ControlSmoothingMode,
+    noiseSettings: NoiseFilterSettings = .fir,
+    reverbSettings: ReverbSettings = .off,
+    reverbIR: Tensor? = nil
   ) -> Signal {
     let featureMaxIndex = Float(max(0, featureFrames - 1))
     let frameDenom = Float(max(1, frameCount - 1))
@@ -184,7 +207,11 @@ enum DDSPSynth {
     let playheadMaxSafe = max(0.0, featureMaxIndex - 1e-4)
     let playhead = playheadRaw.clip(0.0, Double(playheadMaxSafe))
 
-    let f0 = min(max(tensors.f0.peek(playhead), 20.0), 500.0)
+    // Sanitize f0 only; harmonics above Nyquist are masked downstream. A tighter
+    // cap here silently pins high notes (a 500 Hz cap rendered every octave-5
+    // flute note at exactly 500 Hz).
+    let nyquistCap = Double(DGenConfig.sampleRate * 0.5)
+    let f0 = min(max(tensors.f0.peek(playhead), 20.0), nyquistCap)
     let uv = tensors.uv.peek(playhead).clip(0.0, 1.0)
 
     let harmonicAmpsFrames: Tensor
@@ -222,19 +249,42 @@ enum DDSPSynth {
     let noiseGainRaw = noiseGainFrames.peek(playhead, channel: Signal.constant(0.0))
     let noiseGain = noiseGainRaw
 
-    guard let noiseFilter = controls.noiseFilter else {
-      _ = noiseGain
-      return harmonicOut
+    // Learned reverb wraps whatever the synth produced. The dry path rides
+    // through the convolution as a fixed unit tap, so dry and wet share the
+    // operator's fftSize-1 sample latency; the trainer shifts the target to
+    // match (see Trainer.reverbDelayedTarget).
+    func applyReverb(_ dry: Signal) -> Signal {
+      guard reverbSettings.mode == .learned, let ir = reverbIR else { return dry }
+      return learnedReverb(
+        dry, ir: ir, fftSize: reverbSettings.fftSize, hop: reverbSettings.hop)
     }
 
-    let firSize = noiseFilter.shape[1]
+    guard let noiseFilter = controls.noiseFilter else {
+      _ = noiseGain
+      return applyReverb(harmonicOut)
+    }
+
     let noiseExcitation = Signal.noise()
-    let filterTaps = noiseFilter.peekRow(playhead)              // [firSize] learned per frame
-    let noiseBuffer = noiseExcitation.buffer(size: firSize).reshape([firSize])
-    let filteredNoise = (noiseBuffer * filterTaps).sum()
+    let filteredNoise: Signal
+    switch noiseSettings.mode {
+    case .fir:
+      let firSize = noiseFilter.shape[1]
+      let filterTaps = noiseFilter.peekRow(playhead)            // [firSize] learned per frame
+      let noiseBuffer = noiseExcitation.buffer(size: firSize).reshape([firSize])
+      filteredNoise = (noiseBuffer * filterTaps).sum()
+    case .fd:
+      filteredNoise = FilteredNoiseFD.render(
+        magnitudes: noiseFilter,                                // [frames, nBins] magnitudes
+        noise: noiseExcitation,
+        framePosition: playhead,
+        fftSize: noiseSettings.fftSize,
+        hop: noiseSettings.hop,
+        irLength: noiseSettings.irLength
+      )
+    }
     // Keep noise path active for all frames (no hard UV gate).
     let noiseOut = filteredNoise * noiseGain
-    return harmonicOut + noiseOut
+    return applyReverb(harmonicOut + noiseOut)
   }
 
   /// Applies Nyquist masking and (for distribution-like heads) renormalization.

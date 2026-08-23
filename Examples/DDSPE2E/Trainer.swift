@@ -57,11 +57,10 @@ struct TrainerOptions {
   var dumpControlsEvery: Int = 0    // dump decoder controls every N steps (0 = disabled)
   var bestMetric: BestCheckpointMetric = .spectral
   var bestEvalEvery: Int = 10  // evaluate the spectral selection metric every N steps
+  var bestEvalChunks: Int = 1  // fixed, source-distinct chunks averaged per evaluation
 }
 
 enum DDSPE2ETrainer {
-  private static let conditioningFeatureCount = 5
-
   private struct GradientStats {
     var paramCount: Int = 0
     var paramsWithGrad: Int = 0
@@ -97,6 +96,43 @@ enum DDSPE2ETrainer {
   ) throws {
     DGenSpectralConfig.logMagnitudeEpsilon = config.spectralLogEpsilon
     logger("[config] spectralLogEpsilon=\(config.spectralLogEpsilon)")
+    if !config.referenceConditioning,
+      let instrumentNames = dataset.manifest.instrumentNames,
+      instrumentNames.count != config.numInstruments
+    {
+      let labels = instrumentNames.joined(separator: ", ")
+      throw CLIError.invalid(
+        "Dataset has \(instrumentNames.count) instrument labels (\(labels)) "
+          + "but --instruments is \(config.numInstruments)")
+    }
+    if config.referenceConditioning && config.batchSize != 1 {
+      throw CLIError.invalid("reference-conditioned training currently requires batch-size 1")
+    }
+    if config.noiseFilterMode == .fd {
+      // The batched renderer has no frequency-domain noise path; letting it run
+      // would silently feed half-spectrum magnitudes to the FIR tap code.
+      guard config.batchSize <= 1 else {
+        throw CLIError.invalid(
+          "noise-filter-mode fd is not implemented for batch-size > 1 "
+            + "(got \(config.batchSize)); use batch-size 1")
+      }
+      logger(
+        "[config] noise filter: frequency-sampled (fftSize=\(config.noiseFDFFTSize) "
+          + "hop=\(config.noiseFDHop) irLength=\(config.noiseFDIRLength) "
+          + "bins=\(config.noiseFilterOutputSize))")
+    }
+    if config.reverbMode == .learned {
+      // The batched renderer has no reverb path.
+      guard config.batchSize <= 1 else {
+        throw CLIError.invalid(
+          "reverb learned is not implemented for batch-size > 1 "
+            + "(got \(config.batchSize)); use batch-size 1")
+      }
+      logger(
+        "[config] reverb: learned (fftSize=\(config.reverbFFTSize) hop=\(config.reverbHop) "
+          + "irLength=\(config.reverbIRLength) latency=\(spectralConvolveLatency(fftSize: config.reverbFFTSize)) samples; "
+          + "targets are shifted by the latency)")
+    }
     switch options.mode {
     case .dry:
       try runDryStart(
@@ -193,6 +229,21 @@ enum DDSPE2ETrainer {
     logger("Wrote summary and placeholder checkpoint")
   }
 
+  /// The learned reverb delays its output by a fixed
+  /// `spectralConvolveLatency(fftSize:)` samples (dry path included). Shift the
+  /// training/eval target by the same amount so prediction and target stay
+  /// sample-aligned.
+  static func reverbDelayedTarget(_ audio: [Float], config: DDSPE2EConfig) -> [Float] {
+    guard config.reverbMode == .learned else { return audio }
+    let d = spectralConvolveLatency(fftSize: config.reverbFFTSize)
+    guard d > 0 else { return audio }
+    var shifted = [Float](repeating: 0, count: audio.count)
+    if d < audio.count {
+      for n in d..<audio.count { shifted[n] = audio[n - d] }
+    }
+    return shifted
+  }
+
   static func runDecoderOnlyTraining(
     dataset: CachedDataset,
     config: DDSPE2EConfig,
@@ -213,6 +264,7 @@ enum DDSPE2ETrainer {
     LazyGraphContext.reset()
 
     let model = DDSPDecoderModel(config: config)
+    let conditioningFeatureCount = model.inputSize
     if let checkpointPath = options.initCheckpointPath {
       let checkpoint = try CheckpointStore.readModelState(from: URL(fileURLWithPath: checkpointPath))
       model.loadSnapshots(checkpoint.params)
@@ -336,6 +388,72 @@ enum DDSPE2ETrainer {
         count: paddedFeatureFrames
       )
     )
+    let referenceTensor: Tensor?
+    if config.referenceConditioning {
+      switch config.referenceEncoderMode {
+      case .averaged:
+        referenceTensor = Tensor([[Float]](
+          repeating: [Float](repeating: 0, count: config.referenceFeatureSize),
+          count: paddedFeatureFrames))
+      case .temporal:
+        // [timeFrames, melBins] log-mel frames for the learned temporal encoder.
+        referenceTensor = Tensor([[Float]](
+          repeating: [Float](repeating: 0, count: config.referenceMelBins),
+          count: config.referenceTimeFrames))
+      }
+    } else {
+      referenceTensor = nil
+    }
+    let sourceReferenceEntries = Dictionary(grouping: splitEntries, by: \.sourceFile).values.map {
+      let sorted = $0.sorted { $0.startSample < $1.startSample }
+      return sorted[sorted.count / 2]
+    }
+    let referenceEntriesByInstrument = Dictionary(grouping: sourceReferenceEntries) {
+      $0.instrumentIndex ?? 0
+    }
+    func referenceEntry(for target: CachedChunkEntry, offset: UInt64) -> CachedChunkEntry? {
+      guard config.referenceConditioning else { return nil }
+      let candidates = (referenceEntriesByInstrument[target.instrumentIndex ?? 0] ?? [])
+        .filter { $0.sourceFile != target.sourceFile }
+      guard !candidates.isEmpty else { return nil }
+      return candidates[Int(offset % UInt64(candidates.count))]
+    }
+    func crossedReferenceEntry(for target: CachedChunkEntry, offset: UInt64) -> CachedChunkEntry? {
+      guard config.referenceConditioning else { return nil }
+      let targetInstrument = target.instrumentIndex ?? 0
+      let candidates = referenceEntriesByInstrument
+        .filter { $0.key != targetInstrument }
+        .values.flatMap { $0 }
+        .sorted { $0.id < $1.id }
+      guard !candidates.isEmpty else { return nil }
+      return candidates[Int(offset % UInt64(candidates.count))]
+    }
+    func referenceData(from chunk: CachedChunk?) -> [Float] {
+      switch config.referenceEncoderMode {
+      case .averaged:
+        var row = Array((chunk?.timbreFeatures ?? []).prefix(config.referenceFeatureSize))
+        if row.count < config.referenceFeatureSize {
+          row += [Float](repeating: 0, count: config.referenceFeatureSize - row.count)
+        }
+        return Array(repeating: row, count: paddedFeatureFrames).flatMap { $0 }
+      case .temporal:
+        guard let chunk else {
+          return [Float](
+            repeating: 0, count: config.referenceTimeFrames * config.referenceMelBins)
+        }
+        return referenceTimbreFrames(chunk: chunk, config: config)
+      }
+    }
+    // Averaged mode replicates the reference per frame so the classifier sees
+    // [frames, C] logits; the temporal encoder emits one z → [1, C] logits.
+    let classTargetRows =
+      config.referenceEncoderMode == .temporal ? 1 : paddedFeatureFrames
+    let referenceClassTargetTensor: Tensor? = config.referenceConditioning
+      && config.numInstruments > 1
+      ? Tensor([[Float]](
+          repeating: [Float](repeating: 0, count: config.numInstruments),
+          count: classTargetRows))
+      : nil
     let targetTensor = Tensor([Float](repeating: 0, count: frameCount))
     let loudnessTargetTensor = Tensor([[Float]](repeating: [0.0], count: paddedFeatureFrames))
     let uvMaskTensor = Tensor([[Float]](repeating: [0.0], count: paddedFeatureFrames))
@@ -376,6 +494,170 @@ enum DDSPE2ETrainer {
     if options.bestMetric == .spectral && config.spectralWindowSizes.isEmpty {
       logger("best-metric spectral requires --spectral-windows; falling back to combined")
     }
+
+    // Under shuffled multi-chunk training the "current" chunk differs from
+    // step to step, so spectral selection scores on it are not comparable and
+    // best-checkpoint selection would freeze on whichever chunk scores easiest.
+    // Score every eval on a fixed, source-distinct set instead. Its stable
+    // order is independent of per-step training shuffle.
+    struct FixedEvalChunk {
+      let id: String
+      let audio: [Float]
+      let featureFrames: Int
+      let conditioning: [Float]
+      let paddedF0: [Float]
+      let paddedUV: [Float]
+      let reference: [Float]
+      /// Reference from a different instrument than the target (nil when the
+      /// dataset has only one instrument). Used to score reference separation.
+      let referenceCrossed: [Float]?
+    }
+    var fixedEvalChunks = [FixedEvalChunk]()
+    if useSpectralSelection, !config.fixedBatch, splitEntries.count > 1 {
+      let selectionEntries =
+        options.split == .train && !dataset.valEntries.isEmpty ? dataset.valEntries : splitEntries
+      var seenSources = Set<String>()
+      let sourceDistinctEntries = selectionEntries.filter { seenSources.insert($0.sourceFile).inserted }
+      let evalCount = min(max(1, options.bestEvalChunks), sourceDistinctEntries.count)
+      let selectedEntries = (0..<evalCount).map { index in
+        sourceDistinctEntries[index * sourceDistinctEntries.count / evalCount]
+      }
+      for entry in selectedEntries {
+        let chunk = try dataset.loadChunk(entry)
+        let modelFeatures = config.referenceConditioning
+          ? FeatureExtractor.canonicalReferenceControls(
+              features: ChunkFeatures(
+                f0Hz: chunk.f0Hz, loudnessDB: chunk.loudnessDB, uvMask: chunk.uvMask),
+              sourceFile: chunk.sourceFile)
+          : ChunkFeatures(f0Hz: chunk.f0Hz, loudnessDB: chunk.loudnessDB, uvMask: chunk.uvMask)
+        var conditioning = makeConditioningData(
+          f0Hz: modelFeatures.f0Hz,
+          loudnessDB: modelFeatures.loudnessDB,
+          uvMask: modelFeatures.uvMask,
+          instrumentIndex: chunk.instrumentIndex,
+          numInstruments: config.referenceConditioning ? 1 : config.numInstruments
+        )
+        let paddingRows = paddedFeatureFrames * conditioningFeatureCount - conditioning.count
+        if paddingRows > 0 {
+          conditioning.append(contentsOf: [Float](repeating: 0, count: paddingRows))
+        }
+        var paddedF0 = chunk.f0Hz
+        var paddedUV = chunk.uvMask
+        let framePadding = paddedFeatureFrames - paddedF0.count
+        if framePadding > 0 {
+          paddedF0.append(contentsOf: [Float](repeating: 0, count: framePadding))
+          paddedUV.append(contentsOf: [Float](repeating: 0, count: framePadding))
+        }
+        let refEntry = referenceEntry(for: entry, offset: UInt64(fixedEvalChunks.count))
+        let refChunk = try refEntry.map { try dataset.loadChunk($0) }
+        let crossedEntry = crossedReferenceEntry(
+          for: entry, offset: UInt64(fixedEvalChunks.count))
+        let crossedChunk = try crossedEntry.map { try dataset.loadChunk($0) }
+        fixedEvalChunks.append(FixedEvalChunk(
+          id: entry.id,
+          audio: chunk.audio,
+          featureFrames: chunk.f0Hz.count,
+          conditioning: conditioning,
+          paddedF0: paddedF0,
+          paddedUV: paddedUV,
+          reference: referenceData(from: refChunk),
+          referenceCrossed: crossedChunk.map { referenceData(from: $0) }
+        ))
+      }
+      logger(
+        "spectral best-checkpoint selection pinned to \(fixedEvalChunks.count) fixed chunks: "
+          + fixedEvalChunks.map(\.id).joined(separator: ",")
+      )
+    }
+
+    // Classification-only pretraining of the temporal reference encoder.
+    // Joint training lets the synth-reconstruction gradient drown the
+    // classification gradient (z never becomes instrument-separable even
+    // though a linear probe on the raw log-mel input reaches 100%); training
+    // encoder+classifier alone first breaks that cycle. Uses its own Adam:
+    // the main optimizer's moment buffers are indexed positionally and would
+    // mis-align if its first step saw gradients on a mid-list subset.
+    if config.referencePretrainSteps > 0,
+      config.referenceConditioning,
+      config.referenceEncoderMode == .temporal,
+      config.numInstruments > 1,
+      let referenceTensor,
+      let referenceClassTargetTensor
+    {
+      logger(
+        "[pretrain] reference encoder: \(config.referencePretrainSteps) "
+          + "classification-only steps")
+      let pretrainOptimizer = Adam(
+        params: model.referencePretrainParameters, lr: config.referencePretrainLR)
+      var pretrainRng = SeededGenerator(seed: config.seed &+ 0x9E37)
+      var recentLosses = [Float]()
+      // Single-sample cross-entropy steps are too noisy to separate the
+      // latent; accumulate a small batch per optimizer step.
+      let pretrainBatch = 8
+      pretrainLoop: for pretrainStep in 0..<config.referencePretrainSteps {
+        var accumGrads: [Int: [Float]] = [:]
+        var batchLoss: Float = 0
+        for _ in 0..<pretrainBatch {
+          let entry = splitEntries[Int(pretrainRng.next() % UInt64(splitEntries.count))]
+          let chunk = try dataset.loadChunk(entry)
+          referenceTensor.updateDataLazily(referenceData(from: chunk))
+          let selected = min(max(0, entry.instrumentIndex ?? 0), config.numInstruments - 1)
+          var classData = [Float](repeating: 0, count: classTargetRows * config.numInstruments)
+          for row in 0..<classTargetRows {
+            classData[row * config.numInstruments + selected] = 1
+          }
+          referenceClassTargetTensor.updateDataLazily(classData)
+          guard let lossTensor = model.referenceClassificationLossTensor(
+            reference: referenceTensor, target: referenceClassTargetTensor)
+          else {
+            logger("[pretrain] model lacks temporal encoder or classifier; skipping")
+            break pretrainLoop
+          }
+          let lossSignal = lossTensor.peek(Signal.constant(0.0))
+          let lossValues = try lossSignal.backward(frames: 1)
+          batchLoss += lossValues.first ?? Float.nan
+          for (i, param) in model.referencePretrainParameters.enumerated() {
+            if let tensor = param as? Tensor, let gradData = tensor.grad?.getData() {
+              if accumGrads[i] == nil {
+                accumGrads[i] = gradData
+              } else {
+                for j in 0..<min(gradData.count, accumGrads[i]!.count) {
+                  accumGrads[i]![j] += gradData[j]
+                }
+              }
+            }
+          }
+        }
+        let invBatch = 1.0 / Float(pretrainBatch)
+        for (i, param) in model.referencePretrainParameters.enumerated() {
+          if let tensor = param as? Tensor, let gradTensor = tensor.grad,
+            var averaged = accumGrads[i]
+          {
+            for j in 0..<averaged.count { averaged[j] *= invBatch }
+            gradTensor.updateDataLazily(averaged)
+          }
+        }
+        _ = sanitizeAndClipGradients(
+          params: model.referencePretrainParameters,
+          clip: config.gradClip,
+          mode: config.gradClipMode,
+          gradScale: 1.0
+        )
+        pretrainOptimizer.step()
+        pretrainOptimizer.zeroGrad()
+        recentLosses.append(batchLoss * invBatch)
+        if recentLosses.count > 50 { recentLosses.removeFirst() }
+        if pretrainStep % 50 == 0 || pretrainStep == config.referencePretrainSteps - 1 {
+          let meanLoss = recentLosses.reduce(0, +) / Float(recentLosses.count)
+          logger(
+            "[pretrain] step=\(pretrainStep) classLoss(mean\(recentLosses.count))=\(format(meanLoss))")
+        }
+      }
+    }
+    if config.referenceEncoderFreeze {
+      logger("[config] temporal reference encoder frozen during synth training")
+    }
+
     var noImproveSteps = 0
     var completedSteps = 0
     let earlyStopPatience = config.earlyStopPatience
@@ -474,17 +756,39 @@ enum DDSPE2ETrainer {
         lastChunkAudio = chunk.audio
         let tAfterLoad = CFAbsoluteTimeGetCurrent()
 
+        let modelFeatures = config.referenceConditioning
+          ? FeatureExtractor.canonicalReferenceControls(
+              features: ChunkFeatures(
+                f0Hz: chunk.f0Hz, loudnessDB: chunk.loudnessDB, uvMask: chunk.uvMask),
+              sourceFile: chunk.sourceFile)
+          : ChunkFeatures(f0Hz: chunk.f0Hz, loudnessDB: chunk.loudnessDB, uvMask: chunk.uvMask)
         var conditioningData = makeConditioningData(
-          f0Hz: chunk.f0Hz,
-          loudnessDB: chunk.loudnessDB,
-          uvMask: chunk.uvMask
+          f0Hz: modelFeatures.f0Hz,
+          loudnessDB: modelFeatures.loudnessDB,
+          uvMask: modelFeatures.uvMask,
+          instrumentIndex: chunk.instrumentIndex,
+          numInstruments: config.referenceConditioning ? 1 : config.numInstruments
         )
         let paddingRows = paddedFeatureFrames * conditioningFeatureCount - conditioningData.count
         if paddingRows > 0 {
           conditioningData.append(contentsOf: [Float](repeating: 0, count: paddingRows))
         }
         featuresTensor.updateDataLazily(conditioningData)
-        targetTensor.updateDataLazily(chunk.audio)
+        if let referenceTensor {
+          let refEntry = referenceEntry(for: lastEntry, offset: rng.next())
+          let refChunk = try refEntry.map { try dataset.loadChunk($0) }
+          referenceTensor.updateDataLazily(referenceData(from: refChunk))
+          if let referenceClassTargetTensor {
+            let selected = min(max(0, refEntry?.instrumentIndex ?? 0), config.numInstruments - 1)
+            var classData = [Float](
+              repeating: 0, count: classTargetRows * config.numInstruments)
+            for row in 0..<classTargetRows {
+              classData[row * config.numInstruments + selected] = 1
+            }
+            referenceClassTargetTensor.updateDataLazily(classData)
+          }
+        }
+        targetTensor.updateDataLazily(reverbDelayedTarget(chunk.audio, config: config))
         let loudnessTargetData = makeLoudnessTargetData(
           loudnessDB: chunk.loudnessDB,
           paddedFrames: paddedFeatureFrames
@@ -505,14 +809,17 @@ enum DDSPE2ETrainer {
         }
         synthTensors.updateChunkData(f0Frames: paddedF0, uvFrames: paddedUV)
 
-        let controls = model.forward(features: featuresTensor)
+        let controls = model.forward(features: featuresTensor, reference: referenceTensor)
         let prediction = DDSPSynth.renderSignal(
           controls: controls,
           tensors: synthTensors,
           featureFrames: chunk.f0Hz.count,
           frameCount: frameCount,
           numHarmonics: config.numHarmonics,
-          controlSmoothingMode: config.controlSmoothingMode
+          controlSmoothingMode: config.controlSmoothingMode,
+          noiseSettings: config.noiseFilterSettings,
+          reverbSettings: config.reverbSettings,
+          reverbIR: model.reverbIR
         )
         let target = targetTensor.toSignal(maxFrames: frameCount)
         var loss = DDSPTrainingLosses.fullLoss(
@@ -534,6 +841,21 @@ enum DDSPE2ETrainer {
           targetLoudnessNorm: loudnessTargetTensor,
           uvMask: uvMaskTensor
         )
+        if config.referenceClassificationWeight > 0,
+          let logits = controls.referenceClassLogits,
+          let classTarget = referenceClassTargetTensor
+        {
+          let classProbabilities = logits.softmax(axis: 1)
+          let classLossPerRow = -(
+            classTarget * (classProbabilities + 1e-6).log()
+          ).sum(axis: 1)
+          // Every row receives the same reference descriptor, so row zero is
+          // the complete reference classification objective.
+          let classPenalty = classLossPerRow.peek(Signal.constant(0.0))
+          let classWeight = Tensor([config.referenceClassificationWeight])
+            .peek(Signal.constant(0.0))
+          loss = loss + classPenalty * classWeight
+        }
         loss = addHarmonicEntropyRegularization(
           baseLoss: loss,
           controls: controls,
@@ -549,6 +871,15 @@ enum DDSPE2ETrainer {
         let tAfterGraph = CFAbsoluteTimeGetCurrent()
 
         let lossValues = try loss.backward(frames: frameCount)
+        if config.referenceEncoderFreeze {
+          // Zero encoder grads before accumulation so joint training cannot
+          // collapse the pretrained, instrument-separable latent.
+          for tensor in model.temporalEncoderParameters {
+            if let gradTensor = tensor.grad, let count = tensor.getData()?.count {
+              gradTensor.updateDataLazily([Float](repeating: 0, count: count))
+            }
+          }
+        }
         let tAfterBackward = CFAbsoluteTimeGetCurrent()
 
         if shouldDumpControls(step: step, every: options.dumpControlsEvery), accumIdx == gradAccum - 1 {
@@ -670,28 +1001,106 @@ enum DDSPE2ETrainer {
         let isFinalStep = step == steps - 1
         if step % max(1, options.bestEvalEvery) == 0 || isFinalStep {
           do {
-            let evalControls = model.forward(features: featuresTensor)
-            let evalPrediction = DDSPSynth.renderSignal(
-              controls: evalControls,
-              tensors: synthTensors,
-              featureFrames: lastChunkFeatureFrames,
-              frameCount: frameCount,
-              numHarmonics: config.numHarmonics,
-              controlSmoothingMode: config.controlSmoothingMode
-            )
-            let samples = try evalPrediction.realize(frames: frameCount)
-            LazyGraphContext.current.clearComputationGraph()
-            if let score = BestCheckpointScorer.multiScaleSpectralScore(
-              prediction: samples,
-              target: lastChunkAudio,
-              windowSizes: config.spectralWindowSizes,
-              hopDivisor: config.spectralHopDivisor,
-              logEpsilon: config.spectralLogEpsilon
-            ), score < bestSelectionScore {
-              bestSelectionScore = score
-              bestModelSnapshots = model.snapshots()
-              bestModelStep = step
-              logger("step=\(step) bestSpectralScore=\(format(score)) (new best checkpoint)")
+            // Re-upload each fixed chunk and average scores. The next training
+            // step uploads its own data, so no restoration is needed.
+            let evalChunks = fixedEvalChunks.isEmpty ? [] : fixedEvalChunks
+            var scores = [Float]()
+            var crossedScores = [Float]()
+            for evalChunk in evalChunks {
+              featuresTensor.updateDataLazily(evalChunk.conditioning)
+              synthTensors.updateChunkData(
+                f0Frames: evalChunk.paddedF0, uvFrames: evalChunk.paddedUV)
+              // Score with the same-instrument reference and, when the dataset
+              // has more than one instrument, again with a crossed-instrument
+              // reference. Selection must reward both reconstruction AND the
+              // correct reference beating the crossed one — reconstruction-only
+              // selection can pick a checkpoint that ignores references.
+              var referenceVariants: [(data: [Float]?, crossed: Bool)] = [
+                (evalChunk.reference, false)
+              ]
+              if referenceTensor != nil, let crossed = evalChunk.referenceCrossed {
+                referenceVariants.append((crossed, true))
+              }
+              for variant in referenceVariants {
+                if let data = variant.data {
+                  referenceTensor?.updateDataLazily(data)
+                }
+                let evalControls = model.forward(
+                  features: featuresTensor, reference: referenceTensor)
+                let evalPrediction = DDSPSynth.renderSignal(
+                  controls: evalControls,
+                  tensors: synthTensors,
+                  featureFrames: evalChunk.featureFrames,
+                  frameCount: frameCount,
+                  numHarmonics: config.numHarmonics,
+                  controlSmoothingMode: config.controlSmoothingMode,
+                  noiseSettings: config.noiseFilterSettings,
+                  reverbSettings: config.reverbSettings,
+                  reverbIR: model.reverbIR
+                )
+                let samples = try evalPrediction.realize(frames: frameCount)
+                LazyGraphContext.current.clearComputationGraph()
+                if let score = BestCheckpointScorer.multiScaleSpectralScore(
+                  prediction: samples,
+                  target: reverbDelayedTarget(evalChunk.audio, config: config),
+                  windowSizes: config.spectralWindowSizes,
+                  hopDivisor: config.spectralHopDivisor,
+                  logEpsilon: config.spectralLogEpsilon
+                ) {
+                  if variant.crossed {
+                    crossedScores.append(score)
+                  } else {
+                    scores.append(score)
+                  }
+                }
+              }
+            }
+            // fixedEvalChunks is populated for shuffled multi-chunk training.
+            // Retain the old current-chunk fallback for fixed/single datasets.
+            if scores.isEmpty {
+              let evalControls = model.forward(
+                features: featuresTensor, reference: referenceTensor)
+              let evalPrediction = DDSPSynth.renderSignal(
+                controls: evalControls,
+                tensors: synthTensors,
+                featureFrames: lastChunkFeatureFrames,
+                frameCount: frameCount,
+                numHarmonics: config.numHarmonics,
+                controlSmoothingMode: config.controlSmoothingMode,
+                noiseSettings: config.noiseFilterSettings,
+                reverbSettings: config.reverbSettings,
+                reverbIR: model.reverbIR
+              )
+              let samples = try evalPrediction.realize(frames: frameCount)
+              LazyGraphContext.current.clearComputationGraph()
+              if let score = BestCheckpointScorer.multiScaleSpectralScore(
+                prediction: samples,
+                target: reverbDelayedTarget(lastChunkAudio, config: config),
+                windowSizes: config.spectralWindowSizes,
+                hopDivisor: config.spectralHopDivisor,
+                logEpsilon: config.spectralLogEpsilon
+              ) {
+                scores.append(score)
+              }
+            }
+            if !scores.isEmpty {
+              let correctMean = scores.reduce(0, +) / Float(scores.count)
+              var score = correctMean
+              if !crossedScores.isEmpty {
+                let crossedMean = crossedScores.reduce(0, +) / Float(crossedScores.count)
+                let separation = crossedMean - correctMean
+                score = correctMean - config.referenceSeparationWeight * separation
+                logger(
+                  "step=\(step) refEval correct=\(format(correctMean)) "
+                    + "crossed=\(format(crossedMean)) sep=\(format(separation)) "
+                    + "sel=\(format(score))")
+              }
+              if score < bestSelectionScore {
+                bestSelectionScore = score
+                bestModelSnapshots = model.snapshots()
+                bestModelStep = step
+                logger("step=\(step) bestSpectralScore=\(format(score)) (new best checkpoint)")
+              }
             }
           } catch {
             LazyGraphContext.current.clearComputationGraph()
@@ -710,14 +1119,18 @@ enum DDSPE2ETrainer {
         step % options.renderEvery == 0
       {
         do {
-          let renderControls = model.forward(features: featuresTensor)
+          let renderControls = model.forward(
+            features: featuresTensor, reference: referenceTensor)
           let renderPrediction = DDSPSynth.renderSignal(
             controls: renderControls,
             tensors: synthTensors,
             featureFrames: lastChunkFeatureFrames,
             frameCount: frameCount,
             numHarmonics: config.numHarmonics,
-            controlSmoothingMode: config.controlSmoothingMode
+            controlSmoothingMode: config.controlSmoothingMode,
+          noiseSettings: config.noiseFilterSettings,
+            reverbSettings: config.reverbSettings,
+            reverbIR: model.reverbIR
           )
           let samples = try renderPrediction.realize(frames: frameCount)
           LazyGraphContext.current.clearComputationGraph()
@@ -849,6 +1262,7 @@ enum DDSPE2ETrainer {
     logger: (String) -> Void
   ) throws {
     let B = config.batchSize
+    let conditioningFeatureCount = model.inputSize
     let frameCount = max(config.chunkSize, 1)
     let firstChunkFeatureFrames = splitEntries[0].featureFrames
     let paddedFeatureFrames = ((firstChunkFeatureFrames + 7) / 8) * 8
@@ -1003,7 +1417,9 @@ enum DDSPE2ETrainer {
         var chunkCond = makeConditioningData(
           f0Hz: chunk.f0Hz,
           loudnessDB: chunk.loudnessDB,
-          uvMask: chunk.uvMask
+          uvMask: chunk.uvMask,
+          instrumentIndex: chunk.instrumentIndex,
+          numInstruments: config.numInstruments
         )
         let paddingRows = F * conditioningFeatureCount - chunkCond.count
         if paddingRows > 0 {
@@ -1209,7 +1625,9 @@ enum DDSPE2ETrainer {
           let firstChunkCond = makeConditioningData(
             f0Hz: chunks[0].f0Hz,
             loudnessDB: chunks[0].loudnessDB,
-            uvMask: chunks[0].uvMask
+            uvMask: chunks[0].uvMask,
+            instrumentIndex: chunks[0].instrumentIndex,
+            numInstruments: config.numInstruments
           )
           var paddedCond = firstChunkCond
           let condPadding = F * conditioningFeatureCount - paddedCond.count
@@ -1225,7 +1643,8 @@ enum DDSPE2ETrainer {
             featureFrames: chunks[0].f0Hz.count,
             frameCount: frameCount,
             numHarmonics: K,
-            controlSmoothingMode: config.controlSmoothingMode
+            controlSmoothingMode: config.controlSmoothingMode,
+          noiseSettings: config.noiseFilterSettings
           )
           let samples = try renderPrediction.realize(frames: frameCount)
           LazyGraphContext.current.clearComputationGraph()
@@ -2302,13 +2721,16 @@ enum DDSPE2ETrainer {
   private static func makeConditioningData(
     f0Hz: [Float],
     loudnessDB: [Float],
-    uvMask: [Float]
+    uvMask: [Float],
+    instrumentIndex: Int?,
+    numInstruments: Int
   ) -> [Float] {
     let n = min(f0Hz.count, min(loudnessDB.count, uvMask.count))
-    if n == 0 { return [Float](repeating: 0, count: conditioningFeatureCount) }
+    let width = 5 + (numInstruments > 1 ? numInstruments : 0)
+    if n == 0 { return [Float](repeating: 0, count: width) }
 
     var flat = [Float]()
-    flat.reserveCapacity(n * conditioningFeatureCount)
+    flat.reserveCapacity(n * width)
     var prevF0Norm: Float = 0
     var prevLoudNorm: Float = 0
 
@@ -2324,6 +2746,10 @@ enum DDSPE2ETrainer {
       flat.append(uv)
       flat.append(deltaF0)
       flat.append(deltaLoud)
+      if numInstruments > 1 {
+        let selected = min(max(0, instrumentIndex ?? 0), numInstruments - 1)
+        for index in 0..<numInstruments { flat.append(index == selected ? 1 : 0) }
+      }
       prevF0Norm = f0Norm
       prevLoudNorm = loudNorm
     }

@@ -500,6 +500,9 @@ public struct CompilationPipeline {
         context.frameAwareTensorCells.insert(cellId)
       }
     }
+    timings.measure("sumOfMulFusion") {
+      SumOfMulFusionPass.run(graph: graph, ctx: context, backend: backend)
+    }
   }
 
   /// Emits UOp blocks and applies backend-specific post-processing on emitted ops.

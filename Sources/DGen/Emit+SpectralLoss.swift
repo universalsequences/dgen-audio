@@ -1248,8 +1248,10 @@ extension LazyOp {
       }
 
       // The summed window contributions are the exact gradient — no normalization.
-      // Write gradient to frame-aware output: memory[outputCell + frame * B + b]
-      let writeIdx = frameIdx * batchSizeInt + batchIdx_int
+      // Write gradient to frame-aware output: memory[outputCell + slot(frame) * B + b]
+      let writeIdx =
+        b.frameAwareBase(cellId: outputCell, frameIdx: frameIdx, tensorSize: batchSize)
+        + batchIdx_int
       _ = b.memoryWrite(outputCell, writeIdx, gradSum.value)
       b.use(val: b.constant(0.0))
 
@@ -1320,7 +1322,9 @@ extension LazyOp {
       }
 
       // The summed window contributions are the exact gradient — no normalization.
-      let writeIdx = frameIdx * batchSizeInt + batchIdx_int
+      let writeIdx =
+        b.frameAwareBase(cellId: outputCell, frameIdx: frameIdx, tensorSize: batchSize)
+        + batchIdx_int
       _ = b.memoryWrite(outputCell, writeIdx, gradSum.value)
       b.use(val: b.constant(0.0))
 

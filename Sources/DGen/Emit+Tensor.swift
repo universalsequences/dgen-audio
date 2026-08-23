@@ -21,11 +21,12 @@ extension LazyOp {
       // Frame-aware offset: if input/output cells cross block boundaries in a
       // frame/hop-based block, their memory is laid out as frameIdx * tensorSize + elemIdx.
       let inFrameOffset: Expr? = ctx.frameAwareTensorCells.contains(inTensor.cellId)
-        ? b.currentFrameIndex() * b.intConstant(inLen)
+        ? b.frameAwareBase(
+          cellId: inTensor.cellId, frameIdx: b.currentFrameIndex(), tensorSize: inLen)
         : nil
       let outLen = outShape.reduce(1, *)
       let outFrameOffset: Expr? = ctx.frameAwareTensorCells.contains(outCell)
-        ? b.currentFrameIndex() * b.intConstant(outLen)
+        ? b.frameAwareBase(cellId: outCell, frameIdx: b.currentFrameIndex(), tensorSize: outLen)
         : nil
 
       b.parallelRange(outLen) { flatIdx in
@@ -75,10 +76,11 @@ extension LazyOp {
 
       // Frame-aware cells are laid out as frameIdx * total + elemIdx.
       let inFrameOffset: Expr? = ctx.frameAwareTensorCells.contains(inTensor.cellId)
-        ? b.currentFrameIndex() * b.intConstant(total)
+        ? b.frameAwareBase(
+          cellId: inTensor.cellId, frameIdx: b.currentFrameIndex(), tensorSize: total)
         : nil
       let outFrameOffset: Expr? = ctx.frameAwareTensorCells.contains(outCell)
-        ? b.currentFrameIndex() * b.intConstant(total)
+        ? b.frameAwareBase(cellId: outCell, frameIdx: b.currentFrameIndex(), tensorSize: total)
         : nil
 
       b.parallelRange(numRows) { rowFlat in
@@ -115,7 +117,7 @@ extension LazyOp {
       let sourceCount = sourceShape.reduce(1, *)
       let outCount = outShape.reduce(1, *)
       let outFrameOffset: Expr? = ctx.frameAwareTensorCells.contains(outCell)
-        ? b.currentFrameIndex() * b.intConstant(outCount)
+        ? b.frameAwareBase(cellId: outCell, frameIdx: b.currentFrameIndex(), tensorSize: outCount)
         : nil
 
       b.parallelRange(outCount) { flatIdx in
@@ -165,9 +167,11 @@ extension LazyOp {
       let convOutFrameSize = g.frameAwareCells[outCell]?.tensorSize
       let convFrameIdx: Expr? =
         (convInFrameSize != nil || convOutFrameSize != nil) ? b.currentFrameIndex() : nil
-      func convWithFrameOffset(_ offset: Expr, frameSize: Int?) -> Expr {
+      func convWithFrameOffset(_ offset: Expr, cellId: CellID, frameSize: Int?) -> Expr {
         guard let frameSize, let convFrameIdx else { return offset }
-        return b.cast(convFrameIdx * b.intConstant(frameSize) + offset, to: .int)
+        return b.cast(
+          b.frameAwareBase(cellId: cellId, frameIdx: convFrameIdx, tensorSize: frameSize) + offset,
+          to: .int)
       }
 
       b.parallelRange(outShape.reduce(1, *)) { flatIdx in
@@ -191,7 +195,9 @@ extension LazyOp {
             let inVal = b.gswitch(
               inBounds,
               b.memoryRead(
-                inTensor.cellId, convWithFrameOffset(safeIdx, frameSize: convInFrameSize)),
+                inTensor.cellId,
+                convWithFrameOffset(
+                  safeIdx, cellId: inTensor.cellId, frameSize: convInFrameSize)),
               b.constant(0))
 
             let kMemIdx = b.tensorMemoryIndex(
@@ -202,7 +208,8 @@ extension LazyOp {
           }
         }
         _ = b.memoryWrite(
-          outCell, convWithFrameOffset(flatInt, frameSize: convOutFrameSize), acc.value)
+          outCell, convWithFrameOffset(flatInt, cellId: outCell, frameSize: convOutFrameSize),
+          acc.value)
       }
 
     case .sum:
@@ -210,9 +217,10 @@ extension LazyOp {
         let acc = b.float(0.0)
         // Use currentFrameIndex for correct behavior in frame-aware tensor blocks
         let frameIdx = b.currentFrameIndex()
-        let sizeExpr = b.constant(Float(scratch.tensorSize))
+        let frameBase = b.frameAwareBaseFloat(
+          cellId: scratch.cellId, frameIdx: frameIdx, tensorSize: scratch.tensorSize)
         b.loop(scratch.tensorSize) { i in
-          let idx = frameIdx * sizeExpr + b.cast(i, to: .float)
+          let idx = frameBase + b.cast(i, to: .float)
           let val = b.memoryRead(scratch.cellId, b.cast(idx, to: .int))
           acc.accumulate(val)
         }
@@ -225,6 +233,17 @@ extension LazyOp {
         if let s = inputs.first { b.use(val: b.value(s)) }
         return
       }
+
+      // Fused `(sum (* a b))`: read both operands directly in one reduction
+      // loop — the materialized product and its second accumulation pass
+      // disappear. Approved by SumOfMulFusionPass (C backend, same-shape
+      // operands, matching hop gating, cross-block-safe operand reads).
+      if let plan = ctx.fusedSumOfMulPlans[nodeId] {
+        emitFusedSumOfMul(
+          b: b, ctx: ctx, aTensor: plan.aTensor, bTensor: plan.bTensor, shape: plan.shape)
+        return
+      }
+
       let acc = b.float(0.0)
       b.loop(shape.reduce(1, *)) { i in
         let val = b.tensorRead(inTensor, flatIdx: i, shape: shape)
@@ -800,9 +819,9 @@ extension LazyOp {
       let readPosB2: Expr
       if ctx.frameAwareTensorCells.contains(cellId) {
         // Frame-aware tensor: add frameIndex * tensorSize to read positions
-        let tensorSizeFloat = b.constant(Float(channelSize * numChannels))
         let frameIdx = b.currentFrameIndex()
-        let frameBase = frameIdx * tensorSizeFloat
+        let frameBase = b.frameAwareBaseFloat(
+          cellId: cellId, frameIdx: frameIdx, tensorSize: channelSize * numChannels)
         readPosA1 = frameBase + posA1
         readPosA2 = frameBase + posA2
         readPosB1 = frameBase + posB1
@@ -864,7 +883,8 @@ extension LazyOp {
       if isFrameAware {
         // Frame-aware output: write to frame-indexed position (integer arithmetic)
         let frameIdx = b.currentFrameIndex()
-        let frameBase = frameIdx * b.intConstant(size)
+        let frameBase = b.frameAwareBase(
+          cellId: outTensor.cellId, frameIdx: frameIdx, tensorSize: size)
         let writePos = frameBase + b.cast(idx, to: .int)
         _ = b.memoryWrite(outTensor.cellId, writePos, scalarVal)
       } else {
@@ -942,4 +962,98 @@ extension LazyOp {
     default: break
     }
   }
+}
+
+// MARK: - Fused sum-of-mul reduction
+
+/// A tensor that is exactly a circular sliding-window view over a 1D ring
+/// buffer: flat element `j` reads `ring[(pos - count + 1 + j) mod bufSize]`.
+private struct CircularWindowAccess {
+  let cellId: CellID
+  let bufSize: Int
+  let posLazy: Lazy
+}
+
+/// Matches the circular-window shape emitFusedSumOfMul can span-split:
+/// the first transform is a circular-mode `slidingWindow` covering all `count`
+/// elements (every non-window dimension is 1), any remaining transforms are
+/// pure reshapes, and the base ring cell is persistent (not frame-aware).
+private func matchCircularWindow(
+  _ tensor: Tensor, count: Int, ctx: IRContext
+) -> CircularWindowAccess? {
+  guard count > 0,
+    case .slidingWindow(let windowSize, let inputShape, let positionNode)? =
+      tensor.transforms.first,
+    let posNode = positionNode,
+    windowSize == count,
+    tensor.shape.reduce(1, *) == count
+  else { return nil }
+  for transform in tensor.transforms.dropFirst() {
+    guard case .reshape = transform else { return nil }
+  }
+  let bufSize = inputShape.last ?? 0
+  guard bufSize >= windowSize, inputShape.reduce(1, *) == bufSize else { return nil }
+  guard !ctx.frameAwareTensorCells.contains(tensor.cellId) else { return nil }
+  guard tensor.offset == 0 else { return nil }
+  guard let posLazy = ctx.values[posNode] else { return nil }
+  return CircularWindowAccess(cellId: tensor.cellId, bufSize: bufSize, posLazy: posLazy)
+}
+
+private func hasSlidingWindowTransform(_ tensor: Tensor) -> Bool {
+  tensor.transforms.contains {
+    if case .slidingWindow = $0 { return true }
+    return false
+  }
+}
+
+/// Fused `(sum (* a b))`: one reduction loop reading both operands directly.
+/// When one operand is a circular sliding-window view, the window start is
+/// hoisted out of the loop and the reduction splits into two contiguous spans,
+/// eliminating the per-element ring modulo — both spans stay affine so clang's
+/// -O3/-ffast-math auto-vectorization applies.
+private func emitFusedSumOfMul(
+  b: IRBuilder, ctx: IRContext, aTensor: Tensor, bTensor: Tensor, shape: [Int]
+) {
+  let count = shape.reduce(1, *)
+  let acc = b.float(0.0)
+
+  let ringA = matchCircularWindow(aTensor, count: count, ctx: ctx)
+  let ring = ringA ?? matchCircularWindow(bTensor, count: count, ctx: ctx)
+  let other = ringA != nil ? bTensor : aTensor
+
+  if let ring, !hasSlidingWindowTransform(other) {
+    // Window element j reads ring[(pos - count + 1 + j) mod bufSize]. With
+    // pos ∈ [0, bufSize) and count ≤ bufSize, (pos - count + 1 + bufSize) ≥ 1,
+    // so one added bufSize makes the start modulo non-negative.
+    let pos = b.cast(b.value(ring.posLazy), to: .int)
+    let w = b.intConstant(count)
+    let size = b.intConstant(ring.bufSize)
+    let start = (pos - w + b.intConstant(1) + size) % size
+    let tail = size - start
+    let span1 = b.gswitch(tail < w, tail, w)  // min(tail, count): span until wrap
+    b.loop(count: span1) { j in
+      let rv = b.memoryRead(ring.cellId, start + j)
+      let ov = b.tensorRead(other, flatIdx: j, shape: shape)
+      acc.accumulate(rv * ov)
+    }
+    let span2 = w - span1
+    b.loop(count: span2) { j in
+      let rv = b.memoryRead(ring.cellId, j)
+      let ov = b.tensorRead(other, flatIdx: span1 + j, shape: shape)
+      acc.accumulate(rv * ov)
+    }
+    // Publish through an identity so the node's (possibly cross-block global)
+    // value variable is written once after the loops — accumulating directly
+    // into a global array element would alias `memory` and block clang from
+    // keeping the reduction in a register / vectorizing it.
+    b.use(val: acc.value + b.constant(0.0))
+    return
+  }
+
+  b.loop(count) { j in
+    let av = b.tensorRead(aTensor, flatIdx: j, shape: shape)
+    let bv = b.tensorRead(bTensor, flatIdx: j, shape: shape)
+    acc.accumulate(av * bv)
+  }
+  b.use(val: acc.value + b.constant(0.0))
 }

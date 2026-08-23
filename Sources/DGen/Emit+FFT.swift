@@ -70,15 +70,19 @@ extension LazyOp {
 
     case .overlapAddGradGather(let windowSize, let hopSize, let gradStoreCell, let gradInputCell):
       // Gather stored gradients into per-frame gradient tensor
-      // For hop frame h: grad_input[h][i] = grad_output[h + offset(i)]
-      //   where offset(0) = windowSize, offset(i>0) = i
+      // For hop frame h: grad_input[h][i] = grad_output[h + i]
+      // (the forward scatters BEFORE reading, so window index i of a tick at
+      // frame h contributes to output frame h + i — including i == 0, which is
+      // emitted on the tick frame itself. An earlier read-before-scatter
+      // forward surfaced window[0] a full ring revolution later, and the
+      // backward carried a matching offset(0) = windowSize special case long
+      // after the forward changed; every consumer applied a Hann synthesis
+      // window with w[0] == 0, which is why nothing noticed.)
       // For non-hop frames: grad_input = 0
       _ = b.value(inputs[0])  // force dependency on store phase
       let frameIdx = b.currentFrameIndex()
       let frameCount = b.frameCount()
       let hopSizeFloat = b.constant(Float(hopSize))
-      let winSizeFloat = b.constant(Float(windowSize))
-      let winSizeInt = b.intConstant(windowSize)
       let zero = b.constant(0.0)
 
       let frameFloat = b.cast(frameIdx, to: .float)
@@ -92,9 +96,7 @@ extension LazyOp {
 
       b.loop(windowSize) { i in
         let iFloat = b.cast(i, to: .float)
-        // offset(0) = windowSize, offset(i>0) = i (all in float to avoid select ambiguity)
-        let offset = b.gswitch(iFloat == zero, winSizeFloat, iFloat)
-        let readFrame = frameFloat + offset
+        let readFrame = frameFloat + iFloat
         let inBounds = readFrame < frameCountFloat
 
         // Read stored gradient (clamped to avoid OOB)
@@ -104,16 +106,12 @@ extension LazyOp {
         // Only use if hop frame AND in bounds
         let validGrad = b.gswitch(isHopFrame, b.gswitch(inBounds, gradVal, zero), zero)
 
-        // Write to frame-indexed gradient tensor cell. Hop-sliced cells hold
-        // one slot per hop (frameAwareCellHops); index by frame / hop.
+        // Write to frame-indexed gradient tensor cell. `frameAwareBase` maps the
+        // frame onto the cell's slot (hop-sliced cells hold one slot per hop).
         let iInt = b.cast(i, to: .int)
-        let writeIdx: Expr
-        if let hop = g.frameAwareCellHops[gradInputCell], hop > 1 {
-          let slot = frameInt / b.intConstant(hop)
-          writeIdx = slot * winSizeInt + iInt
-        } else {
-          writeIdx = frameInt * winSizeInt + iInt
-        }
+        let writeIdx =
+          b.frameAwareBase(cellId: gradInputCell, frameIdx: frameInt, tensorSize: windowSize)
+          + iInt
         _ = b.memoryWrite(gradInputCell, writeIdx, validGrad)
       }
       b.use(val: zero)
@@ -132,19 +130,14 @@ extension LazyOp {
 
       let bvFrameIdx = b.currentFrameIndex()
       let bvFrameInt = b.cast(bvFrameIdx, to: .int)
-      let bvWinSizeInt = b.intConstant(windowSize)
-      // Hop-sliced grad cells hold one slot per hop; index by frame / hop.
-      let bvSlotInt: Expr
-      if let hop = g.frameAwareCellHops[gradCell], hop > 1 {
-        bvSlotInt = bvFrameInt / b.intConstant(hop)
-      } else {
-        bvSlotInt = bvFrameInt
-      }
+      // Hop-sliced grad cells hold one slot per hop; `frameAwareBase` handles it.
+      let bvFrameBase = b.frameAwareBase(
+        cellId: gradCell, frameIdx: bvFrameInt, tensorSize: windowSize)
 
       b.loop(windowSize) { j in
         let jInt = b.cast(j, to: .int)
         let gradElem = b.tensorRead(tensor, flatIdx: jInt, shape: tensor.shape)
-        let writeIdx = bvSlotInt * bvWinSizeInt + jInt
+        let writeIdx = bvFrameBase + jInt
         _ = b.memoryWrite(gradCell, writeIdx, gradElem)
       }
       b.use(val: b.constant(0.0))

@@ -39,6 +39,20 @@ extension TensorMemoryMaterializationPass {
 
     var lazyToReal: [CellID: CellID] = [:]
 
+    // Hop rate of the block a node is actually *scheduled* in. A node can be
+    // tagged hop-based while landing in a frame-based block (block temporality
+    // degrades to frame-based as soon as one member is frame-based), and then
+    // it writes its cell on every frame. That is survivable for a forward
+    // tensor, whose value is constant across the hop, but not for a gradient
+    // cell that zero-fills between ticks (`frameAwareCellScatter`): the last
+    // write in the hop would be the zeroed one. Gradient cells are therefore
+    // hop-sliced only when their block really runs at hop rate.
+    var scheduledBlockHop: [NodeID: Int] = [:]
+    for block in blocks {
+      guard case .hopBased(let hopSize, _) = block.temporality else { continue }
+      for nodeId in block.nodes { scheduledBlockHop[nodeId] = hopSize }
+    }
+
     for tensorId in graph.tensors.keys.sorted() {
       guard let tensor = graph.tensors[tensorId] else { continue }
       guard tensor.isLazy else { continue }
@@ -46,6 +60,44 @@ extension TensorMemoryMaterializationPass {
       let tensorSize = tensor.shape.reduce(1, *)
       let lazyCellId = tensor.cellId
       let nodeId = liveness.cellToNode[lazyCellId]
+
+      // Latch output aliasing (C backend): a tensor latch already maintains a
+      // persistent per-element state cell that holds exactly the value every
+      // consumer wants — fresh on capture frames, held otherwise. When all
+      // consumers live in the producing block (not outbound), point the output
+      // tensor at the state cell instead of allocating a frame-major copy that
+      // emission would rewrite every frame (4MB/block for a [2048] latch).
+      // Cross-block consumers replay frames from their own loop and need the
+      // per-frame copy, as do gradient tapes and hop-sliced (scatter) latches.
+      if let nodeId,
+        let node = graph.nodes[nodeId],
+        case .latch(let stateCell) = node.op,
+        backend == .c,
+        graph.lastForwardNodeId == nil,
+        tensor.transforms.isEmpty,
+        !graph.materializeNodes.contains(nodeId),
+        !liveness.outboundCells.contains(lazyCellId),
+        hopBasedNodes[nodeId] == nil,
+        node.inputs.count == 2,
+        isScalarShaped(graph.nodes[node.inputs[1]]),
+        (graph.cellAllocationSizes[stateCell] ?? 1) == tensorSize
+      {
+        graph.lazyCells.remove(lazyCellId)
+        lazyToReal[lazyCellId] = stateCell
+        graph.tensors[tensorId] = Tensor(
+          id: tensor.id,
+          shape: tensor.shape,
+          cellId: stateCell,
+          data: tensor.data,
+          baseShape: tensor.baseShape,
+          baseStrides: tensor.baseStrides,
+          transforms: tensor.transforms,
+          isLazy: false,
+          materialize: tensor.materialize
+        )
+        graph.cellToTensor[stateCell] = tensorId
+        continue
+      }
 
       let decision = decideTensorAllocation(
         graph: graph,
@@ -68,7 +120,12 @@ extension TensorMemoryMaterializationPass {
       // storage slot per hop suffices (addressing divides frameIdx by hop).
       // Without this, hop-rate FFT/spectral intermediates would each demand
       // tensorSize * frameCount floats and blow out GPU memory.
-      let hop = nodeId.flatMap { hopBasedNodes[$0]?.0 } ?? 1
+      var hop = nodeId.flatMap { hopBasedNodes[$0]?.0 } ?? 1
+      let isGradientNode =
+        nodeId.map { id in (graph.lastForwardNodeId.map { id > $0 }) ?? false } ?? false
+      if hop > 1, isGradientNode, nodeId.flatMap({ scheduledBlockHop[$0] }) != hop {
+        hop = 1
+      }
       let frameSlots = hop > 1 ? (frameCount + hop - 1) / hop : frameCount
       let allocSize = decision.needsFrameAwareAlloc ? tensorSize * frameSlots : tensorSize
       let realCellId = graph.allocateLazyCell(lazyCellId, vectorWidth: allocSize)
@@ -77,6 +134,13 @@ extension TensorMemoryMaterializationPass {
       if decision.needsFrameAwareAlloc {
         graph.frameAwareCells[realCellId] = (tensorSize: tensorSize, frameCount: frameSlots)
         graph.frameAwareCellHops[realCellId] = hop > 1 ? hop : nil
+        // A hop-sliced value is live only on hop ticks; a frame-rate reader must
+        // see zero in between rather than the held tick value. See
+        // `Graph.frameAwareCellScatter` — this holds for forward tensors and
+        // adjoints alike, and is what keeps the two mutually consistent.
+        if hop > 1 {
+          graph.frameAwareCellScatter.insert(realCellId)
+        }
       }
 
       graph.tensors[tensorId] = Tensor(
@@ -94,6 +158,13 @@ extension TensorMemoryMaterializationPass {
     }
 
     patchViewCellIds(graph: graph, lazyToReal: lazyToReal)
+  }
+
+  /// True when a node exists and is scalar-shaped (missing shape counts as scalar).
+  private static func isScalarShaped(_ node: Node?) -> Bool {
+    guard let node else { return false }
+    if case .tensor = node.shape ?? .scalar { return false }
+    return true
   }
 
   /// Computes liveness facts used by allocation decisioning.

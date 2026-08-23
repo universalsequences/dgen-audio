@@ -41,12 +41,12 @@ extension LazyOp {
         else {
           throw DGenError.missingTensorID
         }
-        let width = b.intConstant(elementCount)
+        let frameBase = b.frameAwareBase(
+          cellId: gradCell, frameIdx: frameInt, tensorSize: elementCount)
         b.parallelRange(elementCount) { element in
           let elementInt = b.cast(element, to: .int)
           let grad = b.tensorRead(tensor, flatIdx: elementInt, shape: tensor.shape)
-          let offset = frameInt * width + elementInt
-          _ = b.memoryWrite(gradCell, offset, grad)
+          _ = b.memoryWrite(gradCell, frameBase + elementInt, grad)
         }
       }
       b.use(val: b.constant(0.0))
@@ -59,7 +59,6 @@ extension LazyOp {
       _ = b.value(inputs[0])  // hard dependency on the completed store pass
 
       let frameCount = b.frameCount()
-      let width = b.intConstant(elementCount)
       let zero = b.constant(0.0)
       b.parallelRange(elementCount) { element in
         let elementInt = b.cast(element, to: .int)
@@ -70,12 +69,17 @@ extension LazyOp {
         let frameInt = b.cast(frame, to: .int)
         let reset = b.memoryRead(resetCell, frameInt)
         let activeCarry = b.gswitch(reset > zero, zero, carry.value)
-        let offset = frameInt * width + elementInt
-        _ = b.memoryWrite(outputCell, offset, activeCarry)
+        let outOffset =
+          b.frameAwareBase(cellId: outputCell, frameIdx: frameInt, tensorSize: elementCount)
+          + elementInt
+        _ = b.memoryWrite(outputCell, outOffset, activeCarry)
 
         // y[n] is the pre-update state. Its gradient contributes to the state
         // entering n even when reset[n] cuts the later recurrence.
-        let upstream = b.memoryRead(gradCell, offset)
+        let upstream = b.memoryRead(
+          gradCell,
+          b.frameAwareBase(cellId: gradCell, frameIdx: frameInt, tensorSize: elementCount)
+            + elementInt)
         carry.mutate(to: upstream + activeCarry)
         b.ops.append(UOp(op: .endLoop, value: .empty))
       }
@@ -97,7 +101,9 @@ extension LazyOp {
       } else {
         elementInt = b.intConstant(0)
       }
-      let offset = frameInt * b.intConstant(elementCount) + elementInt
+      let offset =
+        b.frameAwareBase(cellId: outputCell, frameIdx: frameInt, tensorSize: elementCount)
+        + elementInt
       var result = b.memoryRead(outputCell, offset)
       if scaleBySampleRate {
         result = result / b.hostSampleRate()

@@ -258,6 +258,10 @@ private func emitStandardBlockBodyUOps(
       backwardUOpsStartIndex = bodyUops.count
     }
 
+    // Producers whose every consumer is a fused sum (SumOfMulFusionPass) emit
+    // nothing — the reduce reads their operands inline.
+    if ctx.crossBlockSkippedTensorNodes.contains(nodeId) { continue }
+
     if let node = g.nodes[nodeId] {
       for uop in try node.op.emit(ctx: ctx, g: g, nodeId: nodeId) {
         emittedNodes.insert(nodeId)

@@ -46,9 +46,11 @@ func emitOptimizedConv2D(
   let outFrameSize = g.frameAwareCells[outCell]?.tensorSize
   let frameIdx: Expr? =
     (inFrameSize != nil || outFrameSize != nil) ? b.currentFrameIndex() : nil
-  func withFrameOffset(_ offset: Expr, frameSize: Int?) -> Expr {
+  func withFrameOffset(_ offset: Expr, cellId: CellID, frameSize: Int?) -> Expr {
     guard let frameSize, let frameIdx else { return offset }
-    return b.cast(frameIdx * b.intConstant(frameSize) + offset, to: .int)
+    return b.cast(
+      b.frameAwareBase(cellId: cellId, frameIdx: frameIdx, tensorSize: frameSize) + offset,
+      to: .int)
   }
   // Fast path: kernel data baked at graph-build time → hoist each weight as a
   // preamble-broadcast constant. Runtime path: load and broadcast inside the loop.
@@ -101,7 +103,7 @@ func emitOptimizedConv2D(
             let tapRowOffset = inY * inW + outX_base + (kx - padW)
             let tapOffset =
               tapRowOffset == 0 ? t : (b.intConstant(tapRowOffset) + t)
-            var v = b.memoryRead(inCell, withFrameOffset(tapOffset, frameSize: inFrameSize))
+            var v = b.memoryRead(inCell, withFrameOffset(tapOffset, cellId: inCell, frameSize: inFrameSize))
 
             // Edge masking: multiply by pre-baked 4-lane mask vector. The
             // offset must include the lane var `t`: SIMD rendering loads the
@@ -143,7 +145,7 @@ func emitOptimizedConv2D(
 
         // If every (outY, ky) was OOB for this row, running can be nil — fall back to zero.
         let value = running ?? b.constant(0.0)
-        _ = b.memoryWrite(outCell, withFrameOffset(offset, frameSize: outFrameSize), value)
+        _ = b.memoryWrite(outCell, withFrameOffset(offset, cellId: outCell, frameSize: outFrameSize), value)
       }
     }
   }

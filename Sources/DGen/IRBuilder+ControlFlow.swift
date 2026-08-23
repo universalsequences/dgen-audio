@@ -30,9 +30,9 @@ extension IRBuilder {
 
   /// Emit a conditional execution block. The body executes only when `condition` is non-zero.
   /// Emits `beginIf`/`endIf` UOps that the renderer translates to `if (cond) { ... }`.
-  public func if_(_ condition: Expr, body: () -> Void) {
+  public func if_(_ condition: Expr, body: () throws -> Void) rethrows {
     ops.append(UOp(op: .beginIf(condition.lazy), value: ctx.useVariable(src: nil)))
-    body()
+    try body()
     ops.append(UOp(op: .endIf, value: ctx.useVariable(src: nil)))
   }
 
@@ -44,6 +44,16 @@ extension IRBuilder {
     let loopVar = ctx.useVariable(src: nodeId)
     let countLazy = ctx.useConstant(src: nodeId, value: Float(count))
     ops.append(UOp(op: .beginForLoop(loopVar, countLazy), value: loopVar))
+    body(value(loopVar, scalarType: .int))
+    ops.append(UOp(op: .endLoop, value: ctx.useVariable(src: nil)))
+  }
+
+  /// Emit a sequential for-loop with a runtime-computed trip count.
+  /// The count should be an int-typed expression; a non-positive count runs
+  /// the body zero times. The body receives the loop index as an int `Expr`.
+  public func loop(count: Expr, body: (Expr) -> Void) {
+    let loopVar = ctx.useVariable(src: nodeId)
+    ops.append(UOp(op: .beginForLoop(loopVar, count.lazy), value: loopVar))
     body(value(loopVar, scalarType: .int))
     ops.append(UOp(op: .endLoop, value: ctx.useVariable(src: nil)))
   }

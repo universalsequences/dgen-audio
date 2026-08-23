@@ -25,7 +25,7 @@ TINYGRAD_KERNEL_STATS.txt
 /.ddsp_cache_tinysol_mini2
 /.ddsp_cache_tinysol_mixcheck
 /.ddsp_runs_tinysol
-runs
+/runs/
 testtrain.sh
 docs/SPECTRAL_HOP_GRADIENT_ISSUE.md
 /.ddsp_cache_overfit1
@@ -35,6 +35,10 @@ test_kernel_no_gemm.metal
 test_kernel_revert.metal
 /.ddsp_cache_flute
 /.ddsp_cache_flute2
+/.ddsp_cache_*/
+/.*_wavs/
+/*.wav
+/*.mp3
 train3.sh
 train_flute.sh
 test_kernel_yes_gemm_small_hidden.metal
@@ -49,3 +53,12 @@ bending_metal.wav
 /.toolchain-downloads/
 /.toolchain/
 /toolchain/generated/current/*.dylib
+
+# Beads / Dolt files (added by bd init)
+.dolt/
+*.db
+.beads-credential-key
+.beads/proxieddb/
+*.gate.lock*
+
+__pycache__/
