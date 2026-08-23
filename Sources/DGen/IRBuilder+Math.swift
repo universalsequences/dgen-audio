@@ -1,4 +1,8 @@
+#if canImport(Darwin)
 import Darwin
+#else
+import Glibc
+#endif
 
 /// IRBuilder extension for math operations.
 /// Unary: abs, sign, sin, cos, tan, atan, tanh, exp, log, log10, sqrt, neg, floor, ceil, round.

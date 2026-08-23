@@ -1,6 +1,19 @@
 import Foundation
 
 public enum DGenBinaryAudit {
+  /// Repository-relative audit script for this platform's object format.
+  /// Mach-O (`.dylib`) on Apple platforms, ELF (`.so`) everywhere else. Only
+  /// the last, repo-derived tier of the resolution order is platform-varying;
+  /// an explicit `--audit-tool` path or `DGEN_BINARY_AUDIT_TOOL` is honoured
+  /// verbatim on every platform.
+  static let repositoryScriptName: String = {
+    #if canImport(Darwin)
+      return "audit-dgen-dylib.sh"
+    #else
+      return "audit-dgen-elf-so.sh"
+    #endif
+  }()
+
   /// Resolve the audit script. Precedence: explicit tool path (CLI
   /// `--audit-tool`) > `DGEN_BINARY_AUDIT_TOOL` env var > the repository
   /// script derived from `#filePath`. The last is a build-machine path: it
@@ -19,7 +32,7 @@ public enum DGenBinaryAudit {
       script = override
     } else {
       script = DGenToolchainPolicy.repositoryRoot
-        .appendingPathComponent("scripts/audit-dgen-dylib.sh").path
+        .appendingPathComponent("scripts/\(repositoryScriptName)").path
       resolvedFromRepoFallback = true
     }
 
@@ -29,7 +42,7 @@ public enum DGenBinaryAudit {
         message = """
           DGen binary audit script not found: \(script). This default is the \
           build machine's dgen checkout and does not exist here. Pass \
-          --audit-tool <path-to-audit-dgen-dylib.sh>, set \
+          --audit-tool <path-to-\(repositoryScriptName)>, set \
           DGEN_BINARY_AUDIT_TOOL, or pass --skip-inline-audit if the host \
           application audits compiled dylibs itself.
           """
@@ -56,7 +69,7 @@ public enum DGenBinaryAudit {
       throw NSError(
         domain: "DGenBinaryAudit",
         code: Int(process.terminationStatus),
-        userInfo: [NSLocalizedDescriptionKey: "DGen dylib audit failed: \(output)"])
+        userInfo: [NSLocalizedDescriptionKey: "DGen binary audit failed: \(output)"])
     }
   }
 }

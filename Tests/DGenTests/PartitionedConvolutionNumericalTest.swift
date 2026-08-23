@@ -1,3 +1,5 @@
+#if canImport(AVFoundation)
+
 import AVFoundation
 import Foundation
 import XCTest
@@ -276,3 +278,5 @@ final class PartitionedConvolutionNumericalTest: XCTestCase {
         }
     }
 }
+
+#endif  // canImport(AVFoundation)

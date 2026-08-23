@@ -17,15 +17,21 @@ let package = Package(
         .library(name: "DGen", targets: ["DGen"]),
         .library(name: "DGenLazy", targets: ["DGenLazy"]),
     ],
+    dependencies: [
+        .package(url: "https://github.com/apple/swift-crypto", from: "3.0.0")
+    ],
     targets: [
         .target(
             name: "DGen",
-            dependencies: ["DGenHostSupport"],
+            dependencies: [
+                "DGenHostSupport",
+                .product(name: "Crypto", package: "swift-crypto", condition: .when(platforms: [.linux, .windows, .android]))
+            ],
             linkerSettings: [
-                .linkedFramework("Cocoa"),
-                .linkedFramework("Metal"),
-                .linkedFramework("MetalKit"),
-                .linkedFramework("QuartzCore")
+                .linkedFramework("Cocoa", .when(platforms: [.macOS])),
+                .linkedFramework("Metal", .when(platforms: [.macOS])),
+                .linkedFramework("MetalKit", .when(platforms: [.macOS])),
+                .linkedFramework("QuartzCore", .when(platforms: [.macOS]))
             ]
         ),
         .target(
@@ -33,7 +39,7 @@ let package = Package(
             path: "Sources/DGenHostSupport",
             publicHeadersPath: "include",
             linkerSettings: [
-                .linkedFramework("Accelerate")
+                .linkedFramework("Accelerate", .when(platforms: [.macOS]))
             ]
         ),
         .executableTarget(

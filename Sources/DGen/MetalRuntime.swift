@@ -1,3 +1,5 @@
+#if canImport(Metal)
+
 import AVFoundation
 import Foundation
 import Metal
@@ -891,3 +893,5 @@ public class MetalCompiledKernel: CompiledKernelRuntime {
     cleanup()
   }
 }
+
+#endif  // canImport(Metal)

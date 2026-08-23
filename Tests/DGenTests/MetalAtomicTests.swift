@@ -1,3 +1,5 @@
+#if canImport(Metal)
+
 import XCTest
 import Metal
 
@@ -321,3 +323,5 @@ final class MetalAtomicTests: XCTestCase {
         XCTAssertTrue(allSame, "All runs should be identical")
     }
 }
+
+#endif  // canImport(Metal)

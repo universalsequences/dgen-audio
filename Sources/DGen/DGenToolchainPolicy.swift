@@ -1,4 +1,8 @@
+#if canImport(CryptoKit)
 import CryptoKit
+#else
+import Crypto
+#endif
 import Foundation
 
 public struct DGenCompilerInvocation {
@@ -14,9 +18,129 @@ public struct DGenCompilerInvocation {
 /// remains as a development fallback. The system-Clang path is a
 /// development-only compatibility path; generated C and numerical semantics
 /// are identical.
+///
+/// Everything that varies with the host object format / ISA lives in
+/// `HostProfile`, and exactly one profile is selected at compile time. The
+/// `darwin-arm64` profile is the original policy verbatim: its emitted
+/// argument lists and policy signatures are byte-identical to the pre-port
+/// ones, because they are also a compilation-cache key.
 public enum DGenToolchainPolicy {
   public static let policyVersion = 1
-  public static let target = "arm64-apple-macos11.0"
+
+  // MARK: - Host profiles
+
+  /// The host-varying half of the compile/link policy.
+  ///
+  /// Only object-format and ISA concerns belong here. The numerical contract
+  /// (`optimizationArguments`) and the language/ABI contract shared by every
+  /// host (`sharedContractArguments`) are deliberately profile-independent:
+  /// generated C and numerical semantics must be identical on every platform.
+  struct HostProfile {
+    /// Stable profile identity, recorded in the policy signature.
+    let identifier: String
+    /// Clang target triple.
+    let target: String
+    /// ISA baseline. See the `linux-x86_64` profile for why v3 is a floor.
+    let cpuArguments: [String]
+    /// Extra compile-side flags needed for this host's dead-strip mechanism.
+    let sectionArguments: [String]
+    /// Driver flag that produces a shared library.
+    let sharedLibraryArgument: String
+    /// Linker dead-code stripping.
+    let deadStripArgument: String
+    /// File extension of the produced artifact, without the leading dot.
+    let artifactExtension: String
+    /// Whether a staged (hermetic) toolchain exists for this host at all.
+    let supportsStagedToolchain: Bool
+    /// Extra leading lines mixed into the policy signature.
+    ///
+    /// Empty for `darwin-arm64`: that signature predates host profiles and is
+    /// kept byte-identical so existing artifact caches stay valid. Non-darwin
+    /// profiles carry an explicit identity line instead of relying on the
+    /// argument list alone to distinguish them.
+    let signaturePreamble: [String]
+    /// Linker flag that stamps the artifact's own name into it — Mach-O
+    /// `LC_ID_DYLIB` / ELF `DT_SONAME`. Must be a bare filename plus, on
+    /// Darwin, the `@rpath` prefix the mac host expects.
+    let installNameArgument: (String) -> String
+  }
+
+  #if os(macOS) && arch(arm64)
+
+    static let hostProfile = HostProfile(
+      identifier: "darwin-arm64",
+      target: "arm64-apple-macos11.0",
+      cpuArguments: ["-mcpu=apple-m1"],
+      sectionArguments: [],
+      sharedLibraryArgument: "-dynamiclib",
+      deadStripArgument: "-Wl,-dead_strip",
+      artifactExtension: "dylib",
+      supportsStagedToolchain: true,
+      signaturePreamble: [],
+      installNameArgument: { base in "-Wl,-install_name,@rpath/\(base)" })
+
+  #elseif os(Linux) && arch(x86_64)
+
+    static let hostProfile = HostProfile(
+      identifier: "linux-x86_64",
+      target: "x86_64-unknown-linux-gnu",
+      // `-march=x86-64-v3` (AVX2 + FMA + BMI2; Haswell 2013 / Zen 1 and
+      // later) is a NUMERICAL FLOOR, not a performance preference. Do not
+      // relax it to x86-64 or x86-64-v2 to widen hardware support.
+      //
+      // toolchain/include/dgen_simd_compat.h implements the NEON intrinsics
+      // that CRenderer emits unconditionally; `vfmaq_f32` / `vfmsq_f32` are
+      // implemented with `__builtin_elementwise_fma`, whose contract is a
+      // SINGLE-ROUNDED fused multiply-add — that is what the ARM original
+      // does, and the transcendental polynomials in dgen_runtime.h are
+      // evaluated assuming it. Measured on clang 22 with the exact
+      // optimization flags below (-O3 -ffast-math -ffp-contract=fast):
+      //
+      //   -march=x86-64     -> mulps  + addps      (UNFUSED, double-rounds)
+      //   -march=x86-64-v2  -> mulps  + addps      (UNFUSED, double-rounds)
+      //   -march=x86-64-v3  -> vfmadd231ps         (fused, single-rounded)
+      //
+      // Below v3 there is no FMA instruction to select, so every FMA in the
+      // shim silently degrades to a double-rounded mul+add and the x86 build
+      // stops being numerically faithful to the arm64 one. Supporting
+      // pre-Haswell hardware would require a soft-FMA fallback in the shim,
+      // not a weaker -march here.
+      cpuArguments: ["-march=x86-64-v3"],
+      // GNU ld only strips at section granularity, so per-function/-datum
+      // sections are the compile-side half of `--gc-sections`. Darwin's
+      // `-dead_strip` needs no equivalent: Mach-O atomizes by symbol.
+      sectionArguments: ["-ffunction-sections", "-fdata-sections"],
+      sharedLibraryArgument: "-shared",
+      deadStripArgument: "-Wl,--gc-sections",
+      artifactExtension: "so",
+      // No staged toolchain is built for Linux: toolchain/ stages a Mach-O
+      // clang+lld against libSystem.tbd (toolchain/VERSION.json declares
+      // "target": "arm64-apple-macos"). Selecting a stage root here is an
+      // error, never a silent downgrade to system clang.
+      supportsStagedToolchain: false,
+      signaturePreamble: ["host-profile=linux-x86_64", "host-profile-revision=1"],
+      installNameArgument: { base in "-Wl,-soname,\(base)" })
+
+  #else
+
+    #error(
+      """
+      DGen has no compile/link policy for this host. Supported hosts are \
+      macOS/arm64 and Linux/x86_64. Add a HostProfile in \
+      Sources/DGen/DGenToolchainPolicy.swift before building here.
+      """)
+
+  #endif
+
+  /// Clang target triple for the selected host profile.
+  public static var target: String { hostProfile.target }
+
+  /// Extension (no leading dot) of the shared object this policy produces:
+  /// `dylib` on Darwin, `so` on Linux. Callers that name the user-visible
+  /// artifact must use this rather than hardcoding either.
+  public static var artifactExtension: String { hostProfile.artifactExtension }
+
+  // MARK: - Host-independent contract
 
   private static let optimizationArguments = [
     // `-Ofast` is deprecated. DGen spells out its numerical contract:
@@ -34,16 +158,23 @@ public enum DGenToolchainPolicy {
     "-funroll-loops",
   ]
 
-  private static let contractArguments = [
-    "-mcpu=apple-m1",
+  private static let sharedContractArguments = [
     "-flto=thin",
     "-fPIC",
     "-fvisibility=hidden",
     "-fno-stack-protector",
     "-fno-asynchronous-unwind-tables",
-    "-std=c11",
-    "-x", "c",
   ]
+
+  /// Full contract argument list for the selected host. Ordering matters:
+  /// `-x c` stays last so it applies to the source file, which every caller
+  /// appends after these.
+  private static var contractArguments: [String] {
+    hostProfile.cpuArguments
+      + sharedContractArguments
+      + hostProfile.sectionArguments
+      + ["-std=c11", "-x", "c"]
+  }
 
   public static var repositoryRoot: URL {
     URL(fileURLWithPath: #filePath)
@@ -61,6 +192,29 @@ public enum DGenToolchainPolicy {
     return repositoryRoot.appendingPathComponent("toolchain/include", isDirectory: true)
   }
 
+  // MARK: - Stage-root resolution
+
+  /// Where a resolved stage root came from, so the "no staged toolchain on
+  /// this host" error can name the knob the caller actually turned.
+  private enum StageRootOrigin: String {
+    case explicit = "--toolchain-root"
+    case environment = "DGEN_TOOLCHAIN_STAGE_ROOT"
+  }
+
+  private static func resolvedStageRootWithOrigin(
+    explicit: String?
+  ) -> (root: URL, origin: StageRootOrigin)? {
+    if let explicit, !explicit.isEmpty {
+      return (URL(fileURLWithPath: explicit, isDirectory: true), .explicit)
+    }
+    if let stagePath = ProcessInfo.processInfo.environment["DGEN_TOOLCHAIN_STAGE_ROOT"],
+      !stagePath.isEmpty
+    {
+      return (URL(fileURLWithPath: stagePath, isDirectory: true), .environment)
+    }
+    return nil
+  }
+
   /// Resolves the staged toolchain root for one invocation.
   ///
   /// An explicit root — the host-selected `--toolchain-root` — always wins over
@@ -68,16 +222,10 @@ public enum DGenToolchainPolicy {
   /// staged toolchain was selected at all, which is the only case that may use
   /// the system-Clang development path.
   public static func resolvedStageRoot(explicit: String? = nil) -> URL? {
-    if let explicit, !explicit.isEmpty {
-      return URL(fileURLWithPath: explicit, isDirectory: true)
-    }
-    if let stagePath = ProcessInfo.processInfo.environment["DGEN_TOOLCHAIN_STAGE_ROOT"],
-      !stagePath.isEmpty
-    {
-      return URL(fileURLWithPath: stagePath, isDirectory: true)
-    }
-    return nil
+    resolvedStageRootWithOrigin(explicit: explicit)?.root
   }
+
+  // MARK: - Invocations
 
   public static func compileInvocation(
     outputPath: String,
@@ -85,13 +233,32 @@ public enum DGenToolchainPolicy {
     toolchainRoot: String? = nil
   ) throws -> DGenCompilerInvocation {
     // A selected root is binding: an incomplete stage is an error, never a
-    // silent downgrade to the system compiler.
-    if let stageRoot = resolvedStageRoot(explicit: toolchainRoot) {
+    // silent downgrade to the system compiler. On a host with no staged
+    // toolchain at all, selecting one is the same class of error.
+    if let selection = resolvedStageRootWithOrigin(explicit: toolchainRoot) {
+      guard hostProfile.supportsStagedToolchain else {
+        throw NSError(
+          domain: "DGenToolchainPolicy",
+          code: 2,
+          userInfo: [
+            NSLocalizedDescriptionKey: """
+              No staged DGen toolchain exists for this platform \
+              (\(hostProfile.identifier)), but one was selected via \
+              \(selection.origin.rawValue): \(selection.root.path)
+              The staged distribution under toolchain/ is a Mach-O \
+              clang+lld linking against libSystem.tbd and only targets \
+              arm64-apple-macos. Remove \(selection.origin.rawValue) to \
+              use the system-Clang development path; DGen will not silently \
+              downgrade to it while a stage root is selected.
+              """
+          ])
+      }
       return try embeddedInvocation(
-        stageRoot: stageRoot,
+        stageRoot: selection.root,
         outputPath: outputPath,
         sourcePath: sourcePath)
     }
+    try verifyHostSupportsBaselineISA()
     return systemDevelopmentInvocation(outputPath: outputPath, sourcePath: sourcePath)
   }
 
@@ -107,19 +274,76 @@ public enum DGenToolchainPolicy {
     return SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
   }
 
+  /// Fails the compile up front when the machine cannot execute the ISA
+  /// baseline the policy is about to compile for.
+  ///
+  /// Emitting `-march=x86-64-v3` code onto a pre-AVX2 machine produces an
+  /// artifact that builds and links cleanly and then dies with SIGILL inside
+  /// `dgen_process_v1` — on the audio thread, with no diagnostic. A cheap
+  /// `/proc/cpuinfo` check turns that into a compile-time error naming the
+  /// missing feature. Set `DGEN_ALLOW_UNSUPPORTED_HOST_CPU=1` when
+  /// deliberately building on one machine for another; the flags do not
+  /// change, only this guard is lifted.
+  public static func verifyHostSupportsBaselineISA() throws {
+    #if os(Linux) && arch(x86_64)
+      if let bypass = ProcessInfo.processInfo.environment["DGEN_ALLOW_UNSUPPORTED_HOST_CPU"],
+        bypass == "1"
+      {
+        return
+      }
+      guard let missing = missingBaselineCPUFeatures, !missing.isEmpty else { return }
+      throw NSError(
+        domain: "DGenToolchainPolicy",
+        code: 3,
+        userInfo: [
+          NSLocalizedDescriptionKey: """
+            This CPU does not support the x86-64-v3 baseline DGen compiles \
+            for. Missing feature(s): \(missing.joined(separator: ", ")).
+            x86-64-v3 (AVX2 + FMA, Haswell/Zen 1 and later) is required for \
+            single-rounded FMA in toolchain/include/dgen_simd_compat.h; \
+            below it every fused multiply-add silently double-rounds. \
+            Building anyway would produce a shared object that loads and then \
+            traps with SIGILL on the audio thread. Set \
+            DGEN_ALLOW_UNSUPPORTED_HOST_CPU=1 if you are deliberately \
+            building for a different machine.
+            """
+        ])
+    #endif
+  }
+
+  #if os(Linux) && arch(x86_64)
+    /// `nil` when the feature list could not be read at all — an unreadable
+    /// `/proc` is not evidence of an unsupported CPU, so the guard stands down.
+    private static let missingBaselineCPUFeatures: [String]? = {
+      guard let info = try? String(contentsOfFile: "/proc/cpuinfo", encoding: .utf8) else {
+        return nil
+      }
+      guard
+        let flagsLine = info.split(separator: "\n").first(where: { $0.hasPrefix("flags") })
+      else { return nil }
+      let flags = Set(flagsLine.split(whereSeparator: { $0 == " " || $0 == "\t" }).map(String.init))
+      // The v3 level is AVX2+FMA+BMI1/2+MOVBE+LZCNT+F16C. AVX2 and FMA are the
+      // two that carry the numerical contract and the two whose absence
+      // guarantees a SIGILL in generated code; the rest ride along on any CPU
+      // that has these.
+      return ["avx2", "fma"].filter { !flags.contains($0) }
+    }()
+  #endif
+
   public static func systemDevelopmentInvocation(
     outputPath: String,
     sourcePath: String
   ) -> DGenCompilerInvocation {
+    let artifactName = URL(fileURLWithPath: outputPath).lastPathComponent
     let arguments =
       ["-target", target]
       + optimizationArguments
       + contractArguments
       + [
         "-I", developmentRuntimeInclude.path,
-        "-dynamiclib",
-        "-Wl,-dead_strip",
-        "-Wl,-install_name,@rpath/\(URL(fileURLWithPath: outputPath).lastPathComponent)",
+        hostProfile.sharedLibraryArgument,
+        hostProfile.deadStripArgument,
+        hostProfile.installNameArgument(artifactName),
         "-o", outputPath,
         sourcePath,
       ]
@@ -135,6 +359,20 @@ public enum DGenToolchainPolicy {
     outputPath: String,
     sourcePath: String
   ) throws -> DGenCompilerInvocation {
+    guard hostProfile.supportsStagedToolchain else {
+      throw NSError(
+        domain: "DGenToolchainPolicy",
+        code: 2,
+        userInfo: [
+          NSLocalizedDescriptionKey: """
+            No staged DGen toolchain exists for this platform \
+            (\(hostProfile.identifier)); the staged distribution under \
+            toolchain/ is Mach-O and only targets arm64-apple-macos. \
+            Requested stage root: \(stageRoot.path)
+            """
+        ])
+    }
+
     let clang = stageRoot.appendingPathComponent("bin/dgen-clang").path
     let linker = stageRoot.appendingPathComponent("bin/ld64.lld").path
     let resourceDirectory = stageRoot.appendingPathComponent("lib/clang/20").path
@@ -182,11 +420,11 @@ public enum DGenToolchainPolicy {
         "-I", include,
         "-fuse-ld=\(linker)",
         "-nostdlib",
-        "-dynamiclib",
-        "-Wl,-install_name,@rpath/\(URL(fileURLWithPath: outputPath).lastPathComponent)",
+        hostProfile.sharedLibraryArgument,
+        hostProfile.installNameArgument(URL(fileURLWithPath: outputPath).lastPathComponent),
         "-Wl,-undefined,error",
         "-Wl,-fatal_warnings",
-        "-Wl,-dead_strip",
+        hostProfile.deadStripArgument,
         "-L\(stubDirectory)",
         sourcePath,
         "-x", "none",
@@ -205,7 +443,7 @@ public enum DGenToolchainPolicy {
     executable: String,
     arguments: [String]
   ) -> String {
-    ([
+    (hostProfile.signaturePreamble + [
       "dgen-toolchain-policy=\(policyVersion)",
       "mode=\(mode)",
       "executable=\(executable)",

@@ -1,0 +1,65 @@
+# DGen ABI v1 permitted undefined symbols, ELF flavour (x86_64-linux).
+#
+# ELF sibling of libsystem-symbols-v1.txt. This is a SUPERSET list: an audited
+# .so may leave undefined only symbols named here. Names are unversioned; the
+# audit strips ELF `@GLIBC_x.y` / `@@GLIBC_x.y` suffixes before comparing.
+#
+# Blank lines and #-comments are ignored.
+#
+# Derived empirically: a representative generated-style TU covering the
+# toolchain/fixtures spread (scalar-synth transcendentals, filter-table,
+# feedback-delay-effect delay lines, spectral-effect FFT/complex-MAC via
+# DGenHostServicesV1 function pointers, wavetable-instrument gather) was
+# compiled with the DGenToolchainPolicy flag set and its residual undefined
+# symbols read off, under both the system-clang path and a -nostdlib
+# hermetic-style link.
+
+# --- libm scalar surface declared by toolchain/include/dgen_runtime.h ---
+# One-for-one with the Mach-O list (minus its leading underscores).
+atan2f
+atanf
+ceilf
+copysignf
+cosf
+expf
+fabsf
+floorf
+fmaxf
+fminf
+fmodf
+log10f
+logf
+powf
+roundf
+sinf
+sqrtf
+tanf
+tanhf
+
+# --- libm calls the compiler synthesises, not written by CRenderer ---
+# sincosf: -O3 -ffast-math fuses sinf(x)+cosf(x) on the same argument into one
+# sincosf call. This is the direct ELF counterpart of the Mach-O list's
+# ___sincosf_stret (Apple returns the pair in registers; glibc via pointers).
+sincosf
+
+# --- libc memory surface declared by dgen_runtime.h ---
+# memcpy/memset are emitted explicitly by CRenderer (RNG state bit-punning,
+# spectral accumulator clearing). memmove has no Mach-O counterpart in the
+# original list but is the same class of leaf, real-time-safe libc primitive
+# and clang will select it for potentially-overlapping block copies.
+memcpy
+memmove
+memset
+
+# --- Toolchain link artifacts: NOT DGen calls ---
+# These weak undefined references come from the crtbegin_so.o/crtend_so.o that
+# the system-clang driver links into every -shared output on glibc. They have
+# no Mach-O counterpart: the Darwin driver does not inject equivalents, so
+# allowing them widens the hermeticity contract relative to the Mach-O audit.
+# They are all WEAK and unresolved-at-load-time-safe, they are never called on
+# the audio thread, and the hermetic -nostdlib link path drops all four.
+# If/when the Linux compile policy goes -nostdlib, delete this whole block.
+_ITM_deregisterTMCloneTable
+_ITM_registerTMCloneTable
+__cxa_finalize
+__gmon_start__

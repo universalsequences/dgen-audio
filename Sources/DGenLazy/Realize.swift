@@ -4,6 +4,10 @@
 // returning the computed values.
 
 import Foundation
+#if !canImport(Darwin)
+// Linux Foundation does not re-export CFAbsoluteTime*/CoreFoundation.
+import CoreFoundation
+#endif
 import DGen
 
 // MARK: - LazyRuntime Protocol
@@ -22,6 +26,7 @@ extension CLazyRuntime {
     public func profileKernels(frameCount: Int) -> [(index: Int, name: String, dispatchInfo: String, gpuMs: Double)] { [] }
 }
 
+#if canImport(Metal)
 extension MetalCompiledKernel: LazyRuntime {
     public func memoryPointer() -> UnsafeMutablePointer<Float>? {
         getBuffer(name: "memory")?.contents().assumingMemoryBound(to: Float.self)
@@ -31,6 +36,7 @@ extension MetalCompiledKernel: LazyRuntime {
         getBuffer(name: "outputs")?.contents().assumingMemoryBound(to: Float.self)
     }
 }
+#endif
 
 /// C backend runtime wrapper for lazy execution
 public class CLazyRuntime: LazyRuntime {
@@ -236,12 +242,17 @@ extension LazyGraph {
     private func createRuntime(from result: CompilationResult, frameCount: Int) throws -> LazyRuntime {
         switch DGenConfig.backend {
         case .metal:
-            return try MetalCompiledKernel(
-                kernels: result.kernels,
-                cellAllocations: result.cellAllocations,
-                context: result.context,
-                frameCount: frameCount
-            )
+            #if canImport(Metal)
+                return try MetalCompiledKernel(
+                    kernels: result.kernels,
+                    cellAllocations: result.cellAllocations,
+                    context: result.context,
+                    frameCount: frameCount
+                )
+            #else
+                throw DGenLazyError.runtimeError(
+                    "Metal backend is unavailable on this platform; use the C backend (DGenConfig.backend = .c)")
+            #endif
         case .c:
             return try CLazyRuntime(
                 kernels: result.kernels,

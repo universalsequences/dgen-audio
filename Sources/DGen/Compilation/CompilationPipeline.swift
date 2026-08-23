@@ -1,4 +1,8 @@
 import Foundation
+#if !canImport(Darwin)
+// Linux Foundation does not re-export CFAbsoluteTime*/CoreFoundation.
+import CoreFoundation
+#endif
 
 /// Result of the compilation pipeline containing all intermediate steps
 public struct CompilationResult {

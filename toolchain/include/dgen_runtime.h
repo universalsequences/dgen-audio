@@ -9,7 +9,7 @@
  * the small libSystem symbol allowlist owned by DGen.
  */
 
-#include <arm_neon.h>
+#include "dgen_simd_compat.h"
 #include <stdint.h>
 
 #define DGEN_ABI_VERSION_V1 1u
@@ -75,7 +75,7 @@ static inline float dgen_sanitize_f32(float value) {
 
 static inline float32x4_t dgen_sanitize_f32x4(float32x4_t value) {
   uint32x4_t bits = vreinterpretq_u32_f32(value);
-  __asm__ __volatile__("" : "+w"(bits));
+  DGEN_SIMD_OPT_BARRIER_U32(bits);
   uint32x4_t exponent = vandq_u32(
     bits,
     vdupq_n_u32(UINT32_C(0x7f800000)));

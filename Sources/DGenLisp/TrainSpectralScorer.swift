@@ -1,4 +1,8 @@
+#if canImport(Accelerate)
 import Accelerate
+#else
+import DGenLazy  // portable vDSP stand-ins (PortableAccelerate.swift)
+#endif
 import DGenTrainProtocol
 import Foundation
 

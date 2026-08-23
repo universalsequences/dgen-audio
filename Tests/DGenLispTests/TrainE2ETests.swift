@@ -1,3 +1,5 @@
+#if canImport(Metal)
+
 import Metal
 import XCTest
 
@@ -271,3 +273,5 @@ final class TrainE2ETests: XCTestCase {
         })
     }
 }
+
+#endif  // canImport(Metal)

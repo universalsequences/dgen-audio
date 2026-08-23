@@ -1,0 +1,15 @@
+# DGen ABI v1 exported symbols, ELF flavour (x86_64-linux).
+#
+# ELF sibling of exports-v1.txt. Same contract, no Mach-O leading underscore.
+# This is an EXACT-match list: the audited .so must export these and nothing
+# else. Generated code is built -fvisibility=hidden, so only the two
+# DGEN_EXPORT entry points in toolchain/include/dgen_runtime.h reach .dynsym.
+#
+# Linker-generated dynamic exports (_init, _fini, __bss_start, _edata, _end)
+# are deliberately NOT listed here; scripts/audit-dgen-elf-so.sh filters them
+# out before comparing. They are link artifacts, not ABI. See that script.
+#
+# Blank lines and #-comments are ignored (same convention as
+# scripts/generate-libsystem-stub.sh).
+dgen_process_v1
+dgen_set_param_value_v1

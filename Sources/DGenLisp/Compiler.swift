@@ -57,7 +57,8 @@ func compilePatch(
     try cSource.write(toFile: cFilePath, atomically: true, encoding: .utf8)
 
     // 6. Invoke clang
-    let dylibPath = "\(options.outputDir)/\(options.name).dylib"
+    let dylibPath =
+        "\(options.outputDir)/\(options.name).\(DGenToolchainPolicy.artifactExtension)"
 
     let compile = Process()
     let invocation = try DGenToolchainPolicy.compileInvocation(
