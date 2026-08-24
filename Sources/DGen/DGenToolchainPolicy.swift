@@ -176,20 +176,34 @@ public enum DGenToolchainPolicy {
       + ["-std=c11", "-x", "c"]
   }
 
-  public static var repositoryRoot: URL {
-    URL(fileURLWithPath: #filePath)
-      .deletingLastPathComponent() // DGen
-      .deletingLastPathComponent() // Sources
-      .deletingLastPathComponent() // repository root
+  /// Directory containing the running DGenLisp executable.
+  ///
+  /// Published binaries must never derive runtime resources from `#filePath`:
+  /// that value names the checkout used to build the executable. Resources
+  /// distributed with DGenLisp live beside the executable instead.
+  public static var executableDirectory: URL {
+    if let executable = Bundle.main.executableURL {
+      return executable.deletingLastPathComponent()
+    }
+    return URL(fileURLWithPath: CommandLine.arguments[0])
+      .standardizedFileURL
+      .deletingLastPathComponent()
+  }
+
+  static func resolveDevelopmentRuntimeInclude(
+    environment: [String: String],
+    executableDirectory: URL
+  ) -> URL {
+    if let override = environment["DGEN_RUNTIME_INCLUDE"], !override.isEmpty {
+      return URL(fileURLWithPath: override)
+    }
+    return executableDirectory.appendingPathComponent("toolchain/include", isDirectory: true)
   }
 
   public static var developmentRuntimeInclude: URL {
-    if let override = ProcessInfo.processInfo.environment["DGEN_RUNTIME_INCLUDE"],
-      !override.isEmpty
-    {
-      return URL(fileURLWithPath: override)
-    }
-    return repositoryRoot.appendingPathComponent("toolchain/include", isDirectory: true)
+    resolveDevelopmentRuntimeInclude(
+      environment: ProcessInfo.processInfo.environment,
+      executableDirectory: executableDirectory)
   }
 
   // MARK: - Stage-root resolution
@@ -259,6 +273,21 @@ public enum DGenToolchainPolicy {
         sourcePath: sourcePath)
     }
     try verifyHostSupportsBaselineISA()
+    let runtimeInclude = developmentRuntimeInclude
+    let runtimeHeader = runtimeInclude.appendingPathComponent("dgen_runtime.h")
+    guard FileManager.default.isReadableFile(atPath: runtimeHeader.path) else {
+      throw NSError(
+        domain: "DGenToolchainPolicy",
+        code: 4,
+        userInfo: [
+          NSLocalizedDescriptionKey: """
+            DGen runtime headers are unavailable. Resolved dgen_runtime.h \
+            path: \(runtimeHeader.path)
+            Set DGEN_RUNTIME_INCLUDE to the directory containing \
+            dgen_runtime.h, or install toolchain/include beside DGenLisp.
+            """
+        ])
+    }
     return systemDevelopmentInvocation(outputPath: outputPath, sourcePath: sourcePath)
   }
 

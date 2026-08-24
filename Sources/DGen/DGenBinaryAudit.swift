@@ -15,12 +15,13 @@ public enum DGenBinaryAudit {
   }()
 
   /// Resolve the audit script. Precedence: explicit tool path (CLI
-  /// `--audit-tool`) > `DGEN_BINARY_AUDIT_TOOL` env var > the repository
-  /// script derived from `#filePath`. The last is a build-machine path: it
-  /// only exists where dgen itself was checked out, so a shipped binary must
-  /// either be told where the tool is or be run with the inline audit
-  /// skipped (`--skip-inline-audit`) when the host audits the artifact
-  /// itself.
+  /// `--audit-tool`) > `DGEN_BINARY_AUDIT_TOOL` env var > a `scripts/`
+  /// directory beside the executable. No fallback may derive from `#filePath`:
+  /// that would embed the checkout used to build a published binary.
+  static func executableRelativeScript(executableDirectory: URL) -> String {
+    executableDirectory.appendingPathComponent("scripts/\(repositoryScriptName)").path
+  }
+
   public static func audit(_ dylibPath: String, auditTool: String? = nil) throws {
     let script: String
     var resolvedFromRepoFallback = false
@@ -31,8 +32,8 @@ public enum DGenBinaryAudit {
     {
       script = override
     } else {
-      script = DGenToolchainPolicy.repositoryRoot
-        .appendingPathComponent("scripts/\(repositoryScriptName)").path
+      script = executableRelativeScript(
+        executableDirectory: DGenToolchainPolicy.executableDirectory)
       resolvedFromRepoFallback = true
     }
 
@@ -40,11 +41,11 @@ public enum DGenBinaryAudit {
       let message: String
       if resolvedFromRepoFallback {
         message = """
-          DGen binary audit script not found: \(script). This default is the \
-          build machine's dgen checkout and does not exist here. Pass \
-          --audit-tool <path-to-\(repositoryScriptName)>, set \
-          DGEN_BINARY_AUDIT_TOOL, or pass --skip-inline-audit if the host \
-          application audits compiled dylibs itself.
+          DGen binary audit script not found at the executable-relative path: \
+          \(script). Install scripts/ beside DGenLisp, pass --audit-tool \
+          <path-to-\(repositoryScriptName)>, set DGEN_BINARY_AUDIT_TOOL, or \
+          pass --skip-inline-audit if the host application audits compiled \
+          dylibs itself.
           """
       } else {
         message = "DGen binary audit tool is unavailable or not executable: \(script)"
