@@ -63,6 +63,42 @@ public enum DGenToolchainPolicy {
     /// `LC_ID_DYLIB` / ELF `DT_SONAME`. Must be a bare filename plus, on
     /// Darwin, the `@rpath` prefix the mac host expects.
     let installNameArgument: (String) -> String
+
+    // MARK: Staged-toolchain layout
+    //
+    // The staged layout is object-format specific (toolchain/LAYOUT.md). These
+    // fields keep `embeddedInvocation` profile-driven rather than branching on
+    // the host inside it, which is what let the Mach-O argument list stay
+    // byte-identical while the ELF one was added.
+
+    /// Stage-relative path to the linker selected with `-fuse-ld=`.
+    let stageLinkerRelativePath: String
+    /// Stage-relative path to the compiler-rt builtins archive, linked
+    /// explicitly because the link is `-nostdlib`.
+    let stageBuiltinsRelativePath: String
+    /// Stage-relative paths preflighted in addition to the linker, the builtins
+    /// archive, `include/dgen_runtime.h`, and `VERSION.json`.
+    let stageAdditionalRequiredRelativePaths: [String]
+    /// Stage-relative directory passed as `-isysroot`, or `nil` when the object
+    /// format has no sysroot to neutralise. Mach-O passes a deliberately empty
+    /// one so no system SDK can leak in; ELF has no equivalent knob, and
+    /// `-nostdinc` plus the pinned `-resource-dir` already close that door.
+    let stageEmptySDKRelativePath: String?
+    /// Stage-relative directory searched for the stub system library, or `nil`
+    /// when the profile links against no stub.
+    let stageStubLibraryRelativeDirectory: String?
+    /// Link arguments for the stage's stub system library.
+    let stubLibraryLinkArguments: [String]
+    /// Linker strictness for symbols left undefined by the link.
+    ///
+    /// Mach-O resolves the whole permitted surface through `libSystem.tbd` at
+    /// link time, so anything still undefined is a real error. An ELF
+    /// `-shared -nostdlib` object is the opposite case: its libc/libm surface
+    /// is *meant* to stay undefined for the dynamic loader to bind at
+    /// `dlopen`, and that surface is exactly what `abi/libsystem-symbols-v1-elf.txt`
+    /// allowlists and `scripts/audit-dgen-elf-so.sh` verifies after the fact.
+    /// Demanding a fully-resolved link there would reject every valid artifact.
+    let undefinedSymbolArguments: [String]
   }
 
   #if os(macOS) && arch(arm64)
@@ -77,7 +113,14 @@ public enum DGenToolchainPolicy {
       artifactExtension: "dylib",
       supportsStagedToolchain: true,
       signaturePreamble: [],
-      installNameArgument: { base in "-Wl,-install_name,@rpath/\(base)" })
+      installNameArgument: { base in "-Wl,-install_name,@rpath/\(base)" },
+      stageLinkerRelativePath: "bin/ld64.lld",
+      stageBuiltinsRelativePath: "lib/clang/20/lib/darwin/libclang_rt.builtins.a",
+      stageAdditionalRequiredRelativePaths: ["lib/libSystem.tbd"],
+      stageEmptySDKRelativePath: "empty-sdk",
+      stageStubLibraryRelativeDirectory: "lib",
+      stubLibraryLinkArguments: ["-lSystem"],
+      undefinedSymbolArguments: ["-Wl,-undefined,error", "-Wl,-fatal_warnings"])
 
   #elseif os(Linux) && arch(x86_64)
 
@@ -113,13 +156,23 @@ public enum DGenToolchainPolicy {
       sharedLibraryArgument: "-shared",
       deadStripArgument: "-Wl,--gc-sections",
       artifactExtension: "so",
-      // No staged toolchain is built for Linux: toolchain/ stages a Mach-O
-      // clang+lld against libSystem.tbd (toolchain/VERSION.json declares
-      // "target": "arm64-apple-macos"). Selecting a stage root here is an
-      // error, never a silent downgrade to system clang.
-      supportsStagedToolchain: false,
-      signaturePreamble: ["host-profile=linux-x86_64", "host-profile-revision=1"],
-      installNameArgument: { base in "-Wl,-soname,\(base)" })
+      supportsStagedToolchain: true,
+      // Revision 2: the ELF staged-toolchain path. The preamble is a cache
+      // key, so a profile whose emitted arguments change must bump it or
+      // artifacts compiled under revision 1's system-clang path would be
+      // reused for hermetic ones.
+      signaturePreamble: ["host-profile=linux-x86_64", "host-profile-revision=2"],
+      installNameArgument: { base in "-Wl,-soname,\(base)" },
+      stageLinkerRelativePath: "bin/ld.lld",
+      stageBuiltinsRelativePath:
+        "lib/clang/20/lib/x86_64-unknown-linux-gnu/libclang_rt.builtins.a",
+      // The ELF stage carries no stub library and no SDK to neutralise, so it
+      // preflights nothing beyond the common set.
+      stageAdditionalRequiredRelativePaths: [],
+      stageEmptySDKRelativePath: nil,
+      stageStubLibraryRelativeDirectory: nil,
+      stubLibraryLinkArguments: [],
+      undefinedSymbolArguments: [])
 
   #else
 
@@ -259,14 +312,14 @@ public enum DGenToolchainPolicy {
               No staged DGen toolchain exists for this platform \
               (\(hostProfile.identifier)), but one was selected via \
               \(selection.origin.rawValue): \(selection.root.path)
-              The staged distribution under toolchain/ is a Mach-O \
-              clang+lld linking against libSystem.tbd and only targets \
-              arm64-apple-macos. Remove \(selection.origin.rawValue) to \
-              use the system-Clang development path; DGen will not silently \
+              Stages are target-specific and no distribution is published \
+              for this host. Remove \(selection.origin.rawValue) to use the \
+              system-Clang development path; DGen will not silently \
               downgrade to it while a stage root is selected.
               """
           ])
       }
+      try verifyHostSupportsBaselineISA()
       return try embeddedInvocation(
         stageRoot: selection.root,
         outputPath: outputPath,
@@ -395,30 +448,37 @@ public enum DGenToolchainPolicy {
         userInfo: [
           NSLocalizedDescriptionKey: """
             No staged DGen toolchain exists for this platform \
-            (\(hostProfile.identifier)); the staged distribution under \
-            toolchain/ is Mach-O and only targets arm64-apple-macos. \
+            (\(hostProfile.identifier)); stages are target-specific and none \
+            is published for this host. \
             Requested stage root: \(stageRoot.path)
             """
         ])
     }
 
     let clang = stageRoot.appendingPathComponent("bin/dgen-clang").path
-    let linker = stageRoot.appendingPathComponent("bin/ld64.lld").path
+    let linker = stageRoot.appendingPathComponent(hostProfile.stageLinkerRelativePath).path
     let resourceDirectory = stageRoot.appendingPathComponent("lib/clang/20").path
-    let builtins = stageRoot
-      .appendingPathComponent("lib/clang/20/lib/darwin/libclang_rt.builtins.a").path
+    let builtins = stageRoot.appendingPathComponent(hostProfile.stageBuiltinsRelativePath).path
     let include = stageRoot.appendingPathComponent("include").path
-    let stubDirectory = stageRoot.appendingPathComponent("lib").path
-    let emptySDK = stageRoot.appendingPathComponent("empty-sdk").path
+    let emptySDK = hostProfile.stageEmptySDKRelativePath.map {
+      stageRoot.appendingPathComponent($0).path
+    }
+    let stubLibrarySearchArguments = hostProfile.stageStubLibraryRelativeDirectory.map {
+      ["-L\(stageRoot.appendingPathComponent($0).path)"]
+    } ?? []
+    let sysrootArguments = emptySDK.map { ["-isysroot", $0] } ?? []
 
     // Every file the staged layout promises (toolchain/LAYOUT.md). A selected
     // root that cannot satisfy it fails the compile outright.
-    let missing = [
+    let missing = ([
       clang, linker, builtins,
       stageRoot.appendingPathComponent("include/dgen_runtime.h").path,
-      stageRoot.appendingPathComponent("lib/libSystem.tbd").path,
-      stageRoot.appendingPathComponent("VERSION.json").path,
-    ].filter { !FileManager.default.fileExists(atPath: $0) }
+    ]
+      + hostProfile.stageAdditionalRequiredRelativePaths.map {
+        stageRoot.appendingPathComponent($0).path
+      }
+      + [stageRoot.appendingPathComponent("VERSION.json").path])
+      .filter { !FileManager.default.fileExists(atPath: $0) }
 
     if !missing.isEmpty {
       throw NSError(
@@ -432,18 +492,19 @@ public enum DGenToolchainPolicy {
         ])
     }
 
-    try FileManager.default.createDirectory(
-      atPath: emptySDK,
-      withIntermediateDirectories: true)
+    if let emptySDK {
+      try FileManager.default.createDirectory(
+        atPath: emptySDK,
+        withIntermediateDirectories: true)
+    }
 
     let arguments =
       ["-target", target]
       + optimizationArguments
       + contractArguments
+      + ["-ffreestanding", "-nostdinc"]
+      + sysrootArguments
       + [
-        "-ffreestanding",
-        "-nostdinc",
-        "-isysroot", emptySDK,
         "-resource-dir", resourceDirectory,
         "-isystem", "\(resourceDirectory)/include",
         "-I", include,
@@ -451,16 +512,13 @@ public enum DGenToolchainPolicy {
         "-nostdlib",
         hostProfile.sharedLibraryArgument,
         hostProfile.installNameArgument(URL(fileURLWithPath: outputPath).lastPathComponent),
-        "-Wl,-undefined,error",
-        "-Wl,-fatal_warnings",
-        hostProfile.deadStripArgument,
-        "-L\(stubDirectory)",
-        sourcePath,
-        "-x", "none",
-        builtins,
-        "-lSystem",
-        "-o", outputPath,
       ]
+      + hostProfile.undefinedSymbolArguments
+      + [hostProfile.deadStripArgument]
+      + stubLibrarySearchArguments
+      + [sourcePath, "-x", "none", builtins]
+      + hostProfile.stubLibraryLinkArguments
+      + ["-o", outputPath]
     return DGenCompilerInvocation(
       executable: clang,
       arguments: arguments,
