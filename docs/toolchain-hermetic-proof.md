@@ -68,6 +68,59 @@ services.
 The vector-math measurement and accuracy decision is separately reproducible
 as documented in `docs/vector-math-lowering.md`.
 
+## Linux/x86_64 stage proof
+
+Status: harness complete; authoritative from-source run not yet recorded
+(ESeq bead `eseq-linux.49`).
+
+The `x86_64-unknown-linux-gnu` stage is produced by the same
+`scripts/build-toolchain.sh` from the same pinned LLVM source archive. It
+differs only where the object format forces it: `LLVM_TARGETS_TO_BUILD=X86`,
+`toolchain/patches/lld-elf-only.patch` in place of the Mach-O narrowing patch,
+a statically linked libstdc++, and no libSystem stub or empty sysroot, neither
+of which has an ELF meaning.
+
+A **publishable** archive is built inside the pinned container image, because
+the stage's glibc floor is a property of the distribution rather than of
+whoever built it:
+
+```sh
+scripts/build-toolchain-linux-container.sh
+cat toolchain/VERSION-x86_64-unknown-linux-gnu.json
+cat toolchain/SIZE-x86_64-unknown-linux-gnu.txt
+```
+
+`VERSION.json` records `glibc_floor` read back off the staged binaries, so the
+floor is measured rather than asserted. A native `scripts/build-toolchain.sh`
+run on Linux produces a correct stage with the build host's floor; it is fine
+for development and not publishable.
+
+Prove the staged result:
+
+```sh
+scripts/prove-toolchain-elf.sh
+cat .toolchain/proof-elf/logs/summary.txt
+```
+
+Every hermetic fixture, plus `toolchain/fixtures/nonfinite-containment.c`, is
+compiled and linked under `env -i` with a `PATH` naming a directory that does
+not exist, `-nostdinc`, `-nostdlib`, explicit staged resource paths, and the
+staged compiler-rt builtins archive; the system compiler builds only the
+`dlopen` harness and is unreachable during candidate compilation. Each
+produced `.so` is audited by `scripts/audit-dgen-elf-so.sh`, which requires:
+
+- exactly `dgen_process_v1` and `dgen_set_param_value_v1` exported, after
+  filtering the linker-generated dynamic symbols;
+- every undefined symbol in `toolchain/abi/libsystem-symbols-v1-elf.txt`;
+- `DT_NEEDED` limited to base-system libc/libm, or absent entirely as a
+  `-nostdlib` link produces;
+- a `DT_SONAME`, the ELF analogue of a mandatory `LC_ID_DYLIB`;
+- no absolute build, home, or temporary path anywhere in the image.
+
+Unlike the Mach-O proof there is no system-clang A/B audio comparison: that
+harness is Accelerate-backed. Cross-host numerical equivalence is covered by
+the ESeq-side spectral and dgen tests instead.
+
 ## Phase 1 historical proof
 
 Status: Phase 1 prototype
