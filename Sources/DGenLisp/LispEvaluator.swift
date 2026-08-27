@@ -24,6 +24,7 @@ enum EvalResult {
 
 struct ParamInfo {
   let name: String
+  let canonicalName: String
   let cellId: CellID?
   let defaultValue: Float
   let min: Float?
@@ -86,6 +87,9 @@ class LispEvaluator {
   var tensorHistoryBindings: [String: TensorHistory] = [:]
   var macros: [String: MacroDefinition] = [:]
   var params: [ParamInfo] = []
+  private var paramNamespace = ParamNamespace()
+  private var evaluatedParamIdentities: Set<ParamIdentity> = []
+  private var paramValues: [String: EvalResult] = [:]
   var outputs: [OutputInfo] = []
   var tensorOutputs: [TensorOutputInfo] = []
   var inputs: [InputInfo] = []
@@ -128,16 +132,47 @@ class LispEvaluator {
       tensorHistoryBindings.removeAll()
       macros.removeAll()
       params.removeAll()
+      paramNamespace.removeAll()
+      evaluatedParamIdentities.removeAll()
+      paramValues.removeAll()
       outputs.removeAll()
       tensorOutputs.removeAll()
       inputs.removeAll()
       tensors.removeAll()
       macroExpansionCounter = 0
     }
+    try predeclareTopLevelParams(in: nodes)
     for node in nodes {
       let _ = try evaluateAST(node)
     }
     try validateParamUIMetadata(params)
+  }
+
+  private func predeclareTopLevelParams(in nodes: [ASTNode]) throws {
+    for node in nodes {
+      guard case .list(let elements) = node,
+        elements.count >= 2,
+        case .atom(let op) = elements[0],
+        op.lowercased() == "param",
+        case .atom(let shortName) = elements[1]
+      else { continue }
+
+      var group: String?
+      var index = 2
+      while index < elements.count {
+        guard case .atom(let attribute) = elements[index] else {
+          index += 1
+          continue
+        }
+        if attribute == "@group", index + 1 < elements.count,
+          case .atom(let value) = elements[index + 1]
+        {
+          group = try parseUIMetadataSymbol(value, attribute: "@group", paramName: shortName)
+        }
+        index += attribute.hasPrefix("@") ? 2 : 1
+      }
+      _ = try paramNamespace.declare(shortName: shortName, group: group)
+    }
   }
 
   // MARK: - AST Evaluation
@@ -192,6 +227,14 @@ class LispEvaluator {
     }
 
     if let result = definitions[value] {
+      return result
+    }
+
+    if let identity = try paramNamespace.resolve(value) {
+      guard let result = paramValues[identity.canonicalName] else {
+        throw LispError.validationError(
+          "parameter '\(identity.canonicalName)' is referenced before its declaration")
+      }
       return result
     }
 
@@ -1482,11 +1525,21 @@ class LispEvaluator {
     let modulationActiveParamName = attrValue(attributes, "@mod-active-param")
     let modulationResolvedSymbolName = attrValue(attributes, "@mod-resolved-symbol")
     let generatedModulatorSlot = Int(attrValue(attributes, "@modulator-slot") ?? "")
+    let identity: ParamIdentity
+    if let declared = paramNamespace.identity(shortName: name, group: group) {
+      identity = declared
+    } else {
+      identity = try paramNamespace.declare(shortName: name, group: group)
+    }
+    guard evaluatedParamIdentities.insert(identity).inserted else {
+      throw LispError.validationError(
+        "duplicate param '\(identity.canonicalName)': parameter identity must be unique by (group, name)")
+    }
 
     if let lanes = batchLaneCount {
-      guard let value = batchParameterValues[name] else {
+      guard let value = batchParameterValues[identity.canonicalName] else {
         throw LispError.invalidArgument(
-          "batch param '\(name)' requires a supplied [\(lanes)] tensor")
+          "batch param '\(identity.canonicalName)' requires a supplied [\(lanes)] tensor")
       }
       let shape: [Int]
       switch value {
@@ -1496,10 +1549,11 @@ class LispEvaluator {
       }
       guard shape == [lanes] else {
         throw LispError.invalidArgument(
-          "batch param '\(name)' requires shape [\(lanes)], got \(shape)")
+          "batch param '\(identity.canonicalName)' requires shape [\(lanes)], got \(shape)")
       }
       let info = ParamInfo(
-        name: name, cellId: nil, defaultValue: defaultVal, min: minVal, max: maxVal,
+        name: name, canonicalName: identity.canonicalName, cellId: nil,
+        defaultValue: defaultVal, min: minVal, max: maxVal,
         unit: unit, hidden: hidden, group: group, env: env, role: role,
         generatedKind: generatedKind, generatedFor: generatedFor,
         modulationMode: modulationMode, modulationDepthMin: modulationDepthMin,
@@ -1508,24 +1562,27 @@ class LispEvaluator {
         modulationResolvedSymbolName: modulationResolvedSymbolName,
         generatedModulatorSlot: generatedModulatorSlot)
       params.append(info)
-      definitions[name] = value
+      paramValues[identity.canonicalName] = value
       return value
     }
 
     let graph = LazyGraphContext.current
     let signal: Signal
-    if reusesRegisteredParameters, let registered = graph.registeredSignalParameter(named: name) {
+    if reusesRegisteredParameters,
+      let registered = graph.registeredSignalParameter(named: identity.canonicalName)
+    {
       registered.refresh()
       signal = registered
     } else {
       signal = Signal.param(defaultVal, min: minVal, max: maxVal)
       if reusesRegisteredParameters {
-        graph.registerParameter(signal, named: name)
+        graph.registerParameter(signal, named: identity.canonicalName)
       }
     }
 
     let info = ParamInfo(
       name: name,
+      canonicalName: identity.canonicalName,
       cellId: signal.memoryCellId,
       defaultValue: defaultVal,
       min: minVal,
@@ -1545,7 +1602,7 @@ class LispEvaluator {
       generatedModulatorSlot: generatedModulatorSlot
     )
     params.append(info)
-    definitions[name] = .signal(signal)
+    paramValues[identity.canonicalName] = .signal(signal)
 
     return .signal(signal)
   }

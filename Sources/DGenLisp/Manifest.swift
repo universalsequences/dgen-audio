@@ -32,7 +32,10 @@ struct PatchManifest: Codable {
 }
 
 struct ManifestParam: Codable {
+    /// Canonical host-facing identity (`group.name` for grouped params).
     let name: String
+    /// Short source declaration name for UI labels.
+    let displayName: String
     let cellId: Int
     let cellSpan: Int
     let defaultValue: Float  // JSON key: "default"
@@ -45,7 +48,7 @@ struct ManifestParam: Codable {
     let role: String?
 
     enum CodingKeys: String, CodingKey {
-        case name, cellId, cellSpan
+        case name, displayName, cellId, cellSpan
         case defaultValue = "default"
         case min, max, unit, hidden, group, env, role
     }
@@ -218,7 +221,8 @@ func generateManifest(
             cellSpan = 1
         }
         return ManifestParam(
-            name: param.name,
+            name: param.canonicalName,
+            displayName: param.name,
             cellId: physicalCellId,
             cellSpan: cellSpan,
             defaultValue: param.defaultValue,
@@ -260,7 +264,8 @@ func generateManifest(
     }
     .sorted { $0.slot < $1.slot }
 
-    let paramsByName = Dictionary(uniqueKeysWithValues: evaluator.params.map { ($0.name, $0) })
+    let paramsByName = Dictionary(
+        uniqueKeysWithValues: evaluator.params.map { ($0.canonicalName, $0) })
     let manifestModDestinations = evaluator.params.compactMap { param -> ManifestModDestination? in
         guard let mode = param.modulationMode,
               let activeName = param.modulationActiveParamName,
@@ -275,7 +280,7 @@ func generateManifest(
 
         let depthLanes = evaluator.params.compactMap { depthParam -> ManifestModDepthLane? in
             guard depthParam.generatedKind == "modulation-depth",
-                  depthParam.generatedFor == param.name,
+                  depthParam.generatedFor == param.canonicalName,
                   let slot = depthParam.generatedModulatorSlot,
                   let depthCell = depthParam.cellId
             else {
@@ -289,7 +294,7 @@ func generateManifest(
         .sorted { $0.slot < $1.slot }
 
         return ManifestModDestination(
-            name: param.name,
+            name: param.canonicalName,
             paramCellId: cellMappings[paramCell] ?? paramCell,
             mode: mode.rawValue,
             activeCellId: cellMappings[activeCell] ?? activeCell,
@@ -368,7 +373,7 @@ private func deriveManifestEnvelopes(from params: [ParamInfo]) -> [ManifestEnvel
             byName[env]?.group = group
         }
         if let role = param.role {
-            byName[env]?.roles[role] = param.name
+            byName[env]?.roles[role] = param.canonicalName
         }
     }
 

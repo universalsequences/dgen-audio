@@ -13,7 +13,7 @@ struct TopLevelModulator {
 }
 
 struct TopLevelModulationParam {
-    let name: String
+    let identity: ParamIdentity
     let mode: ModulationMode
     let min: Float
     let max: Float
@@ -27,7 +27,7 @@ struct TopLevelModulationParam {
 private struct PreScanResult {
     let modulatorsBySlot: [Int: TopLevelModulator]
     let modulatableParams: [String: TopLevelModulationParam]
-    let allParamNames: Set<String>
+    let paramNamespace: ParamNamespace
 }
 
 func lowerModulation(in nodes: [ASTNode]) throws -> [ASTNode] {
@@ -41,7 +41,7 @@ func lowerModulation(in nodes: [ASTNode]) throws -> [ASTNode] {
             lowered.append(try rewriteModExpressions(
                 node,
                 modulatableParams: preScan.modulatableParams,
-                allParamNames: preScan.allParamNames
+                paramNamespace: preScan.paramNamespace
             ))
         }
     }
@@ -51,7 +51,7 @@ func lowerModulation(in nodes: [ASTNode]) throws -> [ASTNode] {
 private func preScanModulation(_ nodes: [ASTNode]) throws -> PreScanResult {
     var modulatorsBySlot: [Int: TopLevelModulator] = [:]
     var modulatableParams: [String: TopLevelModulationParam] = [:]
-    var allParamNames: Set<String> = []
+    var paramNamespace = ParamNamespace()
 
     for node in nodes {
         guard case .list(let elements) = node,
@@ -103,7 +103,8 @@ private func preScanModulation(_ nodes: [ASTNode]) throws -> PreScanResult {
             let regularArgs = regularArgs(from: elements)
             let attributes = attributePairs(from: elements)
             guard let name = firstAtom(in: regularArgs) else { continue }
-            allParamNames.insert(name)
+            let identity = try paramNamespace.declare(
+                shortName: name, group: attributes["@group"])
             let isModulatable = parseBool(attributes["@mod"], defaultValue: false)
             if !isModulatable {
                 if attributes["@mod-mode"] != nil {
@@ -135,16 +136,16 @@ private func preScanModulation(_ nodes: [ASTNode]) throws -> PreScanResult {
                 attributes: attributes
             )
 
-            modulatableParams[name] = TopLevelModulationParam(
-                name: name,
+            modulatableParams[identity.canonicalName] = TopLevelModulationParam(
+                identity: identity,
                 mode: mode,
                 min: min,
                 max: max,
                 unit: attributes["@unit"],
                 depthMin: depthRange.min,
                 depthMax: depthRange.max,
-                activeParamName: "__mod__\(name)__active",
-                resolvedSymbolName: "__mod__\(name)__resolved"
+                activeParamName: "__mod__\(identity.canonicalName)__active",
+                resolvedSymbolName: "__mod__\(identity.canonicalName)__resolved"
             )
 
         default:
@@ -160,7 +161,7 @@ private func preScanModulation(_ nodes: [ASTNode]) throws -> PreScanResult {
     return PreScanResult(
         modulatorsBySlot: modulatorsBySlot,
         modulatableParams: modulatableParams,
-        allParamNames: allParamNames
+        paramNamespace: paramNamespace
     )
 }
 
@@ -172,13 +173,16 @@ private func lowerTopLevelNode(_ node: ASTNode, preScan: PreScanResult) throws -
     }
 
     let regular = regularArgs(from: elements)
-    guard let name = firstAtom(in: regular),
-          let modParam = preScan.modulatableParams[name]
-    else {
-        return nil
-    }
-
     let attrs = attributePairs(from: elements)
+    guard let name = firstAtom(in: regular),
+          let identity = preScan.paramNamespace.identity(
+            shortName: name, group: attrs["@group"])
+    else {
+        return [node]
+    }
+    guard let modParam = preScan.modulatableParams[identity.canonicalName] else {
+        return [node]
+    }
     var rebuiltElements = elements
     let rebuiltAttributes = mergeAttributes(
         attrs,
@@ -201,7 +205,7 @@ private func lowerTopLevelNode(_ node: ASTNode, preScan: PreScanResult) throws -
             ("@max", "1"),
             ("@hidden", "true"),
             ("@generated", "modulation-active"),
-            ("@generated-for", modParam.name),
+            ("@generated-for", modParam.identity.canonicalName),
         ]
     )
 
@@ -212,14 +216,14 @@ private func lowerTopLevelNode(_ node: ASTNode, preScan: PreScanResult) throws -
             ("@max", formatFloat(modParam.depthMax)),
             ("@hidden", "true"),
             ("@generated", "modulation-depth"),
-            ("@generated-for", modParam.name),
+            ("@generated-for", modParam.identity.canonicalName),
             ("@modulator-slot", String(slot)),
         ]
         if let unit = modParam.unit {
             depthAttributes.append(("@unit", unit))
         }
         return makeParamNode(
-            name: depthParamName(paramName: modParam.name, slot: slot),
+            name: depthParamName(paramName: modParam.identity.canonicalName, slot: slot),
             attributes: depthAttributes
         )
     }
@@ -235,11 +239,20 @@ private func lowerTopLevelNode(_ node: ASTNode, preScan: PreScanResult) throws -
 private func rewriteModExpressions(
     _ node: ASTNode,
     modulatableParams: [String: TopLevelModulationParam],
-    allParamNames: Set<String>
+    paramNamespace: ParamNamespace
 ) throws -> ASTNode {
     switch node {
-    case .atom:
-        return node
+    case .atom(let value):
+        guard value.hasSuffix("~") else { return node }
+        let reference = String(value.dropLast())
+        guard let identity = try paramNamespace.resolve(reference, requiresParameter: true) else {
+            throw LispError.validationError("'\(reference)' does not reference a parameter")
+        }
+        guard let modParam = modulatableParams[identity.canonicalName] else {
+            throw LispError.validationError(
+                "mod: parameter '\(identity.canonicalName)' is not declared with @mod true")
+        }
+        return .atom(modParam.resolvedSymbolName)
 
     case .list(let elements):
         guard let head = listHead(elements) else {
@@ -247,30 +260,39 @@ private func rewriteModExpressions(
                 try rewriteModExpressions(
                     $0,
                     modulatableParams: modulatableParams,
-                    allParamNames: allParamNames
+                    paramNamespace: paramNamespace
                 )
             })
         }
 
         if head == "mod", elements.count == 2, case .atom(let name) = elements[1] {
-            guard allParamNames.contains(name) else {
-                throw LispError.validationError(
-                    "mod: '\(name)' does not reference a parameter")
+            guard let identity = try paramNamespace.resolve(name, requiresParameter: true) else {
+                throw LispError.validationError("'\(name)' does not reference a parameter")
             }
-            guard let modParam = modulatableParams[name] else {
+            guard let modParam = modulatableParams[identity.canonicalName] else {
                 throw LispError.validationError(
-                    "mod: parameter '\(name)' is not declared with @mod true")
+                    "mod: parameter '\(identity.canonicalName)' is not declared with @mod true")
             }
             return .atom(modParam.resolvedSymbolName)
         }
 
-        return .list(try elements.map {
+        // Operator names and binding targets are declarations, not value
+        // references. Preserve them while rewriting expression positions.
+        let preservedCount: Int
+        switch head {
+        case "def": preservedCount = min(2, elements.count)
+        case "defmacro": preservedCount = min(3, elements.count)
+        default: preservedCount = min(1, elements.count)
+        }
+        let prefix = Array(elements.prefix(preservedCount))
+        let expressions = try elements.dropFirst(preservedCount).map {
             try rewriteModExpressions(
                 $0,
                 modulatableParams: modulatableParams,
-                allParamNames: allParamNames
+                paramNamespace: paramNamespace
             )
-        })
+        }
+        return .list(prefix + expressions)
     }
 }
 
@@ -284,14 +306,14 @@ private func makeResolvedDef(
         }
         return [
             .atom(name),
-            .atom(depthParamName(paramName: param.name, slot: slot)),
+            .atom(depthParamName(paramName: param.identity.canonicalName, slot: slot)),
         ]
     }
 
     let resolvedExpr = ASTNode.list(
         [
             .atom("__modulated-param"),
-            .atom(param.name),
+            .atom(param.identity.canonicalName),
             .atom(param.activeParamName),
         ] + laneArgs + [
             .atom("@mode"),

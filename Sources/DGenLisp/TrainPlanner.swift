@@ -109,36 +109,36 @@ enum TrainPlanner {
         var frozen: [ParamVerdict] = []
         var parameterValues: [String: Float] = [:]
         for param in evaluator.params {
-            let suppliedValue = seed.params[param.name].map(Float.init) ?? param.defaultValue
+            let suppliedValue = seed.params[param.canonicalName].map(Float.init) ?? param.defaultValue
             let seedValue: Float
             if let minBound = param.min, let maxBound = param.max, minBound < maxBound {
                 seedValue = Swift.min(Swift.max(suppliedValue, minBound), maxBound)
             } else {
                 seedValue = suppliedValue
             }
-            parameterValues[param.name] = seedValue
+            parameterValues[param.canonicalName] = seedValue
 
             if param.generatedKind != nil {
-                frozen.append(ParamVerdict(name: param.name, reason: reasonGenerated))
+                frozen.append(ParamVerdict(name: param.canonicalName, reason: reasonGenerated))
                 continue
             }
             if param.hidden {
-                frozen.append(ParamVerdict(name: param.name, reason: reasonHidden))
+                frozen.append(ParamVerdict(name: param.canonicalName, reason: reasonHidden))
                 continue
             }
             if let cell = param.cellId, !gradReachable.contains(cell) {
                 // Zero gradient by construction: no path to the output.
-                frozen.append(ParamVerdict(name: param.name, reason: reasonNoGradPath))
+                frozen.append(ParamVerdict(name: param.canonicalName, reason: reasonNoGradPath))
                 continue
             }
             guard let minBound = param.min, let maxBound = param.max, minBound < maxBound else {
                 // @min/@max ARE the search space; refuse to invent one.
-                frozen.append(ParamVerdict(name: param.name, reason: reasonMissingBounds))
+                frozen.append(ParamVerdict(name: param.canonicalName, reason: reasonMissingBounds))
                 continue
             }
             learnable.append(
                 LearnableParam(
-                    name: param.name, min: minBound, max: maxBound,
+                    name: param.canonicalName, min: minBound, max: maxBound,
                     seedValue: seedValue))
         }
 

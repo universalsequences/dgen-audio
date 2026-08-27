@@ -52,7 +52,7 @@ func validateParamUIMetadata(_ params: [ParamInfo]) throws {
         throw LispError.validationError(
           "envelope '\(env)' has duplicate @role \(role.rawValue) on params '\(existingParam)' and '\(param.name)'")
       }
-      envelope.roles[role] = param.name
+      envelope.roles[role] = param.canonicalName
     }
 
     envelopes[env] = envelope

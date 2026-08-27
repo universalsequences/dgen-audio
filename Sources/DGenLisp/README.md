@@ -276,10 +276,18 @@ Local `def` and `make-history` bindings inside macros are automatically scoped â
 (param amp-attack @group amp @env amp-env @role attack @default 0.01)
 ```
 
-The name becomes a symbol you can use in expressions. Parameters appear in the manifest with their physical memory cell ID for host-side control.
-Modulatable params generate one hidden active flag plus one hidden depth param per declared modulator, and expose those cells through `modDestinations` metadata in the manifest.
+Parameters are unique by `(group, name)`. A grouped parameter is referenced by its
+canonical dotted identity (`amp.attack`). A bare short name remains valid when
+exactly one parameter has that name; otherwise compilation reports the sorted
+canonical candidates. Manifests emit the canonical identity as `name`, the short
+source name as `displayName`, and the optional `group`.
 
-UI metadata attributes are optional and do not affect DSP behavior. `@group` places a param in a generated UI group. `@env` marks a param as part of an envelope, and requires a valid `@role`. Params in the same envelope cannot duplicate roles or declare conflicting groups.
+Modulatable params generate one hidden active flag plus one hidden depth param per
+declared modulator, and expose those cells through `modDestinations` metadata in
+the manifest. Both `(mod amp.cutoff)` and `amp.cutoff~` select a grouped
+modulation destination.
+
+UI metadata attributes are optional and do not affect DSP behavior. `@group` both namespaces a param and places it in a generated UI group. `@env` marks a param as part of an envelope, and requires a valid `@role`. Params in the same envelope cannot duplicate roles or declare conflicting groups.
 
 #### in â€” audio input channel
 
