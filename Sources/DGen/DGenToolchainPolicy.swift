@@ -235,12 +235,18 @@ public enum DGenToolchainPolicy {
   /// that value names the checkout used to build the executable. Resources
   /// distributed with DGenLisp live beside the executable instead.
   public static var executableDirectory: URL {
-    if let executable = Bundle.main.executableURL {
-      return executable.deletingLastPathComponent()
-    }
-    return URL(fileURLWithPath: CommandLine.arguments[0])
-      .standardizedFileURL
-      .deletingLastPathComponent()
+    resolveExecutableDirectory(
+      executableURL: Bundle.main.executableURL,
+      commandLineExecutable: CommandLine.arguments[0])
+  }
+
+  static func resolveExecutableDirectory(
+    executableURL: URL?,
+    commandLineExecutable: String
+  ) -> URL {
+    let executable = executableURL
+      ?? URL(fileURLWithPath: commandLineExecutable).standardizedFileURL
+    return executable.resolvingSymlinksInPath().deletingLastPathComponent()
   }
 
   static func resolveDevelopmentRuntimeInclude(
