@@ -498,27 +498,26 @@ public enum DGenToolchainPolicy {
         withIntermediateDirectories: true)
     }
 
-    let arguments =
-      ["-target", target]
-      + optimizationArguments
-      + contractArguments
-      + ["-ffreestanding", "-nostdinc"]
-      + sysrootArguments
-      + [
-        "-resource-dir", resourceDirectory,
-        "-isystem", "\(resourceDirectory)/include",
-        "-I", include,
-        "-fuse-ld=\(linker)",
-        "-nostdlib",
-        hostProfile.sharedLibraryArgument,
-        hostProfile.installNameArgument(URL(fileURLWithPath: outputPath).lastPathComponent),
-      ]
-      + hostProfile.undefinedSymbolArguments
-      + [hostProfile.deadStripArgument]
-      + stubLibrarySearchArguments
-      + [sourcePath, "-x", "none", builtins]
-      + hostProfile.stubLibraryLinkArguments
-      + ["-o", outputPath]
+    var arguments = ["-target", target]
+    arguments += optimizationArguments
+    arguments += contractArguments
+    arguments += ["-ffreestanding", "-nostdinc"]
+    arguments += sysrootArguments
+    arguments += [
+      "-resource-dir", resourceDirectory,
+      "-isystem", "\(resourceDirectory)/include",
+      "-I", include,
+      "-fuse-ld=\(linker)",
+      "-nostdlib",
+      hostProfile.sharedLibraryArgument,
+      hostProfile.installNameArgument(URL(fileURLWithPath: outputPath).lastPathComponent),
+    ]
+    arguments += hostProfile.undefinedSymbolArguments
+    arguments.append(hostProfile.deadStripArgument)
+    arguments += stubLibrarySearchArguments
+    arguments += [sourcePath, "-x", "none", builtins]
+    arguments += hostProfile.stubLibraryLinkArguments
+    arguments += ["-o", outputPath]
     return DGenCompilerInvocation(
       executable: clang,
       arguments: arguments,
