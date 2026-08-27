@@ -1,3 +1,5 @@
+#if canImport(Metal)
+
 import XCTest
 @testable import DGen
 
@@ -195,3 +197,5 @@ final class MetalTensorOpsTests: XCTestCase {
         try runMetalTest(TensorTestCases.membraneSimulationExecute)
     }
 }
+
+#endif  // canImport(Metal)

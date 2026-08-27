@@ -13,6 +13,7 @@
 //   --debug                  Debug output
 //   -                        Read from stdin (also default if no file given)
 
+import DGen
 import DGenLazy
 import DGenTrainProtocol
 import Foundation
@@ -250,7 +251,9 @@ func main() throws {
     }
 
     if cli.debug {
-        fputs("[debug] Wrote \(cli.outputDir)/\(cli.name).dylib\n", stderr)
+        fputs(
+            "[debug] Wrote \(cli.outputDir)/\(cli.name)."
+                + "\(DGenToolchainPolicy.artifactExtension)\n", stderr)
         fputs("[debug] Wrote \(cli.outputDir)/\(cli.name).json\n", stderr)
         fputs("[debug] Total memory slots: \(compilerResult.compilationResult.totalMemorySlots)\n", stderr)
         fputs("[debug] Kernels: \(compilerResult.compilationResult.kernels.count)\n", stderr)

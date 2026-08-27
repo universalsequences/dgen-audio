@@ -133,6 +133,8 @@ public struct GraphAdam: GraphOptimizer {
 
 // MARK: - Graph Training Context
 
+#if canImport(Metal)
+
 /// Manages training using graph-based gradient computation
 public class GraphTrainingContext {
     public var parameters: [GraphParameter]
@@ -562,3 +564,5 @@ public class GraphTrainingContext {
         return (0..<count).map { memPtr[offset + $0] }
     }
 }
+
+#endif  // canImport(Metal)

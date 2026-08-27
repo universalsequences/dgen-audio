@@ -1,9 +1,18 @@
+#if canImport(AVFoundation)
 import AVFoundation
 import AudioToolbox  // kAudioUnitProperty_MaximumFramesPerSlice
+#endif
+#if canImport(CryptoKit)
 import CryptoKit
+#else
+import Crypto
+#endif
 import DGenHostSupport
 import Foundation
-import Metal
+#if !canImport(Darwin)
+// Linux Foundation does not re-export CFAbsoluteTime*/CoreFoundation.
+import CoreFoundation
+#endif
 
 public typealias AudioLevelCallback = (UnsafePointer<Float>, Int) -> Void
 
@@ -55,7 +64,7 @@ public class DylibCacheManager {
   /// code after edits. This stable alias lets later loads recover the compiled
   /// dylib even when serialized metadata still points at an older source hash.
   public func stableDylibFileName(operatorUUID: UUID, sourceCodeHash: String) -> String {
-    "\(operatorUUID.uuidString)_\(sourceCodeHash).dylib"
+    "\(operatorUUID.uuidString)_\(sourceCodeHash).\(DGenToolchainPolicy.artifactExtension)"
   }
 
   /// Delete dylibs not accessed in the specified number of days
@@ -74,7 +83,7 @@ public class DylibCacheManager {
     let cutoff = Date().addingTimeInterval(-Double(days * 24 * 60 * 60))
     var prunedCount = 0
 
-    for file in contents where file.pathExtension == "dylib" {
+    for file in contents where file.pathExtension == DGenToolchainPolicy.artifactExtension {
       guard let attrs = try? file.resourceValues(forKeys: [.contentAccessDateKey]),
         let accessDate = attrs.contentAccessDate,
         accessDate < cutoff
@@ -104,7 +113,7 @@ public class DylibCacheManager {
     else { return }
 
     var clearedCount = 0
-    for file in contents where file.pathExtension == "dylib" {
+    for file in contents where file.pathExtension == DGenToolchainPolicy.artifactExtension {
       do {
         try FileManager.default.removeItem(at: file)
         clearedCount += 1
@@ -126,12 +135,14 @@ public protocol CompiledKernelRuntime {
   func run(
     outputs: UnsafeMutablePointer<Float>, inputs: UnsafePointer<Float>, frameCount: Int,
     volumeScale: Float)
-  func runAndPlay(engine: AVAudioEngine, sampleRate: Double, channels: Int, volumeScale: Float)
-    throws -> AVAudioNode
-  func runAndPlay(
-    engine: AVAudioEngine, sampleRate: Double, channels: Int, volumeScale: Float,
-    levelCallback: AudioLevelCallback?
-  ) throws -> AVAudioNode
+  #if canImport(AVFoundation)
+    func runAndPlay(engine: AVAudioEngine, sampleRate: Double, channels: Int, volumeScale: Float)
+      throws -> AVAudioNode
+    func runAndPlay(
+      engine: AVAudioEngine, sampleRate: Double, channels: Int, volumeScale: Float,
+      levelCallback: AudioLevelCallback?
+    ) throws -> AVAudioNode
+  #endif
   func setParamValue(cellId: CellID, value: Float)
   func cleanup()
 
@@ -244,7 +255,8 @@ public class CCompiledKernel: CompiledKernelRuntime {
     let salt = Int.random(in: 0..<999999)
     let uniqueId = "\(timestamp)_\(salt)"
     let cFile = tmpDir.appendingPathComponent("kernel_\(uniqueId).c")
-    let dylibFile = tmpDir.appendingPathComponent("libkernel_\(uniqueId).dylib")
+    let dylibFile = tmpDir.appendingPathComponent(
+      "libkernel_\(uniqueId).\(DGenToolchainPolicy.artifactExtension)")
 
     try source.write(to: cFile, atomically: true, encoding: .utf8)
 
@@ -417,7 +429,8 @@ public class CCompiledKernel: CompiledKernelRuntime {
     // Use timestamp + salt for unique filename (critical for dlopen to load fresh code)
     let timestamp = String(Int(Date().timeIntervalSince1970 * 1000))
     let salt = Int.random(in: 0..<999999)
-    let dylibFileName = "\(operatorUUID.uuidString)_\(timestamp)_\(salt).dylib"
+    let dylibFileName =
+      "\(operatorUUID.uuidString)_\(timestamp)_\(salt).\(DGenToolchainPolicy.artifactExtension)"
     let dylibFile = cacheDir.appendingPathComponent(dylibFileName)
 
     // Write source to temp file
@@ -597,6 +610,7 @@ public class CCompiledKernel: CompiledKernelRuntime {
     fn(Int32(cellId), value)
   }
 
+#if canImport(AVFoundation)
   public func runAndPlay(
     engine: AVAudioEngine,
     sampleRate: Double,
@@ -706,6 +720,7 @@ public class CCompiledKernel: CompiledKernelRuntime {
       engine: engine, sampleRate: sampleRate, channels: channels, volumeScale: volumeScale,
       levelCallback: nil)
   }
+#endif
 
   public func cleanup() {
     if let handle = dylibHandle {
@@ -844,7 +859,8 @@ public class CCompiledKernel: CompiledKernelRuntime {
     var dlsymMs: Double = 0
 
     for i in startIndex..<(count - 1) {
-      let copyURL = tmpDir.appendingPathComponent("\(baseName)_copy_\(i).dylib")
+      let copyURL = tmpDir.appendingPathComponent(
+        "\(baseName)_copy_\(i).\(DGenToolchainPolicy.artifactExtension)")
 
       // Copy original dylib
       let c0 = CFAbsoluteTimeGetCurrent()

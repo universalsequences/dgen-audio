@@ -889,6 +889,7 @@ func runCTest(_ testCase: TensorTestCase) throws {
 }
 
 /// Run a test case with the Metal backend
+#if canImport(Metal)
 func runMetalTest(_ testCase: TensorTestCase) throws {
   let g = Graph()
   try testCase.graphBuilder(g)
@@ -951,3 +952,4 @@ func runMetalTest(_ testCase: TensorTestCase) throws {
     }
   }
 }
+#endif  // canImport(Metal)

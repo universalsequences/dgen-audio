@@ -4,6 +4,10 @@
 // returning the computed values.
 
 import Foundation
+#if !canImport(Darwin)
+// Linux Foundation does not re-export CFAbsoluteTime*/CoreFoundation.
+import CoreFoundation
+#endif
 import DGen
 
 // MARK: - LazyRuntime Protocol
@@ -22,6 +26,7 @@ extension CLazyRuntime {
     public func profileKernels(frameCount: Int) -> [(index: Int, name: String, dispatchInfo: String, gpuMs: Double)] { [] }
 }
 
+#if canImport(Metal)
 extension MetalCompiledKernel: LazyRuntime {
     public func memoryPointer() -> UnsafeMutablePointer<Float>? {
         getBuffer(name: "memory")?.contents().assumingMemoryBound(to: Float.self)
@@ -31,6 +36,7 @@ extension MetalCompiledKernel: LazyRuntime {
         getBuffer(name: "outputs")?.contents().assumingMemoryBound(to: Float.self)
     }
 }
+#endif
 
 /// C backend runtime wrapper for lazy execution
 public class CLazyRuntime: LazyRuntime {
@@ -50,7 +56,12 @@ public class CLazyRuntime: LazyRuntime {
     ) throws {
         self.cellAllocations = cellAllocations
         self.memorySize = max(memorySize, 1024)
-        self.outputsSize = frameCount
+        // The C backend emits frame loops that step 4 frames at a time and store
+        // whole `vst1q_f32` vectors, so a call with `frameCount % 4 != 0` writes
+        // up to 3 float lanes past frame `frameCount - 1`. Round the buffer up to
+        // the SIMD group so that tail is inside the allocation. (Real OOB on every
+        // platform; macOS's size-class allocator merely absorbed it silently.)
+        self.outputsSize = (frameCount + 3) & ~3
 
         // Concatenate all kernel sources into a single C file
         let combinedSource = kernels.map { $0.source }.joined(separator: "\n\n")
@@ -236,12 +247,17 @@ extension LazyGraph {
     private func createRuntime(from result: CompilationResult, frameCount: Int) throws -> LazyRuntime {
         switch DGenConfig.backend {
         case .metal:
-            return try MetalCompiledKernel(
-                kernels: result.kernels,
-                cellAllocations: result.cellAllocations,
-                context: result.context,
-                frameCount: frameCount
-            )
+            #if canImport(Metal)
+                return try MetalCompiledKernel(
+                    kernels: result.kernels,
+                    cellAllocations: result.cellAllocations,
+                    context: result.context,
+                    frameCount: frameCount
+                )
+            #else
+                throw DGenLazyError.runtimeError(
+                    "Metal backend is unavailable on this platform; use the C backend (DGenConfig.backend = .c)")
+            #endif
         case .c:
             return try CLazyRuntime(
                 kernels: result.kernels,

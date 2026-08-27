@@ -18,6 +18,10 @@ import DGen
 import DGenLazy
 import DGenTrainProtocol
 import Foundation
+#if !canImport(Darwin)
+// Linux Foundation does not re-export CFAbsoluteTime*/CoreFoundation.
+import CoreFoundation
+#endif
 
 enum DirectionTrainer {
     static let defaultEpochs = 300

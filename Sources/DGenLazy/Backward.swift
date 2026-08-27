@@ -6,6 +6,15 @@
 import DGen
 import Foundation
 
+#if !canImport(Darwin)
+  /// `autoreleasepool` is an Objective-C runtime facility with no equivalent
+  /// (and nothing to drain) off Apple platforms; run the body directly.
+  @inline(__always)
+  func autoreleasepool<Result>(invoking body: () throws -> Result) rethrows -> Result {
+    try body()
+  }
+#endif
+
 // MARK: - Parameter Registry
 
 /// Tracks parameters that need gradients in the current graph

@@ -1,6 +1,10 @@
 import enum DGen.DGenSpectralConfig
 import DGenLazy
 import Foundation
+#if !canImport(Darwin)
+// Linux Foundation does not re-export CFAbsoluteTime*/CoreFoundation.
+import CoreFoundation
+#endif
 
 struct RunDirectories {
   let root: URL

@@ -318,7 +318,7 @@ func generateManifest(
     return PatchManifest(
         version: 3,
         processAbi: "dgen-host-abi-v1",
-        dylib: "\(options.name).dylib",
+        dylib: "\(options.name).\(DGenToolchainPolicy.artifactExtension)",
         cSourcePath: compilerResult.cSourcePath,
         sampleRate: options.sampleRate,
         maxFrameCount: options.maxFrames,

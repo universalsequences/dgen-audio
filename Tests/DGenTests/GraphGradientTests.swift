@@ -11,6 +11,7 @@ final class GraphGradientTests: XCTestCase {
   /// Minimal test to prove atomic_fetch_add is non-deterministic
   /// Multiple frames atomically add to the SAME memory location
   /// If atomic were truly deterministic, results would match across runs
+#if canImport(Metal)
   func testAtomicAccumulateIsDeterministic() throws {
     let frameCount = 64
     let g = Graph(sampleRate: 1000.0)
@@ -91,6 +92,7 @@ final class GraphGradientTests: XCTestCase {
       print("\n✓ Atomic accumulate appears deterministic for this test")
     }
   }
+#endif  // canImport(Metal)
 
   /// Simple test: y = x * 2, loss = (y - target)^2
   /// Gradient: d(loss)/dx = 2 * (y - target) * 2 = 4 * (x*2 - target)
@@ -187,6 +189,7 @@ final class GraphGradientTests: XCTestCase {
   }
 
   /// Simplest end-to-end: y = x * 2, output grad_x only
+#if canImport(Metal)
   func testSimpleEndToEnd() throws {
     let g = Graph()
 
@@ -697,6 +700,7 @@ final class GraphGradientTests: XCTestCase {
       "  Gradient sign: \(computedGrad > 0 ? "positive (increase freq)" : "negative (decrease freq)")"
     )
   }
+#endif  // canImport(Metal)
 
   // MARK: - Helpers
 
@@ -730,6 +734,7 @@ final class GraphGradientTests: XCTestCase {
 
   /// Test the new GraphTrainingContext with a simple optimization problem
   /// Minimize (x - 3)^2, starting from x = 0
+#if canImport(Metal)
   func testGraphTrainingContextSimple() throws {
     let g = Graph()
 
@@ -1332,6 +1337,7 @@ final class GraphGradientTests: XCTestCase {
     print("Final loss: \(finalLoss)")
     XCTAssertLessThan(finalLoss, initialLoss, "Loss should decrease")
   }
+#endif  // canImport(Metal)
 
   /// Simple test: matmul -> sum -> loss (no peekRow, static tensors)
   /// Used to debug kernel scheduling for matmul backward
@@ -1407,6 +1413,7 @@ final class GraphGradientTests: XCTestCase {
   }
 
   /// Test: matmul -> peekRow -> sum -> loss
+#if canImport(Metal)
   func testMatmulPeekRowSumLoss() throws {
     let frameCount = 64
     let numRows = 8
@@ -1990,4 +1997,5 @@ final class GraphGradientTests: XCTestCase {
     // Product should be close to 6
     XCTAssertEqual(a.value * b.value, 6.0, accuracy: 0.5, "a*b should converge to 6")
   }
+#endif  // canImport(Metal)
 }
