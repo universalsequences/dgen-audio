@@ -22,23 +22,27 @@ final class UIMetadataTests: XCTestCase {
         (out (+ op1-ratio op2-ratio) 1 @name audio)
         """)
 
+        // A grouped param is named by its canonical `group.name` identity and
+        // keeps its short declaration name for display.
         let paramsByName = Dictionary(uniqueKeysWithValues: manifest.params.map { ($0.name, $0) })
-        XCTAssertEqual(paramsByName["op1-ratio"]?.group, "op1")
-        XCTAssertNil(paramsByName["op1-ratio"]?.env)
-        XCTAssertNil(paramsByName["op1-ratio"]?.role)
-        XCTAssertEqual(paramsByName["op1-attack"]?.group, "op1")
-        XCTAssertEqual(paramsByName["op1-attack"]?.env, "op1-env")
-        XCTAssertEqual(paramsByName["op1-attack"]?.role, "attack")
+        XCTAssertEqual(paramsByName["op1.op1-ratio"]?.displayName, "op1-ratio")
+        XCTAssertEqual(paramsByName["op1.op1-ratio"]?.group, "op1")
+        XCTAssertNil(paramsByName["op1.op1-ratio"]?.env)
+        XCTAssertNil(paramsByName["op1.op1-ratio"]?.role)
+        XCTAssertEqual(paramsByName["op1.op1-attack"]?.displayName, "op1-attack")
+        XCTAssertEqual(paramsByName["op1.op1-attack"]?.group, "op1")
+        XCTAssertEqual(paramsByName["op1.op1-attack"]?.env, "op1-env")
+        XCTAssertEqual(paramsByName["op1.op1-attack"]?.role, "attack")
 
         XCTAssertEqual(manifest.groups.map(\.name), ["op1", "op2"])
         XCTAssertEqual(manifest.envelopes.count, 1)
         let envelope = try XCTUnwrap(manifest.envelopes.first)
         XCTAssertEqual(envelope.name, "op1-env")
         XCTAssertEqual(envelope.group, "op1")
-        XCTAssertEqual(envelope.roles.attack, "op1-attack")
-        XCTAssertEqual(envelope.roles.decay, "op1-decay")
-        XCTAssertEqual(envelope.roles.sustain, "op1-sustain")
-        XCTAssertEqual(envelope.roles.release, "op1-release")
+        XCTAssertEqual(envelope.roles.attack, "op1.op1-attack")
+        XCTAssertEqual(envelope.roles.decay, "op1.op1-decay")
+        XCTAssertEqual(envelope.roles.sustain, "op1.op1-sustain")
+        XCTAssertEqual(envelope.roles.release, "op1.op1-release")
     }
 
     func testManifestEncodesMissingEnvelopeRolesAsNull() throws {

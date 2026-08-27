@@ -6,8 +6,14 @@ struct ParamIdentity: Hashable {
     let shortName: String
     let group: String?
 
+    /// Host-facing identity. Declarations predating namespacing spelled the
+    /// group into the name itself (`(param fm.attack @group fm)`); such a
+    /// param keeps its existing `fm.attack` identity rather than becoming
+    /// `fm.fm.attack`. Its declared name stays the reference and display name,
+    /// so `attack` in another group is still an unambiguous bare reference.
     var canonicalName: String {
         guard let group else { return shortName }
+        if shortName.hasPrefix("\(group).") { return shortName }
         return "\(group).\(shortName)"
     }
 }

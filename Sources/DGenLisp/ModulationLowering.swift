@@ -243,11 +243,12 @@ private func rewriteModExpressions(
 ) throws -> ASTNode {
     switch node {
     case .atom(let value):
+        // `~` sugar applies only to symbols that name a parameter. A trailing
+        // `~` is otherwise ordinary symbol text (a `def` binding, a history
+        // name), so leave it alone rather than failing the compile.
         guard value.hasSuffix("~") else { return node }
         let reference = String(value.dropLast())
-        guard let identity = try paramNamespace.resolve(reference, requiresParameter: true) else {
-            throw LispError.validationError("'\(reference)' does not reference a parameter")
-        }
+        guard let identity = try paramNamespace.resolve(reference) else { return node }
         guard let modParam = modulatableParams[identity.canonicalName] else {
             throw LispError.validationError(
                 "mod: parameter '\(identity.canonicalName)' is not declared with @mod true")
@@ -284,15 +285,31 @@ private func rewriteModExpressions(
         case "defmacro": preservedCount = min(3, elements.count)
         default: preservedCount = min(1, elements.count)
         }
-        let prefix = Array(elements.prefix(preservedCount))
-        let expressions = try elements.dropFirst(preservedCount).map {
-            try rewriteModExpressions(
-                $0,
-                modulatableParams: modulatableParams,
-                paramNamespace: paramNamespace
+        var rewritten = Array(elements.prefix(preservedCount))
+        var index = preservedCount
+        while index < elements.count {
+            // `@attr value` pairs are metadata, not expressions: copy them
+            // verbatim so an attribute value is never mistaken for a symbol
+            // reference.
+            if case .atom(let key) = elements[index], key.hasPrefix("@") {
+                rewritten.append(elements[index])
+                index += 1
+                if index < elements.count, case .atom = elements[index] {
+                    rewritten.append(elements[index])
+                    index += 1
+                }
+                continue
+            }
+            rewritten.append(
+                try rewriteModExpressions(
+                    elements[index],
+                    modulatableParams: modulatableParams,
+                    paramNamespace: paramNamespace
+                )
             )
+            index += 1
         }
-        return .list(prefix + expressions)
+        return .list(rewritten)
     }
 }
 

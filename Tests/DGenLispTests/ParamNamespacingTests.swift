@@ -88,6 +88,65 @@ final class ParamNamespacingTests: XCTestCase {
         XCTAssertEqual(param.group, "op1")
     }
 
+    func testLegacyDottedDeclarationKeepsItsExistingIdentity() throws {
+        let nodes = try lowerModulation(in: parseSource("""
+        (param fm.attack @group fm @default 0.25 @min 0 @max 1)
+        (param attack @group amp @default 0.5 @min 0 @max 1)
+        (out fm.attack 1)
+        (out attack 2)
+        """))
+        let evaluator = LispEvaluator()
+        try evaluator.evaluate(nodes: nodes)
+
+        XCTAssertEqual(evaluator.params[0].canonicalName, "fm.attack")
+        XCTAssertEqual(evaluator.params[0].name, "fm.attack")
+        XCTAssertEqual(
+            evaluator.outputs[0].signal.memoryCellId,
+            evaluator.params[0].cellId
+        )
+        // A bare `attack` elsewhere stays unambiguous: the legacy declaration
+        // keeps its declared name, it does not also claim the short name.
+        XCTAssertEqual(evaluator.params[1].canonicalName, "amp.attack")
+        XCTAssertEqual(
+            evaluator.outputs[1].signal.memoryCellId,
+            evaluator.params[1].cellId
+        )
+    }
+
+    func testTildeSuffixedNonParameterSymbolsSurviveLowering() throws {
+        let nodes = try lowerModulation(in: parseSource("""
+        (param level @default 0.5 @min 0 @max 1)
+        (def scaled~ (* level 2))
+        (out scaled~ 1)
+        """))
+        XCTAssertTrue(
+            nodes.contains(.list([.atom("out"), .atom("scaled~"), .atom("1")])),
+            "a non-parameter `~` symbol was rewritten: \(nodes)"
+        )
+
+        // It still evaluates: `scaled~` is an ordinary `def` binding.
+        let evaluator = LispEvaluator()
+        try evaluator.evaluate(nodes: nodes)
+        XCTAssertEqual(evaluator.outputs.count, 1)
+    }
+
+    func testAttributeValuesAreNotRewrittenAsReferences() throws {
+        let nodes = try lowerModulation(in: parseSource("""
+        (def mod1 (in 5 @name mod1 @modulator 1))
+        (param amount @group op1 @default 0.25 @min 0 @max 1 @mod true @mod-mode additive)
+        (out (mod op1.amount) 1 @name amount~)
+        """))
+
+        let outNode = try XCTUnwrap(nodes.last)
+        guard case .list(let elements) = outNode else {
+            return XCTFail("expected an out list, got \(outNode)")
+        }
+        XCTAssertTrue(
+            elements.contains(.atom("amount~")),
+            "attribute value was rewritten: \(elements)"
+        )
+    }
+
     func testDottedModFormsAndTildeSugarLowerIndependently() throws {
         let nodes = try lowerModulation(in: parseSource("""
         (def mod1 (in 5 @name mod1 @modulator 1))
