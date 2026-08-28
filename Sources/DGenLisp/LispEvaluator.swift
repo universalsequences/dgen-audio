@@ -1147,9 +1147,9 @@ class LispEvaluator {
       case "sqrt": return .signal(DGenLazy.sqrt(s))
       case "abs": return .signal(DGenLazy.abs(s))
       case "sign": return .signal(DGenLazy.sign(s))
-      case "floor": return .signal(s)  // floor not available for Signal, pass through
-      case "ceil": return .signal(s)
-      case "round": return .signal(s)
+      case "floor": return .signal(DGenLazy.floor(s))
+      case "ceil": return .signal(DGenLazy.ceil(s))
+      case "round": return .signal(DGenLazy.round(s))
       case "relu": return .signal(DGenLazy.relu(s))
       case "sigmoid": return .signal(DGenLazy.sigmoid(s))
       default: throw LispError.unknownOperator(fn)

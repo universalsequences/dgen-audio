@@ -125,6 +125,21 @@ public func tanh(_ x: Signal) -> Signal {
   return Signal(nodeId: nodeId, graph: x.graph, requiresGrad: x.requiresGrad)
 }
 
+public func floor(_ x: Signal) -> Signal {
+  let nodeId = x.graph.node(.floor, [x.nodeId])
+  return Signal(nodeId: nodeId, graph: x.graph, requiresGrad: x.requiresGrad)
+}
+
+public func ceil(_ x: Signal) -> Signal {
+  let nodeId = x.graph.node(.ceil, [x.nodeId])
+  return Signal(nodeId: nodeId, graph: x.graph, requiresGrad: x.requiresGrad)
+}
+
+public func round(_ x: Signal) -> Signal {
+  let nodeId = x.graph.node(.round, [x.nodeId])
+  return Signal(nodeId: nodeId, graph: x.graph, requiresGrad: x.requiresGrad)
+}
+
 // MARK: - Unary Math Functions (SignalTensor)
 
 public func sin(_ x: SignalTensor) -> SignalTensor {
