@@ -42,6 +42,8 @@ struct ParamInfo {
   let modulationActiveParamName: String?
   let modulationResolvedSymbolName: String?
   let generatedModulatorSlot: Int?
+  let options: ParamOptions?
+  let extraAttributes: [String: String]
 }
 
 struct OutputInfo {
@@ -1499,6 +1501,62 @@ class LispEvaluator {
 
   // MARK: - I/O
 
+  /// Resolves a param's `@options` attribute into a manifest label source plus
+  /// the option count that derives the param's integer-stepped domain.
+  ///
+  /// Inline `["a" "b"]` labels are baked here; a bare symbol names a
+  /// file-backed tensor binding whose asset metadata supplies the labels, so
+  /// the audio and the labels can never come from different files.
+  private func resolveParamOptions(
+    _ attributes: [(name: String, value: String)], paramName: String
+  ) throws -> (options: ParamOptions, count: Int)? {
+    guard let raw = attrValue(attributes, "@options") else { return nil }
+    let trimmed = raw.trimmingCharacters(in: .whitespaces)
+    guard !trimmed.isEmpty, !trimmed.hasPrefix("@") else {
+      throw LispError.validationError(
+        "param '\(paramName)' has @options without labels or a tensor name")
+    }
+
+    if trimmed.hasPrefix("[") {
+      let labels = try parseInlineParamOptionLabels(trimmed, paramName: paramName)
+      return (.labels(labels), labels.count)
+    }
+
+    let symbol = unquote(trimmed)
+    let info = tensors.last(where: { $0.name == symbol })
+    if info == nil, definitions[symbol] == nil {
+      throw LispError.validationError(
+        "param '\(paramName)' has @options \(symbol), which does not name a tensor binding")
+    }
+    guard let file = info?.sourceFile else {
+      throw LispError.validationError(
+        "param '\(paramName)' has @options \(symbol), but that tensor has no file contents; @options needs a tensor with @file or @default-file")
+    }
+    let shape = info?.shape ?? []
+    let key = attrValue(attributes, "@options-key").map(normalizeParamOptionsKey)
+      ?? defaultParamOptionsKey
+    let count = try loadParamOptionCount(file: file, key: key, shape: shape)
+    return (.asset(tensor: symbol, file: file, key: key), count)
+  }
+
+  /// Counts the labels an asset-backed `@options` param resolves to, following
+  /// the same policy the host uses: the requested key, else `wave_names`, else
+  /// numbered entries derived from `waves_per_set`.
+  private func loadParamOptionCount(file: String, key: String, shape: [Int]) throws -> Int {
+    let url = URL(fileURLWithPath: file, relativeTo: sourceDirectory).standardizedFileURL
+    guard let rawData = try? Data(contentsOf: url),
+      let object = (try? JSONSerialization.jsonObject(with: rawData)) as? [String: Any]
+    else {
+      throw LispError.invalidArgument(
+        "failed to read @options metadata from tensor file '\(file)' relative to \(sourceDirectory.path)")
+    }
+    if let labels = object[key] as? [Any], !labels.isEmpty { return labels.count }
+    if let labels = object["wave_names"] as? [Any], !labels.isEmpty { return labels.count }
+    let laneCount = shape.count > 1 ? shape.dropFirst().reduce(1, *) : shape.reduce(1, *)
+    let perSet = (object["waves_per_set"] as? NSNumber)?.intValue ?? 1
+    return Swift.max(laneCount / Swift.max(perSet, 1), 1)
+  }
+
   private func evalParam(_ args: [ASTNode], attributes: [(name: String, value: String)]) throws
     -> EvalResult
   {
@@ -1508,8 +1566,22 @@ class LispEvaluator {
     }
 
     let defaultVal = Float(attrValue(attributes, "@default") ?? "0") ?? 0
-    let minVal = Float(attrValue(attributes, "@min") ?? "")
-    let maxVal = Float(attrValue(attributes, "@max") ?? "")
+    var minVal = Float(attrValue(attributes, "@min") ?? "")
+    var maxVal = Float(attrValue(attributes, "@max") ?? "")
+    let resolvedOptions = try resolveParamOptions(attributes, paramName: name)
+    if let resolvedOptions {
+      if minVal != nil || maxVal != nil {
+        FileHandle.standardError.write(
+          Data(
+            "warning: param '\(name)' has @options; authored @min/@max are ignored (domain is derived as 0..\(resolvedOptions.count - 1))\n"
+              .utf8))
+      }
+      // Derived integer-stepped domain: option params never author a range.
+      minVal = 0
+      maxVal = Float(Swift.max(resolvedOptions.count - 1, 0))
+    }
+    let paramOptions = resolvedOptions?.options
+    let extraAttributes = inertParamAttributes(attributes)
     let unit = attrValue(attributes, "@unit")
     let hidden = parseBoolAttr(attributes, "@hidden")
     let group = try parseUIMetadataSymbol(attrValue(attributes, "@group"), attribute: "@group", paramName: name)
@@ -1560,7 +1632,9 @@ class LispEvaluator {
         modulationDepthMax: modulationDepthMax,
         modulationActiveParamName: modulationActiveParamName,
         modulationResolvedSymbolName: modulationResolvedSymbolName,
-        generatedModulatorSlot: generatedModulatorSlot)
+        generatedModulatorSlot: generatedModulatorSlot,
+        options: paramOptions,
+        extraAttributes: extraAttributes)
       params.append(info)
       paramValues[identity.canonicalName] = value
       return value
@@ -1599,7 +1673,9 @@ class LispEvaluator {
       modulationDepthMax: modulationDepthMax,
       modulationActiveParamName: modulationActiveParamName,
       modulationResolvedSymbolName: modulationResolvedSymbolName,
-      generatedModulatorSlot: generatedModulatorSlot
+      generatedModulatorSlot: generatedModulatorSlot,
+      options: paramOptions,
+      extraAttributes: extraAttributes
     )
     params.append(info)
     paramValues[identity.canonicalName] = .signal(signal)

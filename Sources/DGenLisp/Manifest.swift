@@ -46,11 +46,41 @@ struct ManifestParam: Codable {
     let group: String?
     let env: String?
     let role: String?
+    /// Label source for a discrete `@options` param; absent for plain knobs.
+    let options: ManifestParamOptions?
+    /// Authored attributes the compiler does not consume, carried through as
+    /// inert UI hints instead of being dropped.
+    let attrs: [String: String]?
 
     enum CodingKeys: String, CodingKey {
         case name, displayName, cellId, cellSpan
         case defaultValue = "default"
-        case min, max, unit, hidden, group, env, role
+        case min, max, unit, hidden, group, env, role, options, attrs
+    }
+}
+
+/// Either baked inline labels (`{"labels": […]}`) or a reference to the asset
+/// backing a tensor binding (`{"tensor", "file", "key"}`), which the host
+/// re-resolves so labels track bank swaps and `tensor-param` pushes.
+struct ManifestParamOptions: Codable {
+    let labels: [String]?
+    let tensor: String?
+    let file: String?
+    let key: String?
+
+    init(_ options: ParamOptions) {
+        switch options {
+        case .labels(let labels):
+            self.labels = labels
+            self.tensor = nil
+            self.file = nil
+            self.key = nil
+        case .asset(let tensor, let file, let key):
+            self.labels = nil
+            self.tensor = tensor
+            self.file = file
+            self.key = key
+        }
     }
 }
 
@@ -232,7 +262,9 @@ func generateManifest(
             hidden: param.hidden ? true : nil,
             group: param.group,
             env: param.env,
-            role: param.role?.rawValue
+            role: param.role?.rawValue,
+            options: param.options.map(ManifestParamOptions.init),
+            attrs: param.extraAttributes.isEmpty ? nil : param.extraAttributes
         )
     }
 
