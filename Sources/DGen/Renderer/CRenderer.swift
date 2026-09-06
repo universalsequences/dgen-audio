@@ -13,10 +13,10 @@ public class CRenderer: Renderer {
   public var loadedGlobal: [Int: GlobalLoadState] = [:]
   private var loadedGlobalScopeStack: [[Int: GlobalLoadState]] = []
   private var staticGlobalVars: Set<VarID> = []
-  /// Step of the innermost open frame loop (1 = scalar, 4 = SIMD); 1 outside
-  /// any loop. Scalar loads of a global only need a SIMD alias when a SIMD op
-  /// in the same loop can reference it.
-  private var currentLoopStep: Int = 1
+  /// Globals whose scalar load must also declare a four-lane alias because a
+  /// SIMD op in the same block reads `simd<id>`. Computed in prepareSchedule;
+  /// every other scalar load of a global is a self-copy and emits nothing.
+  private var simdAliasGlobals: Set<VarID> = []
   private var frameIndexOverride: String? = nil
   private var currentThreadCountScale: Int? = nil
 
@@ -88,9 +88,14 @@ public class CRenderer: Renderer {
     _ frameCount: Int
   ) {
     staticGlobalVars.removeAll()
+    simdAliasGlobals.removeAll()
     for block in uopBlocks {
-      guard block.temporality == .static_ else { continue }
+      let blockHasSimd = block.vectorWidth > 1 || block.ops.contains { $0.isSimd }
       for uop in block.ops {
+        if case .loadGlobal(let varId) = uop.op, blockHasSimd {
+          simdAliasGlobals.insert(varId)
+        }
+        guard block.temporality == .static_ else { continue }
         if case .defineGlobal(let varId) = uop.op {
           staticGlobalVars.insert(varId)
         }
@@ -1047,7 +1052,6 @@ public class CRenderer: Renderer {
 
     case .beginLoop(let iters, let step):
       loopVarBindingStack.append(nil)
-      currentLoopStep = step
       return "for (int i = 0; i < \(g(iters)); i += \(step)) {"
     case .beginReverseLoop(let iters):
       loopVarBindingStack.append(nil)
@@ -1067,7 +1071,6 @@ public class CRenderer: Renderer {
       }
       return "for (int t\(varId) = 0; t\(varId) < \(countStr); t\(varId)++) {"
     case .endLoop:
-      currentLoopStep = 1
       if let boundVarId = loopVarBindingStack.popLast() ?? nil {
         activeLoopVarNames.removeValue(forKey: boundVarId)
       }
@@ -1156,9 +1159,9 @@ public class CRenderer: Renderer {
       } else {
         var lines: [String] = []
 
-        // A SIMD alias is only reachable from SIMD ops in the same loop; in a
-        // scalar loop (or outside any loop) it would be a dead 4-lane load.
-        if !state.simdLoaded && currentLoopStep > 1 {
+        // A SIMD alias is only reachable from SIMD ops in the same block; in a
+        // scalar block it would be a dead 4-lane load.
+        if !state.simdLoaded && simdAliasGlobals.contains(id) {
           if staticGlobalVars.contains(id) {
             lines.append("float32x4_t simd\(id) = vdupq_n_f32(t\(id)[0]); /* extra */")
           } else {
