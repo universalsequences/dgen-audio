@@ -154,21 +154,15 @@ final class HopHoldTests: XCTestCase {
         XCTAssertFalse(output.contains(where: \.isNaN))
         XCTAssertFalse(output.contains(where: \.isInfinite))
 
-        // Count hop-gated FFT calls: the generated C should have exactly two
-        // `vDSP_fft_zip(..., Forward)` and two `..., Inverse` invocations
-        // emitted (one in acceleratedFFT, one in acceleratedIFFT, each inside
-        // a single hop-gated block) — NOT one per frame. A frame-rate FFT
-        // would emit the call inside the outer `for (int i = 0; i <
-        // frameCount)` loop without an `if (hopCounter == 0)` wrapping it.
-        //
-        // We can't easily distinguish "gated" vs "ungated" in plain text
-        // without a full C parser, so just check the FFT call count: there
-        // should be exactly ONE forward and ONE inverse call site.
+        // The generated module calls the portable host-services ABI, not
+        // Accelerate directly. Pin one forward and one inverse call site;
+        // this structural check alone does not prove hop gating or cadence.
+        // SpectralSchedulingTests covers sample-level scheduling numerically.
         let kernelSource = result.source
         let fwdCount =
-            kernelSource.components(separatedBy: "kFFTDirection_Forward").count - 1
+            kernelSource.components(separatedBy: "host->fft_forward_fn(").count - 1
         let invCount =
-            kernelSource.components(separatedBy: "kFFTDirection_Inverse").count - 1
+            kernelSource.components(separatedBy: "host->fft_inverse_fn(").count - 1
         print("FFT call sites: forward=\(fwdCount), inverse=\(invCount)")
         XCTAssertEqual(fwdCount, 1, "exactly one forward FFT call site expected")
         XCTAssertEqual(invCount, 1, "exactly one inverse FFT call site expected")

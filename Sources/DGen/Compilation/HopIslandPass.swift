@@ -54,12 +54,16 @@ extension HopIslandPass {
 
     for (index, block) in blocks.enumerated() {
       guard let domain = hopDomain(for: block), isIslandEligible(block) else {
-        if hopDomain(for: block) != nil || block.temporality == .static_ {
+        if hopDomain(for: block) != nil {
           flushPending()
           regions.append(.block(index))
           continue
         }
 
+        // Independent static setup (for example a sample-rate-derived gain
+        // coefficient) can precede the island just like independent frame work.
+        // Splitting on it would let a shared FFT scratch buffer be overwritten
+        // for every hop before its frame-rate consumer reads the first result.
         let access = BlockAccess(block.ops)
         if access.conflicts(with: pendingAccess) {
           if isFrameCarrierEligible(block) {
@@ -160,8 +164,10 @@ private struct BlockAccess {
   func conflicts(with earlier: BlockAccess) -> Bool {
     !earlier.writesVariables.isDisjoint(with: readsVariables)
       || !earlier.readsVariables.isDisjoint(with: writesVariables)
+      || !earlier.writesVariables.isDisjoint(with: writesVariables)
       || !earlier.writesCells.isDisjoint(with: readsCells)
       || !earlier.readsCells.isDisjoint(with: writesCells)
+      || !earlier.writesCells.isDisjoint(with: writesCells)
   }
 
   private mutating func record(_ uop: UOp) {

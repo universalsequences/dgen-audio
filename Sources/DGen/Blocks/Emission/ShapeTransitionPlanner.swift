@@ -60,20 +60,12 @@ func detectShapeTransitions(block: Block, g: Graph) -> [(nodeIndex: Int, shape: 
         break
       }
     } else if case .scalar = node.shape {
-      // Scalar node - check if it consumes a tensor (e.g., sum reduction)
-      // These need their own region AFTER the tensor region completes
-      // BUT: only create a new region when transitioning FROM tensor TO scalar,
-      // not for consecutive scalar operations (which may depend on each other)
-      let consumesTensor = node.inputs.contains { inputId in
-        if let inputNode = g.nodes[inputId], case .tensor = inputNode.shape {
-          return true
-        }
-        return false
-      }
-      let alreadyInScalarRegion = currentShape == [1]
-      if consumesTensor && currentShape != nil && !alreadyInScalarRegion {
-        // Create a "scalar reduction" region with shape [1] to separate it
-        // This ensures the tensor computation completes before reduction runs
+      // Scalar execution rate is independent of whether this node directly
+      // consumes a tensor. In particular, feedback state must advance once per
+      // frame, never once per element of a neighboring tensor region. Record
+      // the scalar prefix too, so a single tensor shape with scalar neighbors
+      // uses region emission rather than wrapping the entire block in a loop.
+      if currentShape != [1] {
         transitions.append((nodeIndex: index, shape: [1]))
         currentShape = [1]
       }
