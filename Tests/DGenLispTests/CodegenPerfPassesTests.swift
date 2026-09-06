@@ -13,9 +13,11 @@ import XCTest
 final class CodegenPerfPassesTests: XCTestCase {
   private var tempDir: URL!
   private let toggles = ["DGEN_NO_DCE", "DGEN_NO_STATIC_HOIST", "DGEN_NO_COALESCE"]
+  private var savedConfig: (backend: Backend, sampleRate: Float, maxFrameCount: Int)!
 
   override func setUpWithError() throws {
     try super.setUpWithError()
+    savedConfig = (DGenConfig.backend, DGenConfig.sampleRate, DGenConfig.maxFrameCount)
     DGenConfig.backend = .c
     DGenConfig.sampleRate = 48000
     DGenConfig.maxFrameCount = 64
@@ -27,6 +29,11 @@ final class CodegenPerfPassesTests: XCTestCase {
 
   override func tearDownWithError() throws {
     for key in toggles { unsetenv(key) }
+    // Other suites read these globals without setting them; leave no trace.
+    DGenConfig.backend = savedConfig.backend
+    DGenConfig.sampleRate = savedConfig.sampleRate
+    DGenConfig.maxFrameCount = savedConfig.maxFrameCount
+    LazyGraphContext.reset()
     if let tempDir { try? FileManager.default.removeItem(at: tempDir) }
     try super.tearDownWithError()
   }
