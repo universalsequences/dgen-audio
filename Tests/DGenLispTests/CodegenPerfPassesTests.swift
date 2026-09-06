@@ -117,7 +117,10 @@ final class CodegenPerfPassesTests: XCTestCase {
     let reference = try compile(source)
     unsetenv("DGEN_NO_DCE")
 
-    XCTAssertLessThan(optimized.nodeCount, reference.nodeCount, "DCE removed nothing")
+    // Pruning is scoped to one compile and the lazy graph is restored after it,
+    // so the evidence is in the emitted C, not the graph's node count.
+    XCTAssertEqual(optimized.nodeCount, reference.nodeCount, "graph must be restored after compile")
+    XCTAssertLessThan(optimized.source.count, reference.source.count, "DCE removed nothing")
     // Parameter cells survive DCE untouched: the host addresses them by cell id.
     XCTAssertEqual(optimized.paramCells, reference.paramCells)
     // The unused destinations' modulation sums (input channel times depth) are gone.
@@ -136,8 +139,8 @@ final class CodegenPerfPassesTests: XCTestCase {
     setenv("DGEN_NO_DCE", "1", 1)
     let reference = try compile(source)
     unsetenv("DGEN_NO_DCE")
-    XCTAssertLessThan(optimized.nodeCount, reference.nodeCount)
     XCTAssertFalse(optimized.source.contains("expf("), "dead exp survived DCE")
+    XCTAssertTrue(reference.source.contains("expf("), "reference build should still carry the dead exp")
     XCTAssertEqual(try render(optimized), try render(reference))
     XCTAssertGreaterThan(try render(optimized).map { abs($0) }.max() ?? 0, 1e-6)
   }

@@ -164,12 +164,20 @@ public struct CompilationPipeline {
     try GraphPrepPasses.validateMutableTensorUses(graph: graph)
     try rejectUnsupportedBackendOps(graph: graph, backend: backend)
     var timings = PipelineTimings()
+    var prunedNodes: [NodeID: Node] = [:]
     if options.eliminateDeadCode {
-      let removed = timings.measure("deadCodeElimination") {
+      prunedNodes = timings.measure("deadCodeElimination") {
         DeadCodeEliminationPass.run(graph: graph)
       }
-      if options.debug, !removed.isEmpty {
-        print("[dce] removed \(removed.count) unreachable nodes")
+      if options.debug, !prunedNodes.isEmpty {
+        print("[dce] pruned \(prunedNodes.count) unreachable nodes for this compile")
+      }
+    }
+    // The graph is shared with the lazy front end and may be compiled again
+    // after more nodes are added, so pruning is scoped to this compile.
+    defer {
+      for (id, node) in prunedNodes where graph.nodes[id] == nil {
+        graph.nodes[id] = node
       }
     }
 

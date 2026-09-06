@@ -33,9 +33,12 @@ enum DeadCodeEliminationPass {
     }
   }
 
-  /// Deletes unreachable pure scalar nodes in place. Returns the removed ids.
+  /// Deletes unreachable pure scalar nodes in place and returns them so the
+  /// caller can restore them once compilation is done: a lazy graph outlives a
+  /// single compile, and a value nothing reads today may be consumed by nodes
+  /// added before the next `realize()`.
   @discardableResult
-  static func run(graph: Graph) -> Set<NodeID> {
+  static func run(graph: Graph) -> [NodeID: Node] {
     var consumers: [NodeID: [NodeID]] = [:]
     var roots: [NodeID] = []
     for (id, node) in graph.nodes {
@@ -66,10 +69,11 @@ enum DeadCodeEliminationPass {
       stack.append(contentsOf: node.allDependencies)
     }
 
-    var removed = Set<NodeID>()
+    var removed: [NodeID: Node] = [:]
     for id in graph.nodes.keys where !live.contains(id) {
-      graph.nodes.removeValue(forKey: id)
-      removed.insert(id)
+      if let node = graph.nodes.removeValue(forKey: id) {
+        removed[id] = node
+      }
     }
     _ = consumers
     return removed
