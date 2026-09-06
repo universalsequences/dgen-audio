@@ -84,7 +84,7 @@ final class SynthIDTrainer {
       peakNormalized(rawTargetSamples, peak: resolvedConfig.peakNormalizeTo),
       frames: resolvedConfig.frames)
     let pitchSearchProfile: PitchSearchProfile =
-      resolvedConfig.profile == "909" ? .tr909 : .tr808
+      PitchSearchProfile.forSynthIDProfile(resolvedConfig.profile)
     let pitchPoints = PitchTrack.extract(samples: targetSamples, sampleRate: resolvedConfig.sampleRate)
     let pitchFit: PitchFit
     if resolvedConfig.profile == "subtractive-bass" {
@@ -164,7 +164,7 @@ final class SynthIDTrainer {
         ? ["attackTime", "decayTime", "releaseTime", "fDecay"]
         : (isBass
           ? ["attackTime", "decayTime", "noteOff", "releaseTime", "brightnessDecay"]
-          : ["ampDecay", "clickDecay", "noiseDecay", "ampCurve"])),
+          : ["ampDecay", "attackTime", "clickDecay", "noiseDecay", "ampCurve"])),
       lr: isSubtractive ? resolvedConfig.decayLR / 3.0 : resolvedConfig.decayLR)
     let noiseOpt = Adam(
       params: params.trainableStorage(names: isSubtractive ? [] : ["noiseAmp"]),
@@ -355,7 +355,7 @@ final class SynthIDTrainer {
         pitchFit: PitchTrack.fit(
           samples: targetSamples,
           sampleRate: resolvedConfig.sampleRate,
-          profile: resolvedConfig.profile == "909" ? .tr909 : .tr808),
+          profile: PitchSearchProfile.forSynthIDProfile(resolvedConfig.profile)),
         restartIndex: 0)
     let baseZ = spec.transform(initial[paramName])
     let eps = resolvedConfig.fdEpsilon
@@ -616,12 +616,13 @@ final class SynthIDTrainer {
       if values.noiseAmp <= 0 { values.noiseAmp = 0.02 }
       if values.clickAmp <= 0 { values.clickAmp = 0.05 }
     }
-    if config.rung == 3 && restartIndex == 4 && config.profile != "909" {
+    if config.rung == 3 && restartIndex == 4 && config.profile == "808" {
       // A dedicated, target-independent capture-floor hypothesis. PCM targets
       // can contain persistent broadband energy that the original -60/s noise
       // bound made structurally unreachable. The 909 recording's noise floor
       // is dead (measured), so this restart would be wasted there — fall
-      // through to a plain midpoint restart instead.
+      // through to a plain midpoint restart instead. The 808 low tom's floor
+      // is dead as well (808-tom profile), so it takes the same path.
       values.noiseAmp = 0.0001
       values.noiseDecay = -0.1
       values.noiseCutoff = 10_000
@@ -630,7 +631,16 @@ final class SynthIDTrainer {
     // Never initialize a param ON its trainable bound: projected Adam plus
     // compensation by other params forms a sticky local minimum there
     // (observed: fit pd = -15 exactly, recovery pinned at -15 all run).
-    values.pitchDecay = Swift.min(Swift.max(values.pitchDecay, -76), -17)
+    // Margins are relative to the profile's own pitchDecay bounds: the 808
+    // table's -80..-15 gives exactly the original -76..-17, and a profile
+    // with a different range (808-tom: -80..-5) keeps the same standoff.
+    if let pdSpec = KickParamSpecs.byName["pitchDecay"] {
+      let lo = pdSpec.min * 0.95
+      let hi = pdSpec.max * (17.0 / 15.0)
+      values.pitchDecay = Swift.min(Swift.max(values.pitchDecay, lo), hi)
+    } else {
+      values.pitchDecay = Swift.min(Swift.max(values.pitchDecay, -76), -17)
+    }
     return values.clamped()
   }
 

@@ -133,6 +133,61 @@ enum KickParamSpecs {
     .init(name: "ampCurve", unit: "1/s^2", min: -0.001, max: 0.001, reparam: .raw, tolerance: 0.2),
   ]
 
+  // TR-808 low tom bounds, derived from measurement of Assets/808-tom-low.wav
+  // (2026-09-01): 430 ms, near-pure sine sweeping 113 -> 93 Hz with
+  // pitchDecay ~ -20/s (zero-crossing fit residual 0.5 Hz), uniform amplitude
+  // decay ~ -13/s (no steepening: -13.5 / -12.8 / -12.2 over successive
+  // windows, so ampCurve stays pinned), H2 -40 dB / H3 -33 dB at onset, a
+  // high band 70 dB below the fundamental (tiny click), dead noise floor.
+  // Same 808 tanh voice; only the bounds move. Rung 3 does not peak-normalize
+  // the target (it renders at the capture's -11 dBFS), so bodyAmp/outGain
+  // open downward like the 909 table: with the kick's 0.5 x 0.4 floor the
+  // shakedown pinned both at their lower bound.
+  static let tr808Tom: [ParameterSpec] = [
+    .init(name: "fStart", unit: "Hz", min: 80, max: 220, reparam: .log, tolerance: 0.03),
+    .init(name: "fEnd", unit: "Hz", min: 60, max: 130, reparam: .log, tolerance: 0.03),
+    .init(name: "pitchDecay", unit: "1/s", min: -80, max: -5, reparam: .logNegative, tolerance: 0.10),
+    .init(name: "bodyAmp", unit: "lin", min: 0.2, max: 1.0, reparam: .raw, tolerance: 0.10),
+    .init(name: "ampDecay", unit: "1/s", min: -25, max: -3, reparam: .raw, tolerance: 0.10),
+    .init(name: "clickFreq", unit: "Hz", min: 300, max: 3000, reparam: .log, tolerance: 0.10),
+    .init(name: "clickAmp", unit: "lin", min: 0.0, max: 1.0, reparam: .raw, tolerance: 0.20),
+    .init(name: "clickDecay", unit: "1/s", min: -1600, max: -100, reparam: .logNegative, tolerance: 0.20),
+    .init(name: "noiseCutoff", unit: "Hz", min: 1000, max: 20000, reparam: .log, tolerance: 0.10),
+    .init(name: "noiseAmp", unit: "lin", min: 0.0, max: 0.3, reparam: .raw, tolerance: 0.20),
+    .init(name: "noiseDecay", unit: "1/s", min: -400, max: -0.001, reparam: .logNegative, tolerance: 0.20),
+    .init(name: "drive", unit: "lin", min: 1.0, max: 3.0, reparam: .raw, tolerance: 0.10),
+    .init(name: "outGain", unit: "lin", min: 0.1, max: 1.0, reparam: .raw, tolerance: 0.10),
+    .init(name: "bodyAsymmetry", unit: "lin", min: -0.5, max: 0.5, reparam: .raw, tolerance: 0.20),
+    .init(name: "bodyHarmonic", unit: "lin", min: -1.0, max: 1.0, reparam: .raw, tolerance: 0.20),
+    .init(name: "ampCurve", unit: "1/s^2", min: -0.001, max: 0.001, reparam: .raw, tolerance: 0.2),
+  ]
+
+  // Access Virus B BassDrum_23 bounds, derived from the lossless 32.5 kHz
+  // sample (2026-09-03): a near-sine oscillator sweeps roughly 1100 -> 48 Hz
+  // at -82/s, with a measured 20-40 ms amplitude attack and a decay that
+  // steepens to about -19/s. The source's 32.5 kHz rate fixes its output
+  // Nyquist at 16.25 kHz. Noise and extra harmonics are retained as small,
+  // zero-capable diagnostic paths rather than assumed parts of the voice.
+  static let accessVirusBKick: [ParameterSpec] = [
+    .init(name: "fStart", unit: "Hz", min: 500, max: 2200, reparam: .log, tolerance: 0.03),
+    .init(name: "fEnd", unit: "Hz", min: 35, max: 70, reparam: .log, tolerance: 0.03),
+    .init(name: "pitchDecay", unit: "1/s", min: -150, max: -25, reparam: .logNegative, tolerance: 0.10),
+    .init(name: "bodyAmp", unit: "lin", min: 0.1, max: 2.0, reparam: .log, tolerance: 0.10),
+    .init(name: "ampDecay", unit: "1/s", min: -30, max: -0.1, reparam: .logNegative, tolerance: 0.10),
+    .init(name: "attackTime", unit: "s", min: 0.005, max: 0.5, reparam: .log, tolerance: 0.15),
+    .init(name: "clickFreq", unit: "Hz", min: 300, max: 4000, reparam: .log, tolerance: 0.10),
+    .init(name: "clickAmp", unit: "lin", min: 0.0, max: 0.5, reparam: .raw, tolerance: 0.20),
+    .init(name: "clickDecay", unit: "1/s", min: -2000, max: -100, reparam: .logNegative, tolerance: 0.20),
+    .init(name: "noiseCutoff", unit: "Hz", min: 500, max: 16000, reparam: .log, tolerance: 0.10),
+    .init(name: "noiseAmp", unit: "lin", min: 0.0, max: 0.05, reparam: .raw, tolerance: 0.20),
+    .init(name: "noiseDecay", unit: "1/s", min: -800, max: -5, reparam: .logNegative, tolerance: 0.20),
+    .init(name: "drive", unit: "lin", min: 0.25, max: 4.0, reparam: .log, tolerance: 0.10),
+    .init(name: "outGain", unit: "lin", min: 0.1, max: 1.5, reparam: .log, tolerance: 0.10),
+    .init(name: "bodyAsymmetry", unit: "lin", min: -0.25, max: 0.25, reparam: .raw, tolerance: 0.20),
+    .init(name: "bodyHarmonic", unit: "lin", min: -0.5, max: 0.5, reparam: .raw, tolerance: 0.20),
+    .init(name: "ampCurve", unit: "1/s^2", min: -80.0, max: 0.0, reparam: .raw, tolerance: 0.2),
+  ]
+
   // TR-909 kick bounds, derived from measurement of Assets/909kick.wav (see
   // SPEC.md rung-3 909 profile notes): fStart 150-400 Hz, fEnd 35-60 Hz,
   // pitchDecay -80..-20 1/s, wider click/noise/drive ranges than the 808 table.
@@ -242,6 +297,8 @@ enum KickParamSpecs {
   static var all: [ParameterSpec] {
     switch activeProfile {
     case "909": return tr909
+    case "808-tom": return tr808Tom
+    case "access-virus-b-kick": return accessVirusBKick
     case "hoodie-bass": return hoodieBass
     case "subtractive-bass": return subtractiveBass
     case "monologue-bass": return monologueBass
@@ -713,6 +770,7 @@ struct KickVoiceSignals {
   var bodyAsymmetry: Signal
   var bodyHarmonic: Signal
   var ampCurve: Signal
+  var attackTime: Signal
   var harmonicCorrections: [(spec: KickParamSpecs.HarmonicCorrection, coefficient: Signal)]
 }
 
@@ -825,6 +883,9 @@ final class TrainableKickParams {
       bodyAsymmetry: naturalSignal("bodyAsymmetry"),
       bodyHarmonic: naturalSignal("bodyHarmonic"),
       ampCurve: naturalSignal("ampCurve"),
+      attackTime: storage["attackTime"] == nil
+        ? Signal.constant(frozenNaturalValues.attackTime)
+        : naturalSignal("attackTime"),
       harmonicCorrections: KickParamSpecs.tr909HarmonicCorrections.compactMap { spec in
         guard storage[spec.name] != nil else { return nil }
         return (spec, naturalSignal(spec.name))

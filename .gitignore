@@ -63,3 +63,6 @@ bending_metal.wav
 *.gate.lock*
 
 __pycache__/
+/output/
+__pycache__/
+*.pyc

@@ -37,7 +37,7 @@ def main():
                          help="defaults to the target wav's sample rate")
     parser.add_argument("--highpass-hz", type=float, default=compare.DEFAULT_HIGHPASS_HZ)
     parser.add_argument(
-        "--profile", choices=["808", "909", "hoodie-bass", "subtractive-bass", "monologue-bass"],
+        "--profile", choices=["808", "909", "808-tom", "access-virus-b-kick", "hoodie-bass", "subtractive-bass", "monologue-bass"],
         default="808",
                          help="accepted for CLI parity with refine_rung3.py; the raw"
                               " synth render does not depend on the profile's bounds")

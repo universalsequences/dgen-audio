@@ -21,6 +21,11 @@ public struct PitchFit: Codable {
   public var error: Float?
 }
 
+public enum PitchContourMethod {
+  case autocorrelation
+  case positiveZeroCrossings
+}
+
 /// Profile-dependent search ranges for pitch contour extraction/fitting.
 /// `.tr808` matches every literal that was previously hardcoded in this file
 /// exactly, so passing it explicitly (or relying on the default parameter)
@@ -28,12 +33,13 @@ public struct PitchFit: Codable {
 public struct PitchSearchProfile {
   public init(contourMinHz: Float, contourMaxHz: Float, tailMinHz: Float, tailMaxHz: Float,
               candidateMaxHz: Float, highRidgeHz: Float, fEndRange: ClosedRange<Float>,
-              pitchDecayRange: ClosedRange<Float>, fStartRange: ClosedRange<Float>) {
+              pitchDecayRange: ClosedRange<Float>, fStartRange: ClosedRange<Float>,
+              contourMethod: PitchContourMethod = .autocorrelation) {
     self.contourMinHz = contourMinHz; self.contourMaxHz = contourMaxHz
     self.tailMinHz = tailMinHz; self.tailMaxHz = tailMaxHz
     self.candidateMaxHz = candidateMaxHz; self.highRidgeHz = highRidgeHz
     self.fEndRange = fEndRange; self.pitchDecayRange = pitchDecayRange
-    self.fStartRange = fStartRange
+    self.fStartRange = fStartRange; self.contourMethod = contourMethod
   }
   public var contourMinHz: Float
   public var contourMaxHz: Float
@@ -48,6 +54,7 @@ public struct PitchSearchProfile {
   /// profile-aware cap here, the 808-derived 80...180 Hz literal silently
   /// clips the 909 fit (measured fStart ~= 247 Hz) at 180 Hz.
   public var fStartRange: ClosedRange<Float>
+  public var contourMethod: PitchContourMethod
 
   public static let tr808 = PitchSearchProfile(
     contourMinHz: 50, contourMaxHz: 300,
@@ -57,6 +64,44 @@ public struct PitchSearchProfile {
     fEndRange: 35...60,
     pitchDecayRange: -80...(-15),
     fStartRange: 80...180)
+
+  /// TR-808 low tom: a shallow 113 -> 93 Hz sweep with a slow ~-20/s decay
+  /// and no attack ridge above the body. The tail band brackets the measured
+  /// end pitch so the fEnd estimate cannot latch onto the kick's 35-60 Hz
+  /// band, where a tom has no energy at all.
+  public static let tr808Tom = PitchSearchProfile(
+    contourMinHz: 50, contourMaxHz: 300,
+    tailMinHz: 60, tailMaxHz: 140,
+    candidateMaxHz: 300,
+    highRidgeHz: 250,
+    fEndRange: 60...130,
+    pitchDecayRange: -80...(-5),
+    fStartRange: 80...220)
+
+  /// Access Virus B BassDrum_23: an unusually broad, fast 1100 -> 48 Hz
+  /// oscillator sweep. The high-frequency onset is measured from short-window
+  /// spectral peaks; the tail remains anchored by long-window autocorrelation.
+  public static let accessVirusBKick = PitchSearchProfile(
+    contourMinHz: 40, contourMaxHz: 1600,
+    tailMinHz: 35, tailMaxHz: 70,
+    candidateMaxHz: 1600,
+    highRidgeHz: 1500,
+    fEndRange: 35...70,
+    pitchDecayRange: -150...(-25),
+    fStartRange: 500...2200,
+    contourMethod: .positiveZeroCrossings)
+
+  /// SynthID profile name -> pitch search profile. Every non-kick profile
+  /// falls back to the 808 table, exactly as the previous `909 ? : 808`
+  /// ternary did.
+  public static func forSynthIDProfile(_ name: String) -> PitchSearchProfile {
+    switch name {
+    case "909": return .tr909
+    case "808-tom": return .tr808Tom
+    case "access-virus-b-kick": return .accessVirusBKick
+    default: return .tr808
+    }
+  }
 
   public static let tr909 = PitchSearchProfile(
     contourMinHz: 50, contourMaxHz: 450,
@@ -141,6 +186,36 @@ public enum PitchTrack {
       start += hop
     }
     return points
+  }
+
+  /// Instantaneous contour for clean, monophonic sweeps whose frequency moves
+  /// too far within an autocorrelation window. Linear interpolation of each
+  /// positive-going crossing avoids integer-period quantization; points are
+  /// timestamped at interval centers because each period measures an average.
+  public static func positiveZeroCrossingContour(
+    samples: [Float], sampleRate: Float, minHz: Float, maxHz: Float
+  ) -> [PitchPoint] {
+    guard samples.count >= 3 else { return [] }
+    var crossings: [Float] = []
+    crossings.reserveCapacity(samples.count / 32)
+    for index in 0..<(samples.count - 1) where samples[index] < 0 && samples[index + 1] >= 0 {
+      let a = samples[index]
+      let b = samples[index + 1]
+      let fraction = abs(b - a) > 1e-12 ? -a / (b - a) : 0
+      crossings.append(Float(index) + fraction)
+    }
+    guard crossings.count >= 2 else { return [] }
+    return zip(crossings, crossings.dropFirst()).compactMap { pair in
+      let (first, second) = pair
+      let period = second - first
+      guard period > 0 else { return nil }
+      let hz = sampleRate / period
+      guard hz >= minHz, hz <= maxHz else { return nil }
+      return PitchPoint(
+        time: (first + second) * 0.5 / sampleRate,
+        hz: hz,
+        confidence: 1.0)
+    }
   }
 
   /// Estimate fEnd from the tail of the signal, where the body has settled to a
@@ -248,13 +323,23 @@ public enum PitchTrack {
     // Contour extraction favors time resolution for the fast early sweep
     // (fStart/pitchDecay); 2048-sample windows only support >= ~50 Hz, which is
     // fine because fEnd comes from the long-window tail anchor below.
-    let points = extract(
-      samples: samples,
-      sampleRate: sampleRate,
-      windowSize: 2048,
-      hop: 256,
-      minHz: profile.contourMinHz,
-      maxHz: profile.contourMaxHz)
+    let points: [PitchPoint]
+    switch profile.contourMethod {
+    case .autocorrelation:
+      points = extract(
+        samples: samples,
+        sampleRate: sampleRate,
+        windowSize: 2048,
+        hop: 256,
+        minHz: profile.contourMinHz,
+        maxHz: profile.contourMaxHz)
+    case .positiveZeroCrossings:
+      points = positiveZeroCrossingContour(
+        samples: samples,
+        sampleRate: sampleRate,
+        minHz: profile.contourMinHz,
+        maxHz: profile.contourMaxHz)
+    }
     let tail = tailFEnd(
       samples: samples,
       sampleRate: sampleRate,

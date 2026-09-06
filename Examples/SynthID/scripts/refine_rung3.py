@@ -38,6 +38,49 @@ BOUNDS_808 = {
     "ampCurve": (-0.001, 0.001, "linear"),
 }
 
+# TR-808 low tom bounds, mirroring Params.swift's KickParamSpecs.tr808Tom
+# exactly (noiseAmp floor is 1e-6/log as in BOUNDS_808, which the Swift table
+# expresses as 0..0.3 raw).
+BOUNDS_808_TOM = {
+    "fStart": (80.0, 220.0, "log"),
+    "fEnd": (60.0, 130.0, "log"),
+    "pitchDecay": (-80.0, -5.0, "logneg"),
+    "bodyAmp": (0.2, 1.0, "linear"),
+    "ampDecay": (-25.0, -3.0, "linear"),
+    "clickFreq": (300.0, 3000.0, "log"),
+    "clickAmp": (0.0, 1.0, "linear"),
+    "clickDecay": (-1600.0, -100.0, "logneg"),
+    "noiseCutoff": (1000.0, 20000.0, "log"),
+    "noiseAmp": (1e-6, 0.3, "log"),
+    "noiseDecay": (-400.0, -0.001, "logneg"),
+    "drive": (1.0, 3.0, "linear"),
+    "outGain": (0.1, 1.0, "linear"),
+    "bodyAsymmetry": (-0.5, 0.5, "linear"),
+    "bodyHarmonic": (-1.0, 1.0, "linear"),
+    "ampCurve": (-0.001, 0.001, "linear"),
+}
+
+# Access Virus B BassDrum_23 bounds, mirroring Params.swift exactly.
+BOUNDS_ACCESS_VIRUS_B_KICK = {
+    "fStart": (500.0, 2200.0, "log"),
+    "fEnd": (35.0, 70.0, "log"),
+    "pitchDecay": (-150.0, -25.0, "logneg"),
+    "bodyAmp": (0.1, 2.0, "log"),
+    "ampDecay": (-30.0, -0.1, "logneg"),
+    "attackTime": (0.005, 0.5, "log"),
+    "clickFreq": (300.0, 4000.0, "log"),
+    "clickAmp": (0.0, 0.5, "linear"),
+    "clickDecay": (-2000.0, -100.0, "logneg"),
+    "noiseCutoff": (500.0, 16000.0, "log"),
+    "noiseAmp": (0.0, 0.05, "linear"),
+    "noiseDecay": (-800.0, -5.0, "logneg"),
+    "drive": (0.25, 4.0, "log"),
+    "outGain": (0.1, 1.5, "log"),
+    "bodyAsymmetry": (-0.25, 0.25, "linear"),
+    "bodyHarmonic": (-0.5, 0.5, "linear"),
+    "ampCurve": (-80.0, 0.0, "linear"),
+}
+
 # TR-909 kick bounds, mirroring Params.swift's KickParamSpecs.tr909 exactly.
 BOUNDS_909 = {
     "fStart": (150.0, 400.0, "log"),
@@ -184,12 +227,13 @@ def coordinate_refine(objective, start, passes=6, steps=15, order_override=None,
     order = order_override or [
         "bodyAsymmetry", "bodyHarmonic", "clickFreq", "clickDecay", "clickAmp",
         "noiseCutoff", "noiseDecay", "noiseAmp",
-        "fStart", "pitchDecay", "fEnd", "ampDecay", "ampCurve",
+        "fStart", "pitchDecay", "fEnd", "attackTime", "ampDecay", "ampCurve",
         "bodyAmp", "drive", "outGain",
     ]
     if order_override is None and any(
             name in BOUNDS for name, _, _, _ in reference.TR909_HARMONIC_CORRECTIONS):
         order.extend(name for name, _, _, _ in reference.TR909_HARMONIC_CORRECTIONS)
+    order = [name for name in order if name in BOUNDS]
 
     for pass_index in range(passes):
         contraction = contraction_rate ** pass_index
@@ -231,13 +275,15 @@ def main():
     parser.add_argument("--highpass-hz", type=float, default=compare.DEFAULT_HIGHPASS_HZ)
     parser.add_argument(
         "--profile",
-        choices=["808", "909", "hoodie-bass", "subtractive-bass", "monologue-bass"],
+        choices=["808", "909", "808-tom", "access-virus-b-kick", "hoodie-bass", "subtractive-bass", "monologue-bass"],
         default="808")
     args = parser.parse_args()
 
     BOUNDS = {
         "808": BOUNDS_808,
         "909": BOUNDS_909,
+        "808-tom": BOUNDS_808_TOM,
+        "access-virus-b-kick": BOUNDS_ACCESS_VIRUS_B_KICK,
         "hoodie-bass": BOUNDS_HOODIE_BASS,
         "subtractive-bass": BOUNDS_SUBTRACTIVE_BASS,
         "monologue-bass": BOUNDS_MONOLOGUE_BASS,

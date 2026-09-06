@@ -126,10 +126,10 @@ struct SynthIDConfig: Codable {
       }
     }
     if let value = options["profile"] {
-      guard ["808", "909", "hoodie-bass", "subtractive-bass", "monologue-bass"].contains(value)
+      guard ["808", "909", "808-tom", "access-virus-b-kick", "hoodie-bass", "subtractive-bass", "monologue-bass"].contains(value)
       else {
         throw SynthIDError.message(
-          "unknown --profile \(value); expected 808, 909, hoodie-bass, subtractive-bass, or monologue-bass")
+          "unknown --profile \(value); expected 808, 909, 808-tom, access-virus-b-kick, hoodie-bass, subtractive-bass, or monologue-bass")
       }
       profile = value
       if value == "hoodie-bass" {

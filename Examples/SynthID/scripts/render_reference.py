@@ -87,6 +87,10 @@ def render(
     )
     amp_curve = np.float32(params.get("ampCurve", 0.0))
     body_env = np.exp(np.float32(params["ampDecay"]) * t + amp_curve * (t * t))
+    if profile == "access-virus-b-kick":
+        attack_time = np.float32(params["attackTime"])
+        body_env *= ((np.float32(1.0) - np.exp(-t / attack_time))
+                     / (np.float32(1.0) - np.exp(np.float32(-0.05) / attack_time)))
     body = (
         np.sin(two_pi * sweep_phase)
         * body_env
@@ -465,7 +469,7 @@ def main():
     parser.add_argument("--sample-rate", type=int, default=44100)
     parser.add_argument("--no-noise-filter", action="store_true")
     parser.add_argument(
-        "--profile", choices=["808", "909", "hoodie-bass", "subtractive-bass"],
+        "--profile", choices=["808", "909", "808-tom", "access-virus-b-kick", "hoodie-bass", "subtractive-bass"],
         default=None)
     parser.add_argument("--oscillator-only", action="store_true")
     args = parser.parse_args()

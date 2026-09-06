@@ -40,7 +40,14 @@ enum KickVoice {
     // 150-450ms); the zero-default ampCurve term adds that log-quadratic
     // curvature without disturbing the exponential 808 envelope (ampCurve
     // pinned near 0 there).
-    let bodyEnv = DGenLazy.exp(params.ampDecay * t + params.ampCurve * (t * t))
+    let decayEnvelope = DGenLazy.exp(params.ampDecay * t + params.ampCurve * (t * t))
+    // BassDrum_23 has a real 20-40 ms VCA rise before its decay. Keep this
+    // profile-specific so every established kick profile remains numerically
+    // identical; attackTime is an ordinary scalar recovered with the voice.
+    let bodyEnv = config.profile == "access-virus-b-kick"
+      ? decayEnvelope * (1.0 - DGenLazy.exp(-t / params.attackTime))
+        / (1.0 - DGenLazy.exp(-0.05 / params.attackTime))
+      : decayEnvelope
     let body =
       DGenLazy.sin(sweepPhase * (2.0 * Float.pi)) * bodyEnv
       * params.bodyAmp
