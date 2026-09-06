@@ -374,7 +374,11 @@ private func determineVectorPlan(
   let hasSIMDBlockers = hasCViewNode || containsSIMDBlockers(bodyUops, backend: backend)
 
   let canUseSIMD: Bool
-  if backend == .c, case .hopBased = block.temporality {
+  if backend == .c, block.temporality == .static_ {
+    // A static block runs once per process call with no frame loop; four-lane
+    // math there is pure overhead and its outputs are read from lane zero.
+    canUseSIMD = false
+  } else if backend == .c, case .hopBased = block.temporality {
     // Hop-rate C blocks often contain transform/index-heavy tensor reads
     // under an outer hop gate. Rendering those as SIMD is currently unsafe:
     // scalar loop-index math inside the body can be rewritten as lane-wise

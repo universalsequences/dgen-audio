@@ -13,6 +13,10 @@ public class CRenderer: Renderer {
   public var loadedGlobal: [Int: GlobalLoadState] = [:]
   private var loadedGlobalScopeStack: [[Int: GlobalLoadState]] = []
   private var staticGlobalVars: Set<VarID> = []
+  /// Step of the innermost open frame loop (1 = scalar, 4 = SIMD); 1 outside
+  /// any loop. Scalar loads of a global only need a SIMD alias when a SIMD op
+  /// in the same loop can reference it.
+  private var currentLoopStep: Int = 1
   private var frameIndexOverride: String? = nil
   private var currentThreadCountScale: Int? = nil
 
@@ -1043,6 +1047,7 @@ public class CRenderer: Renderer {
 
     case .beginLoop(let iters, let step):
       loopVarBindingStack.append(nil)
+      currentLoopStep = step
       return "for (int i = 0; i < \(g(iters)); i += \(step)) {"
     case .beginReverseLoop(let iters):
       loopVarBindingStack.append(nil)
@@ -1062,6 +1067,7 @@ public class CRenderer: Renderer {
       }
       return "for (int t\(varId) = 0; t\(varId) < \(countStr); t\(varId)++) {"
     case .endLoop:
+      currentLoopStep = 1
       if let boundVarId = loopVarBindingStack.popLast() ?? nil {
         activeLoopVarNames.removeValue(forKey: boundVarId)
       }
@@ -1150,7 +1156,9 @@ public class CRenderer: Renderer {
       } else {
         var lines: [String] = []
 
-        if !state.simdLoaded {
+        // A SIMD alias is only reachable from SIMD ops in the same loop; in a
+        // scalar loop (or outside any loop) it would be a dead 4-lane load.
+        if !state.simdLoaded && currentLoopStep > 1 {
           if staticGlobalVars.contains(id) {
             lines.append("float32x4_t simd\(id) = vdupq_n_f32(t\(id)[0]); /* extra */")
           } else {
@@ -1160,10 +1168,16 @@ public class CRenderer: Renderer {
         }
 
         if !state.scalarLoaded {
-          if staticGlobalVars.contains(id) {
-            lines.append(emitAssign(uop, "t\(id)[0]", ctx))
-          } else {
-            lines.append(emitAssign(uop, "t\(id)[\(idx)]", ctx))
+          // Scalar references to a global render as `t<id>[i]` (or `t<id>[0]`
+          // for static globals) directly, so the "load" is a self-copy. Keep
+          // the emitAssign call for its type bookkeeping but drop the text.
+          let source = staticGlobalVars.contains(id) ? "t\(id)[0]" : "t\(id)[\(idx)]"
+          let assign = emitAssign(uop, source, ctx)
+          let isSelfCopy = assign == "\(source) = \(source);"
+          let isStaticBroadcast = staticGlobalVars.contains(id) && assign.hasSuffix("= \(source);")
+            && !assign.hasPrefix("int ")
+          if !isSelfCopy && !isStaticBroadcast {
+            lines.append(assign)
           }
           state.scalarLoaded = true
         }

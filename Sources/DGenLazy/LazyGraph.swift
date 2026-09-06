@@ -1,3 +1,4 @@
+import Foundation
 // LazyGraph - Implicit graph management for lazy execution
 //
 // This is the internal graph that accumulates operations. Users don't interact
@@ -158,6 +159,7 @@ public class LazyGraph {
       options: .init(
         frameCount: frameCount,
         debug: DGenConfig.debug,
+        forceScalar: ProcessInfo.processInfo.environment["DGEN_FORCE_SCALAR"] == "1",
         voiceCount: voiceCount,
         enableBufferReuse: DGenConfig.enableBufferReuse,
         gemmStrategy: DGenConfig.gemmStrategy)

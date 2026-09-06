@@ -138,8 +138,13 @@ final class WavetableTensorTests: XCTestCase {
         let excerptEnd = source.index(cutoffReadRange.upperBound, offsetBy: 240, limitedBy: source.endIndex) ?? source.endIndex
         let excerpt = source[excerptStart..<excerptEnd]
 
+        // A span-1 param is read either as a scalar broadcast inside a SIMD loop
+        // or, when the read is hoisted into the static (frame-invariant) block,
+        // as a plain scalar load. Both are correct; a four-lane contiguous load
+        // of the cell is the bug this test guards against.
         XCTAssertTrue(
-            source.contains("vdupq_n_f32(\(cutoffRead) +"),
+            source.contains("vdupq_n_f32(\(cutoffRead) +")
+                || source.contains("= \(cutoffRead) + (int)0.0];"),
             "span-1 params used in SIMD must be scalar-loaded and broadcast; cutoffRead=\(cutoffRead), excerpt=\(excerpt)")
         XCTAssertFalse(
             source.contains("vld1q_f32(&\(cutoffRead))"),

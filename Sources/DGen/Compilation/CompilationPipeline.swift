@@ -83,6 +83,9 @@ public struct CompilationPipeline {
     public let voiceCellId: Int?
     public let enableBufferReuse: Bool
     public let gemmStrategy: GEMMStrategy
+    /// Drop pure scalar nodes that no output or side effect can reach.
+    /// `DGEN_NO_DCE=1` disables it for A/B measurement.
+    public let eliminateDeadCode: Bool
 
     public init(
       frameCount: Int = 128,
@@ -92,7 +95,8 @@ public struct CompilationPipeline {
       voiceCount: Int = 1,
       voiceCellId: Int? = nil,
       enableBufferReuse: Bool = false,
-      gemmStrategy: GEMMStrategy = .registerTiled
+      gemmStrategy: GEMMStrategy = .registerTiled,
+      eliminateDeadCode: Bool = ProcessInfo.processInfo.environment["DGEN_NO_DCE"] != "1"
     ) {
       self.frameCount = frameCount
       self.debug = debug
@@ -102,6 +106,7 @@ public struct CompilationPipeline {
       self.voiceCellId = voiceCellId
       self.enableBufferReuse = enableBufferReuse
       self.gemmStrategy = gemmStrategy
+      self.eliminateDeadCode = eliminateDeadCode
     }
   }
 
@@ -159,6 +164,14 @@ public struct CompilationPipeline {
     try GraphPrepPasses.validateMutableTensorUses(graph: graph)
     try rejectUnsupportedBackendOps(graph: graph, backend: backend)
     var timings = PipelineTimings()
+    if options.eliminateDeadCode {
+      let removed = timings.measure("deadCodeElimination") {
+        DeadCodeEliminationPass.run(graph: graph)
+      }
+      if options.debug, !removed.isEmpty {
+        print("[dce] removed \(removed.count) unreachable nodes")
+      }
+    }
 
     let prep = try runGraphPreparationPasses(
       graph: graph, backend: backend, options: options, timings: &timings)
@@ -181,10 +194,42 @@ public struct CompilationPipeline {
     // peeled parallel blocks (undeclared simd temps), so C keeps the pre-peel
     // layout.
     let peelHopNodes = backend == .metal ? nodeTemporality.hopBasedNodes : [:]
+    // Frame-invariant scalar math is emitted once per process call in a leading
+    // static block instead of being recomputed inside a frame loop.
+    let hoisted: [NodeID] =
+      (backend == .c && StaticHoistPass.isEnabled)
+      ? timings.measure("staticHoist") {
+        StaticHoistPass.hoistableNodes(
+          graph: graph, sortedNodes: prep.sortedNodes,
+          frameBasedNodes: nodeTemporality.frameBasedNodes,
+          hopBasedNodes: nodeTemporality.hopBasedNodes,
+          scalarNodeSet: finalScalarSet)
+      } : []
+    let hoistedSet = Set(hoisted)
+    let loopNodes = hoistedSet.isEmpty
+      ? prep.sortedNodes : prep.sortedNodes.filter { !hoistedSet.contains($0) }
     var finalBlocks = buildInitialBlocks(
-      graph: graph, sortedNodes: prep.sortedNodes, scalarNodeSet: finalScalarSet, context: context,
+      graph: graph, sortedNodes: loopNodes, scalarNodeSet: finalScalarSet, context: context,
       hopBasedNodes: peelHopNodes,
       timings: &timings)
+    if backend == .c && ScalarBlockCoalescingPass.isEnabled {
+      let before = finalBlocks.count
+      finalBlocks = timings.measure("coalesceScalarBlocks") {
+        ScalarBlockCoalescingPass.run(
+          blocks: finalBlocks, graph: graph, hopBasedNodes: nodeTemporality.hopBasedNodes)
+      }
+      if options.debug, finalBlocks.count != before {
+        print("[coalesce] \(before) blocks -> \(finalBlocks.count)")
+      }
+    }
+    if !hoisted.isEmpty {
+      var staticBlock = Block(frameOrder: .parallel)
+      staticBlock.nodes = hoisted
+      finalBlocks.insert(staticBlock, at: 0)
+      if options.debug {
+        print("[static-hoist] hoisted \(hoisted.count) frame-invariant nodes")
+      }
+    }
 
     if backend == .metal {
       promoteFrameIndependentSumBlocks(&finalBlocks, graph: graph)

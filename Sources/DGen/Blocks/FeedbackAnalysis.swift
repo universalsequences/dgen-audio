@@ -613,12 +613,33 @@ public func topologicalSort(
     groupIndegree[groupId] = depGroups.count
   }
 
-  // Simple topological sort on groups (Kahn's algorithm)
+  // Simple topological sort on groups (Kahn's algorithm).
+  //
+  // Among ready groups, prefer one whose frame order matches the group just
+  // emitted: block formation splits the schedule at every scalar/parallel flip
+  // and each split costs a scratch-buffer round trip per crossing value, so a
+  // schedule that keeps like with like renders as fewer, larger loops. The
+  // tie-break within a kind stays smallest-id-first for determinism.
+  // Measured neutral on a large synth voice once small blocks are coalesced,
+  // so it is opt-in: `DGEN_AFFINE_SORT=1`.
+  let affineSort = ProcessInfo.processInfo.environment["DGEN_AFFINE_SORT"] == "1"
+  func groupIsScalar(_ groupId: Int) -> Bool {
+    guard let members = groupToNodes[groupId] else { return false }
+    return members.contains { finalScalarSet.contains($0) }
+  }
   var queue = groupIndegree.filter { $0.value == 0 }.map { $0.key }.sorted()
   var sortedGroups: [Int] = []
+  var lastWasScalar: Bool? = nil
 
-  while let groupId = queue.first {
-    queue.removeFirst()
+  while !queue.isEmpty {
+    var pick = 0
+    if affineSort, let last = lastWasScalar,
+      let match = queue.firstIndex(where: { groupIsScalar($0) == last })
+    {
+      pick = match
+    }
+    let groupId = queue.remove(at: pick)
+    lastWasScalar = groupIsScalar(groupId)
     sortedGroups.append(groupId)
 
     // Update consumers
