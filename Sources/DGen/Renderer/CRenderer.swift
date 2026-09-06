@@ -757,6 +757,9 @@ public class CRenderer: Renderer {
       }
 
     case .memoryWrite(let base, let offset, let value):
+      // A memoryWrite expression returns the stored sample. Preserve its UOp
+      // result as well as the side effect (poke may itself feed an output).
+      let result = emitAssign(uop, g(value), ctx) + "\n"
       if uop.isSimd {
         let valueExpr = g(value)
         // Check offset type to determine how to handle it
@@ -774,11 +777,11 @@ public class CRenderer: Renderer {
         case .int_, .float_:
           // Offset is scalar (int or float) - use direct SIMD store
           let scalarOffsetExpr = emitScalarLazy(offset, ctx: ctx)
-          return "vst1q_f32(&memory[\(base) + (int)\(scalarOffsetExpr)], \(valueExpr));"
+          return result + "vst1q_f32(&memory[\(base) + (int)\(scalarOffsetExpr)], \(valueExpr));"
         case .float32x4:
           // Offset is a SIMD vector - scatter 4 values to different locations
           let offsetExpr = g(offset)
-          return """
+          return result + """
             memory[\(base) + (int)vgetq_lane_f32(\(offsetExpr), 0)] = vgetq_lane_f32(\(valueExpr), 0);
             memory[\(base) + (int)vgetq_lane_f32(\(offsetExpr), 1)] = vgetq_lane_f32(\(valueExpr), 1);
             memory[\(base) + (int)vgetq_lane_f32(\(offsetExpr), 2)] = vgetq_lane_f32(\(valueExpr), 2);
@@ -787,7 +790,7 @@ public class CRenderer: Renderer {
         }
       } else {
         let cast = isIntTypedOffset(offset) ? "" : "(int)"
-        return "memory[\(base) + \(cast)\(g(offset))] = \(g(value));"
+        return result + "memory[\(base) + \(cast)\(g(offset))] = \(g(value));"
       }
     case .memoryAccumulate(let base, let offset, let value):
       // C kernels execute schedule items serially, so a plain add is sufficient.

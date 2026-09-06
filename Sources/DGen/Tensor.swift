@@ -1330,9 +1330,23 @@ extension Graph {
     guard let tensorId = nodeToTensor[tensor] else {
       throw DGenError.missingTensorID
     }
+    guard case .tensorRef = nodes[tensor]?.op else {
+      throw DGenError.tensorError(op: "poke", reason: "destination must be a stored tensor, not a computed tensor or view")
+    }
     guard let tensor = tensors[tensorId] else {
       throw DGenError.missingTensorID
     }
+
+    guard (1...2).contains(tensor.shape.count), tensor.shape.allSatisfy({ $0 > 0 }) else {
+      throw DGenError.tensorError(op: "poke", reason: "destination must have shape [samples] or [samples channels] with positive dimensions")
+    }
+    for input in [index, channel, value] {
+      guard nodes[input]?.shape == .scalar else {
+        throw DGenError.tensorError(op: "poke", reason: "index, channel and value must be scalar signals")
+      }
+    }
+    mutableTensorCells.insert(tensor.cellId)
+    persistentCells.insert(tensor.cellId)
 
     let zero = n(.constant(0.0))
     let channelSizeFloat = n(.constant(Float(tensor.shape[0])))
@@ -1354,7 +1368,7 @@ extension Graph {
       .floor,
       n(
         .max, zero,
-        n(.min, channel, n(.constant(Float(tensor.shape[1] - 1))))))
+        n(.min, channel, n(.constant(Float((tensor.shape.count == 1 ? 1 : tensor.shape[1]) - 1))))))
 
     let channelOffset = n(.mul, channelSizeFloat, clampedChannel)
 

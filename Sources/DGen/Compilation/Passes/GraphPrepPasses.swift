@@ -4,6 +4,23 @@ import Foundation
 enum GraphPrepPasses {}
 
 extension GraphPrepPasses {
+  /// Mutable sample buffers are scalar-addressed storage. Whole-tensor math
+  /// and views currently model immutable/frame tensors, not memory snapshots;
+  /// reject that mixture rather than silently hoisting a stale copy.
+  static func validateMutableTensorUses(graph: Graph) throws {
+    guard !graph.mutableTensorCells.isEmpty else { return }
+    for node in graph.nodes.values {
+      for input in node.inputs {
+        guard let tensorId = graph.nodeToTensor[input], let tensor = graph.tensors[tensorId],
+          graph.mutableTensorCells.contains(tensor.cellId) else { continue }
+        guard case .peek = node.op else {
+          throw DGenError.tensorError(
+            op: "poke", reason: "mutable buffers support scalar peek/sample reads only; tensor math and views require an explicit snapshot")
+        }
+      }
+    }
+  }
+
   /// Propagates scalar requirements through `seq` inputs while preserving SIMD-safe atomics.
   static func propagateSeqScalarInputs(
     graph: Graph, initialScalarSet: Set<NodeID>

@@ -532,6 +532,46 @@ binding for the whole-row `sampleRow` read — it is a Swift/training-path API.
 **Naming rule:** nouns are tensor-driven (`tensor`, `tensor-param`, `@shape`);
 verbs follow Max/MSP gen (`peek`, `poke`, `sample`).
 
+### Mutable Sample Buffers and Sequencing
+
+```lisp
+(poke buffer index value)          ; channel 0
+(poke buffer index channel value)  ; write one sample; return value
+(seq first second ...)             ; order memory effects; return last scalar
+```
+
+`poke` writes to a stored `tensor`/`tensor-param` of shape `[samples]` or
+`[samples channels]`. Its index wraps within the sample dimension and is
+floored after wrapping; its channel is clamped and floored. It does not
+interpolate writes. Index, channel, and value are scalar signals. Reads with
+`peek` (or normalized-phase `sample`) retain their usual interpolation.
+
+```lisp
+(def recording (tensor @shape [48000 2]))
+(make-history cursor)
+(def position (read-history cursor))
+(write-history cursor (wrap (+ position 1) 0 48000))
+(def recorded
+  (seq (poke recording position 0 (in 1))
+       (poke recording position 1 (in 2))
+       (peek recording (- position 2400) 0)))
+(out recorded 1)
+```
+
+These accesses execute per sample, with persistent memory across host blocks.
+Use `seq` to specify read/write order; textual `def` order alone is not a
+memory-ordering contract. A reused binding is a shared graph value, not a new
+read: `(def old (peek b 0))` followed by
+`(seq old (poke b 0 (+ old 1)) old)` returns the pre-write snapshot. Write a
+fresh `(peek b 0)` expression for the post-write value.
+
+`seq` requires at least two scalar operands. Nested sequences and variable
+aliases of the same buffer are supported. Writes to computed tensors or views
+are rejected. Whole-tensor math/views on a poked buffer are also rejected:
+those operations do not yet define a mutable-memory snapshot. Read individual
+samples instead. This is a forward-DSP buffer API; no gradient through mutable
+buffer contents is promised.
+
 ### Tensor Shape Operations
 
 ```lisp

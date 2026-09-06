@@ -156,6 +156,7 @@ public struct CompilationPipeline {
     name: String = "kernel"
   ) throws -> CompilationResult {
     validateFrameCount(options, graph: graph)
+    try GraphPrepPasses.validateMutableTensorUses(graph: graph)
     try rejectUnsupportedBackendOps(graph: graph, backend: backend)
     var timings = PipelineTimings()
 

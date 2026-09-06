@@ -1416,13 +1416,15 @@ public class MetalRenderer: Renderer, UOpEmitter {
       let cast = intCastPrefix(for: offset)
       return emitAssign(uop, "memory[\(base) + \(cast)\(g(offset))]", ctx)
     case .memoryWrite(let base, let offset, let value):
+      // Stores are value-producing UOps: poke returns the sample it writes.
+      let result = emitAssign(uop, g(value), ctx) + "\n"
       if activeScalarMemoryCells.contains(base), case .constant(_, let scalar) = offset,
         scalar == 0
       {
-        return "m\(base) = \(g(value));"
+        return result + "m\(base) = \(g(value));"
       }
       let cast = intCastPrefix(for: offset)
-      return "memory[\(base) + \(cast)\(g(offset))] = \(g(value));"
+      return result + "memory[\(base) + \(cast)\(g(offset))] = \(g(value));"
     case .memoryAccumulate(let base, let offset, let value):
       // Atomic add to memory cell - safe for concurrent accumulation from SIMD threads
       let cast = intCastPrefix(for: offset)

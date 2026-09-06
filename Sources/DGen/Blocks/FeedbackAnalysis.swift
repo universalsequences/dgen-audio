@@ -247,6 +247,41 @@ public func findFeedbackLoops(_ g: Graph) -> [[NodeID]] {
     }
   }
 
+  // Poked tensors are persistent state even without a syntactic feedback
+  // cycle: write(input); read(buffer) must interleave once per frame, not run
+  // all writes for the block before all reads. Group every access to a cell,
+  // then close over paths between accesses and overlapping history clusters.
+  for cell in g.mutableTensorCells.sorted() {
+    let accesses = Set(g.nodes.values.compactMap { node -> NodeID? in
+      if case .memoryWrite(let c) = node.op, c == cell { return node.id }
+      return g.mutableTensorReadCell(node) == cell ? node.id : nil
+    })
+    if !accesses.isEmpty { clusters.append(accesses) }
+  }
+  if !g.mutableTensorCells.isEmpty {
+    var changed = true
+    while changed {
+      changed = false
+      for i in clusters.indices {
+        let paths = reachForward(from: clusters[i]).intersection(reachBackward(from: clusters[i]))
+        if !paths.isSubset(of: clusters[i]) {
+          clusters[i].formUnion(paths)
+          changed = true
+        }
+      }
+      var merged: [Set<NodeID>] = []
+      for cluster in clusters {
+        if let i = merged.firstIndex(where: { !$0.isDisjoint(with: cluster) }) {
+          merged[i].formUnion(cluster)
+          changed = true
+        } else {
+          merged.append(cluster)
+        }
+      }
+      clusters = merged
+    }
+  }
+
   // Convert sets to arrays for compatibility
   return clusters.map { Array($0).sorted() }
 }
@@ -328,6 +363,7 @@ public func findSequentialNodes(_ g: Graph, feedbackClusters: [[NodeID]], backen
 
   // First, mark inherently scalar operations (stateful ops with frame-to-frame dependencies)
   g.nodes.values.forEach {
+    if g.isMutableTensorAccess($0) { scalar.insert($0.id) }
     switch $0.op {
     case .accum(_):
       scalar.insert($0.id)  // Accum operations need to be scalar (stateful)

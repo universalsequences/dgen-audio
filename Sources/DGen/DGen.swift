@@ -24,6 +24,22 @@ open class Graph {
     public var nodeToTensor: [NodeID: TensorID] = [:]
     public var cellToTensor: [CellID: TensorID] = [:]  // Maps cell IDs to their associated tensor
 
+    /// Stored tensors written by poke. Their accesses are per-frame state, not
+    /// immutable table lookups or frame-parallel scratch-memory operations.
+    public var mutableTensorCells: Set<CellID> = []
+
+    public func mutableTensorReadCell(_ node: Node) -> CellID? {
+        guard case .peek = node.op, let source = node.inputs.first,
+              let tensorId = nodeToTensor[source], let tensor = tensors[tensorId],
+              mutableTensorCells.contains(tensor.cellId) else { return nil }
+        return tensor.cellId
+    }
+
+    public func isMutableTensorAccess(_ node: Node) -> Bool {
+        if case .memoryWrite(let cell) = node.op { return mutableTensorCells.contains(cell) }
+        return mutableTensorReadCell(node) != nil
+    }
+
     /// Track allocation sizes for memory cells (especially large buffers like spectral scratch)
     public var cellAllocationSizes: [CellID: Int] = [:]
 
@@ -169,34 +185,37 @@ open class Graph {
             nodes[id]?.shape = inferredShape
         }
 
-        // Handle seq operator: find root dependencies of B and make them depend on A
+        // Sequence graphs, not just their root values. Shared dependencies are
+        // already evaluated by the earlier operand and must not acquire a back
+        // edge (e.g. seq(read, poke(buffer, ..., read + 1))).
         if case .seq = op, ins.count >= 2 {
-            let a = ins[0]  // First input (e.g., writeOp)
-            let b = ins[1]  // Second input (e.g., interpolated)
-
-            // For seq(a, b), find all nodes in B's dependency tree that should wait for A
-            // We traverse B's dependencies and find memory operations that should depend on A
-            var visited = Set<NodeID>()
-            var queue = [b]
-
-            while !queue.isEmpty {
-                let currentId = queue.removeFirst()
-                if visited.contains(currentId) { continue }
-                visited.insert(currentId)
-
-                guard let node = nodes[currentId] else { continue }
-
-                // Check if this node is a memory operation that should depend on A
-                switch node.op {
-                case .memoryRead(_), .historyRead(_):
-                    // Memory reads should depend on the write
-                    if var currentNode = nodes[currentId] {
-                        currentNode.temporalDependencies.append(a)
-                        nodes[currentId] = currentNode
+            var completed = Set<NodeID>()
+            for i in 0..<(ins.count - 1) {
+                let a = ins[i]
+                var pending = [a]
+                while let current = pending.popLast() {
+                    guard completed.insert(current).inserted, let node = nodes[current] else { continue }
+                    pending.append(contentsOf: node.allDependencies)
+                }
+                var visited = completed
+                pending = [ins[i + 1]]
+                while let current = pending.popLast() {
+                    guard visited.insert(current).inserted, let node = nodes[current] else { continue }
+                    pending.append(contentsOf: node.allDependencies)
+                    let touchesMemory: Bool
+                    switch node.op {
+                    case .memoryRead, .memoryWrite, .memoryAccumulate, .memoryCellSum, .peek:
+                        touchesMemory = true
+                    default:
+                        touchesMemory = !node.op.persistentStateCellIds.isEmpty
                     }
-                default:
-                    // For other nodes, continue traversing
-                    queue.append(contentsOf: node.inputs)
+                    if touchesMemory {
+                        // A pure middle operand does not itself carry the
+                        // earlier effects, so wait for the entire prefix.
+                        for prior in ins[0...i] where !node.temporalDependencies.contains(prior) {
+                            nodes[current]?.temporalDependencies.append(prior)
+                        }
+                    }
                 }
             }
         }

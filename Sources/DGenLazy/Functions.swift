@@ -1000,12 +1000,40 @@ extension Tensor {
     return Signal(nodeId: nodeId, graph: graph, requiresGrad: requiresGrad || index.requiresGrad)
   }
 
+  /// Write one scalar sample into stored tensor memory. Returns the written
+  /// value; use Signal.seq to order reads and writes within each audio frame.
+  public func poke(_ value: Signal, at index: Signal, channel: Signal? = nil) throws -> Signal {
+    let ch = channel ?? Signal.constant(0)
+    guard value.graph === graph, index.graph === graph, ch.graph === graph else {
+      throw DGenError.tensorError(op: "poke", reason: "all operands must belong to the same graph")
+    }
+    let nodeId = try graph.graph.poke(
+      tensor: nodeId, index: index.nodeId, channel: ch.nodeId, value: value.nodeId)
+    return Signal(nodeId: nodeId, graph: graph)
+  }
+
   /// Convert a 1D tensor to a Signal: frame[i] reads tensor[i].
   /// Convenience over peek + accumulator.
   public func toSignal(maxFrames: Int? = nil) -> Signal {
     let len = Float(maxFrames ?? shape[0])
     let counter = Signal.accum(Signal.constant(1.0), reset: 0.0, min: 0.0, max: len)
     return peek(counter)
+  }
+}
+
+extension Signal {
+  /// Evaluate operands in order once per frame and return the last value.
+  /// Reusing a Signal reuses its graph node; it does not evaluate it twice.
+  public static func seq(_ operands: [Signal]) throws -> Signal {
+    guard operands.count >= 2 else {
+      throw DGenError.insufficientInputs(operator: "seq", expected: 2, actual: operands.count)
+    }
+    let graph = operands[0].graph
+    guard operands.allSatisfy({ $0.graph === graph }) else {
+      throw DGenError.tensorError(op: "seq", reason: "all operands must belong to the same graph")
+    }
+    let nodeId = graph.graph.n(.seq, operands.map { $0.nodeId })
+    return Signal(nodeId: nodeId, graph: graph, requiresGrad: operands.last!.requiresGrad)
   }
 }
 

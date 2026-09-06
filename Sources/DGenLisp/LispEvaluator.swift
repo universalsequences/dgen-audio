@@ -736,6 +736,10 @@ class LispEvaluator {
       return try evalMatmul(regularArgs)
     case "peek":
       return try evalPeek(regularArgs)
+    case "poke":
+      return try evalPoke(regularArgs)
+    case "seq":
+      return .signal(try Signal.seq(regularArgs.map { try requireSignal(coerceToSignal(evaluateAST($0))) }))
     case "peek-row", "peekrow":
       return try evalPeekRow(regularArgs)
     case "gather":
@@ -1893,6 +1897,20 @@ class LispEvaluator {
     default:
       throw LispError.typeError("matmul: unsupported operand combination")
     }
+  }
+
+  private func evalPoke(_ args: [ASTNode]) throws -> EvalResult {
+    guard args.count == 3 || args.count == 4 else {
+      throw LispError.invalidArgument("poke requires (tensor index value) or (tensor index channel value)")
+    }
+    guard case .tensor(let tensor) = try evaluateAST(args[0]) else {
+      throw LispError.typeError("poke: first argument must be a stored tensor")
+    }
+    let index = try requireSignal(coerceToSignal(evaluateAST(args[1])))
+    let channel = args.count == 4
+      ? try requireSignal(coerceToSignal(evaluateAST(args[2]))) : Signal.constant(0)
+    let value = try requireSignal(coerceToSignal(evaluateAST(args[args.count - 1])))
+    return .signal(try tensor.poke(value, at: index, channel: channel))
   }
 
   private func evalPeek(_ args: [ASTNode]) throws -> EvalResult {

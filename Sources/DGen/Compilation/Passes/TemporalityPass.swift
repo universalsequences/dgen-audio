@@ -105,7 +105,7 @@ extension TemporalityPass {
         continue
       }
 
-      if isIntrinsicallyFrameBased(node.op) {
+      if isIntrinsicallyFrameBased(node.op) || graph.isMutableTensorAccess(node) {
         frameBasedNodes.insert(nodeId)
         continue
       }
