@@ -513,6 +513,21 @@ public class CRenderer: Renderer {
     return varEmittedTypes[varId] == .int_
   }
 
+  /// Materialized frame offsets are vectors in a SIMD consumer even when a
+  /// scalar producer/load last updated varEmittedTypes. Their lanes may wrap or
+  /// jump independently; the first lane is not a proof of contiguous addresses.
+  private func simdMemoryOffsetType(_ offset: Lazy, ctx: IRContext) -> EmittedType {
+    switch offset {
+    case .variable(let id, _):
+      if ctx.globals.contains(id) && !staticGlobalVars.contains(id) { return .float32x4 }
+      return varEmittedTypes[id] ?? .float32x4
+    case .global(let id):
+      return staticGlobalVars.contains(id) ? .float_ : .float32x4
+    case .constant: return .int_
+    default: return .float32x4
+    }
+  }
+
   /// Render a Lazy value using its scalar form regardless of the surrounding UOp vector width.
   /// This is required for scalar-typed memory offsets that may also have an opportunistic SIMD
   /// alias in scope; address arithmetic must use the scalar symbol, not `simd{id}`.
@@ -744,16 +759,7 @@ public class CRenderer: Renderer {
     case .memoryRead(let base, let offset):
       if uop.isSimd {
         // Check offset type to determine how to handle it
-        let offsetType: EmittedType
-        if case .variable(let varId, _) = offset {
-          offsetType = varEmittedTypes[varId] ?? .float32x4
-        } else if case .constant = offset {
-          // Compile-time constant offset — treat as scalar so we get a
-          // contiguous 4-wide load at a fixed address, not a 4-way gather.
-          offsetType = .int_
-        } else {
-          offsetType = .float32x4
-        }
+        let offsetType = simdMemoryOffsetType(offset, ctx: ctx)
 
         switch offsetType {
         case .int_, .float_:
@@ -810,15 +816,7 @@ public class CRenderer: Renderer {
       if uop.isSimd {
         let valueExpr = g(value)
         // Check offset type to determine how to handle it
-        let offsetType: EmittedType
-        if case .variable(let varId, _) = offset {
-          offsetType = varEmittedTypes[varId] ?? .float32x4
-        } else if case .constant = offset {
-          // Compile-time constant offset — treat as scalar for a contiguous store.
-          offsetType = .int_
-        } else {
-          offsetType = .float32x4
-        }
+        let offsetType = simdMemoryOffsetType(offset, ctx: ctx)
 
         switch offsetType {
         case .int_, .float_:
@@ -845,14 +843,7 @@ public class CRenderer: Renderer {
       // case) requires a horizontal reduction; lane-varying offsets scatter-add.
       if uop.isSimd {
         let valueExpr = g(value)
-        let offsetType: EmittedType
-        if case .variable(let varId, _) = offset {
-          offsetType = varEmittedTypes[varId] ?? .float32x4
-        } else if case .constant = offset {
-          offsetType = .int_
-        } else {
-          offsetType = .float32x4
-        }
+        let offsetType = simdMemoryOffsetType(offset, ctx: ctx)
 
         switch offsetType {
         case .int_, .float_:

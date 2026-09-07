@@ -73,7 +73,7 @@ final class ExecutionGateTests: XCTestCase {
   /// Renders `blocks` blocks of `blockSize` frames, calling `beforeBlock` with
   /// the memory pointer before each so tests can move parameters mid-stream.
   private func render(
-    _ compiled: Compiled, blockSize: Int = 64, blocks: Int = 4, input: Float = 0,
+    _ compiled: Compiled, blockSize: Int = 64, blocks: Int = 4, input: Float = 0, inputChannels: [Float]? = nil,
     beforeBlock: (Int, UnsafeMutablePointer<Float>) -> Void = { _, _ in }
   ) throws -> [Float] {
     let kernel = CCompiledKernel(
@@ -85,18 +85,50 @@ final class ExecutionGateTests: XCTestCase {
     mem.initialize(repeating: 0, count: max(1024, compiled.result.totalMemorySlots))
     let out = UnsafeMutablePointer<Float>.allocate(capacity: blockSize + 4)
     out.initialize(repeating: 0, count: blockSize + 4)
-    let inp = UnsafeMutablePointer<Float>.allocate(capacity: blockSize + 4)
-    inp.initialize(repeating: input, count: blockSize + 4)
-    defer { mem.deallocate(); out.deallocate(); inp.deallocate() }
+    let inputs = (inputChannels ?? [input]).map { value -> UnsafeMutablePointer<Float> in
+      let buffer = UnsafeMutablePointer<Float>.allocate(capacity: blockSize + 4)
+      buffer.initialize(repeating: value, count: blockSize + 4)
+      return buffer
+    }
+    defer { mem.deallocate(); out.deallocate(); inputs.forEach { $0.deallocate() } }
+    let process = try XCTUnwrap(kernel.getProcessFunction())
+    let inputPointers: [UnsafePointer<Float>?] = inputs.map { UnsafePointer($0) }
+    let outputPointers: [UnsafeMutablePointer<Float>?] = [out]
+    var context = DGenProcessContextV1(sampleRate: 48000)
     DGen.injectTensorData(result: compiled.result, memory: mem)
     for (cell, value) in compiled.paramDefaults { mem[cell] = value }
     var samples: [Float] = []
     for b in 0..<blocks {
       beforeBlock(b, mem)
-      kernel.runWithMemory(outputs: out, inputs: inp, memory: mem, frameCount: blockSize)
+      inputPointers.withUnsafeBufferPointer { ip in
+        outputPointers.withUnsafeBufferPointer { op in
+          withUnsafePointer(to: &context) { contextPointer in
+            process(ip.baseAddress, op.baseAddress, UInt32(blockSize), mem,
+              UnsafeRawPointer(contextPointer), nil)
+          }
+        }
+      }
       for i in 0..<blockSize { samples.append(out[i]) }
     }
     return samples
+  }
+
+  func testModulationRegionPreservesDelayRingWrap() throws {
+    for size in [8, 64] {
+      let program = try compile("""
+        (def signal (in 1 @name signal @modulator 1))
+        (param gain @default 0.5 @min 0 @max 1 @mod true @mod-mode additive)
+        (out (delay (* signal (mod gain)) 18.4) 1)
+        """, blockSize: size)
+      // Read across the ring boundary at startup and again after its 88000
+      // samples wrap. The ring counter follows the buffer and is not audio.
+      let output = try render(program, blockSize: size,
+        blocks: 89000 / size + 1, input: 1) { _, _ in }
+      for (frame, value) in output.enumerated() {
+        let expected: Float = frame < 18 ? 0 : (frame == 18 ? 0.3 : 0.5)
+        XCTAssertEqual(value, expected, accuracy: 0.003, "frame \(frame), block \(size)")
+      }
+    }
   }
 
   func testGateFreezesAndResumesHistory() throws {
@@ -187,12 +219,18 @@ final class ExecutionGateTests: XCTestCase {
       for voices in [1, 12] {
         let program = try compile("""
           (def mod1 (in 1 @name mod1 @modulator 1))
+          (def mod2 (in 2 @name mod2 @modulator 2))
+          (def mod3 (in 3 @name mod3 @modulator 3))
+          (def mod4 (in 4 @name mod4 @modulator 4))
           (param level @default 100 @min 1 @max 2000 @mod true @mod-mode \(mode))
           (out (mod level) 1)
           """, voiceCount: voices)
-        let output = try render(program, input: 1) { b, mem in
+        let output = try render(program, inputChannels: [0.5, -0.25, 0.75, -1]) { b, mem in
           mem[program.paramCells["__mod__level__active"]!] = b % 2 == 1 ? 1 : 0
-          mem[program.paramCells["__mod__level__depth__slot1"]!] = 12
+          // Four independently valued sources sum to 12 semitones/units.
+          for (slot, depth) in [Float(2), 4, 8, -6].enumerated() {
+            mem[program.paramCells["__mod__level__depth__slot\(slot + 1)"]!] = depth
+          }
         }
         for b in 0..<4 {
           for sample in output[(b*64)..<((b+1)*64)] {
