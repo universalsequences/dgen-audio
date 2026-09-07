@@ -64,6 +64,12 @@ enum SumOfMulFusionPass {
 
       ctx.fusedSumOfMulPlans[sumId] = IRContext.FusedSumOfMulPlan(
         aTensor: aTensor, bTensor: bTensor, shape: shape)
+      // The reduce now reads both operands from memory in its own block. An
+      // operand whose only graph consumer is the elided product `mul` is not
+      // outbound by block liveness, so `tstore` would skip its write and the
+      // reduce would read an untouched allocation (silence, or stale frames).
+      ctx.fusedSumOperandCells.insert(aTensor.cellId)
+      ctx.fusedSumOperandCells.insert(bTensor.cellId)
       fusedSumsByMul[mulId, default: []].append(sumId)
 
       // Wire circular-window position values (per-frame scalars produced in

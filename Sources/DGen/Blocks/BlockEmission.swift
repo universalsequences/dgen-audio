@@ -173,6 +173,7 @@ private func prepareOutboundTensorCells(
   }
 
   markConvInputsAsOutbound(&outboundCells, block: block, g: g)
+  outboundCells.formUnion(ctx.fusedSumOperandCells)
   ctx.outboundTensorCells = outboundCells
   ctx.clearTensorRegisters()
 }

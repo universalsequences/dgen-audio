@@ -250,12 +250,28 @@ public struct CompilationPipeline {
       promoteParallelBufferViewWriteBlocks(&finalBlocks, graph: graph)
     }
 
-    let temporalityResult = assignTemporality(
+    var temporalityResult = assignTemporality(
       nodeTemporality,
       blocks: &finalBlocks,
       context: context,
       timings: &timings
     )
+    // A block that mixes hop-rate and frame-rate nodes emits one hop guard over
+    // both, freezing the frame-rate half between hops. Split before tensor
+    // memory materialization so the boundary value gets its own storage.
+    if TemporalityPass.splitMixedRateBlocks(
+      blocks: &finalBlocks,
+      context: context,
+      frameBasedNodes: temporalityResult.frameBasedNodes,
+      hopBasedNodes: temporalityResult.hopBasedNodes)
+    {
+      temporalityResult = assignTemporality(
+        nodeTemporality,
+        blocks: &finalBlocks,
+        context: context,
+        timings: &timings
+      )
+    }
     applyBackendBlockSafetySplitsIfNeeded(
       graph: graph,
       backend: backend,
