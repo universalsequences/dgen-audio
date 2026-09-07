@@ -96,9 +96,10 @@ struct EmissionRegion {
 /// - Returns: Unified outbound tensor-cell set for shape-aware emission.
 func computeShapeAwareOutboundCells(
   block: Block, blocks: [Block], g: Graph,
-  transitions: [(nodeIndex: Int, shape: [Int])]
+  transitions: [(nodeIndex: Int, shape: [Int])],
+  index: BlockDependencyIndex? = nil
 ) -> Set<CellID> {
-  var outbound = findOutboundTensorCells(blocks, g, block: block)
+  var outbound = findOutboundTensorCells(blocks, g, block: block, index: index)
   outbound.formUnion(findCrossRegionOutboundCells(block: block, g: g, transitions: transitions))
 
   // Conv/cumsum/gather ops use memoryRead() directly; input MUST be in memory, not registers.

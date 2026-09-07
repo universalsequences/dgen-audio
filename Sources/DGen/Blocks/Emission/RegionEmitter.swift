@@ -152,21 +152,23 @@ public func emitScalarBlockWithShapeTransitions(
   ctx: IRContext, block: Block, blocks: [Block], g: Graph,
   transitions: [(nodeIndex: Int, shape: [Int])],
   backend: Backend = .c,
-  laneParallel: Bool = false
+  laneParallel: Bool = false,
+  index: BlockDependencyIndex? = nil
 ) throws -> [UOp] {
   // Reset per-block sumAxis fusion metadata; detection repopulates it for this block.
   ctx.inlineReduceSources = [:]
   ctx.skippedTensorComputeNodes = []
 
   // Analysis: compute outbound cells and detect fusable reduces
-  let blockOutbound = findOutboundTensorCells(blocks, g, block: block)
+  let blockOutbound = findOutboundTensorCells(blocks, g, block: block, index: index)
   var outbound = computeShapeAwareOutboundCells(
-    block: block, blocks: blocks, g: g, transitions: transitions)
+    block: block, blocks: blocks, g: g, transitions: transitions, index: index)
   let skipRegions = detectFusableReduces(
     block: block, g: g, transitions: transitions,
     blockOutbound: blockOutbound, outbound: &outbound, ctx: ctx)
   detectInlineableMulReduceNodes(block: block, g: g, ctx: ctx)
   detectInlineableExpandAxisReduceNodes(block: block, g: g, ctx: ctx)
+  outbound.formUnion(ctx.fusedSumOperandCells)
   ctx.outboundTensorCells = outbound
   ctx.clearTensorRegisters()
 

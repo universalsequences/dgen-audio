@@ -32,12 +32,17 @@ enum ScalarBlockCoalescingPass {
     return 16
   }
 
+  /// Whether `op` is scalar DSP that a plain scalar block may hold.
+  ///
+  /// Both callers (this pass and `ExecutionGatePass`) run only on the C backend, where
+  /// `ModulationGateLoweringPass` has already rewritten every `.modulatedParam` into a
+  /// `.gswitch` over plain arithmetic, so that operator is deliberately absent here.
   static func isPlainScalarOp(_ op: LazyOp) -> Bool {
     switch op {
     case .add, .sub, .div, .mul, .abs, .sign, .sin, .cos, .tan, .atan, .tanh, .exp, .log,
       .log10, .sqrt, .atan2, .gt, .gte, .lte, .lt, .eq, .gswitch, .mix, .pow, .floor, .ceil,
       .round, .mod, .min, .max, .and, .or, .xor, .neg, .mse,
-      .selector, .modulatedParam, .constant, .hostSampleRate, .param, .input, .output,
+      .selector, .constant, .hostSampleRate, .param, .input, .output,
       .historyRead, .historyWrite, .historyReadWrite, .phasor, .deterministicPhasor,
       .accum, .noise, .latch, .click, .seq:
       return true
@@ -71,6 +76,7 @@ enum ScalarBlockCoalescingPass {
     }
 
     for (index, block) in blocks.enumerated() {
+      if let current = run, current.executionDemand != block.executionDemand { flush() }
       guard plain[index] else {
         flush()
         result.append(block)
@@ -86,7 +92,7 @@ enum ScalarBlockCoalescingPass {
       }
       // Parallel: absorb only when small and adjacent to a sequential run.
       let nextIsSequential =
-        index + 1 < blocks.count && plain[index + 1] && blocks[index + 1].frameOrder == .sequential
+        index + 1 < blocks.count && plain[index + 1] && blocks[index + 1].executionDemand == block.executionDemand && blocks[index + 1].frameOrder == .sequential
       let small = block.nodes.count <= threshold
       if small && (run != nil || nextIsSequential) {
         if run != nil {

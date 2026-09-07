@@ -17,6 +17,8 @@ extension UOp {
     public func prettyDescription() -> String {
         let opStr: String
         switch op {
+        case let .blockGateTest(value, varying):
+            opStr = "blockGateTest(\(value), frameVarying: \(varying))"
         case let .add(a, b):
             opStr = "\(ANSI.green)add\(ANSI.reset)(\(a), \(b))"
         case let .sub(a, b):

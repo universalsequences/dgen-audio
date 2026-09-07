@@ -14,6 +14,9 @@ public struct Node {
 }
 
 open class Graph {
+    /// Explicit C block gates: mux node -> condition. Only the true input is gated.
+    /// Shared dependencies keep executing when any ungated consumer needs them.
+    public var executionGates: [NodeID: NodeID] = [:]
     public var next = 0
     public var nodes: [NodeID: Node] = [:]
     private var nextCellId = 0
@@ -304,6 +307,8 @@ extension Op {
             return [b]
         case .load(_):
             return []
+        case .blockGateTest(let a, _):
+            return [a]
         case .beginIf(let a):
             return [a]
         case .mutate(let a, let b):

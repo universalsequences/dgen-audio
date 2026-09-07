@@ -130,9 +130,10 @@ final class CodegenPerfPassesTests: XCTestCase {
     XCTAssertLessThan(optimized.source.count, reference.source.count, "DCE removed nothing")
     // Parameter cells survive DCE untouched: the host addresses them by cell id.
     XCTAssertEqual(optimized.paramCells, reference.paramCells)
-    // The unused destinations' modulation sums (input channel times depth) are gone.
-    let modReads = { (src: String) in src.components(separatedBy: "in[5][").count - 1 }
-    XCTAssertLessThan(modReads(optimized.source), modReads(reference.source))
+    // Input reads are now shared graph nodes. Check emitted work rather than
+    // counting repeated textual channel loads from the old opaque mod operator.
+    XCTAssertLessThan(optimized.result.uopBlocks.reduce(0) { $0 + $1.ops.count },
+                      reference.result.uopBlocks.reduce(0) { $0 + $1.ops.count })
   }
 
   func testDeadPureSubgraphRemovalIsExact() throws {

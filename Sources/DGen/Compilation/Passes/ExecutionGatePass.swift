@@ -1,0 +1,142 @@
+import Foundation
+
+/// A disjunction of conjunctions of positive block-gate conditions.
+/// An empty conjunction means unconditional demand; no terms means no demand.
+public struct ExecutionDemand: Equatable {
+  public var terms: [Set<NodeID>]
+  public static let always = ExecutionDemand(terms: [[]])
+
+  mutating func include(_ term: Set<NodeID>) -> Bool {
+    if terms.contains(where: { $0.isSubset(of: term) }) { return false }
+    terms.removeAll { term.isSubset(of: $0) }
+    terms.append(term)
+    terms.sort { $0.sorted().lexicographicallyPrecedes($1.sorted()) }
+    return true
+  }
+}
+
+/// Computes demand through value and history dependencies, before block formation.
+/// Shared producers execute whenever ANY consumer needs them. A gate may never
+/// hide arbitrary side effects or gate only one half of a feedback recurrence.
+enum ExecutionGatePass {
+  struct Plan {
+    var demands: [NodeID: ExecutionDemand] = [:]
+    var originalDependencies: [NodeID: [NodeID]] = [:]
+
+    func restoreDependencies(graph: Graph) {
+      for (id, deps) in originalDependencies { graph.nodes[id]?.temporalDependencies = deps }
+    }
+
+    func split(blocks: [Block]) -> [Block] {
+      guard !demands.isEmpty else { return blocks }
+      return blocks.flatMap { block -> [Block] in
+        var result: [Block] = []
+        for id in block.nodes {
+          let demand = demands[id] ?? .always
+          if result.last?.executionDemand == demand {
+            result[result.count - 1].nodes.append(id)
+          } else {
+            var part = block
+            part.nodes = [id]
+            part.executionDemand = demand
+            result.append(part)
+          }
+        }
+        return result
+      }
+    }
+  }
+
+  static func prepare(graph: Graph, backend: Backend) throws -> Plan {
+    guard backend == .c, !graph.executionGates.isEmpty else { return Plan() }
+    var writers: [CellID: [NodeID]] = [:]
+    for (id, node) in graph.nodes {
+      switch node.op {
+      case .historyWrite(let cell), .historyReadWrite(let cell):
+        writers[cell, default: []].append(id)
+      default: break
+      }
+    }
+    func dependencies(_ id: NodeID) -> [NodeID] {
+      guard let node = graph.nodes[id] else { return [] }
+      switch node.op {
+      case .historyRead(let cell), .historyReadWrite(let cell):
+        return node.allDependencies + (writers[cell] ?? [])
+      default: return node.allDependencies
+      }
+    }
+    var candidates = Set<NodeID>()
+    var stack = graph.executionGates.keys.compactMap { graph.nodes[$0]?.inputs.dropFirst().first }
+    while let id = stack.popLast() {
+      guard candidates.insert(id).inserted else { continue }
+      stack.append(contentsOf: dependencies(id))
+    }
+    for id in candidates {
+      guard let node = graph.nodes[id] else { continue }
+      guard ScalarBlockCoalescingPass.isPlainScalarOp(node.op),
+        graph.nodeToTensor[id] == nil, graph.nodeHopRate[id] == nil else {
+        throw DGenError.compilationFailed("block-gate supports scalar DSP only; unsupported node \(id): \(node.op)")
+      }
+      if case .tensor? = node.shape {
+        throw DGenError.compilationFailed("block-gate does not support tensor state")
+      }
+    }
+    // Parameters and pure functions of parameters stay unconditional and can
+    // still be hoisted. This also keeps every gate condition available.
+    var invariant = Set<NodeID>()
+    var changed = true
+    while changed {
+      changed = false
+      for (id, node) in graph.nodes where !invariant.contains(id) {
+        if StaticHoistPass.isHoistableOp(node.op), node.temporalDependencies.isEmpty,
+          node.inputs.allSatisfy({ invariant.contains($0) }) {
+          invariant.insert(id); changed = true
+        }
+      }
+    }
+    var demands: [NodeID: ExecutionDemand] = [:]
+    var work: [(NodeID, Set<NodeID>)] = []
+    for (id, node) in graph.nodes {
+      if !candidates.contains(id) || invariant.contains(id) || node.op.isOutput {
+        work.append((id, []))
+      }
+    }
+    // Gate predicates must be available before choosing a region. Their entire
+    // dependency cone is unconditional, including other muxes: conditioning a
+    // shared producer on a downstream predicate would introduce a scheduling
+    // cycle. Conservatively keep predicate preparation outside every gate.
+    var predicateDependencies = Set<NodeID>()
+    var pendingPredicates = Array(graph.executionGates.values)
+    while let id = pendingPredicates.popLast() {
+      guard predicateDependencies.insert(id).inserted else { continue }
+      pendingPredicates.append(contentsOf: dependencies(id))
+    }
+    work.append(contentsOf: predicateDependencies.map { ($0, []) })
+    work.append(contentsOf: graph.materializeNodes.map { ($0, []) })
+    work.append(contentsOf: graph.gradientSideEffects.map { ($0, []) })
+    while let (id, term) = work.popLast() {
+      guard let node = graph.nodes[id] else { continue }
+      var demand = demands[id] ?? ExecutionDemand(terms: [])
+      guard demand.include(term) else { continue }
+      demands[id] = demand
+      if let condition = graph.executionGates[id], node.inputs.count == 3 {
+        work.append((node.inputs[0], term))
+        work.append((node.inputs[1], term.union([condition])))
+        work.append((node.inputs[2], term))
+        work.append(contentsOf: node.temporalDependencies.map { ($0, term) })
+      } else {
+        work.append(contentsOf: dependencies(id).map { ($0, term) })
+      }
+    }
+    var plan = Plan(demands: demands)
+    for (id, demand) in demands where demand != .always {
+      let conditions = Set(demand.terms.flatMap { $0 }).sorted()
+      guard let node = graph.nodes[id] else { continue }
+      plan.originalDependencies[id] = node.temporalDependencies
+      for condition in conditions where !node.allDependencies.contains(condition) {
+        graph.nodes[id]?.temporalDependencies.append(condition)
+      }
+    }
+    return plan
+  }
+}

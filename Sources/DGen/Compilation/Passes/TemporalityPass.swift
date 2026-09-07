@@ -165,6 +165,82 @@ extension TemporalityPass {
     return TemporalityResult(frameBasedNodes: frameBasedNodes, hopBasedNodes: hopBasedNodes)
   }
 
+  /// Splits blocks that mix hop-rate and frame-rate work into homogeneous runs.
+  ///
+  /// A frame-based block's tensor region is emitted under one `beginHopCheck`
+  /// as soon as any node in it is hop-based (`ShapeTransitionPlanner`), because
+  /// hop-rate producers must not recompute between hops. Frame-rate nodes in
+  /// the same region are then gated too — and a frame-rate node is frame-rate
+  /// precisely because skipping it is wrong. The canonical victim is
+  /// `hop chain -> latch -> per-sample consumer`: the tensor `latch` stops
+  /// re-emitting its held value between hops, so its consumer sees the value
+  /// only on hop frames and the signal collapses to hop-rate impulses.
+  ///
+  /// Splitting here, before tensor memory materialization, keeps the boundary
+  /// value materialized and lets `assignBlockTemporality` label each part.
+  /// Each part keeps the original block's frame order, so a sequential block
+  /// stays sequential and its interleaved frame loop is preserved.
+  ///
+  /// Returns true when any block was split.
+  static func splitMixedRateBlocks(
+    blocks: inout [Block],
+    context: IRContext,
+    frameBasedNodes: Set<NodeID>,
+    hopBasedNodes: [NodeID: (Int, NodeID)]
+  ) -> Bool {
+    guard !hopBasedNodes.isEmpty else { return false }
+    var result: [Block] = []
+    var didSplit = false
+    for block in blocks {
+      guard block.nodes.contains(where: { hopBasedNodes[$0] != nil }),
+        block.nodes.contains(where: { frameBasedNodes.contains($0) })
+      else {
+        result.append(block)
+        continue
+      }
+      // A part's element loop is sized from its own leading tensor shape, not
+      // the shape the original block started with.
+      func retagShape(_ part: inout Block) {
+        guard part.shape != nil else { return }
+        for nodeId in part.nodes {
+          if case .tensor(let shape)? = context.g.nodes[nodeId]?.shape {
+            part.shape = shape
+            return
+          }
+        }
+      }
+      var part = block
+      part.nodes = []
+      var hasHop = false
+      var hasFrame = false
+      for nodeId in block.nodes {
+        let isHop = hopBasedNodes[nodeId] != nil
+        let isFrame = frameBasedNodes.contains(nodeId)
+        if !part.nodes.isEmpty, (isHop && hasFrame) || (isFrame && hasHop) {
+          retagShape(&part)
+          result.append(part)
+          didSplit = true
+          part = block
+          part.nodes = []
+          // Each emitted block owns its element loop, so the new part needs
+          // its own iterator variable.
+          if block.tensorIndex != nil { part.tensorIndex = context.useVariable(src: nil) }
+          hasHop = false
+          hasFrame = false
+        }
+        part.nodes.append(nodeId)
+        hasHop = hasHop || isHop
+        hasFrame = hasFrame || isFrame
+      }
+      if !part.nodes.isEmpty {
+        retagShape(&part)
+        result.append(part)
+      }
+    }
+    if didSplit { blocks = result }
+    return didSplit
+  }
+
   /// Assigns block temporality from member node temporality.
   static func assignBlockTemporality(
     blocks: inout [Block],

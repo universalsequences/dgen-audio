@@ -116,6 +116,9 @@ public class CRenderer: Renderer {
     var currentDispatchMode: DispatchMode? = nil
     var currentVectorWidth: Int? = nil
     var currentThreadScale: Int? = nil
+    var currentDemand = ExecutionDemand.always
+    var gateOpen = false
+    var gateTests: [NodeID: Lazy] = [:]
     var hopCheckOpen = false  // Track if we have an open hop check conditional
     var loopOpen = false
 
@@ -176,6 +179,38 @@ public class CRenderer: Renderer {
     }
 
     func appendNormalBlock(_ block: BlockUOps) {
+      if currentDemand != block.executionDemand {
+        closeOpenScope()
+        if gateOpen { scheduleItem.ops.append(UOp(op: .endIf, value: .empty)); gateOpen = false }
+        resetCurrentBlockState()
+        currentDemand = block.executionDemand
+        if currentDemand != .always {
+          let conditions = Set(currentDemand.terms.flatMap { $0 }).sorted()
+          for id in conditions where gateTests[id] == nil {
+            guard let value = ctx.values[id] else { preconditionFailure("missing gate condition") }
+            let test = ctx.useVariable(src: nil, trackInValues: false)
+            let varying: Bool
+            if case .variable(let vid, _) = value { varying = !staticGlobalVars.contains(vid) }
+            else { varying = false }
+            scheduleItem.ops.append(UOp(op: .blockGateTest(value, frameVarying: varying), value: test))
+            gateTests[id] = test
+          }
+          var predicate = ctx.useConstant(src: nil, value: 0)
+          for term in currentDemand.terms {
+            var conjunction = ctx.useConstant(src: nil, value: 1)
+            for id in term.sorted() {
+              let next = ctx.useVariable(src: nil, trackInValues: false)
+              scheduleItem.ops.append(UOp(op: .mul(conjunction, gateTests[id]!), value: next))
+              conjunction = next
+            }
+            let next = ctx.useVariable(src: nil, trackInValues: false)
+            scheduleItem.ops.append(UOp(op: .max(predicate, conjunction), value: next))
+            predicate = next
+          }
+          scheduleItem.ops.append(UOp(op: .beginIf(predicate), value: .empty))
+          gateOpen = true
+        }
+      }
       let needsNewLoop =
         currentFrameOrder != block.frameOrder
         || currentTemporality != block.temporality
@@ -226,6 +261,8 @@ public class CRenderer: Renderer {
 
     func appendHopIsland(_ island: HopIsland) {
       closeOpenScope()
+      if gateOpen { scheduleItem.ops.append(UOp(op: .endIf, value: .empty)); gateOpen = false }
+      currentDemand = .always
       emitThreadCountScaleChange(nil)
       resetCurrentBlockState()
 
@@ -265,6 +302,7 @@ public class CRenderer: Renderer {
     }
 
     closeOpenScope()
+    if gateOpen { scheduleItem.ops.append(UOp(op: .endIf, value: .empty)) }
   }
 
   public override func render(
@@ -473,6 +511,21 @@ public class CRenderer: Renderer {
   private func isIntTypedOffset(_ offset: Lazy) -> Bool {
     guard case .variable(let varId, _) = offset else { return false }
     return varEmittedTypes[varId] == .int_
+  }
+
+  /// Materialized frame offsets are vectors in a SIMD consumer even when a
+  /// scalar producer/load last updated varEmittedTypes. Their lanes may wrap or
+  /// jump independently; the first lane is not a proof of contiguous addresses.
+  private func simdMemoryOffsetType(_ offset: Lazy, ctx: IRContext) -> EmittedType {
+    switch offset {
+    case .variable(let id, _):
+      if ctx.globals.contains(id) && !staticGlobalVars.contains(id) { return .float32x4 }
+      return varEmittedTypes[id] ?? .float32x4
+    case .global(let id):
+      return staticGlobalVars.contains(id) ? .float_ : .float32x4
+    case .constant: return .int_
+    default: return .float32x4
+    }
   }
 
   /// Render a Lazy value using its scalar form regardless of the surrounding UOp vector width.
@@ -706,16 +759,7 @@ public class CRenderer: Renderer {
     case .memoryRead(let base, let offset):
       if uop.isSimd {
         // Check offset type to determine how to handle it
-        let offsetType: EmittedType
-        if case .variable(let varId, _) = offset {
-          offsetType = varEmittedTypes[varId] ?? .float32x4
-        } else if case .constant = offset {
-          // Compile-time constant offset — treat as scalar so we get a
-          // contiguous 4-wide load at a fixed address, not a 4-way gather.
-          offsetType = .int_
-        } else {
-          offsetType = .float32x4
-        }
+        let offsetType = simdMemoryOffsetType(offset, ctx: ctx)
 
         switch offsetType {
         case .int_, .float_:
@@ -772,15 +816,7 @@ public class CRenderer: Renderer {
       if uop.isSimd {
         let valueExpr = g(value)
         // Check offset type to determine how to handle it
-        let offsetType: EmittedType
-        if case .variable(let varId, _) = offset {
-          offsetType = varEmittedTypes[varId] ?? .float32x4
-        } else if case .constant = offset {
-          // Compile-time constant offset — treat as scalar for a contiguous store.
-          offsetType = .int_
-        } else {
-          offsetType = .float32x4
-        }
+        let offsetType = simdMemoryOffsetType(offset, ctx: ctx)
 
         switch offsetType {
         case .int_, .float_:
@@ -807,14 +843,7 @@ public class CRenderer: Renderer {
       // case) requires a horizontal reduction; lane-varying offsets scatter-add.
       if uop.isSimd {
         let valueExpr = g(value)
-        let offsetType: EmittedType
-        if case .variable(let varId, _) = offset {
-          offsetType = varEmittedTypes[varId] ?? .float32x4
-        } else if case .constant = offset {
-          offsetType = .int_
-        } else {
-          offsetType = .float32x4
-        }
+        let offsetType = simdMemoryOffsetType(offset, ctx: ctx)
 
         switch offsetType {
         case .int_, .float_:
@@ -1014,6 +1043,16 @@ public class CRenderer: Renderer {
       let bounded =
         "(\(index) < 0 || \(index) >= frameCount) ? 0.0f : \(source)[\(index)]"
       return emitAssign(uop, bounded, ctx)
+    case .blockGateTest(let condition, let varying):
+      let dest = extractVarId(uop.value)
+      varEmittedTypes[dest] = .float_
+      if case .variable(let id, _) = condition, ctx.globals.contains(id) {
+        if varying {
+          return "float t\(dest) = 0.0f; for (int _gateFrame = 0; _gateFrame < frameCount; ++_gateFrame) { if (t\(id)[_gateFrame] > 0.0f) { t\(dest) = 1.0f; break; } }"
+        }
+        return "float t\(dest) = t\(id)[0] > 0.0f;"
+      }
+      return "float t\(dest) = \(g(condition)) > 0.0f;"
     case .beginIf(let cond): return "if (\(g(cond))) {"
     case .endIf: return "}"
 

@@ -64,13 +64,15 @@ extension UOpBlockFinalization {
       ops: finalOps
     )
 
-    return BlockUOps(
+    var result = BlockUOps(
       ops: finalOps,
       frameOrder: effectiveFrameOrder,
       vectorWidth: effectiveVectorWidth,
       temporality: block.temporality,
       dispatchMode: dispatchMode
     )
+    result.executionDemand = block.executionDemand
+    return result
   }
 
   /// Removes thread-scale directives from op list while keeping the latest scale value.

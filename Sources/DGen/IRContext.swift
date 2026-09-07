@@ -20,6 +20,11 @@ public class IRContext {
   // - tensorCellToVar: maps cell IDs to computed Lazy values (register variables) within current block
   // This allows intermediate tensor values to stay in registers instead of going through memory.
   public var outboundTensorCells: Set<CellID> = []
+  /// Operand cells of a fused `(sum (* a b))` plan. The fused reduce reads them
+  /// from memory in the sum's own block, so their producing block must store
+  /// them even when the graph shows no consumer outside that block (the only
+  /// consumer, the product `mul`, is the node the fusion elides).
+  public var fusedSumOperandCells: Set<CellID> = []
   public var tensorCellToVar: [CellID: Lazy] = [:]
 
   // Temporality data from analysis (set during compilation)
