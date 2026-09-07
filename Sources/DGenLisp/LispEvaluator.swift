@@ -2945,28 +2945,27 @@ class LispEvaluator {
     let a = try promoteToValue(evaluateAST(args[1]))
     let b = try promoteToValue(evaluateAST(args[2]))
 
-    switch (cond, a, b) {
-    case (.signal(let c), .signal(let va), .signal(let vb)):
-      return .signal(DGenLazy.gswitch(c, va, vb))
-    case (.signal(let c), .float(let va), .float(let vb)):
-      return .signal(DGenLazy.gswitch(c, Double(va), Double(vb)))
-    case (.signal(let c), .signal(let va), .float(let vb)):
-      return .signal(DGenLazy.gswitch(c, va, Double(vb)))
-    case (.signal(let c), .float(let va), .signal(let vb)):
-      return .signal(DGenLazy.gswitch(c, Double(va), vb))
-    case (.tensor(let c), .tensor(let va), .tensor(let vb)):
-      return .tensor(DGenLazy.gswitch(c, va, vb))
-    default:
-      // Anything involving a frame-varying tensor is evaluated elementwise in
-      // the signalTensor domain (`.gswitch` is an elementwise, broadcasting op).
-      guard let dc = numericDomain(of: cond), let da = numericDomain(of: a),
-        let db = numericDomain(of: b),
-        joinDomains(joinDomains(dc, da), db) == .signalTensor
-      else {
-        throw LispError.typeError(
-          "gswitch: unsupported operand combination "
-            + "(\(describeKind(cond)), \(describeKind(a)), \(describeKind(b)))")
-      }
+    guard let dc = numericDomain(of: cond), let da = numericDomain(of: a),
+      let db = numericDomain(of: b)
+    else {
+      throw LispError.typeError("gswitch: every operand must be numeric")
+    }
+    switch joinDomains(joinDomains(dc, da), db) {
+    case .float:
+      return try requireFloat(cond) > 0 ? a : b
+    case .signal:
+      return .signal(
+        DGenLazy.gswitch(
+          try asSignal(cond, op: "gswitch"),
+          try asSignal(a, op: "gswitch"),
+          try asSignal(b, op: "gswitch")))
+    case .tensor:
+      return .tensor(
+        DGenLazy.gswitch(
+          try asTensor(cond, op: "gswitch"),
+          try asTensor(a, op: "gswitch"),
+          try asTensor(b, op: "gswitch")))
+    case .signalTensor:
       let shape = broadcastShapeOf([cond, a, b])
       return .signalTensor(
         DGenLazy.gswitch(

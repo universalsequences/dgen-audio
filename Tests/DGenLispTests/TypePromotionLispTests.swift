@@ -209,6 +209,35 @@ final class TypePromotionLispTests: XCTestCase {
     }
   }
 
+  func testGswitchPromotesLiteralControlsAndBranches() throws {
+    for condition in [-1, 0, 1] {
+      LazyGraphContext.reset()
+      let e = try evaluator(
+        """
+        (def scalar (gswitch \(condition) 2 7))
+        (def signal (gswitch \(condition) (+ (in 1) 2) 7))
+        (def tensor (gswitch \(condition) (tensor @shape [2] @data [2 3]) 7))
+        (def total (sum tensor))
+        """)
+      let expected: Float = condition > 0 ? 2 : 7
+      guard case .float(let scalar)? = e.definitions["scalar"],
+        case .signal(let signal)? = e.definitions["signal"],
+        case .tensor(let tensor)? = e.definitions["tensor"],
+        case .tensor(let total)? = e.definitions["total"]
+      else {
+        return XCTFail("gswitch should preserve the joined numeric domain")
+      }
+      XCTAssertEqual(scalar, expected)
+      XCTAssertEqual(tensor.shape, [2])
+      for value in try signal.realize(frames: 4) {
+        XCTAssertEqual(value, expected, accuracy: 1e-6)
+      }
+      for value in try total.realize() {
+        XCTAssertEqual(value, condition > 0 ? 5 : 14, accuracy: 1e-6)
+      }
+    }
+  }
+
   /// Scalar behaviour must be unchanged by the promotion rework.
   func testScalarPathsUnchanged() throws {
     let e = try evaluator(

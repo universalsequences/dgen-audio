@@ -263,10 +263,12 @@ private func emitStandardBlockBodyUOps(
     if ctx.crossBlockSkippedTensorNodes.contains(nodeId) { continue }
 
     if let node = g.nodes[nodeId] {
-      for uop in try node.op.emit(ctx: ctx, g: g, nodeId: nodeId) {
-        emittedNodes.insert(nodeId)
-        bodyUops.append(uop)
-      }
+      let nodeUOps = try node.op.emit(ctx: ctx, g: g, nodeId: nodeId)
+      // Constant selectors and arithmetic identities can bind an existing
+      // value without emitting a UOp. Their graph consumers still cross block
+      // boundaries: include the alias in scratch-global liveness as well.
+      emittedNodes.insert(nodeId)
+      bodyUops.append(contentsOf: nodeUOps)
     }
   }
 
