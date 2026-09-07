@@ -13,6 +13,7 @@ public enum FrameOrder {
 public struct Block: Equatable {
   public var frameOrder: FrameOrder
   public var nodes: [NodeID] = []
+  public var executionDemand = ExecutionDemand.always
   public var temporality: Temporality = .static_
 
   /// Logical element iterator for tensor blocks — identifies which tensor element the
@@ -47,7 +48,7 @@ public struct Block: Equatable {
   }
 
   public static func == (lhs: Block, rhs: Block) -> Bool {
-    return lhs.frameOrder == rhs.frameOrder && lhs.nodes == rhs.nodes
+    return lhs.executionDemand == rhs.executionDemand && lhs.frameOrder == rhs.frameOrder && lhs.nodes == rhs.nodes
       && lhs.temporality == rhs.temporality && lhs.tensorIndex == rhs.tensorIndex
       && lhs.shape == rhs.shape
   }

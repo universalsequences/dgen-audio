@@ -65,6 +65,9 @@ extension GraphPrepPasses {
             // Rewire any consumers of the removed write node to the write's
             // input so they keep receiving the same (current-frame) value.
             let passThroughSource = writeInfo.inputs[0]
+            for (gate, condition) in graph.executionGates where condition == writeInfo.nodeId {
+              graph.executionGates[gate] = passThroughSource
+            }
             for (consumerId, consumer) in graph.nodes
             where consumer.inputs.contains(writeInfo.nodeId)
               || consumer.temporalDependencies.contains(writeInfo.nodeId) {

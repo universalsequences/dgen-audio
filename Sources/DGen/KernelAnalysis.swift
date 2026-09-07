@@ -68,7 +68,7 @@ private func classify(_ op: Op) -> OpClass {
     return .arithmetic
 
   // Control flow / markers — 0 FLOPs
-  case .beginIf, .endIf, .beginLoop, .endLoop, .beginRange, .endRange,
+  case .blockGateTest, .beginIf, .endIf, .beginLoop, .endLoop, .beginRange, .endRange,
        .beginForLoop, .beginParallelRange, .endParallelRange,
        .setThreadCountScale, .setFrameIndex, .frameCount, .hostSampleRate, .frameIndex,
        .threadIndex, .output, .input, .defineGlobal, .defineConstant,

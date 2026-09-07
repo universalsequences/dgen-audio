@@ -832,6 +832,8 @@ class LispEvaluator {
       return try evalWrap(regularArgs)
     case "clip":
       return try evalClip(regularArgs)
+    case "block-gate":
+      return try evalBlockGate(regularArgs)
     case "gswitch":
       return try evalGswitch(regularArgs)
     case "selector":
@@ -845,6 +847,20 @@ class LispEvaluator {
   }
 
   // MARK: - Arithmetic
+
+  private func evalBlockGate(_ args: [ASTNode]) throws -> EvalResult {
+    guard args.count == 2 else {
+      throw LispError.invalidArgument("block-gate requires condition and scalar/tuple body")
+    }
+    let condition = try asSignal(evaluateAST(args[0]), op: "block-gate")
+    func wrap(_ value: EvalResult) throws -> EvalResult {
+      if case .tuple(let values) = value { return .tuple(try values.map(wrap)) }
+      let signal = try asSignal(value, op: "block-gate")
+      let result = DGenLazy.blockGate(condition, signal)
+      return .signal(result)
+    }
+    return try wrap(evaluateAST(args[1]))
+  }
 
   private func evalTuple(_ args: [ASTNode]) throws -> EvalResult {
     guard !args.isEmpty else {

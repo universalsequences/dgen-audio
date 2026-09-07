@@ -566,6 +566,16 @@ public func selector(_ mode: Signal, _ options: [Signal]) -> Signal {
   return Signal(nodeId: nodeId, graph: mode.graph, requiresGrad: needsGrad)
 }
 
+/// Zero-masked scalar execution region. On C, exclusively owned state freezes
+/// for process calls whose condition is non-positive at every frame. If any
+/// frame is enabled, the body advances for the entire call; output is masked
+/// per frame. Use a frame-invariant parameter for block-size-independent freeze.
+public func blockGate(_ condition: Signal, _ body: Signal) -> Signal {
+  let result = gswitch(condition, body, 0.0)
+  result.graph.graph.executionGates[result.nodeId] = condition.nodeId
+  return result
+}
+
 public func modulatedParam(
   _ base: Signal,
   active: Signal,

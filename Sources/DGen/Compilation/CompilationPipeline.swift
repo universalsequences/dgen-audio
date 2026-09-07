@@ -163,6 +163,8 @@ public struct CompilationPipeline {
     validateFrameCount(options, graph: graph)
     try GraphPrepPasses.validateMutableTensorUses(graph: graph)
     try rejectUnsupportedBackendOps(graph: graph, backend: backend)
+    let modulationChanges = backend == .c ? ModulationGateLoweringPass.run(graph: graph) : .init()
+    defer { modulationChanges.restore(graph: graph) }
     var timings = PipelineTimings()
     var prunedNodes: [NodeID: Node] = [:]
     if options.eliminateDeadCode {
@@ -181,8 +183,11 @@ public struct CompilationPipeline {
       }
     }
 
+    var gatePlan = ExecutionGatePass.Plan()
+    defer { gatePlan.restoreDependencies(graph: graph) }
+
     let prep = try runGraphPreparationPasses(
-      graph: graph, backend: backend, options: options, timings: &timings)
+      graph: graph, backend: backend, options: options, timings: &timings, gatePlan: &gatePlan)
     let finalScalarSet = timings.measure("seqScalarPropagate") {
       GraphPrepPasses.propagateSeqScalarInputs(
         graph: graph, initialScalarSet: prep.scalarNodeSet)
@@ -220,6 +225,7 @@ public struct CompilationPipeline {
       graph: graph, sortedNodes: loopNodes, scalarNodeSet: finalScalarSet, context: context,
       hopBasedNodes: peelHopNodes,
       timings: &timings)
+    finalBlocks = gatePlan.split(blocks: finalBlocks)
     if backend == .c && ScalarBlockCoalescingPass.isEnabled {
       let before = finalBlocks.count
       finalBlocks = timings.measure("coalesceScalarBlocks") {
@@ -343,6 +349,9 @@ public struct CompilationPipeline {
   /// tensorFFT instead.
   private static func rejectUnsupportedBackendOps(graph: Graph, backend: Backend) throws {
     guard backend == .metal else { return }
+    if !graph.executionGates.isEmpty {
+      throw DGenError.compilationFailed("block-gate currently requires the C backend")
+    }
     for nodeId in graph.nodes.keys.sorted() {
       guard let node = graph.nodes[nodeId] else { continue }
       switch node.op {
@@ -363,7 +372,8 @@ public struct CompilationPipeline {
 
   /// Runs graph-level analysis passes that prepare sorting and scalar execution decisions.
   private static func runGraphPreparationPasses(
-    graph: Graph, backend: Backend, options: Options, timings: inout PipelineTimings
+    graph: Graph, backend: Backend, options: Options, timings: inout PipelineTimings,
+    gatePlan: inout ExecutionGatePass.Plan
   ) throws -> GraphPreparationResult {
     let feedbackClusters = timings.measure("findFeedbackLoops") {
       findFeedbackLoops(graph)
@@ -377,6 +387,8 @@ public struct CompilationPipeline {
     timings.measure("foldConstants") {
       GraphPrepPasses.foldConstants(graph, options: options)
     }
+
+    gatePlan = try ExecutionGatePass.prepare(graph: graph, backend: backend)
 
     let scalarNodeSet = timings.measure("findSequentialNodes") {
       options.forceScalar
