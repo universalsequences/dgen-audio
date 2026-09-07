@@ -6,6 +6,10 @@ import XCTest
 final class RuntimeSampleRateLispTests: XCTestCase {
   override func setUp() {
     super.setUp()
+    // `backend` is process-wide and later suites read it without setting it;
+    // restore exactly what was here on entry so suite order cannot change results.
+    let savedBackend = DGenConfig.backend
+    addTeardownBlock { DGenConfig.backend = savedBackend }
     DGenConfig.backend = .c
     DGenConfig.sampleRate = 44_100
     DGenConfig.maxFrameCount = 64

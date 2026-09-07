@@ -10,6 +10,10 @@ final class ParamOptionsTests: XCTestCase {
 
     override func setUpWithError() throws {
         try super.setUpWithError()
+        // `backend` is process-wide and later suites read it without setting it;
+        // restore exactly what was here on entry so suite order cannot change results.
+        let savedBackend = DGenConfig.backend
+        addTeardownBlock { DGenConfig.backend = savedBackend }
         DGenConfig.backend = .c
         DGenConfig.sampleRate = 48_000
         DGenConfig.maxFrameCount = 64

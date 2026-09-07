@@ -152,15 +152,17 @@ private func markConvInputsAsOutbound(_ outboundCells: inout Set<CellID>, block:
 ///   - g: Graph containing node/tensor metadata.
 ///   - shapeTransitions: Shape-transition boundaries for this block.
 ///   - hasMultipleShapes: Whether the block emits through multiple shape regions.
+///   - index: Prebuilt plan index shared by all blocks in this emission.
 private func prepareOutboundTensorCells(
   ctx: IRContext, block: Block, blocks: [Block], g: Graph,
   shapeTransitions: [(nodeIndex: Int, shape: [Int])],
-  hasMultipleShapes: Bool
+  hasMultipleShapes: Bool,
+  index: BlockDependencyIndex?
 ) {
   // Tensor Register Optimization:
   // Compute which tensor cells need to be written to memory (used by later blocks)
   // and clear the register tracking for this new block.
-  var outboundCells = findOutboundTensorCells(blocks, g, block: block)
+  var outboundCells = findOutboundTensorCells(blocks, g, block: block, index: index)
 
   // For ALL backends: include cross-region outbound cells (tensor -> scalar reductions)
   // This ensures tensors are written to memory before scalar reductions read them.
@@ -308,12 +310,14 @@ private func emitStandardBlockBodyUOps(
 ///   - useShapeAwareEmission: Whether to emit using per-region shape-aware loops.
 ///   - shapeTransitions: Shape-transition boundaries used by shape-aware emission.
 ///   - emittedNodes: Accumulator of emitted nodes for cross-block global wiring.
+///   - index: Prebuilt plan index shared by all blocks in this emission.
 /// - Returns: Emitted body UOps plus whether emission inserted an internal frame loop.
 private func emitBlockBodyUOps(
   ctx: IRContext, block: Block, blocks: [Block], g: Graph, backend: Backend,
   useShapeAwareEmission: Bool,
   shapeTransitions: [(nodeIndex: Int, shape: [Int])],
-  emittedNodes: inout Set<NodeID>
+  emittedNodes: inout Set<NodeID>,
+  index: BlockDependencyIndex?
 ) throws -> (uops: [UOp], hasOwnFrameLoop: Bool) {
   if useShapeAwareEmission {
     // Lane-parallel detached BPTT backward: bind the region element index to
@@ -324,7 +328,7 @@ private func emitBlockBodyUOps(
     // Use specialized emission with per-shape element loops.
     let shapeAwareUOps = try emitScalarBlockWithShapeTransitions(
       ctx: ctx, block: block, blocks: blocks, g: g, transitions: shapeTransitions,
-      backend: backend, laneParallel: bpttLane.enabled
+      backend: backend, laneParallel: bpttLane.enabled, index: index
     )
     for nodeId in block.nodes {
       emittedNodes.insert(nodeId)
@@ -479,13 +483,14 @@ private func wrapBodyUOpsWithTensorLoopIfNeeded(
 ///   - block: Block currently being emitted.
 ///   - blocks: Full block list for dependency queries.
 ///   - g: Graph containing node metadata.
+///   - index: Prebuilt plan index shared by all blocks in this emission.
 private func wireCrossBlockGlobals(
   uops: inout [UOp], emittedNodes: Set<NodeID>, ctx: IRContext, block: Block,
-  blocks: [Block], g: Graph
+  blocks: [Block], g: Graph, index: BlockDependencyIndex?
 ) {
   // Handle cross-block dependencies using scratch buffers (for scalar values only).
   // Tensor-valued outputs/inputs do NOT use scratch buffers.
-  let outbound = findNodesWithOutboundDependencies(blocks, g, block: block)
+  let outbound = findNodesWithOutboundDependencies(blocks, g, block: block, index: index)
   for nodeId in outbound {
     if emittedNodes.contains(nodeId) {
       // Skip defineGlobal for tensor-valued outputs - they use memory cells, not scratch buffers
@@ -509,7 +514,7 @@ private func wireCrossBlockGlobals(
     }
   }
 
-  let inbound = findNodesAsInboundDependencies(blocks, g, block: block)
+  let inbound = findNodesAsInboundDependencies(blocks, g, block: block, index: index)
   for nodeId in inbound {
     if let lz = ctx.values[nodeId] {
       switch lz {
@@ -544,10 +549,12 @@ private func wireCrossBlockGlobals(
 ///   - g: Graph containing nodes, tensors, and metadata used by emitters.
 ///   - backend: Target backend (`.metal` by default).
 ///   - debug: Reserved debug toggle (currently ignored).
+///   - index: Plan-wide dependency index; built on demand when `nil`. Callers that emit
+///     every block of one plan should build it once and pass it to every call.
 /// - Returns: Final UOps, frame order, vector width, and whether emission inserted its own frame loop.
 public func emitBlockUOps(
   ctx: IRContext, block: Block, blocks: [Block], g: Graph, backend: Backend = .metal,
-  debug: Bool = false
+  debug: Bool = false, index: BlockDependencyIndex? = nil
 ) throws -> (uops: [UOp], frameOrder: FrameOrder, vectorWidth: Int, hasOwnFrameLoop: Bool) {
   _ = debug
   resetFrameAwareBlockContext(ctx)
@@ -560,13 +567,13 @@ public func emitBlockUOps(
 
   prepareOutboundTensorCells(
     ctx: ctx, block: block, blocks: blocks, g: g,
-    shapeTransitions: shapeTransitions, hasMultipleShapes: hasMultipleShapes)
+    shapeTransitions: shapeTransitions, hasMultipleShapes: hasMultipleShapes, index: index)
 
   var emittedNodes: Set<NodeID> = []
   let bodyEmission = try emitBlockBodyUOps(
     ctx: ctx, block: block, blocks: blocks, g: g, backend: backend,
     useShapeAwareEmission: useShapeAwareEmission, shapeTransitions: shapeTransitions,
-    emittedNodes: &emittedNodes)
+    emittedNodes: &emittedNodes, index: index)
   var bodyUops = bodyEmission.uops
 
   let vectorPlan = determineVectorPlan(
@@ -579,7 +586,8 @@ public func emitBlockUOps(
     simdIncrement: vectorPlan.simdIncrement, vectorWidth: vectorPlan.vectorWidth)
 
   wireCrossBlockGlobals(
-    uops: &uops, emittedNodes: emittedNodes, ctx: ctx, block: block, blocks: blocks, g: g)
+    uops: &uops, emittedNodes: emittedNodes, ctx: ctx, block: block, blocks: blocks, g: g,
+    index: index)
 
   return (
     uops: uops,

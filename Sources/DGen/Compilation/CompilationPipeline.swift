@@ -595,6 +595,11 @@ public struct CompilationPipeline {
         )
       }
     }
+    // One structural index for the whole plan: every block's dependency query
+    // reads it instead of rescanning all blocks.
+    let dependencyIndex = timings.measure("blockDependencyIndex") {
+      BlockDependencyIndex(blocks: blocks, graph: graph)
+    }
     try timings.measure("emitBlockUOps") {
       for block in blocks {
         let emission = try emitBlockUOps(
@@ -603,7 +608,8 @@ public struct CompilationPipeline {
           blocks: blocks,
           g: graph,
           backend: backend,
-          debug: options.debug
+          debug: options.debug,
+          index: dependencyIndex
         )
 
         uopBlocks.append(

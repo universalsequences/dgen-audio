@@ -32,12 +32,17 @@ enum ScalarBlockCoalescingPass {
     return 16
   }
 
+  /// Whether `op` is scalar DSP that a plain scalar block may hold.
+  ///
+  /// Both callers (this pass and `ExecutionGatePass`) run only on the C backend, where
+  /// `ModulationGateLoweringPass` has already rewritten every `.modulatedParam` into a
+  /// `.gswitch` over plain arithmetic, so that operator is deliberately absent here.
   static func isPlainScalarOp(_ op: LazyOp) -> Bool {
     switch op {
     case .add, .sub, .div, .mul, .abs, .sign, .sin, .cos, .tan, .atan, .tanh, .exp, .log,
       .log10, .sqrt, .atan2, .gt, .gte, .lte, .lt, .eq, .gswitch, .mix, .pow, .floor, .ceil,
       .round, .mod, .min, .max, .and, .or, .xor, .neg, .mse,
-      .selector, .modulatedParam, .constant, .hostSampleRate, .param, .input, .output,
+      .selector, .constant, .hostSampleRate, .param, .input, .output,
       .historyRead, .historyWrite, .historyReadWrite, .phasor, .deterministicPhasor,
       .accum, .noise, .latch, .click, .seq:
       return true
