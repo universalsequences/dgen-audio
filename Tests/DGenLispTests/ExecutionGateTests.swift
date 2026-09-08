@@ -131,6 +131,28 @@ final class ExecutionGateTests: XCTestCase {
     }
   }
 
+  func testGateReadsLeafTableAndFreezesOnlyItsScalarHistory() throws {
+    for size in [1, 8, 64] {
+      let program = try compile("""
+        (param enabled @default 1 @min 0 @max 1)
+        (def bank (tensor @shape [2 2] @data [1 3 5 7]))
+        (make-history counter)
+        (def count (+ (read-history counter) 1))
+        (write-history counter count)
+        (out (block-gate enabled (* count (peek bank (in 1) (in 2)))) 1)
+        """, blockSize: size)
+      let output = try render(program, blockSize: size, blocks: 4,
+        inputChannels: [0.5, 0.5]) { block, memory in
+        memory[program.paramCells["enabled"]!] = block == 1 || block == 2 ? 0 : 1
+      }
+      // Bilinear interpolation is 4; the table survives disabled blocks while
+      // the counter resumes at precisely its prior value.
+      XCTAssertEqual(Array(output.prefix(size)), (1...size).map { Float($0) * 4 })
+      XCTAssertEqual(Array(output[size..<(3*size)]), Array(repeating: 0, count: 2*size))
+      XCTAssertEqual(Array(output.suffix(size)), ((size+1)...(2*size)).map { Float($0) * 4 })
+    }
+  }
+
   func testGateFreezesAndResumesHistory() throws {
     for size in [1, 8, 64] {
       let program = try compile("""
@@ -147,6 +169,26 @@ final class ExecutionGateTests: XCTestCase {
       XCTAssertEqual(Array(output[size..<(3*size)]), Array(repeating: 0, count: 2*size))
       XCTAssertEqual(Array(output.suffix(size)), ((size+1)...(2*size)).map(Float.init))
       XCTAssertTrue(program.source.contains("if ("))
+    }
+  }
+
+  func testGateInsideFeedbackPreservesOneSampleDelay() throws {
+    for size in [1, 8, 64] {
+      let program = try compile("""
+        (param enabled @default 1)
+        (make-history feedback)
+        (def value (block-gate enabled (+ (read-history feedback) 1)))
+        (write-history feedback value)
+        (out value 1)
+        """, blockSize: size)
+      XCTAssertEqual(try render(program, blockSize: size, blocks: 4),
+        (1...(4*size)).map(Float.init))
+      let switched = try render(program, blockSize: size, blocks: 4) { block, memory in
+        memory[program.paramCells["enabled"]!] = block == 1 || block == 2 ? 0 : 1
+      }
+      XCTAssertEqual(switched, (1...size).map(Float.init)
+        + Array(repeating: 0, count: 2*size)
+        + ((size+1)...(2*size)).map(Float.init))
     }
   }
 
@@ -195,6 +237,11 @@ final class ExecutionGateTests: XCTestCase {
 
   func testGateRejectsTensorBodyAndMetalBackend() throws {
     XCTAssertThrowsError(try compile("(out (block-gate 0 (sum (tensor 1 2 3))) 1)"))
+    XCTAssertThrowsError(try compile("""
+      (param enabled @default 1)
+      (def bank (tensor @shape [2] @data [1 3]))
+      (out (block-gate enabled (peek (+ bank bank) 0)) 1)
+      """))
     _ = try compile("(param enabled @default 1) (out (block-gate enabled (phasor 100)) 1)")
     XCTAssertThrowsError(try CompilationPipeline.compile(
       graph: LazyGraphContext.current.graph, backend: .metal, options: .init(frameCount: 64)))

@@ -14,6 +14,9 @@ public struct Block: Equatable {
   public var frameOrder: FrameOrder
   public var nodes: [NodeID] = []
   public var executionDemand = ExecutionDemand.always
+  /// Fragments of a sequential region must share a single sample loop even
+  /// when their execution predicates differ.
+  public var executionFrameGroup: Int?
   public var temporality: Temporality = .static_
 
   /// Logical element iterator for tensor blocks — identifies which tensor element the
@@ -48,7 +51,7 @@ public struct Block: Equatable {
   }
 
   public static func == (lhs: Block, rhs: Block) -> Bool {
-    return lhs.executionDemand == rhs.executionDemand && lhs.frameOrder == rhs.frameOrder && lhs.nodes == rhs.nodes
+    return lhs.executionFrameGroup == rhs.executionFrameGroup && lhs.executionDemand == rhs.executionDemand && lhs.frameOrder == rhs.frameOrder && lhs.nodes == rhs.nodes
       && lhs.temporality == rhs.temporality && lhs.tensorIndex == rhs.tensorIndex
       && lhs.shape == rhs.shape
   }

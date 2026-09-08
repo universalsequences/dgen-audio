@@ -225,7 +225,7 @@ public struct CompilationPipeline {
       graph: graph, sortedNodes: loopNodes, scalarNodeSet: finalScalarSet, context: context,
       hopBasedNodes: peelHopNodes,
       timings: &timings)
-    finalBlocks = gatePlan.split(blocks: finalBlocks)
+    finalBlocks = try gatePlan.split(blocks: finalBlocks)
     if backend == .c && ScalarBlockCoalescingPass.isEnabled {
       let before = finalBlocks.count
       finalBlocks = timings.measure("coalesceScalarBlocks") {

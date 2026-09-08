@@ -27,9 +27,9 @@ enum ExecutionGatePass {
       for (id, deps) in originalDependencies { graph.nodes[id]?.temporalDependencies = deps }
     }
 
-    func split(blocks: [Block]) -> [Block] {
+    func split(blocks: [Block]) throws -> [Block] {
       guard !demands.isEmpty else { return blocks }
-      return blocks.flatMap { block -> [Block] in
+      return try blocks.enumerated().flatMap { index, block -> [Block] in
         var result: [Block] = []
         for id in block.nodes {
           let demand = demands[id] ?? .always
@@ -41,6 +41,17 @@ enum ExecutionGatePass {
             part.executionDemand = demand
             result.append(part)
           }
+        }
+        if block.frameOrder == .sequential && result.count > 1 {
+          // Splitting a recurrence into separate frame loops changes a
+          // one-sample history edge into a block delay. Keep these fragments
+          // together and put their conditionals INSIDE the sample loop.
+          let internalConditions = Set(result.flatMap { $0.executionDemand.terms.flatMap { $0 } })
+            .intersection(block.nodes)
+          if !internalConditions.isEmpty {
+            throw DGenError.compilationFailed("block-gate predicate must be available before its feedback region")
+          }
+          for i in result.indices { result[i].executionFrameGroup = index }
         }
         return result
       }
@@ -57,8 +68,20 @@ enum ExecutionGatePass {
       default: break
       }
     }
+    // A scalar lookup may be skipped while its externally owned table remains
+    // available. Stop execution demand at a leaf table reference; do not extend
+    // this to computed tensors, tensor histories, or hop-rate producers.
+    func isLeafTableRead(_ node: Node) -> Bool {
+      guard case .peek = node.op, let tableID = node.inputs.first,
+        let table = graph.nodes[tableID], case .tensorRef = table.op,
+        table.allDependencies.isEmpty else { return false }
+      return true
+    }
     func dependencies(_ id: NodeID) -> [NodeID] {
       guard let node = graph.nodes[id] else { return [] }
+      if isLeafTableRead(node) {
+        return Array(node.inputs.dropFirst()) + node.temporalDependencies
+      }
       switch node.op {
       case .historyRead(let cell), .historyReadWrite(let cell):
         return node.allDependencies + (writers[cell] ?? [])
@@ -73,7 +96,7 @@ enum ExecutionGatePass {
     }
     for id in candidates {
       guard let node = graph.nodes[id] else { continue }
-      guard ScalarBlockCoalescingPass.isPlainScalarOp(node.op),
+      guard (ScalarBlockCoalescingPass.isPlainScalarOp(node.op) || isLeafTableRead(node)),
         graph.nodeToTensor[id] == nil, graph.nodeHopRate[id] == nil else {
         throw DGenError.compilationFailed("block-gate supports scalar DSP only; unsupported node \(id): \(node.op)")
       }

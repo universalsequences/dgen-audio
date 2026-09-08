@@ -178,6 +178,32 @@ public class CRenderer: Renderer {
       currentVectorWidth = nil
     }
 
+    func gatePredicate(_ demand: ExecutionDemand) -> Lazy {
+      let conditions = Set(demand.terms.flatMap { $0 }).sorted()
+      for id in conditions where gateTests[id] == nil {
+        guard let value = ctx.values[id] else { preconditionFailure("missing gate condition") }
+        let test = ctx.useVariable(src: nil, trackInValues: false)
+        let varying: Bool
+        if case .variable(let vid, _) = value { varying = !staticGlobalVars.contains(vid) }
+        else { varying = false }
+        scheduleItem.ops.append(UOp(op: .blockGateTest(value, frameVarying: varying), value: test))
+        gateTests[id] = test
+      }
+      var predicate = ctx.useConstant(src: nil, value: 0)
+      for term in demand.terms {
+        var conjunction = ctx.useConstant(src: nil, value: 1)
+        for id in term.sorted() {
+          let next = ctx.useVariable(src: nil, trackInValues: false)
+          scheduleItem.ops.append(UOp(op: .mul(conjunction, gateTests[id]!), value: next))
+          conjunction = next
+        }
+        let next = ctx.useVariable(src: nil, trackInValues: false)
+        scheduleItem.ops.append(UOp(op: .max(predicate, conjunction), value: next))
+        predicate = next
+      }
+      return predicate
+    }
+
     func appendNormalBlock(_ block: BlockUOps) {
       if currentDemand != block.executionDemand {
         closeOpenScope()
@@ -185,28 +211,7 @@ public class CRenderer: Renderer {
         resetCurrentBlockState()
         currentDemand = block.executionDemand
         if currentDemand != .always {
-          let conditions = Set(currentDemand.terms.flatMap { $0 }).sorted()
-          for id in conditions where gateTests[id] == nil {
-            guard let value = ctx.values[id] else { preconditionFailure("missing gate condition") }
-            let test = ctx.useVariable(src: nil, trackInValues: false)
-            let varying: Bool
-            if case .variable(let vid, _) = value { varying = !staticGlobalVars.contains(vid) }
-            else { varying = false }
-            scheduleItem.ops.append(UOp(op: .blockGateTest(value, frameVarying: varying), value: test))
-            gateTests[id] = test
-          }
-          var predicate = ctx.useConstant(src: nil, value: 0)
-          for term in currentDemand.terms {
-            var conjunction = ctx.useConstant(src: nil, value: 1)
-            for id in term.sorted() {
-              let next = ctx.useVariable(src: nil, trackInValues: false)
-              scheduleItem.ops.append(UOp(op: .mul(conjunction, gateTests[id]!), value: next))
-              conjunction = next
-            }
-            let next = ctx.useVariable(src: nil, trackInValues: false)
-            scheduleItem.ops.append(UOp(op: .max(predicate, conjunction), value: next))
-            predicate = next
-          }
+          let predicate = gatePredicate(currentDemand)
           scheduleItem.ops.append(UOp(op: .beginIf(predicate), value: .empty))
           gateOpen = true
         }
@@ -292,10 +297,46 @@ public class CRenderer: Renderer {
       resetCurrentBlockState()
     }
 
+    // Mixed-demand fragments from a sequential region cannot each run a whole
+    // block. Reduce predicates first, then execute all fragments per sample.
+    let frameGroups = Dictionary(grouping: uopBlocks.indices.filter {
+      uopBlocks[$0].executionFrameGroup != nil
+    }, by: { uopBlocks[$0].executionFrameGroup! })
+    func appendFrameGroup(_ indices: [Int]) {
+      closeOpenScope()
+      if gateOpen { scheduleItem.ops.append(UOp(op: .endIf, value: .empty)); gateOpen = false }
+      currentDemand = .always
+      resetCurrentBlockState()
+      emitThreadCountScaleChange(nil)
+      let predicates = indices.map { index -> Lazy? in
+        let demand = uopBlocks[index].executionDemand
+        return demand == .always ? nil : gatePredicate(demand)
+      }
+      scheduleItem.ops.append(UOp(op: .beginLoop(frameCountUOp, 1), value: .empty))
+      for (offset, index) in indices.enumerated() {
+        let block = uopBlocks[index]
+        precondition(block.vectorWidth == 1 && block.temporality == .frameBased,
+          "execution frame groups require scalar frame-based fragments")
+        if let predicate = predicates[offset] {
+          scheduleItem.ops.append(UOp(op: .beginIf(predicate), value: .empty))
+        }
+        appendBlockOps(block)
+        if predicates[offset] != nil {
+          scheduleItem.ops.append(UOp(op: .endIf, value: .empty))
+        }
+      }
+      scheduleItem.ops.append(UOp(op: .endLoop, value: .empty))
+    }
+
     for region in scheduledRegions {
       switch region {
       case .block(let index):
-        appendNormalBlock(uopBlocks[index])
+        if let group = uopBlocks[index].executionFrameGroup {
+          let indices = frameGroups[group]!
+          if index == indices.first { appendFrameGroup(indices) }
+        } else {
+          appendNormalBlock(uopBlocks[index])
+        }
       case .hopIsland(let island):
         appendHopIsland(island)
       }
