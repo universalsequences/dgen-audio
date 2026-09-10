@@ -45,6 +45,19 @@ final class MultiFrameBlockEquivalenceTests: XCTestCase {
 
   private let totalFrames = 512
 
+  func testLiveTensorSampleInsideScalarFeedback() throws {
+    try assertBlockSizeInvariant(
+      source: """
+        (make-history state)
+        (def previous (read-history state))
+        (def coefficients (* (tensor @shape [8] @data [1 2 3 4 5 6 7 8]) (+ 1 previous)))
+        (def value (* 0.1 (sample coefficients 0.125)))
+        (write-history state value)
+        (def outsig value)
+        """,
+      label: "scalar feedback through live tensor sample")
+  }
+
   /// Compile `source` at the given block size and render `totalFrames` samples
   /// by calling the kernel repeatedly with persistent memory — the same way the
   /// host drives a compiled dylib.

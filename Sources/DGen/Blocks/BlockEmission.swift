@@ -16,7 +16,7 @@ import Foundation
 private func containsSIMDBlockers(_ uops: [UOp], backend: Backend) -> Bool {
   for uop in uops {
     switch uop.op {
-    case .beginLoop, .beginForLoop, .beginReverseLoop:
+    case .beginLoop, .beginForLoop, .beginReverseLoop, .beginParallelRange:
       return true
     case .beginIf, .endIf, .mutate, .declareVar:
       if case .c = backend { return true }

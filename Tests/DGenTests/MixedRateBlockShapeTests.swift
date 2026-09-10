@@ -3,6 +3,26 @@ import XCTest
 @testable import DGen
 
 final class MixedRateBlockShapeTests: XCTestCase {
+  func testTensorGroupingKeepsScalarHistoryInOneFrameLoop() throws {
+    let graph = Graph()
+    let input = graph.n(.input(0))
+    let tick = graph.n(.accum(graph.alloc()), graph.n(.constant(1)), graph.n(.constant(0)))
+    let table = graph.tensor(shape: [8], data: Array(repeating: 0.5, count: 8))
+    let cell = graph.alloc()
+    let previous = graph.n(.historyRead(cell))
+    let coefficients = graph.n(.mul, table, input)
+    let selected = try graph.peek(tensor: coefficients, index: graph.n(.constant(0)), channel: graph.n(.constant(0)))
+    let value = graph.n(.add, previous, selected)
+    let write = graph.n(.historyWrite(cell), value)
+    var block = Block(frameOrder: .sequential)
+    block.nodes = [tick, previous, coefficients, selected, value, write]
+    let parts = determineTensorBlocks([block], graph, IRContext(g: graph))
+    let reader = try XCTUnwrap(parts.firstIndex { $0.nodes.contains(previous) })
+    let writer = try XCTUnwrap(parts.firstIndex { $0.nodes.contains(write) })
+    XCTAssertEqual(reader, writer, "tensor grouping must not make history block-stale")
+    XCTAssertEqual(parts[reader].frameOrder, .sequential)
+  }
+
   func testRateSplitRemovesInheritedTensorLoopFromScalarFeedback() {
     let graph = Graph()
     let counter = graph.n(.constant(0))

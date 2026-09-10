@@ -1302,6 +1302,22 @@ private func scalarPrefixNeedsSplit(
 private func splitScalarBlockForTensorGrouping(
   _ block: Block, graph: Graph, ctx: IRContext
 ) -> [Block] {
+  // History reads and writes must share a frame loop. Tensor grouping may
+  // introduce element regions inside that loop, but must not turn a recurrence
+  // into separate full-block read and write passes.
+  var stateCells = Set<CellID>()
+  let hasSharedState = block.nodes.contains { nodeId in
+    guard let node = graph.nodes[nodeId] else { return false }
+    for cell in node.op.persistentStateCellIds {
+      if !stateCells.insert(cell).inserted { return true }
+    }
+    return false
+  }
+  if hasSharedState {
+    var preserved = block
+    assignTensorIndexFromFirstTensorNode(to: &preserved, graph: graph, ctx: ctx)
+    return [preserved]
+  }
   guard let firstTensorOffset = firstNonViewTensorOffset(in: block, graph: graph) else {
     var modified = block
     assignTensorIndexFromFirstTensorNode(to: &modified, graph: graph, ctx: ctx)

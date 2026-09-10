@@ -274,4 +274,104 @@ final class ModulatedParamSchedulingTests: XCTestCase {
       XCTAssertLessThanOrEqual(maxDifference, 1e-6, "block \(blockSize): previous-frame history")
     }
   }
+  /// A tensor-selected waveguide loss must not move the adjacent exciter's
+  /// history reads into a separate full-block pass. Synthetic coefficients
+  /// preserve the original mixed control/filter/delay scheduling pattern.
+  func testTensorSelectedLossPreservesExciterFeedback() throws {
+    let program = """
+      (def mod1 (in 1 @name mod1 @modulator 1))
+      (def gate (phasor 0))
+      (def pitch (+ 261.625565 (phasor 0)))
+      (def velocity (+ 1 (phasor 0)))
+      (def trigger (eq (accum 1 0 0 100000) 0))
+      (param character @group voicing @default 0.5 @min 0 @max 1 @mod true @mod-mode additive)
+      (param size @group body @default 1 @min 0.5 @max 2 @mod true @mod-mode additive)
+      (param decay @group body @default 1 @min 0.2 @max 3 @mod true @mod-mode additive)
+      (param damping @group body @default 1 @min 0.25 @max 3 @mod true @mod-mode additive)
+      (param hardness @group stick @default 0.5 @min 0 @max 1 @mod true @mod-mode additive)
+      (param touch @group contact @default 0 @min 0 @max 1 @mod true @mod-mode additive)
+      (param tracking @group tuning @default 0 @min 0 @max 1)
+      (param openness @group contact @default 0 @min 0 @max 1 @mod true @mod-mode additive)
+      (def closed_material (tensor @shape [24] @data [
+        1 2 3 4 5 6 0.0006 0
+        2 3 4 5 6 7 0.0006 0.3
+        3 4 5 6 7 8 0.0006 1]))
+      (def open_material (tensor @shape [24] @data [
+        1 2 3 4 5 6 0.008 0
+        2 3 4 5 6 7 0.0006 0.3
+        3 4 5 6 7 8 0.0025 1]))
+      (defmacro cymbal-smooth (target ms)
+        (make-history previous)
+        (make-history ready)
+        (def pole (exp (/ -1 (* 0.001 ms samplerate))))
+        (def value (gswitch (read-history ready) (mix target (read-history previous) pole) target))
+        (write-history previous value)
+        (write-history ready 1)
+        value)
+      (defmacro cymbal-pole (input pole)
+        (make-history previous)
+        (def value (mix input (read-history previous) pole))
+        (write-history previous value)
+        value)
+      (make-history last_gate)
+      (def held (gt gate 0.5))
+      (def onset (max (gt trigger 0.5) (* held (lte (read-history last_gate) 0.5))))
+      (write-history last_gate held)
+      (def tick (max onset (eq (accum 1 0 0 16) 0)))
+      (def strength (latch (clip velocity 0 1) onset))
+      (def scale (latch (cymbal-smooth (/ (clip (mod size) 0.5 2)
+        (pow (/ (clip pitch 65.406391 1046.50226) 261.625565) (clip tracking 0 1))) 12) tick))
+      (def decay_v (latch (cymbal-smooth (clip (mod decay) 0.2 3) 8) tick))
+      (def damping_v (latch (cymbal-smooth (clip (mod damping) 0.25 3) 8) tick))
+      (def touch_v (cymbal-smooth (clip (mod touch) 0 1) 2))
+      (def character_v (latch (cymbal-smooth (clip (mod character) 0 1) 12) tick))
+      (def closed_row (* character_v 2))
+      (def closed_lo (floor closed_row))
+      (def closed_hi (min 2 (+ closed_lo 1)))
+      (def closed_mix (- closed_row closed_lo))
+      (def closed_material_v (mix (gather closed_material (+ (iota 8) (* closed_lo 8))) (gather closed_material (+ (iota 8) (* closed_hi 8))) closed_mix))
+      (def open_row (* character_v 2))
+      (def open_lo (floor open_row))
+      (def open_hi (min 2 (+ open_lo 1)))
+      (def open_mix (- open_row open_lo))
+      (def open_material_v (mix (gather open_material (+ (iota 8) (* open_lo 8))) (gather open_material (+ (iota 8) (* open_hi 8))) open_mix))
+      (def openness_v (latch (cymbal-smooth (clip (mod openness) 0 1) 2) tick))
+      (def material (mix closed_material_v open_material_v openness_v))
+      (def base_rate0 (sample material 0))
+      (def base_contact_s (sample material 0.75))
+      (def contact_loss (* 180 touch_v touch_v))
+      (def hardness_v (latch (clip (mod hardness) 0 1) tick))
+      (def contact_s (latch (* base_contact_s (pow 2 (* 2 (- 0.5 hardness_v)))) tick))
+      (def age (accum (/ 1 samplerate) onset 0 100000))
+      (def pulse_phase (clip (/ age contact_s) 0 1))
+      (def friction (* (noise) (sin (* pi pulse_phase)) (lt age contact_s)))
+      (def force_pole (exp (/ -1 (* samplerate 0.000025 (pow 2 (* 3 (- 0.5 hardness_v)))))))
+      (def force (cymbal-pole (cymbal-pole
+        (* strength friction 0.23) force_pole) force_pole))
+      (def region_rate0 (+ (/ (* base_rate0 (pow damping_v 0)) decay_v) contact_loss))
+      (make-history outgoing0)
+      (def path_samples0 (max 8 (* 109 scale (/ samplerate 48000))))
+      (def integer_delay0 (- (floor path_samples0) 2))
+      (def fractional0 (+ 1 (- path_samples0 (floor path_samples0))))
+      (def allpass_a0 (/ (- 1 fractional0) (+ 1 fractional0)))
+      (def incoming0 (delay (read-history outgoing0) integer_delay0))
+      (make-history ap_x0)
+      (make-history ap_y0)
+      (def arrival0 (- (+ (* allpass_a0 incoming0) (read-history ap_x0)) (* allpass_a0 (read-history ap_y0))))
+      (write-history ap_x0 incoming0)
+      (write-history ap_y0 arrival0)
+      (def path_seconds0 (/ path_samples0 samplerate))
+      (def damped0 (* (exp (* (- region_rate0) path_seconds0)) arrival0))
+      (write-history outgoing0 (+ force (* damped0 0.9)))
+      (out (+ force damped0) 1 @name audio)
+      """
+    let expected = try render(
+      compile(program, blockSize: 1), blockSize: 1, blocks: 512, input: 0)
+    let actual = try render(
+      compile(program, blockSize: 128), blockSize: 128, blocks: 4, input: 0)
+    XCTAssertGreaterThan(expected.map(abs).max() ?? 0, 0.01)
+    let error = zip(expected, actual).map { abs($0 - $1) }.max() ?? .infinity
+    XCTAssertLessThan(error, 1e-5, "filter state must advance every sample")
+  }
+
 }

@@ -57,6 +57,20 @@ final class GatherLispTests: XCTestCase {
     XCTAssertEqual(try out.realize(frames: 4), [120, 120, 120, 120])
   }
 
+  func testSingleElementSignalTensorGather() throws {
+    let e = try evaluator(
+      """
+      (def ramp (accum 1 0 0 100))
+      (def source (* (tensor @shape [8] @data [1 2 3 4 5 6 7 8]) (+ 1 ramp)))
+      (def picked (gather source (tensor @shape [1] @data [5])))
+      (def out (sum picked))
+      """)
+    guard case .signal(let out)? = e.definitions["out"] else {
+      return XCTFail("expected signal out")
+    }
+    XCTAssertEqual(try out.realize(frames: 8), [6, 12, 18, 24, 30, 36, 42, 48])
+  }
+
   func testSignalTensorComparisonsForSpectralMasks() throws {
     let e = try evaluator(
       """

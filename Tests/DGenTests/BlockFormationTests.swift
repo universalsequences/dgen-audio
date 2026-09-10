@@ -5,6 +5,23 @@ import XCTest
 /// to debug issues with frame-based tensor operations like cos(phasor(tensor)*twopi)
 final class BlockFormationTests: XCTestCase {
 
+    func testSingleElementGatherKeepsItsOwnScalarLoop() throws {
+        let graph = Graph()
+        let source = graph.tensor(shape: [8], data: [1, 2, 3, 4, 5, 6, 7, 8])
+        let indices = graph.tensor(shape: [1], data: [5])
+        let gather = graph.n(.gather, source, indices)
+        // Emission runs after the pipeline has allocated tensor outputs.
+        let outputStorage = graph.tensor(shape: [1], data: nil)
+        graph.nodeToTensor[gather] = graph.nodeToTensor[outputStorage]
+        var block = Block(frameOrder: .parallel)
+        block.temporality = .frameBased
+        block.nodes = [source, indices, gather]
+        let emitted = try emitBlockUOps(
+            ctx: IRContext(g: graph), block: block, blocks: [block], g: graph, backend: .c)
+        XCTAssertEqual(emitted.vectorWidth, 1,
+            "a gather's element indices cannot be promoted to frame-axis SIMD vectors")
+    }
+
     // MARK: - Helper to print block structure
 
     private func printBlockStructure(
