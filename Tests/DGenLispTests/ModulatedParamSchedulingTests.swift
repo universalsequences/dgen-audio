@@ -193,4 +193,34 @@ final class ModulatedParamSchedulingTests: XCTestCase {
       """,
       label: "fused sum-of-mul operand")
   }
+
+  /// A ready flag has an independent constant writer. When its read feeds a
+  /// feedback delay's time input, both join the feedback region and must still
+  /// observe read-before-write semantics on the first frame.
+  func testSeededSmootherInDelayFeedbackReadsPreviousReadyFlag() throws {
+    let program = """
+      (param target @default 0.5 @min 0 @max 1)
+      (make-history previous)
+      (make-history ready)
+      (def value @@VALUE@@)
+      (write-history previous value)
+      (write-history ready 1)
+      (make-history wave)
+      (def delayed (delay (read-history wave) (+ 8 (* value 4))))
+      (write-history wave (+ (* delayed 0.5) 0.01))
+      (out (+ value (* delayed 0.001)) 1 @name audio)
+      """
+    let seeded = program.replacingOccurrences(of: "@@VALUE@@", with:
+      "(gswitch (read-history ready) (mix target (read-history previous) 0.99) target)")
+    let constant = program.replacingOccurrences(of: "@@VALUE@@", with: "target")
+    for blockSize in [1, 8, 128] {
+      let expected = try render(compile(constant, blockSize: blockSize),
+        blockSize: blockSize, blocks: 4, input: 0)
+      let actual = try render(compile(seeded, blockSize: blockSize),
+        blockSize: blockSize, blocks: 4, input: 0)
+      XCTAssertEqual(actual[0], 0.5, accuracy: 1e-6, "block \(blockSize): initialize immediately")
+      let maxDifference = zip(actual, expected).map { abs($0 - $1) }.max() ?? 0
+      XCTAssertLessThanOrEqual(maxDifference, 1e-6, "block \(blockSize): previous-frame history")
+    }
+  }
 }

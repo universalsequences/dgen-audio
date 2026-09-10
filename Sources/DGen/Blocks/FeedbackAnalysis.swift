@@ -719,15 +719,31 @@ private func topologicalSortWithinGroup(nodes: [NodeID], g: Graph) -> [NodeID] {
     let subsetSet = Set(subsetNodes)
     var indegree: [NodeID: Int] = [:]
 
+    // A history read snapshots the previous sample, even when the current
+    // writer does not depend on that read (ready flags, input histories).
+    // Feedback grouping keeps the pair in one frame loop, but value edges
+    // alone do not keep the independent writer from overwriting the cell
+    // first. These scheduling-only anti-dependencies preserve every reader
+    // without changing the graph's value/gradient dependency structure.
+    var historyReads: [CellID: Set<NodeID>] = [:]
+    for nodeId in subsetNodes {
+      if case .historyRead(let cell)? = g.nodes[nodeId]?.op {
+        historyReads[cell, default: []].insert(nodeId)
+      }
+    }
+    var dependencies: [NodeID: Set<NodeID>] = [:]
+    for nodeId in subsetNodes {
+      guard let node = g.nodes[nodeId] else { continue }
+      var deps = Set(node.allDependencies).intersection(subsetSet)
+      if case .historyWrite(let cell) = node.op {
+        deps.formUnion(historyReads[cell] ?? [])
+      }
+      dependencies[nodeId] = deps
+    }
+
     // Calculate in-degrees (only counting deps within the subset)
     for nodeId in subsetNodes {
-      var count = 0
-      if let node = g.nodes[nodeId] {
-        for dep in node.allDependencies where subsetSet.contains(dep) {
-          count += 1
-        }
-      }
-      indegree[nodeId] = count
+      indegree[nodeId] = dependencies[nodeId]?.count ?? 0
     }
 
     // Kahn's algorithm
@@ -740,9 +756,7 @@ private func topologicalSortWithinGroup(nodes: [NodeID], g: Graph) -> [NodeID] {
 
       // Update consumers within subset
       for otherNodeId in subsetNodes {
-        if let otherNode = g.nodes[otherNodeId],
-          otherNode.allDependencies.contains(nodeId)
-        {
+        if dependencies[otherNodeId]?.contains(nodeId) == true {
           indegree[otherNodeId]! -= 1
           if indegree[otherNodeId] == 0 {
             let insertIndex = queue.firstIndex { $0 > otherNodeId } ?? queue.count
