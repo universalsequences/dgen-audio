@@ -131,6 +131,29 @@ final class ExecutionGateTests: XCTestCase {
     }
   }
 
+  func testModulationSplitKeepsScalarPoleOutsideTensorLoop() throws {
+    for size in [1, 8, 64] {
+      let program = try compile("""
+        (def mod1 (in 1 @name mod1 @modulator 1))
+        (param pole @default 0.9 @min 0 @max 1 @mod true @mod-mode additive)
+        (def weights (tensor @shape [8] @data [1 2 3 4 5 6 7 8]))
+        (def tick (eq (accum 1 0 0 16) 0))
+        (def coefficients (* weights (hop-hold (mod pole) 16)))
+        (make-history h)
+        (def value (+ (* (read-history h) (mod pole)) 0.1))
+        (write-history h value)
+        (out (+ value (sum (* value (latch coefficients tick)))) 1)
+        """, blockSize: size)
+      let output = try render(program, blockSize: size, blocks: 8)
+      var value: Float = 0
+      for (frame, actual) in output.enumerated() {
+        value = value * 0.9 + 0.1
+        XCTAssertEqual(actual, value * (1 + 36 * 0.9), accuracy: 0.0001,
+          "scalar pole must advance once at frame \(frame), block \(size)")
+      }
+    }
+  }
+
   func testGateReadsLeafTableAndFreezesOnlyItsScalarHistory() throws {
     for size in [1, 8, 64] {
       let program = try compile("""

@@ -208,6 +208,10 @@ extension TemporalityPass {
             return
           }
         }
+        // A scalar-only fragment no longer owns an element loop. Retaining
+        // the parent's shape advances scalar histories once per former lane.
+        part.shape = nil
+        part.tensorIndex = nil
       }
       var part = block
       part.nodes = []
