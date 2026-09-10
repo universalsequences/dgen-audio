@@ -82,6 +82,11 @@ open class Graph {
     /// divides the frame index by this hop. Cells absent here use hop = 1.
     public var frameAwareCellHops: [CellID: Int] = [:]
 
+    /// Persistent producer clocks for C streaming hop slices. Local frame zero
+    /// need not be a tick when a process call starts partway through a hop.
+    /// Batch/GPU tensors without a streaming clock retain frame-index masks.
+    public var frameAwareCellClocks: [CellID: NodeID] = [:]
+
     /// Hop-sliced cells whose frame-rate reads must **zero-fill** between hop
     /// ticks instead of holding the tick's value.
     ///

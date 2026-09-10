@@ -140,6 +140,9 @@ extension TensorMemoryMaterializationPass {
         // adjoints alike, and is what keeps the two mutually consistent.
         if hop > 1 {
           graph.frameAwareCellScatter.insert(realCellId)
+          if backend == .c, let nodeId, let clock = hopBasedNodes[nodeId]?.1 {
+            graph.frameAwareCellClocks[realCellId] = clock
+          }
         }
       }
 

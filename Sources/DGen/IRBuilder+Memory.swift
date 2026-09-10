@@ -172,13 +172,22 @@ extension IRBuilder {
   /// discarded by the forward (adjoint) — so a frame-rate reader must see zero.
   /// See `Graph.frameAwareCellScatter` for the full argument.
   ///
-  /// The tick test matches `overlapAddGradGather`'s (`frame % hop == 0`); inside
-  /// a hop-gated block it is always true, so this costs nothing there.
+  /// Streaming C tensors use their persistent producer clock. Batch tensors
+  /// use `frame % hop == 0`, matching `overlapAddGradGather`'s adjoint.
   private func scatterMaskedRead(cellId: CellID, frameIdx: Expr, value: Expr) -> Expr {
     guard let hop = ctx.g.frameAwareCellHops[cellId], hop > 1,
       ctx.g.frameAwareCellScatter.contains(cellId)
     else { return value }
     let zero = constant(0.0)
+    if let clock = ctx.g.frameAwareCellClocks[cellId] {
+      guard let clockValue = ctx.values[clock] else {
+        fatalError("Hop scatter clock \(clock) was not emitted before cell \(cellId)")
+      }
+      // An explicit frame index can differ from the current loop's frame.
+      // Read the saved clock at that index, not its final persistent state.
+      let phase = tapeLoad(self.value(clockValue), at: frameIdx)
+      return gswitch(phase == zero, value, zero)
+    }
     let frameFloat = cast(frameIdx, to: .float)
     let hopFloat = constant(Float(hop))
     let isTick = (frameFloat - floor(frameFloat / hopFloat) * hopFloat) == zero

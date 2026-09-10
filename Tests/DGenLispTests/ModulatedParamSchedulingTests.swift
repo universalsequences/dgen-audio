@@ -179,6 +179,57 @@ final class ModulatedParamSchedulingTests: XCTestCase {
       label: "hop-held control -> latch")
   }
 
+  /// Control ticks follow persistent sample time, including calls that begin
+  /// between ticks. A tensor's scatter mask must use the producer's clock,
+  /// rather than restarting at local frame zero on every process call.
+  func testHopTensorLatchPreservesStreamingPhase() throws {
+    let program = """
+      (def input (in 1 @name audio))
+      (def ramp (accum 0.002 0 0 1000))
+      (def control (hop-hold ramp 16))
+      (def modes (+ (iota 4) 1))
+      (def coefficients (cos (* modes control)))
+      (def tick (eq (accum 1 0 0 16) 0))
+      (def held (latch coefficients tick))
+      (out (+ (sum held) (* input 0.01)) 1)
+      """
+    for blockSize in [1, 4, 12, 28, 64, 128] {
+      let output = try render(compile(program, blockSize: blockSize),
+        blockSize: blockSize, blocks: 12, input: 1)
+      var ramp: Float = 0
+      var expected: Float = 0
+      for i in output.indices {
+        if i % 16 == 0 {
+          expected = (1...4).reduce(Float(0.01)) { $0 + cos(Float($1) * ramp) }
+        }
+        XCTAssertEqual(output[i], expected, accuracy: 1e-5,
+          "block \(blockSize), sample \(i): coefficients must hold between global ticks")
+        ramp += 0.002
+      }
+    }
+    // The same compiled kernel also receives shorter calls at runtime. Check
+    // raw hop-domain reads separately: they must scatter zeros, not hold.
+    let scattered = program.replacingOccurrences(of: "(sum held)", with: "(sum (* coefficients input))")
+    let compiledScatter = try compile(scattered, blockSize: 128)
+    let compiledHold = try compile(program, blockSize: 128)
+    for blockSize in [1, 7, 12, 28, 63] {
+      for (compiled, holds) in [(compiledHold, true), (compiledScatter, false)] {
+        let output = try render(compiled, blockSize: blockSize, blocks: 8, input: 1)
+        var ramp: Float = 0
+        var expected: Float = 0
+        for i in output.indices {
+          if i % 16 == 0 {
+            expected = (1...4).reduce(Float(0)) { $0 + cos(Float($1) * ramp) }
+          }
+          let wanted: Float = 0.01 + ((holds || i % 16 == 0) ? expected : 0)
+          XCTAssertEqual(output[i], wanted, accuracy: 1e-5,
+            "short call \(blockSize), sample \(i), hold=\(holds)")
+          ramp += 0.002
+        }
+      }
+    }
+  }
+
   /// `(sum (* a b))` where `b` is a per-frame tensor whose only graph consumer
   /// is the product itself. The fused reduce reads `b` from memory in its own
   /// block, so `b`'s producer must store it.
