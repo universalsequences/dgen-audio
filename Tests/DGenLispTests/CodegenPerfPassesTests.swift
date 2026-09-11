@@ -78,6 +78,7 @@ final class CodegenPerfPassesTests: XCTestCase {
   /// the memory pointer before each so tests can move parameters mid-stream.
   private func render(
     _ compiled: Compiled, blockSize: Int = 64, blocks: Int = 4,
+    sampleRate: Float? = nil,
     beforeBlock: (Int, UnsafeMutablePointer<Float>) -> Void = { _, _ in }
   ) throws -> [Float] {
     let runtime = try CLazyRuntime(
@@ -85,7 +86,7 @@ final class CodegenPerfPassesTests: XCTestCase {
       cellAllocations: compiled.result.cellAllocations,
       memorySize: compiled.result.totalMemorySlots,
       frameCount: blockSize,
-      defaultHostSampleRate: DGenConfig.sampleRate)
+      defaultHostSampleRate: sampleRate ?? DGenConfig.sampleRate)
     runtime.zeroAllBuffers()
     guard let mem = runtime.memoryPointer(), let out = runtime.outputsPointer() else {
       XCTFail("runtime has no memory/output pointers")
@@ -154,6 +155,102 @@ final class CodegenPerfPassesTests: XCTestCase {
   }
 
   // MARK: - Static hoisting
+
+  func testConstantTensorMaskIsHoistedAwayFromFrameCounter() throws {
+    // A scalar history makes block formation conservatively mark the tensor
+    // arithmetic sequential too. Without tensor hoisting the mask shares the
+    // clock's frame loop, exactly as the causal Filter Table's cepstral mask.
+    let source = """
+      (def idx (iota 16))
+      (def mask (+ (+ (eq idx 0) (eq idx 8))
+                   (* 2 (* (gte idx 1) (lte idx 7)))))
+      (make-history clock)
+      (def counter (write-history clock (% (+ (read-history clock) 1) 8)))
+      (out (sum (* mask (+ counter 1))) 1)
+      """
+    let optimized = try compile(source)
+    setenv("DGEN_NO_STATIC_HOIST", "1", 1)
+    let reference = try compile(source)
+    unsetenv("DGEN_NO_STATIC_HOIST")
+
+    let comparisons = optimized.result.graph.nodes.values.filter { node in
+      guard case .tensor = node.shape else { return false }
+      switch node.op {
+      case .eq, .gte, .lte: return true
+      default: return false
+      }
+    }
+    XCTAssertEqual(comparisons.count, 4)
+    for node in comparisons {
+      let block = try XCTUnwrap(optimized.result.blocks.first { $0.nodes.contains(node.id) })
+      XCTAssertEqual(block.temporality, .static_, "constant mask inherited the counter's rate")
+    }
+    let got = try render(optimized)
+    XCTAssertEqual(got, try render(reference))
+    XCTAssertEqual(Set(got), Set((1...8).map { Float($0 * 16) }))
+  }
+
+  func testHoistedTensorBroadcastFollowsHostUpdates() throws {
+    let source = """
+      (param gain @default 1 @min 0 @max 4)
+      (def rows (+ (* (tensor @shape [2 1] @data [1 2]) gain) (/ samplerate 1024)))
+      (def weights (+ rows (iota 4)))
+      (make-history clock)
+      (def counter (write-history clock (% (+ (read-history clock) 1) 8)))
+      (out (sum (* weights (+ counter 1))) 1)
+      """
+    let optimized = try compile(source)
+    setenv("DGEN_NO_STATIC_HOIST", "1", 1)
+    let reference = try compile(source)
+    unsetenv("DGEN_NO_STATIC_HOIST")
+    let cell = try XCTUnwrap(optimized.paramCells["gain"])
+    let refCell = try XCTUnwrap(reference.paramCells["gain"])
+    func tableCell(_ compiled: Compiled) throws -> Int {
+      let tensor = try XCTUnwrap(compiled.result.graph.tensors.values.first {
+        $0.shape == [2, 1] && $0.data == [1, 2]
+      })
+      return try XCTUnwrap(compiled.result.cellAllocations.cellMappings[tensor.cellId])
+    }
+    let table = try tableCell(optimized)
+    let refTable = try tableCell(reference)
+    for rate: Float in [32_000, 48_000] {
+      let got = try render(optimized, sampleRate: rate) { block, memory in
+        memory[cell] = block < 2 ? 1 : 3
+        if block == 3 { memory[table] = 2; memory[table + 1] = 4 }
+      }
+      let want = try render(reference, sampleRate: rate) { block, memory in
+        memory[refCell] = block < 2 ? 1 : 3
+        if block == 3 { memory[refTable] = 2; memory[refTable + 1] = 4 }
+      }
+      XCTAssertEqual(got, want)
+      for index in got.indices {
+        let gain: Float = index < 128 ? 1 : 3
+        let tableScale: Float = index < 192 ? 1 : 2
+        let weightSum = 12 * gain * tableScale + 8 * rate / 1024 + 12
+        XCTAssertEqual(got[index], weightSum * Float((index + 1) % 8 + 1))
+      }
+    }
+  }
+
+  func testFrameVaryingTensorComparisonIsNotHoisted() throws {
+    let source = """
+      (make-history clock)
+      (def counter (write-history clock (% (+ (read-history clock) 1) 16)))
+      (def mask (eq (iota 16) counter))
+      (out (sum (* mask (+ counter 1))) 1)
+      """
+    let optimized = try compile(source)
+    let comparison = try XCTUnwrap(optimized.result.graph.nodes.values.first {
+      if case .eq = $0.op { return true }
+      return false
+    })
+    let block = try XCTUnwrap(optimized.result.blocks.first { $0.nodes.contains(comparison.id) })
+    XCTAssertEqual(block.temporality, .frameBased)
+    let got = try render(optimized)
+    XCTAssertEqual(got, (0..<256).map { Float(($0 + 1) % 16 + 1) })
+    let single = try render(try compile(source, blockSize: 1), blockSize: 1, blocks: 256)
+    XCTAssertEqual(got, single)
+  }
 
   func testFrameInvariantMathIsHoistedAndFollowsParamChanges() throws {
     let source = """

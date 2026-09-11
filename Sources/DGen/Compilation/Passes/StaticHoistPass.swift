@@ -1,6 +1,6 @@
 import Foundation
 
-/// Lifts frame-invariant scalar math out of the per-sample loops.
+/// Lifts frame-invariant scalar and tensor math out of the per-sample loops.
 ///
 /// `partitionIntoBlocks` groups nodes by adjacency in topological order, so a
 /// parameter read, a `heat-db`-style exponential on it, or an envelope
@@ -10,10 +10,15 @@ import Foundation
 /// ones, and the C renderer broadcasts static globals into SIMD loops from lane
 /// zero, so the only missing piece is forming such a block.
 ///
-/// A node is hoistable when it is scalar, has no temporal dependencies, is not
-/// frame- or hop-based, is not scheduled sequentially, uses an op from a pure
+/// A node is hoistable when it has no temporal dependencies, is not
+/// frame- or hop-based, uses an op from a pure
 /// allowlist, and every value input is itself hoistable. Hoistable nodes depend
 /// only on hoistable nodes, so emitting them all first is a valid schedule.
+/// Stored tensors may change between process calls (host parameter updates),
+/// but tensors written by the graph and streaming views must remain in place.
+/// Sequential frame order alone does not imply a changing value: tensor math
+/// is conservatively marked sequential when a graph contains scalar feedback.
+/// The closed dependency proof, not that scheduling choice, establishes safety.
 /// `DGEN_NO_STATIC_HOIST=1` disables the pass for A/B measurement.
 enum StaticHoistPass {
 
@@ -36,25 +41,31 @@ enum StaticHoistPass {
   /// Returns the hoistable nodes in `sortedNodes` order.
   static func hoistableNodes(
     graph: Graph, sortedNodes: [NodeID], frameBasedNodes: Set<NodeID>,
-    hopBasedNodes: [NodeID: (Int, NodeID)], scalarNodeSet: Set<NodeID>
+    hopBasedNodes: [NodeID: (Int, NodeID)]
   ) -> [NodeID] {
     var hoistable = Set<NodeID>()
     var ordered: [NodeID] = []
     for id in sortedNodes {
       guard let node = graph.nodes[id],
-        isHoistableOp(node.op),
+        isHoistableOp(node.op) || isStoredTensorRead(node, graph: graph),
         node.temporalDependencies.isEmpty,
-        graph.nodeToTensor[id] == nil,
         !frameBasedNodes.contains(id),
         hopBasedNodes[id] == nil,
-        !scalarNodeSet.contains(id),
         !graph.materializeNodes.contains(id),
         node.inputs.allSatisfy({ hoistable.contains($0) })
       else { continue }
-      if case .tensor? = node.shape { continue }
       hoistable.insert(id)
       ordered.append(id)
     }
     return ordered
+  }
+
+  private static func isStoredTensorRead(_ node: Node, graph: Graph) -> Bool {
+    guard case .tensorRef(let tensorId) = node.op,
+      let tensor = graph.tensors[tensorId],
+      node.inputs.isEmpty, tensor.transforms.isEmpty,
+      !graph.mutableTensorCells.contains(tensor.cellId)
+    else { return false }
+    return true
   }
 }

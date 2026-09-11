@@ -207,16 +207,15 @@ public struct CompilationPipeline {
     // peeled parallel blocks (undeclared simd temps), so C keeps the pre-peel
     // layout.
     let peelHopNodes = backend == .metal ? nodeTemporality.hopBasedNodes : [:]
-    // Frame-invariant scalar math is emitted once per process call in a leading
-    // static block instead of being recomputed inside a frame loop.
+    // Frame-invariant math is emitted once per process call in leading static
+    // blocks instead of being recomputed inside a frame loop.
     let hoisted: [NodeID] =
       (backend == .c && StaticHoistPass.isEnabled)
       ? timings.measure("staticHoist") {
         StaticHoistPass.hoistableNodes(
           graph: graph, sortedNodes: prep.sortedNodes,
           frameBasedNodes: nodeTemporality.frameBasedNodes,
-          hopBasedNodes: nodeTemporality.hopBasedNodes,
-          scalarNodeSet: finalScalarSet)
+          hopBasedNodes: nodeTemporality.hopBasedNodes)
       } : []
     let hoistedSet = Set(hoisted)
     let loopNodes = hoistedSet.isEmpty
@@ -239,7 +238,10 @@ public struct CompilationPipeline {
     if !hoisted.isEmpty {
       var staticBlock = Block(frameOrder: .parallel)
       staticBlock.nodes = hoisted
-      finalBlocks.insert(staticBlock, at: 0)
+      // Hoisted tensors still need ordinary shape/reduction boundaries and
+      // their own element iterators. Keep these blocks outside frame loops.
+      let staticBlocks = determineTensorBlocks([staticBlock], graph, context)
+      finalBlocks.insert(contentsOf: staticBlocks, at: 0)
       if options.debug {
         print("[static-hoist] hoisted \(hoisted.count) frame-invariant nodes")
       }
