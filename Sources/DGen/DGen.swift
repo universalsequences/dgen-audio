@@ -50,6 +50,12 @@ open class Graph {
     /// Used for FFT/IFFT nodes and operations that inherit hop-based temporality
     public var nodeHopRate: [NodeID: (Int, NodeID)] = [:]
 
+    /// Aperiodic clocks have no minimum spacing beyond one sample. Their
+    /// hop metadata uses a dense storage stride of one, while the clock still
+    /// gates execution. Sharing a trigger shares the exact same clock domain.
+    public var eventHoldClocks: [NodeID: NodeID] = [:]
+    public var eventClockNodes: Set<NodeID> = []
+
     /// Tracks buffer position dependencies for slidingWindow circular buffer mode.
     /// Maps bufferView result nodes to their writePos accum nodes.
     /// Propagated via temporalDependencies so defineGlobal/loadGlobal wiring works.
@@ -131,6 +137,7 @@ open class Graph {
     /// Last node ID before gradient nodes were added.
     /// Used to separate forward and gradient node ordering during compilation.
     public var lastForwardNodeId: NodeID?
+    public internal(set) var hasComputedGradients = false
 
     /// Conv2d nodes the Conv2DPass has annotated for SIMD-unrolled emission.
     public var simdOptimizedConv2Ds: Set<NodeID> = []
@@ -157,6 +164,9 @@ open class Graph {
     /// Reset node and cell counters for graph reuse
     /// Call this when clearing the graph to start fresh with IDs
     public func resetCounters() {
+        eventHoldClocks.removeAll()
+        eventClockNodes.removeAll()
+        hasComputedGradients = false
         next = 0
         nextCellId = 0
         nextLazyCellId = -1

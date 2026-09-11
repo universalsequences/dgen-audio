@@ -297,11 +297,9 @@ public class CRenderer: Renderer {
       resetCurrentBlockState()
     }
 
-    // Mixed-demand fragments from a sequential region cannot each run a whole
-    // block. Reduce predicates first, then execute all fragments per sample.
-    let frameGroups = Dictionary(grouping: uopBlocks.indices.filter {
-      uopBlocks[$0].executionFrameGroup != nil
-    }, by: { uopBlocks[$0].executionFrameGroup! })
+    // Fragments of one feedback region share a sample loop, even when their
+    // execution demands or update clocks differ. Running a fragment across
+    // the whole call first would turn a one-sample history into a block delay.
     func appendFrameGroup(_ indices: [Int]) {
       closeOpenScope()
       if gateOpen { scheduleItem.ops.append(UOp(op: .endIf, value: .empty)); gateOpen = false }
@@ -315,12 +313,21 @@ public class CRenderer: Renderer {
       scheduleItem.ops.append(UOp(op: .beginLoop(frameCountUOp, 1), value: .empty))
       for (offset, index) in indices.enumerated() {
         let block = uopBlocks[index]
-        precondition(block.vectorWidth == 1 && block.temporality == .frameBased,
-          "execution frame groups require scalar frame-based fragments")
+        precondition(block.vectorWidth == 1, "sequential frame groups require scalar frame loops")
         if let predicate = predicates[offset] {
           scheduleItem.ops.append(UOp(op: .beginIf(predicate), value: .empty))
         }
-        appendBlockOps(block)
+        if case .hopBased(_, let clock) = block.temporality {
+          guard let counter = ctx.values[clock] else {
+            preconditionFailure("missing sequential frame group clock")
+          }
+          appendHoistedCounterLoad(counterLazy: counter, from: [block])
+          scheduleItem.ops.append(UOp(op: .beginHopCheck(counter), value: .empty))
+          appendBlockOps(block)
+          scheduleItem.ops.append(UOp(op: .endHopCheck, value: .empty))
+        } else {
+          appendBlockOps(block)
+        }
         if predicates[offset] != nil {
           scheduleItem.ops.append(UOp(op: .endIf, value: .empty))
         }
@@ -331,14 +338,11 @@ public class CRenderer: Renderer {
     for region in scheduledRegions {
       switch region {
       case .block(let index):
-        if let group = uopBlocks[index].executionFrameGroup {
-          let indices = frameGroups[group]!
-          if index == indices.first { appendFrameGroup(indices) }
-        } else {
-          appendNormalBlock(uopBlocks[index])
-        }
+        appendNormalBlock(uopBlocks[index])
       case .hopIsland(let island):
         appendHopIsland(island)
+      case .sequentialFrameGroup(let indices):
+        appendFrameGroup(indices)
       }
     }
 

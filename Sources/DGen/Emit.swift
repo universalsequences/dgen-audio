@@ -5,9 +5,15 @@ extension LazyOp {
     guard let node = g.nodes[nodeId] else { return [] }
 
     // collect operands
-    let inputs: [Lazy] = node.inputs.compactMap { ctx.values[$0] }
     var ops: [UOp] = []
     let b = IRBuilder(ctx: ctx, nodeId: nodeId)
+    let inputs: [Lazy] = node.inputs.compactMap { input in
+      guard let value = ctx.values[input] else { return nil }
+      guard let rate = ctx.hopBasedNodes[input], g.eventClockNodes.contains(rate.1),
+        ctx.hopBasedNodes[nodeId]?.1 != rate.1,
+        g.nodeToTensor[input] == nil, let clock = ctx.values[rate.1] else { return value }
+      return b.gswitch(b.value(clock) == b.constant(0), b.value(value), b.constant(0)).lazy
+    }
 
     switch self {
     // MARK: - Early returns

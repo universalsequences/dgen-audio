@@ -74,7 +74,7 @@ extension TemporalityPass {
   }
 
   /// Infers node temporality from intrinsic op properties and input propagation.
-  static func inferTemporality(graph: Graph, sortedNodes: [NodeID]) -> TemporalityResult {
+  static func inferTemporality(graph: Graph, sortedNodes: [NodeID]) throws -> TemporalityResult {
     var frameBasedNodes = Set<NodeID>()
     var hopBasedNodes: [NodeID: (Int, NodeID)] = [:]
     var hopProducingNodes: [NodeID: (Int, NodeID)] = [:]
@@ -138,6 +138,11 @@ extension TemporalityPass {
       }
 
       if !hopInputRates.isEmpty {
+        let clocks = Set(hopInputRates.map { $0.1 })
+        if clocks.count > 1, !clocks.isDisjoint(with: graph.eventClockNodes) {
+          throw DGenError.compilationFailed(
+            "Independent event/hop clocks must be latched to frame rate before combining them (node \(nodeId))")
+        }
         let fastestRate = hopInputRates.min(by: { $0.0 < $1.0 })!
         hopBasedNodes[nodeId] = fastestRate
 
@@ -145,6 +150,19 @@ extension TemporalityPass {
         if !node.inputs.contains(counterNode) {
           graph.nodes[nodeId]?.temporalDependencies.append(counterNode)
         }
+      }
+    }
+
+    // A scalar produced only on event frames also needs its clock at a
+    // frame-rate consumer. The value tape may contain an earlier call's data
+    // on skipped frames, so the read must be masked there just like a tensor.
+    for id in sortedNodes {
+      guard let node = graph.nodes[id] else { continue }
+      for input in node.inputs {
+        guard let rate = hopBasedNodes[input], graph.eventClockNodes.contains(rate.1),
+          hopBasedNodes[id]?.1 != rate.1,
+          !node.allDependencies.contains(rate.1) else { continue }
+        graph.nodes[id]?.temporalDependencies.append(rate.1)
       }
     }
 
@@ -191,7 +209,9 @@ extension TemporalityPass {
     guard !hopBasedNodes.isEmpty else { return false }
     var result: [Block] = []
     var didSplit = false
+    var nextGroup = (blocks.compactMap { $0.sequentialFrameGroup }.max() ?? -1) + 1
     for block in blocks {
+      let firstPart = result.count
       guard block.nodes.contains(where: { hopBasedNodes[$0] != nil }),
         block.nodes.contains(where: { frameBasedNodes.contains($0) })
       else {
@@ -239,6 +259,11 @@ extension TemporalityPass {
       if !part.nodes.isEmpty {
         retagShape(&part)
         result.append(part)
+      }
+      if block.frameOrder == .sequential, result.count - firstPart > 1 {
+        let group = block.sequentialFrameGroup ?? nextGroup
+        if block.sequentialFrameGroup == nil { nextGroup += 1 }
+        for index in firstPart..<result.count { result[index].sequentialFrameGroup = group }
       }
     }
     if didSplit { blocks = result }

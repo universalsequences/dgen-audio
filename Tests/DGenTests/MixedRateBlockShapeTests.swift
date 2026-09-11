@@ -40,7 +40,7 @@ final class MixedRateBlockShapeTests: XCTestCase {
     block.nodes = [hopTensor, history, value, write, nextTensor]
     block.shape = [64]
     block.tensorIndex = context.useVariable(src: nil)
-    block.executionFrameGroup = 7
+    block.sequentialFrameGroup = 7
     var blocks = [block]
     XCTAssertTrue(TemporalityPass.splitMixedRateBlocks(
       blocks: &blocks, context: context,
@@ -53,6 +53,29 @@ final class MixedRateBlockShapeTests: XCTestCase {
     XCTAssertEqual(blocks[2].shape, [32])
     XCTAssertNotNil(blocks[0].tensorIndex)
     XCTAssertNotNil(blocks[2].tensorIndex)
-    XCTAssertTrue(blocks.allSatisfy { $0.frameOrder == .sequential && $0.executionFrameGroup == 7 })
+    XCTAssertTrue(blocks.allSatisfy { $0.frameOrder == .sequential && $0.sequentialFrameGroup == 7 })
   }
+  func testBufferReuseKeepsEveryFeedbackFragmentLiveForWholeSampleLoop() throws {
+    let zero = Lazy.constant(0, 0)
+    let one = Lazy.constant(1, 1)
+    var blocks = [
+      BlockUOps(ops: [UOp(op: .memoryWrite(10, zero, one), value: .empty)],
+        frameOrder: .sequential, vectorWidth: 1, temporality: .static_, dispatchMode: .singleThreaded),
+      BlockUOps(ops: [UOp(op: .memoryRead(10, zero), value: .variable(2, nil))],
+        frameOrder: .sequential, vectorWidth: 1, temporality: .frameBased, dispatchMode: .singleThreaded),
+      BlockUOps(ops: [UOp(op: .memoryWrite(20, zero, one), value: .empty)],
+        frameOrder: .sequential, vectorWidth: 1,
+        temporality: .hopBased(hopSize: 16, counterNode: 100), dispatchMode: .singleThreaded),
+      BlockUOps(ops: [UOp(op: .memoryRead(20, zero), value: .variable(3, nil))],
+        frameOrder: .sequential, vectorWidth: 1, temporality: .frameBased, dispatchMode: .singleThreaded),
+    ]
+    for index in 1..<blocks.count { blocks[index].sequentialFrameGroup = 7 }
+    let allocations = remapVectorMemorySlots(&blocks, cellSizes: [10: 64, 20: 32],
+      voiceCellId: nil, enableBufferReuse: true)
+    let first = try XCTUnwrap(allocations.cellMappings[10])
+    let second = try XCTUnwrap(allocations.cellMappings[20])
+    XCTAssertTrue(first + 64 <= second || second + 32 <= first,
+      "a later fragment's write must not corrupt the preceding fragment's next sample")
+  }
+
 }

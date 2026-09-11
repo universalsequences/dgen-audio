@@ -240,7 +240,7 @@ final class ShapeInferenceTests: XCTestCase {
         XCTAssertTrue(TemporalityPass.isIntrinsicallyFrameBased(.historyRead(0)))
     }
 
-    func testTemporalityPropagates() {
+    func testTemporalityPropagates() throws {
         let g = Graph()
 
         // Create: phasor -> mul scalar -> output
@@ -252,7 +252,7 @@ final class ShapeInferenceTests: XCTestCase {
         let scaled = g.n(.mul, phasor, scale)
 
         let sortedNodes = [freq, phasor, scale, scaled]
-        let temporalityResult = TemporalityPass.inferTemporality(graph: g, sortedNodes: sortedNodes)
+        let temporalityResult = try TemporalityPass.inferTemporality(graph: g, sortedNodes: sortedNodes)
         let frameBased = temporalityResult.frameBasedNodes
 
         XCTAssertFalse(frameBased.contains(freq))  // constant is static

@@ -175,9 +175,8 @@ extension IRBuilder {
   /// Streaming C tensors use their persistent producer clock. Batch tensors
   /// use `frame % hop == 0`, matching `overlapAddGradGather`'s adjoint.
   private func scatterMaskedRead(cellId: CellID, frameIdx: Expr, value: Expr) -> Expr {
-    guard let hop = ctx.g.frameAwareCellHops[cellId], hop > 1,
-      ctx.g.frameAwareCellScatter.contains(cellId)
-    else { return value }
+    guard ctx.g.frameAwareCellScatter.contains(cellId) else { return value }
+    let hop = ctx.g.frameAwareCellHops[cellId] ?? 1
     let zero = constant(0.0)
     if let clock = ctx.g.frameAwareCellClocks[cellId] {
       guard let clockValue = ctx.values[clock] else {

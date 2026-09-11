@@ -131,7 +131,7 @@ final class BlockFormationTests: XCTestCase {
         printBlockStructure(blocks: tensorBlocks, graph: g, scalarSet: scalarNodeSet, title: "After determineTensorBlocks")
 
         // Step 10: Infer temporality
-        let temporalityResult = TemporalityPass.inferTemporality(graph: g, sortedNodes: sortedNodes)
+        let temporalityResult = try TemporalityPass.inferTemporality(graph: g, sortedNodes: sortedNodes)
         let frameBasedNodes = temporalityResult.frameBasedNodes
         print("\n=== Frame-Based Nodes ===")
         for nodeId in frameBasedNodes.sorted() {
@@ -330,7 +330,7 @@ final class BlockFormationTests: XCTestCase {
         let context = IRContext(g: g)
         let tensorBlocks = determineTensorBlocks(reFusedBlocks, g, context)
 
-        let temporalityResult = TemporalityPass.inferTemporality(graph: g, sortedNodes: sortedNodes)
+        let temporalityResult = try TemporalityPass.inferTemporality(graph: g, sortedNodes: sortedNodes)
         var finalBlocks = tensorBlocks
         TemporalityPass.assignBlockTemporality(
             blocks: &finalBlocks,
@@ -381,7 +381,7 @@ final class BlockFormationTests: XCTestCase {
         let context = IRContext(g: g)
         let tensorBlocks = determineTensorBlocks(reFusedBlocks, g, context)
 
-        let temporalityResult = TemporalityPass.inferTemporality(graph: g, sortedNodes: sortedNodes)
+        let temporalityResult = try TemporalityPass.inferTemporality(graph: g, sortedNodes: sortedNodes)
         var finalBlocks = tensorBlocks
         TemporalityPass.assignBlockTemporality(
             blocks: &finalBlocks,
@@ -601,7 +601,7 @@ final class BlockFormationTests: XCTestCase {
         let context = IRContext(g: g)
         var tensorBlocks = determineTensorBlocks(reFusedBlocks, g, context)
 
-        let temporalityResult = TemporalityPass.inferTemporality(graph: g, sortedNodes: sortedNodes)
+        let temporalityResult = try TemporalityPass.inferTemporality(graph: g, sortedNodes: sortedNodes)
         TemporalityPass.assignBlockTemporality(
             blocks: &tensorBlocks,
             frameBasedNodes: temporalityResult.frameBasedNodes,

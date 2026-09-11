@@ -162,6 +162,12 @@ func remapVectorMemorySlots(
             blockGroup[idx] = group
           }
           prevKey = nil  // the block after an island always opens a new loop
+        case .sequentialFrameGroup(let indices):
+          group += 1
+          for idx in indices {
+            blockGroup[idx] = group
+          }
+          prevKey = nil
         }
       }
     }
@@ -177,10 +183,11 @@ func remapVectorMemorySlots(
           default:
             break
           }
-          if cellFirstUse[cellId] == nil {
-            cellFirstUse[cellId] = blockGroup[blockIndex]
-          }
-          cellLastUse[cellId] = blockGroup[blockIndex]
+          // Regions may move independent setup before a hop island, so source
+          // block order need not be execution order.
+          let group = blockGroup[blockIndex]
+          cellFirstUse[cellId] = min(cellFirstUse[cellId] ?? group, group)
+          cellLastUse[cellId] = max(cellLastUse[cellId] ?? group, group)
         }
       }
     }

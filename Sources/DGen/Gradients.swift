@@ -54,6 +54,7 @@ extension Graph {
   ///   - targets: Set of nodes we want gradients for (e.g., parameters)
   /// - Returns: Dictionary mapping forward NodeID -> gradient NodeID
   public func computeGradients(loss: NodeID, targets: Set<NodeID>) -> [NodeID: NodeID] {
+    hasComputedGradients = true
     var grads: [NodeID: NodeID] = [:]
     gradientSideEffects = []
 

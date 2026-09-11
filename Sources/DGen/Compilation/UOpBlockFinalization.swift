@@ -72,7 +72,7 @@ extension UOpBlockFinalization {
       dispatchMode: dispatchMode
     )
     result.executionDemand = block.executionDemand
-    result.executionFrameGroup = block.executionFrameGroup
+    result.sequentialFrameGroup = block.sequentialFrameGroup
     return result
   }
 

@@ -138,7 +138,7 @@ extension TensorMemoryMaterializationPass {
         // see zero in between rather than the held tick value. See
         // `Graph.frameAwareCellScatter` — this holds for forward tensors and
         // adjoints alike, and is what keeps the two mutually consistent.
-        if hop > 1 {
+        if hop > 1 || nodeId.flatMap({ hopBasedNodes[$0]?.1 }).map({ graph.eventClockNodes.contains($0) }) == true {
           graph.frameAwareCellScatter.insert(realCellId)
           if backend == .c, let nodeId, let clock = hopBasedNodes[nodeId]?.1 {
             graph.frameAwareCellClocks[realCellId] = clock

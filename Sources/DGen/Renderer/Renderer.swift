@@ -2,7 +2,7 @@ import Foundation
 
 public struct BlockUOps {
   public var executionDemand = ExecutionDemand.always
-  public var executionFrameGroup: Int?
+  public var sequentialFrameGroup: Int?
   public var ops: [UOp]
   public let frameOrder: FrameOrder
   public let vectorWidth: Int

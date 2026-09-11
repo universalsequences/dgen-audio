@@ -51,7 +51,7 @@ enum ExecutionGatePass {
           if !internalConditions.isEmpty {
             throw DGenError.compilationFailed("block-gate predicate must be available before its feedback region")
           }
-          for i in result.indices { result[i].executionFrameGroup = index }
+          for i in result.indices { result[i].sequentialFrameGroup = index }
         }
         return result
       }

@@ -76,7 +76,7 @@ enum ScalarBlockCoalescingPass {
     }
 
     for (index, block) in blocks.enumerated() {
-      if block.executionFrameGroup != nil {
+      if block.sequentialFrameGroup != nil {
         flush()
         result.append(block)
         continue
@@ -97,7 +97,7 @@ enum ScalarBlockCoalescingPass {
       }
       // Parallel: absorb only when small and adjacent to a sequential run.
       let nextIsSequential =
-        index + 1 < blocks.count && blocks[index + 1].executionFrameGroup == nil && plain[index + 1] && blocks[index + 1].executionDemand == block.executionDemand && blocks[index + 1].frameOrder == .sequential
+        index + 1 < blocks.count && blocks[index + 1].sequentialFrameGroup == nil && plain[index + 1] && blocks[index + 1].executionDemand == block.executionDemand && blocks[index + 1].frameOrder == .sequential
       let small = block.nodes.count <= threshold
       if small && (run != nil || nextIsSequential) {
         if run != nil {

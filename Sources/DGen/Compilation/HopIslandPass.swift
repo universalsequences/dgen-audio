@@ -21,6 +21,7 @@ public struct HopIsland: Equatable {
 public enum ScheduledRegion: Equatable {
   case block(Int)
   case hopIsland(HopIsland)
+  case sequentialFrameGroup([Int])
 }
 
 enum HopIslandPass {}
@@ -53,6 +54,23 @@ extension HopIslandPass {
     }
 
     for (index, block) in blocks.enumerated() {
+      // A split feedback region owns one frame loop across all its fragments.
+      // An opportunistic hop island must never pull part of that loop away.
+      if let group = block.sequentialFrameGroup {
+        flushPending()
+        if index > 0, blocks[index - 1].sequentialFrameGroup == group {
+          guard case .sequentialFrameGroup(var indices) = regions.removeLast() else {
+            preconditionFailure("sequential frame group fragments must remain adjacent")
+          }
+          indices.append(index)
+          regions.append(.sequentialFrameGroup(indices))
+        } else {
+          precondition(!blocks[..<index].contains { $0.sequentialFrameGroup == group },
+            "sequential frame group fragments must remain adjacent")
+          regions.append(.sequentialFrameGroup([index]))
+        }
+        continue
+      }
       guard let domain = hopDomain(for: block), isIslandEligible(block) else {
         if hopDomain(for: block) != nil {
           flushPending()

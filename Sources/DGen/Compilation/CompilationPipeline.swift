@@ -199,8 +199,8 @@ public struct CompilationPipeline {
     // hop-rate tensor math out of sequential scalar blocks (see
     // peelHopTensorRuns) instead of discovering the classification only
     // after blocks are frozen.
-    let nodeTemporality = timings.measure("inferTemporality") {
-      TemporalityPass.inferTemporality(graph: graph, sortedNodes: prep.sortedNodes)
+    let nodeTemporality = try timings.measure("inferTemporality") {
+      try TemporalityPass.inferTemporality(graph: graph, sortedNodes: prep.sortedNodes)
     }
     // The hop-tensor peel targets Metal's dispatch model (per-frame threads +
     // block-level hop guard). The C renderer's SIMD lowering cannot consume the
@@ -366,7 +366,13 @@ public struct CompilationPipeline {
   /// using them on Metal is a compile-time error directing the user to
   /// tensorFFT instead.
   private static func rejectUnsupportedBackendOps(graph: Graph, backend: Backend) throws {
+    if !graph.eventClockNodes.isEmpty, graph.hasComputedGradients {
+      throw DGenError.compilationFailed("event-hold does not yet support automatic differentiation")
+    }
     guard backend == .metal else { return }
+    if !graph.eventClockNodes.isEmpty {
+      throw DGenError.compilationFailed("event-hold currently requires the C backend")
+    }
     if !graph.executionGates.isEmpty {
       throw DGenError.compilationFailed("block-gate currently requires the C backend")
     }

@@ -150,6 +150,27 @@ extension Tensor {
   }
 }
 
+extension Signal {
+  public func eventHold(when trigger: Signal) -> Signal {
+    let id = graph.graph.eventHold(nodeId, when: trigger.nodeId)
+    return Signal(nodeId: id, graph: graph, requiresGrad: requiresGrad)
+  }
+}
+
+extension SignalTensor {
+  public func eventHold(when trigger: Signal) -> SignalTensor {
+    let id = graph.graph.eventHold(nodeId, when: trigger.nodeId)
+    return SignalTensor(nodeId: id, graph: graph, shape: shape, requiresGrad: requiresGrad)
+  }
+}
+
+extension Tensor {
+  public func eventHold(when trigger: Signal) -> SignalTensor {
+    let id = graph.graph.eventHold(nodeId, when: trigger.nodeId)
+    return SignalTensor(nodeId: id, graph: graph, shape: shape, requiresGrad: requiresGrad)
+  }
+}
+
 // MARK: - Tensor Ops
 
 extension TensorOps {

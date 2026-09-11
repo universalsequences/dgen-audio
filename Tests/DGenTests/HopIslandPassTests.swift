@@ -147,6 +147,17 @@ final class HopIslandPassTests: XCTestCase {
     )
   }
 
+  func testMixedRateFeedbackFragmentsShareOneScheduledRegion() {
+    var frame = block(.frameBased)
+    var hop = block(.hopBased(hopSize: 16, counterNode: 100))
+    frame.sequentialFrameGroup = 3
+    hop.sequentialFrameGroup = 3
+    let blocks = [block(.hopBased(hopSize: 16, counterNode: 100)), frame, hop, frame,
+      block(.hopBased(hopSize: 16, counterNode: 100))]
+    XCTAssertEqual(HopIslandPass.buildRegions(for: blocks),
+      [.block(0), .sequentialFrameGroup([1, 2, 3]), .block(4)])
+  }
+
   private func block(
     _ temporality: Temporality,
     dispatchMode: DispatchMode = .singleThreaded,

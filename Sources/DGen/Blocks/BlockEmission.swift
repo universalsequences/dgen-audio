@@ -355,6 +355,9 @@ private func emitBlockBodyUOps(
 private func determineVectorPlan(
   bodyUops: [UOp], block: Block, graph: Graph, backend: Backend
 ) -> (frameOrder: FrameOrder, vectorWidth: Int, simdIncrement: Int) {
+  if block.sequentialFrameGroup != nil {
+    return (frameOrder: .sequential, vectorWidth: 1, simdIncrement: 1)
+  }
   // View markers can be emitted as shape-transition setup rather than body UOps.
   // Check the graph nodes as well: C's four-wide load assumes contiguous lanes,
   // which is false for shrink/transpose/pad views even when the body only shows
