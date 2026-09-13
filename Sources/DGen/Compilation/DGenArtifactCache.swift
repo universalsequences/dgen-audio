@@ -74,7 +74,7 @@ public final class DGenArtifactCache {
 
   /// Bump when DGen/codegen semantics change in a way the graph fingerprint does
   /// not capture.
-  public static let cacheVersion = 2
+  public static let cacheVersion = 3
 
   /// Enabled by default. Set `PE_DGEN_ARTIFACT_CACHE=0` or `false` to disable
   /// without changing code while comparing preset timing traces.

@@ -3,11 +3,12 @@
 // Emission for .acceleratedFFT / .acceleratedIFFT LazyOps. Both decompose into:
 //   1. A loop that copies the input tensor(s) into owned re/im scratch cells
 //   2. A single `.acceleratedFFTCall` UOp that the CRenderer renders as a call
-//      to vDSP_fft_zip (per-N static FFTSetup, lazy-initialized on first use)
-//   3. For IFFT only, a scale-by-1/N pass over the real output cell
+//      to the runtime host FFT service
+//   3. For IFFT only, a scale-by-1/N pass over the real scratch cell
+//   4. Copy the result into temporality-aware published tensor storage
 //
-// Downstream consumers read the result via tensorRef nodes backed by reCell
-// (and imCell for forward FFT). Fails with a clear error on the Metal backend
+// Downstream tensorRef consumers read published results, never mutable scratch.
+// Fails with a clear error on the Metal backend
 // via MetalRenderer's unsupported-op path.
 
 import Foundation
@@ -18,7 +19,7 @@ extension LazyOp {
     inputs: [Lazy], nodeId: NodeID
   ) throws {
     switch self {
-    case .acceleratedFFT(let N, let reCell, let imCell):
+    case .acceleratedFFT(let N, let reCell, let imCell, let reOutput, let imOutput):
       guard inputs.count == 1 else {
         throw DGenError.insufficientInputs(
           operator: "acceleratedFFT", expected: 1, actual: inputs.count)
@@ -46,16 +47,18 @@ extension LazyOp {
         _ = b.memoryWrite(imCell, i, zero)
       }
 
-      // vDSP_fft_zip forward — rendered directly by CRenderer.
+      // Forward host FFT call, rendered by CRenderer.
       let callUOp = UOp(
         op: .acceleratedFFTCall(
           log2N: log2N, reCell: reCell, imCell: imCell, inverse: false),
         value: ctx.useVariable(src: nil))
       b.ops.append(callUOp)
 
+      try publishFFTResult(reCell, tensorId: reOutput, count: N, b: b, g: g)
+      try publishFFTResult(imCell, tensorId: imOutput, count: N, b: b, g: g)
       b.use(val: zero)
 
-    case .acceleratedIFFT(let N, let reCell, let imCell):
+    case .acceleratedIFFT(let N, let reCell, let imCell, let output):
       guard inputs.count == 2 else {
         throw DGenError.insufficientInputs(
           operator: "acceleratedIFFT", expected: 2, actual: inputs.count)
@@ -92,22 +95,41 @@ extension LazyOp {
         _ = b.memoryWrite(imCell, i, imSample)
       }
 
-      // vDSP_fft_zip inverse — rendered directly by CRenderer.
+      // Inverse host FFT call, rendered by CRenderer.
       let callUOp = UOp(
         op: .acceleratedFFTCall(
           log2N: log2N, reCell: reCell, imCell: imCell, inverse: true),
         value: ctx.useVariable(src: nil))
       b.ops.append(callUOp)
 
-      // Normalize real output by 1/N (vDSP_fft_zip is unnormalized).
+      // The host inverse FFT is unnormalized; normalize the real output by 1/N.
       b.loop(N) { i in
         let v = b.memoryRead(reCell, i)
         _ = b.memoryWrite(reCell, i, v * invN)
       }
 
+      try publishFFTResult(reCell, tensorId: output, count: N, b: b, g: g)
       b.use(val: zero)
 
     default: break
+    }
+  }
+}
+
+/// Copy host-call scratch into the result's temporality-aware allocation.
+private func publishFFTResult(
+  _ scratch: CellID, tensorId: TensorID, count: Int, b: IRBuilder, g: Graph
+) throws {
+  guard let tensor = g.tensors[tensorId], !tensor.isLazy else {
+    throw DGenError.tensorError(op: "acceleratedFFT", reason: "result storage was not materialized")
+  }
+  b.loop(count) { i in
+    let value = b.memoryRead(scratch, i)
+    if let layout = g.frameAwareCells[tensor.cellId] {
+      _ = b.frameAwareTensorWrite(cellId: tensor.cellId, tensorSize: layout.tensorSize,
+                                 elemIdx: i, value: value)
+    } else {
+      _ = b.memoryWrite(tensor.cellId, i, value)
     }
   }
 }

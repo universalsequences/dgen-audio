@@ -1,8 +1,8 @@
 // HigherOps+AcceleratedFFT.swift
 //
-// C-only FFT/IFFT ops backed by Apple's Accelerate framework (vDSP_fft_zip).
+// C-only FFT/IFFT ops backed by the runtime host FFT service.
 // API mirrors tensorFFT/tensorIFFT in HigherOps+FFT.swift: input/output shapes
-// are identical, but the kernel compiles down to a single vDSP call instead of
+// are identical, but the kernel compiles down to a single host FFT call instead of
 // a butterfly decomposition — orders of magnitude smaller generated C code and
 // much faster at runtime. Throws `DGenError.compilationFailed` if used with the
 // Metal backend.
@@ -11,7 +11,7 @@ import Foundation
 
 extension Graph {
 
-  /// N-point forward FFT using Apple's Accelerate framework (vDSP_fft_zip).
+  /// N-point forward FFT using the runtime host FFT service.
   ///
   /// Input must have tensor shape [N] where N is a power of 2.
   /// Returns (re, im) NodeIDs, both shape [N].
@@ -24,32 +24,38 @@ extension Graph {
     let reCell = alloc(vectorWidth: N)
     let imCell = alloc(vectorWidth: N)
 
-    // Side-effect op: reads input tensor, populates re/im cells, calls vDSP.
-    let fftOp = n(
-      .acceleratedFFT(windowSize: N, reCell: reCell, imCell: imCell),
-      [input], shape: .scalar)
-
-    // Re tensor view backed by reCell
+    // Published real result, separate from the in-place host-call scratch.
+    let reOutputCell = reserveLazyCellId()
     let reTensorId = nextTensorId
     nextTensorId += 1
     tensors[reTensorId] = Tensor(
-      id: reTensorId, shape: [N], cellId: reCell,
-      baseShape: [N], transforms: [])
-    cellToTensor[reCell] = reTensorId
+      id: reTensorId, shape: [N], cellId: reOutputCell,
+      baseShape: [N], transforms: [], isLazy: true)
+    cellToTensor[reOutputCell] = reTensorId
 
-    // Im tensor view backed by imCell
+    // Published imaginary result.
+    let imOutputCell = reserveLazyCellId()
     let imTensorId = nextTensorId
     nextTensorId += 1
     tensors[imTensorId] = Tensor(
-      id: imTensorId, shape: [N], cellId: imCell,
-      baseShape: [N], transforms: [])
-    cellToTensor[imCell] = imTensorId
+      id: imTensorId, shape: [N], cellId: imOutputCell,
+      baseShape: [N], transforms: [], isLazy: true)
+    cellToTensor[imOutputCell] = imTensorId
+
+    // Scratch is private to the host FFT call. Published results use ordinary
+    // lazy tensor storage so consumers in another frame loop retain each hop.
+    let fftOp = n(
+      .acceleratedFFT(windowSize: N, reCell: reCell, imCell: imCell,
+                      reOutput: reTensorId, imOutput: imTensorId),
+      [input], shape: .scalar)
 
     // TensorRef nodes chained after fftOp for ordering.
     let reNode = n(.tensorRef(reTensorId), [fftOp], shape: .tensor([N]))
     let imNode = n(.tensorRef(imTensorId), [fftOp], shape: .tensor([N]))
     nodeToTensor[reNode] = reTensorId
+    materializeNodes.insert(reNode)
     nodeToTensor[imNode] = imTensorId
+    materializeNodes.insert(imNode)
 
     if let hopRate = nodeHopRate[input] ?? nodeHopRate[fftOp] {
       nodeHopRate[reNode] = hopRate
@@ -59,7 +65,7 @@ extension Graph {
     return (re: reNode, im: imNode)
   }
 
-  /// N-point inverse FFT using Apple's Accelerate framework (vDSP_fft_zip).
+  /// N-point inverse FFT using the runtime host FFT service.
   ///
   /// Takes (re, im) NodeIDs of shape [N], returns real part of shape [N]
   /// normalized by 1/N. Imaginary part is discarded (correct for real signals).
@@ -72,20 +78,22 @@ extension Graph {
     let reCell = alloc(vectorWidth: N)
     let imCell = alloc(vectorWidth: N)
 
-    let ifftOp = n(
-      .acceleratedIFFT(windowSize: N, reCell: reCell, imCell: imCell),
-      [re, im], shape: .scalar)
-
-    // Only re tensor is exposed (result is real-valued).
+    // Only the real result is exposed. Scratch never aliases published results.
+    let reOutputCell = reserveLazyCellId()
     let reTensorId = nextTensorId
     nextTensorId += 1
     tensors[reTensorId] = Tensor(
-      id: reTensorId, shape: [N], cellId: reCell,
-      baseShape: [N], transforms: [])
-    cellToTensor[reCell] = reTensorId
+      id: reTensorId, shape: [N], cellId: reOutputCell,
+      baseShape: [N], transforms: [], isLazy: true)
+    cellToTensor[reOutputCell] = reTensorId
+
+    let ifftOp = n(
+      .acceleratedIFFT(windowSize: N, reCell: reCell, imCell: imCell, output: reTensorId),
+      [re, im], shape: .scalar)
 
     let reNode = n(.tensorRef(reTensorId), [ifftOp], shape: .tensor([N]))
     nodeToTensor[reNode] = reTensorId
+    materializeNodes.insert(reNode)
 
     if let hopRate = nodeHopRate[re] ?? nodeHopRate[im] ?? nodeHopRate[ifftOp] {
       nodeHopRate[reNode] = hopRate

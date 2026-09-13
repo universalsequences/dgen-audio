@@ -1867,7 +1867,7 @@ final class GraphGradientTests: XCTestCase {
       loss: loss,
       tensorParameters: [studentW1, studentB1, studentW2, studentB2],
       optimizer: GraphSGD(),
-      learningRate: 400.0,  // High LR due to tiny gradients from sigmoid saturation
+      learningRate: 1.0,  // Keep updates within the sigmoid’s unsaturated region.
       frameCount: frameCount,
       kernelDebugOutput: "/tmp/mlp_peekrow_harmonic_graph.metal"
     )

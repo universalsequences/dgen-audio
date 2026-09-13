@@ -148,9 +148,9 @@ final class SpectrumLatchTests: XCTestCase {
 
         let kernelSource = result.source
         let fwdCount =
-            kernelSource.components(separatedBy: "kFFTDirection_Forward").count - 1
+            kernelSource.components(separatedBy: "host->fft_forward_fn(").count - 1
         let invCount =
-            kernelSource.components(separatedBy: "kFFTDirection_Inverse").count - 1
+            kernelSource.components(separatedBy: "host->fft_inverse_fn(").count - 1
         print("latch-freeze FFT sites: forward=\(fwdCount), inverse=\(invCount)")
         XCTAssertEqual(fwdCount, 1, "exactly one forward FFT call site expected")
         XCTAssertEqual(invCount, 1, "exactly one inverse FFT call site expected")
@@ -228,8 +228,8 @@ final class SpectrumLatchTests: XCTestCase {
             options: .init(frameCount: framesPerRun, debug: false))
 
         let src = result.source
-        let fwd = src.components(separatedBy: "kFFTDirection_Forward").count - 1
-        let inv = src.components(separatedBy: "kFFTDirection_Inverse").count - 1
+        let fwd = src.components(separatedBy: "host->fft_forward_fn(").count - 1
+        let inv = src.components(separatedBy: "host->fft_inverse_fn(").count - 1
         XCTAssertEqual(fwd, 1, "forward FFT must appear exactly once (hop-gated)")
         XCTAssertEqual(inv, 1, "inverse FFT must appear exactly once (hop-gated)")
     }

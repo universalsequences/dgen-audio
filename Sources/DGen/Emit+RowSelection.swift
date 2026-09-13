@@ -270,16 +270,19 @@ extension LazyOp {
         cellId: floorGradCell, frameIdx: frameIdx, tensorSize: remainingSize)
       let ceilBase = b.frameAwareBaseFloat(
         cellId: ceilGradCell, frameIdx: frameIdx, tensorSize: remainingSize)
-      let gradReadBase = gradCellId.map {
-        b.frameAwareBaseFloat(cellId: $0, frameIdx: frameIdx, tensorSize: remainingSize)
-      }
-
       b.parallelRange(remainingSize) { elemIdx in
         let elemIdxFloat = b.cast(elemIdx, to: .float)
         let gradValue: Expr
-        if let cellId = gradCellId, let gradReadBase {
-          let readPos = gradReadBase + elemIdxFloat
-          gradValue = b.memoryRead(cellId, b.cast(readPos, to: .int))
+        if let cellId = gradCellId {
+          // Hop adjoints exist only on clock ticks. The ordinary tensor read
+          // applies that scatter gate; a raw read repeats a hop's gradient at
+          // every intervening row index and scatters it into the wrong rows.
+          if let layout = g.frameAwareCells[cellId] {
+            gradValue = b.frameAwareTensorRead(
+              cellId: cellId, tensorSize: layout.tensorSize, elemIdx: elemIdx)
+          } else {
+            gradValue = b.memoryRead(cellId, b.cast(elemIdx, to: .int))
+          }
         } else {
           gradValue = scalarGrad
         }

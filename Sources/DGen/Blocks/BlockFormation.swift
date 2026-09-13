@@ -1192,7 +1192,7 @@ private func appendCurrentGroupingBlockIfNeeded(
   }
 }
 
-/// Assigns tensor loop metadata from the first tensor-shaped node in `block`.
+/// Assigns tensor loop metadata from the first per-element compute node in `block`.
 private func assignTensorIndexFromFirstTensorNode(
   to block: inout Block, graph: Graph, ctx: IRContext
 ) {
@@ -1201,7 +1201,7 @@ private func assignTensorIndexFromFirstTensorNode(
     // Self-iterating ops (delayLine, spectrumDelay, ...) emit their own lane
     // loops; a block whose only tensor work is self-iterating must not get a
     // block-level element loop wrapped around it.
-    if node.op.emitsInternalIteration { continue }
+    if node.op.isViewOnly || node.op.emitsInternalIteration { continue }
     guard block.tensorIndex == nil else { break }
     block.tensorIndex = ctx.useVariable(src: nil)
     block.shape = shape
@@ -1365,16 +1365,22 @@ private func splitScalarBlockForTensorGrouping(
   return result
 }
 
-/// Strip `block.shape` / `block.tensorIndex` when the block contains no node
-/// that genuinely emits per-element work. Otherwise
-/// `wrapBodyUOpsWithTensorLoopIfNeeded` would wrap the block body in a
-/// `parallelRange(shape.size)` wrapper that forces scalar / self-iterating
-/// ops to run `shape.size` times for no reason.
-private func clearWastedTensorLoopMetadata(_ block: inout Block, graph: Graph) {
-  if !blockHasPerElementComputeNode(block, graph: graph) {
-    block.shape = nil
-    block.tensorIndex = nil
+/// Derives the loop extent from compute nodes, never from metadata-only views.
+/// A tensorRef can seed the source shape before a reshape/axis reduction changes
+/// the iteration domain. Keeping that extent makes the reduction write beyond
+/// its output allocation. Blocks with several compute shapes use region loops;
+/// their first compute shape remains the block's representative shape.
+private func normalizeTensorLoopMetadata(_ block: inout Block, graph: Graph) {
+  for nodeId in block.nodes {
+    guard let node = graph.nodes[nodeId],
+      !node.op.isViewOnly, !node.op.emitsInternalIteration,
+      case .tensor(let shape) = node.shape
+    else { continue }
+    block.shape = shape
+    return
   }
+  block.shape = nil
+  block.tensorIndex = nil
 }
 
 /// Groups non-scalar blocks by tensor shape while preserving special-case execution constraints.
@@ -1526,32 +1532,13 @@ private func groupRegularTensorBlock(
   // then `wrapBodyUOpsWithTensorLoopIfNeeded` would still wrap the body in a
   // `parallelRange(tensorRef.size)` — which turns a scalar per-frame input
   // read into `tensorRef.size` iterations of the same store. Strip the
-  // metadata when it would only cause wasted iteration.
+  // metadata when it would only cause wasted iteration, and derive the extent
+  // from the compute shape when views precede the first compute node.
   for i in grouped.indices {
-    clearWastedTensorLoopMetadata(&grouped[i], graph: graph)
+    normalizeTensorLoopMetadata(&grouped[i], graph: graph)
   }
 
   return grouped
-}
-
-/// Returns true iff the block contains at least one node that emits per-element
-/// tensor work driven by the block-level `tensorIndex`.
-///
-/// Skipped:
-/// - tensorRef: just a cell pointer, emits no code.
-/// - view-only ops (reshape/transpose/…): metadata markers, no code.
-/// - ops marked `emitsInternalIteration` (bufferView's seq, FFT/IFFT, overlapAdd,
-///   partitionedSpectralConvolve, gemm/conv self-isolated, spectral-loss
-///   variants, …): these emit their own `b.loop`/`b.parallelRange`/vDSP calls.
-/// - scalar-shape ops (e.g. `.input(0)`): per-frame, not per-element.
-private func blockHasPerElementComputeNode(_ block: Block, graph: Graph) -> Bool {
-  for nodeId in block.nodes {
-    guard let node = graph.nodes[nodeId] else { continue }
-    if node.op.isViewOnly { continue }
-    if node.op.emitsInternalIteration { continue }
-    if case .tensor = node.shape { return true }
-  }
-  return false
 }
 
 /// Annotates/splits blocks for tensor loop emission.
@@ -1720,7 +1707,7 @@ private func determineSequentialBlockParts(
       } else {
         var split = splitScalarBlockForTensorGrouping(part, graph: graph, ctx: ctx)
         for i in split.indices {
-          clearWastedTensorLoopMetadata(&split[i], graph: graph)
+          normalizeTensorLoopMetadata(&split[i], graph: graph)
         }
         determined.append(contentsOf: split)
       }
@@ -1740,7 +1727,7 @@ private func determineSequentialBlockParts(
   // combined `determineVectorPlan` + `hasSIMDBlockers` check keeps
   // SIMD-4 promotion from firing on blocks with internal scalar loops.
   for i in split.indices {
-    clearWastedTensorLoopMetadata(&split[i], graph: graph)
+    normalizeTensorLoopMetadata(&split[i], graph: graph)
   }
   determined.append(contentsOf: split)
   return determined

@@ -149,10 +149,10 @@ public enum LazyOp {
   // Accelerate-framework FFT (C backend only). Calls vDSP_fft_zip for in-place
   // complex FFT. Writes result to reCell/imCell, exposed downstream as two [N]
   // tensorRef views. Forward variant takes a real [N] input (im cleared internally).
-  case acceleratedFFT(windowSize: Int, reCell: CellID, imCell: CellID)
+  case acceleratedFFT(windowSize: Int, reCell: CellID, imCell: CellID, reOutput: TensorID, imOutput: TensorID)
   // Accelerate-framework IFFT (C backend only). Takes two [N] inputs (re, im),
   // calls vDSP_fft_zip with FFT_INVERSE, normalizes by 1/N, returns real [N].
-  case acceleratedIFFT(windowSize: Int, reCell: CellID, imCell: CellID)
+  case acceleratedIFFT(windowSize: Int, reCell: CellID, imCell: CellID, output: TensorID)
 
   // Dedicated hop-rate phase vocoder pitch shifter. Inputs:
   //   [xRe, xIm, pitchRatio, hopCounter]

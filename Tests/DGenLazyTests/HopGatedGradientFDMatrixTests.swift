@@ -74,12 +74,12 @@ final class HopGatedGradientFDMatrixTests: XCTestCase {
     epsilon: Float = 1e-2,
     build: @escaping (Tensor) -> Signal
   ) throws -> (cos: Float, auto: [Float], fd: [Float]) {
-    func run(_ values: [Float]) throws -> (Float, [Float]) {
+    func run(_ values: [Float]) throws -> (Double, [Float]) {
       LazyGraphContext.reset()
       let p = Tensor.param(paramShape, data: values)
       let loss = build(p)
       let perFrame = try loss.backward(frames: frameCount)
-      let total = perFrame.reduce(0, +)
+      let total = perFrame.reduce(0.0) { $0 + Double($1) }
       return (total, p.grad?.getData() ?? [])
     }
 
@@ -92,7 +92,7 @@ final class HopGatedGradientFDMatrixTests: XCTestCase {
       plus[i] += epsilon
       var minus = start
       minus[i] -= epsilon
-      fd[i] = (try run(plus).0 - (try run(minus).0)) / (2 * epsilon)
+      fd[i] = Float((try run(plus).0 - (try run(minus).0)) / Double(2 * epsilon))
     }
     return (cosine(auto, fd), auto, fd)
   }

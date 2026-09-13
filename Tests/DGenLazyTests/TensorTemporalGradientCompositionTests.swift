@@ -341,15 +341,18 @@ final class TensorTemporalGradientCompositionTests: XCTestCase {
     let rateGrad = try XCTUnwrap(rate.grad?.data)
     let cutoffGrads = try XCTUnwrap(cutoffs.grad?.getData())
 
-    func lv(_ rateValue: Float) throws -> Float {
+    func lv(_ rateValue: Float) throws -> Double {
       LazyGraphContext.reset()
       let (_, _, loss) = build(rateValue, requiresGrad: false)
-      return try loss.realize(frames: frames).reduce(0, +)
+      return try loss.realize(frames: frames).reduce(0.0) { $0 + Double($1) }
     }
-    let eps: Float = 1e-3
-    let fd = (try lv(1.0 + eps) - (try lv(1.0 - eps))) / (2 * eps)
-    XCTAssertLessThan(
-      relativeError(rateGrad, fd), 0.05, "rate: autograd=\(rateGrad), fd=\(fd)")
+    // The rate changes this short render by only ~1e-5. Check several
+    // central-difference steps above Float render quantization, with a Double sum.
+    for eps: Float in [0.05, 0.1, 0.2] {
+      let fd = Float((try lv(1.0 + eps) - (try lv(1.0 - eps))) / Double(2 * eps))
+      XCTAssertLessThan(
+        relativeError(rateGrad, fd), 0.05, "rate: autograd=\(rateGrad), fd=\(fd), eps=\(eps)")
+    }
     for lane in 0..<lanes {
       XCTAssertNotEqual(cutoffGrads[lane], 0.0, "cutoff lane \(lane) grad is zero")
     }
