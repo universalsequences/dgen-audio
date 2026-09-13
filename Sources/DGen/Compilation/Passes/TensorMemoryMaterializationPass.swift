@@ -36,6 +36,9 @@ extension TensorMemoryMaterializationPass {
       frameBasedNodes: frameBasedNodes,
       hopBasedNodes: hopBasedNodes
     )
+    let frameLocalCells = backend == .c && graph.lastForwardNodeId == nil
+      ? sequentialFrameLocalCells(graph: graph, blocks: blocks, hopBasedNodes: hopBasedNodes)
+      : []
 
     var lazyToReal: [CellID: CellID] = [:]
 
@@ -108,7 +111,8 @@ extension TensorMemoryMaterializationPass {
         hopBasedNodes: hopBasedNodes,
         feedbackClusterNodes: feedbackClusterNodes,
         outboundCells: liveness.outboundCells,
-        intraBlockFrameAwareCells: liveness.intraBlockFrameAwareCells
+        intraBlockFrameAwareCells: liveness.intraBlockFrameAwareCells,
+        frameLocalCells: frameLocalCells
       )
 
       if !decision.shouldMaterialize {
@@ -168,6 +172,44 @@ extension TensorMemoryMaterializationPass {
     guard let node else { return false }
     if case .tensor = node.shape ?? .scalar { return false }
     return true
+  }
+
+  /// A mandatory sequential frame group runs every fragment for frame i before
+  /// advancing to i+1. A tensor confined to that group needs only one frame of
+  /// scratch, even when it crosses fragment boundaries. Keep the outbound flag
+  /// for materialization: fragments still exchange values through memory.
+  ///
+  /// Do not infer groups from adjacent blocks: final SIMD widths can split their
+  /// loops. Hop/event values retain their frame tapes and zero-fill semantics;
+  /// host materialization and views also retain the existing allocation policy.
+  private static func sequentialFrameLocalCells(
+    graph: Graph, blocks: [Block], hopBasedNodes: [NodeID: (Int, NodeID)]
+  ) -> Set<CellID> {
+    var owner: [CellID: Int] = [:]
+    var excluded: Set<CellID> = []
+    // Materialized views may be observed by the host without a scheduled reader.
+    for (nodeId, tensorId) in graph.nodeToTensor {
+      guard let tensor = graph.tensors[tensorId] else { continue }
+      if tensor.materialize || !tensor.transforms.isEmpty
+        || graph.materializeNodes.contains(nodeId) || hopBasedNodes[nodeId] != nil {
+        excluded.insert(tensor.cellId)
+      }
+    }
+    for block in blocks {
+      for nodeId in block.nodes {
+        guard let node = graph.nodes[nodeId] else { continue }
+        for reference in [nodeId] + node.inputs + node.temporalDependencies {
+          guard let tensorId = graph.nodeToTensor[reference],
+            let tensor = graph.tensors[tensorId]
+          else { continue }
+          let cell = tensor.cellId
+          guard let group = block.sequentialFrameGroup else { excluded.insert(cell); continue }
+          if let previous = owner[cell], previous != group { excluded.insert(cell) }
+          owner[cell] = group
+        }
+      }
+    }
+    return Set(owner.keys).subtracting(excluded)
   }
 
   /// Computes liveness facts used by allocation decisioning.
@@ -323,7 +365,8 @@ extension TensorMemoryMaterializationPass {
     hopBasedNodes: [NodeID: (Int, NodeID)],
     feedbackClusterNodes: Set<NodeID>,
     outboundCells: Set<CellID>,
-    intraBlockFrameAwareCells: Set<CellID>
+    intraBlockFrameAwareCells: Set<CellID>,
+    frameLocalCells: Set<CellID>
   ) -> TensorAllocationDecision {
     let isOutbound = outboundCells.contains(lazyCellId)
     let isFrameBasedByTemporality =
@@ -349,7 +392,8 @@ extension TensorMemoryMaterializationPass {
 
     let needsFrameAwareForMaterialize = shouldMaterialize && isFrameBased &&
       (!isInFeedbackLoop || isOutbound)
-    let needsFrameAwareAlloc = needsFrameAwareForFlow || needsFrameAwareForMaterialize
+    let needsFrameAwareAlloc = (needsFrameAwareForFlow || needsFrameAwareForMaterialize)
+      && !frameLocalCells.contains(lazyCellId)
 
     let shouldAllocate = shouldMaterialize || needsFrameAwareAlloc
     if ProcessInfo.processInfo.environment["DGEN_DEBUG_TENSOR_ALLOC"] != nil {

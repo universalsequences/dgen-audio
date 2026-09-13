@@ -162,6 +162,39 @@ final class EventHoldTests: XCTestCase {
       XCTAssertEqual(value, a + b)
     }
   }
+
+  func testFrameLocalTensorScratchPreservesCoupledFeedbackAndRateChanges() throws {
+    let source = """
+      (def position (accum 1 0 0 1024))
+      (def tick (eq (% position 16) 0))
+      (def held (event-hold (+ 0.5 (* position 0.0005)) tick))
+      (def coefficients (latch (* held (tensor @shape [4] @data [1 0.9 0.8 0.7])) tick))
+      (make-history drive)
+      (make-tensor-history modes @shape [4])
+      (def force (+ 0.1 (* 0.01 (read-history drive))))
+      (def next (+ (* force (tensor @shape [4] @data [1 2 3 4]))
+        (* coefficients (read-tensor-history modes))))
+      (write-tensor-history modes next)
+      (def total (sum next))
+      (write-history drive total)
+      (out total 1)
+      """
+    for parts in [[128], [1], [7, 31, 3]] {
+      let audio = try render(source, parts: parts)
+      var state = [Float](repeating: 0, count: 4)
+      var drive: Float = 0
+      for (frame, sample) in audio.enumerated() {
+        let held = 0.5 + Float((frame / 16) * 16) * 0.0005
+        let force = 0.1 + 0.01 * drive
+        for lane in 0..<4 {
+          state[lane] = force * Float(lane + 1)
+            + held * (1 - Float(lane) * 0.1) * state[lane]
+        }
+        drive = state.reduce(0, +)
+        XCTAssertEqual(sample, drive, accuracy: 0.00001, "frame \(frame), parts \(parts)")
+      }
+    }
+  }
   func testUnsupportedBackendsAndGradientsFailBeforeCodeGeneration() throws {
     let result = try compile("(out (event-hold (in 1) (in 2)) 1)")
     XCTAssertThrowsError(try CompilationPipeline.compile(graph: result.graph, backend: .metal)) {
