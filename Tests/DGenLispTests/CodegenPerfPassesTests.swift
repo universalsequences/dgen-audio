@@ -291,6 +291,33 @@ final class CodegenPerfPassesTests: XCTestCase {
 
   // MARK: - Scalar block coalescing
 
+  func testCircularWindowWrapsMatchIntegerHistory() throws {
+    // Exercise all ring positions with complete SIMD groups. Partial groups
+    // already lose buffer samples at HEAD and are tracked in dgen-j6r.
+    for blockSize in [4, 8, 64] {
+      for window in [1, 3, 17, 64, 256] {
+        let source = """
+          (make-history clock)
+          (def value (write-history clock (+ (read-history clock) 1)))
+          (def window (reshape (buffer value \(window)) @shape [\(window)]))
+          (out (sum (+ window (iota \(window)))) 1)
+          """
+        let compiled = try compile(source, blockSize: blockSize)
+        // Enough calls to cross the persistent ring boundary several times,
+        // including windows larger than the processing block and size one.
+        let blocks = (4 * (blockSize + window)) / blockSize + 1
+        let got = try render(compiled, blockSize: blockSize, blocks: blocks)
+        for index in got.indices {
+          let frame = index + 1
+          let active = min(frame, window)
+          let historySum = active * (2 * frame - active + 1) / 2
+          XCTAssertEqual(got[index], Float(historySum + window * (window - 1) / 2),
+            "block \(blockSize), window \(window), frame \(index)")
+        }
+      }
+    }
+  }
+
   func testChainedSmoothersCoalesceIntoOneLoopExactly() throws {
     let source = """
       (defmacro smooth (target)

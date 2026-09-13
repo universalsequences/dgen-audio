@@ -237,9 +237,12 @@ extension IRBuilder {
         let pos = cast(value(posLazy, scalarType: .float), to: .int)
         let bufSize = intConstant(inputShape[lastDim])
         // Window element j maps to (pos - windowSize + 1 + j) mod bufferSize
-        // Since pos >= 0 and windowSize <= bufferSize, (raw + bufSize) >= 1, so single add handles negative
+        // The accum write head is in [0, bufferSize), and j is in
+        // [0, windowSize). With windowSize <= bufferSize, raw is in
+        // [1 - windowSize, bufferSize - 1]: only a negative wrap is possible.
+        // One conditional add avoids an integer remainder for every tap.
         let raw = pos - wSize + one + newIndices[lastDim]
-        let baseIdx = (raw + bufSize) % bufSize
+        let baseIdx = gswitch(raw < intConstant(0), raw + bufSize, raw)
         newIndices[lastDim] = baseIdx
         return (newIndices, inputShape, inBoundsCheck)
       } else {
