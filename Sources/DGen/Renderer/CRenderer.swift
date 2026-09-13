@@ -664,10 +664,10 @@ public class CRenderer: Renderer {
           }
         } else {
           if val == 1.0 {
-            let expr = "(\(g(a)) - floorf(\(g(a))))"
+            let expr = "(\(g(a)) - __builtin_floorf(\(g(a))))"
             return emitAssign(uop, expr, ctx)
           } else {
-            let expr = "(\(g(a)) - floorf(\(g(a)) / \(val)f) * \(val)f)"
+            let expr = "(\(g(a)) - __builtin_floorf(\(g(a)) / \(val)f) * \(val)f)"
             return emitAssign(uop, expr, ctx)
           }
         }
@@ -705,7 +705,7 @@ public class CRenderer: Renderer {
             return emitAssign(uop, expr, ctx)
           }
         } else if val == 0.5 {
-          let expr = uop.isSimd ? "vsqrtf(\(g(a)))" : "sqrtf(\(g(a)))"
+          let expr = uop.isSimd ? "vsqrtf(\(g(a)))" : "__builtin_sqrtf(\(g(a)))"
           return emitAssign(uop, expr, ctx)
         } else if val == 0.0 {
           let expr = uop.isSimd ? "vdupq_n_f32(1.0f)" : "1.0f"
@@ -729,16 +729,19 @@ public class CRenderer: Renderer {
         return emitAssign(uop, expr, ctx)
       }
 
+    // The C toolchain is freestanding, so ordinary libm names are opaque calls.
+    // Explicit Clang builtins retain hardware lowering and auto-vectorization
+    // under our no-errno numerical policy, without approximate replacements.
     case .min(let a, let b):
-      let expr = uop.isSimd ? "vminq_f32(\(g(a)), \(g(b)))" : "fminf(\(g(a)), \(g(b)))"
+      let expr = uop.isSimd ? "vminq_f32(\(g(a)), \(g(b)))" : "__builtin_fminf(\(g(a)), \(g(b)))"
       return emitAssign(uop, expr, ctx)
 
     case .max(let a, let b):
-      let expr = uop.isSimd ? "vmaxq_f32(\(g(a)), \(g(b)))" : "fmaxf(\(g(a)), \(g(b)))"
+      let expr = uop.isSimd ? "vmaxq_f32(\(g(a)), \(g(b)))" : "__builtin_fmaxf(\(g(a)), \(g(b)))"
       return emitAssign(uop, expr, ctx)
 
     case .abs(let a):
-      let expr = uop.isSimd ? "vabsq_f32(\(g(a)))" : "fabsf(\(g(a)))"
+      let expr = uop.isSimd ? "vabsq_f32(\(g(a)))" : "__builtin_fabsf(\(g(a)))"
       return emitAssign(uop, expr, ctx)
 
     case .sign(let a):
@@ -753,15 +756,15 @@ public class CRenderer: Renderer {
       }
 
     case .floor(let a):
-      let expr = uop.isSimd ? "vrndmq_f32(\(g(a)))" : "floorf(\(g(a)))"
+      let expr = uop.isSimd ? "vrndmq_f32(\(g(a)))" : "__builtin_floorf(\(g(a)))"
       return emitAssign(uop, expr, ctx)
 
     case .ceil(let a):
-      let expr = uop.isSimd ? "vrndpq_f32(\(g(a)))" : "ceilf(\(g(a)))"
+      let expr = uop.isSimd ? "vrndpq_f32(\(g(a)))" : "__builtin_ceilf(\(g(a)))"
       return emitAssign(uop, expr, ctx)
 
     case .round(let a):
-      let expr = uop.isSimd ? "vrndaq_f32(\(g(a)))" : "roundf(\(g(a)))"
+      let expr = uop.isSimd ? "vrndaq_f32(\(g(a)))" : "__builtin_roundf(\(g(a)))"
       return emitAssign(uop, expr, ctx)
 
     case .noise(let cellId):
@@ -944,7 +947,7 @@ public class CRenderer: Renderer {
       return emitAssign(uop, expr, ctx)
 
     case .sqrt(let a):
-      let expr = uop.isSimd ? "vsqrtf(\(g(a)))" : "sqrtf(\(g(a)))"
+      let expr = uop.isSimd ? "vsqrtf(\(g(a)))" : "__builtin_sqrtf(\(g(a)))"
       return emitAssign(uop, expr, ctx)
 
     case .and(let a, let b):
@@ -1084,7 +1087,11 @@ public class CRenderer: Renderer {
       let sourceId = extractVarId(val)
       let source = "t\(sourceId)"
       let rawOffset = emitScalarLazy(offset, ctx: ctx)
-      let index = "(isfinite(\(rawOffset)) ? (int)\(rawOffset) : 0)"
+      // Integer frame offsets cannot be NaN/Inf. The floating classifier is
+      // deliberately opaque under fast-math, so applying it to integers also
+      // prevents vectorization of independent tensor lanes.
+      let index = isIntTypedOffset(offset)
+        ? rawOffset : "(isfinite(\(rawOffset)) ? (int)\(rawOffset) : 0)"
       let bounded =
         "(\(index) < 0 || \(index) >= frameCount) ? 0.0f : \(source)[\(index)]"
       return emitAssign(uop, bounded, ctx)
@@ -1145,6 +1152,7 @@ public class CRenderer: Renderer {
         fatalError("beginForLoop requires variable")
       }
       activeLoopVarNames[varId] = "t\(varId)"
+      varEmittedTypes[varId] = .int_
       loopVarBindingStack.append(varId)
       // Emit count as integer to avoid "t < 33.0" in loop bounds
       let countStr: String
