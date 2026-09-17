@@ -31,8 +31,8 @@ final class EventHoldTests: XCTestCase {
       backend: .c, options: .init(frameCount: 128, debug: false, enableBufferReuse: reuse))
   }
 
-  private func render(_ source: String, parts: [Int]) throws -> [Float] {
-    let result = try compile(source)
+  private func render(_ source: String, parts: [Int], reuse: Bool = true) throws -> [Float] {
+    let result = try compile(source, reuse: reuse)
     let kernel = CCompiledKernel(source: result.kernels.map { $0.source }.joined(separator: "\n\n"),
       cellAllocations: result.cellAllocations, memorySize: result.totalMemorySlots,
       defaultHostSampleRate: 48000)
@@ -63,6 +63,55 @@ final class EventHoldTests: XCTestCase {
     return audio
   }
 
+  func testDenseScalarEventsUseSIMDWithExactSparseAndTailFallback() throws {
+    let program = """
+      (def position (accum 1 0 0 1024))
+      (def event (max (lt position 128) (gte position 320)
+        (* (gte position 256) (eq (% position 7) 3))))
+      (def table (tensor @shape [8] @data [0.1 0.2 0.3 0.4 0.5 0.6 0.7 0.8]))
+      (def control (HOLD position event))
+      (def coefficient (+ (exp (* -0.003 control))
+        (* 0.2 (sin (* 0.13 control))) (peek table (% control 8))))
+      OUTPUT
+      """
+    for output in ["(out (gswitch event coefficient 0) 1)",
+      "(out (latch coefficient event) 1)"] {
+      let source = program.replacingOccurrences(of: "OUTPUT", with: output)
+      let scheduled = source.replacingOccurrences(of: "HOLD", with: "event-hold")
+      let result = try compile(scheduled)
+      XCTAssertTrue(result.uopBlocks.contains { block in
+        if case .hopBased = block.temporality { return block.vectorWidth == 4 }
+        return false
+      }, "The dense-event path must exercise frame SIMD")
+      XCTAssertTrue(result.uopBlocks.contains { block in
+        block.vectorWidth == 4 && block.ops.contains { op in
+          if case .memoryRead = op.op { return true }
+          return false
+        }
+      }, "Immutable scalar table lookups must retain lane-wise gathers")
+      let baseline = try render(source.replacingOccurrences(of: "HOLD", with: "latch"),
+        parts: [128])
+      var held = 0
+      for (frame, sample) in baseline.enumerated() {
+        let event = frame < 128 || frame >= 320 || (frame >= 256 && frame % 7 == 3)
+        if event { held = frame }
+        let coefficient = exp(-0.003 * Double(held))
+          + 0.2 * sin(0.13 * Double(held)) + Double(held % 8 + 1) * 0.1
+        let expected = output.contains("gswitch") && !event ? 0 : coefficient
+        XCTAssertEqual(sample, Float(expected), accuracy: 0.00002, "reference frame \(frame)")
+      }
+      for reuse in [true, false] {
+        for parts in [[128], [1], [3, 17, 64, 7], [127, 128, 1, 4]] {
+          let actual = try render(scheduled, parts: parts, reuse: reuse)
+          for (frame, pair) in zip(actual, baseline).enumerated() {
+            XCTAssertEqual(pair.0, pair.1, accuracy: 0.00002,
+              "frame \(frame), parts \(parts), reuse \(reuse), \(output)")
+          }
+        }
+      }
+    }
+  }
+
   func testEventCoefficientsMatchEagerLatchesAcrossPartitions() throws {
     // Multiple events can share a nominal 16-sample interval. A compressed
     // per-hop scratch slot would overwrite the earlier event's coefficients.
@@ -89,6 +138,35 @@ final class EventHoldTests: XCTestCase {
           XCTAssertEqual(pair.0, pair.1, accuracy: 0.00001,
             "width \(width), parts \(parts), frame \(frame)")
         }
+      }
+    }
+  }
+
+  func testEventTableLookupsPreserveBilinearWrappingAndChannelClamping() throws {
+    let source = """
+      (def position (accum 1 0 0 1024))
+      (def event (lt (% position 11) 8))
+      (def table (tensor @shape [5 3] @data [11 12 13 14 15 21 22 23 24 25 31 32 33 34 35]))
+      (def index (event-hold (- (* position 0.37) 12.4) event))
+      (def channel (event-hold (- (* (% position 17) 0.25) 0.75) event))
+      (out (peek table index channel) 1)
+      """
+    for parts in [[128], [1], [3, 17, 64, 7]] {
+      let actual = try render(source, parts: parts)
+      for (frame, sample) in actual.enumerated() {
+        if frame % 11 >= 8 {
+          XCTAssertEqual(sample, 0, "inactive frame \(frame), parts \(parts)")
+          continue
+        }
+        let index = Double(Float(frame) * 0.37 - 12.4)
+        let wrapped = index - floor(index / 5) * 5
+        let low = Int(floor(wrapped))
+        let fraction = wrapped - Double(low)
+        let channel = min(2, max(0, Double(frame % 17) * 0.25 - 0.75))
+        let expected = Double(11 + low) * (1 - fraction)
+          + Double(11 + (low + 1) % 5) * fraction + 10 * channel
+        XCTAssertEqual(sample, Float(expected), accuracy: 0.0001,
+          "frame \(frame), parts \(parts)")
       }
     }
   }

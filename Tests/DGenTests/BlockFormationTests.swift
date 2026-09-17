@@ -5,6 +5,29 @@ import XCTest
 /// to debug issues with frame-based tensor operations like cos(phasor(tensor)*twopi)
 final class BlockFormationTests: XCTestCase {
 
+    func testScalarTableLookupsOnlyPromoteInitializedUnwrittenStorage() throws {
+        let graph = Graph()
+        let source = graph.tensor(shape: [8], data: [1, 2, 3, 4, 5, 6, 7, 8])
+        let index = graph.n(.input(0))
+        let zero = graph.n(.constant(0))
+        let peek = graph.n(.peek, source, index, zero)
+        let scaled = graph.n(.mul, peek, index)
+        let classify = { findSequentialNodes(graph, feedbackClusters: [], backend: .c) }
+        XCTAssertFalse(classify().contains(peek))
+        XCTAssertFalse(classify().contains(scaled))
+        let tensorId = try XCTUnwrap(graph.nodeToTensor[source])
+        let cell = try XCTUnwrap(graph.tensors[tensorId]).cellId
+        // Low-level graph clients can write a tensor without Lisp's `poke`
+        // mutable-table marker. Such a table is still not immutable.
+        _ = graph.n(.memoryWrite(cell), zero, index)
+        XCTAssertTrue(classify().contains(peek))
+        XCTAssertTrue(classify().contains(scaled))
+
+        let scratch = graph.tensor(shape: [8], data: nil)
+        let scratchPeek = graph.n(.peek, scratch, index, zero)
+        XCTAssertTrue(classify().contains(scratchPeek))
+    }
+
     func testSingleElementGatherKeepsItsOwnScalarLoop() throws {
         let graph = Graph()
         let source = graph.tensor(shape: [8], data: [1, 2, 3, 4, 5, 6, 7, 8])

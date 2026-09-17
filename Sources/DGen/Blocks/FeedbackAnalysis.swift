@@ -344,6 +344,28 @@ public func findSequentialNodes(_ g: Graph, feedbackClusters: [[NodeID]], backen
 > {
   var scalar: Set<NodeID> = []
 
+  // A scalar lookup in an immutable stored table is independent across frames.
+  // It does not make its scalar consumers tensor operations. C already lowers
+  // varying memoryRead offsets to lane-wise gathers; only actual tensor values,
+  // views, and mutable tables need the conservative tensor classification below.
+  var writtenCells = g.mutableTensorCells
+  for node in g.nodes.values {
+    writtenCells.formUnion(node.op.persistentStateCellIds)
+    switch node.op {
+    case .memoryWrite(let cell), .memoryAccumulate(let cell), .tensorAccumulate(let cell):
+      writtenCells.insert(cell)
+    default: break
+    }
+  }
+  let scalarTableReads = Set(g.nodes.values.compactMap { node -> NodeID? in
+    guard backend == .c, case .peek = node.op, node.shape == .scalar,
+      let source = node.inputs.first, let stored = g.nodes[source],
+      case .tensorRef(let tensorId) = stored.op, stored.allDependencies.isEmpty,
+      let tensor = g.tensors[tensorId], tensor.transforms.isEmpty, tensor.data != nil,
+      !writtenCells.contains(tensor.cellId) else { return nil }
+    return node.id
+  })
+
   // Track nodes that are SIMD-safe due to using atomics (should never be scalar)
   var simdSafe: Set<NodeID> = []
   g.nodes.values.forEach {
@@ -428,6 +450,7 @@ public func findSequentialNodes(_ g: Graph, feedbackClusters: [[NodeID]], backen
   while changed {
     changed = false
     g.nodes.values.forEach { node in
+      if scalarTableReads.contains(node.id) { return }
       for inputId in node.inputs {
         if tensorNodes.contains(inputId) && !tensorNodes.contains(node.id) {
           tensorNodes.insert(node.id)
@@ -451,15 +474,17 @@ public func findSequentialNodes(_ g: Graph, feedbackClusters: [[NodeID]], backen
         if g.cellToTensor[cellId] != nil {
           scalar.insert($0.id)
         }
-      case .conv2d(_), .sum, .maxAxis, .meanAxis, .peek:
+      case .conv2d(_), .sum, .maxAxis, .meanAxis:
         scalar.insert($0.id)
+      case .peek:
+        if !scalarTableReads.contains($0.id) { scalar.insert($0.id) }
       default: break
       }
     }
 
     // Mark nodes with tensor inputs as scalar for C
     g.nodes.values.forEach {
-      if simdSafe.contains($0.id) { return }
+      if simdSafe.contains($0.id) || scalarTableReads.contains($0.id) { return }
       for inputId in $0.inputs {
         if tensorNodes.contains(inputId) {
           scalar.insert($0.id)
@@ -472,7 +497,7 @@ public func findSequentialNodes(_ g: Graph, feedbackClusters: [[NodeID]], backen
     while changed {
       changed = false
       g.nodes.values.forEach { node in
-        if simdSafe.contains(node.id) { return }
+        if simdSafe.contains(node.id) || scalarTableReads.contains(node.id) { return }
         for inputId in node.inputs {
           if tensorNodes.contains(inputId) && !scalar.contains(node.id) {
             scalar.insert(node.id)

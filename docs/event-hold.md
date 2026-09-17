@@ -42,3 +42,17 @@ Mixed-rate feedback fragments share one sample loop in the execution schedule.
 The renderer and buffer allocator consume that same region, so scratch values
 remain live across every fragment of the loop. Event scratch uses dense frame
 slots because adjacent events cannot share a compressed periodic-hop slot.
+
+Independent scalar coefficient expressions use C frame SIMD in groups of four
+when all four event frames are active. Mixed groups and partial buffers run only
+their active frames through the scalar path; groups with no events are skipped.
+The decision is per group, so sparse events do not disable vectorization for
+the rest of a callback. Adjacent expressions sharing a clock and execution demand
+share the traversal. Tensor loops, mutable state, and mixed-rate feedback retain
+their original scheduling. SIMD and scalar math can differ by float rounding.
+
+Scalar `peek` results from immutable stored tables remain scalar signals rather
+than propagating tensor classification to their consumers. Their C SIMD lowering
+gathers each lane's integer index separately, including wrapped indices and
+fractional channel interpolation. Mutable tables and tensor views retain the
+conservative classification.

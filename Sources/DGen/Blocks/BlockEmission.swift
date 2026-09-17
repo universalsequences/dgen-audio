@@ -47,6 +47,23 @@ private func containsSIMDBlockers(_ uops: [UOp], backend: Backend) -> Bool {
   return false
 }
 
+/// Only independent scalar expressions can use the dense-clock frame SIMD path.
+/// Tensor loops and state updates still require their original hop schedule.
+private func supportsDenseHopSIMD(_ uops: [UOp]) -> Bool {
+  uops.allSatisfy { uop in
+    switch uop.op {
+    case .add, .sub, .mul, .div, .abs, .sign, .sin, .cos, .tan, .atan,
+      .tanh, .exp, .log, .log10, .sqrt, .pow, .atan2, .mod, .gt, .gte,
+      .lte, .lt, .eq, .min, .max, .floor, .ceil, .round, .gswitch,
+      .selector, .cast, .identity, .memoryRead, .defineGlobal,
+      .defineConstant, .loadGlobal:
+      return true
+    default:
+      return false
+    }
+  }
+}
+
 // MARK: - Thread Count Scale
 
 /// Emits setup UOps for flat thread decomposition in tensor blocks when required.
@@ -388,13 +405,13 @@ private func determineVectorPlan(
     // A static block runs once per process call with no frame loop; four-lane
     // math there is pure overhead and its outputs are read from lane zero.
     canUseSIMD = false
-  } else if backend == .c, case .hopBased = block.temporality {
-    // Hop-rate C blocks often contain transform/index-heavy tensor reads
-    // under an outer hop gate. Rendering those as SIMD is currently unsafe:
-    // scalar loop-index math inside the body can be rewritten as lane-wise
-    // vector names, producing invalid C. Keep them scalar until the C
-    // renderer has a legality-aware lowering for hop-gated tensor loops.
-    canUseSIMD = false
+  } else if backend == .c, case .hopBased(_, let clock) = block.temporality {
+    // CRenderer uses frame SIMD only when every lane is active and there is
+    // no partial vector. Sparse clocks retain scalar hop checks;
+    // in particular, no gather or arithmetic runs on inactive lanes.
+    canUseSIMD = graph.eventClockNodes.contains(clock)
+      && block.frameOrder == .parallel && block.shape == nil
+      && block.tensorIndex == nil && !hasSIMDBlockers && supportsDenseHopSIMD(bodyUops)
   } else if let shape = block.shape, block.tensorIndex != nil {
     let size = shape.reduce(1, *)
     // Frame-based tensor blocks must run element-by-element per frame

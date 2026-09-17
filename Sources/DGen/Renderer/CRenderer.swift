@@ -204,6 +204,60 @@ public class CRenderer: Renderer {
       return predicate
     }
 
+    func appendEventVectorBlock(_ block: BlockUOps, clock: NodeID) {
+      closeOpenScope()
+      resetCurrentBlockState()
+      emitThreadCountScaleChange(nil)
+      guard let counter = ctx.values[clock] else {
+        preconditionFailure("Hop counter node \(clock) not found in ctx.values")
+      }
+      let zero = ctx.useConstant(src: nil, value: 0)
+      let width = ctx.useConstant(src: nil, value: Float(block.vectorWidth))
+      func expression(_ op: Op, type: CastType = .float) -> Lazy {
+        let result = ctx.useVariable(src: nil, trackInValues: false)
+        scheduleItem.ops.append(UOp(op: op, value: result, scalarType: type))
+        return result
+      }
+      // Decide per vector, not per callback: an isolated inactive sample
+      // must not scalarize hundreds of otherwise independent updates.
+      // loadTape bounds the final partial vector; it never reads past the
+      // callback. The SIMD path only executes complete, fully active groups.
+      scheduleItem.ops.append(UOp(op: .beginLoop(frameCountUOp, block.vectorWidth), value: .empty))
+      let start = expression(.frameIndex, type: .int)
+      let remaining = expression(.sub(frameCountUOp, start), type: .int)
+      let count = expression(.min(remaining, width), type: .int)
+      var dense = expression(.gte(remaining, width))
+      var active = zero
+      for lane in 0..<block.vectorWidth {
+        let offset = ctx.useConstant(src: nil, value: Float(lane))
+        let frame = expression(.add(start, offset), type: .int)
+        let clockValue = expression(.loadTape(counter, frame))
+        let enabled = expression(.eq(clockValue, zero))
+        dense = expression(.mul(dense, enabled))
+        active = expression(.max(active, enabled))
+      }
+      scheduleItem.ops.append(UOp(op: .beginIf(dense), value: .empty))
+      appendBlockOps(block)
+      scheduleItem.ops.append(UOp(op: .endIf, value: .empty))
+
+      let notDense = expression(.eq(dense, zero))
+      let sparse = expression(.mul(active, notDense))
+      scheduleItem.ops.append(UOp(op: .beginIf(sparse), value: .empty))
+      let lane = ctx.useVariable(src: nil, trackInValues: false)
+      scheduleItem.ops.append(UOp(op: .beginForLoop(lane, count), value: .empty))
+      let frame = expression(.add(start, lane), type: .int)
+      scheduleItem.ops.append(UOp(op: .setFrameIndex(frame), value: .empty))
+      scheduleItem.ops.append(UOp(op: .beginHopCheck(counter), value: .empty))
+      for var op in block.ops {
+        op.vectorWidth = 1
+        scheduleItem.ops.append(op)
+      }
+      scheduleItem.ops.append(UOp(op: .endHopCheck, value: .empty))
+      scheduleItem.ops.append(UOp(op: .endLoop, value: .empty))
+      scheduleItem.ops.append(UOp(op: .endIf, value: .empty))
+      scheduleItem.ops.append(UOp(op: .endLoop, value: .empty))
+    }
+
     func appendNormalBlock(_ block: BlockUOps) {
       if currentDemand != block.executionDemand {
         closeOpenScope()
@@ -215,6 +269,10 @@ public class CRenderer: Renderer {
           scheduleItem.ops.append(UOp(op: .beginIf(predicate), value: .empty))
           gateOpen = true
         }
+      }
+      if case .hopBased(_, let clock) = block.temporality, block.vectorWidth > 1 {
+        appendEventVectorBlock(block, clock: clock)
+        return
       }
       let needsNewLoop =
         currentFrameOrder != block.frameOrder
@@ -335,15 +393,34 @@ public class CRenderer: Renderer {
       scheduleItem.ops.append(UOp(op: .endLoop, value: .empty))
     }
 
-    for region in scheduledRegions {
-      switch region {
+    var regionIndex = 0
+    while regionIndex < scheduledRegions.count {
+      switch scheduledRegions[regionIndex] {
       case .block(let index):
-        appendNormalBlock(uopBlocks[index])
+        var block = uopBlocks[index]
+        if case .hopBased = block.temporality, block.vectorWidth > 1 {
+          // Preserve the normal renderer's adjacent-loop fusion for both
+          // branches. One event check and one frame traversal serve the
+          // whole expression, instead of one traversal per arithmetic node.
+          while regionIndex + 1 < scheduledRegions.count,
+            case .block(let nextIndex) = scheduledRegions[regionIndex + 1] {
+            let next = uopBlocks[nextIndex]
+            guard next.frameOrder == block.frameOrder,
+              next.temporality == block.temporality,
+              next.dispatchMode == block.dispatchMode,
+              next.vectorWidth == block.vectorWidth,
+              next.executionDemand == block.executionDemand else { break }
+            block.ops.append(contentsOf: next.ops)
+            regionIndex += 1
+          }
+        }
+        appendNormalBlock(block)
       case .hopIsland(let island):
         appendHopIsland(island)
       case .sequentialFrameGroup(let indices):
         appendFrameGroup(indices)
       }
+      regionIndex += 1
     }
 
     closeOpenScope()
@@ -1218,6 +1295,15 @@ public class CRenderer: Renderer {
       return emitAssign(uop, expr, ctx)
 
     case .cast(let expr, let castType):
+      if uop.isSimd {
+        // Signal lanes stay float vectors, including integer-valued gather
+        // offsets. A scalar C cast cannot convert four independent indices.
+        let converted = castType == .int
+          ? "vcvtq_f32_s32(vcvtq_s32_f32(\(g(expr))))" : g(expr)
+        var vectorOp = uop
+        vectorOp.scalarType = .float
+        return emitAssign(vectorOp, converted, ctx)
+      }
       let typeStr = castType == .int ? "int" : "float"
       return emitAssign(
         uop, "(\(typeStr))\(g(expr))", ctx,
