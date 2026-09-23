@@ -10,7 +10,6 @@ public struct ExecutionDemand: Equatable {
     if terms.contains(where: { $0.isSubset(of: term) }) { return false }
     terms.removeAll { term.isSubset(of: $0) }
     terms.append(term)
-    terms.sort { $0.sorted().lexicographicallyPrecedes($1.sorted()) }
     return true
   }
 }
@@ -137,19 +136,41 @@ enum ExecutionGatePass {
     work.append(contentsOf: predicateDependencies.map { ($0, []) })
     work.append(contentsOf: graph.materializeNodes.map { ($0, []) })
     work.append(contentsOf: graph.gradientSideEffects.map { ($0, []) })
-    while let (id, term) = work.popLast() {
+    // Propagation only preserves a conjunction or adds a predicate. Exhaust
+    // shorter conjunctions first so a broad demand reaches a shared producer
+    // before narrower paths through its feedback cycle can multiply.
+    var workBySize = [work]
+    work.removeAll()
+    var size = 0
+    func enqueue(_ id: NodeID, _ term: Set<NodeID>) {
+      while workBySize.count <= term.count { workBySize.append([]) }
+      workBySize[term.count].append((id, term))
+    }
+    while size < workBySize.count {
+      guard let (id, term) = workBySize[size].popLast() else {
+        size += 1
+        continue
+      }
       guard let node = graph.nodes[id] else { continue }
       var demand = demands[id] ?? ExecutionDemand(terms: [])
       guard demand.include(term) else { continue }
       demands[id] = demand
       if let condition = graph.executionGates[id], node.inputs.count == 3 {
-        work.append((node.inputs[0], term))
-        work.append((node.inputs[1], term.union([condition])))
-        work.append((node.inputs[2], term))
-        work.append(contentsOf: node.temporalDependencies.map { ($0, term) })
+        enqueue(node.inputs[0], term)
+        enqueue(node.inputs[1], term.union([condition]))
+        enqueue(node.inputs[2], term)
+        for dependency in node.temporalDependencies { enqueue(dependency, term) }
       } else {
-        work.append(contentsOf: dependencies(id).map { ($0, term) })
+        for dependency in dependencies(id) { enqueue(dependency, term) }
       }
+    }
+    // Canonical ordering is needed for region equality, not during fixed-point
+    // propagation. Sort each accepted predicate set once after convergence.
+    for id in demands.keys {
+      let sorted = demands[id]!.terms.map { $0.sorted() }.sorted {
+        $0.lexicographicallyPrecedes($1)
+      }
+      demands[id]!.terms = sorted.map { Set($0) }
     }
     var plan = Plan(demands: demands)
     for (id, demand) in demands where demand != .always {
