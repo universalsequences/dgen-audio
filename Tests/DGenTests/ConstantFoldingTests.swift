@@ -354,4 +354,70 @@ final class ConstantFoldingTests: XCTestCase {
             XCTFail("Expected final result to be folded")
         }
     }
+
+    // MARK: - Algebraic Identities
+
+    func testAlgebraicFoldSelectorAliasesSelectedInputAndRestores() throws {
+        let g = Graph()
+        let index = g.n(.constant(2.0))
+        let a = g.n(.input(0))
+        let b = g.n(.input(1))
+        let chosen = g.n(.selector, index, a, b)
+        let out = g.n(.output(0), chosen)
+
+        let changes = GraphPrepPasses.foldAlgebraicIdentities(g)
+        XCTAssertEqual(g.nodes[out]?.inputs, [b])
+
+        changes.restore(graph: g)
+        XCTAssertEqual(g.nodes[out]?.inputs, [chosen])
+    }
+
+    func testAlgebraicFoldMulByZeroRemovesFalseFeedback() throws {
+        // y = in + 0 * history; the unfolded graph looks like a recurrence.
+        let g = Graph()
+        let cell = g.alloc()
+        let previous = g.n(.historyRead(cell))
+        let scaled = g.n(.mul, previous, g.n(.constant(0.0)))
+        let y = g.n(.add, g.n(.input(0)), scaled)
+        _ = g.n(.historyWrite(cell), y)
+        _ = g.n(.output(0), y)
+        XCTAssertFalse(findFeedbackLoops(g).isEmpty)
+
+        _ = GraphPrepPasses.foldAlgebraicIdentities(g)
+
+        if case .constant(let value) = g.nodes[scaled]?.op {
+            XCTAssertEqual(value, 0.0)
+        } else {
+            XCTFail("Expected x * 0 to fold to constant 0")
+        }
+        XCTAssertTrue(findFeedbackLoops(g).isEmpty)
+    }
+
+    func testAlgebraicFoldLeavesTensorOperandsAlone() throws {
+        let g = Graph()
+        let table = g.tensor(shape: [4], data: [1, 2, 3, 4])
+        let product = g.n(.mul, table, g.n(.constant(0.0)))
+        _ = g.n(.output(0), product)
+
+        _ = GraphPrepPasses.foldAlgebraicIdentities(g)
+
+        if case .mul = g.nodes[product]?.op {
+        } else {
+            XCTFail("tensor * 0 must not fold to a scalar constant")
+        }
+    }
+
+    func testDeadCodeEliminationDropsOrphanedTableLookup() throws {
+        let g = Graph()
+        let table = g.tensor(shape: [4, 2], data: [1, 2, 3, 4, 5, 6, 7, 8])
+        let phase = g.n(.input(0))
+        let lookup = try g.peek(tensor: table, index: phase, channel: g.n(.constant(0.0)))
+        let unused = g.n(.mul, lookup, g.n(.constant(0.0)))
+        _ = g.n(.output(0), g.n(.add, phase, unused))
+
+        _ = GraphPrepPasses.foldAlgebraicIdentities(g)
+        let removed = DeadCodeEliminationPass.run(graph: g, removeTableReads: true)
+
+        XCTAssertNotNil(removed[lookup], "orphaned immutable table lookup should be removed")
+    }
 }

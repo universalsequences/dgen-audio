@@ -73,6 +73,147 @@ extension GraphPrepPasses {
     }
   }
 
+  /// `DGEN_NO_ALGEBRAIC_FOLD=1` disables `foldAlgebraicIdentities` for A/B runs.
+  static var algebraicFoldingEnabled: Bool {
+    ProcessInfo.processInfo.environment["DGEN_NO_ALGEBRAIC_FOLD"] != "1"
+  }
+
+  /// Node replacements made by `foldAlgebraicIdentities`, undone after one compile.
+  struct AlgebraicFoldChanges {
+    var originals: [NodeID: Node] = [:]
+
+    func restore(graph: Graph) {
+      for (id, node) in originals { graph.nodes[id] = node }
+    }
+  }
+
+  /// Folds scalar nodes whose result is decided by SOME constant operands:
+  /// `selector`/`gswitch`/`mix` with a constant index, `x * 0`, and the
+  /// identities `x + 0`, `x - 0`, `x * 1`, `x / 1`.
+  ///
+  /// Must run before feedback analysis. A literal-algorithm macro such as
+  /// `(* fb (selector 2 1 0 1 ...))` or `(* b1 gain (selector 2 0 0 1 ...))` is
+  /// always zero, but the unfolded graph still carries an edge from the
+  /// feedback history into every downstream lookup, so `findFeedbackLoops`
+  /// pulls feedback-free work into the frame-serial loop. C emission and clang
+  /// fold these later, after the loop layout is already decided.
+  ///
+  /// `x * 0 -> 0` relies on DGen's finite-only fast-math contract. The graph is
+  /// shared with the lazy front end, so every rewrite is recorded for restore.
+  static func foldAlgebraicIdentities(_ graph: Graph) -> AlgebraicFoldChanges {
+    var changes = AlgebraicFoldChanges()
+    var pinned = Set<NodeID>(graph.executionGates.keys)
+    pinned.formUnion(graph.executionGates.values)
+    pinned.formUnion(graph.nodeToTensor.keys)
+    pinned.formUnion(graph.nodeHopRate.keys)
+    pinned.formUnion(graph.nodeHopRate.values.map { $0.1 })
+    pinned.formUnion(graph.eventHoldClocks.keys)
+    pinned.formUnion(graph.eventHoldClocks.values)
+    pinned.formUnion(graph.eventClockNodes)
+    pinned.formUnion(graph.nodePositionDep.keys)
+    pinned.formUnion(graph.nodePositionDep.values)
+    pinned.formUnion(graph.tensorGradCells.keys)
+    pinned.formUnion(graph.frameAwareCellClocks.values)
+    pinned.formUnion(graph.materializeNodes)
+    pinned.formUnion(graph.gradientSideEffects)
+    pinned.formUnion(graph.simdOptimizedConv2Ds)
+    pinned.formUnion(graph.conv2dMaskCells.keys)
+    if let last = graph.lastForwardNodeId { pinned.insert(last) }
+
+    func isScalar(_ id: NodeID) -> Bool {
+      guard let node = graph.nodes[id], graph.nodeToTensor[id] == nil else { return false }
+      if case .tensor? = node.shape { return false }
+      return true
+    }
+    func constant(_ id: NodeID) -> Float? {
+      if case .constant(let value)? = graph.nodes[id]?.op { return value }
+      return nil
+    }
+    func record(_ id: NodeID) {
+      if changes.originals[id] == nil, let node = graph.nodes[id] { changes.originals[id] = node }
+    }
+
+    enum Fold { case value(Float), alias(NodeID) }
+    func fold(_ node: Node) -> Fold? {
+      let ins = node.inputs
+      let values = ins.map(constant)
+      if canFoldOp(node.op), !ins.isEmpty, values.allSatisfy({ $0 != nil }),
+        let result = evaluateConstantOp(node.op, values.map { $0! }), result.isFinite
+      {
+        return .value(result)
+      }
+      switch node.op {
+      case .add where ins.count == 2:
+        if values[1] == 0 { return .alias(ins[0]) }
+        if values[0] == 0 { return .alias(ins[1]) }
+      case .sub where ins.count == 2:
+        if values[1] == 0 { return .alias(ins[0]) }
+      case .mul where ins.count == 2:
+        if values[0] == 0 || values[1] == 0 { return .value(0) }
+        if values[1] == 1 { return .alias(ins[0]) }
+        if values[0] == 1 { return .alias(ins[1]) }
+      case .div where ins.count == 2:
+        if values[1] == 1 { return .alias(ins[0]) }
+      case .gswitch where ins.count == 3:
+        if let cond = values[0] { return .alias(cond > 0 ? ins[1] : ins[2]) }
+      case .mix where ins.count == 3:
+        if values[2] == 0 { return .alias(ins[0]) }
+        if values[2] == 1 { return .alias(ins[1]) }
+      case .selector where ins.count >= 2:
+        // Same 1-indexed contract as evaluateConstantOp: out of range is 0.
+        guard let mode = values[0] else { return nil }
+        let index = Int(mode)
+        return index >= 1 && index < ins.count ? .alias(ins[index]) : .value(0)
+      default:
+        break
+      }
+      return nil
+    }
+
+    // `replacement` maps a folded-away node to the node its consumers use now.
+    var replacement: [NodeID: NodeID] = [:]
+    func resolve(_ id: NodeID) -> NodeID {
+      var current = id
+      while let next = replacement[current] { current = next }
+      return current
+    }
+
+    var changed = true
+    while changed {
+      changed = false
+      for id in graph.nodes.keys.sorted() {
+        guard var node = graph.nodes[id] else { continue }
+        let inputs = node.inputs.map(resolve)
+        let temporal = node.temporalDependencies.map(resolve)
+        if inputs != node.inputs || temporal != node.temporalDependencies {
+          record(id)
+          var rewired = Node(id: id, op: node.op, inputs: inputs)
+          rewired.temporalDependencies = temporal
+          rewired.shape = node.shape
+          graph.nodes[id] = rewired
+          node = rewired
+          changed = true
+        }
+        guard replacement[id] == nil, !pinned.contains(id), node.temporalDependencies.isEmpty,
+          isScalar(id), let result = fold(node)
+        else { continue }
+        switch result {
+        case .value(let value):
+          record(id)
+          var folded = Node(id: id, op: .constant(value), inputs: [])
+          folded.shape = .scalar
+          graph.nodes[id] = folded
+          changed = true
+        case .alias(let target):
+          guard target != id, isScalar(target) else { continue }
+          replacement[id] = target
+          changed = true
+        }
+      }
+    }
+    return changes
+  }
+
   private static func canFoldOp(_ op: LazyOp) -> Bool {
     switch op {
     // Arithmetic
