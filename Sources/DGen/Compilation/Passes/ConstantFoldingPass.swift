@@ -160,10 +160,11 @@ extension GraphPrepPasses {
         if values[2] == 0 { return .alias(ins[0]) }
         if values[2] == 1 { return .alias(ins[1]) }
       case .selector where ins.count >= 2:
-        // Same 1-indexed contract as evaluateConstantOp: out of range is 0.
         guard let mode = values[0] else { return nil }
-        let index = Int(mode)
-        return index >= 1 && index < ins.count ? .alias(ins[index]) : .value(0)
+        if let index = selectorInputIndex(mode: mode, optionCount: ins.count - 1) {
+          return .alias(ins[index])
+        }
+        return .value(0)
       default:
         break
       }
@@ -237,6 +238,14 @@ extension GraphPrepPasses {
     }
   }
 
+  /// Input index (1-based, past the mode) a constant-mode selector picks, or nil when it
+  /// yields 0. Mirrors the emitted `mode <= i` comparison chain (CRenderer, IRBuilder.selector)
+  /// so fractional modes round up and NaN/out-of-range modes produce 0 without trapping.
+  private static func selectorInputIndex(mode: Float, optionCount: Int) -> Int? {
+    guard optionCount >= 1, mode > 0 else { return nil }
+    return (1...optionCount).first { mode <= Float($0) }
+  }
+
   private static func evaluateConstantOp(_ op: LazyOp, _ inputs: [Float]) -> Float? {
     switch op {
     // Unary
@@ -292,12 +301,10 @@ extension GraphPrepPasses {
     case .selector:
       // selector(mode, options...): 1-indexed, mode<=0 returns 0
       guard inputs.count >= 2 else { return nil }
-      let mode = Int(inputs[0])
-      if mode <= 0 { return 0.0 }
-      if mode <= inputs.count - 1 {
-        return inputs[mode]
+      if let index = selectorInputIndex(mode: inputs[0], optionCount: inputs.count - 1) {
+        return inputs[index]
       }
-      return 0.0  // Out of range
+      return 0.0
 
     default:
       return nil

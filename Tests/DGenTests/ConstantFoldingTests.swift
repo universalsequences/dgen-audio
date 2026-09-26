@@ -372,6 +372,31 @@ final class ConstantFoldingTests: XCTestCase {
         XCTAssertEqual(g.nodes[out]?.inputs, [chosen])
     }
 
+    func testAlgebraicFoldSelectorMatchesEmittedRounding() throws {
+        // Emitted code picks the first option with mode <= i, so fractional modes round up;
+        // NaN and huge modes select nothing (0) rather than trapping.
+        let cases: [(mode: Float, expected: Int?)] = [
+            (0.0, nil), (0.5, 0), (1.0, 0), (1.5, 1), (2.0, 1), (2.5, nil),
+            (.nan, nil), (.infinity, nil), (1e20, nil), (-3.0, nil),
+        ]
+        for (mode, expected) in cases {
+            let g = Graph()
+            let options = [g.n(.input(0)), g.n(.input(1))]
+            let chosen = g.n(.selector, g.n(.constant(mode)), options[0], options[1])
+            let out = g.n(.output(0), chosen)
+
+            _ = GraphPrepPasses.foldAlgebraicIdentities(g)
+
+            if let expected {
+                XCTAssertEqual(g.nodes[out]?.inputs, [options[expected]], "mode \(mode)")
+            } else if case .constant(let value) = g.nodes[chosen]?.op {
+                XCTAssertEqual(value, 0.0, "mode \(mode)")
+            } else {
+                XCTFail("mode \(mode): expected selector to fold to constant 0")
+            }
+        }
+    }
+
     func testAlgebraicFoldMulByZeroRemovesFalseFeedback() throws {
         // y = in + 0 * history; the unfolded graph looks like a recurrence.
         let g = Graph()
