@@ -166,10 +166,19 @@ public struct CompilationPipeline {
     let modulationChanges = backend == .c ? ModulationGateLoweringPass.run(graph: graph) : .init()
     defer { modulationChanges.restore(graph: graph) }
     var timings = PipelineTimings()
+    // Before DCE and feedback analysis: folding removes false feedback edges
+    // (e.g. `x * 0` from literal-algorithm selectors) and DCE drops what dies.
+    let algebraicChanges =
+      backend == .c && GraphPrepPasses.algebraicFoldingEnabled
+      ? timings.measure("foldAlgebraicIdentities") {
+        GraphPrepPasses.foldAlgebraicIdentities(graph)
+      } : .init()
+    defer { algebraicChanges.restore(graph: graph) }
     var prunedNodes: [NodeID: Node] = [:]
     if options.eliminateDeadCode {
       prunedNodes = timings.measure("deadCodeElimination") {
-        DeadCodeEliminationPass.run(graph: graph)
+        DeadCodeEliminationPass.run(
+          graph: graph, removeTableReads: backend == .c && GraphPrepPasses.algebraicFoldingEnabled)
       }
       if options.debug, !prunedNodes.isEmpty {
         print("[dce] pruned \(prunedNodes.count) unreachable nodes for this compile")

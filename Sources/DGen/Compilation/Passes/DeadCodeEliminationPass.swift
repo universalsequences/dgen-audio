@@ -38,15 +38,15 @@ enum DeadCodeEliminationPass {
   /// single compile, and a value nothing reads today may be consumed by nodes
   /// added before the next `realize()`.
   @discardableResult
-  static func run(graph: Graph) -> [NodeID: Node] {
+  static func run(graph: Graph, removeTableReads: Bool = false) -> [NodeID: Node] {
     var consumers: [NodeID: [NodeID]] = [:]
     var roots: [NodeID] = []
     for (id, node) in graph.nodes {
       for dep in node.allDependencies {
         consumers[dep, default: []].append(id)
       }
-      let removable = isPure(node.op) && graph.nodeToTensor[id] == nil
-        && !isTensorShaped(node)
+      let removable = (isPure(node.op) || (removeTableReads && isImmutableTableRead(node, graph: graph)))
+        && graph.nodeToTensor[id] == nil && !isTensorShaped(node)
       if !removable {
         roots.append(id)
       }
@@ -77,6 +77,19 @@ enum DeadCodeEliminationPass {
     }
     _ = consumers
     return removed
+  }
+
+  /// A scalar lookup in a stored table nothing writes has no side effect.
+  /// Enabled with C algebraic folding, which can orphan one (a literal-algorithm
+  /// selector drops the only consumer of a wavetable read); left as a root, the
+  /// dead lookup and its input chain would run every frame outside any gate.
+  private static func isImmutableTableRead(_ node: Node, graph: Graph) -> Bool {
+    guard case .peek = node.op, let source = node.inputs.first,
+      let stored = graph.nodes[source], case .tensorRef(let tensorId) = stored.op,
+      stored.allDependencies.isEmpty, let tensor = graph.tensors[tensorId],
+      tensor.data != nil, !graph.mutableTensorCells.contains(tensor.cellId)
+    else { return false }
+    return true
   }
 
   private static func isTensorShaped(_ node: Node) -> Bool {
