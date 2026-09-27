@@ -47,7 +47,8 @@ enum StaticHoistPass {
     var ordered: [NodeID] = []
     for id in sortedNodes {
       guard let node = graph.nodes[id],
-        isHoistableOp(node.op) || isStoredTensorRead(node, graph: graph),
+        isHoistableOp(node.op) || isStoredTensorRead(node, graph: graph)
+          || isImmutableTablePeek(node, graph: graph),
         node.temporalDependencies.isEmpty,
         !frameBasedNodes.contains(id),
         hopBasedNodes[id] == nil,
@@ -58,6 +59,21 @@ enum StaticHoistPass {
       ordered.append(id)
     }
     return ordered
+  }
+
+  /// A `peek` into an immutable stored table is a pure function of its index
+  /// and channel: when those are hoistable (e.g. derived from a param), the
+  /// lookup is frame-invariant and runs once per process call instead of as a
+  /// four-lane gather every sample. The source must be the stored tensor itself
+  /// (no view transforms, never written by `poke`); the dependency closure in
+  /// `hoistableNodes` guarantees index and channel are hoistable too.
+  private static func isImmutableTablePeek(_ node: Node, graph: Graph) -> Bool {
+    guard case .peek = node.op, node.inputs.count == 3,
+      let source = graph.nodes[node.inputs[0]],
+      isStoredTensorRead(source, graph: graph),
+      graph.mutableTensorReadCell(node) == nil
+    else { return false }
+    return true
   }
 
   private static func isStoredTensorRead(_ node: Node, graph: Graph) -> Bool {

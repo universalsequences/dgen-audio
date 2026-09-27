@@ -289,6 +289,68 @@ final class CodegenPerfPassesTests: XCTestCase {
     XCTAssertGreaterThan(late, early * 2, "hoisted gain did not follow the parameter change")
   }
 
+  // MARK: - Static hoisting of immutable table lookups
+
+  /// Renders `source` with and without the static hoist pass, moving `param`
+  /// between blocks, and requires identical output.
+  private func assertHoistExact(
+    _ source: String, param: String, values: (Float, Float), file: StaticString = #filePath,
+    line: UInt = #line
+  ) throws -> Compiled {
+    let optimized = try compile(source)
+    setenv("DGEN_NO_STATIC_HOIST", "1", 1)
+    let reference = try compile(source)
+    unsetenv("DGEN_NO_STATIC_HOIST")
+    let cell = try XCTUnwrap(optimized.paramCells[param])
+    let refCell = try XCTUnwrap(reference.paramCells[param])
+    let got = try render(optimized) { block, mem in mem[cell] = block < 2 ? values.0 : values.1 }
+    let want = try render(reference) { block, mem in mem[refCell] = block < 2 ? values.0 : values.1 }
+    XCTAssertEqual(got, want, file: file, line: line)
+    return optimized
+  }
+
+  func testImmutableTablePeekWithParamIndexIsHoisted() throws {
+    // A per-preset table read by a param-derived row: frame-invariant, so the
+    // gather belongs in the static block, not in every sample's SIMD lanes.
+    // The carrier is defined first so the peek sorts after frame-rate work:
+    // that is the order that used to drag the lookup into the frame loop,
+    // where it ran as a per-lane gather every sample.
+    let source = """
+      (def carrier (phasor 100))
+      (param row @default 0 @min 0 @max 2)
+      (def table (tensor @shape [3 4] @data [10 11 12 13  20 21 22 23  30 31 32 33]))
+      (def value (peek table (floor (+ row 0.5)) 2))
+      (out (* value carrier) 1)
+      """
+    let optimized = try assertHoistExact(source, param: "row", values: (0, 2))
+    XCTAssertFalse(
+      optimized.source.contains("vgetq_lane_f32"),
+      "table gather still emitted per SIMD lane inside a frame loop")
+  }
+
+  func testPokedTablePeekIsNotHoisted() throws {
+    // A table written by poke changes every frame: its reads must stay in the
+    // frame loop, ordered after the write, even with a param-derived index.
+    let source = """
+      (param slot @default 1 @min 0 @max 3)
+      (def buf (tensor @shape [4]))
+      (make-history cursor)
+      (def pos (read-history cursor))
+      (write-history cursor (wrap (+ pos 1) 0 4))
+      (out (seq (poke buf pos (phasor 50)) (peek buf (floor slot))) 1)
+      """
+    _ = try assertHoistExact(source, param: "slot", values: (1, 3))
+  }
+
+  func testTablePeekWithFrameVaryingIndexIsNotHoisted() throws {
+    let source = """
+      (param depth @default 1 @min 0 @max 1)
+      (def table (tensor @shape [8] @data [0 1 2 3 4 5 6 7]))
+      (out (* depth (peek table (* 8 (phasor 30)))) 1)
+      """
+    _ = try assertHoistExact(source, param: "depth", values: (1, 0.5))
+  }
+
   // MARK: - Scalar block coalescing
 
   func testCircularWindowWrapsMatchIntegerHistory() throws {
