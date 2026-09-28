@@ -10,7 +10,8 @@ import Foundation
 /// ones, and the C renderer broadcasts static globals into SIMD loops from lane
 /// zero, so the only missing piece is forming such a block.
 ///
-/// A node is hoistable when it has no temporal dependencies, is not
+/// A node is hoistable when it has no temporal dependencies (an immutable
+/// table peek's ordering dependencies are moot), is not
 /// frame- or hop-based, uses an op from a pure
 /// allowlist, and every value input is itself hoistable. Hoistable nodes depend
 /// only on hoistable nodes, so emitting them all first is a valid schedule.
@@ -46,10 +47,14 @@ enum StaticHoistPass {
     var hoistable = Set<NodeID>()
     var ordered: [NodeID] = []
     for id in sortedNodes {
-      guard let node = graph.nodes[id],
-        isHoistableOp(node.op) || isStoredTensorRead(node, graph: graph)
-          || isImmutableTablePeek(node, graph: graph),
-        node.temporalDependencies.isEmpty,
+      guard let node = graph.nodes[id] else { continue }
+      let tablePeek = isImmutableTablePeek(node, graph: graph)
+      guard isHoistableOp(node.op) || isStoredTensorRead(node, graph: graph) || tablePeek,
+        // seq construction orders every peek in a later operand's cone after
+        // the earlier writes (e.g. a delay time behind `delay`'s write). A
+        // table nothing writes reads the same whatever the order, so those
+        // temporal dependencies do not pin its lookup to the frame loop.
+        tablePeek || node.temporalDependencies.isEmpty,
         !frameBasedNodes.contains(id),
         hopBasedNodes[id] == nil,
         !graph.materializeNodes.contains(id),
