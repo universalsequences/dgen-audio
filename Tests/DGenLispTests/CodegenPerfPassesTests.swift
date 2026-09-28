@@ -328,6 +328,54 @@ final class CodegenPerfPassesTests: XCTestCase {
       "table gather still emitted per SIMD lane inside a frame loop")
   }
 
+  func testImmutableTablePeekFeedingDelayTimeIsHoisted() throws {
+    // `delay` is seq(write, read), and seq construction gives every
+    // memory-touching node in the read side's cone a temporal dependency on
+    // the write -- including a peek of an immutable table. A table value that
+    // feeds a delay time therefore stayed in the frame loop, and through the
+    // shared delay time the tag reached the table-driven gain on the delayed
+    // bus as well: DOOM Master Snare ran 868 of 1142 table peeks per sample.
+    // Reading a table nothing writes cannot depend on write order.
+    let source = """
+      (def carrier (phasor 100))
+      (param row @default 0 @min 0 @max 2)
+      (def ki (floor (+ row 0.5)))
+      (def table (tensor @shape [3 3] @data [8 16 24  0.5 0.25 0.75  2 3 4]))
+      (def gain (peek table ki 1))
+      (def bus (* gain carrier))
+      (def dt (latch (peek table ki 0) (eq (phasor 10) 0)))
+      (out (+ (delay bus dt @max-delay 64) (* (peek table ki 2) (delay bus dt @max-delay 64))) 1)
+      """
+    let optimized = try assertHoistExact(source, param: "row", values: (0, 2))
+    // The delay line itself is legitimately gathered per lane, so check the
+    // table lookups' blocks rather than the emitted C.
+    let graph = optimized.result.graph
+    let tablePeeks = graph.nodes.values.filter { node in
+      guard case .peek = node.op, let source = graph.nodes[node.inputs[0]],
+        case .tensorRef(let tensorId) = source.op else { return false }
+      return graph.tensors[tensorId]?.shape == [3, 3]
+    }
+    XCTAssertEqual(tablePeeks.count, 3)
+    for peek in tablePeeks {
+      let block = try XCTUnwrap(optimized.result.blocks.first { $0.nodes.contains(peek.id) })
+      XCTAssertEqual(block.temporality, .static_, "table peek behind a delay time stayed per frame")
+    }
+  }
+
+  func testPokedTablePeekFeedingDelayTimeIsExact() throws {
+    // A table written by poke keeps its write ordering in a delay's cone.
+    let source = """
+      (param slot @default 1 @min 0 @max 3)
+      (def buf (tensor @shape [4]))
+      (make-history cursor)
+      (def pos (read-history cursor))
+      (write-history cursor (wrap (+ pos 1) 0 4))
+      (def dt (+ 1 (* 8 (seq (poke buf pos (phasor 50)) (peek buf (floor slot))))))
+      (out (delay (phasor 200) dt @max-delay 64) 1)
+      """
+    _ = try assertHoistExact(source, param: "slot", values: (1, 3))
+  }
+
   func testPokedTablePeekIsNotHoisted() throws {
     // A table written by poke changes every frame: its reads must stay in the
     // frame loop, ordered after the write, even with a param-derived index.
