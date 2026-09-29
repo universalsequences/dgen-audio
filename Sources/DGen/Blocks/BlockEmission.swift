@@ -409,7 +409,7 @@ private func determineVectorPlan(
     // CRenderer uses frame SIMD only when every lane is active and there is
     // no partial vector. Sparse clocks retain scalar hop checks;
     // in particular, no gather or arithmetic runs on inactive lanes.
-    canUseSIMD = graph.eventClockNodes.contains(clock)
+    canUseSIMD = graph.eventClockNodes.contains(clock) && !graph.sparseEventClocks.contains(clock)
       && block.frameOrder == .parallel && block.shape == nil
       && block.tensorIndex == nil && !hasSIMDBlockers && supportsDenseHopSIMD(bodyUops)
   } else if let shape = block.shape, block.tensorIndex != nil {

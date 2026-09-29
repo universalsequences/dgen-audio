@@ -665,30 +665,75 @@ public func topologicalSort(
     let ka = groupKey[a]!, kb = groupKey[b]!
     return ka != kb ? ka < kb : a < b
   }
-  var queue = groupIndegree.filter { $0.value == 0 }.map { $0.key }.sorted(by: before)
+  // Consumers per group, so releasing a group touches only its consumers
+  // (scanning every group's deps per step was quadratic in node count).
+  var consumersOf: [Int: [Int]] = [:]
+  for (groupId, deps) in groupDeps {
+    for dep in deps { consumersOf[dep, default: []].append(groupId) }
+  }
   var sortedGroups: [Int] = []
-  var lastWasScalar: Bool? = nil
+  sortedGroups.reserveCapacity(groupToNodes.count)
 
-  while !queue.isEmpty {
-    var pick = 0
-    if affineSort, let last = lastWasScalar,
-      let match = queue.firstIndex(where: { groupIsScalar($0) == last })
-    {
-      pick = match
-    }
-    let groupId = queue.remove(at: pick)
-    lastWasScalar = groupIsScalar(groupId)
-    sortedGroups.append(groupId)
-
-    // Update consumers
-    for (otherGroupId, deps) in groupDeps {
-      if deps.contains(groupId) {
-        groupIndegree[otherGroupId]! -= 1
-        if groupIndegree[otherGroupId] == 0 {
-          // Insert in sorted order for determinism
-          let insertIndex = queue.firstIndex { before(otherGroupId, $0) } ?? queue.count
-          queue.insert(otherGroupId, at: insertIndex)
+  if affineSort {
+    var queue = groupIndegree.filter { $0.value == 0 }.map { $0.key }.sorted(by: before)
+    var lastWasScalar: Bool? = nil
+    while !queue.isEmpty {
+      var pick = 0
+      if let last = lastWasScalar,
+        let match = queue.firstIndex(where: { groupIsScalar($0) == last })
+      {
+        pick = match
+      }
+      let groupId = queue.remove(at: pick)
+      lastWasScalar = groupIsScalar(groupId)
+      sortedGroups.append(groupId)
+      for other in consumersOf[groupId] ?? [] {
+        groupIndegree[other]! -= 1
+        if groupIndegree[other] == 0 {
+          let insertIndex = queue.firstIndex { before(other, $0) } ?? queue.count
+          queue.insert(other, at: insertIndex)
         }
+      }
+    }
+  } else {
+    // Min-heap on (key, id): the same order as always taking the smallest
+    // ready group from a sorted queue.
+    var heap: [Int] = []
+    func push(_ x: Int) {
+      heap.append(x)
+      var i = heap.count - 1
+      while i > 0 {
+        let parent = (i - 1) / 2
+        guard before(heap[i], heap[parent]) else { break }
+        heap.swapAt(i, parent)
+        i = parent
+      }
+    }
+    func pop() -> Int {
+      let top = heap[0]
+      let last = heap.removeLast()
+      if !heap.isEmpty {
+        heap[0] = last
+        var i = 0
+        while true {
+          let l = 2 * i + 1, r = l + 1
+          var m = i
+          if l < heap.count, before(heap[l], heap[m]) { m = l }
+          if r < heap.count, before(heap[r], heap[m]) { m = r }
+          if m == i { break }
+          heap.swapAt(i, m)
+          i = m
+        }
+      }
+      return top
+    }
+    for (groupId, degree) in groupIndegree where degree == 0 { push(groupId) }
+    while !heap.isEmpty {
+      let groupId = pop()
+      sortedGroups.append(groupId)
+      for other in consumersOf[groupId] ?? [] {
+        groupIndegree[other]! -= 1
+        if groupIndegree[other] == 0 { push(other) }
       }
     }
   }

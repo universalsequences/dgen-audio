@@ -59,6 +59,10 @@ open class Graph {
     /// node had this id. Without it a pass-created node (and everything that
     /// waits on it) sorts after every original node that happens to be ready.
     public var schedulingKeys: [NodeID: NodeID] = [:]
+    /// Event clocks whose events are sparse (at most one per lane group in
+    /// practice, e.g. note onsets). Their blocks skip the all-lanes-active SIMD
+    /// copy, which would never run and doubles the generated code.
+    public var sparseEventClocks: Set<NodeID> = []
 
     /// Tracks buffer position dependencies for slidingWindow circular buffer mode.
     /// Maps bufferView result nodes to their writePos accum nodes.

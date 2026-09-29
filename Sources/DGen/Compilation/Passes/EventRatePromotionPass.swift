@@ -33,6 +33,7 @@ enum EventRatePromotionPass {
     var addedNodes: Set<NodeID> = []
     var clockKeys: [NodeID] = []
     var hopRateKeys: [NodeID] = []
+    var sparseClocks: [NodeID] = []
 
     func restore(graph: Graph) {
       for id in addedNodes {
@@ -46,6 +47,7 @@ enum EventRatePromotionPass {
         }
       }
       for key in hopRateKeys { graph.nodeHopRate.removeValue(forKey: key) }
+      for clock in sparseClocks { graph.sparseEventClocks.remove(clock) }
     }
   }
 
@@ -196,6 +198,8 @@ enum EventRatePromotionPass {
       // value is current, so they read the root through a clock-tagged
       // pass-through instead of a second, frame-serial `eventHold` latch.
       let clock = graph.eventClock(for: clockTrigger)
+      graph.sparseEventClocks.insert(clock)
+      changes.sparseClocks.append(clock)
       var held: [NodeID: NodeID] = [:]
       for root in roots where (consumers[root] ?? []).contains(where: { memberSet.contains($0) }) {
         let read = make(.add, [root, zero])
