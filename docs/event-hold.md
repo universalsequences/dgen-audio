@@ -56,3 +56,42 @@ than propagating tensor classification to their consumers. Their C SIMD lowering
 gathers each lane's integer index separately, including wrapped indices and
 fractional channel interpolation. Mutable tables and tensor views retain the
 conservative classification.
+
+## Returning scalars to audio rate: `event-latch`
+
+`(event-latch value trigger)` is `latch` for a scalar computed on `trigger`'s
+event clock. A plain `latch` is frame-serial: every frame runs a conditional
+store, which keeps its loop scalar. `event-latch` reads one held cell: a
+four-frame group with no event broadcasts it, and only groups containing an
+event walk their lanes in order. Its consumer loop stays SIMD, so hundreds of
+held coefficients cost about as much as the same number of parameters.
+
+## Automatic promotion of latched math
+
+Most instruments do not need either operator. A C compilation schedules plain
+latched math at event rate by itself (`EventRatePromotionPass`):
+
+```lisp
+(def vel (latch velocity onset))
+(def row (latch (floor kit) onset))
+(def decay (* (peek table row 0) (exp (* 0.5 vel))))   ; runs only on onsets
+(out (* (exp (/ (* -1 age) decay)) body) 1)
+```
+
+`latch(x, trigger)` changes only on `trigger` frames, whatever `x` is. Pure
+scalar math over such latches and frame-invariant values (parameters,
+immutable table lookups) is therefore piecewise constant. The pass runs each
+such region on an event clock that fires on `trigger`, or on the first frame of
+a process call when a frame-invariant input of the region changed (and on the
+first call). Values read by frame-rate code return through `event-latch`.
+Output is the same as per-sample evaluation, up to scalar/SIMD float rounding.
+
+The pass keeps a value at frame rate when that is cheaper than holding it (a
+multiply whose inputs are already held), and skips regions whose saved work
+does not cover the held reads. After block formation, each frame-rate block
+that reads a held value gets its own copy with its own cell, so the value stays
+in a register instead of travelling through a frame tape. `changed(x)`, which
+detects a parameter change once per call, is hoisted with the other
+frame-invariant math.
+
+`DGEN_DISABLE_EVENT_PROMOTION=1` turns the pass off, for comparisons.

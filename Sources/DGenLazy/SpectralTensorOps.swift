@@ -155,6 +155,11 @@ extension Signal {
     let id = graph.graph.eventHold(nodeId, when: trigger.nodeId)
     return Signal(nodeId: id, graph: graph, requiresGrad: requiresGrad)
   }
+
+  public func eventLatch(when trigger: Signal) -> Signal {
+    let id = graph.graph.eventLatch(nodeId, when: trigger.nodeId)
+    return Signal(nodeId: id, graph: graph, requiresGrad: requiresGrad)
+  }
 }
 
 extension SignalTensor {

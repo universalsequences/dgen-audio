@@ -65,7 +65,7 @@ public func upgradeElementLoopsToSIMD(_ uops: inout [UOp]) {
       switch uops[k].op {
       case .load, .store, .delay1, .memoryAccumulate:
         hasBlocker = true
-      case .noise, .latch:
+      case .noise, .latch, .eventLatch:
         hasBlocker = true
       case .beginForLoop, .endLoop, .beginParallelRange, .endParallelRange,
         .beginIf, .endIf, .gswitch:
@@ -445,6 +445,9 @@ extension Op {
       visit(c)
       visit(a)
       visit(b)
+    case .eventLatch(_, let v, let k):
+      visit(v)
+      visit(k)
     case .selector(let m, let opts):
       visit(m)
       opts.forEach(visit)

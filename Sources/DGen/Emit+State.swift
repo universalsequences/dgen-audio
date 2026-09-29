@@ -317,6 +317,27 @@ extension LazyOp {
         let cond = b.value(inputs[1])
         b.use(val: u_latch(cellId, value: value, cond: cond)(b))
       }
+    case .changed(let previousCell, let seenCell):
+      guard inputs.count == 1 else {
+        throw DGenError.insufficientInputs(operator: "changed", expected: 1, actual: inputs.count)
+      }
+      let x = b.value(inputs[0])
+      let previous = b.load(previousCell)
+      let seen = b.load(seenCell)
+      let one = b.constant(1)
+      let result = b.max(one - (x == previous), seen == b.constant(0))
+      _ = b.store(previousCell, x)
+      _ = b.store(seenCell, one)
+      b.use(val: result)
+    case .eventLatch(let cellId):
+      guard inputs.count == 2 else {
+        throw DGenError.insufficientInputs(
+          operator: "eventLatch", expected: 2, actual: inputs.count)
+      }
+      guard ctx.tensorIndices[nodeId] == nil else {
+        throw DGenError.compilationFailed("eventLatch supports scalar values only")
+      }
+      b.use(val: b.eventLatch(cellId, value: b.value(inputs[0]), clock: b.value(inputs[1])))
     case .accum(let cellId):
       guard inputs.count == 4 else {
         throw DGenError.insufficientInputs(

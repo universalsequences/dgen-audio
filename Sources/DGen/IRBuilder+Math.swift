@@ -254,6 +254,13 @@ extension IRBuilder {
     return value(dest)
   }
 
+  /// Held read of an event-rate value; see `Op.eventLatch`.
+  public func eventLatch(_ cellId: CellID, value: Expr, clock: Expr) -> Expr {
+    let dest = ctx.useVariable(src: nodeId)
+    ops.append(UOp(op: .eventLatch(cellId, value.lazy, clock.lazy), value: dest))
+    return self.value(dest)
+  }
+
   /// Emit a pseudo-random noise value. The `cellId` provides per-cell state for the RNG.
   public func noise(_ cellId: CellID) -> Expr {
     let dest = ctx.useVariable(src: nodeId)

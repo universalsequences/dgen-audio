@@ -276,6 +276,8 @@ private struct BlockAccess {
       return [a]
     case .gswitch(let a, let b, let c), .simdgroupMultiplyAccumulate(let a, let b, let c):
       return [a, b, c]
+    case .eventLatch(_, let a, let b):
+      return [a, b]
     case .selector(let mode, let options):
       return [mode] + options
     case .simdgroupLoadScratch(_, let offset, _, _):

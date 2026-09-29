@@ -42,8 +42,9 @@ extension TemporalityPass {
   /// Returns true if an op is intrinsically frame-based (its value changes per frame).
   static func isIntrinsicallyFrameBased(_ op: LazyOp) -> Bool {
     switch op {
-    case .phasor(_), .deterministicPhasor, .output(_), .accum(_), .input(_),
-      .historyRead(_), .historyWrite(_), .historyReadWrite(_), .latch(_), .click(_),
+    case .phasor(_), .deterministicPhasor, .output(_), .accum(_), .input(_), .blockStart,
+      .historyRead(_), .historyWrite(_), .historyReadWrite(_), .latch(_), .eventLatch(_),
+      .click(_),
       .noise(_), .tensorNoise(_, _, _), .hopTensorNoise(_, _, _),
       .temporalGradStore, .temporalGradRead,
       .spectrumDelay(_, _, _, _, _),

@@ -9,6 +9,8 @@ extension LazyOp {
     let b = IRBuilder(ctx: ctx, nodeId: nodeId)
     let inputs: [Lazy] = node.inputs.compactMap { input in
       guard let value = ctx.values[input] else { return nil }
+      // eventLatch reads its event-rate value only on its own event frames.
+      if case .eventLatch = node.op { return value }
       guard let rate = ctx.hopBasedNodes[input], g.eventClockNodes.contains(rate.1),
         ctx.hopBasedNodes[nodeId]?.1 != rate.1,
         g.nodeToTensor[input] == nil, let clock = ctx.values[rate.1] else { return value }
@@ -23,6 +25,10 @@ extension LazyOp {
     case .hostSampleRate:
       let dest = ctx.useVariable(src: nodeId)
       ops.append(UOp(op: .hostSampleRate, value: dest))
+    case .blockStart:
+      // Float compare so a SIMD frame loop tests each lane's own frame.
+      let frame = b.cast(b.frameIndex(), to: .float)
+      b.use(val: frame == b.constant(0))
     case .tensorRef(_):
       // Register a placeholder value so that downstream ops can find this input
       // The actual tensor data is accessed via nodeToTensor lookup
@@ -559,7 +565,9 @@ extension LazyOp {
 
     case .memoryRead, .memoryWrite, .memoryAccumulate, .memoryCellSum, .tensorAccumulate,
       .chunkPartialsReduceToCell,
-      .historyWrite, .historyReadWrite, .historyRead, .param, .latch, .click, .noise,
+      .historyWrite, .historyReadWrite, .historyRead, .param, .latch, .eventLatch, .changed,
+      .click,
+      .noise,
       .phasor, .deterministicPhasor, .gradDeterministicPhasor, .accum,
       .output, .input, .seq:
       try emitStateOp(b: b, ctx: ctx, g: g, node: node, inputs: inputs, nodeId: nodeId)

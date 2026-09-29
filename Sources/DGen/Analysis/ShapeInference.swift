@@ -248,7 +248,8 @@ public func inferShape(op: LazyOp, inputs: [ValueShape], graph: Graph) throws ->
     .pow, .mod, .min, .max, .atan2, .gt, .gte, .lt, .lte, .eq,
     .and, .or, .xor, .gswitch, .mix, .selector,
     .modulatedParam,
-    .phasor(_), .accum(_), .latch(_), .deterministicPhasor, .gradDeterministicPhasor:
+    .phasor(_), .accum(_), .latch(_), .eventLatch(_), .deterministicPhasor,
+    .gradDeterministicPhasor:
     let tensorShapes = inputs.compactMap { input -> Shape? in
       if case .tensor(let shape) = input { return shape }
       return nil
@@ -312,7 +313,7 @@ public func inferShape(op: LazyOp, inputs: [ValueShape], graph: Graph) throws ->
     .memoryAccumulate, .memoryCellSum,
     .historyReadWrite,
     .param, .click, .noise,
-    .constant, .hostSampleRate, .output, .input:
+    .constant, .hostSampleRate, .blockStart, .changed, .output, .input:
     return .scalar
   }
 }

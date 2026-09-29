@@ -618,7 +618,7 @@ public class MetalRenderer: Renderer, UOpEmitter {
     case .simdgroupMultiplyAccumulate(let a, let b, let acc):
       return variableIdsUsed(in: a).union(variableIdsUsed(in: b)).union(variableIdsUsed(in: acc))
 
-    case .latch(let a, let b):
+    case .latch(let a, let b), .eventLatch(_, let a, let b):
       return variableIdsUsed(in: a).union(variableIdsUsed(in: b))
 
     case .gswitch(let c, let a, let b):
@@ -1875,7 +1875,7 @@ public class MetalRenderer: Renderer, UOpEmitter {
       .add, .sub, .mul, .div, .abs, .sign, .sin, .cos, .and, .or, .xor,
       .tan, .atan, .tanh, .exp, .log, .log10, .sqrt, .pow, .atan2, .mod,
       .gt, .gte, .lte, .lt, .eq, .min, .max, .floor, .ceil, .round,
-      .noise, .memoryRead, .simdBroadcastLoad, .broadcastScalar, .latch,
+      .noise, .memoryRead, .simdBroadcastLoad, .broadcastScalar, .latch, .eventLatch,
       .gswitch, .selector, .hostSampleRate, .frameIndex, .threadIndex,
       .loadTape, .cast, .identity, .declareVar, .threadgroupRead,
       .threadgroupPositionX, .threadgroupPositionY, .threadgroupPositionZ,

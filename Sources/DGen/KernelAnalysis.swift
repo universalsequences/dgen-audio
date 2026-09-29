@@ -57,7 +57,7 @@ private func classify(_ op: Op) -> OpClass {
 
   // Arithmetic ops
   case .add, .sub, .mul, .div, .mod, .abs, .sign, .floor, .ceil, .round,
-       .min, .max, .gt, .gte, .lt, .lte, .eq, .gswitch, .noise, .latch,
+       .min, .max, .gt, .gte, .lt, .lte, .eq, .gswitch, .noise, .latch, .eventLatch,
        .and, .or, .xor, .cast, .identity, .declareVar, .mutate, .selector:
     return .arithmetic
 

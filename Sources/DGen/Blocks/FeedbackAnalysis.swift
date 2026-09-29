@@ -321,7 +321,7 @@ public func determineFeedbackGroups(_ g: Graph, feedbackClusters: [[NodeID]]) ->
       writes[c, default: []].append($0.id)
     case .accum(let c):
       writes[c, default: []].append($0.id)
-    case .latch(let c):
+    case .latch(let c), .eventLatch(let c):
       writes[c, default: []].append($0.id)
     case .phasor(let c):
       writes[c, default: []].append($0.id)
@@ -420,6 +420,8 @@ public func findSequentialNodes(_ g: Graph, feedbackClusters: [[NodeID]], backen
       // not every stateful chain, so all history operations stay frame-serial;
       // tensor blocks still iterate/index their elements inside each frame.
       scalar.insert($0.id)
+    case .changed:
+      scalar.insert($0.id)  // Compare-and-store on its cells; once per call when hoisted
     case .memoryRead(let cellId), .memoryWrite(let cellId):
       // Vector-width gradient carry cells are the reverse-time analogue of
       // history: state carried across (reverse) frames. A parallel per-frame
@@ -652,30 +654,86 @@ public func topologicalSort(
     guard let members = groupToNodes[groupId] else { return false }
     return members.contains { finalScalarSet.contains($0) }
   }
-  var queue = groupIndegree.filter { $0.value == 0 }.map { $0.key }.sorted()
+  // Singleton groups are numbered in node-id order, so ordering them by their
+  // (possibly overridden) node id keeps the default order.
+  var groupKey: [Int: Int] = [:]
+  for (groupId, nodes) in groupToNodes {
+    groupKey[groupId] =
+      groupId < 1000 ? groupId : 1000 + (nodes.map { g.schedulingKeys[$0] ?? $0 }.min() ?? 0)
+  }
+  func before(_ a: Int, _ b: Int) -> Bool {
+    let ka = groupKey[a]!, kb = groupKey[b]!
+    return ka != kb ? ka < kb : a < b
+  }
+  // Consumers per group, so releasing a group touches only its consumers
+  // (scanning every group's deps per step was quadratic in node count).
+  var consumersOf: [Int: [Int]] = [:]
+  for (groupId, deps) in groupDeps {
+    for dep in deps { consumersOf[dep, default: []].append(groupId) }
+  }
   var sortedGroups: [Int] = []
-  var lastWasScalar: Bool? = nil
+  sortedGroups.reserveCapacity(groupToNodes.count)
 
-  while !queue.isEmpty {
-    var pick = 0
-    if affineSort, let last = lastWasScalar,
-      let match = queue.firstIndex(where: { groupIsScalar($0) == last })
-    {
-      pick = match
-    }
-    let groupId = queue.remove(at: pick)
-    lastWasScalar = groupIsScalar(groupId)
-    sortedGroups.append(groupId)
-
-    // Update consumers
-    for (otherGroupId, deps) in groupDeps {
-      if deps.contains(groupId) {
-        groupIndegree[otherGroupId]! -= 1
-        if groupIndegree[otherGroupId] == 0 {
-          // Insert in sorted order for determinism
-          let insertIndex = queue.firstIndex { $0 > otherGroupId } ?? queue.count
-          queue.insert(otherGroupId, at: insertIndex)
+  if affineSort {
+    var queue = groupIndegree.filter { $0.value == 0 }.map { $0.key }.sorted(by: before)
+    var lastWasScalar: Bool? = nil
+    while !queue.isEmpty {
+      var pick = 0
+      if let last = lastWasScalar,
+        let match = queue.firstIndex(where: { groupIsScalar($0) == last })
+      {
+        pick = match
+      }
+      let groupId = queue.remove(at: pick)
+      lastWasScalar = groupIsScalar(groupId)
+      sortedGroups.append(groupId)
+      for other in consumersOf[groupId] ?? [] {
+        groupIndegree[other]! -= 1
+        if groupIndegree[other] == 0 {
+          let insertIndex = queue.firstIndex { before(other, $0) } ?? queue.count
+          queue.insert(other, at: insertIndex)
         }
+      }
+    }
+  } else {
+    // Min-heap on (key, id): the same order as always taking the smallest
+    // ready group from a sorted queue.
+    var heap: [Int] = []
+    func push(_ x: Int) {
+      heap.append(x)
+      var i = heap.count - 1
+      while i > 0 {
+        let parent = (i - 1) / 2
+        guard before(heap[i], heap[parent]) else { break }
+        heap.swapAt(i, parent)
+        i = parent
+      }
+    }
+    func pop() -> Int {
+      let top = heap[0]
+      let last = heap.removeLast()
+      if !heap.isEmpty {
+        heap[0] = last
+        var i = 0
+        while true {
+          let l = 2 * i + 1, r = l + 1
+          var m = i
+          if l < heap.count, before(heap[l], heap[m]) { m = l }
+          if r < heap.count, before(heap[r], heap[m]) { m = r }
+          if m == i { break }
+          heap.swapAt(i, m)
+          i = m
+        }
+      }
+      return top
+    }
+    for (groupId, degree) in groupIndegree where degree == 0 { push(groupId) }
+    while !heap.isEmpty {
+      let groupId = pop()
+      sortedGroups.append(groupId)
+      for other in consumersOf[groupId] ?? [] {
+        groupIndegree[other]! -= 1
+        if groupIndegree[other] == 0 { push(other) }
       }
     }
   }

@@ -258,6 +258,72 @@ public class CRenderer: Renderer {
       scheduleItem.ops.append(UOp(op: .endLoop, value: .empty))
     }
 
+    /// A frame-rate SIMD block reading `eventLatch` values, split per lane
+    /// group: groups without an event on any of its clocks run the SIMD body
+    /// with every held value as a plain broadcast of its cell; groups with an
+    /// event run the body lane by lane, where `eventLatch` stores on its frame.
+    func appendEventLatchVectorBlock(_ block: BlockUOps, clocks: [Lazy]) {
+      closeOpenScope()
+      resetCurrentBlockState()
+      emitThreadCountScaleChange(nil)
+      let zero = ctx.useConstant(src: nil, value: 0)
+      let width = ctx.useConstant(src: nil, value: Float(block.vectorWidth))
+      func expression(_ op: Op, type: CastType = .float) -> Lazy {
+        let result = ctx.useVariable(src: nil, trackInValues: false)
+        scheduleItem.ops.append(UOp(op: op, value: result, scalarType: type))
+        return result
+      }
+      scheduleItem.ops.append(UOp(op: .beginLoop(frameCountUOp, block.vectorWidth), value: .empty))
+      let start = expression(.frameIndex, type: .int)
+      let remaining = expression(.sub(frameCountUOp, start), type: .int)
+      let count = expression(.min(remaining, width), type: .int)
+      // loadTape reads 0 past the callback, so a trailing partial group takes
+      // the lane path, which stops at `count`.
+      var event = zero
+      for lane in 0..<block.vectorWidth {
+        let offset = ctx.useConstant(src: nil, value: Float(lane))
+        let frame = expression(.add(start, offset), type: .int)
+        for clock in clocks {
+          let tick = expression(.eq(expression(.loadTape(clock, frame)), zero))
+          event = expression(.max(event, tick))
+        }
+      }
+      let quiet = expression(.eq(event, zero))
+      scheduleItem.ops.append(UOp(op: .beginIf(quiet), value: .empty))
+      for uop in block.ops {
+        guard case .eventLatch(let cell, _, _) = uop.op else {
+          scheduleItem.ops.append(uop)
+          continue
+        }
+        var held = UOp(op: .simdBroadcastLoad(cell, zero), value: uop.value)
+        held.vectorWidth = uop.vectorWidth
+        scheduleItem.ops.append(held)
+      }
+      scheduleItem.ops.append(UOp(op: .endIf, value: .empty))
+      scheduleItem.ops.append(UOp(op: .beginIf(event), value: .empty))
+      let lane = ctx.useVariable(src: nil, trackInValues: false)
+      scheduleItem.ops.append(UOp(op: .beginForLoop(lane, count), value: .empty))
+      let frame = expression(.add(start, lane), type: .int)
+      scheduleItem.ops.append(UOp(op: .setFrameIndex(frame), value: .empty))
+      for var op in block.ops {
+        op.vectorWidth = 1
+        scheduleItem.ops.append(op)
+      }
+      scheduleItem.ops.append(UOp(op: .endLoop, value: .empty))
+      scheduleItem.ops.append(UOp(op: .endIf, value: .empty))
+      scheduleItem.ops.append(UOp(op: .endLoop, value: .empty))
+    }
+
+    func eventLatchClocks(_ block: BlockUOps) -> [Lazy] {
+      var clocks: [Lazy] = []
+      for uop in block.ops {
+        if case .eventLatch(_, _, let clock) = uop.op, !clocks.contains(clock) {
+          clocks.append(clock)
+        }
+      }
+      return clocks
+    }
+
     func appendNormalBlock(_ block: BlockUOps) {
       if currentDemand != block.executionDemand {
         closeOpenScope()
@@ -273,6 +339,15 @@ public class CRenderer: Renderer {
       if case .hopBased(_, let clock) = block.temporality, block.vectorWidth > 1 {
         appendEventVectorBlock(block, clock: clock)
         return
+      }
+      if block.temporality == .frameBased, block.vectorWidth > 1,
+        block.dispatchMode.threadCountScale == nil
+      {
+        let clocks = eventLatchClocks(block)
+        if !clocks.isEmpty {
+          appendEventLatchVectorBlock(block, clocks: clocks)
+          return
+        }
       }
       let needsNewLoop =
         currentFrameOrder != block.frameOrder
@@ -398,6 +473,23 @@ public class CRenderer: Renderer {
       switch scheduledRegions[regionIndex] {
       case .block(let index):
         var block = uopBlocks[index]
+        let latchesEvents =
+          block.temporality == .frameBased && block.vectorWidth > 1
+          && block.ops.contains { if case .eventLatch = $0.op { return true } else { return false } }
+        if latchesEvents {
+          // One lane-group event test and one traversal for the whole run.
+          while regionIndex + 1 < scheduledRegions.count,
+            case .block(let nextIndex) = scheduledRegions[regionIndex + 1] {
+            let next = uopBlocks[nextIndex]
+            guard next.frameOrder == block.frameOrder,
+              next.temporality == block.temporality,
+              next.dispatchMode == block.dispatchMode,
+              next.vectorWidth == block.vectorWidth,
+              next.executionDemand == block.executionDemand else { break }
+            block.ops.append(contentsOf: next.ops)
+            regionIndex += 1
+          }
+        }
         if case .hopBased = block.temporality, block.vectorWidth > 1 {
           // Preserve the normal renderer's adjacent-loop fusion for both
           // branches. One event check and one frame traversal serve the
@@ -844,6 +936,42 @@ public class CRenderer: Renderer {
       let expr = uop.isSimd ? "vrndaq_f32(\(g(a)))" : "__builtin_roundf(\(g(a)))"
       return emitAssign(uop, expr, ctx)
 
+    case .eventLatch(let cellId, let value, let clock):
+      if uop.isSimd {
+        // Events are rare: one lane-group test, then the held cell broadcast.
+        // Only groups containing an event walk their lanes in frame order;
+        // lanes past frameCount (a trailing partial group) never store.
+        // The event value is read from its tape by lane, only in the slow
+        // path. Referencing its vector would keep a load (and a register) live
+        // across the whole loop for every latch.
+        let valueId = extractVarId(value)
+        let lane =
+          ctx.globals.contains(valueId) ? "t\(valueId)[i + el_k]" : "el_v[el_k]"
+        let spill =
+          ctx.globals.contains(valueId) ? "" : "float el_v[4]; vst1q_f32(el_v, \(g(value)));"
+        let expr = """
+          ({
+              float32x4_t el_out;
+              float32x4_t el_clock = \(g(clock));
+              if (__builtin_expect(vmaxvq_u32(vceqq_f32(el_clock, vdupq_n_f32(0.0f))) == 0u, 1)) {
+                el_out = vdupq_n_f32(memory[\(cellId)]);
+              } else {
+                float el_c[4], el_o[4];
+                vst1q_f32(el_c, el_clock);
+                \(spill)
+                for (int el_k = 0; el_k < 4; el_k++) {
+                  if (i + el_k < frameCount && el_c[el_k] == 0.0f) memory[\(cellId)] = \(lane);
+                  el_o[el_k] = memory[\(cellId)];
+                }
+                el_out = vld1q_f32(el_o);
+              }
+              el_out;
+          })
+          """
+        return emitAssign(uop, expr, ctx)
+      }
+      return emitAssign(
+        uop, "({ if (\(g(clock)) == 0.0f) memory[\(cellId)] = \(g(value)); memory[\(cellId)]; })", ctx)
     case .noise(let cellId):
       // Xorshift32 PRNG - better spectral properties than LCG
       // State is stored as raw uint32 bits in a float slot via memcpy

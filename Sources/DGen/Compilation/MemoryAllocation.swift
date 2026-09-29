@@ -176,7 +176,7 @@ func remapVectorMemorySlots(
       for uop in block.ops {
         if let cellId = uop.op.memoryCellId {
           switch uop.op {
-          case .load, .store, .delay1, .noise:
+          case .load, .store, .delay1, .noise, .eventLatch:
             persistentCells.insert(cellId)
           case .memoryAccumulate:
             accumulateCells.insert(cellId)
