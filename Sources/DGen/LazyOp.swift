@@ -309,6 +309,10 @@ public enum LazyOp {
   case historyReadWrite(CellID)
   case param(CellID)
   case latch(CellID)
+  /// Frame-rate read of an event-rate value: inputs [value, eventClock].
+  /// Stores `value` into the cell on event frames (clock == 0) and returns
+  /// the held cell every frame. See HigherOps+EventHold.swift.
+  case eventLatch(CellID)
   case click(CellID)
   case historyRead(CellID)
   case phasor(CellID)
@@ -322,6 +326,13 @@ public enum LazyOp {
   case spectrumDelayMod(CellID, CellID, CellID, Int, Int)  // ringCell, rowCell, outputCell, N, maxHops — fractional delay driven by a scalar `delay` input (0..maxHops)
   case constant(Float)
   case hostSampleRate
+  /// 1 on the first frame of each process call, 0 otherwise. Parameters
+  /// change only between calls, so this is the frame static values change on.
+  case blockStart
+  /// changed(prevCell, seenCell), input [x]: 1 when `x` differs from its value
+  /// at the previous evaluation, or on the first evaluation; 0 otherwise.
+  /// Hoisted to run once per process call when `x` is frame-invariant.
+  case changed(CellID, CellID)
   case output(Int)
   case input(Int)
   case tensorRef(TensorID)
@@ -398,7 +409,7 @@ public enum LazyOp {
   /// access on single-cell state, corrupting adjacent memory).
   public var isInherentlyScalar: Bool {
     switch self {
-    case .accum, .phasor, .click, .latch, .noise:
+    case .accum, .phasor, .click, .latch, .eventLatch, .changed, .noise:
       return true
     default:
       return false
@@ -425,8 +436,10 @@ public enum LazyOp {
     // Core scalar/tensor stateful ops. The tensor lowerings of these emit
     // memoryRead/memoryWrite and are the ones the UOp scan cannot classify.
     case .phasor(let cellId), .accum(let cellId), .latch(let cellId),
-      .click(let cellId), .noise(let cellId):
+      .eventLatch(let cellId), .click(let cellId), .noise(let cellId):
       return [cellId]
+    case .changed(let previous, let seen):
+      return [previous, seen]
 
     // History (delay/feedback) buffers.
     case .historyRead(let cellId), .historyWrite(let cellId),

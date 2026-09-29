@@ -65,6 +65,10 @@ public enum Op {
   /// reference frame-scope scalars. Scalar mode degrades to a plain copy.
   case broadcastScalar(Lazy)
   case latch(Lazy, Lazy)
+  /// eventLatch(cell, value, clock): on frames where `clock == 0` store
+  /// `value` into `memory[cell]`; always yield `memory[cell]`. The C renderer
+  /// emits a lane-group fast path (one event test, one broadcast load).
+  case eventLatch(CellID, Lazy, Lazy)
   case blockGateTest(Lazy, frameVarying: Bool)
   case beginIf(Lazy)
   case gswitch(Lazy, Lazy, Lazy)
@@ -160,7 +164,7 @@ public enum Op {
       .memoryRead(let cellId, _), .memoryWrite(let cellId, _, _),
       .memoryAccumulate(let cellId, _, _),
       .simdBroadcastLoad(let cellId, _),
-      .noise(let cellId),
+      .noise(let cellId), .eventLatch(let cellId, _, _),
       .simdgroupLoad(let cellId, _, _, _), .simdgroupStore(_, let cellId, _, _):
       return cellId
     default:
@@ -214,6 +218,7 @@ public enum Op {
     case .broadcastScalar(let a): return .broadcastScalar(r(a))
     case .memoryAccumulate(let c, let o, let v): return .memoryAccumulate(c, r(o), r(v))
     case .latch(let a, let b): return .latch(r(a), r(b))
+    case .eventLatch(let c, let v, let k): return .eventLatch(c, r(v), r(k))
     case .gswitch(let c, let a, let b): return .gswitch(r(c), r(a), r(b))
     case .selector(let m, let opts): return .selector(r(m), opts.map { r($0) })
     case .beginForLoop(let v, let c): return .beginForLoop(r(v), r(c))
@@ -279,6 +284,7 @@ public enum Op {
     case .store(_, let val): return .store(newCellId, val)
     case .delay1(_, let a): return .delay1(newCellId, a)
     case .noise: return .noise(newCellId)
+    case .eventLatch(_, let v, let k): return .eventLatch(newCellId, v, k)
     case .memoryRead(_, let offset): return .memoryRead(newCellId, offset)
     case .memoryWrite(_, let offset, let value): return .memoryWrite(newCellId, offset, value)
     case .memoryAccumulate(_, let offset, let value):

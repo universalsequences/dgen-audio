@@ -32,7 +32,7 @@ enum StaticHoistPass {
     case .add, .sub, .div, .mul, .abs, .sign, .sin, .cos, .tan, .atan, .tanh, .exp, .log,
       .log10, .sqrt, .atan2, .gt, .gte, .lte, .lt, .eq, .gswitch, .mix, .pow, .floor, .ceil,
       .round, .mod, .min, .max, .and, .or, .xor, .neg,
-      .selector, .constant, .hostSampleRate, .param:
+      .selector, .constant, .hostSampleRate, .param, .changed:
       return true
     default:
       return false

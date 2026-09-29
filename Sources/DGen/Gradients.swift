@@ -749,6 +749,11 @@ extension LazyOp {
       // inputs: [increment, reset, min, max]
       return [gradIncrement, zero, zero, zero]
 
+    case .eventLatch(_):
+      // event-hold graphs reject automatic differentiation before this runs.
+      let zero = g.n(.constant(0.0), [])
+      return [zero, zero]
+
     case .latch(_):
       // Gradient flows through value when condition was true
       // inputs: [value, condition]
@@ -789,7 +794,7 @@ extension LazyOp {
 
     // MARK: I/O and Constants
 
-    case .constant(_), .hostSampleRate:
+    case .constant(_), .hostSampleRate, .blockStart, .changed:
       return []  // No inputs
 
     case .input(_):

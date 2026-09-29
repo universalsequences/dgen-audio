@@ -55,6 +55,10 @@ open class Graph {
     /// gates execution. Sharing a trigger shares the exact same clock domain.
     public var eventHoldClocks: [NodeID: NodeID] = [:]
     public var eventClockNodes: Set<NodeID> = []
+    /// Tie-break order for nodes a compile pass inserts: schedule as if the
+    /// node had this id. Without it a pass-created node (and everything that
+    /// waits on it) sorts after every original node that happens to be ready.
+    public var schedulingKeys: [NodeID: NodeID] = [:]
 
     /// Tracks buffer position dependencies for slidingWindow circular buffer mode.
     /// Maps bufferView result nodes to their writePos accum nodes.

@@ -192,6 +192,15 @@ public struct CompilationPipeline {
       }
     }
 
+    // After DCE so dead latches do not open regions; before feedback and
+    // sequential analysis, which must see the event clocks it adds.
+    let eventPromotion =
+      backend == .c && EventRatePromotionPass.isEnabled
+      ? timings.measure("eventRatePromotion") {
+        EventRatePromotionPass.run(graph: graph, debug: options.debug)
+      } : .init()
+    defer { eventPromotion.restore(graph: graph) }
+
     var gatePlan = ExecutionGatePass.Plan()
     defer { gatePlan.restoreDependencies(graph: graph) }
 
@@ -211,6 +220,12 @@ public struct CompilationPipeline {
     let nodeTemporality = try timings.measure("inferTemporality") {
       try TemporalityPass.inferTemporality(graph: graph, sortedNodes: prep.sortedNodes)
     }
+    let sortedNodes =
+      backend == .c
+      ? EventRatePromotionPass.clusterEventNodes(
+        sorted: prep.sortedNodes, graph: graph, hopBasedNodes: nodeTemporality.hopBasedNodes,
+        feedbackClusters: prep.feedbackClusters)
+      : prep.sortedNodes
     // The hop-tensor peel targets Metal's dispatch model (per-frame threads +
     // block-level hop guard). The C renderer's SIMD lowering cannot consume the
     // peeled parallel blocks (undeclared simd temps), so C keeps the pre-peel
@@ -222,18 +237,21 @@ public struct CompilationPipeline {
       (backend == .c && StaticHoistPass.isEnabled)
       ? timings.measure("staticHoist") {
         StaticHoistPass.hoistableNodes(
-          graph: graph, sortedNodes: prep.sortedNodes,
+          graph: graph, sortedNodes: sortedNodes,
           frameBasedNodes: nodeTemporality.frameBasedNodes,
           hopBasedNodes: nodeTemporality.hopBasedNodes)
       } : []
     let hoistedSet = Set(hoisted)
     let loopNodes = hoistedSet.isEmpty
-      ? prep.sortedNodes : prep.sortedNodes.filter { !hoistedSet.contains($0) }
+      ? sortedNodes : sortedNodes.filter { !hoistedSet.contains($0) }
     var finalBlocks = buildInitialBlocks(
       graph: graph, sortedNodes: loopNodes, scalarNodeSet: finalScalarSet, context: context,
       hopBasedNodes: peelHopNodes,
       timings: &timings)
     finalBlocks = try gatePlan.split(blocks: finalBlocks)
+    if backend == .c {
+      finalBlocks = isolateDelayLines(finalBlocks, graph: graph)
+    }
     if backend == .c && ScalarBlockCoalescingPass.isEnabled {
       let before = finalBlocks.count
       finalBlocks = timings.measure("coalesceScalarBlocks") {
@@ -288,6 +306,17 @@ public struct CompilationPipeline {
       backend: backend,
       blocks: &finalBlocks
     )
+    var localLatches = EventRatePromotionPass.Changes()
+    defer { localLatches.restore(graph: graph) }
+    if backend == .c {
+      let copies = EventRatePromotionPass.localizeEventLatches(
+        blocks: &finalBlocks, graph: graph, changes: &localLatches)
+      if !copies.isEmpty {
+        temporalityResult = BlockTemporalityResult(
+          frameBasedNodes: temporalityResult.frameBasedNodes.union(copies),
+          hopBasedNodes: temporalityResult.hopBasedNodes)
+      }
+    }
     materializeTensorMemory(
       graph: graph,
       blocks: finalBlocks,
@@ -346,7 +375,7 @@ public struct CompilationPipeline {
 
     return CompilationResult(
       graph: graph,
-      sortedNodes: prep.sortedNodes,
+      sortedNodes: sortedNodes,
       sequentialNodes: finalScalarSet,
       blocks: finalBlocks,
       sortedBlockIndices: finalBlockIndices,
@@ -459,6 +488,45 @@ public struct CompilationPipeline {
       feedbackClusters: feedbackClusters,
       scalarNodeSet: scalarNodeSet,
       sortedNodes: sortedNodes)
+  }
+
+  /// Moves each scalar `historyReadWrite` (delay1) out of a parallel block.
+  ///
+  /// C renders delay1 frame-serially and never vectorizes a block holding one
+  /// (see containsSIMDBlockers), so a single delay1 inside a large parallel
+  /// block scalarizes all of it. Each run of them becomes its own sequential
+  /// block, in place, so the surrounding math keeps its SIMD loop; coalescing
+  /// then folds small pieces into neighbouring sequential runs. Runs after the
+  /// execution-gate split: every piece keeps its block's demand.
+  private static func isolateDelayLines(_ blocks: [Block], graph: Graph) -> [Block] {
+    func isDelay(_ id: NodeID) -> Bool {
+      guard let node = graph.nodes[id], case .historyReadWrite = node.op else { return false }
+      if case .tensor = node.shape { return false }
+      return true
+    }
+    var result: [Block] = []
+    for block in blocks {
+      guard block.frameOrder == .parallel, block.shape == nil, block.tensorIndex == nil,
+        block.sequentialFrameGroup == nil, block.nodes.contains(where: isDelay),
+        block.nodes.contains(where: { !isDelay($0) })
+      else {
+        result.append(block)
+        continue
+      }
+      var part = block
+      part.nodes = []
+      for id in block.nodes {
+        let order: FrameOrder = isDelay(id) ? .sequential : .parallel
+        if !part.nodes.isEmpty, part.frameOrder != order {
+          result.append(part)
+          part.nodes = []
+        }
+        part.frameOrder = order
+        part.nodes.append(id)
+      }
+      result.append(part)
+    }
+    return result
   }
 
   /// Builds executable blocks before temporality-aware rewrites.

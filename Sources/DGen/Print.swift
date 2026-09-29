@@ -115,6 +115,8 @@ extension UOp {
             opStr = "\(ANSI.green)switch\(ANSI.reset)(\(a), \(b), \(t))"
         case let .latch(a, b):
             opStr = "\(ANSI.green)latch\(ANSI.reset)(\(a), \(b))"
+        case let .eventLatch(c, a, b):
+            opStr = "\(ANSI.green)eventLatch\(ANSI.reset)(\(c), \(a), \(b))"
         case let .beginLoop(a, b):
             opStr = "\(ANSI.green)begin_loop\(ANSI.reset)(\(a), \(b))"
         case let .beginReverseLoop(a):

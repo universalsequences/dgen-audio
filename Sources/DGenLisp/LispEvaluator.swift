@@ -684,6 +684,8 @@ class LispEvaluator {
       return try evalLatch(regularArgs)
     case "event-hold":
       return try evalEventHold(regularArgs)
+    case "event-latch":
+      return try evalEventLatch(regularArgs)
     case "hop-hold", "hophold":
       return try evalHopHold(regularArgs)
     case "mix":
@@ -1345,6 +1347,15 @@ class LispEvaluator {
     default:
       throw LispError.typeError("latch: value must be signal, tensor, or signalTensor")
     }
+  }
+
+  private func evalEventLatch(_ args: [ASTNode]) throws -> EvalResult {
+    guard args.count == 2 else {
+      throw LispError.invalidArgument("event-latch requires 2 arguments (value, trigger)")
+    }
+    let value = try requireSignal(evaluateAST(args[0]))
+    let trigger = try requireSignal(evaluateAST(args[1]))
+    return .signal(value.eventLatch(when: trigger))
   }
 
   private func evalEventHold(_ args: [ASTNode]) throws -> EvalResult {
