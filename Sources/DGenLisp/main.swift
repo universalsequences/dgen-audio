@@ -10,6 +10,7 @@
 //   --toolchain-root <dir>   Staged DGen toolchain root (embedded clang/lld)
 //   --skip-inline-audit      Skip the post-compile binary audit (host audits)
 //   --audit-tool <path>      Explicit audit script for the inline audit
+//   --no-probes              Compile `probe` forms as plain identity
 //   --debug                  Debug output
 //   -                        Read from stdin (also default if no file given)
 
@@ -47,6 +48,7 @@ struct CLIArgs {
     var toolchainRoot: String? = nil
     var skipInlineAudit: Bool = false
     var auditTool: String? = nil
+    var noProbes: Bool = false
     var debug: Bool = false
     var readStdin: Bool = false
 }
@@ -86,6 +88,8 @@ func parseArgs(_ args: [String]) -> CLIArgs {
         case "--audit-tool":
             i += 1
             if i < args.count { cli.auditTool = args[i] }
+        case "--no-probes":
+            cli.noProbes = true
         case "--debug":
             cli.debug = true
         case "-":
@@ -140,6 +144,8 @@ func printUsage() {
           --audit-tool <path>      Audit script for the inline audit
                                    (overrides DGEN_BINARY_AUDIT_TOOL and the
                                    dgen-checkout fallback)
+          --no-probes              Compile `probe` forms as plain identity:
+                                   no probe channels, empty manifest probes[]
           --debug                  Debug output
           -                        Read from stdin (also default if no file given)
           -h, --help               Show this help
@@ -195,6 +201,7 @@ func main() throws {
     // Evaluate lisp source
     let assetBase = cli.assetBase ?? inputDirectory
     let evaluator = LispEvaluator(sourceDirectory: URL(fileURLWithPath: assetBase, isDirectory: true))
+    evaluator.probesEnabled = !cli.noProbes
     do {
         let parsedNodes = try parseSource(source)
         let loweredNodes = try lowerModulation(in: parsedNodes)
@@ -204,7 +211,7 @@ func main() throws {
         exit(1)
     }
 
-    guard !evaluator.outputs.isEmpty else {
+    guard evaluator.outputs.contains(where: { !$0.probe }) else {
         fputs("Error: No outputs defined. Use (out <signal> <channel>) to define outputs.\n", stderr)
         exit(1)
     }

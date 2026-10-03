@@ -54,6 +54,25 @@ struct OutputInfo {
   /// `@amp true`: the voice's amp-activity flag (nonzero while the voice is
   /// audible), so a host can retire a released voice once it reads 0.
   let amp: Bool
+  /// True for the hidden output a `probe` form lowers to; its channel is
+  /// assigned by the compiler after evaluation (see `ProbeInfo`).
+  var probe: Bool = false
+}
+
+/// One evaluation of a `(probe <signal> …)` form: a host-visible view of a
+/// scalar signal, lowered to a hidden output channel placed after every
+/// user-declared output.
+struct ProbeInfo {
+  let signal: Signal
+  /// `@id`, or `probe-<ordinal>` in evaluation order when omitted.
+  let id: String
+  /// 0, 1, 2… among probes sharing this `id`, in evaluation order.
+  let occurrence: Int
+  /// `@view` hint passed through to the manifest uninterpreted.
+  let view: String
+  let name: String?
+  /// 0-indexed output channel; assigned once the whole source is evaluated.
+  var channel: Int = -1
 }
 
 struct TensorOutputInfo {
@@ -97,6 +116,11 @@ class LispEvaluator {
   private var paramValues: [String: EvalResult] = [:]
   var outputs: [OutputInfo] = []
   var tensorOutputs: [TensorOutputInfo] = []
+  /// Probes in evaluation order. Their channels are assigned and their hidden
+  /// outputs appended to `outputs` at the end of `evaluate(nodes:)`.
+  var probes: [ProbeInfo] = []
+  /// `--no-probes`: `probe` is a plain identity with no channel or manifest entry.
+  var probesEnabled: Bool = true
   var inputs: [InputInfo] = []
   var tensors: [TensorInfo] = []
   var macroExpansionCounter: Int = 0
@@ -142,6 +166,7 @@ class LispEvaluator {
       paramValues.removeAll()
       outputs.removeAll()
       tensorOutputs.removeAll()
+      probes.removeAll()
       inputs.removeAll()
       tensors.removeAll()
       macroExpansionCounter = 0
@@ -150,7 +175,31 @@ class LispEvaluator {
     for node in nodes {
       let _ = try evaluateAST(node)
     }
+    assignProbeChannels()
     try validateParamUIMetadata(params)
+  }
+
+  /// Places every probe on its own channel after the highest user-declared
+  /// output channel (audio, `@modulator`, `@amp`, tensor outputs) and lowers
+  /// it to an ordinary scalar output, which keeps it a graph root. Runs after
+  /// the whole source is evaluated so an `out` later in the source can't
+  /// collide with a probe. Idempotent across repeated `evaluate` calls.
+  private func assignProbeChannels() {
+    outputs.removeAll(where: \.probe)
+    guard !probes.isEmpty else { return }
+    let highestUserChannel = max(
+      outputs.map(\.channel).max() ?? -1,
+      tensorOutputs.map(\.channel).max() ?? -1
+    )
+    for index in probes.indices {
+      let channel = highestUserChannel + 1 + index
+      probes[index].channel = channel
+      outputs.append(
+        OutputInfo(
+          channel: channel, signal: probes[index].signal,
+          name: probes[index].name ?? probes[index].id, modulatorSlot: nil, amp: false,
+          probe: true))
+    }
   }
 
   private func predeclareTopLevelParams(in nodes: [ASTNode]) throws {
@@ -711,6 +760,8 @@ class LispEvaluator {
       return try evalInput(regularArgs, attributes: attributePairs)
     case "out":
       return try evalOutput(regularArgs, attributes: attributePairs)
+    case "probe":
+      return try evalProbe(regularArgs, attributes: attributePairs)
 
     // Tensor creation
     case "tensor":
@@ -1821,6 +1872,42 @@ class LispEvaluator {
     }
 
     return .none
+  }
+
+  /// `(probe <signal> [@id <string>] [@view <string>] [@name <string>])`:
+  /// returns `<signal>` unchanged and records a probe (see `ProbeInfo`).
+  private func evalProbe(_ args: [ASTNode], attributes: [(name: String, value: String)]) throws
+    -> EvalResult
+  {
+    guard args.count == 1 else {
+      throw LispError.invalidArgument("probe requires exactly 1 argument (signal)")
+    }
+    let value = try evaluateAST(args[0])
+    let signal: Signal
+    switch value {
+    case .signalTensor, .tensor:
+      throw LispError.invalidArgument("probe requires a scalar signal")
+    default:
+      if batchLaneCount != nil {
+        throw LispError.invalidArgument("probe is not supported on batched signals")
+      }
+      signal = try requireSignal(value)
+    }
+    guard probesEnabled else { return value }
+
+    let id = attrValue(attributes, "@id").map(unquote) ?? "probe-\(probes.count)"
+    if id.isEmpty {
+      throw LispError.invalidArgument("probe @id cannot be empty")
+    }
+    let occurrence = probes.filter { $0.id == id }.count
+    probes.append(
+      ProbeInfo(
+        signal: signal,
+        id: id,
+        occurrence: occurrence,
+        view: attrValue(attributes, "@view").map(unquote) ?? "number",
+        name: attrValue(attributes, "@name").map(unquote)))
+    return value
   }
 
   // MARK: - Tensor ops

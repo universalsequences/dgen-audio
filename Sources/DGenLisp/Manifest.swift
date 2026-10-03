@@ -28,6 +28,9 @@ struct PatchManifest: Codable {
     let modOutputs: [ManifestModOutput]
     /// The output marked `@amp true`, if any: nonzero while a voice is audible.
     let ampOutput: ManifestAmpOutput?
+    /// `probe` forms, each on a compiler-assigned channel after every
+    /// user-declared output. The channels are also listed in `outputs`.
+    let probes: [ManifestProbe]
     let modDestinations: [ManifestModDestination]
     let tensors: [ManifestTensor]
     let tensorInitData: [ManifestTensorInit]
@@ -198,6 +201,50 @@ struct ManifestAmpOutput: Codable {
     let name: String?
 }
 
+struct ManifestProbe: Codable {
+    let id: String
+    let occurrence: Int
+    /// 0-indexed output channel, like `ampOutput.channel`.
+    let channel: Int
+    let view: String
+    let name: String?
+
+    enum CodingKeys: String, CodingKey {
+        case id, occurrence, channel, view, name
+    }
+
+    init(id: String, occurrence: Int, channel: Int, view: String, name: String?) {
+        self.id = id
+        self.occurrence = occurrence
+        self.channel = channel
+        self.view = view
+        self.name = name
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        id = try container.decode(String.self, forKey: .id)
+        occurrence = try container.decode(Int.self, forKey: .occurrence)
+        channel = try container.decode(Int.self, forKey: .channel)
+        view = try container.decode(String.self, forKey: .view)
+        name = try container.decodeIfPresent(String.self, forKey: .name)
+    }
+
+    /// Always writes `name`, as `null` when absent.
+    func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(id, forKey: .id)
+        try container.encode(occurrence, forKey: .occurrence)
+        try container.encode(channel, forKey: .channel)
+        try container.encode(view, forKey: .view)
+        if let name {
+            try container.encode(name, forKey: .name)
+        } else {
+            try container.encodeNil(forKey: .name)
+        }
+    }
+}
+
 struct ManifestModDestination: Codable {
     let name: String
     let paramCellId: Int
@@ -307,6 +354,12 @@ func generateManifest(
         ManifestAmpOutput(channel: output.channel, name: output.name)
     }
 
+    let manifestProbes = evaluator.probes.map { probe in
+        ManifestProbe(
+            id: probe.id, occurrence: probe.occurrence, channel: probe.channel,
+            view: probe.view, name: probe.name)
+    }
+
     let paramsByName = Dictionary(
         uniqueKeysWithValues: evaluator.params.map { ($0.canonicalName, $0) })
     let manifestModDestinations = evaluator.params.compactMap { param -> ManifestModDestination? in
@@ -381,6 +434,7 @@ func generateManifest(
         modulators: manifestModulators,
         modOutputs: manifestModOutputs,
         ampOutput: manifestAmpOutput,
+        probes: manifestProbes,
         modDestinations: manifestModDestinations,
         tensors: manifestTensors,
         tensorInitData: manifestTensorInit
