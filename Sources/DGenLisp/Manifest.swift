@@ -26,6 +26,8 @@ struct PatchManifest: Codable {
     let outputs: [ManifestOutput]
     let modulators: [ManifestModulator]
     let modOutputs: [ManifestModOutput]
+    /// The output marked `@amp true`, if any: nonzero while a voice is audible.
+    let ampOutput: ManifestAmpOutput?
     let modDestinations: [ManifestModDestination]
     let tensors: [ManifestTensor]
     let tensorInitData: [ManifestTensorInit]
@@ -191,6 +193,11 @@ struct ManifestModOutput: Codable {
     let range: String
 }
 
+struct ManifestAmpOutput: Codable {
+    let channel: Int
+    let name: String?
+}
+
 struct ManifestModDestination: Codable {
     let name: String
     let paramCellId: Int
@@ -296,6 +303,10 @@ func generateManifest(
     }
     .sorted { $0.slot < $1.slot }
 
+    let manifestAmpOutput = evaluator.outputs.first(where: \.amp).map { output in
+        ManifestAmpOutput(channel: output.channel, name: output.name)
+    }
+
     let paramsByName = Dictionary(
         uniqueKeysWithValues: evaluator.params.map { ($0.canonicalName, $0) })
     let manifestModDestinations = evaluator.params.compactMap { param -> ManifestModDestination? in
@@ -369,6 +380,7 @@ func generateManifest(
         outputs: manifestOutputs,
         modulators: manifestModulators,
         modOutputs: manifestModOutputs,
+        ampOutput: manifestAmpOutput,
         modDestinations: manifestModDestinations,
         tensors: manifestTensors,
         tensorInitData: manifestTensorInit

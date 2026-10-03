@@ -165,6 +165,79 @@ final class ModulationTests: XCTestCase {
         }
     }
 
+    func testManifestIncludesAmpOutputDeclaredOnOutForm() throws {
+        let source = """
+        (def env (phasor 0.5))
+        (out (* env (phasor 220)) 1 @name left)
+        (out (* env (phasor 220)) 2 @name right)
+        (out (> env 0.0001) 3 @name amp @amp true)
+        (out (phasor 0.25) 4 @name macro-a @modulator 1)
+        """
+
+        let evaluator = LispEvaluator()
+        try evaluator.evaluate(nodes: parseSource(source))
+
+        let graph = LazyGraphContext.current
+        for output in evaluator.outputs {
+            graph.addOutput(output.signal, channel: output.channel)
+        }
+
+        let compilation = try graph.compileOnly(frameCount: 64, voiceCount: 1)
+        let compilerResult = CompilerResult(
+            dylibPath: "",
+            cSourcePath: "",
+            compilationResult: compilation,
+            cSource: ""
+        )
+        let options = CompilerOptions(
+            outputDir: ".",
+            name: "patch",
+            sampleRate: 48_000,
+            maxFrames: 64,
+            voiceCount: 1,
+            debug: false
+        )
+        let manifest = generateManifest(
+            compilerResult: compilerResult,
+            evaluator: evaluator,
+            options: options
+        )
+
+        let ampOutput = try XCTUnwrap(manifest.ampOutput)
+        XCTAssertEqual(ampOutput.channel, 2)
+        XCTAssertEqual(ampOutput.name, "amp")
+        XCTAssertEqual(manifest.modOutputs.map(\.channel), [3])
+
+        let json = String(decoding: try JSONEncoder().encode(manifest), as: UTF8.self)
+        XCTAssertTrue(json.contains("\"ampOutput\":{"))
+    }
+
+    func testManifestOmitsAmpOutputWhenUndeclared() throws {
+        let source = "(out (phasor 220) 1 @name audio)"
+        let evaluator = LispEvaluator()
+        try evaluator.evaluate(nodes: parseSource(source))
+        XCTAssertFalse(evaluator.outputs.contains(where: \.amp))
+    }
+
+    func testAmpOutputMustBeUnique() throws {
+        let source = """
+        (out (phasor 1) 3 @amp true)
+        (out (phasor 2) 4 @amp true)
+        """
+        let evaluator = LispEvaluator()
+        XCTAssertThrowsError(try evaluator.evaluate(nodes: parseSource(source))) { error in
+            XCTAssertTrue("\(error)".contains("only one output may be marked @amp"))
+        }
+    }
+
+    func testAmpOutputCannotAlsoBeModulator() throws {
+        let source = "(out (phasor 1) 3 @amp true @modulator 1)"
+        let evaluator = LispEvaluator()
+        XCTAssertThrowsError(try evaluator.evaluate(nodes: parseSource(source))) { error in
+            XCTAssertTrue("\(error)".contains("cannot be both @amp and @modulator"))
+        }
+    }
+
     func testManifestKeepsScalarParamCellSpanWhenBroadcastInSIMD() throws {
         let source = """
         (param gain @default 0.5 @min 0 @max 1)
