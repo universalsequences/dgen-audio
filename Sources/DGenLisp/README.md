@@ -311,6 +311,14 @@ UI metadata attributes are optional and do not affect DSP behavior. `@group` bot
 
 At least one `out` is required. Channel numbers are 1-indexed.
 `@modulator <slot>` marks an output as a host-visible modulation output.
+`@amp true` marks the one output that reports whether the voice is still
+audible (nonzero while sounding, 0 once the amp envelope has finished). It is
+listed as `ampOutput` in the manifest; hosts keep it out of the audio mix and
+may stop processing a released voice as soon as it reads 0:
+
+```lisp
+(out (> env 0.0001) 3 @name amp @amp true)
+```
 
 ### Arithmetic
 
@@ -666,6 +674,7 @@ Floats are promoted automatically when combined with graph types. Signals and te
     "name": "macro-a",
     "range": "unipolar"
   }],
+  "ampOutput": {"channel": 2, "name": "amp"},
   "tensors": [{
     "name": "waves",
     "cellOffset": 100,

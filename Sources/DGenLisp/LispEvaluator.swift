@@ -51,6 +51,9 @@ struct OutputInfo {
   let signal: Signal
   let name: String?
   let modulatorSlot: Int?
+  /// `@amp true`: the voice's amp-activity flag (nonzero while the voice is
+  /// audible), so a host can retire a released voice once it reads 0.
+  let amp: Bool
 }
 
 struct TensorOutputInfo {
@@ -1776,6 +1779,23 @@ class LispEvaluator {
     {
       throw LispError.invalidArgument("duplicate output @modulator slot \(modulatorSlot)")
     }
+    let amp = parseBoolAttr(attributes, "@amp")
+    if amp {
+      if modulatorSlot != nil {
+        throw LispError.invalidArgument("an output cannot be both @amp and @modulator")
+      }
+      if outputs.contains(where: { $0.amp }) {
+        throw LispError.invalidArgument("only one output may be marked @amp")
+      }
+      switch value {
+      case .signalTensor, .tensor:
+        throw LispError.invalidArgument("@amp requires a scalar output signal")
+      default:
+        if batchLaneCount != nil {
+          throw LispError.invalidArgument("@amp is not supported on batched outputs")
+        }
+      }
+    }
     switch value {
     case .signalTensor(let signal):
       tensorOutputs.append(
@@ -1795,7 +1815,8 @@ class LispEvaluator {
             channel: channel, signal: lifted, name: name, modulatorSlot: modulatorSlot))
       } else {
         outputs.append(
-          OutputInfo(channel: channel, signal: signal, name: name, modulatorSlot: modulatorSlot))
+          OutputInfo(
+            channel: channel, signal: signal, name: name, modulatorSlot: modulatorSlot, amp: amp))
       }
     }
 
