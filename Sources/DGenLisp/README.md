@@ -320,6 +320,35 @@ may stop processing a released voice as soon as it reads 0:
 (out (> env 0.0001) 3 @name amp @amp true)
 ```
 
+#### Probes
+
+```lisp
+(probe expr [@id string] [@view string] [@name string])
+
+(biquad in (probe (clip f 50 5000) @id "cut" @view scope) 0.9 1 1)
+(probe env @id "env")              ; dangling at top level is fine
+```
+
+`probe` returns `expr` unchanged and makes it a host-visible view. Every probe
+is a graph root, so it survives even when its value is unused. The compiler
+places each probe on its own output channel, after the highest user-declared
+channel (audio, `@modulator`, `@amp`), in evaluation order. Channels are
+assigned once the whole source is evaluated, so a later `out` never collides
+with a probe, and authors never pick a probe channel.
+
+- `@id` identifies the probe for the host; it defaults to `probe-<ordinal>`
+  in evaluation order. Repeated ids are allowed (e.g. a probe inside a
+  `defmacro` expanded several times); each gets an `occurrence` index 0, 1, 2…
+- `@view` is an opaque display hint (`number`, `scope`, `meter`, …) passed
+  through to the manifest; default `number`.
+- Only scalar signals can be probed; tensors and batched signals are an error.
+
+The manifest lists them in `probes` (0-indexed `channel`, as for
+`ampOutput`), and their channels also appear in `outputs`, so hosts that size
+buffers by the highest output channel allocate them. Hosts treat probe channels
+as non-audio. `dgenlisp compile --no-probes` compiles every `probe` as plain
+identity: no channels, empty `probes`.
+
 ### Arithmetic
 
 Binary operators auto-nest for 3+ arguments: `(+ a b c)` becomes `(+ (+ a b) c)`.
@@ -675,6 +704,7 @@ Floats are promoted automatically when combined with graph types. Signals and te
     "range": "unipolar"
   }],
   "ampOutput": {"channel": 2, "name": "amp"},
+  "probes": [{"id": "cut", "occurrence": 0, "channel": 4, "view": "scope", "name": null}],
   "tensors": [{
     "name": "waves",
     "cellOffset": 100,
