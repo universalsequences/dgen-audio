@@ -1446,6 +1446,12 @@ public class MetalRenderer: Renderer, UOpEmitter {
     case .lte(let a, let b): return emitAssign(uop, "\(g(a)) <= \(g(b))", ctx)
     case .lt(let a, let b): return emitAssign(uop, "\(g(a)) < \(g(b))", ctx)
     case .eq(let a, let b): return emitAssign(uop, "\(g(a)) == \(g(b))", ctx)
+    case .and(let a, let b):
+      return emitAssign(uop, "((\(g(a)) != 0.0f) && (\(g(b)) != 0.0f)) ? 1.0f : 0.0f", ctx)
+    case .or(let a, let b):
+      return emitAssign(uop, "((\(g(a)) != 0.0f) || (\(g(b)) != 0.0f)) ? 1.0f : 0.0f", ctx)
+    case .xor(let a, let b):
+      return emitAssign(uop, "((\(g(a)) != 0.0f) != (\(g(b)) != 0.0f)) ? 1.0f : 0.0f", ctx)
     case .gswitch(let cond, let a, let b):
       // Cast both value args to float to avoid ambiguous select overload (int vs float)
       let bStr = isIntTyped(b) ? "(float)\(gi(b))" : g(b)

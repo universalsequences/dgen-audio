@@ -713,6 +713,12 @@ class LispEvaluator {
     case "lte", "<=": return try evalComparison(regularArgs, op: "lte")
     case "eq", "==": return try evalComparison(regularArgs, op: "eq")
 
+    // Logic: nonzero is true; results are 1.0/0.0 like the comparisons
+    case "and": return try evalComparison(regularArgs, op: "and")
+    case "or": return try evalComparison(regularArgs, op: "or")
+    case "xor": return try evalComparison(regularArgs, op: "xor")
+    case "not": return try evalNot(regularArgs)
+
     // Signal generators
     case "phasor":
       return try evalPhasor(regularArgs)
@@ -1059,6 +1065,9 @@ class LispEvaluator {
       case "gte": return .float(a >= b ? 1 : 0)
       case "lte": return .float(a <= b ? 1 : 0)
       case "eq": return .float(a == b ? 1 : 0)
+      case "and": return .float(a != 0 && b != 0 ? 1 : 0)
+      case "or": return .float(a != 0 || b != 0 ? 1 : 0)
+      case "xor": return .float((a != 0) != (b != 0) ? 1 : 0)
       default: throw LispError.unknownOperator(op)
       }
 
@@ -1080,6 +1089,9 @@ class LispEvaluator {
       case "gte": return .signal(a >= b)
       case "lte": return .signal(a <= b)
       case "eq": return .signal(a.eq(b))
+      case "and": return .signal(logicalAnd(a, b))
+      case "or": return .signal(logicalOr(a, b))
+      case "xor": return .signal(logicalXor(a, b))
       default: throw LispError.unknownOperator(op)
       }
 
@@ -1101,6 +1113,9 @@ class LispEvaluator {
         case "gte": return .tensor(a >= Double(b))
         case "lte": return .tensor(a <= Double(b))
         case "eq": return .tensor(a.eq(b))
+        case "and": return .tensor(logicalAnd(a, b))
+        case "or": return .tensor(logicalOr(a, b))
+        case "xor": return .tensor(logicalXor(a, b))
         default: break
         }
       case (.float(let a), .tensor(let b)):
@@ -1117,6 +1132,9 @@ class LispEvaluator {
         case "gte": return .tensor(Double(a) >= b)
         case "lte": return .tensor(Double(a) <= b)
         case "eq": return .tensor(b.eq(a))
+        case "and": return .tensor(logicalAnd(b, a))
+        case "or": return .tensor(logicalOr(b, a))
+        case "xor": return .tensor(logicalXor(b, a))
         default: break
         }
       default:
@@ -1139,6 +1157,9 @@ class LispEvaluator {
       case "gte": return .tensor(a >= b)
       case "lte": return .tensor(a <= b)
       case "eq": return .tensor(a.eq(b))
+      case "and": return .tensor(logicalAnd(a, b))
+      case "or": return .tensor(logicalOr(a, b))
+      case "xor": return .tensor(logicalXor(a, b))
       case "%":
         // `.mod` has no constant-folding Tensor overload; evaluate it in the
         // frame-varying domain, which lowers to the same elementwise UOp.
@@ -1165,6 +1186,9 @@ class LispEvaluator {
       case "gte": return .signalTensor(a >= b)
       case "lte": return .signalTensor(a <= b)
       case "eq": return .signalTensor(a.eq(b))
+      case "and": return .signalTensor(logicalAnd(a, b))
+      case "or": return .signalTensor(logicalOr(a, b))
+      case "xor": return .signalTensor(logicalXor(a, b))
       default: throw LispError.unknownOperator(op)
       }
     }
@@ -1318,6 +1342,13 @@ class LispEvaluator {
       promoteToValue(evaluateAST(args[0])), promoteToValue(evaluateAST(args[1])), op: op)
   }
 
+
+  private func evalNot(_ args: [ASTNode]) throws -> EvalResult {
+    guard args.count == 1 else {
+      throw LispError.invalidArgument("not requires 1 argument")
+    }
+    return try applyBinaryOp(promoteToValue(evaluateAST(args[0])), .float(0), op: "eq")
+  }
 
   // MARK: - Signal generators
 
