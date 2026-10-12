@@ -152,7 +152,7 @@ func parse(_ tokens: inout ArraySlice<String>) throws -> ASTNode {
 
 // MARK: - Binary Operator Nesting
 
-private let binaryOperators: Set<String> = ["+", "-", "*", "/", "%", "min", "max", "and", "or"]
+private let binaryOperators: Set<String> = ["+", "-", "*", "/", "%", "min", "max", "and", "or", "xor"]
 
 /// Transform n-ary binary operators into nested binary form (left-associative)
 /// e.g., (+ a b c d) becomes (+ (+ (+ a b) c) d)
