@@ -103,6 +103,7 @@ enum EventRatePromotionPass {
     }
 
     let usesOutput = Set(graph.nodes.values.flatMap { $0.temporalDependencies })
+    let gated = gatedCone(graph)
     var report = Report()
     var blockStart: NodeID?
     var changedFlags: [NodeID: NodeID] = [:]
@@ -161,34 +162,42 @@ enum EventRatePromotionPass {
       let start = blockStart ?? make(.blockStart, [])
       blockStart = start
       let zero = make(.constant(0), [])
-      // Frame-invariant inputs change only between process calls. Re-run the
-      // region at a call's first frame only when one of them did (or on the
-      // first call), not on every call: `changed` is hoisted to once per call.
-      var live: [NodeID] = []
-      for id in interior {
-        for input in graph.nodes[id]!.inputs where invariant.contains(input) {
-          // Constants and immutable tables never change; only scalar values can.
-          guard let node = graph.nodes[input], isScalar(node) else { continue }
-          switch node.op {
-          case .constant, .tensorRef: continue
-          default: break
+      let clockTrigger: NodeID
+      if !gated.isDisjoint(with: interior) {
+        // A gated region is skipped for whole calls, events included. Refresh
+        // it on the first frame of every call, not only when an input changed,
+        // so the call that reopens its gate starts from current values.
+        clockTrigger = make(.max, [make(.gt, [trigger, zero]), start])
+      } else {
+        // Frame-invariant inputs change only between process calls. Re-run the
+        // region at a call's first frame only when one of them did (or on the
+        // first call), not on every call: `changed` is hoisted to once per call.
+        var live: [NodeID] = []
+        for id in interior {
+          for input in graph.nodes[id]!.inputs where invariant.contains(input) {
+            // Constants and immutable tables never change; only scalar values can.
+            guard let node = graph.nodes[input], isScalar(node) else { continue }
+            switch node.op {
+            case .constant, .tensorRef: continue
+            default: break
+            }
+            if !live.contains(input) { live.append(input) }
           }
-          if !live.contains(input) { live.append(input) }
         }
-      }
-      if live.isEmpty { live.append(zero) }
-      var dirty: NodeID?
-      for input in live {
-        let flag: NodeID
-        if let existing = changedFlags[input] {
-          flag = existing
-        } else {
-          flag = make(.changed(graph.alloc(), graph.alloc()), [input])
-          changedFlags[input] = flag
+        if live.isEmpty { live.append(zero) }
+        var dirty: NodeID?
+        for input in live {
+          let flag: NodeID
+          if let existing = changedFlags[input] {
+            flag = existing
+          } else {
+            flag = make(.changed(graph.alloc(), graph.alloc()), [input])
+            changedFlags[input] = flag
+          }
+          dirty = dirty.map { make(.max, [$0, flag]) } ?? flag
         }
-        dirty = dirty.map { make(.max, [$0, flag]) } ?? flag
+        clockTrigger = make(.max, [make(.gt, [trigger, zero]), make(.mul, [start, dirty!])])
       }
-      let clockTrigger = make(.max, [make(.gt, [trigger, zero]), make(.mul, [start, dirty!])])
 
       let clocksBefore = Set(graph.eventHoldClocks.keys)
       let hopBefore = Set(graph.nodeHopRate.keys)
@@ -242,6 +251,34 @@ enum EventRatePromotionPass {
           + "\(report.promotedNodes) nodes at event rate, \(report.frontier) latched back")
     }
     return changes
+  }
+
+  /// Nodes a block-gated body depends on: its value, history and ring cone.
+  private static func gatedCone(_ graph: Graph) -> Set<NodeID> {
+    guard !graph.executionGates.isEmpty else { return [] }
+    var writers: [CellID: [NodeID]] = [:]
+    for (id, node) in graph.nodes {
+      switch node.op {
+      case .historyWrite(let cell), .historyReadWrite(let cell), .memoryWrite(let cell):
+        writers[cell, default: []].append(id)
+      default: break
+      }
+    }
+    var cone = Set<NodeID>()
+    var stack = graph.executionGates.keys.compactMap { graph.nodes[$0]?.inputs.dropFirst().first }
+    while let id = stack.popLast() {
+      guard cone.insert(id).inserted, let node = graph.nodes[id] else { continue }
+      stack.append(contentsOf: node.allDependencies)
+      switch node.op {
+      case .historyRead(let cell), .historyReadWrite(let cell), .memoryRead(let cell):
+        stack.append(contentsOf: writers[cell] ?? [])
+      default:
+        if let cell = graph.mutableTensorReadCell(node) {
+          stack.append(contentsOf: writers[cell] ?? [])
+        }
+      }
+    }
+    return cone
   }
 
   // MARK: - Block-local latches
