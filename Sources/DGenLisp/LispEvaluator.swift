@@ -503,6 +503,21 @@ class LispEvaluator {
     _ history: TensorHistory, valueNode: ASTNode
   ) throws -> EvalResult {
     let value = try evaluateAST(valueNode)
+    // The history write copies `value` element by element into the history's
+    // storage, iterating over the VALUE's shape. A value with a different
+    // element count overruns (or under-fills) the history cell, e.g. a [8 8]
+    // produced by broadcasting [8 1] with [8] written into an [8 1] history.
+    // Accept any value with the same element count (row-major layout is
+    // identical, so [8] into [8 1] is a plain reshape) and reject the rest.
+    if let valueShape = tensorShape(of: value),
+      valueShape.reduce(1, *) != history.shape.reduce(1, *)
+    {
+      throw LispError.typeError(
+        "write-history: value shape \(valueShape) (\(valueShape.reduce(1, *)) elements) does not fit "
+          + "the history's declared @shape \(history.shape) (\(history.shape.reduce(1, *)) elements). "
+          + "Note that elementwise ops broadcast NumPy-style, so [N 1] combined with [N] yields [N N]; "
+          + "reshape one operand so the shapes agree")
+    }
     switch value {
     case .tensor(let t):
       return .tensor(history.write(t))
@@ -1016,6 +1031,31 @@ class LispEvaluator {
     return shape
   }
 
+  /// Shape of a tensor-domain value, or nil for scalars/other kinds.
+  private func tensorShape(of value: EvalResult) -> [Int]? {
+    switch value {
+    case .tensor(let t): return t.shape
+    case .signalTensor(let st): return st.shape
+    default: return nil
+    }
+  }
+
+  /// Validates an `@axis` for an axis reduction before calling into DGenLazy,
+  /// whose out-of-range / rank-1 cases are `fatalError`s (silent traps in a
+  /// release CLI). `allowsRank1` is false for ops that cannot yet reduce a 1-D
+  /// tensor to a scalar (max-axis, mean-axis).
+  private func checkAxis(_ op: String, axis: Int, shape: [Int], allowsRank1: Bool = true) throws {
+    let ndim = shape.count
+    guard axis >= -ndim && axis < ndim else {
+      throw LispError.invalidArgument(
+        "\(op): @axis \(axis) is out of range for a \(ndim)-D tensor of shape \(shape)")
+    }
+    if !allowsRank1 && ndim < 2 {
+      throw LispError.invalidArgument(
+        "\(op): reducing a 1-D tensor (shape \(shape)) to a scalar is not supported by this op; use a full reduction such as (sum t) instead")
+    }
+  }
+
   private func asSignal(_ value: EvalResult, op: String) throws -> Signal {
     switch value {
     case .signal(let s): return s
@@ -1524,6 +1564,24 @@ class LispEvaluator {
     let controls = [input, cutoff, resonance, gain, mode]
     let shape = broadcastShapeOf(controls)
     if !shape.isEmpty {
+      // The tensor biquad keeps one filter state per element, so every
+      // tensor-shaped operand must already have exactly the filter's shape
+      // (scalars are lifted). DGenLazy enforces this with a `precondition`,
+      // which traps the CLI with no message in release builds; check here so
+      // user source gets a compile error naming the operand and both shapes.
+      // Implicit NumPy broadcasting (e.g. [8 1] with [8] -> [8 8]) is not
+      // applied: it would silently multiply the number of filter states.
+      let names = ["input", "cutoff", "resonance", "gain", "mode"]
+      for (name, value) in zip(names, controls) {
+        guard let operandShape = tensorShape(of: value), operandShape != shape else { continue }
+        let broadcastNote = broadcastShapes(shape, operandShape).map {
+          " (NumPy-style broadcasting would give \($0), which biquad does not do implicitly)"
+        } ?? ""
+        throw LispError.typeError(
+          "biquad: \(name) shape \(operandShape) does not match the filter shape \(shape); "
+            + "every tensor operand of a tensor biquad must have the same shape\(broadcastNote). "
+            + "Use reshape/expand to make the shapes agree, or pass a scalar to share one value")
+      }
       return .signalTensor(try asSignalTensor(input, shape: shape, op: "biquad").biquad(
         cutoff: asSignalTensor(cutoff, shape: shape, op: "biquad cutoff"),
         resonance: asSignalTensor(resonance, shape: shape, op: "biquad resonance"),
@@ -2602,6 +2660,17 @@ class LispEvaluator {
     // Default is "valid" (asStrided window path, shrinks output). `@padding same`
     // emits the zero-padded fused graph op so output shape == input shape.
     let same = (attrValue(attributes, "@padding")?.lowercased() == "same")
+    // DGenLazy `fatalError`s on non-2-D operands; reject them as a compile error.
+    if let inShape = tensorShape(of: val) {
+      guard inShape.count == 2, kernel.shape.count == 2 else {
+        throw LispError.typeError(
+          "conv2d: needs a 2-D input and a 2-D kernel, got input \(inShape) and kernel \(kernel.shape)")
+      }
+      if !same && (kernel.shape[0] > inShape[0] || kernel.shape[1] > inShape[1]) {
+        throw LispError.typeError(
+          "conv2d: kernel \(kernel.shape) is larger than input \(inShape) (valid padding); use @padding same")
+      }
+    }
     switch val {
     case .tensor(let t):
       return .tensor(same ? t.conv2dSame(kernel) : t.conv2d(kernel))
@@ -2617,6 +2686,11 @@ class LispEvaluator {
     }
     let val = try evaluateAST(args[0])
     let kernel = try requireTensor(evaluateAST(args[1]))
+    // DGenLazy `fatalError`s on non-1-D operands; reject them as a compile error.
+    if let inShape = tensorShape(of: val), inShape.count != 1 || kernel.shape.count != 1 {
+      throw LispError.typeError(
+        "conv1d: needs a 1-D input and a 1-D kernel, got input \(inShape) and kernel \(kernel.shape)")
+    }
     switch val {
     case .tensor(let t): return .tensor(t.conv1d(kernel))
     case .signalTensor(let st): return .signalTensor(st.conv1d(kernel))
@@ -2635,6 +2709,11 @@ class LispEvaluator {
     }
     let shape = parseShape(shapeStr)
     let val = try evaluateAST(args[0])
+    // DGenLazy `fatalError`s unless input is >= 2-D and the window is 2-D.
+    if let inShape = tensorShape(of: val), inShape.count < 2 || shape.count != 2 {
+      throw LispError.typeError(
+        "windows: needs an input of rank >= 2 and @shape [kH kW], got input \(inShape) and @shape \(shape)")
+    }
     switch val {
     case .tensor(let t): return .tensor(t.windows(shape))
     case .signalTensor(let st): return .signalTensor(st.windows(shape))
@@ -2694,6 +2773,9 @@ class LispEvaluator {
     }
     let val = try evaluateAST(args[0])
     let axis = Int(attrValue(attributes, "@axis") ?? "0") ?? 0
+    if let shape = tensorShape(of: val) {
+      try checkAxis("max-axis", axis: axis, shape: shape, allowsRank1: false)
+    }
     switch val {
     case .tensor(let t): return .tensor(t.max(axis: axis))
     case .signalTensor(let st): return .signalTensor(st.max(axis: axis))
@@ -2709,6 +2791,9 @@ class LispEvaluator {
     }
     let val = try evaluateAST(args[0])
     let axis = Int(attrValue(attributes, "@axis") ?? "0") ?? 0
+    if let shape = tensorShape(of: val) {
+      try checkAxis("sum-axis", axis: axis, shape: shape)
+    }
     switch val {
     case .tensor(let t): return .tensor(t.sum(axis: axis))
     case .signalTensor(let st): return .signalTensor(st.sum(axis: axis))
@@ -2740,6 +2825,9 @@ class LispEvaluator {
     }
     let val = try evaluateAST(args[0])
     let axis = Int(attrValue(attributes, "@axis") ?? "0") ?? 0
+    if let shape = tensorShape(of: val) {
+      try checkAxis("mean-axis", axis: axis, shape: shape, allowsRank1: false)
+    }
     switch val {
     case .tensor(let t): return .tensor(t.mean(axis: axis))
     case .signalTensor(let st): return .signalTensor(st.mean(axis: axis))
@@ -2755,6 +2843,8 @@ class LispEvaluator {
     }
     let t = try requireTensor(evaluateAST(args[0]))
     let axis = Int(attrValue(attributes, "@axis") ?? "-1") ?? -1
+    // softmax reduces with max(axis:), which cannot yet reduce rank-1 to scalar.
+    try checkAxis("softmax", axis: axis, shape: t.shape, allowsRank1: false)
     return .tensor(t.softmax(axis: axis))
   }
 
@@ -2901,6 +2991,9 @@ class LispEvaluator {
       n = Int(try requireFloat(evaluateAST(args[0])))
     } else {
       throw LispError.invalidArgument("hann requires N")
+    }
+    guard n > 0 else {  // DGenLazy.hann preconditions on this
+      throw LispError.invalidArgument("hann: N must be positive, got \(n)")
     }
     return .tensor(DGenLazy.hann(n))
   }
