@@ -275,6 +275,33 @@ func readStdin() -> String {
     return lines.joined()
 }
 
+// Swift runtime traps (precondition / fatalError / force-unwrap) raise SIGTRAP
+// on arm64 and SIGILL on x86_64, and an optimized (-O) build prints NO message
+// for a failed precondition. A host such as eseq then sees only "exit 133" with
+// an empty stderr. User-reachable traps should be thrown LispErrors instead; as
+// a last line of defence, say something on stderr before dying. The handler
+// only uses async-signal-safe calls (write/signal/raise) and re-raises with the
+// default action so the exit status is unchanged.
+let compilerTrapMessage: StaticString =
+    """
+    DGenLisp: internal compiler error (Swift runtime trap). The patch hit an \
+    unchecked compiler assumption instead of a proper error message; please \
+    report it with the .lisp source that triggered it.
+
+    """
+func installCompilerTrapHandler() {
+    let handler: @convention(c) (Int32) -> Void = { sig in
+        compilerTrapMessage.withUTF8Buffer { buf in
+            _ = write(2, buf.baseAddress, buf.count)
+        }
+        signal(sig, SIG_DFL)
+        raise(sig)
+    }
+    signal(SIGTRAP, handler)
+    signal(SIGILL, handler)
+}
+installCompilerTrapHandler()
+
 // Run
 do {
     try main()

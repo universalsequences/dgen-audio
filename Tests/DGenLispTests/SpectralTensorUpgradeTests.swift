@@ -604,7 +604,10 @@ final class SpectralTensorUpgradeTests: XCTestCase {
       (make-tensor-history h @shape [2 2])
       (def state (read-tensor-history h))
       (def k (tensor @shape [2 2] @data [1 0 0 1]))
-      (def next (conv2d state k))
+      ; `@padding same` keeps next at [2 2]. A valid-padding conv2d yields
+      ; [1 1], which write-history now rejects: it only filled 1 of the
+      ; history's 4 elements.
+      (def next (conv2d state k @padding same))
       (def written (write-tensor-history h next))
       (out (sum written) 1)
       """)
