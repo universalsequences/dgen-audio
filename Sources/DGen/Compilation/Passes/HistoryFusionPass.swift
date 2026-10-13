@@ -44,11 +44,18 @@ extension GraphPrepPasses {
           continue
         }
 
-        // Check if neither the read nor write node is in a feedback loop.
+        // Fuse unless the written value depends on this read within the frame
+        // (a recurrence through this cell, which must stay a read/write pair).
+        // A read that merely sits inside some other feedback loop still fuses:
+        // left apart, a write that does not depend on its read can be scheduled
+        // in an earlier frame loop, and the read then never sees the previous
+        // frame's value (a constant "started" flag reads 1 on the first frame).
         // Skip writes that carry a reset (2nd input): historyReadWrite has no
         // reset path, so fusing would silently drop the reset.
-        if writeInfo.inputs.count <= 1
-          && !nodesInFeedback.contains(readNodeId) && !nodesInFeedback.contains(writeInfo.nodeId) {
+        let selfRecurrent =
+          (nodesInFeedback.contains(readNodeId) || nodesInFeedback.contains(writeInfo.nodeId))
+          && sameFrameCone(of: writeInfo.inputs, in: graph).contains(readNodeId)
+        if writeInfo.inputs.count <= 1 && !selfRecurrent {
           // Replace the historyRead node with historyReadWrite using the write's inputs.
           if graph.nodes[readNodeId] != nil {
             let newNode = Node(
@@ -96,5 +103,16 @@ extension GraphPrepPasses {
         }
       }
     }
+  }
+
+  /// Nodes `roots` depend on within one frame (value and ordering edges).
+  private static func sameFrameCone(of roots: [NodeID], in graph: Graph) -> Set<NodeID> {
+    var cone = Set<NodeID>()
+    var stack = roots
+    while let id = stack.popLast() {
+      guard cone.insert(id).inserted, let node = graph.nodes[id] else { continue }
+      stack.append(contentsOf: node.allDependencies)
+    }
+    return cone
   }
 }

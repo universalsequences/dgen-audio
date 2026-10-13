@@ -60,12 +60,38 @@ enum ExecutionGatePass {
   static func prepare(graph: Graph, backend: Backend) throws -> Plan {
     guard backend == .c, !graph.executionGates.isEmpty else { return Plan() }
     var writers: [CellID: [NodeID]] = [:]
+    var memoryWriters: [CellID: [NodeID]] = [:]
     for (id, node) in graph.nodes {
       switch node.op {
       case .historyWrite(let cell), .historyReadWrite(let cell):
         writers[cell, default: []].append(id)
+      case .memoryWrite(let cell):
+        memoryWriters[cell, default: []].append(id)
       default: break
       }
+    }
+    // A scalar ring buffer (`delay`, or `poke`/`peek` on a stored tensor)
+    // freezes with its gate like a history: every read of a ring depends on
+    // all of its writes, so a ring is either wholly gated or wholly live.
+    func isScalarRingAccess(_ node: Node) -> Bool {
+      if case .tensor? = node.shape { return false }
+      guard graph.nodeToTensor[node.id] == nil else { return false }
+      switch node.op {
+      case .memoryRead, .memoryWrite: return true
+      default: return graph.mutableTensorReadCell(node) != nil
+      }
+    }
+    // Event-rate coefficient math (EventRatePromotionPass) may run inside a
+    // gate: its clock fires on the first frame of every call where the region
+    // is gated, so a region skipped while the gate was closed is current again
+    // on the call that reopens it. The clock is gated with its region.
+    func isPromotedEventNode(_ id: NodeID, _ node: Node) -> Bool {
+      if case .blockStart = node.op { return true }
+      if case .eventLatch = node.op {
+        return node.inputs.count == 2 && graph.sparseEventClocks.contains(node.inputs[1])
+      }
+      guard let rate = graph.nodeHopRate[id] else { return false }
+      return graph.sparseEventClocks.contains(rate.1)
     }
     // A scalar lookup may be skipped while its externally owned table remains
     // available. Stop execution demand at a leaf table reference; do not extend
@@ -79,11 +105,14 @@ enum ExecutionGatePass {
     func dependencies(_ id: NodeID) -> [NodeID] {
       guard let node = graph.nodes[id] else { return [] }
       if isLeafTableRead(node) {
-        return Array(node.inputs.dropFirst()) + node.temporalDependencies
+        let ringWriters = graph.mutableTensorReadCell(node).flatMap { memoryWriters[$0] } ?? []
+        return Array(node.inputs.dropFirst()) + node.temporalDependencies + ringWriters
       }
       switch node.op {
       case .historyRead(let cell), .historyReadWrite(let cell):
         return node.allDependencies + (writers[cell] ?? [])
+      case .memoryRead(let cell):
+        return node.allDependencies + (memoryWriters[cell] ?? [])
       default: return node.allDependencies
       }
     }
@@ -95,6 +124,7 @@ enum ExecutionGatePass {
     }
     for id in candidates {
       guard let node = graph.nodes[id] else { continue }
+      if isScalarRingAccess(node) || isPromotedEventNode(id, node) { continue }
       guard (ScalarBlockCoalescingPass.isPlainScalarOp(node.op) || isLeafTableRead(node)),
         graph.nodeToTensor[id] == nil, graph.nodeHopRate[id] == nil else {
         throw DGenError.compilationFailed("block-gate supports scalar DSP only; unsupported node \(id): \(node.op)")
