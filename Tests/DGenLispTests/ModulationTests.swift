@@ -152,6 +152,62 @@ final class ModulationTests: XCTestCase {
         XCTAssertEqual(manifest.modOutputs.map(\.range), ["unipolar", "unipolar"])
     }
 
+    func testExtReadsItsModulatorInputAndClaimsTheSlot() throws {
+        let source = """
+        (def gate (in 1 @name gate))
+        (def mod1 (in 6 @name mod1 @modulator 1))
+        (def mod2 (in 7 @name mod2 @modulator 2))
+        (out (* (ext 2) gate) 1 @name audio)
+        """
+
+        let evaluator = LispEvaluator()
+        try evaluator.evaluate(nodes: parseSource(source))
+        XCTAssertEqual(evaluator.extSlots, [2])
+
+        let graph = LazyGraphContext.current
+        for output in evaluator.outputs {
+            graph.addOutput(output.signal, channel: output.channel)
+        }
+        let compilation = try graph.compileOnly(frameCount: 64, voiceCount: 1)
+        let manifest = generateManifest(
+            compilerResult: CompilerResult(
+                dylibPath: "", cSourcePath: "", compilationResult: compilation, cSource: ""),
+            evaluator: evaluator,
+            options: CompilerOptions(
+                outputDir: ".", name: "patch", sampleRate: 48_000, maxFrames: 64,
+                voiceCount: 1, debug: false)
+        )
+
+        XCTAssertEqual(manifest.modulators.map(\.slot), [1, 2])
+        XCTAssertEqual(manifest.modulators.map(\.ext), [nil, 2])
+        let json = String(data: try JSONEncoder().encode(manifest.modulators), encoding: .utf8)!
+        XCTAssertEqual(json.components(separatedBy: "\"ext\"").count - 1, 1,
+            "an unclaimed slot omits the key: \(json)")
+    }
+
+    func testExtNeedsItsModulatorInputDeclaredFirst() throws {
+        let source = """
+        (def mod1 (in 6 @name mod1 @modulator 1))
+        (out (ext 3) 1)
+        """
+
+        XCTAssertThrowsError(try LispEvaluator().evaluate(nodes: parseSource(source))) { error in
+            XCTAssertTrue("\(error)".contains("(ext 3) needs its modulator input declared first"),
+                "\(error)")
+        }
+    }
+
+    func testExtSlotMustBeAPositiveInteger() throws {
+        let source = """
+        (def mod1 (in 6 @name mod1 @modulator 1))
+        (out (ext 1.5) 1)
+        """
+
+        XCTAssertThrowsError(try LispEvaluator().evaluate(nodes: parseSource(source))) { error in
+            XCTAssertTrue("\(error)".contains("ext slot must be a positive integer"), "\(error)")
+        }
+    }
+
     func testOutputModulatorSlotsMustBeUnique() throws {
         let source = """
         (out (phasor 0.25) 2 @name macro-a @modulator 1)

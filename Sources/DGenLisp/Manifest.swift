@@ -187,6 +187,8 @@ struct ManifestModulator: Codable {
     let slot: Int
     let inputChannel: Int
     let name: String?
+    /// Set when `(ext N)` claimed this slot: the host feeds it from ext input N.
+    let ext: Int?
 }
 
 struct ManifestModOutput: Codable {
@@ -335,7 +337,12 @@ func generateManifest(
 
     let manifestModulators = evaluator.inputs.compactMap { input -> ManifestModulator? in
         guard let slot = input.modulatorSlot else { return nil }
-        return ManifestModulator(slot: slot, inputChannel: input.channel, name: input.name)
+        return ManifestModulator(
+            slot: slot,
+            inputChannel: input.channel,
+            name: input.name,
+            ext: evaluator.extSlots.contains(slot) ? slot : nil
+        )
     }
     .sorted { $0.slot < $1.slot }
 
