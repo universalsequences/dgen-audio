@@ -300,6 +300,20 @@ UI metadata attributes are optional and do not affect DSP behavior. `@group` bot
 
 `@modulator <slot>` marks an input as a host-visible modulation source.
 
+#### ext — raw host ext input
+
+```lisp
+(def mod1 (in 6 @name mod1 @modulator 1))
+(out (* (ext 1) gate) 2 @name vca @modulator 1)
+```
+
+`(ext N)` reads the `@modulator N` input, which must be declared before it,
+and claims slot N: the manifest's modulator entry gets `"ext": N`, and the host
+then feeds that slot from its raw ext input N instead of a configurable
+modulation source (LFO, envelope, ...). Use it for patches that process an
+incoming modulation signal directly, such as a VCA that multiplies ext 1 by the
+gate.
+
 #### out — audio output channel
 
 ```lisp

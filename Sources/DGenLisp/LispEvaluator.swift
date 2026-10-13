@@ -122,6 +122,9 @@ class LispEvaluator {
   /// `--no-probes`: `probe` is a plain identity with no channel or manifest entry.
   var probesEnabled: Bool = true
   var inputs: [InputInfo] = []
+  /// Modulator slots claimed by `(ext N)`: the host feeds slot N from its ext
+  /// input N instead of a configurable modulation source.
+  var extSlots: Set<Int> = []
   var tensors: [TensorInfo] = []
   var macroExpansionCounter: Int = 0
   let sourceDirectory: URL
@@ -168,6 +171,7 @@ class LispEvaluator {
       tensorOutputs.removeAll()
       probes.removeAll()
       inputs.removeAll()
+      extSlots.removeAll()
       tensors.removeAll()
       macroExpansionCounter = 0
     }
@@ -764,6 +768,8 @@ class LispEvaluator {
       return try evalParam(regularArgs, attributes: attributePairs)
     case "in":
       return try evalInput(regularArgs, attributes: attributePairs)
+    case "ext":
+      return try evalExt(regularArgs)
     case "out":
       return try evalOutput(regularArgs, attributes: attributePairs)
     case "probe":
@@ -1833,6 +1839,26 @@ class LispEvaluator {
     inputs.append(InputInfo(channel: channel, name: name, modulatorSlot: modulatorSlot))
 
     return .signal(Signal.input(channel))
+  }
+
+  /// `(ext N)`: the host's raw ext input N, read through the `@modulator N`
+  /// input the patch already declares. Using it claims slot N, so the host
+  /// pins that slot's source to ext N instead of a configurable one.
+  private func evalExt(_ args: [ASTNode]) throws -> EvalResult {
+    guard args.count == 1 else {
+      throw LispError.invalidArgument("ext takes one slot number: (ext 1)")
+    }
+    let value = try requireFloat(evaluateAST(args[0]))
+    let slot = Int(value)
+    guard Float(slot) == value, slot >= 1 else {
+      throw LispError.invalidArgument("ext slot must be a positive integer, got \(value)")
+    }
+    guard let input = inputs.first(where: { $0.modulatorSlot == slot }) else {
+      throw LispError.invalidArgument(
+        "(ext \(slot)) needs its modulator input declared first: (in <channel> @modulator \(slot))")
+    }
+    extSlots.insert(slot)
+    return .signal(Signal.input(input.channel))
   }
 
   private func evalOutput(_ args: [ASTNode], attributes: [(name: String, value: String)]) throws
