@@ -22,6 +22,94 @@ enum EvalResult {
   case none
 }
 
+/// What a top-level binding holds, as reported to hosts (`bindingShapes`).
+struct BindingShape: Codable, Equatable {
+  enum Kind: String, Codable {
+    /// A per-sample scalar signal.
+    case signal
+    /// A compile-time number.
+    case constant
+    /// A constant (per-patch) tensor.
+    case tensor
+    /// A per-sample tensor: a multichannel signal.
+    case signalTensor = "signal-tensor"
+    /// A tensor history declared with `@shape`.
+    case tensorHistory = "tensor-history"
+    /// Several values (destructured or not); see `elements`.
+    case tuple
+    /// A form with no value (e.g. a write).
+    case none
+  }
+  let kind: Kind
+  /// The tensor shape; `[]` for scalars and constants.
+  let shape: [Int]
+  /// A tuple's element shapes.
+  let elements: [BindingShape]?
+
+  init(kind: Kind, shape: [Int], elements: [BindingShape]? = nil) {
+    self.kind = kind
+    self.shape = shape
+    self.elements = elements
+  }
+
+  init(_ value: EvalResult) {
+    switch value {
+    case .signal: self.init(kind: .signal, shape: [])
+    case .float: self.init(kind: .constant, shape: [])
+    case .tensor(let t): self.init(kind: .tensor, shape: t.shape)
+    case .signalTensor(let st): self.init(kind: .signalTensor, shape: st.shape)
+    case .tuple(let values):
+      self.init(kind: .tuple, shape: [], elements: values.map(BindingShape.init))
+    case .none: self.init(kind: .none, shape: [])
+    }
+  }
+}
+
+/// The top-level form whose evaluation threw.
+struct FailedForm: Codable, Equatable {
+  /// Its position among the top-level forms, from 0.
+  let index: Int
+  /// Its operator: `def`, `write-history`, `out`, `param`, …
+  let op: String
+  /// What it names: a `def`'s binding (the first of a destructuring def), a
+  /// history's name, a param's name; nil when it names nothing.
+  let name: String?
+  /// The error, as printed after `Error: `.
+  let message: String
+
+  init(node: ASTNode, index: Int, error: Error) {
+    self.index = index
+    var op = ""
+    var name: String? = nil
+    if case .list(let elements) = node, case .atom(let head)? = elements.first {
+      op = head
+      if elements.count > 1 {
+        switch elements[1] {
+        case .atom(let atom) where !atom.hasPrefix("@"): name = atom
+        case .list(let targets):
+          if op == "def", case .atom(let first)? = targets.first { name = first }
+        default: break
+        }
+      }
+    }
+    self.op = op
+    self.name = name
+    self.message = (error as? LispError)?.message ?? "\(error)"
+  }
+
+  /// `(def biquad-2)`, `(write-history h)`, or the bare op.
+  var label: String {
+    name.map { "(\(op) \($0))" } ?? "(\(op))"
+  }
+}
+
+/// The `<name>.shapes.json` a compile writes whether or not it succeeds.
+struct BindingShapesReport: Codable {
+  let bindingShapes: [String: BindingShape]
+  /// The top-level form whose evaluation failed, if evaluation failed.
+  let failedForm: FailedForm?
+}
+
 struct ParamInfo {
   let name: String
   let canonicalName: String
@@ -127,6 +215,23 @@ class LispEvaluator {
   var extSlots: Set<Int> = []
   var tensors: [TensorInfo] = []
   var macroExpansionCounter: Int = 0
+
+  // MARK: Binding shapes (for hosts that draw the patch)
+  //
+  // A patch editor emits one top-level `def` per node, so the shape of each
+  // top-level binding tells it what flows out of that node: a scalar, or a
+  // tensor of some shape (drawn as a multichannel cable). Recorded as the
+  // evaluator binds, so a failed evaluation still reports everything bound
+  // before the error, plus the binding that was being evaluated when it
+  // failed. Macro-local defs (renamed `_mN_…`) are not reported.
+
+  /// Top-level binding name → what it holds.
+  private(set) var bindingShapes: [String: BindingShape] = [:]
+  /// The top-level form whose evaluation threw, if any: which node a patch
+  /// editor should mark with the error.
+  private(set) var failedForm: FailedForm?
+  /// > 0 while expanding a macro body.
+  private var macroDepth = 0
   let sourceDirectory: URL
   let reusesRegisteredParameters: Bool
   /// When present, scalar patch parameters and state are lifted into this
@@ -175,9 +280,19 @@ class LispEvaluator {
       tensors.removeAll()
       macroExpansionCounter = 0
     }
+    bindingShapes.removeAll()
+    failedForm = nil
     try predeclareTopLevelParams(in: nodes)
-    for node in nodes {
-      let _ = try evaluateAST(node)
+    for (index, node) in nodes.enumerated() {
+      do {
+        let _ = try evaluateAST(node)
+      } catch {
+        // Name the failing top-level form so a host can mark its node: a
+        // patch editor emits one form per node (`(def name …)`, or
+        // `(write-history name …)`, `(out … )` …).
+        failedForm = FailedForm(node: node, index: index, error: error)
+        throw error
+      }
     }
     assignProbeChannels()
     try validateParamUIMetadata(params)
@@ -344,6 +459,7 @@ class LispEvaluator {
       }
       for (name, value) in zip(names, values) {
         definitions[name] = value
+        recordBindingShape(name, value)
       }
       return .none
     }
@@ -352,6 +468,7 @@ class LispEvaluator {
       throw LispError.parseError("def: name must be an atom or a destructuring list")
     }
 
+    recordBindingShape(name, result)
     if case .tensor = result, let idx = tensors.indices.last, tensors[idx].name.isEmpty {
       tensors[idx].name = name
     }
@@ -428,6 +545,11 @@ class LispEvaluator {
   /// history (the `@shape` form); with `@hop` the feedback advances once per hop
   /// (fs/hop) for STFT-style spectral state. Both attributes are optional; absent
   /// `@shape` yields the scalar form. `read-history`/`write-history` work on either.
+  private func recordBindingShape(_ name: String, _ value: EvalResult) {
+    guard macroDepth == 0 else { return }
+    bindingShapes[name] = BindingShape(value)
+  }
+
   private func evaluateMakeHistory(_ elements: [ASTNode]) throws -> EvalResult {
     guard elements.count >= 2, case .atom(let name) = elements[1] else {
       throw LispError.parseError("make-history requires a name: (make-history name)")
@@ -435,6 +557,9 @@ class LispEvaluator {
     let attrs = try parseTrailingAttributes(elements, startIndex: 2, form: "make-history")
     if attrValue(attrs, "@shape") != nil {
       try makeTensorHistoryBinding(name: name, attrs: attrs, form: "make-history")
+      if macroDepth == 0, let history = tensorHistoryBindings[name] {
+        bindingShapes[name] = BindingShape(kind: .tensorHistory, shape: history.shape)
+      }
       return .none
     }
     if let lanes = batchLaneCount {
@@ -561,6 +686,8 @@ class LispEvaluator {
       substitutions[defName] = .atom(scopePrefix + defName)
     }
 
+    macroDepth += 1
+    defer { macroDepth -= 1 }
     var lastResult: EvalResult = .none
     for bodyExpr in macro.body {
       var expandedExpr = substituteInAST(bodyExpr, substitutions: substitutions)
