@@ -34,6 +34,10 @@ struct PatchManifest: Codable {
     let modDestinations: [ManifestModDestination]
     let tensors: [ManifestTensor]
     let tensorInitData: [ManifestTensorInit]
+    /// Top-level binding name → its kind and shape, so a patch editor can
+    /// tell scalar cables from tensor (multichannel) ones. Also written as
+    /// `<name>.shapes.json`, which a failed compile writes too.
+    let bindingShapes: [String: BindingShape]
 }
 
 struct ManifestParam: Codable {
@@ -444,8 +448,25 @@ func generateManifest(
         probes: manifestProbes,
         modDestinations: manifestModDestinations,
         tensors: manifestTensors,
-        tensorInitData: manifestTensorInit
+        tensorInitData: manifestTensorInit,
+        bindingShapes: evaluator.bindingShapes
     )
+}
+
+/// Write `<dir>/<name>.shapes.json`: the binding shapes known so far and,
+/// after a failed evaluation, the top-level form that failed. Best effort; a host
+/// that never reads it loses nothing.
+func writeBindingShapes(_ evaluator: LispEvaluator, to dir: String, name: String) {
+    let report = BindingShapesReport(
+        bindingShapes: evaluator.bindingShapes,
+        failedForm: evaluator.failedForm)
+    let encoder = JSONEncoder()
+    encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+    guard let data = try? encoder.encode(report) else { return }
+    // Evaluation runs before the compile step creates the output directory.
+    try? FileManager.default.createDirectory(
+        atPath: dir, withIntermediateDirectories: true)
+    try? data.write(to: URL(fileURLWithPath: "\(dir)/\(name).shapes.json"), options: .atomic)
 }
 
 private func deriveManifestGroups(from params: [ParamInfo]) -> [ManifestGroup] {

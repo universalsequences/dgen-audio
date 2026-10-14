@@ -206,10 +206,18 @@ func main() throws {
         let parsedNodes = try parseSource(source)
         let loweredNodes = try lowerModulation(in: parsedNodes)
         try evaluator.evaluate(nodes: loweredNodes)
-    } catch let error as LispError {
-        fputs("Error: \(error.message)\n", stderr)
+    } catch {
+        // Shapes bound before the error, and the form that failed, so a patch
+        // editor can still draw what it knows and point at the culprit.
+        writeBindingShapes(evaluator, to: cli.outputDir, name: cli.name)
+        // `Error: at (def biquad-2): …` names the failing form for a human;
+        // hosts read `failedForm` from the shapes file.
+        let location = evaluator.failedForm.map { "at \($0.label): " } ?? ""
+        let message = (error as? LispError)?.message ?? "\(error)"
+        fputs("Error: \(location)\(message)\n", stderr)
         exit(1)
     }
+    writeBindingShapes(evaluator, to: cli.outputDir, name: cli.name)
 
     guard evaluator.outputs.contains(where: { !$0.probe }) else {
         fputs("Error: No outputs defined. Use (out <signal> <channel>) to define outputs.\n", stderr)
