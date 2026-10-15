@@ -422,9 +422,13 @@ func generateManifest(
     let manifestTensorInit = tensorInitPairs.map { (offset, data) in
         ManifestTensorInit(offset: offset, data: data)
     }
+    // Locate tensors through the full layout: zero-filled ones have no init entry.
     let manifestTensors = mapTensorMetadata(
         evaluatorTensors: evaluator.tensors,
-        tensorInitPairs: tensorInitPairs
+        tensorInitPairs: collectTensorLayout(
+            graph: compilerResult.compilationResult.graph,
+            cellAllocations: compilerResult.compilationResult.cellAllocations
+        )
     )
 
     return PatchManifest(

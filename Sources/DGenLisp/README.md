@@ -547,6 +547,9 @@ one source of contents (inline data, a JSON asset, or nothing = zeros):
   `--asset-base` when that flag is provided. JSON may be a flat numeric array,
   nested numeric arrays, or an object with `shape` and `data`.
 - **neither** — a zero-filled buffer. Record into it at runtime with `poke`.
+  It costs no manifest space: hosts start from zeroed memory, so all-zero
+  tensors get no `tensorInitData` entry (a 16 s stereo recording buffer is
+  just its `@shape`).
 - **`tensor-param`** — same surface, but host-writable (the host can push new
   contents by `@name`); `@default-file` seeds the initial contents.
 
@@ -566,7 +569,12 @@ The DGenLisp read convention is `(peek tensor index channel)`, so 2D buffers use
 shape `[samples channels]` (a wavetable bank is `[samples waves]`). Flat data
 should store each channel/wave contiguously. Fractional `index` and fractional
 `channel` values are interpolated, so 2D reads are bilinear across sample
-position and wave position.
+position and wave position. When the compiler can prove an `index` or
+`channel` is a whole number (a `floor`/`ceil`/`round`, an integer constant, a
+comparison, or `+ - * min max %`/`gswitch`/`selector` over such values), it
+skips that axis's second read and blend: `(peek buf (floor i) 1)` is a single
+memory load. Wrap a computed index in `floor` to get this when it comes from a
+history or parameter, e.g. hand-rolled Hermite/cubic reads.
 
 ### Tensor Operations
 
@@ -749,7 +757,7 @@ Floats are promoted automatically when combined with graph types. Signals and te
 - `cellId` values are **physical** memory offsets (after remapping), ready for direct indexing into the memory buffer
 - `groups` and `envelopes` are derived from param UI metadata in first-reference order
 - `tensors` gives named metadata for tensor-backed assets and editable tensor slots
-- `tensorInitData` entries must be written to the memory buffer before the first `dgen_process_v1()` call
+- `tensorInitData` entries must be written to the memory buffer before the first `dgen_process_v1()` call; the buffer must otherwise start zeroed (all-zero tensors have no entry)
 - `totalMemorySlots` is the required memory buffer size (in floats)
 
 ### Host Integration
