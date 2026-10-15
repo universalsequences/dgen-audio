@@ -3,6 +3,8 @@ import Foundation
 extension LazyOp {
   public func emit(ctx: IRContext, g: Graph, nodeId: NodeID) throws -> [UOp] {
     guard let node = g.nodes[nodeId] else { return [] }
+    ctx.currentEmitNode = nodeId
+    defer { ctx.currentEmitNode = nil }
 
     // collect operands
     var ops: [UOp] = []

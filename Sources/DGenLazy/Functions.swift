@@ -576,6 +576,20 @@ public func blockGate(_ condition: Signal, _ body: Signal) -> Signal {
   return result
 }
 
+/// Per-frame execution region. On frames where `condition` is non-positive the
+/// state the body owns holds and the output is zero; on the others the body
+/// runs. `ownedCells` are the history / delay cells written inside the body;
+/// state written elsewhere keeps running whatever the gate does. Unlike
+/// `blockGate`, the condition is tested inside the sample loop, so it may read
+/// owned state (e.g. a voice's own active flag) and sees the value the body
+/// last wrote. C backend only.
+public func sampleGate(_ condition: Signal, _ body: Signal, ownedCells: Set<CellID>) -> Signal {
+  let result = gswitch(condition, body, 0.0)
+  result.graph.graph.executionGates[result.nodeId] = condition.nodeId
+  result.graph.graph.sampleGates[result.nodeId] = ownedCells
+  return result
+}
+
 public func modulatedParam(
   _ base: Signal,
   active: Signal,

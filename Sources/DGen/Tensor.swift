@@ -1365,14 +1365,20 @@ extension Graph {
 
     // Properly wrap the index within the channel using modulo for true wrapping
     // This handles cases where index might be very negative or very positive
-    let wrappedIndex = n(.mod, index, channelSizeFloat)
+    // (skipped when the index provably lies in the channel already)
+    let positiveIndex: NodeID
+    if let r = provableRange(index, in: self), r.lowerBound >= 0, r.upperBound < Double(tensor.shape[0]) {
+      positiveIndex = index
+    } else {
+      let wrappedIndex = n(.mod, index, channelSizeFloat)
 
-    // Handle negative modulo results: if wrappedIndex < 0, add channelSize
-    let isNegative = n(.lt, wrappedIndex, zero)
-    let positiveIndex = n(
-      .gswitch, isNegative,
-      n(.add, wrappedIndex, channelSizeFloat),
-      wrappedIndex)
+      // Handle negative modulo results: if wrappedIndex < 0, add channelSize
+      let isNegative = n(.lt, wrappedIndex, zero)
+      positiveIndex = n(
+        .gswitch, isNegative,
+        n(.add, wrappedIndex, channelSizeFloat),
+        wrappedIndex)
+    }
 
     // Calculate channel offset: floor(channel) * channelSize
     // Clamp channel to valid range [0, numChannels-1]

@@ -17,6 +17,10 @@ public class CRenderer: Renderer {
   /// SIMD op in the same block reads `simd<id>`. Computed in prepareSchedule;
   /// every other scalar load of a global is a self-copy and emits nothing.
   private var simdAliasGlobals: Set<VarID> = []
+  /// Cross-block values that never leave one sequential frame group: they live
+  /// for one iteration of its sample loop, so a scalar declared ahead of the
+  /// loop carries them instead of a frame array (value type: int or float).
+  private var loopLocalGlobals: [VarID: CastType] = [:]
   private var frameIndexOverride: String? = nil
   private var currentThreadCountScale: Int? = nil
 
@@ -81,6 +85,56 @@ public class CRenderer: Renderer {
     }
   }
 
+  /// Globals defined and loaded only inside one sequential frame group.
+  private func findLoopLocalGlobals(
+    _ uopBlocks: [BlockUOps], regions: [ScheduledRegion], ctx: IRContext
+  ) -> [VarID: CastType] {
+    var groupOf: [Int: Int] = [:]
+    for (regionIndex, region) in regions.enumerated() {
+      if case .sequentialFrameGroup(let indices) = region {
+        for index in indices { groupOf[index] = regionIndex }
+      }
+    }
+    guard !groupOf.isEmpty else { return [:] }
+    // Per-call gate conditions are tested ahead of the loop; per-frame ones
+    // inside it, where a loop-local value is in scope.
+    var excluded = Set<VarID>()
+    let frameConditions = ctx.g.sampleGateConditions
+    for condition in Set(ctx.g.executionGates.values).subtracting(frameConditions) {
+      if case .variable(let id, _)? = ctx.values[condition] { excluded.insert(id) }
+    }
+    var home: [VarID: Int] = [:]
+    var types: [VarID: CastType] = [:]
+    var escapes = Set<VarID>()
+    for (index, block) in uopBlocks.enumerated() {
+      let group = groupOf[index]
+      // A value computed once per hop must hold across process calls: only
+      // values produced every frame are loop-local.
+      let everyFrame = block.temporality == .frameBased
+      for uop in block.ops {
+        switch uop.op {
+        case .defineGlobal(let id) where !everyFrame:
+          escapes.insert(id)
+        case .defineGlobal(let id), .loadGlobal(let id):
+          guard let group else { escapes.insert(id); continue }
+          if let other = home[id], other != group { escapes.insert(id) }
+          home[id] = group
+        default:
+          if case .variable(let id, _) = uop.value, group != nil {
+            types[id] = uop.scalarType == .int ? .int : .float
+          }
+        }
+      }
+    }
+    var result: [VarID: CastType] = [:]
+    for (id, _) in home
+    where !escapes.contains(id) && !excluded.contains(id) && !staticGlobalVars.contains(id)
+      && !simdAliasGlobals.contains(id) && ctx.globals.contains(id) {
+      result[id] = types[id] ?? .float
+    }
+    return result
+  }
+
   public override func prepareSchedule(
     _ scheduleItems: inout [ScheduleItem],
     _ uopBlocks: [BlockUOps],
@@ -109,6 +163,7 @@ public class CRenderer: Renderer {
     scheduleItem.ops.append(UOp(op: .frameCount, value: .empty))
     let frameCountUOp = Lazy.variable(-1, nil)  // Special variable ID for frameCount
     let scheduledRegions = HopIslandPass.buildRegions(for: uopBlocks)
+    loopLocalGlobals = findLoopLocalGlobals(uopBlocks, regions: scheduledRegions, ctx: ctx)
 
     // Merge adjacent blocks of the same frameOrder into a single loop to reduce passes
     var currentFrameOrder: FrameOrder? = nil
@@ -178,9 +233,12 @@ public class CRenderer: Renderer {
       currentVectorWidth = nil
     }
 
-    func gatePredicate(_ demand: ExecutionDemand) -> Lazy {
-      let conditions = Set(demand.terms.flatMap { $0 }).sorted()
-      for id in conditions where gateTests[id] == nil {
+    let sampleConditions = ctx.g.sampleGateConditions
+    // Per-frame tests made in the current sample loop (valid until it closes).
+    var frameTests: [NodeID: Lazy] = [:]
+
+    func prepareCallTests<S: Sequence>(_ conditions: S) where S.Element == NodeID {
+      for id in conditions where !sampleConditions.contains(id) && gateTests[id] == nil {
         guard let value = ctx.values[id] else { preconditionFailure("missing gate condition") }
         let test = ctx.useVariable(src: nil, trackInValues: false)
         let varying: Bool
@@ -189,19 +247,35 @@ public class CRenderer: Renderer {
         scheduleItem.ops.append(UOp(op: .blockGateTest(value, frameVarying: varying), value: test))
         gateTests[id] = test
       }
-      var predicate = ctx.useConstant(src: nil, value: 0)
+    }
+
+    func gatePredicate(_ demand: ExecutionDemand) -> Lazy {
+      let conditions = Set(demand.terms.flatMap { $0 }).sorted()
+      for id in conditions where sampleConditions.contains(id) && frameTests[id] == nil {
+        guard let value = ctx.values[id] else { preconditionFailure("missing gate condition") }
+        let test = ctx.useVariable(src: nil, trackInValues: false)
+        scheduleItem.ops.append(UOp(op: .frameGateTest(value), value: test))
+        frameTests[id] = test
+      }
+      prepareCallTests(conditions)
+      // Tests are 0 or 1: a conjunction is their product, a disjunction the max.
+      var predicate: Lazy? = nil
       for term in demand.terms {
-        var conjunction = ctx.useConstant(src: nil, value: 1)
+        var conjunction: Lazy? = nil
         for id in term.sorted() {
+          let test = frameTests[id] ?? gateTests[id]!
+          guard let previous = conjunction else { conjunction = test; continue }
           let next = ctx.useVariable(src: nil, trackInValues: false)
-          scheduleItem.ops.append(UOp(op: .mul(conjunction, gateTests[id]!), value: next))
+          scheduleItem.ops.append(UOp(op: .mul(previous, test), value: next))
           conjunction = next
         }
+        let value = conjunction ?? ctx.useConstant(src: nil, value: 1)
+        guard let previous = predicate else { predicate = value; continue }
         let next = ctx.useVariable(src: nil, trackInValues: false)
-        scheduleItem.ops.append(UOp(op: .max(predicate, conjunction), value: next))
+        scheduleItem.ops.append(UOp(op: .max(previous, value), value: next))
         predicate = next
       }
-      return predicate
+      return predicate ?? ctx.useConstant(src: nil, value: 0)
     }
 
     func appendEventVectorBlock(_ block: BlockUOps, clock: NodeID) {
@@ -439,14 +513,38 @@ public class CRenderer: Renderer {
       currentDemand = .always
       resetCurrentBlockState()
       emitThreadCountScaleChange(nil)
-      let predicates = indices.map { index -> Lazy? in
+      // Per-call predicates are ready before the loop; per-frame ones are
+      // tested at the top level of the loop body, ahead of their fragment.
+      var predicates = indices.map { index -> Lazy? in
         let demand = uopBlocks[index].executionDemand
-        return demand == .always ? nil : gatePredicate(demand)
+        return demand == .always || demand.mentions(sampleConditions) ? nil : gatePredicate(demand)
+      }
+      prepareCallTests(Set(indices.flatMap { uopBlocks[$0].executionDemand.conditions }).sorted())
+      var declared = Set<VarID>()
+      for index in indices {
+        for uop in uopBlocks[index].ops {
+          guard case .defineGlobal(let id) = uop.op, let type = loopLocalGlobals[id],
+            declared.insert(id).inserted else { continue }
+          scheduleItem.ops.append(UOp(
+            op: .declareVar(ctx.useConstant(src: nil, value: 0)), value: .variable(id, nil),
+            scalarType: type))
+        }
       }
       scheduleItem.ops.append(UOp(op: .beginLoop(frameCountUOp, 1), value: .empty))
+      frameTests.removeAll()
+      var framePredicates: [ExecutionDemand: Lazy] = [:]
       for (offset, index) in indices.enumerated() {
         let block = uopBlocks[index]
         precondition(block.vectorWidth == 1, "sequential frame groups require scalar frame loops")
+        if block.executionDemand.mentions(sampleConditions) {
+          if let predicate = framePredicates[block.executionDemand] {
+            predicates[offset] = predicate
+          } else {
+            let predicate = gatePredicate(block.executionDemand)
+            framePredicates[block.executionDemand] = predicate
+            predicates[offset] = predicate
+          }
+        }
         if let predicate = predicates[offset] {
           scheduleItem.ops.append(UOp(op: .beginIf(predicate), value: .empty))
         }
@@ -466,6 +564,7 @@ public class CRenderer: Renderer {
         }
       }
       scheduleItem.ops.append(UOp(op: .endLoop, value: .empty))
+      frameTests.removeAll()
     }
 
     var regionIndex = 0
@@ -1310,6 +1409,15 @@ public class CRenderer: Renderer {
         return "float t\(dest) = t\(id)[0] > 0.0f;"
       }
       return "float t\(dest) = \(g(condition)) > 0.0f;"
+    case .frameGateTest(let condition):
+      let dest = extractVarId(uop.value)
+      varEmittedTypes[dest] = .float_
+      if case .variable(let id, _) = condition, ctx.globals.contains(id),
+        loopLocalGlobals[id] == nil {
+        let index = staticGlobalVars.contains(id) ? "0" : (frameIndexOverride ?? "i")
+        return "float t\(dest) = t\(id)[\(index)] > 0.0f;"
+      }
+      return "float t\(dest) = \(g(condition)) > 0.0f;"
     case .beginIf(let cond): return "if (\(g(cond))) {"
     case .endIf: return "}"
 
@@ -1438,10 +1546,17 @@ public class CRenderer: Renderer {
         forceFloatType: true)
     case .declareVar(let value):
       // Declares and initializes a variable: float t = value;
+      let declared = extractVarId(uop.value)
+      if let type = loopLocalGlobals[declared] {
+        varEmittedTypes[declared] = type == .int ? .int_ : .float_
+        return "\(type == .int ? "int" : "float") l\(declared) = \(type == .int ? "0" : "0.0f");"
+      }
       return emitAssign(uop, g(value), ctx)
 
     case .frameCount: return "/* frameCount available as function parameter */"
 
+    case .loadGlobal(let id) where loopLocalGlobals[id] != nil:
+      return CRenderer.nodeComments ? "/* t\(id) loop-local */" : ""
     case .loadGlobal(let id):
       // Compute the correct index - use scaled index when in a scaled frame loop
       let baseIdx = "i"
@@ -1639,6 +1754,8 @@ public class CRenderer: Renderer {
     case .variable(let id, _):
       if id == -1 {  // Special case for frameCount
         return "frameCount"
+      } else if loopLocalGlobals[id] != nil {
+        return "l\(id)"
       } else if ctx.globals.contains(id) {
         if vectorWidth > 1 {
           return isOut ? "t\(id) + i" : "simd\(id)"
@@ -1661,6 +1778,7 @@ public class CRenderer: Renderer {
         }
       }
     case .global(let id):
+      if loopLocalGlobals[id] != nil { return "l\(id)" }
       // Global variables are always accessed through global buffers
       if vectorWidth > 1 {
         return isOut ? "t\(id) + i" : "simd\(id)"
@@ -1680,10 +1798,25 @@ public class CRenderer: Renderer {
     }
   }
 
+  private static let nodeComments = IRContext.recordsVariableNodes
+
   func emitAssign(_ uop: UOp, _ expr: String, _ ctx: IRContext, forceFloatType: Bool = false)
     -> String
   {
+    let line = emitAssignLine(uop, expr, ctx, forceFloatType: forceFloatType)
+    if CRenderer.nodeComments, case .variable(let id, _) = uop.value, let node = ctx.variableNodes[id] {
+      return line + " /*n\(node)*/"
+    }
+    return line
+  }
+
+  private func emitAssignLine(_ uop: UOp, _ expr: String, _ ctx: IRContext, forceFloatType: Bool)
+    -> String
+  {
     let varId = extractVarId(uop.value)
+    if loopLocalGlobals[varId] != nil {
+      return "l\(varId) = \(expr);"
+    }
     let isGlobal = ctx.globals.contains(varId)
 
     // Int-typed UOps stay scalar `int` even when surrounded by a SIMD block.
