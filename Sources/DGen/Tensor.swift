@@ -344,7 +344,9 @@ public func injectTensorData(
 /// Used by the Engine to inject DGen-internal tensor data (e.g. twiddle factors)
 /// through the AudioGraph param initialization path.
 /// IMPORTANT: Returns physical memory offsets (after cell remapping), not raw cellIds.
-public func collectTensorInitData(graph: Graph, cellAllocations: CellAllocations) -> [(
+/// Every data-backed tensor's physical offset and contents, in tensor-id order
+/// (zero-filled buffers included). Hosts use it to locate tensors.
+public func collectTensorLayout(graph: Graph, cellAllocations: CellAllocations) -> [(
   Int, [Float]
 )] {
   var result: [(Int, [Float])] = []
@@ -355,6 +357,16 @@ public func collectTensorInitData(graph: Graph, cellAllocations: CellAllocations
     result.append((physicalOffset, Array(data.prefix(tensor.size))))
   }
   return result
+}
+
+/// The tensor contents a host must write into its (zeroed) memory before the
+/// first process call. All-zero tensors, e.g. a recording buffer declared as
+/// `(tensor @shape [768000 2])`, need no entry: memory starts zeroed.
+public func collectTensorInitData(graph: Graph, cellAllocations: CellAllocations) -> [(
+  Int, [Float]
+)] {
+  collectTensorLayout(graph: graph, cellAllocations: cellAllocations)
+    .filter { _, data in data.contains { $0 != 0 } }
 }
 
 extension Graph {

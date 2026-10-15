@@ -833,15 +833,22 @@ extension LazyOp {
         readPosB2 = posB2
       }
 
-      // Bilinear interpolation: sample index first, then channel/wave.
+      // Bilinear interpolation: sample index first, then channel/wave. An index
+      // or channel that is provably a whole number has a zero fraction, so its
+      // second read and blend are skipped (same value, one load instead of four).
+      let integralIndex = isProvablyIntegral(node.inputs[1], in: g)
+      let integralChannel = numChannels == 1 || isProvablyIntegral(node.inputs[2], in: g)
       let sampleA1 = b.memoryRead(cellId, b.cast(readPosA1, to: .int))
-      let sampleA2 = b.memoryRead(cellId, b.cast(readPosA2, to: .int))
-      let sampleB1 = b.memoryRead(cellId, b.cast(readPosB1, to: .int))
-      let sampleB2 = b.memoryRead(cellId, b.cast(readPosB2, to: .int))
-      let channelA = b.mix(sampleA1, sampleA2, indexFrac)
-      let channelB = b.mix(sampleB1, sampleB2, indexFrac)
-      let interpolated = b.mix(channelA, channelB, channelFrac)
-      b.use(val: interpolated)
+      let channelA = integralIndex
+        ? sampleA1 : b.mix(sampleA1, b.memoryRead(cellId, b.cast(readPosA2, to: .int)), indexFrac)
+      if integralChannel {
+        b.use(val: channelA)
+      } else {
+        let sampleB1 = b.memoryRead(cellId, b.cast(readPosB1, to: .int))
+        let channelB = integralIndex
+          ? sampleB1 : b.mix(sampleB1, b.memoryRead(cellId, b.cast(readPosB2, to: .int)), indexFrac)
+        b.use(val: b.mix(channelA, channelB, channelFrac))
+      }
 
     case .expand(let targetShape):
       // Broadcast scalar to tensor shape (for sum backward)
@@ -1056,4 +1063,25 @@ private func emitFusedSumOfMul(
     acc.accumulate(av * bv)
   }
   b.use(val: acc.value + b.constant(0.0))
+}
+
+/// Whether a scalar node always holds a whole number: integer constants,
+/// rounding ops, comparisons and logic (0/1), and arithmetic / selection over
+/// such values. Conservative: anything else (history reads, params, inputs)
+/// is not provably integral.
+func isProvablyIntegral(_ id: NodeID, in g: Graph, depth: Int = 0) -> Bool {
+  guard depth < 48, let node = g.nodes[id] else { return false }
+  if case .tensor? = node.shape { return false }
+  let all: ([NodeID]) -> Bool = { ids in
+    !ids.isEmpty && ids.allSatisfy { isProvablyIntegral($0, in: g, depth: depth + 1) }
+  }
+  switch node.op {
+  case .constant(let v): return v.isFinite && v == v.rounded(.towardZero)
+  case .floor, .ceil, .round, .sign, .gt, .gte, .lt, .lte, .eq, .and, .or, .xor: return true
+  case .add, .sub, .mul, .abs, .min, .max, .mod: return all(node.inputs)
+  case .gswitch: return node.inputs.count == 3 && all(Array(node.inputs.dropFirst()))
+  case .selector: return node.inputs.count >= 2 && all(Array(node.inputs.dropFirst()))
+  case .seq: return node.inputs.last.map { isProvablyIntegral($0, in: g, depth: depth + 1) } ?? false
+  default: return false
+  }
 }
