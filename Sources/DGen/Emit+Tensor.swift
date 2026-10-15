@@ -773,10 +773,17 @@ extension LazyOp {
       let zero = b.constant(0.0)
       let channelSizeFloat = b.constant(Float(channelSize))
 
-      // Wrap index within channel using modulo
-      let wrappedIndex = b.mod(index, channelSizeFloat)
-      let isNegative = wrappedIndex < zero
-      let positiveIndex = b.gswitch(isNegative, wrappedIndex + channelSizeFloat, wrappedIndex)
+      // Wrap index within channel using modulo, unless it provably lies in
+      // the channel already.
+      let positiveIndex: Expr
+      if let r = provableRange(node.inputs[1], in: g), r.lowerBound >= 0,
+        r.upperBound < Double(channelSize) {
+        positiveIndex = index
+      } else {
+        let wrappedIndex = b.mod(index, channelSizeFloat)
+        let isNegative = wrappedIndex < zero
+        positiveIndex = b.gswitch(isNegative, wrappedIndex + channelSizeFloat, wrappedIndex)
+      }
 
       // Clamp channel to valid range [0, numChannels-1], but preserve
       // fractional channel position for bilinear table reads.
@@ -787,7 +794,7 @@ extension LazyOp {
       let nextChannel = b.min(channelFloor + one, maxChannel)
 
       // Linear interpolation for fractional indices, wrapped within a channel.
-      let flooredIndex = b.floor(positiveIndex)
+      let flooredIndex = isProvablyIntegral(node.inputs[1], in: g) ? positiveIndex : b.floor(positiveIndex)
       let indexFrac = positiveIndex - flooredIndex
       let nextIndex = b.gswitch(flooredIndex + one >= channelSizeFloat, zero, flooredIndex + one)
 
@@ -1063,6 +1070,99 @@ private func emitFusedSumOfMul(
     acc.accumulate(av * bv)
   }
   b.use(val: acc.value + b.constant(0.0))
+}
+
+/// A conservative interval every value of a scalar node lies in, or nil when
+/// unbounded: constants, bounded counters (accum), comparisons, and
+/// arithmetic, rounding, min/max (clip) and selection over them.
+func provableRange(_ id: NodeID, in g: Graph) -> ClosedRange<Double>? {
+  var memo: [NodeID: ClosedRange<Double>] = [:]
+  let r = valueBounds(id, in: g, depth: 0, memo: &memo)
+  return r.lowerBound.isFinite && r.upperBound.isFinite ? r : nil
+}
+
+private let unbounded: ClosedRange<Double> = -Double.infinity...Double.infinity
+
+private func valueBounds(
+  _ id: NodeID, in g: Graph, depth: Int, memo: inout [NodeID: ClosedRange<Double>]
+) -> ClosedRange<Double> {
+  if let known = memo[id] { return known }
+  guard depth < 48, let node = g.nodes[id] else { return unbounded }
+  if case .tensor? = node.shape { return unbounded }
+  func range(_ i: Int) -> ClosedRange<Double> {
+    i < node.inputs.count ? valueBounds(node.inputs[i], in: g, depth: depth + 1, memo: &memo) : unbounded
+  }
+  let result = computeBounds(node, range: range, graph: g)
+  memo[id] = result
+  return result
+}
+
+private func computeBounds(
+  _ node: Node, range: (Int) -> ClosedRange<Double>, graph g: Graph
+) -> ClosedRange<Double> {
+  func make(_ lo: Double, _ hi: Double) -> ClosedRange<Double> {
+    lo.isNaN || hi.isNaN || lo > hi ? unbounded : lo...hi
+  }
+  switch node.op {
+  case .constant(let v):
+    return v.isFinite ? Double(v)...Double(v) : unbounded
+  case .gt, .gte, .lt, .lte, .eq, .and, .or, .xor:
+    return 0...1
+  case .accum:
+    // Output is the state before this frame's step: in [min, max).
+    let lo = range(2), hi = range(3)
+    return make(lo.lowerBound, Swift.max(lo.lowerBound, hi.upperBound))
+  case .add:
+    let a = range(0), b = range(1)
+    return make(a.lowerBound + b.lowerBound, a.upperBound + b.upperBound)
+  case .sub:
+    let a = range(0), b = range(1)
+    return make(a.lowerBound - b.upperBound, a.upperBound - b.lowerBound)
+  case .mul:
+    let a = range(0), b = range(1)
+    guard a.lowerBound.isFinite, a.upperBound.isFinite, b.lowerBound.isFinite, b.upperBound.isFinite
+    else { return unbounded }
+    let p = [a.lowerBound * b.lowerBound, a.lowerBound * b.upperBound,
+             a.upperBound * b.lowerBound, a.upperBound * b.upperBound]
+    return make(p.min()!, p.max()!)
+  case .floor:
+    let a = range(0)
+    return make(a.lowerBound.rounded(.down), a.upperBound.rounded(.down))
+  case .ceil:
+    let a = range(0)
+    return make(a.lowerBound.rounded(.up), a.upperBound.rounded(.up))
+  case .min:
+    let a = range(0), b = range(1)
+    return make(Swift.min(a.lowerBound, b.lowerBound), Swift.min(a.upperBound, b.upperBound))
+  case .max:
+    let a = range(0), b = range(1)
+    return make(Swift.max(a.lowerBound, b.lowerBound), Swift.max(a.upperBound, b.upperBound))
+  case .gswitch:
+    // One-step wrap `x >= c ? x - c : x` of x in [0, 2c) lands in [0, c).
+    if node.inputs.count == 3, let test = g.nodes[node.inputs[0]], case .gte = test.op,
+      test.inputs.count == 2, let minus = g.nodes[node.inputs[1]], case .sub = minus.op,
+      minus.inputs.count == 2, minus.inputs[0] == test.inputs[0], node.inputs[2] == test.inputs[0],
+      case .constant(let c)? = g.nodes[test.inputs[1]]?.op,
+      case .constant(let c2)? = g.nodes[minus.inputs[1]]?.op, c == c2, c > 0 {
+      let x = range(2)
+      if x.lowerBound >= 0, x.upperBound < 2 * Double(c) {
+        return make(0, Swift.min(x.upperBound, Double(c).nextDown))
+      }
+    }
+    let a = range(1), b = range(2)
+    return make(Swift.min(a.lowerBound, b.lowerBound), Swift.max(a.upperBound, b.upperBound))
+  case .selector:
+    var lo = 0.0, hi = 0.0
+    for i in 1..<Swift.max(node.inputs.count, 1) {
+      let r = range(i)
+      lo = Swift.min(lo, r.lowerBound); hi = Swift.max(hi, r.upperBound)
+    }
+    return make(lo, hi)
+  case .seq:
+    return node.inputs.isEmpty ? unbounded : range(node.inputs.count - 1)
+  default:
+    return unbounded
+  }
 }
 
 /// Whether a scalar node always holds a whole number: integer constants,

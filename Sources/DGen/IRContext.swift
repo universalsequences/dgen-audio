@@ -149,6 +149,12 @@ public class IRContext {
     return constant
   }
 
+  /// The graph node being emitted, and the node each variable was emitted
+  /// for (debug attribution of generated code; see DGEN_C_NODE_COMMENTS).
+  public var currentEmitNode: NodeID? = nil
+  public var variableNodes: [VarID: NodeID] = [:]
+  public static let recordsVariableNodes = ProcessInfo.processInfo.environment["DGEN_C_NODE_COMMENTS"] != nil
+
   /// Allocates a fresh variable Lazy value and optionally records node/value ownership.
   ///
   /// - Parameters:
@@ -158,6 +164,7 @@ public class IRContext {
   public func useVariable(src: NodeID?, trackInValues: Bool = true) -> Lazy {
     let varId = self.varIdx + 1
     self.varIdx = varId
+    if IRContext.recordsVariableNodes, let node = src ?? currentEmitNode { variableNodes[varId] = node }
     let variable = Lazy.variable(varId, src)
     if let srcNodeId = src, trackInValues {
       self.values[srcNodeId] = variable

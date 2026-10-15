@@ -684,32 +684,20 @@ extension Graph {
     // Write first (important for feedback)
     let writeOp = n(.memoryWrite(bufferBase), writePos, input)
 
-    // ---- Robust wrap helper (mod) in-node form ----
-    // wrap(x, L) = x - floor(x / L) * L  -> [0, L) for any finite x
-    func wrap0ToL(_ x: NodeID, _ L: NodeID) -> NodeID {
-      let q = n(.div, x, L)
-      let qFloor = n(.floor, q)
-      let wrapped = n(.sub, x, n(.mul, qFloor, L))
-      let wrappedHigh = n(.gswitch, n(.gte, wrapped, L), n(.sub, wrapped, L), wrapped)
-      return n(.gswitch, n(.lt, wrappedHigh, zero), n(.add, wrappedHigh, L), wrappedHigh)
-    }
+    // Read position in samples (float). The delay time is clamped to the line
+    // (a NaN time clamps too), so one conditional wrap keeps it in range.
+    let lastIndex = n(.constant(Float(MAX_DELAY - 1)))
+    let time = n(.max, n(.min, delayTimeInSamples, lastIndex), zero)
+    let rawReadPos = n(.sub, writePos, time)
+    let readPos = n(.gswitch, n(.lt, rawReadPos, zero), n(.add, rawReadPos, maxDelay), rawReadPos)
 
-    // Read position in samples (float)
-    let rawReadPos = n(.sub, writePos, delayTimeInSamples)
-
-    // True modulo wrap (robust vs huge modulation)
-    let readPos = wrap0ToL(rawReadPos, maxDelay)
-
-    // Linear interpolation
-    let i0 = n(.floor, readPos)
+    // Linear interpolation. A position a hair below the end rounds up to it
+    // in float, so i0 is clamped, and i1 wraps with a compare.
+    let i0 = n(.min, n(.floor, readPos), lastIndex)
     let frac = n(.sub, readPos, i0)
-
-    // i1 = (i0 + 1) wrapped — use a conditional instead of wrap0ToL to avoid
-    // float-reciprocal precision: wrap0ToL(88000, 88000) can return 88000 (not 0)
-    // when 88000 * (1/88000_approx) < 1 due to float rounding, causing OOB reads.
-    // Since i0 is in [0, MAX_DELAY-1], i1raw is at most MAX_DELAY; one check suffices.
     let i1raw = n(.add, i0, one)
     let i1 = n(.gswitch, n(.gte, i1raw, maxDelay), zero, i1raw)
+    boundedIndexNodes.formUnion([i0, i1])
 
     let s0 = n(.memoryRead(bufferBase), i0)
     let s1 = n(.memoryRead(bufferBase), i1)

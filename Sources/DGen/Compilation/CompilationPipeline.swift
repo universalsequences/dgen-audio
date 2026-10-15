@@ -248,7 +248,7 @@ public struct CompilationPipeline {
       graph: graph, sortedNodes: loopNodes, scalarNodeSet: finalScalarSet, context: context,
       hopBasedNodes: peelHopNodes,
       timings: &timings)
-    finalBlocks = try gatePlan.split(blocks: finalBlocks)
+    finalBlocks = try gatePlan.split(blocks: finalBlocks, graph: graph)
     if backend == .c {
       finalBlocks = isolateDelayLines(finalBlocks, graph: graph)
     }
@@ -437,7 +437,7 @@ public struct CompilationPipeline {
     graph: Graph, backend: Backend, options: Options, timings: inout PipelineTimings,
     gatePlan: inout ExecutionGatePass.Plan
   ) throws -> GraphPreparationResult {
-    let feedbackClusters = timings.measure("findFeedbackLoops") {
+    var feedbackClusters = timings.measure("findFeedbackLoops") {
       findFeedbackLoops(graph)
     }
 
@@ -451,6 +451,12 @@ public struct CompilationPipeline {
     }
 
     gatePlan = try ExecutionGatePass.prepare(graph: graph, backend: backend)
+    if !gatePlan.sampleConditions.isEmpty {
+      // A sample-gate's condition now orders ahead of its body. When it reads
+      // the body's state it closes a loop through that state, and has to run
+      // in the same sample loop: find the clusters again with these edges.
+      feedbackClusters = timings.measure("findFeedbackLoops (sample-gate)") { findFeedbackLoops(graph) }
+    }
 
     let scalarNodeSet = timings.measure("findSequentialNodes") {
       options.forceScalar
