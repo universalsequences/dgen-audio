@@ -258,7 +258,24 @@ public func findFeedbackLoops(_ g: Graph) -> [[NodeID]] {
     })
     if !accesses.isEmpty { clusters.append(accesses) }
   }
-  if !g.mutableTensorCells.isEmpty {
+  // History cells read and written without a cycle through them are state
+  // all the same: biquad's x chain writes x[n] to one cell and reads it back as
+  // x[n-1] next frame, but nothing feeds the read back into the write, so the
+  // cycle search above never groups the pair. Ungrouped, the read could be
+  // scheduled into an earlier frame loop than the write; under a multi-frame
+  // block every frame of that loop then read state the write had not stored
+  // yet (stale for the whole block). Pin each such cell's accesses together.
+  var addedHistoryClusters = false
+  for cell in Set(cellReads.keys).intersection(cellWrites.keys).sorted() {
+    // A read nothing consumes (folded away, e.g. `0 * history`) observes no
+    // state, so it orders nothing and must not resurrect a "feedback" group.
+    guard cellReads[cell]!.contains(where: { !(consumers[$0] ?? []).isEmpty }) else { continue }
+    let accesses = Set(cellReads[cell]! + cellWrites[cell]!)
+    if clusters.contains(where: { accesses.isSubset(of: $0) }) { continue }
+    clusters.append(accesses)
+    addedHistoryClusters = true
+  }
+  if !g.mutableTensorCells.isEmpty || addedHistoryClusters {
     var changed = true
     while changed {
       changed = false
@@ -587,7 +604,13 @@ public func topologicalSort(
   // Group nodes by feedback group (much simpler grouping)
   var groupToNodes: [Int: [NodeID]] = [:]
   var nodeToFinalGroupId: [NodeID: Int] = [:]
-  var nextGroupId = 1000
+  // Singleton groups are numbered after every feedback group. A fixed 1000
+  // used to collide with feedback group ids once a patch had more than 1000
+  // clusters (Plaits: ~1200 history cells), merging unrelated nodes into one
+  // group; the resulting bogus group cycles fell through to the sorted-order
+  // fallback below and emitted nodes before their inputs.
+  let firstSingletonGroupId = max(1000, (nodeToGroupId.values.max() ?? -1) + 1)
+  var nextGroupId = firstSingletonGroupId
 
   for nodeId in g.nodes.keys.sorted() {
     let groupId = nodeToGroupId[nodeId] ?? -1
@@ -606,7 +629,7 @@ public func topologicalSort(
   if debug {
     print("🏗️ Feedback groups:")
     for (groupId, nodes) in groupToNodes.sorted(by: { $0.key < $1.key })
-    where groupId < 1000 {
+    where groupId < firstSingletonGroupId {
       print("  FeedbackGroup \(groupId): \(nodes)")
     }
   }
@@ -659,7 +682,8 @@ public func topologicalSort(
   var groupKey: [Int: Int] = [:]
   for (groupId, nodes) in groupToNodes {
     groupKey[groupId] =
-      groupId < 1000 ? groupId : 1000 + (nodes.map { g.schedulingKeys[$0] ?? $0 }.min() ?? 0)
+      groupId < firstSingletonGroupId
+      ? groupId : firstSingletonGroupId + (nodes.map { g.schedulingKeys[$0] ?? $0 }.min() ?? 0)
   }
   func before(_ a: Int, _ b: Int) -> Bool {
     let ka = groupKey[a]!, kb = groupKey[b]!
@@ -769,7 +793,7 @@ public func topologicalSort(
       let groupId = nodeToFinalGroupId[nodeId] ?? -1
       let color = isScalar ? ANSI.red : ""
       let reset = isScalar ? ANSI.reset : ""
-      let groupMarker = groupId < 1000 ? "~\(groupId)" : ""
+      let groupMarker = groupId < firstSingletonGroupId ? "~\(groupId)" : ""
       return "\(color)(\(nodeId),\(op)\(groupMarker))\(reset)"
     }
     print("📋 Topo sort: [\(nodeDescriptions.joined(separator: " | "))]")

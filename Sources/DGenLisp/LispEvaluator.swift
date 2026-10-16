@@ -1746,7 +1746,17 @@ class LispEvaluator {
             + "every tensor operand of a tensor biquad must have the same shape\(broadcastNote). "
             + "Use reshape/expand to make the shapes agree, or pass a scalar to share one value")
       }
-      return .signalTensor(try asSignalTensor(input, shape: shape, op: "biquad").biquad(
+      // A scalar input is the one operand that cannot stay a lifted view: the
+      // filter keeps per-element x[n-1]/x[n-2] history of its input, and a
+      // tensor history write of a scalar-shaped node trapped the compiler
+      // (Emit+State historyWrite force-unwraps `nodeToTensor`). Materialize it
+      // as a real [shape] tensor, so `(biquad scalar <freqs>)` runs one filter
+      // per frequency over the shared input.
+      var filterInput = try asSignalTensor(input, shape: shape, op: "biquad")
+      if tensorShape(of: input) == nil {
+        filterInput = filterInput + SignalTensor.lift(Tensor.zeros(shape))
+      }
+      return .signalTensor(try filterInput.biquad(
         cutoff: asSignalTensor(cutoff, shape: shape, op: "biquad cutoff"),
         resonance: asSignalTensor(resonance, shape: shape, op: "biquad resonance"),
         gain: asSignalTensor(gain, shape: shape, op: "biquad gain"),
