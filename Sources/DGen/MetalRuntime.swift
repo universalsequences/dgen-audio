@@ -5,6 +5,14 @@ import Foundation
 import Metal
 
 public class MetalCompiledKernel: CompiledKernelRuntime {
+  /// Commit a run's kernels in command buffers of at most this many kernels (0: one
+  /// command buffer for the whole run). Buffers on one queue execute in order, so results
+  /// are identical; shorter buffers let the window server interleave, so a long training
+  /// step is not killed by the GPU watchdog ("Impacting Interactivity") on a Mac that also
+  /// drives a display. DGEN_METAL_KERNELS_PER_COMMAND_BUFFER overrides the default.
+  public static var kernelsPerCommandBuffer: Int =
+    Int(ProcessInfo.processInfo.environment["DGEN_METAL_KERNELS_PER_COMMAND_BUFFER"] ?? "") ?? 0
+
   public let kernels: [CompiledKernel]
   public let cellAllocations: CellAllocations
   private let device: MTLDevice
@@ -331,7 +339,21 @@ public class MetalCompiledKernel: CompiledKernelRuntime {
     if !debugGradients {
       sharedEncoder = commandBuffer.makeComputeCommandEncoder()
     }
+    let splitEvery = debugGradients ? 0 : Self.kernelsPerCommandBuffer
+    var committed: [MTLCommandBuffer] = []
     for (index, kernel) in kernels.enumerated() {
+      if splitEvery > 0, index > 0, index % splitEvery == 0, let enc = sharedEncoder {
+        enc.endEncoding()
+        commandBuffer.commit()
+        committed.append(commandBuffer)
+        guard let cb = commandQueue.makeCommandBuffer(), let next = cb.makeComputeCommandEncoder() else {
+          lastRunError = "Metal could not make a command buffer"
+          sharedEncoder = nil
+          break
+        }
+        commandBuffer = cb
+        sharedEncoder = next
+      }
       // Pick encoder: shared if available (non-debug), otherwise one per kernel
       let computeEncoder: MTLComputeCommandEncoder
       if let enc = sharedEncoder {
@@ -367,6 +389,7 @@ public class MetalCompiledKernel: CompiledKernelRuntime {
     if !debugGradients {
       commandBuffer.commit()
       commandBuffer.waitUntilCompleted()
+      for cb in committed { checkCompleted(cb) }
       checkCompleted(commandBuffer)
     }
     firstDebug = false

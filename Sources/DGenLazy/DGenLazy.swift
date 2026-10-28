@@ -26,6 +26,18 @@ public enum DGenConfig {
         didSet { LazyGraphContext._current?.graph.maxFrameCount = maxFrameCount }
     }
 
+    /// Kernels per Metal command buffer within one run (0: a single buffer). Splitting keeps
+    /// long training steps under the macOS GPU watchdog on a display-driving GPU; results
+    /// are unchanged. See MetalCompiledKernel.kernelsPerCommandBuffer.
+    #if canImport(Metal)
+    public static var metalKernelsPerCommandBuffer: Int {
+        get { MetalCompiledKernel.kernelsPerCommandBuffer }
+        set { MetalCompiledKernel.kernelsPerCommandBuffer = newValue }
+    }
+    #else
+    public static var metalKernelsPerCommandBuffer: Int = 0
+    #endif
+
     /// Optional path to write generated Metal kernels for debugging
     /// When set, kernels will be written to this file after compilation
     public static var kernelOutputPath: String? = nil

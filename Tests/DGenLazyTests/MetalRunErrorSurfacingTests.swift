@@ -33,4 +33,28 @@ final class MetalRunErrorSurfacingTests: XCTestCase {
     let y = try (Signal.phasor(Tensor([100])).sum() * 2.0).realize(frames: 256)
     XCTAssertEqual(y.count, 256)
   }
+
+  /// Splitting a run into several command buffers must not change any result.
+  func testSplitCommandBuffersGiveIdenticalResults() throws {
+    func run(split: Int) throws -> ([Float], [Float]) {
+      DGenConfig.metalKernelsPerCommandBuffer = split
+      defer { DGenConfig.metalKernelsPerCommandBuffer = 0 }
+      DGenConfig.backend = .metal
+      DGenConfig.sampleRate = 48_000
+      DGenConfig.maxFrameCount = 512
+      LazyGraphContext.reset()
+      let p = Tensor.param([2, 3], data: [0.5, -0.25, 1, 2, -1, 0.3])
+      let q = Tensor.param([1, 3], data: [0.1, 0.2, 0.3])
+      let t = Signal.phasor(Tensor([30])).sum()
+      let x = exp(t * (p * -3.0)) * q.expand([2, 3])
+      let y = (x * x).sum(axis: 1)
+      let v = try (y.sum() + (Tensor([0.0]) + (p * p).sum()).peek(Signal.constant(0)) * 0.1).backward(frames: 512)
+      return (v, (p.grad?.getData() ?? []) + (q.grad?.getData() ?? []))
+    }
+    let (v0, g0) = try run(split: 0)
+    let (v1, g1) = try run(split: 1)
+    XCTAssertEqual(v0, v1)
+    XCTAssertEqual(g0.count, 9)
+    XCTAssertEqual(g0, g1)
+  }
 }
