@@ -545,6 +545,21 @@ public class MetalRenderer: Renderer, UOpEmitter {
       return [SplitScheduleItem(item: scheduleItem, threadCount: nil)]
     }
 
+    // A .parallel block addresses cross-kernel globals and frameIndex by thread index (= frame),
+    // which a per-region N-thread kernel would reinterpret as the element index. Split those
+    // blocks only when they use neither.
+    if scheduleItem.frameOrder == .parallel {
+      let deps = analyzeDependencies(scheduleItem: scheduleItem, ctx: ctx)
+      let usesGlobals = (deps.inputs + deps.outputs).contains { $0 != memoryVarID }
+      let usesFrameIndex = ops.contains {
+        if case .frameIndex = $0.op { return true }
+        return false
+      }
+      if usesGlobals || usesFrameIndex {
+        return [SplitScheduleItem(item: scheduleItem, threadCount: nil)]
+      }
+    }
+
     // Safety guard: do not split if a later segment reads a non-global temp
     // that was defined in an earlier segment. Splitting would move the use into
     // a separate kernel where that local variable is out of scope.
