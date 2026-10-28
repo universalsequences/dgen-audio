@@ -242,8 +242,10 @@ public class LazyGraph {
     runtimeCache = nil
     isDirty = true
 
-    // 7. Increment identifier to signify we have a new graph
-    id += 1
+    // 7. A fresh identifier signifies a new graph. Take it from the shared counter: `id += 1`
+    // could collide with another LazyGraph's id and let its tensors skip refresh().
+    id = LazyGraph._nextId
+    LazyGraph._nextId += 1
 
     // 8. Prune dead refs and refresh surviving tensors/signals
     tensors = tensors.filter { $0.value != nil }

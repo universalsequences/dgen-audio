@@ -25,7 +25,7 @@ public class Tensor: LazyValue {
   private var _nodeId: NodeID
 
   /// The graph this tensor belongs to
-  public let graph: LazyGraph
+  public private(set) var graph: LazyGraph
 
   /// Shape of the tensor
   public let shape: Shape
@@ -46,7 +46,7 @@ public class Tensor: LazyValue {
 
   /// Computed property for nodeId
   public var nodeId: NodeID {
-    if graphId != graph.id, graphId >= 0 {
+    if graphId >= 0, graphId != graph.id {
       // The graph was cleared since this tensor's node was created. Data-backed
       // tensors are re-created in the new graph; a derived tensor (op/view result
       // with no data of its own) cannot be, and its stale node ID would silently
@@ -118,9 +118,11 @@ public class Tensor: LazyValue {
   // Checks whether we're in a new graph and adds the tensor
   public func refresh() {
     let graph = LazyGraphContext.current
-    guard graph === self.graph else { return }
     if let data = getData() {
       if graph.id != graphId {
+        // Data-backed tensors follow the current graph, including one created after a
+        // LazyGraphContext.reset(): ops and reads then all go through the same graph.
+        self.graph = graph
         graphId = graph.id
         let (nodeId, tensorId) = graph.createTensor(shape: shape, data: data)
         self._nodeId = nodeId
