@@ -60,6 +60,14 @@ func detectShapeTransitions(block: Block, g: Graph) -> [(nodeIndex: Int, shape: 
         break
       }
     } else if case .scalar = node.shape {
+      // Input-free literals carry no state and no dependencies; buildRegions
+      // hoists them into the enclosing region's scalar prologue. Letting them
+      // open a [1] region instead splits every `x * -1.0` style elementwise
+      // chain into one element loop per op, materializing each intermediate
+      // into frame-aware memory (B*K*frames floats apiece).
+      if case .constant = node.op, node.inputs.isEmpty, let shape = currentShape, shape != [1] {
+        continue
+      }
       // Scalar execution rate is independent of whether this node directly
       // consumes a tensor. In particular, feedback state must advance once per
       // frame, never once per element of a neighboring tensor region. Record

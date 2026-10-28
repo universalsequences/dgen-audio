@@ -348,7 +348,10 @@ final class TensorTemporalGradientCompositionTests: XCTestCase {
     }
     // The rate changes this short render by only ~1e-5. Check several
     // central-difference steps above Float render quantization, with a Double sum.
-    for eps: Float in [0.05, 0.1, 0.2] {
+    // eps <= 0.05 is inside that quantization floor: the autograd value is
+    // stable to 6 digits across kernel fusion changes while the FD estimate
+    // wanders 5.2e-5..6.6e-5 at eps 0.01..0.05 (FD converges to 5.68e-5 by 0.2-0.4).
+    for eps: Float in [0.1, 0.2, 0.4] {
       let fd = Float((try lv(1.0 + eps) - (try lv(1.0 - eps))) / Double(2 * eps))
       XCTAssertLessThan(
         relativeError(rateGrad, fd), 0.05, "rate: autograd=\(rateGrad), fd=\(fd), eps=\(eps)")
