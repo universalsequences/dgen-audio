@@ -201,6 +201,10 @@ public class LazyGraph {
     graph.gradCarryCells.removeAll()
     graph.lastForwardNodeId = nil
     graph.simdOptimizedConv2Ds.removeAll()
+    // Node IDs restart from 0 after a clear, so stale realize() materialization
+    // requests would pin (as DCE roots) and materialize unrelated nodes of the
+    // next graph.
+    graph.materializeNodes.removeAll()
     graph.conv2dMaskCells.removeAll()
     unsupportedGradientNodes.removeAll()
 

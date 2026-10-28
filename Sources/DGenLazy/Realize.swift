@@ -160,7 +160,13 @@ extension LazyGraph {
 
         // Fast path: reuse full compilation cache when graph topology is unchanged.
         // CompilationResult.graph is a reference type, so cached results see current tensor data.
-        if let cached = fullCompilationCache, cached.fingerprint == compileFingerprint {
+        // Not for SignalTensor/Tensor realize(): their readback resolves the
+        // node's tensor via graph.nodeToTensor / frameAwareCells, which
+        // clearComputationGraph() wipes and only a real compile repopulates, so
+        // a cache hit read the wrong (non-frame-aware) tensor.
+        if graph.materializeNodes.isEmpty, let cached = fullCompilationCache,
+          cached.fingerprint == compileFingerprint
+        {
             compilationCache = cached.result
             runtimeCache = cached.runtime
             isDirty = false
