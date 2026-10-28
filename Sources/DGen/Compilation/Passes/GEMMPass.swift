@@ -273,6 +273,11 @@ extension GraphPrepPasses {
       case .tensor(let expandSrcShape) = expandSourceNode.shape,
       expandSrcShape.count == 2
     else { return nil }
+    // The GEMM reads its inputs' physical memory. A VIEW as the expand source (e.g. the
+    // transpose(reshape(...)) adjoint of a matmul's right operand, flowing into the matmul
+    // that produced that operand: x @ (n @ c)) is not laid out as its logical [r, c] shape,
+    // and reading it raw gave wrong gradients. Leave such patterns to the generic path.
+    if expandSourceNode.op.isViewOnly { return nil }
 
     // The expand axis must not be the reduce axis (they'd cancel out)
     let remaining = [0, 1, 2].filter { $0 != expandAxisPos }
