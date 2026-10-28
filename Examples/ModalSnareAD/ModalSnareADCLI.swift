@@ -106,6 +106,8 @@ enum ModalSnareADMain {
     case "latent-train": try LatentCommands.train(opts)
     case "latent-fitz": try LatentCommands.fitz(opts)
     case "latent-render": try LatentCommands.render(opts)
+    case "latent-path": try LatentCommands.path(opts)
+    case "latent-surrogate": try LatentCommands.surrogateDump(opts)
     default:
       throw CLIError(description: "unknown command \(command)")
     }
