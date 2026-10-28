@@ -98,7 +98,7 @@ enum ModalSnareADMain {
         ids: idList(opts["ids"], default: VillainData.snareIDs()), frames: frames,
         steps: opts["steps"].flatMap(Int.init) ?? 300, lr: opts["lr"].flatMap(Float.init) ?? 0.02,
         lambda: opts["lambda"].flatMap(Float.init) ?? 0, K: opts["k"].flatMap(Int.init) ?? 24,
-        pure: opts["pure"] == "true", out: out)
+        pure: opts["pure"] == "true", keepTableTemporal: opts["table-temporal"] == "true", out: out)
       print(String(format: "phys lambda=%g: mean head score %.4f (init %.4f, wrong-min %.4f); residual f %.1f cents rms, dec %.3f, amp %.3f",
         s["lambda"] as! Float, s["mean_fit"] as! Float, s["mean_init"] as! Float, s["mean_wrong_min_head"] as! Float,
         s["res_f_cents_rms"] as! Float, s["res_dec_log_rms"] as! Float, s["res_amp_log_rms"] as! Float))

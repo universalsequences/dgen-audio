@@ -63,6 +63,10 @@ final class PhysHeadParams {
   }
 
   /// Head tensor overrides for HeadRenderer (shapes [B,K]).
+  /// Per-slot attack / onset / phase / glide copied from the assigned table mode
+  /// (CPU arrays [B*K]); slots without a table mode keep the shared values.
+  var tableTemporal: [String: [Float]]? = nil
+
   func overrides(table: BesselTable) -> [String: DGenLazy.Tensor] {
     let ratios = Tensor((0..<B).flatMap { _ in Array(table.ratios.prefix(K)) }).reshape([B, K])
     func ex(_ t: DGenLazy.Tensor) -> DGenLazy.Tensor { t.expand([B, K]) }
@@ -85,6 +89,15 @@ final class PhysHeadParams {
     let tau = ex(logMap(rTau, PhysRanges.tau.0, PhysRanges.tau.1))
     let zeros = Tensor([Float](repeating: 0, count: B * K)).reshape([B, K])
     let ones = Tensor([Float](repeating: 1, count: B * K)).reshape([B, K])
+    if let tt = tableTemporal {
+      func c(_ k: String) -> DGenLazy.Tensor { Tensor(tt[k]!).reshape([B, K]) }
+      let m = c("tt_assigned"), keep = Tensor(tt["tt_assigned"]!.map { 1 - $0 }).reshape([B, K])
+      return [
+        "f": f, "amp": amp, "idec": idec, "irise": irise * keep + c("tt_irise") * m,
+        "t0": c("tt_t0"), "ph": c("tt_ph"), "sh": (g * keep + c("tt_g") * m) * f,
+        "tau": tau * keep + c("tt_tau") * m, "mh": ones, "md": ones,
+      ]
+    }
     return [
       "f": f, "amp": amp, "idec": idec, "irise": irise, "t0": zeros, "ph": zeros, "sh": g * f,
       "tau": tau, "mh": ones, "md": ones,
@@ -157,12 +170,18 @@ enum PhysHeadFitter {
         let lawIdec = a + bb * fk * fk
         put("res_dec", b, k, K, atanhClamped(Foundation.log(Float(1 / slots[s].dec0) / lawIdec) / PhysRanges.sD))
         put("res_amp", b, k, K, atanhClamped(Foundation.log(max(Float(slots[s].amp), 1e-6) / max(A * poly[k], 1e-9)) / PhysRanges.sA))
+        put("tt_assigned", b, k, K, 1)
+        put("tt_irise", b, k, K, Float(1 / slots[s].rise0))
+        put("tt_t0", b, k, K, Float(slots[s].t0))
+        put("tt_ph", b, k, K, Float(slots[s].ph))
+        put("tt_g", b, k, K, Float(max(-0.9, slots[s].g0)))
+        put("tt_tau", b, k, K, Float(slots[s].tau))
       }
     }
     return out
   }
 
-  static func run(ids: [String], frames: Int, steps: Int, lr: Float, lambda: Float, K: Int, pure: Bool, out: URL) throws -> [String: Any] {
+  static func run(ids: [String], frames: Int, steps: Int, lr: Float, lambda: Float, K: Int, pure: Bool, keepTableTemporal: Bool = false, out: URL) throws -> [String: Any] {
     configureRuntime(frames: frames)
     LazyGraphContext.preserveCompilationCaches = true
     try FileManager.default.createDirectory(at: out, withIntermediateDirectories: true)
@@ -178,6 +197,13 @@ enum PhysHeadFitter {
     LazyGraphContext.reset()
     let targetTable = Tensor(interleave(targets, frames: frames)).reshape([frames, B])
     let params = PhysHeadParams(B: B, K: K, initial: init0)
+    if keepTableTemporal && !pure {
+      var tt: [String: [Float]] = [:]
+      for k in ["tt_assigned", "tt_irise", "tt_t0", "tt_ph", "tt_g", "tt_tau"] {
+        tt[k] = init0[k] ?? [Float](repeating: 0, count: B * K)
+      }
+      params.tableTemporal = tt
+    }
     let opt = Adam(params: params.groups.map { $0.1 }, lr: lr)
 
     func render() -> SignalTensor {
@@ -235,7 +261,7 @@ enum PhysHeadFitter {
       (0..<B).filter { $0 != b }.map { Scores.score(targets[$0], targets[b], windows: metricWindows) }.min() ?? .nan
     }
     let summary: [String: Any] = [
-      "lambda": lambda, "K": K, "steps": steps, "pure_init": pure,
+      "lambda": lambda, "K": K, "steps": steps, "pure_init": pure, "table_temporal": keepTableTemporal,
       "mean_init": initScores.reduce(0, +) / Float(B), "mean_fit": finalScores.reduce(0, +) / Float(B),
       "per_snare_fit": finalScores, "per_snare_init": initScores, "wrong_min_head": wrong,
       "mean_wrong_min_head": wrong.reduce(0, +) / Float(B),
