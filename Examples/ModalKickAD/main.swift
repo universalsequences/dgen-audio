@@ -310,6 +310,7 @@ do {
   case "fdcheck": try runFDCheck(args)
   case "probe": try runProbe(args)
   case "probe2": try runProbe2(args)
+  case "train-audio": try runTrainAudio(args)
   default: print("usage: ModalKickAD parity|fdcheck [--key value ...]")
   }
 } catch {
