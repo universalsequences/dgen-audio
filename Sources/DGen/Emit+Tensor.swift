@@ -331,10 +331,15 @@ extension LazyOp {
         if tensor.padding != nil {
           return b.tensorRead(tensor, indices: indices)
         }
-        if ctx.frameAwareTensorCells.contains(tensor.cellId) {
+        if ctx.frameAwareTensorCells.contains(tensor.cellId) && tensor.transforms.isEmpty {
+          // Only an untransformed tensor may index its base storage directly.
+          // A view (the reshape/transpose/expand that matmul and broadcasts put
+          // over a frame-varying operand) must walk its transform chain via
+          // tensorRead below: `tensor.strides` are the BASE strides, so zipping
+          // them with the view's indices silently drops dims (matmul read
+          // x[i][0] for every k).
           let elemIdx = b.tensorMemoryIndex(tensor, indices: indices)
           // Frame stride is the underlying storage size, not the view size.
-          // View tensors (e.g. pool/expand) can have shape larger than base storage.
           let tensorSize = ctx.g.frameAwareCells[tensor.cellId]?.tensorSize
             ?? tensor.shape.reduce(1, *)
           return b.frameAwareTensorRead(
@@ -598,7 +603,8 @@ extension LazyOp {
         let val: Expr
         if inTensor.padding != nil {
           val = b.tensorRead(inTensor, indices: inIndices)
-        } else if inIsFrameAwareMax {
+        } else if inIsFrameAwareMax && inTensor.transforms.isEmpty {
+          // Views walk their transform chain in tensorRead (frame-aware too).
           val = b.frameAwareTensorRead(
             cellId: inTensor.cellId, tensorSize: inTensorSizeMax, elemIdx: inFlatIdx)
         } else {
@@ -678,7 +684,8 @@ extension LazyOp {
         let val: Expr
         if inTensor.padding != nil {
           val = b.tensorRead(inTensor, indices: inIndices)
-        } else if inIsFrameAwareMean {
+        } else if inIsFrameAwareMean && inTensor.transforms.isEmpty {
+          // Views walk their transform chain in tensorRead (frame-aware too).
           val = b.frameAwareTensorRead(
             cellId: inTensor.cellId, tensorSize: inTensorSizeMean, elemIdx: inFlatIdx)
         } else {
@@ -957,7 +964,11 @@ extension LazyOp {
 
       // Read with frame-aware addressing if needed
       let val: Expr
-      if inIsFrameAware {
+      if !inTensor.transforms.isEmpty {
+        // A view input (e.g. the transpose in matmul's backward) must walk its
+        // transform chain; tensorRead also handles frame-aware base storage.
+        val = b.tensorRead(inTensor, flatIdx: inputFlatIdx, shape: inputShape)
+      } else if inIsFrameAware {
         val = b.frameAwareTensorRead(
           cellId: inTensor.cellId, tensorSize: inSize, elemIdx: b.cast(inputFlatIdx, to: .float))
       } else {

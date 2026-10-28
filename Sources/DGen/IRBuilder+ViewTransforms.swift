@@ -11,20 +11,28 @@ extension IRBuilder {
   ///
   /// Tries composed path first: if all transforms compose into (shape, strides, offset)
   /// views, emits a single stridedIndex per view instead of divmod chains.
-  public func tensorRead(_ tensor: Tensor, indices: [Expr]) -> Expr {
+  ///
+  /// `readBase` overrides the final base-storage load: it receives the base
+  /// element index the view maps to (e.g. a loop that reduces a per-frame tape
+  /// over all frames supplies its own frame offset). nil reads the current frame.
+  public func tensorRead(
+    _ tensor: Tensor, indices: [Expr], readBase: ((Expr) -> Expr)? = nil
+  ) -> Expr {
     // If no transforms, fast path: direct read from base memory
     if tensor.transforms.isEmpty {
       let memIdx = stridedIndex(indices: indices, strides: tensor.baseStrides)
-      return tensorReadFromBase(tensor, elemIdx: memIdx)
+      return tensorReadFromBase(tensor, elemIdx: memIdx, readBase: readBase)
     }
 
     // Try composed path: collapse transform chain into stride tuples
     let composed = tensor.composeTransforms()
     if composed.isFullyComposed && !composed.views.isEmpty {
       if composed.views.count == 1 {
-        return tensorReadSingleView(tensor, indices: indices, view: composed.views[0])
+        return tensorReadSingleView(
+          tensor, indices: indices, view: composed.views[0], readBase: readBase)
       }
-      return tensorReadComposed(tensor, indices: indices, views: composed.views)
+      return tensorReadComposed(
+        tensor, indices: indices, views: composed.views, readBase: readBase)
     }
 
     // Fall back: walk transforms BACKWARDS to map output indices → base indices
@@ -48,12 +56,12 @@ extension IRBuilder {
     if let bounds = inBoundsCheck {
       let val = float(0.0)
       self.if(bounds) {
-        mutate(val.value, to: tensorReadFromBase(tensor, elemIdx: memOffset))
+        mutate(val.value, to: tensorReadFromBase(tensor, elemIdx: memOffset, readBase: readBase))
       }
       return val.value
     }
 
-    return tensorReadFromBase(tensor, elemIdx: memOffset)
+    return tensorReadFromBase(tensor, elemIdx: memOffset, readBase: readBase)
   }
 
   /// Read from tensor using flat index with transform chain support.
@@ -97,10 +105,12 @@ extension IRBuilder {
 
   /// Fast path for a single composed view: one stridedIndex call → base memory read.
   /// Squeezes out size-1 dims to avoid redundant IR ops.
-  private func tensorReadSingleView(_ tensor: Tensor, indices: [Expr], view: ComposedView) -> Expr {
+  private func tensorReadSingleView(
+    _ tensor: Tensor, indices: [Expr], view: ComposedView, readBase: ((Expr) -> Expr)? = nil
+  ) -> Expr {
     let (sqIdx, sqStr) = squeezeView(indices: indices, view: view)
     let memIdx = stridedIndex(indices: sqIdx, strides: sqStr, offset: view.offset)
-    return tensorReadFromBase(tensor, elemIdx: memIdx)
+    return tensorReadFromBase(tensor, elemIdx: memIdx, readBase: readBase)
   }
 
   /// Multi-view composed path: walk from outermost view to innermost.
@@ -110,7 +120,7 @@ extension IRBuilder {
   /// Views are ordered innermost-first (index 0 = closest to base memory).
   /// We process from the last view (outermost, matching the tensor's final shape) inward.
   private func tensorReadComposed(
-    _ tensor: Tensor, indices: [Expr], views: [ComposedView]
+    _ tensor: Tensor, indices: [Expr], views: [ComposedView], readBase: ((Expr) -> Expr)? = nil
   ) -> Expr {
     // Fast path: 2-view chain where the outer view is contiguous (row-major strides, zero offset)
     // and shapes match. The outer stridedIndex→flatToMultiIndex round-trip is a no-op — skip it
@@ -122,7 +132,7 @@ extension IRBuilder {
     {
       let (sqIdx, sqStr) = squeezeView(indices: indices, view: views[0])
       let memIdx = stridedIndex(indices: sqIdx, strides: sqStr, offset: views[0].offset)
-      return tensorReadFromBase(tensor, elemIdx: memIdx)
+      return tensorReadFromBase(tensor, elemIdx: memIdx, readBase: readBase)
     }
 
     var currentIndices = indices
@@ -137,7 +147,7 @@ extension IRBuilder {
 
       if i == 0 {
         // Innermost view: flat index maps directly to base memory
-        return tensorReadFromBase(tensor, elemIdx: flatIdx)
+        return tensorReadFromBase(tensor, elemIdx: flatIdx, readBase: readBase)
       }
 
       // Decompose flat index into the next inner view's full shape.
@@ -150,7 +160,7 @@ extension IRBuilder {
     // Should not reach here (loop always returns at i==0)
     let memIdx = stridedIndex(
       indices: currentIndices, strides: views[0].strides, offset: views[0].offset)
-    return tensorReadFromBase(tensor, elemIdx: memIdx)
+    return tensorReadFromBase(tensor, elemIdx: memIdx, readBase: readBase)
   }
 
   /// Remove size-1 dimensions from indices and strides to avoid useless IR.
@@ -260,7 +270,10 @@ extension IRBuilder {
   // MARK: - Transform Helpers
 
   /// Read from base tensor memory, handling frame-aware tensors
-  private func tensorReadFromBase(_ tensor: Tensor, elemIdx: Expr) -> Expr {
+  private func tensorReadFromBase(
+    _ tensor: Tensor, elemIdx: Expr, readBase: ((Expr) -> Expr)? = nil
+  ) -> Expr {
+    if let readBase { return readBase(elemIdx) }
     if ctx.frameAwareTensorCells.contains(tensor.cellId),
       let (tensorSize, _) = ctx.g.frameAwareCells[tensor.cellId]
     {
