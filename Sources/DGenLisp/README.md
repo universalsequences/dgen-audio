@@ -499,14 +499,26 @@ Works on both signal and signalTensor. When a sidechain is provided, level detec
 
 ```lisp
 (delay signal time_in_samples)
+(delay signal time_in_samples @max-delay 16384)   ; line length (default 88000)
 ```
+
+The time is clamped to `[0, max-delay - 1]` samples and read with linear
+interpolation; delay 0 is the current input.
 
 ### Conditional
 
 ```lisp
 (gswitch condition true_value false_value)
 (selector mode option1 option2 ...)
+(block-gate condition body)    ; body runs in process calls where condition > 0
+(sample-gate condition body)   ; body runs on frames where condition > 0
+(do form1 ... formN)           ; evaluate in order, return the last
+(scalar-loop)                  ; compile the patch as one sample loop
 ```
+
+`gswitch` and `selector` evaluate every branch; the gates skip theirs. A
+`sample-gate` body's own state holds on frames it skips, and its condition may
+read that state. See `docs/execution-gating.md`.
 
 `selector` is 1-based: `mode <= 0` returns `0`, `1` returns `option1`, `2` returns `option2`, and so on.
 

@@ -36,6 +36,28 @@ public class LazyGraph {
   /// The underlying DGen graph
   internal let graph: Graph
 
+  /// Compile the whole graph as one sample-by-sample loop (see Graph.singleSampleLoop).
+  public var singleSampleLoop: Bool {
+    get { graph.singleSampleLoop }
+    set { graph.singleSampleLoop = newValue }
+  }
+
+  /// Node ids handed out so far; every later node gets a larger id.
+  public var nodeWatermark: NodeID { graph.next }
+
+  /// State cells of nodes created at or after `watermark`: histories and
+  /// delay lines written there, and self-contained stateful ops (phasor,
+  /// latch, noise, ...). Minus those a sample-gate created since then already
+  /// owns (a nested gate's state is held by the nested gate alone).
+  public func stateCellsWritten(since watermark: NodeID) -> Set<CellID> {
+    var cells = Set<CellID>()
+    for id in watermark..<graph.next {
+      if let node = graph.nodes[id] { cells.formUnion(graph.stateAccess(node).writes) }
+    }
+    for (gate, owned) in graph.sampleGates where gate >= watermark { cells.subtract(owned) }
+    return cells
+  }
+
   /// Parameters registered for gradient computation
   internal var parameters: [any LazyValue] = []
 
@@ -159,7 +181,7 @@ public class LazyGraph {
       options: .init(
         frameCount: frameCount,
         debug: DGenConfig.debug,
-        forceScalar: ProcessInfo.processInfo.environment["DGEN_FORCE_SCALAR"] == "1",
+        forceScalar: graph.singleSampleLoop || ProcessInfo.processInfo.environment["DGEN_FORCE_SCALAR"] == "1",
         voiceCount: voiceCount,
         enableBufferReuse: DGenConfig.enableBufferReuse,
         gemmStrategy: DGenConfig.gemmStrategy)

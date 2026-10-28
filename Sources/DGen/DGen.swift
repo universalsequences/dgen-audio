@@ -17,6 +17,22 @@ open class Graph {
     /// Explicit C block gates: mux node -> condition. Only the true input is gated.
     /// Shared dependencies keep executing when any ungated consumer needs them.
     public var executionGates: [NodeID: NodeID] = [:]
+    /// Per-frame gates (sample-gate): mux -> the state cells its body owns.
+    /// Owned state (histories and delay lines written inside the body) holds
+    /// on frames where the condition is off. The condition is tested inside
+    /// the sample loop, so it may read owned state. A subset of `executionGates`.
+    public var sampleGates: [NodeID: Set<CellID>] = [:]
+
+    /// Conditions of per-frame gates.
+    public var sampleGateConditions: Set<NodeID> {
+        Set(sampleGates.keys.compactMap { executionGates[$0] })
+    }
+
+    /// Cells owned by any per-frame gate.
+    public var sampleGateCells: Set<CellID> {
+        sampleGates.values.reduce(into: Set<CellID>()) { $0.formUnion($1) }
+    }
+
     public var next = 0
     public var nodes: [NodeID: Node] = [:]
     private var nextCellId = 0
@@ -36,6 +52,16 @@ open class Graph {
               let tensorId = nodeToTensor[source], let tensor = tensors[tensorId],
               mutableTensorCells.contains(tensor.cellId) else { return nil }
         return tensor.cellId
+    }
+
+    /// The state cells `node` reads and writes: histories, ring and tensor
+    /// memory, and the cells of self-contained stateful ops (phasor, latch, ...).
+    public func stateAccess(_ node: Node) -> (reads: [CellID], writes: [CellID]) {
+        switch node.op {
+        case .historyRead(let cell), .memoryRead(let cell): return ([cell], [])
+        case .historyWrite(let cell), .historyReadWrite(let cell), .memoryWrite(let cell): return ([], [cell])
+        default: return (mutableTensorReadCell(node).map { [$0] } ?? [], node.op.persistentStateCellIds)
+        }
     }
 
     public func isMutableTensorAccess(_ node: Node) -> Bool {
@@ -137,6 +163,13 @@ open class Graph {
 
     /// Nodes that should have their tensor results materialized in memory (for realize())
     public var materializeNodes: Set<NodeID> = []
+    /// Index nodes known to be finite and within their buffer (e.g. a delay
+    /// line's clamped read position): reads through them skip the NaN guard.
+    public var boundedIndexNodes: Set<NodeID> = []
+    /// Compile every node into one sample-by-sample loop (`(scalar-loop)`):
+    /// for feedback-heavy patches whose values would otherwise cross many
+    /// small frame loops through scratch buffers.
+    public var singleSampleLoop = false
 
     /// Side-effect nodes created during backward pass (e.g., gradient carry writes)
     /// These need to be chained with gradient outputs to ensure they execute.
@@ -227,7 +260,12 @@ open class Graph {
                 pending = [ins[i + 1]]
                 while let current = pending.popLast() {
                     guard visited.insert(current).inserted, let node = nodes[current] else { continue }
-                    pending.append(contentsOf: node.allDependencies)
+                    // Value edges only: an ordering edge carries no value, so
+                    // what it orders before `current` need not follow the
+                    // prefix. Following one walks into unrelated state (e.g.
+                    // another delay line's write) and orders reads after a
+                    // write that depends on them.
+                    pending.append(contentsOf: node.inputs)
                     let touchesMemory: Bool
                     switch node.op {
                     case .memoryRead, .memoryWrite, .memoryAccumulate, .memoryCellSum, .peek:
@@ -330,7 +368,7 @@ extension Op {
             return [b]
         case .load(_):
             return []
-        case .blockGateTest(let a, _):
+        case .blockGateTest(let a, _), .frameGateTest(let a):
             return [a]
         case .beginIf(let a):
             return [a]

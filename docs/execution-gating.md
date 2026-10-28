@@ -33,6 +33,48 @@ that all DSP influencing an output is disposable: shared producers and
 predicate preparation remain unconditional. Feedback state still requires
 normal initialization and note-on/retrigger handling.
 
+## Per-frame gates
+
+`(sample-gate condition body)` is the per-frame counterpart. On every frame
+where `condition > 0` the body runs; on the others its owned state holds and
+the result is zero. The condition is tested inside the sample loop, so it may
+read state the body writes: a voice gated on its own envelope reads the
+envelope the body wrote on the previous frame.
+
+```
+(def trig (eq (accum 1 0 0 4800) 0))
+(make-history h_env)
+(def alive (or trig (gt (read-history h_env) 0)))
+(out (sample-gate alive
+       (do
+         (def env (gswitch trig 1 (* (read-history h_env) 0.999)))
+         (write-history h_env (gswitch (lt env 0.0001) 0 env))
+         (* env (sin (* twopi (phasor 440))))))
+     1)
+```
+
+Ownership is lexical. A history, delay line or stateful op (phasor, latch,
+noise, ...) created while evaluating the body belongs to the gate and holds
+while it is closed. State created outside every sample-gate keeps running
+even if only gated code reads it. A nested sample-gate owns its own state.
+Shared stateless producers run whenever any consumer needs them; arithmetic
+wanted by many alternative gates (say, by each of 32 voices) runs under the
+conditions the alternatives share instead of testing them all. `(do e1 ... en)`
+evaluates its forms in order and returns the last, so a body can hold
+definitions and history writes.
+
+Gated bodies of one feedback region stay in its sample loop as `if` blocks.
+The scheduler keeps each gate's nodes together, and values passed between
+fragments of one loop are scalars, not scratch buffers. C backend only.
+
+## One sample loop
+
+`(scalar-loop)` compiles the whole patch as a single sample-by-sample loop.
+Patches that are mostly feedback (granular processors, reverbs, physical
+models) otherwise split into many small frame loops, with values crossing them
+through scratch buffers. A patch that mostly computes tensors (spectral
+processing, convolution) should not use it.
+
 ## Unassigned modulation
 
 The C compiler lowers `modulatedParam` into a conditional arithmetic region.

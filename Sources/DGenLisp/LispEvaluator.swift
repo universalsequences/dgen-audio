@@ -283,7 +283,21 @@ class LispEvaluator {
     bindingShapes.removeAll()
     failedForm = nil
     try predeclareTopLevelParams(in: nodes)
+    // DGEN_DEBUG_FORM_NODES=<path>: the first node id each top-level form
+    // created, for attributing generated code to source forms.
+    let formLog = ProcessInfo.processInfo.environment["DGEN_DEBUG_FORM_NODES"]
+    var formLines: [String] = []
+    defer {
+      if let formLog { try? formLines.joined(separator: "\n").write(toFile: formLog, atomically: true, encoding: .utf8) }
+    }
     for (index, node) in nodes.enumerated() {
+      if formLog != nil {
+        var label = "form\(index)"
+        if case .list(let elements) = node, elements.count >= 2 {
+          label = "\(elements[0])".prefix(20) + " " + "\(elements[1])".prefix(60)
+        }
+        formLines.append("\(LazyGraphContext.current.nodeWatermark)\t\(label.replacingOccurrences(of: "\n", with: " "))")
+      }
       do {
         let _ = try evaluateAST(node)
       } catch {
@@ -1046,6 +1060,21 @@ class LispEvaluator {
       return try evalClip(regularArgs)
     case "block-gate":
       return try evalBlockGate(regularArgs)
+    case "sample-gate":
+      return try evalBlockGate(regularArgs, perFrame: true)
+    case "scalar-loop":
+      // (scalar-loop): run the patch as one sample-by-sample loop.
+      guard regularArgs.isEmpty else {
+        throw LispError.invalidArgument("scalar-loop takes no arguments")
+      }
+      LazyGraphContext.current.singleSampleLoop = true
+      return .none
+    case "do":
+      // (do e1 ... en): evaluate in order, return the last value. Lets a
+      // gate's body hold definitions and state updates.
+      var last: EvalResult = .none
+      for arg in regularArgs { last = try evaluateAST(arg) }
+      return last
     case "gswitch":
       return try evalGswitch(regularArgs)
     case "selector":
@@ -1060,18 +1089,26 @@ class LispEvaluator {
 
   // MARK: - Arithmetic
 
-  private func evalBlockGate(_ args: [ASTNode]) throws -> EvalResult {
+  private func evalBlockGate(_ args: [ASTNode], perFrame: Bool = false) throws -> EvalResult {
+    let name = perFrame ? "sample-gate" : "block-gate"
     guard args.count == 2 else {
-      throw LispError.invalidArgument("block-gate requires condition and scalar/tuple body")
+      throw LispError.invalidArgument("\(name) requires condition and scalar/tuple body")
     }
-    let condition = try asSignal(evaluateAST(args[0]), op: "block-gate")
+    let condition = try asSignal(evaluateAST(args[0]), op: name)
+    let lazy = LazyGraphContext.current
+    let watermark = lazy.nodeWatermark
+    let body = try evaluateAST(args[1])
+    // State written while evaluating the body belongs to a per-frame gate.
+    let owned = perFrame ? lazy.stateCellsWritten(since: watermark) : []
     func wrap(_ value: EvalResult) throws -> EvalResult {
       if case .tuple(let values) = value { return .tuple(try values.map(wrap)) }
-      let signal = try asSignal(value, op: "block-gate")
-      let result = DGenLazy.blockGate(condition, signal)
+      let signal = try asSignal(value, op: name)
+      let result = perFrame
+        ? DGenLazy.sampleGate(condition, signal, ownedCells: owned)
+        : DGenLazy.blockGate(condition, signal)
       return .signal(result)
     }
-    return try wrap(evaluateAST(args[1]))
+    return try wrap(body)
   }
 
   private func evalTuple(_ args: [ASTNode]) throws -> EvalResult {
@@ -1709,7 +1746,17 @@ class LispEvaluator {
             + "every tensor operand of a tensor biquad must have the same shape\(broadcastNote). "
             + "Use reshape/expand to make the shapes agree, or pass a scalar to share one value")
       }
-      return .signalTensor(try asSignalTensor(input, shape: shape, op: "biquad").biquad(
+      // A scalar input is the one operand that cannot stay a lifted view: the
+      // filter keeps per-element x[n-1]/x[n-2] history of its input, and a
+      // tensor history write of a scalar-shaped node trapped the compiler
+      // (Emit+State historyWrite force-unwraps `nodeToTensor`). Materialize it
+      // as a real [shape] tensor, so `(biquad scalar <freqs>)` runs one filter
+      // per frequency over the shared input.
+      var filterInput = try asSignalTensor(input, shape: shape, op: "biquad")
+      if tensorShape(of: input) == nil {
+        filterInput = filterInput + SignalTensor.lift(Tensor.zeros(shape))
+      }
+      return .signalTensor(try filterInput.biquad(
         cutoff: asSignalTensor(cutoff, shape: shape, op: "biquad cutoff"),
         resonance: asSignalTensor(resonance, shape: shape, op: "biquad resonance"),
         gain: asSignalTensor(gain, shape: shape, op: "biquad gain"),

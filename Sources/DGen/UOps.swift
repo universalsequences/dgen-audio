@@ -70,6 +70,8 @@ public enum Op {
   /// emits a lane-group fast path (one event test, one broadcast load).
   case eventLatch(CellID, Lazy, Lazy)
   case blockGateTest(Lazy, frameVarying: Bool)
+  /// Per-frame gate test inside a sample loop: 1 when the condition is positive.
+  case frameGateTest(Lazy)
   case beginIf(Lazy)
   case gswitch(Lazy, Lazy, Lazy)
   case selector(Lazy, [Lazy])  // selector(mode, options[])
@@ -233,6 +235,7 @@ public enum Op {
     case .setFrameIndex(let i): return .setFrameIndex(r(i))
     case .loadTape(let v, let o): return .loadTape(r(v), r(o))
     case .blockGateTest(let c, let varying): return .blockGateTest(r(c), frameVarying: varying)
+    case .frameGateTest(let c): return .frameGateTest(r(c))
     case .beginIf(let c): return .beginIf(r(c))
     case .beginHopCheck(let c): return .beginHopCheck(r(c))
     case .simdgroupLoad(let c, let o, let s, let t): return .simdgroupLoad(c, r(o), s, t)

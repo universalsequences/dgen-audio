@@ -22,6 +22,8 @@ extension LazyOp {
         let value = b.tload(cellId, idx)
         _ = b.tstore(outputCellId, idx, value)
         ctx.values[nodeId] = .empty
+      } else if g.boundedIndexNodes.contains(node.inputs[0]) {
+        b.use(val: b.memoryRead(cellId, b.cast(b.value(inputs[0]), to: .int)))
       } else {
         b.use(val: b.memoryRead(cellId, b.value(inputs[0])))
       }
@@ -85,17 +87,28 @@ extension LazyOp {
         // Frame-aware: sum across all frames (each at frameIdx * tensorSize + elemIdx).
         // Each parallel lane owns one elemIdx, so reduce locally first, then do a single
         // accumulate to avoid frameCount atomics per element.
+        // A view (matmul's backward hands a weight its gradient as a transpose
+        // of the per-frame [N,K] product tape) must map each element through
+        // its transform chain; reading the base flat would return it transposed.
         let tensorSizeInt = b.intConstant(tensorSize)
-        b.parallelRange(size) { elemIdx in
-          let elemIdxInt = b.cast(elemIdx, to: .int)
+        func sumFrames(at baseIdx: Expr) -> Expr {
           let localSum = b.float(0.0)
           b.loop(frameCount) { frameIdx in
-            let frameIdxInt = b.cast(frameIdx, to: .int)
-            let readPos = frameIdxInt * tensorSizeInt + elemIdxInt
-            let val = b.memoryRead(tensor.cellId, readPos)
-            localSum.accumulate(val)
+            let readPos = b.cast(frameIdx, to: .int) * tensorSizeInt + baseIdx
+            localSum.accumulate(b.memoryRead(tensor.cellId, readPos))
           }
-          _ = b.memoryWrite(cellId, elemIdxInt, localSum.value)
+          return localSum.value
+        }
+        b.parallelRange(size) { elemIdx in
+          let elemIdxInt = b.cast(elemIdx, to: .int)
+          // The view->base mapping depends only on the element: emit it once,
+          // outside the frame loop (a padded-out element skips the loop: 0).
+          let sum = tensor.transforms.isEmpty
+            ? sumFrames(at: elemIdxInt)
+            : b.tensorRead(tensor, indices: b.flatToMultiIndex(elemIdxInt, shape)) { baseIdx in
+              sumFrames(at: b.cast(baseIdx, to: .int))
+            }
+          _ = b.memoryWrite(cellId, elemIdxInt, sum)
         }
       } else if !tensor.transforms.isEmpty {
         // Use tensorRead to walk the transform chain
@@ -381,9 +394,22 @@ extension LazyOp {
         // Output the previous value (like scalar accum)
         try b.writeOutput(node, prevAcc)
       } else {
-        // Scalar accum: use original implementation
+        func constant(_ index: Int) -> Float? {
+          guard case .constant(let value)? = g.nodes[node.inputs[index]]?.op else { return nil }
+          return value
+        }
         let (incr, reset, min, max) = b.values(inputs, count: 4)
-        b.use(val: u_accum(cellId, incr: incr, reset: reset, min: min, max: max)(b))
+        if let step = constant(0), constant(2) == 0, let top = constant(3), step >= 0, step <= top {
+          // A counter from 0 that steps at most one span: the state stays in
+          // [0, top), so one compare replaces the modulo.
+          let acc = b.load(cellId, b.nodeId)
+          let next = acc + incr
+          let wrapped = b.gswitch(next >= max, next - max, next)
+          _ = b.store(cellId, b.gswitch(reset > b.constant(0.0), min, wrapped))
+          b.use(val: acc)
+        } else {
+          b.use(val: u_accum(cellId, incr: incr, reset: reset, min: min, max: max)(b))
+        }
       }
     case .click(let cellId):
       guard inputs.count == 0 else {

@@ -30,8 +30,12 @@ extension GraphPrepPasses {
       }
     }
 
+    // A per-frame gate's state keeps its read apart from its write: the gate's
+    // condition may read the cell while only the body writes it.
+    let gatedCells = graph.sampleGateCells
+
     // For each cellId that has both read and write, check if they're not in feedback loops.
-    for cellId in historyReads.keys.sorted() {
+    for cellId in historyReads.keys.sorted() where !gatedCells.contains(cellId) {
       guard let readNodeId = historyReads[cellId] else { continue }
       if let writeInfo = historyWrites[cellId] {
         // historyReadWrite is a scalar delay operation. Tensor history must keep

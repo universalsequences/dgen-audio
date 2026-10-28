@@ -113,6 +113,150 @@ final class ExecutionGateTests: XCTestCase {
     return samples
   }
 
+  // MARK: - sample-gate
+
+  /// A decaying voice whose gate condition reads the voice's own envelope: the
+  /// body runs on live frames only, so a counter inside it counts live frames.
+  func testSampleGateConditionReadsTheBodysOwnState() throws {
+    let program = try compile("""
+      (def trig (eq (accum 1 0 0 40) 0))
+      (make-history h_env)
+      (def alive (or trig (gt (read-history h_env) 0)))
+      (def (e c)
+        (sample-gate alive
+          (do
+            (make-history h_count)
+            (def e0 (gswitch trig 1 (* (read-history h_env) 0.5)))
+            (def e1 (gswitch (lt e0 0.001) 0 e0))
+            (write-history h_env e1)
+            (def c (+ (read-history h_count) 1))
+            (write-history h_count c)
+            (tuple e1 c))))
+      (out (+ c (* 0 e)) 1)
+      """)
+    for size in [1, 16, 64] {
+      let output = try render(program, blockSize: size, blocks: 400 / size + 1)
+      var env: Float = 0, count: Float = 0
+      for (frame, value) in output.enumerated() {
+        let trig = frame % 40 == 0
+        let alive = trig || env > 0
+        var expected: Float = 0
+        if alive {
+          var e = trig ? 1 : env * 0.5
+          if e < 0.001 { e = 0 }
+          env = e
+          count += 1
+          expected = count
+        }
+        XCTAssertEqual(value, expected, "frame \(frame), block \(size)")
+      }
+    }
+  }
+
+  /// State written outside a sample-gate keeps running while the gate is
+  /// closed, even when only the gated body reads it.
+  func testSampleGateLeavesOutsideStateRunning() throws {
+    let program = try compile("""
+      (make-history h_frames)
+      (def frames (read-history h_frames))
+      (write-history h_frames (+ frames 1))
+      (def open (eq (% frames 8) 0))
+      (out (sample-gate open frames) 1)
+      """)
+    let output = try render(program, blockSize: 16, blocks: 6)
+    for (frame, value) in output.enumerated() {
+      XCTAssertEqual(value, frame % 8 == 0 ? Float(frame) : 0, "frame \(frame)")
+    }
+  }
+
+  /// A nested gate's state belongs to the nested gate: it advances only when
+  /// both gates are open.
+  func testNestedSampleGateOwnsItsState() throws {
+    let program = try compile("""
+      (make-history h_frames)
+      (def frames (read-history h_frames))
+      (write-history h_frames (+ frames 1))
+      (def outer (lt (% frames 10) 6))
+      (def inner (eq (% frames 2) 0))
+      (out (sample-gate outer
+             (do
+               (make-history h_outer)
+               (write-history h_outer (+ (read-history h_outer) 1))
+               (+ (* 100 (read-history h_outer))
+                  (sample-gate inner
+                    (do
+                      (make-history h_inner)
+                      (def n (+ (read-history h_inner) 1))
+                      (write-history h_inner n)
+                      n)))))
+           1)
+      """)
+    let output = try render(program, blockSize: 8, blocks: 5)
+    var outerCount: Float = 0, innerCount: Float = 0
+    for (frame, value) in output.enumerated() {
+      var expected: Float = 0
+      if frame % 10 < 6 {
+        let before = outerCount
+        outerCount += 1
+        var inner: Float = 0
+        if frame % 2 == 0 { innerCount += 1; inner = innerCount }
+        expected = 100 * before + inner
+      }
+      XCTAssertEqual(value, expected, "frame \(frame)")
+    }
+  }
+
+  func testScalarLoopCompilesOneFrameLoop() throws {
+    let program = try compile("""
+      (scalar-loop)
+      (def x (in 1))
+      (make-history h)
+      (def y (+ (* (read-history h) 0.5) x))
+      (write-history h y)
+      (out (+ (* x 3) (sin y)) 1)
+      """)
+    let loops = program.source.components(separatedBy: "for (int i = 0; i < frameCount;").count - 1
+    XCTAssertEqual(loops, 1)
+  }
+
+  /// A ring index already wrapped into the buffer is read and written without
+  /// another modulo.
+  func testInRangeRingIndexSkipsTheWrap() throws {
+    let program = try compile("""
+      (def buf (tensor @shape [64 1]))
+      (make-history h)
+      (def next (+ (clip (read-history h) 0 63) 63))
+      (def wp (gswitch (gte next 64) (- next 64) next))
+      (write-history h wp)
+      (def ahead (+ wp 9))
+      (def r (gswitch (gte ahead 64) (- ahead 64) ahead))
+      (def w (poke buf wp 0 wp))
+      (out (seq w (peek buf r 0)) 1)
+      """)
+    XCTAssertFalse(program.source.contains("/ 64.0f"), "a wrapped index needs no modulo")
+    // The write pointer steps back one slot a frame; reading 9 slots ahead
+    // returns the pointer value written 9 frames earlier.
+    let output = try render(program, blockSize: 32, blocks: 4)
+    for (frame, value) in output.enumerated() where frame >= 10 {
+      let wpAt: (Int) -> Float = { f in Float(((63 - f) % 64 + 64) % 64) }
+      XCTAssertEqual(value, wpAt(frame - 9), "frame \(frame)")
+    }
+  }
+
+  /// Two delay lines of one length delay independently (clamped read path).
+  func testDelayLinesOfOneLengthDelayIndependently() throws {
+    let program = try compile("""
+      (def ramp (accum 1 0 0 100000))
+      (out (+ (delay ramp 3 @max-delay 64) (* 1000 (delay (* ramp 2) 5 @max-delay 64))) 1)
+      """)
+    let output = try render(program, blockSize: 16, blocks: 12)
+    for (frame, value) in output.enumerated() {
+      let a: Float = frame >= 3 ? Float(frame - 3) : 0
+      let b: Float = frame >= 5 ? Float(2 * (frame - 5)) : 0
+      XCTAssertEqual(value, a + 1000 * b, accuracy: 0.01, "frame \(frame)")
+    }
+  }
+
   func testModulationRegionPreservesDelayRingWrap() throws {
     for size in [8, 64] {
       let program = try compile("""

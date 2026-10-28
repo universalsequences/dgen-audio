@@ -134,6 +134,10 @@ extension Graph {
     lines.append("mutableTensorCells=\(mutableTensorCells.sorted())")
     lines.append("parameterCells=\(parameterCells.sorted())")
     lines.append("gradientSideEffects=\(gradientSideEffects)")
+    lines.append("executionGates=\(executionGates.sorted { $0.key < $1.key }.map { "\($0.key):\($0.value)" })")
+    lines.append("boundedIndexNodes=\(boundedIndexNodes.sorted())")
+    lines.append("singleSampleLoop=\(singleSampleLoop)")
+    lines.append("sampleGates=\(sampleGates.sorted { $0.key < $1.key }.map { "\($0.key):\($0.value.sorted())" })")
     lines.append("lastForwardNodeId=\(String(describing: lastForwardNodeId))")
 
     for nodeId in nodes.keys.sorted() {
