@@ -39,7 +39,7 @@ enum ModalSnareADMain {
     setvbuf(stdout, nil, _IOLBF, 0)
     let args = CommandLine.arguments.dropFirst()
     guard let command = args.first else {
-      print("usage: ModalSnareAD parity|fdcheck|fit|calibrate|physfit [options]")
+      print("usage: ModalSnareAD parity|fdcheck|fit|calibrate|physfit|latent-pretrain|latent-train|latent-fitz|latent-render [options]")
       return
     }
     let opts = parseOptions(args.dropFirst())
@@ -102,6 +102,10 @@ enum ModalSnareADMain {
       print(String(format: "phys lambda=%g: mean head score %.4f (init %.4f, wrong-min %.4f); residual f %.1f cents rms, dec %.3f, amp %.3f",
         s["lambda"] as! Float, s["mean_fit"] as! Float, s["mean_init"] as! Float, s["mean_wrong_min_head"] as! Float,
         s["res_f_cents_rms"] as! Float, s["res_dec_log_rms"] as! Float, s["res_amp_log_rms"] as! Float))
+    case "latent-pretrain": try LatentCommands.pretrain(opts)
+    case "latent-train": try LatentCommands.train(opts)
+    case "latent-fitz": try LatentCommands.fitz(opts)
+    case "latent-render": try LatentCommands.render(opts)
     default:
       throw CLIError(description: "unknown command \(command)")
     }

@@ -31,3 +31,29 @@ $B physfit --lambda 0.01 --out <dir>                 # Bessel-structured head vs
 `fit` trains B = 32 snares in one batched pass (MR-STFT lin + log, windows 128–2048,
 hop w/4) against `out.wav`, and writes per-snare `*.fit.wav`, `*.target.wav`,
 `*.fit_headpart.wav`, `*.fit_noisepart.wav`, `summary.json`, `params.json` and `loss.csv`.
+
+## E2: latent snare autodecoder (`latent-*`)
+
+Per-snare latent codes z (D) + velocity -> tanh MLP (D+1 -> 128 -> 128 -> P) -> the segments
+of the realtime Latent Snare template (`Latent.swift`; layout = `decoder_layout.json` written by
+the research `e3proto/gen_dsp.py`, numpy twin `e2/template.py`). The renderer is the same math
+as the instrument: 32 closed-form head modes, 2 head gates, 16 band-noise envelopes, drive,
+soft clipper, length fade.
+
+```bash
+$B latent-pretrain --d 4 --steps 12000 --zl2 1e-4 --box 3 --out <pre>      # stage a: param space
+DGEN_METAL_KERNELS_PER_COMMAND_BUFFER=1 \
+$B latent-train --stage head --init <pre>/checkpoint.json --steps 120 --lr 3e-4 --anchor 10 --box 3 --group 24 --out <head>
+$B latent-train --stage out  --init <head>/checkpoint.json --steps 360 --lr 3e-4 --anchor 10 --anchor-end 3 --box 3 --group 16 --out <out>
+$B latent-fitz --ckpt <out>/checkpoint.json --spec <spec.json> --out <dir>  # fresh z per held-out target (or --free-u)
+$B latent-render --ckpt <out>/checkpoint.json --spec <spec.json> --out <dir>
+```
+
+- Audio stages backprop in two passes (`twoPass`): the audio loss to a leaf u [B, P] (frame-summed
+  dL/du), then sum(u * dL/du) + anchors through the static decoder. One graph would carry
+  per-frame tapes through the MLP ([frames, H, P], > 2^31 floats even at B = 12).
+- `--train readout` (default) moves only W3/b3, with the `mode_freq` columns masked: decoder-wide
+  Adam steps move every frequency by several cents.
+- Batch tensors are persistent and updated in place per chunk: a fresh data tensor per step or per
+  chunk compiles new kernels (and kept one runtime + buffers per chunk alive).
+- `--box`: range hinge on random latent samples keeps off-code decodes in the corpus parameter box.
