@@ -462,10 +462,18 @@ public class MetalRenderer: Renderer, UOpEmitter {
     let threadCount: Int?
   }
 
+  private var staticRegionSplitDisabled: Bool {
+    ProcessInfo.processInfo.environment["DGEN_NO_STATIC_REGION_SPLIT"] != nil
+  }
+
   private func splitStaticParallelRanges(_ scheduleItem: ScheduleItem, ctx: IRContext)
     -> [SplitScheduleItem]
   {
-    guard scheduleItem.temporality == .static_, scheduleItem.frameOrder == .sequential else {
+    // Static blocks run once (no frame loop), so their frame order does not matter here:
+    // a .parallel static block dispatched as staticThreads(1) is just as serial.
+    guard scheduleItem.temporality == .static_,
+      scheduleItem.frameOrder == .sequential || !staticRegionSplitDisabled
+    else {
       return [SplitScheduleItem(item: scheduleItem, threadCount: nil)]
     }
 
