@@ -328,7 +328,12 @@ extension LazyOp {
           }
         }
 
-        if tensor.padding != nil {
+        // View operands (reshape/expand/... of a frame tensor, e.g. a shared
+        // [K] signal broadcast to [B, K]) must map view indices through the
+        // transform chain: tensor.strides describe the base storage, so the
+        // direct path zip-truncated the indices (assert in debug, silently
+        // wrong addresses in release).
+        if tensor.padding != nil || !tensor.transforms.isEmpty {
           return b.tensorRead(tensor, indices: indices)
         }
         if ctx.frameAwareTensorCells.contains(tensor.cellId) {
