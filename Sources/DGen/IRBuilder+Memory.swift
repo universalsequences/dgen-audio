@@ -160,7 +160,12 @@ extension IRBuilder {
   /// Compute the linear memory offset for frame-aware storage: `slotIdx * tensorSize + elemIdx`.
   /// Result is cast to int for use as a memory index.
   private func frameAwareOffset(cellId: CellID, frameIdx: Expr, tensorSize: Int, elemIdx: Expr) -> Expr {
-    return cast(frameAwareBase(cellId: cellId, frameIdx: frameIdx, tensorSize: tensorSize) + elemIdx, to: .int)
+    // Integer addition: some element-index paths are float-typed (e.g. expandAxis
+    // casts its source index to float), and `int base + float elem` promoted the
+    // whole offset to float, which cannot address past 2^24 (frames * B * K >
+    // 16.7M): late-frame gradients were read/written at rounded addresses.
+    return cast(frameAwareBase(cellId: cellId, frameIdx: frameIdx, tensorSize: tensorSize), to: .int)
+      + cast(elemIdx, to: .int)
   }
 
   /// Zero a hop-sliced read on frames that are not hop ticks.
