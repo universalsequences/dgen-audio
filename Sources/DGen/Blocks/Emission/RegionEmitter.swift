@@ -166,7 +166,7 @@ public func emitScalarBlockWithShapeTransitions(
   let skipRegions = detectFusableReduces(
     block: block, g: g, transitions: transitions,
     blockOutbound: blockOutbound, outbound: &outbound, ctx: ctx)
-  detectInlineableMulReduceNodes(block: block, g: g, ctx: ctx)
+  outbound.formUnion(detectInlineableMulReduceNodes(block: block, g: g, ctx: ctx))
   detectInlineableExpandAxisReduceNodes(block: block, g: g, ctx: ctx)
   outbound.formUnion(ctx.fusedSumOperandCells)
   ctx.outboundTensorCells = outbound

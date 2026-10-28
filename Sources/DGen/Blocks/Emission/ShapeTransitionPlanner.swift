@@ -374,14 +374,22 @@ func detectFusableReduces(
 /// This is a fallback for multi-consumer matmul-backward regions where full
 /// transition skipping is not possible. It marks eligible mul nodes so emission
 /// skips materializing their outputs, while sumAxis reads A/B directly.
+///
+/// Returns the operand cells the inlined reduce reads from memory. The caller
+/// must add them to the block's outbound set: an operand produced in this block
+/// whose only consumer is the elided `mul` is otherwise not outbound by
+/// liveness, so its store is skipped and the reduce reads an untouched
+/// allocation (silence). E.g. `(sin(signal * T) * W).sum(axis: 1)` returned 0.
+@discardableResult
 func detectInlineableMulReduceNodes(
   block: Block,
   g: Graph,
   ctx: IRContext
-) {
+) -> Set<CellID> {
   // Safety gate: this fallback is intended for frame-based matmul-backward style regions.
   // Keep static-only tensor programs on the conservative path to avoid behavioral drift.
-  guard block.temporality == .frameBased else { return }
+  guard block.temporality == .frameBased else { return [] }
+  var operandCells = Set<CellID>()
 
   let blockNodeSet = Set(block.nodes)
   var candidateMulNodes = Set<NodeID>()
@@ -402,6 +410,8 @@ func detectInlineableMulReduceNodes(
     else { continue }
 
     ctx.inlineReduceSources[mulTensor.cellId] = .mul(a: aTensor, b: bTensor)
+    operandCells.insert(aTensor.cellId)
+    operandCells.insert(bTensor.cellId)
     candidateMulNodes.insert(mulNodeId)
   }
 
@@ -411,6 +421,7 @@ func detectInlineableMulReduceNodes(
       ctx.skippedTensorComputeNodes.insert(mulNodeId)
     }
   }
+  return operandCells
 }
 
 /// Detect `sumAxis(expandAxis(X))` patterns that can inline `expandAxis` reads into `sumAxis`.
