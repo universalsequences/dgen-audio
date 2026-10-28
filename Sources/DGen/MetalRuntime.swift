@@ -229,6 +229,18 @@ public class MetalCompiledKernel: CompiledKernelRuntime {
     for bufferName in allBufferNames {
       // Memory buffer size comes from getMemorySize(), others need maxFrameCount
       let elementCount = getElementCount(bufferName)
+      // Emitted kernels index buffers with 32-bit `int` arithmetic
+      // (`memory[base + frame * width + i]`). Past Int32.max elements the
+      // offsets wrap and kernels silently read/write the wrong cells.
+      if elementCount > Int(Int32.max) {
+        throw NSError(
+          domain: "MetalError", code: 5,
+          userInfo: [
+            NSLocalizedDescriptionKey:
+              "Buffer \(bufferName) needs \(elementCount) floats, beyond the 32-bit index range of "
+              + "emitted kernels (\(Int32.max)); reduce frames, batch or materialized tensors"
+          ])
+      }
 
       let bufferSize = elementCount * MemoryLayout<Float>.size
       guard let buffer = device.makeBuffer(length: bufferSize, options: .storageModeShared)
