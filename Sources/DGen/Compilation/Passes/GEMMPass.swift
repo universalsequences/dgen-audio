@@ -136,23 +136,23 @@ extension GraphPrepPasses {
           mulShape.count == 2
         else { continue }
 
-        let (leftSource, leftViewIds, _, leftNearest2D) = traceViewChain(
-          from: mulNode.inputs[0], graph: graph)
-        let (rightSource, rightViewIds, _, rightNearest2D) = traceViewChain(
-          from: mulNode.inputs[1], graph: graph)
-
-        func sourceMatchesMulShape(_ sourceId: NodeID, _ nearest2D: [Int]?) -> Bool {
-          if let node = graph.nodes[sourceId],
-            case .tensor(let sourceShape) = node.shape, sourceShape.count == 2
+        // Strip an operand's view chain only when its source already is the [M, N]
+        // tensor. Otherwise the chain reshapes or BROADCASTS (e.g. the expand that
+        // sum()'s adjoint puts over the scalar seed) and the source has a different
+        // shape: keep the mul's own [M, N] view operand, which the emitter reads
+        // through its transforms. (Stripping it failed shape inference, and would
+        // have read the wrong elements.)
+        func operand(_ inputId: NodeID) -> (NodeID, [NodeID]) {
+          let (source, viewIds, _, _) = traceViewChain(from: inputId, graph: graph)
+          if let node = graph.nodes[source], case .tensor(let sourceShape) = node.shape,
+            sourceShape == mulShape
           {
-            return sourceShape == mulShape
+            return (source, viewIds)
           }
-          return nearest2D == mulShape
+          return (inputId, [])
         }
-
-        guard sourceMatchesMulShape(leftSource, leftNearest2D),
-          sourceMatchesMulShape(rightSource, rightNearest2D)
-        else { continue }
+        let (leftSource, leftViewIds) = operand(mulNode.inputs[0])
+        let (rightSource, rightViewIds) = operand(mulNode.inputs[1])
 
         graph.nodes[nodeId] = Node(
           id: nodeId,
