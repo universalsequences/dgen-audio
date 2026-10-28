@@ -172,6 +172,7 @@ public func emitScalarBlockWithShapeTransitions(
     blockOutbound: blockOutbound, outbound: &outbound, ctx: ctx)
   outbound.formUnion(detectInlineableMulReduceNodes(block: block, g: g, ctx: ctx))
   detectInlineableExpandAxisReduceNodes(block: block, g: g, ctx: ctx)
+  outbound.formUnion(findInBlockViewReadCells(block: block, g: g))
   outbound.formUnion(ctx.fusedSumOperandCells)
   ctx.outboundTensorCells = outbound
   ctx.clearTensorRegisters()
