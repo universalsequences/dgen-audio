@@ -214,7 +214,7 @@ extension LazyGraph {
     var lossValues: [Float] = []
     try autoreleasepool {
       let context = try compile(frameCount: frameCount)
-      run(context: context, preserveState: false)
+      try run(context: context, preserveState: false)
 
       let (tensorGrads, signalGrads) = readGradients(context: context)
 

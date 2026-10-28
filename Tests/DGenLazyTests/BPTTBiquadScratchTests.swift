@@ -554,7 +554,7 @@ final class BPTTBiquadScratchTests: XCTestCase {
         graph.graph.gradientSideEffects = []
       }
       let context = try graph.compile(frameCount: frameCount)
-      graph.run(context: context, preserveState: false)
+      try graph.run(context: context, preserveState: false)
 
       let registry = graph.parameterRegistry
       let mappings = context.compilationResult.cellAllocations.cellMappings

@@ -294,10 +294,22 @@ public class MetalCompiledKernel: CompiledKernelRuntime {
     }
   }
 
+  /// Why the last `run` did not execute every kernel (a command buffer that failed on the
+  /// GPU -- e.g. a timeout or an out-of-memory fault -- or an encoder that could not be
+  /// made), or nil. Metal reports these only through the command buffer, so without this
+  /// check a failed run leaves zeroed buffers that read back as valid results.
+  public private(set) var lastRunError: String?
+
   public func run(
     outputs: UnsafeMutablePointer<Float>, inputs: UnsafePointer<Float>, frameCount: Int,
     volumeScale: Float = 1.0
   ) {
+    lastRunError = nil
+    func checkCompleted(_ cb: MTLCommandBuffer) {
+      if cb.status == .error, lastRunError == nil {
+        lastRunError = "Metal command buffer failed: \(cb.error?.localizedDescription ?? "unknown error")"
+      }
+    }
     precondition(
       frameCount <= maxFrameCount,
       "frameCount (\(frameCount)) exceeds maxFrameCount (\(maxFrameCount))"
@@ -308,7 +320,10 @@ public class MetalCompiledKernel: CompiledKernelRuntime {
       frameCountPtr[0] = UInt32(frameCount)
     }
 
-    guard var commandBuffer = commandQueue.makeCommandBuffer() else { return }
+    guard var commandBuffer = commandQueue.makeCommandBuffer() else {
+      lastRunError = "Metal could not make a command buffer"
+      return
+    }
 
     // Execute kernels in sequence
     // In non-debug mode, reuse a single encoder to reduce CPU overhead
@@ -322,7 +337,10 @@ public class MetalCompiledKernel: CompiledKernelRuntime {
       if let enc = sharedEncoder {
         computeEncoder = enc
       } else {
-        guard let enc = commandBuffer.makeComputeCommandEncoder() else { continue }
+        guard let enc = commandBuffer.makeComputeCommandEncoder() else {
+          lastRunError = lastRunError ?? "Metal could not make a compute encoder for \(kernel.name)"
+          continue
+        }
         computeEncoder = enc
       }
 
@@ -336,6 +354,7 @@ public class MetalCompiledKernel: CompiledKernelRuntime {
         // Execute this kernel now so shared-memory buffers are visible for debug
         commandBuffer.commit()
         commandBuffer.waitUntilCompleted()
+        checkCompleted(commandBuffer)
         if let cb = commandQueue.makeCommandBuffer() { commandBuffer = cb }
       }
     }
@@ -348,6 +367,7 @@ public class MetalCompiledKernel: CompiledKernelRuntime {
     if !debugGradients {
       commandBuffer.commit()
       commandBuffer.waitUntilCompleted()
+      checkCompleted(commandBuffer)
     }
     firstDebug = false
 
