@@ -186,7 +186,8 @@ struct DatasetRows {
         guard let v = row[s.name], v.count == s.width else {
           throw TrainProtocolError("rows \(n).\(s.name): expected \(s.width) values")
         }
-        for k in 0..<s.width { u[r * L.width + s.offset + k] = s.toU(v[k]) }
+        // 1% inside the squash box: an analysis value at a box edge keeps a usable gradient
+        for k in 0..<s.width { u[r * L.width + s.offset + k] = s.toU(v[k], margin: 0.01) }
       }
     }
     return u

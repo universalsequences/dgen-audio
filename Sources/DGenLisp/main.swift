@@ -51,6 +51,10 @@ if CommandLine.arguments.count > 1 && CommandLine.arguments[1] == "metric-score"
 if CommandLine.arguments.count > 1 && CommandLine.arguments[1] == "analyze-kicks" {
     AnalyzeKicksCommand.run(arguments: Array(CommandLine.arguments.dropFirst(2)))
 }
+// Slot correspondence: analysis -> voice rows (KickRowsCommand.swift).
+if CommandLine.arguments.count > 1 && CommandLine.arguments[1] == "kick-rows" {
+    KickRowsCommand.run(arguments: Array(CommandLine.arguments.dropFirst(2)))
+}
 // Hidden render helper spawned by the trainer (realize() must not share a
 // process with backward()).
 if CommandLine.arguments.count > 1 && CommandLine.arguments[1] == "train-render" {
