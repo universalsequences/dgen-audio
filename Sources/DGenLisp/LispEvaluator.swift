@@ -216,6 +216,15 @@ class LispEvaluator {
   var tensors: [TensorInfo] = []
   var macroExpansionCounter: Int = 0
 
+  // MARK: Dataset training (DatasetForms.swift)
+
+  /// Attached by `train-dataset`; nil in compiles, where every dataset form is identity-like.
+  var dataset: DatasetContext?
+  var rowLayouts: [String: RowLayout] = [:]
+  var learnableTensors: [LearnableTensorInfo] = []
+  var latentTables: [LatentTableInfo] = []
+  var paramRows: [ParamRowInfo] = []
+
   // MARK: Binding shapes (for hosts that draw the patch)
   //
   // A patch editor emits one top-level `def` per node, so the shape of each
@@ -279,6 +288,10 @@ class LispEvaluator {
       extSlots.removeAll()
       tensors.removeAll()
       macroExpansionCounter = 0
+      rowLayouts.removeAll()
+      learnableTensors.removeAll()
+      latentTables.removeAll()
+      paramRows.removeAll()
     }
     bindingShapes.removeAll()
     failedForm = nil
@@ -899,10 +912,13 @@ class LispEvaluator {
     case "accum":
       return try evalAccum(regularArgs)
     case "latch":
+      if let lowered = try oneShotLatch(op, regularArgs) { return lowered }
       return try evalLatch(regularArgs)
     case "event-hold":
+      if let lowered = try oneShotLatch(op, regularArgs) { return lowered }
       return try evalEventHold(regularArgs)
     case "event-latch":
+      if let lowered = try oneShotLatch(op, regularArgs) { return lowered }
       return try evalEventLatch(regularArgs)
     case "hop-hold", "hophold":
       return try evalHopHold(regularArgs)
@@ -933,7 +949,24 @@ class LispEvaluator {
 
     // Tensor creation
     case "tensor":
+      if parseBoolAttr(attributePairs, "@learnable") {
+        return try evalLearnableTensor(regularArgs, attributes: attributePairs)
+      }
       return try evalTensor(regularArgs, attributes: attributePairs)
+
+    // Dataset training (DatasetForms.swift)
+    case "latent-table":
+      return try evalLatentTable(regularArgs, attributes: attributePairs)
+    case "row-layout":
+      return try evalRowLayout(regularArgs)
+    case "seg":
+      return try evalSeg(regularArgs)
+    case "param-row":
+      return try evalParamRow(regularArgs, attributes: attributePairs)
+    case "row-out":
+      return try evalRowOut(regularArgs)
+    case "hit-time":
+      return try evalHitTime(regularArgs, attributes: attributePairs)
     // DEPRECATED hidden alias of `tensor` (undocumented; kept for old sources only).
     case "wavetable":
       return try evalWavetable(regularArgs, attributes: attributePairs, mutable: false)
@@ -1196,7 +1229,7 @@ class LispEvaluator {
   }
 
   /// Shape of a tensor-domain value, or nil for scalars/other kinds.
-  private func tensorShape(of value: EvalResult) -> [Int]? {
+  func tensorShape(of value: EvalResult) -> [Int]? {
     switch value {
     case .tensor(let t): return t.shape
     case .signalTensor(let st): return st.shape
@@ -2599,7 +2632,7 @@ class LispEvaluator {
     return .tensor(Tensor.param(shape))
   }
 
-  private func evalWavetable(
+  func evalWavetable(
     _ args: [ASTNode], attributes: [(name: String, value: String)], mutable: Bool
   ) throws -> EvalResult {
     let shape = try parseShapeFromArgsOrAttributes(
@@ -3525,7 +3558,7 @@ class LispEvaluator {
   // MARK: - Type helpers
 
   /// Promote float to signal/tensor-ready value, keeping typed results as-is
-  private func promoteToValue(_ result: EvalResult) -> EvalResult {
+  func promoteToValue(_ result: EvalResult) -> EvalResult {
     return result
   }
 
@@ -3539,7 +3572,7 @@ class LispEvaluator {
     }
   }
 
-  private func requireSignal(_ result: EvalResult) throws -> Signal {
+  func requireSignal(_ result: EvalResult) throws -> Signal {
     switch result {
     case .signal(let s): return s
     case .float(let f): return Signal.constant(f)
@@ -3554,7 +3587,7 @@ class LispEvaluator {
     }
   }
 
-  private func requireFloat(_ result: EvalResult) throws -> Float {
+  func requireFloat(_ result: EvalResult) throws -> Float {
     switch result {
     case .float(let f): return f
     case .signal(let s):
@@ -3583,7 +3616,7 @@ class LispEvaluator {
 
   // MARK: - Attribute helpers
 
-  private func attrValue(_ attrs: [(name: String, value: String)], _ key: String) -> String? {
+  func attrValue(_ attrs: [(name: String, value: String)], _ key: String) -> String? {
     attrs.first(where: { $0.name == key })?.value
   }
 
@@ -3598,12 +3631,12 @@ class LispEvaluator {
     return value
   }
 
-  private func parseBoolAttr(_ attrs: [(name: String, value: String)], _ key: String) -> Bool {
+  func parseBoolAttr(_ attrs: [(name: String, value: String)], _ key: String) -> Bool {
     guard let value = attrValue(attrs, key)?.lowercased() else { return false }
     return value == "true" || value == "1"
   }
 
-  private func parseBoolString(_ value: String, defaultValue: Bool) -> Bool {
+  func parseBoolString(_ value: String, defaultValue: Bool) -> Bool {
     switch value.lowercased() {
     case "true", "1", "yes", "on": return true
     case "false", "0", "no", "off": return false
@@ -3611,7 +3644,7 @@ class LispEvaluator {
     }
   }
 
-  private func unquote(_ value: String) -> String {
+  func unquote(_ value: String) -> String {
     if value.count >= 2, value.first == "\"", value.last == "\"" {
       return String(value.dropFirst().dropLast())
     }
@@ -3635,7 +3668,7 @@ class LispEvaluator {
       .compactMap { Int($0.trimmingCharacters(in: .whitespaces)) }
   }
 
-  private func parseFloatList(_ str: String) -> [Float] {
+  func parseFloatList(_ str: String) -> [Float] {
     let cleaned = str.trimmingCharacters(in: CharacterSet(charactersIn: "[]"))
     return
       cleaned
@@ -3650,7 +3683,7 @@ class LispEvaluator {
     return try args.map { Int(try requireFloat(evaluateAST($0))) }
   }
 
-  private func parseShapeFromArgsOrAttributes(
+  func parseShapeFromArgsOrAttributes(
     _ args: [ASTNode],
     attributes: [(name: String, value: String)],
     op: String
@@ -3670,7 +3703,7 @@ class LispEvaluator {
     return shape
   }
 
-  private func makeTensor(shape: [Int], data: [Float], mutable: Bool) -> Tensor {
+  func makeTensor(shape: [Int], data: [Float], mutable: Bool) -> Tensor {
     if mutable {
       return Tensor.param(shape, data: data)
     }
@@ -3688,7 +3721,7 @@ class LispEvaluator {
     return Tensor.param(shape, data: data)
   }
 
-  private func loadTensorData(file: String, expectedShape: [Int]) throws -> [Float] {
+  func loadTensorData(file: String, expectedShape: [Int]) throws -> [Float] {
     let url = URL(fileURLWithPath: file, relativeTo: sourceDirectory).standardizedFileURL
     let rawData: Data
     do {

@@ -28,6 +28,10 @@ if CommandLine.arguments.count > 1 && CommandLine.arguments[1] == "train" {
         realTrainer: RealTrainer.run
     )
 }
+// Dataset training of row-batched patches (TrainDataset.swift); never returns.
+if CommandLine.arguments.count > 1 && CommandLine.arguments[1] == "train-dataset" {
+    TrainDatasetCommand.run(arguments: Array(CommandLine.arguments.dropFirst(2)))
+}
 // Hidden render helper spawned by the trainer (realize() must not share a
 // process with backward()).
 if CommandLine.arguments.count > 1 && CommandLine.arguments[1] == "train-render" {
