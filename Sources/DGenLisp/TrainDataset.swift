@@ -35,6 +35,10 @@ struct TrainDatasetOptions {
   var frames = 32768
   var anchor: Float = 0
   var codeL2: Float = 1e-3
+  /// Path regulariser weight (pretrain): in-between latents decode near the straight line
+  /// between the two ends' decoded rows (u space).
+  var path: Float = 0
+  var pathPairs = 64
   var windows = [64, 128, 256, 512, 1024, 2048, 4096]
   /// metric: the acceptance metrics on CPU (MetricLoss), gradient injected as Σ y·g;
   /// dgen: in-graph batched MR-STFT (windows ≤ 2048 on Metal).
@@ -79,6 +83,8 @@ struct TrainDatasetOptions {
       case "--frames": o.frames = Int(try value()) ?? o.frames
       case "--anchor": o.anchor = Float(try value()) ?? o.anchor
       case "--code-l2": o.codeL2 = Float(try value()) ?? o.codeL2
+      case "--path": o.path = Float(try value()) ?? o.path
+      case "--path-pairs": o.pathPairs = Int(try value()) ?? o.pathPairs
       case "--windows": o.windows = try value().split(separator: ",").compactMap { Int($0) }
       case "--loss": o.loss = try value()
       case "--band-weight": o.bandWeight = Double(try value()) ?? o.bandWeight
@@ -474,17 +480,22 @@ final class DatasetTrainer {
 
   /// Evaluates the training patch with a dataset context; returns the evaluator.
   @discardableResult
-  func evaluate(mode: DatasetContext.RowMode, latch: DatasetContext.LatchMode = .identity) throws
+  func evaluate(mode: DatasetContext.RowMode, latch: DatasetContext.LatchMode = .identity,
+                pathSelect: Tensor? = nil) throws
     -> (LispEvaluator, DatasetContext)
   {
+    // pathSelect [M, N]: M extra rows decoded at S @ codes (the code rows come first)
+    let M = pathSelect?.shape[0] ?? 0
     let ctx = DatasetContext(
-      rows: N, frames: o.frames, sampleRate: sampleRate, rowMode: mode,
+      rows: N + M, frames: o.frames, sampleRate: sampleRate, rowMode: mode,
       learnable: { [self] name, shape, fileData, initKind in
         let info = LearnableTensorInfo(name: name, shape: shape, file: nil, initKind: initKind)
         return store.leaf("w:" + name, shape) { initData(info, fileData: fileData) }
       },
       latentRows: { [self] name, dim in
-        store.leaf("z:" + name, [N, dim]) { initCodes(dim) }
+        let z = store.leaf("z:" + name, [N, dim]) { initCodes(dim) }
+        guard let S = pathSelect else { return z }
+        return z.pad([(0, M), (0, 0)]) + S.matmul(z).pad([(N, 0), (0, 0)])
       })
     ctx.latchMode = latch
     let ev = LispEvaluator(sourceDirectory: patchDir)
@@ -625,6 +636,7 @@ final class DatasetTrainer {
     // in a different order on later steps, shifting memory offsets and missing the kernel cache.
     _ = targetTable
     _ = gTable
+    if o.path > 0 { _ = pathSelect.tensor }
     log("[train-dataset] \(N) targets @ \(Int(sampleRate)) Hz, \(o.frames) frames; layouts \(layouts.keys.sorted()); learnable \(learnables.map { "\($0.name)\($0.shape)" }); tables \(tables.map { "\($0.name)[\($0.dim)]" }); rows \(paramRows.map(\.name))")
     LazyGraphContext.current.clearComputationGraph()
   }
@@ -713,9 +725,19 @@ final class DatasetTrainer {
     let staticFrames = 64
     try loop({ step in
       LazyGraphContext.current.clearComputationGraph()
-      let (_, ctx) = try evaluate(mode: .capture)
-      guard let u = ctx.captured[pr.name] else { throw TrainProtocolError("param-row was not reached") }
+      var S: Tensor? = nil
+      if o.path > 0 { S = pathSelect.updated(self) }
+      let (_, ctx) = try evaluate(mode: .capture, pathSelect: S)
+      guard let uAll = ctx.captured[pr.name] else { throw TrainProtocolError("param-row was not reached") }
+      let P = uAll.shape[1]
+      let u = S == nil ? uAll : uAll.shrink([(0, N), (0, P)])
       var reg = anchorLoss(u, row: pr.name)!
+      if let S {
+        let M = S.shape[0]
+        let mid = uAll.shrink([(N, N + M), (0, P)])
+        let d = mid - S.matmul(u)
+        reg = reg + (d * d).sum() * (o.path / Float(M * P))
+      }
       for t in tables where o.codeL2 > 0 {
         let z = store.leaves["z:" + t.name]!
         reg = reg + (z * z).sum() * (o.codeL2 / Float(N * t.dim))
@@ -734,6 +756,31 @@ final class DatasetTrainer {
     }, trainable: { store.order.filter { !$0.hasPrefix("row:") } })
     try export()
     return try finish()
+  }
+
+  /// Persistent [M, N] selector of random in-between latents: row m = (1-t) e_a + t e_b.
+  lazy var pathSelect = PathSelect(M: o.pathPairs, N: N)
+
+  final class PathSelect {
+    let M: Int, N: Int
+    let tensor: Tensor
+    init(M: Int, N: Int) {
+      self.M = M; self.N = N
+      tensor = Tensor([Float](repeating: 0, count: M * N)).reshape([M, N])
+    }
+    func updated(_ t: DatasetTrainer) -> Tensor {
+      var s = [Float](repeating: 0, count: M * N)
+      for m in 0..<M {
+        let a = Int(t.rng.uniform() * Float(N)) % N
+        var b = Int(t.rng.uniform() * Float(N)) % N
+        if b == a { b = (a + 1) % N }
+        let w = 0.2 + 0.6 * t.rng.uniform()
+        s[m * N + a] += 1 - w
+        s[m * N + b] += w
+      }
+      tensor.updateDataLazily(s)
+      return tensor
+    }
   }
 
   // MARK: latch-boundary step
