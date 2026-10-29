@@ -291,9 +291,17 @@ public enum KickAnalyzer {
             modes = jointAmplitudes(modes, x: x, count: nFit, sr: sr, weights: lsW)
             let ym0 = KickVoice.renderModes(modes.map { $0.params }, count: x.count, sampleRate: sr)
             let r1 = zip(x, ym0).map { $0 - $1 }
-            var sopt = StrikeFit.Options()
-            sopt.count = o.strikeCount
-            let st = StrikeFit.fit(residual: r1, sr: sr, onset: onset, options: sopt)
+            // half the strikes below 1 kHz (chirp / body transients), half above (the attack click):
+            // energy alone would spend every strike on the loud low end
+            var st: [ModeEstimate] = []
+            for (k, band) in StrikeFit.regions.enumerated() {
+                var sopt = StrikeFit.Options()
+                sopt.count = k == 0 ? (o.strikeCount + 1) / 2 : o.strikeCount / 2
+                sopt.fRange = band
+                sopt.highpassHz = band[0]
+                if k > 0 { sopt.minGain = 0.05 }
+                st += StrikeFit.fit(residual: r1, sr: sr, onset: onset, options: sopt)
+            }
             if !st.isEmpty {
                 let all = jointAmplitudes(modes + st, x: x, count: nFit, sr: sr, weights: lsW)
                 modes = Array(all[0..<modes.count])

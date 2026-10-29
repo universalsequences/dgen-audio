@@ -28,6 +28,8 @@ public enum StrikeFit {
     }
 
     public static let rise = 0.0001
+    /// strike regions (analysis and slot roles): slots 0-1 low, 2-3 high
+    public static let regions: [[Double]] = [[100, 1000], [1000, 16000]]
 
     static func strike(F: Double, G: Double, T: Double, D: Double) -> ModeEstimate {
         ModeEstimate(F: F, G: G, T: T, A: 0, D: D, R: rise, phi: 0, G2: 0, T2: 0, region: "strike", energy: 0,
@@ -41,7 +43,7 @@ public enum StrikeFit {
         -> [ModeEstimate]
     {
         let n = r.count
-        let hi = min(o.fRange[1] * 1.1, 0.47 * sr)
+        let hi = min(o.fRange[1] * 1.05, 0.47 * sr)
         let y = FFT.spectralFilter(r, sampleRate: sr, analytic: false,
                                    gain: FFT.bandGain(lo: o.highpassHz, hi: hi, taper: 0.1)).re
         let a = Int(onset * sr)
@@ -55,6 +57,7 @@ public enum StrikeFit {
         mpo.maxPencil = 100
         mpo.dynamicRangeDB = 50
         let mp = MatrixPencil.estimate(Array(y[a..<b]), sampleRate: sr, options: mpo).modes
+        // a candidate's decay may be far below a strike's floor; its frequency must be in the region
         var cands = mp.filter {
             $0.frequency >= o.fRange[0] && $0.frequency <= o.fRange[1] && $0.decay >= o.dRange[0] * 0.5
         }.map { m in
@@ -82,8 +85,8 @@ public enum StrikeFit {
         var x0 = [Double](), lo = [Double](), up = [Double]()
         for c in chosen {
             x0 += [log(c.F), 0.02, log(c.T), log(c.D)]
-            lo += [log(max(o.fRange[0], c.F * 0.8)), 0, log(o.tRange[0]), log(o.dRange[0])]
-            up += [log(min(o.fRange[1], c.F * 1.25)), o.gMax, log(o.tRange[1]), log(o.dRange[1])]
+            lo += [log(max(o.fRange[0], min(c.F, c.F * 0.8))), 0, log(o.tRange[0]), log(o.dRange[0])]
+            up += [log(min(o.fRange[1], max(c.F, c.F * 1.25))), o.gMax, log(o.tRange[1]), log(o.dRange[1])]
         }
         func modes(_ q: [Double]) -> [ModeEstimate] {
             (0..<chosen.count).map { j in
