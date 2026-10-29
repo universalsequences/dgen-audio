@@ -53,6 +53,8 @@ struct TrainDatasetOptions {
   var freeze: Set<String> = []
   var pitchHz: Double = 261.6255653
   var noRender = false
+  /// `--stage render`: z rows to decode and render, {"names": [...], "z": [[...], ...]}.
+  var zRows: String?
 
   static func parse(_ args: [String]) throws -> TrainDatasetOptions {
     var o = TrainDatasetOptions()
@@ -91,15 +93,22 @@ struct TrainDatasetOptions {
       case "--freeze": o.freeze = Set(try value().split(separator: ",").map(String.init))
       case "--pitch-hz": o.pitchHz = Double(try value()) ?? o.pitchHz
       case "--no-render": o.noRender = true
+      case "--z-rows": o.zRows = try value()
       default: throw TrainProtocolError("unknown train-dataset option \(a)")
       }
       i += 1
     }
-    guard !o.patch.isEmpty, !o.dataset.isEmpty, !o.jobDir.isEmpty else {
-      throw TrainProtocolError("train-dataset requires --patch, --dataset and --job-dir")
+    guard ["refine", "pretrain", "audio", "render"].contains(o.stage) else {
+      throw TrainProtocolError("--stage must be refine, pretrain, audio or render")
     }
-    guard ["refine", "pretrain", "audio"].contains(o.stage) else {
-      throw TrainProtocolError("--stage must be refine, pretrain or audio")
+    if o.stage == "render" {
+      guard !o.patch.isEmpty, !o.jobDir.isEmpty, o.zRows != nil, o.initFrom != nil else {
+        throw TrainProtocolError("--stage render requires --patch, --job-dir, --z-rows and --init-from")
+      }
+    } else {
+      guard !o.patch.isEmpty, !o.dataset.isEmpty, !o.jobDir.isEmpty else {
+        throw TrainProtocolError("train-dataset requires --patch, --dataset and --job-dir")
+      }
     }
     return o
   }
@@ -333,6 +342,7 @@ final class DatasetTrainer {
   let store = LeafStore()
   var adam = AdamMoments()
   var startStep = 0
+  var zPreset: [Float]? = nil
   var rng: SplitMix64
 
   // discovered on the plan evaluation
@@ -352,10 +362,19 @@ final class DatasetTrainer {
       try FileManager.default.createDirectory(
         at: run.appendingPathComponent(sub), withIntermediateDirectories: true)
     }
-    let (t, sr) = try DatasetTargets.load(dir: o.dataset, frames: o.frames)
-    names = t.map(\.name)
-    targets = t.map(\.samples)
-    sampleRate = sr
+    if let zPath = o.zRows {
+      let j = try JSONSerialization.jsonObject(with: Data(contentsOf: URL(fileURLWithPath: zPath))) as! [String: Any]
+      let z = (j["z"] as? [[NSNumber]] ?? []).map { $0.map(\.floatValue) }
+      names = j["names"] as? [String] ?? z.indices.map { String(format: "z%03d", $0) }
+      zPreset = z.flatMap { $0 }
+      targets = names.map { _ in [Float](repeating: 0, count: o.frames) }
+      sampleRate = (j["sample_rate"] as? NSNumber)?.floatValue ?? 44100
+    } else {
+      let (t, sr) = try DatasetTargets.load(dir: o.dataset, frames: o.frames)
+      names = t.map(\.name)
+      targets = t.map(\.samples)
+      sampleRate = sr
+    }
     let patchURL = URL(fileURLWithPath: o.patch)
     patchDir = patchURL.deletingLastPathComponent()
     let source = try String(contentsOf: patchURL, encoding: .utf8)
@@ -367,7 +386,7 @@ final class DatasetTrainer {
       throw TrainProtocolError("inlets outside the excitation convention: \(driven.undriven.joined(separator: ", "))")
     }
     nodes = driven.nodes
-    for (n, x) in zip(names, targets) {
+    for (n, x) in zip(names, targets) where o.stage != "render" {
       try MiniWav.write(url: run.appendingPathComponent("targets/\(n).wav"), samples: x,
                         sampleRate: Int(sampleRate))
     }
@@ -560,6 +579,11 @@ final class DatasetTrainer {
       let ck = url.pathExtension == "json" ? url : DatasetCheckpoint.latest(in: url)
       guard let ck else { throw TrainProtocolError("--init-from \(initFrom): no checkpoint") }
       store.preset = try DatasetCheckpoint.load(ck).leaves
+      if let zPreset {
+        // render: the code table is the requested z rows, whatever the run trained
+        for key in store.preset.keys where key.hasPrefix("z:") { store.preset[key] = nil }
+        store.preset["z:codes"] = zPreset
+      }
       log("[train-dataset] init from \(ck.path) (\(store.preset.count) leaves)")
     }
     if o.resume, let ck = DatasetCheckpoint.latest(in: run) {
@@ -619,6 +643,7 @@ final class DatasetTrainer {
   func train() throws -> [String: Any] {
     try plan()
     switch o.stage {
+    case "render": return try finish()
     case "refine": return try refine()
     case "pretrain": return try pretrain()
     default: return try audio()
@@ -897,7 +922,7 @@ final class DatasetTrainer {
     var sc = [(Double, Double)](repeating: (0, 0), count: N)
     DispatchQueue.concurrentPerform(iterations: N) { r in
       let y = renders[r]
-      sc[r] = y.allSatisfy(\.isFinite)
+      sc[r] = o.stage == "render" ? (0, 0) : y.allSatisfy(\.isFinite)
         ? MetricLoss.scores(y, targets[r], windows: [64, 128, 256, 512, 1024, 2048, 4096])
         : (.infinity, .infinity)
     }
