@@ -35,6 +35,15 @@ public struct KickAnalysisOptions: Codable {
     public var stabilityRelD = 0.8
     public var modeDropRatio = 2.0
     public var defaultRise = 0.0007
+    /// re-admit modes the stabilisation removed (gliding modes move between segment variants) and
+    /// harmonics 2..4 of slot 0 on its drop law, when they explain much more of the signal than the
+    /// same candidate detuned (a significance test, not an energy floor)
+    public var rescueModes = true
+    public var rescueSignificance = 3.0
+    /// v3 voice: strike sines, crackle, noise events (RecordLayer.swift, StrikeFit.swift)
+    public var v3 = false
+    public var strikeCount = 4
+    public var maxEvents = 2
     public var sharedNoiseWhite = true    // SPEC §3.1: one white for all bands
     public var noiseSections = 1          // 1 = 2nd-order bands (SPEC §3.1), 2 = 4th order
     public var checkLength = 32768
@@ -56,6 +65,10 @@ public struct ModeEstimate: Codable {
     public var energy: Double       // ∫ env² sin² ≈ A² D / 4 (prepared units)
     public var dropTestRatio: Double?
     public var amplitudeCapped: Bool
+    /// h when the mode is the h-th harmonic of slot 0 on its drop law (rescue step)
+    public var harmonic: Int? = nil
+    /// true when a stabilisation-rejected matrix-pencil mode was re-admitted
+    public var rescued: Bool? = nil
 
     var params: ModeParams {
         ModeParams(F: F, G: G, T: T, A: A, D: D, R: R, phi: phi, G2: G2, T2: T2)
@@ -71,6 +84,9 @@ public struct KickCheck: Codable {
     public var tailRelRMSModal: Double
     public var noiseShare: Double
     public var tailStartSeconds: Double
+    /// v3: the same check rendered without crackle (its random clicks never line up with the target's)
+    public var bandNoCrackle: Double? = nil
+    public var mrNoCrackle: Double? = nil
 }
 
 public struct PrepInfo: Codable {
@@ -97,11 +113,17 @@ public struct KickAnalysis: Codable {
     public var chain: ChainParams
     public var check: KickCheck?
     public var warnings: [String]
+    /// v3: strike sines (modes with R = 0.1 ms and their own glide), crackle
+    public var strikes: [ModeEstimate]? = nil
+    public var crackle: CrackleParams? = nil
 
     public var voiceParams: KickVoiceParams {
-        KickVoiceParams(modes: modes.map { $0.params }, noiseBands: noise.bands, rn: noise.rn,
-                        gate: GateParams(E: gate.E, Fd: gate.Fd), chain: chain, sharedWhite: noise.sharedWhite,
-                        noiseSections: noise.sections)
+        var p = KickVoiceParams(modes: (modes + (strikes ?? [])).map { $0.params }, noiseBands: noise.bands,
+                                rn: noise.rn, gate: GateParams(E: gate.E, Fd: gate.Fd), chain: chain,
+                                sharedWhite: noise.sharedWhite, noiseSections: noise.sections)
+        p.events = noise.events ?? []
+        p.crackle = crackle
+        return p
     }
 }
 
@@ -191,8 +213,15 @@ public enum KickAnalyzer {
 
         // candidate modes: matrix pencil on the slot-0 residual, per region
         var cands: [ModeEstimate] = []
+        var rawLow: [ModeEstimate] = []
         if let seg = regionSegment(r0, sr: sr, band: o.lowRegion, decim: o.lowDecimation, from: t1,
                                    to: min(tEnd, t1 + o.lowSegmentSeconds)) {
+            if o.rescueModes && o.stabilize {
+                rawLow = MatrixPencil.estimate(seg.x, sampleRate: seg.fs).modes.filter {
+                    $0.frequency >= o.lowRegion[0] && $0.frequency <= o.lowRegion[1] && $0.decay >= o.minDecayLow
+                        && $0.decay <= 5 && abs($0.frequency / slot0.F - 1) >= o.fundamentalExclusion
+                }.map { candidate($0, t0: seg.t0, region: "low", rise: o.defaultRise) }
+            }
             var lows = modesOf(seg, o).filter {
                 $0.frequency >= o.lowRegion[0] * 0.9 && $0.frequency <= o.lowRegion[1] * 1.1 && $0.decay >= o.minDecayLow
             }
@@ -247,13 +276,48 @@ public enum KickAnalyzer {
                              drop: drop, ratio: o.modeDropRatio, weights: lsW)
         }
 
+        if o.rescueModes {
+            modes = rescue(modes, raw: rawLow, x: x, count: nFit, sr: sr, options: o, weights: lsW)
+        }
+
+        // v3: strike sines on the early residual (modes with D at the floor are attack transients:
+        // the strikes take them over), then a joint LS of every sinusoid
+        var strikes: [ModeEstimate]? = nil
+        if o.v3 {
+            let floorLow = o.minDecayLow * 1.05, floorMid = o.minDecayMid * 1.05
+            modes = [modes[0]] + modes.dropFirst().filter {
+                !(($0.region == "low" && $0.D <= floorLow) || ($0.region == "mid" && $0.D <= floorMid))
+            }
+            modes = jointAmplitudes(modes, x: x, count: nFit, sr: sr, weights: lsW)
+            let ym0 = KickVoice.renderModes(modes.map { $0.params }, count: x.count, sampleRate: sr)
+            let r1 = zip(x, ym0).map { $0 - $1 }
+            var sopt = StrikeFit.Options()
+            sopt.count = o.strikeCount
+            let st = StrikeFit.fit(residual: r1, sr: sr, onset: onset, options: sopt)
+            if !st.isEmpty {
+                let all = jointAmplitudes(modes + st, x: x, count: nFit, sr: sr, weights: lsW)
+                modes = Array(all[0..<modes.count])
+                strikes = Array(all[modes.count...])
+            } else {
+                strikes = []
+            }
+        }
+
         // noise from the residual of the full modal part
-        let ym = KickVoice.renderModes(modes.map { $0.params }, count: x.count, sampleRate: sr)
+        let ym = KickVoice.renderModes((modes + (strikes ?? [])).map { $0.params }, count: x.count, sampleRate: sr)
         let resid = zip(x, ym).map { $0 - $1 }
         let edges = NoiseBands.edges(count: o.noiseBandCount, lo: o.noiseLoHz, hi: min(o.noiseHiHz, 0.45 * sr))
         var nopt = NoiseFit.Options()
         nopt.sharedWhite = o.sharedNoiseWhite
         nopt.sections = o.noiseSections
+        var crackle: CrackleParams? = nil
+        if o.v3 {
+            // crackle first: its impulses are gated out of the hiss/event measurement
+            let cr = Crackle.fit(residual: resid, sr: sr, onset: onset, end: gate.E - gate.Fd)
+            crackle = cr.params
+            nopt.sampleMask = cr.mask
+            nopt.maxEvents = o.maxEvents
+        }
         let noise = NoiseFit.fit(residual: resid, sr: sr, onset: onset, end: gate.E, edges: edges, options: nopt)
 
         var a = KickAnalysis(name: name, sampleRate: sr,
@@ -263,6 +327,8 @@ public enum KickAnalyzer {
                                             channels: prep.channels, rawFrames: prep.rawFrames),
                              drop: drop, dropTail: dropTail, modes: modes, noise: noise, gate: gate,
                              chain: ChainParams(), check: nil, warnings: warnings)
+        a.strikes = strikes
+        a.crackle = crackle
         a.check = check(a, target: x, residual: resid, modal: ym, options: o)
         return (a, prep)
     }
@@ -642,6 +708,134 @@ public enum KickAnalyzer {
         return changed ? jointAmplitudes(out, x: x, count: fullCount, sr: sr, weights: weights) : out
     }
 
+    /// Energy of a fitted mode over [0, n) (weighted like the LS).
+    static func modeEnergy(_ m: ModeEstimate, count n: Int, sr: Double, weights: [Double]?) -> Double {
+        var p = m.params
+        var e = 0.0
+        p.R = max(p.R, 0)
+        for i in 0..<n {
+            let t = Double(i) / sr
+            let y = p.envelope(t) * sin(p.phaseLaw(t) + p.phi) * (weights?[i] ?? 1)
+            e += y * y
+        }
+        return e
+    }
+
+    /// Re-admit modes the stabilisation removed and harmonics 2..4 of slot 0 (on its drop law).
+    /// A candidate is kept when adding it lowers the joint-LS SSE over [0, n) by at least
+    /// `rescueSignificance` times what the same candidate detuned by ±max(12%, 3/(πD)) achieves
+    /// (a narrowband test: noise and neighbouring modes help a detuned column about as much) and by
+    /// at least 1e-5 of the signal energy. For harmonics the decay is chosen on a small grid.
+    static func rescue(_ modes0: [ModeEstimate], raw: [ModeEstimate], x: [Double], count n: Int, sr: Double,
+                       options o: KickAnalysisOptions, weights lsW: [Double]?) -> [ModeEstimate]
+    {
+        // the test runs in relative terms (errors 30 dB down count up to ~30x): tail modes are
+        // quiet next to the loud early drop, which also sweeps through every low candidate
+        let weights = relativeWeights(x, sr: sr, count: n, floor: 0.03)
+        var modes = modes0
+        var base = 0.0
+        _ = jointAmplitudes(modes, x: x, count: n, sr: sr, weights: weights, sse: &base)
+        var ex = 0.0
+        for i in 0..<n { ex += x[i] * x[i] * (weights?[i] ?? 1) * (weights?[i] ?? 1) }
+        let s0 = modes[0]
+        var cands: [[ModeEstimate]] = []
+        for h in 2...4 {
+            let F = Double(h) * s0.F
+            if F > o.lowRegion[1] { break }
+            if modes.contains(where: { abs($0.F / F - 1) < 0.04 }) { continue }
+            cands.append([s0.D, 0.1].map { D in
+                var m = ModeEstimate(F: F, G: s0.G, T: s0.T, A: 0, D: D, R: s0.R, phi: 0, G2: 0, T2: 0,
+                                     region: "low", energy: 0, dropTestRatio: nil, amplitudeCapped: false)
+                m.harmonic = h
+                return m
+            })
+        }
+        for m in raw.sorted(by: { $0.energy > $1.energy }) {
+            if modes.contains(where: { abs($0.F / m.F - 1) < 0.04 }) { continue }
+            var r = m
+            r.rescued = true
+            var g = r
+            g.G = s0.G
+            g.T = s0.T
+            // near a harmonic candidate: one more alternative of that candidate
+            if let k = cands.firstIndex(where: { abs($0[0].F / m.F - 1) < 0.04 }) {
+                if cands[k].allSatisfy({ $0.rescued != true }) { cands[k] += [r, g] }
+                continue
+            }
+            cands.append([r, g])
+            if cands.count >= 8 { break }
+        }
+        // single-mode variable projection on the weighted residual of the current modes: refines D
+        // (and F within ±4% for matrix-pencil candidates; harmonics keep h·F0)
+        let wv = weights ?? [Double](repeating: 1, count: n)
+        func residualOf(_ ms: [ModeEstimate]) -> [Double] {
+            let fitted = jointAmplitudes(ms, x: x, count: n, sr: sr, weights: weights)
+            let y = KickVoice.renderModes(fitted.map { $0.params }, count: n, sampleRate: sr)
+            return (0..<n).map { (x[$0] - y[$0]) * wv[$0] }
+        }
+        func refineOne(_ m0: ModeEstimate, _ res: [Double]) -> (ModeEstimate, Double) {
+            let freeF = m0.harmonic == nil
+            func sse(_ m: ModeEstimate) -> Double {
+                let (c, s) = columns(m, count: n, sr: sr)
+                var cc = 0.0, ss = 0.0, cs = 0.0, rc = 0.0, rs = 0.0
+                for i in 0..<n {
+                    let a = c[i] * wv[i], b = s[i] * wv[i]
+                    cc += a * a; ss += b * b; cs += a * b; rc += res[i] * a; rs += res[i] * b
+                }
+                let det = cc * ss - cs * cs
+                guard det > 1e-300 else { return res.reduce(0) { $0 + $1 * $1 } }
+                let ca = (rc * ss - rs * cs) / det, cb = (rs * cc - rc * cs) / det
+                return -(ca * rc + cb * rs)  // SSE minus the constant Σ res²
+            }
+            var m = m0
+            let x0 = freeF ? [log(m0.F), log(m0.D)] : [log(m0.D)]
+            let lo = freeF ? [log(m0.F * 0.96), log(o.minDecayLow)] : [log(o.minDecayLow)]
+            let hi = freeF ? [log(m0.F * 1.04), log(5.0)] : [log(5.0)]
+            let f = LinAlg.levenbergMarquardt(x0: x0, lower: lo, upper: hi, maxIter: 25) { q in
+                var t = m0
+                if freeF { t.F = exp(q[0]) }
+                t.D = exp(q[q.count - 1])
+                return [max(0, sse(t) + 1e9).squareRoot()]
+            }
+            if freeF { m.F = exp(f.x[0]) }
+            m.D = exp(f.x[f.x.count - 1])
+            return (m, sse(m))
+        }
+        for alts in cands {
+            if modes.count >= o.maxModes { break }
+            let res = residualOf(modes)
+            var pick: (m: ModeEstimate, e: Double)? = nil
+            for c in alts {
+                let r = refineOne(c, res)
+                if pick == nil || r.1 < pick!.e { pick = r }
+            }
+            guard let pk = pick else { continue }
+            var e = 0.0
+            let trial = jointAmplitudes(modes + [pk.m], x: x, count: n, sr: sr, weights: weights, sse: &e)
+            let gain = base - e
+            // controls: the same candidate detuned by ±8..35%: the median is the local floor
+            var ctrls: [Double] = []
+            for d in [-0.35, -0.25, -0.15, -0.08, 0.08, 0.15, 0.25, 0.35] {
+                var c = pk.m
+                c.F = max(20, pk.m.F * (1 + d))
+                var ec = 0.0
+                _ = jointAmplitudes(modes + [c], x: x, count: n, sr: sr, weights: weights, sse: &ec)
+                ctrls.append(base - ec)
+            }
+            ctrls.sort()
+            let ctrl = 0.5 * (ctrls[3] + ctrls[4])
+            if ProcessInfo.processInfo.environment["DGEN_ANALYSIS_TRACE"] != nil {
+                fputs(String(format: "rescue F %.1f D %.1fms h %d: gain %.3g ctrl %.3g (ex %.3g)\n", pk.m.F, pk.m.D * 1000,
+                             pk.m.harmonic ?? 0, gain, ctrl, ex), stderr)
+            }
+            if gain > o.rescueSignificance * max(ctrl, 0) && gain > 1e-5 * ex {
+                modes.append(trial.last!)
+                base = e
+            }
+        }
+        return modes.count == modes0.count ? modes0 : jointAmplitudes(modes, x: x, count: n, sr: sr, weights: lsW)
+    }
+
     // MARK: check
 
     public static func pad(_ x: [Double], _ n: Int) -> [Double] {
@@ -671,11 +865,21 @@ public enum KickAnalyzer {
             er += residual[i] * residual[i]
             ex += x[i] * x[i]
         }
-        return KickCheck(band: KickMetrics.bandScore(envP: envP, envT: envT),
+        var noCr: (Double, Double)? = nil
+        if a.crackle?.present == true {
+            var p = a.voiceParams
+            p.crackle = nil
+            let P2 = pad(KickVoice.render(p, count: n, sampleRate: sr, seed: o.noiseSeed), L)
+            noCr = (KickMetrics.bandScore(envP: KickMetrics.bandEnvDB(P2), envT: envT), KickMetrics.mrScore(P2, T))
+        }
+        var c = KickCheck(band: KickMetrics.bandScore(envP: envP, envT: envT),
                          mr: KickMetrics.mrScore(P, T),
                          bandModal: KickMetrics.bandScore(envP: envM, envT: envT),
                          mrModal: KickMetrics.mrScore(Mo, T),
                          tailBandModal: fb > fa ? KickMetrics.bandScore(envP: envM, envT: envT, frames: fa..<fb) : .nan,
                          tailRelRMSModal: tailRel, noiseShare: er / max(ex, 1e-30), tailStartSeconds: tailStart)
+        c.bandNoCrackle = noCr?.0 ?? (a.crackle != nil ? c.band : nil)
+        c.mrNoCrackle = noCr?.1 ?? (a.crackle != nil ? c.mr : nil)
+        return c
     }
 }
