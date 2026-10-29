@@ -80,7 +80,10 @@ public class LazyGraph {
   /// baked constant changing every step) eventually aborts the process.
   internal var runtimeCacheByKernelHash: [UInt64: LazyRuntime] = [:]
   internal var runtimeCacheInsertionOrder: [UInt64] = []
-  internal static let runtimeCacheLimit = 8
+  /// Cached runtimes per graph (LRU by insertion). Each holds its Metal buffers, which can be
+  /// gigabytes for a long training render: a trainer whose kernel hash changes every step should
+  /// keep this small.
+  public static var runtimeCacheLimit = 8
 
   internal func cacheRuntime(_ runtime: LazyRuntime, forKernelHash hash: UInt64) {
     if runtimeCacheByKernelHash[hash] == nil {

@@ -414,6 +414,9 @@ final class DatasetTrainer {
     DGenGradientConfig.detachPhasorFrequency = false
     LazyGraphContext.preserveCompilationCaches = true
     LazyGraphContext.collectExecutionTiming = timing
+    // Three passes per step (static capture, voice, static backward); runtimes beyond that hold
+    // multi-GB buffers and got the process killed after ~150 steps on a 32 GB machine.
+    LazyGraph.runtimeCacheLimit = 3
   }
 
   let timing = ProcessInfo.processInfo.environment["DGENLISP_TRAIN_TIMING"] == "1"
