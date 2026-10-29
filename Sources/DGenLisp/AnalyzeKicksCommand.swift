@@ -19,6 +19,8 @@ enum AnalyzeKicksCommand {
           --max-modes K       modal slots incl. the fundamental (default 24)
           --no-second-drop    fit a single pitch-drop term
           --no-mode-drop      keep G = 0 for every non-fundamental mode
+          --relative-weight F relative-error weighting floor for slot 0 / joint LS (default 0 = plain LS)
+          --no-fundamental-tail  no second (slower-decay) mode on the fundamental's law
           --no-stabilize      keep every matrix-pencil mode (no stabilisation check)
           --stability F,D     stabilisation tolerances: relative frequency, relative decay
           --noise-order 2|4   band-pass order of each noise band (default 2, SPEC §3.1)
@@ -62,6 +64,9 @@ enum AnalyzeKicksCommand {
             case "--no-second-drop": opts.secondDrop = false
             case "--no-mode-drop": opts.modeDropTest = false
             case "--no-stabilize": opts.stabilize = false
+            case "--no-fundamental-tail": opts.fundamentalTail = false
+            case "--fundamental-tail-gain": opts.fundamentalTailGain = number(value())
+            case "--relative-weight": opts.relativeWeightFloor = number(value())
             case "--stability": // relF,relD
                 let v = value().split(separator: ",").map { number(String($0)) }
                 guard v.count == 2 else {
