@@ -6,9 +6,9 @@ import Foundation
 
 // ModalKickAD: the Latent Kick trainer-side renderer (K1). Commands:
 //   parity  --ids kick_00_v100,sweep_11_tune_0.5,... [--backend c|metal] [--frames N]
-//           renders each id's teacher row (kick/data/teacher.json, kick_KK_v100) with that
-//           id's velocity / pitch / knobs; writes <tap>.f32 per id to kick/data/swift_parity/
-//           (kick/scripts/swift_parity.py compares with kick_np trainer mode + VILLAIN stems)
+//           renders each id's teacher row ($MODAL_AD_ROOT/kick/data/teacher.json, kick_KK_v100) with that
+//           id's velocity / pitch / knobs; writes <tap>.f32 per id to $MODAL_AD_ROOT/kick/data/swift_parity/
+//           (scripts/swift_parity.py compares with kick_np trainer mode + VILLAIN stems)
 //   fdcheck [--backend c|metal] [--frames N] [--ids a,b] [--per-group N] [--eps E]
 //           MSE(out) + MSE(modal) + MSE(noise) at a perturbed teacher point, autograd wrt the
 //           decoder-output leaf u [B,P] vs central differences, per layout segment.

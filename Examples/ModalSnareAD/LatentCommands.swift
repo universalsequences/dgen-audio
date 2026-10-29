@@ -2,10 +2,10 @@ import DGenLazy
 import Foundation
 
 // E2 subcommands: latent-pretrain, latent-train, latent-fitz, latent-render.
-// Data prep (targets, weights, PCA z init) is e2/targets.py + e2/prep_pretrain.py;
-// evaluation with the band metric and floors is e2/eval_e2.py.
+// Data prep (targets, weights, PCA z init) is scripts/e2/targets.py + scripts/e2/prep_pretrain.py;
+// evaluation with the band metric and floors is scripts/e2/eval_e2.py.
 
-/// pretrain.json (e2/prep_pretrain.py): the 96 fit renders, s* targets and loss weights.
+/// $MODAL_AD_ROOT/e2/pretrain.json (scripts/e2/prep_pretrain.py): the 96 fit renders, s* targets and loss weights.
 struct LatentData {
   var ids: [String]
   var snare: [Int]
@@ -15,7 +15,7 @@ struct LatentData {
   var s: [Float]  // [R, P]
   var w: [Float]  // [R, P]
   var zInit: [String: [Float]]
-  // Blend-line rows (prep_pretrain.py --blend): z = (1-t) Z[a] + t Z[b]; fit rows have a = b.
+  // Blend-line rows (scripts/e2/prep_pretrain.py --blend): z = (1-t) Z[a] + t Z[b]; fit rows have a = b.
   var a: [Int], b: [Int], t: [Float]
   var audioRows: [Int]
   var nfit: Int
@@ -27,7 +27,7 @@ struct LatentData {
     return w
   }
 
-  static func load(_ url: URL = Paths.research.appendingPathComponent("e2/pretrain.json")) throws -> LatentData {
+  static func load(_ url: URL = Paths.root.appendingPathComponent("e2/pretrain.json")) throws -> LatentData {
     let j = try JSONSerialization.jsonObject(with: Data(contentsOf: url)) as! [String: Any]
     func fl(_ k: String) -> [Float] { (j[k] as! [NSNumber]).map { $0.floatValue } }
     var zi: [String: [Float]] = [:]
@@ -58,7 +58,7 @@ struct LatentCheckpoint {
     return LatentCheckpoint(D: i("D"), H: i("H"), P: i("P"), codes: i("codes"), tensors: t)
   }
 
-  /// checkpoint.json (resume), weights.json (export_weights.py input), codes.json (named z).
+  /// checkpoint.json (resume), weights.json (scripts/e3proto/export_weights.py input), codes.json (named z).
   static func save(_ dec: LatentDecoder, names: [String], to dir: URL, extra: [String: Any] = [:]) throws {
     let snap = dec.snapshot()
     try writeJSON(["D": dec.D, "H": dec.H, "P": dec.P, "codes": dec.codes, "tensors": snap],
@@ -220,11 +220,11 @@ enum LatentCommands {
     let D = Int(o["d"] ?? "4")!, H = Int(o["h"] ?? "128")!
     let steps = Int(o["steps"] ?? "4000")!, lr = Float(o["lr"] ?? "0.003")!
     let zl2 = Float(o["zl2"] ?? "0.01")!
-    let out = url(o["out"] ?? Paths.research.appendingPathComponent("e2/runs/pre_d\(D)").path)
+    let out = url(o["out"] ?? Paths.root.appendingPathComponent("e2/runs/pre_d\(D)").path)
     try FileManager.default.createDirectory(at: out, withIntermediateDirectories: true)
     let L = try LatentLayout.load(o["layout"].map(url) ?? LatentLayout.defaultURL)
-    let data = try LatentData.load(o["data"].map(url) ?? Paths.research.appendingPathComponent("e2/pretrain.json"))
-    precondition(data.P == L.P, "pretrain.json P \(data.P) != layout P \(L.P): rerun prep_pretrain.py")
+    let data = try LatentData.load(o["data"].map(url) ?? Paths.root.appendingPathComponent("e2/pretrain.json"))
+    precondition(data.P == L.P, "pretrain.json P \(data.P) != layout P \(L.P): rerun scripts/e2/prep_pretrain.py")
     let frames = 64
     configureRuntime(frames: frames)
     LazyGraphContext.preserveCompilationCaches = true
@@ -311,7 +311,7 @@ enum LatentCommands {
     let out = url(o["out"]!)
     try FileManager.default.createDirectory(at: out, withIntermediateDirectories: true)
     let L = try LatentLayout.load(o["layout"].map(url) ?? LatentLayout.defaultURL)
-    let data = try LatentData.load(o["data"].map(url) ?? Paths.research.appendingPathComponent("e2/pretrain.json"))
+    let data = try LatentData.load(o["data"].map(url) ?? Paths.root.appendingPathComponent("e2/pretrain.json"))
     let ck = try LatentCheckpoint.load(url(o["init"]!))
     // Render subset: "all" = the 96 fit renders, "v100" = 32. Trained in rotating chunks of
     // --group renders (interleaved, so each chunk mixes snares and velocities).
@@ -343,7 +343,7 @@ enum LatentCommands {
           let gin = Float(r.vel > 0 ? Foundation.exp(-r.c("c_vin") * Foundation.log(max(r.vel, 1e-4))) : 0)
           targets.append(try loadTarget(id, kind: "head", frames: frames).map { $0 * gin })
         } else if id.hasPrefix("bl_") {
-          var t = try WAV.read(Paths.research.appendingPathComponent("e2/blend_targets/\(id).wav"))
+          var t = try WAV.read(Paths.root.appendingPathComponent("e2/blend_targets/\(id).wav"))
           if t.count < frames { t += [Float](repeating: 0, count: frames - t.count) }
           targets.append(Array(t.prefix(frames)))
         } else {

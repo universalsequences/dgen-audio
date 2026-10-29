@@ -88,7 +88,8 @@ let package = Package(
         .executableTarget(
             name: "ModalKickAD",
             dependencies: ["DGenLazy", "DGen"],
-            path: "Examples/ModalKickAD"
+            path: "Examples/ModalKickAD",
+            exclude: ["README.md", "scripts"]
         ),
         .executableTarget(
             name: "DGenLisp",

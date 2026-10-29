@@ -111,7 +111,8 @@ final class PhysHeadParams {
 }
 
 enum PhysHeadFitter {
-  /// CPU init from the VILLAIN table: f0 from e1/physical/table_vs_bessel.json,
+  /// CPU init from the VILLAIN table: f0 from $MODAL_AD_ROOT/e1/physical/table_vs_bessel.json
+  /// (scripts/e1/physical/table_vs_bessel.py),
   /// greedy energy-ordered assignment of table modes to membrane slots, residuals
   /// set to reproduce the assigned table modes (clamped to the residual span),
   /// damping law from the table fit, strike 0.3.

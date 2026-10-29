@@ -2,7 +2,7 @@ import DGenLazy
 import Foundation
 
 // The Latent Kick voice in DGenLazy: VILLAIN Kick's kick-hit math with decoded per-kick
-// parameters, frame-parallel (no state cells). Mirrors kick/scripts/kick_np.py render(...,
+// parameters, frame-parallel (no state cells). Mirrors scripts/kick_np.py render(...,
 // mode="trainer"): modal bank (24 slots, VILLAIN drop law with a second drop on slots 0-3,
 // time warp, gate masks), 5 transient sines, growl, burst, body shaper/saturator, 18-band
 // noise + hum from fixed tables, recording clipper, fade, out gate. The instrument's IIR

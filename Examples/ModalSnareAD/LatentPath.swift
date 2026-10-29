@@ -10,7 +10,7 @@ import Foundation
 // glide, band noises spread over 32 log bands by their filter response, gates/coupling/fade exact,
 // drive + clipper as an envelope-level gain). No audio is rendered, so the whole graph is static.
 // The numpy twin and its validation against the real band-envelope metric are in
-// research e6/common.py (surrogate) and e6/validate_surrogate.py.
+// scripts/e6/common.py (surrogate) and scripts/e6/validate_surrogate.py.
 //
 // Losses:
 //   rec   : weighted squared error of sigmoid positions at the 96 fit rows against the E2 decoder's
@@ -62,7 +62,7 @@ func smooth01T(_ x: Tensor) -> Tensor {
 
 enum BandSurrogate {
   /// Decoded natural params (each [R, width]) -> (D [R, Tg, NBM] dB band density, level [R, Tg] dB).
-  /// Same math as research e6/common.py `surrogate`.
+  /// Same math as scripts/e6/common.py `surrogate`.
   static func eval(_ p: [String: Tensor], rows R: Int, layout L: LatentLayout, data c: PathData) -> (Tensor, Tensor) {
     let Tg = c.T.count, K = L.K, NN = L.NB, NBM = c.NBM
     let tt = Tensor(c.T).reshape([1, Tg, 1]).expand([R, Tg, 1])
@@ -237,7 +237,7 @@ extension LatentCommands {
     // knob-space offsets for the Lipschitz term: z_raw = z_c + delta * (dir @ M), M from the PCA of the codes
     let Z0 = dec.Z.getData()!
     var M = [Float](repeating: 0, count: D * D)
-    do {  // M = diag(s) V^T as in export_instrument.py (without the final shrink): sample cov Cholesky is fine here
+    do {  // M = diag(s) V^T as in scripts/e2/export_instrument.py (without the final shrink): sample cov Cholesky is fine here
       var mu = [Double](repeating: 0, count: D)
       for c in 0..<codes { for d in 0..<D { mu[d] += Double(Z0[c * D + d]) / Double(codes) } }
       var Cv = [Double](repeating: 0, count: D * D)
@@ -438,7 +438,7 @@ extension LatentCommands {
     print("saved \(out.path)")
   }
 
-  // MARK: latent-surrogate (parity of the Swift surrogate against research e6/common.py)
+  // MARK: latent-surrogate (parity of the Swift surrogate against scripts/e6/common.py)
   static func surrogateDump(_ o: [String: String]) throws {
     let L = try LatentLayout.load(o["layout"].map(url) ?? LatentLayout.defaultURL)
     let data = try PathData.load(url(o["data"]!))

@@ -5,12 +5,12 @@ import Foundation
 //
 // A per-snare latent code z (learned, dim D) plus velocity goes through a tanh MLP
 // (D+1 -> H -> H -> P) into the segments of the realtime Latent Snare template
-// (eseq research e3proto/gen_dsp.py, layout "e2"), and the decoded parameters drive
-// the SAME closed-form voice the instrument runs per sample (e2/template.py is the
+// (scripts/e3proto/gen_dsp.py, layout "e2"), and the decoded parameters drive
+// the SAME closed-form voice the instrument runs per sample (scripts/e2/template.py is the
 // numpy twin). Everything is static per render except the frame-parallel clock, so
 // the [B,K] render is frame-parallel and batched exactly like E1's SnareRenderer.
 
-// MARK: - Layout (decoder_layout.json written by gen_dsp.py)
+// MARK: - Layout ($MODAL_AD_ROOT/e2/decoder_layout.json, written by scripts/e3proto/gen_dsp.py --layout)
 
 struct LatentSegment {
   var name: String
@@ -29,7 +29,7 @@ struct LatentLayout {
   var segments: [LatentSegment]
   var byName: [String: LatentSegment]
 
-  static var defaultURL: URL { Paths.research.appendingPathComponent("e2/decoder_layout.json") }
+  static var defaultURL: URL { Paths.root.appendingPathComponent("e2/decoder_layout.json") }
 
   static func load(_ url: URL = defaultURL) throws -> LatentLayout {
     let j = try JSONSerialization.jsonObject(with: Data(contentsOf: url)) as! [String: Any]
@@ -149,7 +149,7 @@ final class LatentDecoder {
     for (n, t) in named { if let v = values[n], v.count == t.shape.reduce(1, *) { t.updateDataLazily(v) } }
   }
 
-  /// export_weights.py input: {l1,l2,l3:{W:{shape,data},b:{shape,data}}}, W [in,out] row-major;
+  /// scripts/e3proto/export_weights.py input: {l1,l2,l3:{W:{shape,data},b:{shape,data}}}, W [in,out] row-major;
   /// layer-1 rows are z1..zD then velocity.
   static func exportJSON(_ s: [String: [Float]], D: Int, H: Int, P: Int) -> [String: Any] {
     func t(_ shape: [Int], _ d: [Float]) -> [String: Any] { ["shape": shape, "data": d] }

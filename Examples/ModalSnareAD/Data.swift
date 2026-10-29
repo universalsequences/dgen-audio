@@ -1,20 +1,20 @@
 import Foundation
 
-/// Paths into the eseq research workspace (overridable with ESEQ_MODAL_AD_ROOT).
+/// Paths into the data directory the scripts in scripts/ build ($MODAL_AD_ROOT, see README.md).
 enum Paths {
-  static var research: URL {
-    if let root = ProcessInfo.processInfo.environment["ESEQ_MODAL_AD_ROOT"] {
-      return URL(fileURLWithPath: root, isDirectory: true)
+  static var root: URL {
+    guard let root = ProcessInfo.processInfo.environment["MODAL_AD_ROOT"], !root.isEmpty else {
+      FileHandle.standardError.write(
+        "MODAL_AD_ROOT is not set: point it at the data directory built by Examples/ModalSnareAD/scripts (see Examples/ModalSnareAD/README.md)\n"
+          .data(using: .utf8)!)
+      exit(2)
     }
-    return URL(
-      fileURLWithPath:
-        "/Users/alecresende/code/learning/anthropic/eseq/.local/research/modal-autograd",
-      isDirectory: true)
+    return URL(fileURLWithPath: (root as NSString).expandingTildeInPath, isDirectory: true)
   }
-  static var modesJSON: URL { research.appendingPathComponent("data/villain_modes.json") }
-  static var manifest: URL { research.appendingPathComponent("data/villain/manifest.json") }
-  static var villain: URL { research.appendingPathComponent("data/villain") }
-  static var e1: URL { research.appendingPathComponent("e1") }
+  static var modesJSON: URL { root.appendingPathComponent("data/villain_modes.json") }
+  static var manifest: URL { root.appendingPathComponent("data/villain/manifest.json") }
+  static var villain: URL { root.appendingPathComponent("data/villain") }
+  static var e1: URL { root.appendingPathComponent("e1") }
   static func stem(_ id: String, _ kind: String) -> URL {
     villain.appendingPathComponent("stems/\(id).\(kind).wav")
   }

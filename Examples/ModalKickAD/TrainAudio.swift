@@ -10,7 +10,7 @@ import Foundation
 //              columns except mode_f (frequencies stay bit-identical to the pretrain).
 // stage noise: MR on VILLAIN's texture+grit stem (exact, deterministic noise); trains band_* /
 //              noise_* / hum_* / couple_ga.
-// Reads <run>/weights.json, codes.json, anchor.json (kick/scripts/train_np.py, prep_audio.py);
+// Reads <run>/weights.json, codes.json, anchor.json (scripts/train_np.py, scripts/prep_audio.py);
 // writes <out>/weights.json (+ codes.json copy, loss.csv).
 
 struct Mat { var r: Int; var c: Int; var d: [Float] }

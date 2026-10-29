@@ -1,20 +1,22 @@
 import DGenLazy
 import Foundation
 
-// Latent Kick decoder contract (eseq research kick/scripts/kick_layout.py, written to
-// decoder_layout.json by kick/scripts/gen_dsp.py). The voice it drives is
-// kick/scripts/kick_np.py (mode="trainer" here: the frame-parallel subset).
+// Latent Kick decoder contract: Examples/ModalKickAD/scripts/kick_layout.py, written to
+// decoder_layout.json by scripts/gen_dsp.py. The voice it drives is scripts/kick_np.py
+// (mode="trainer" here: the frame-parallel subset).
 
 enum KickPaths {
-  static var research: URL {
-    if let root = ProcessInfo.processInfo.environment["ESEQ_MODAL_AD_ROOT"] {
-      return URL(fileURLWithPath: root, isDirectory: true)
+  /// The data directory the scripts in scripts/ write ($MODAL_AD_ROOT, see README.md).
+  static var root: URL {
+    guard let root = ProcessInfo.processInfo.environment["MODAL_AD_ROOT"], !root.isEmpty else {
+      FileHandle.standardError.write(
+        "MODAL_AD_ROOT is not set: point it at the data directory built by Examples/ModalKickAD/scripts (see Examples/ModalKickAD/README.md)\n"
+          .data(using: .utf8)!)
+      exit(2)
     }
-    return URL(
-      fileURLWithPath: "/Users/alecresende/code/learning/anthropic/eseq/.local/research/modal-autograd",
-      isDirectory: true)
+    return URL(fileURLWithPath: (root as NSString).expandingTildeInPath, isDirectory: true)
   }
-  static var kick: URL { research.appendingPathComponent("kick") }
+  static var kick: URL { root.appendingPathComponent("kick") }
   static var data: URL { kick.appendingPathComponent("data") }
   static var layout: URL { kick.appendingPathComponent("Latent Kick/decoder_layout.json") }
   static var teacher: URL { data.appendingPathComponent("teacher.json") }
@@ -71,7 +73,7 @@ struct KickLayout {
   }
 }
 
-/// Teacher rows (kick/data/teacher.json): decoder-space u per render id.
+/// Teacher rows ($MODAL_AD_ROOT/kick/data/teacher.json, scripts/targets.py): decoder-space u per render id.
 enum KickTeacher {
   static func load(_ url: URL = KickPaths.teacher) throws -> [String: [Float]] {
     let j = try JSONSerialization.jsonObject(with: Data(contentsOf: url)) as! [String: Any]
@@ -83,7 +85,7 @@ enum KickTeacher {
   }
 }
 
-/// Fixed noise signals (kick/scripts/export_tables.py): what the instrument computes on a
+/// Fixed noise signals (scripts/export_tables.py): what the instrument computes on a
 /// fresh voice from the seed-1 xorshift white.
 struct KickTables {
   var frames: Int

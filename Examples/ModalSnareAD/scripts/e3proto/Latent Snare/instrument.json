@@ -1,0 +1,8 @@
+{
+  "version": 1,
+  "run_mode": "instrument",
+  "current": 1,
+  "releases": {
+    "1": { "path": ".", "name": "Research/Latent Snare" }
+  }
+}

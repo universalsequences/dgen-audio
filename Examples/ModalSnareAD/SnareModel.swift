@@ -27,7 +27,7 @@ func logMapCPU(_ raw: Float, _ lo: Float, _ hi: Float) -> Float {
   Foundation.exp(Foundation.log(lo) + sigmoidF(raw) * (Foundation.log(hi) - Foundation.log(lo)))
 }
 
-// MARK: - Band noise bank (precomputed constants, see e1/make_noise_bands.py)
+// MARK: - Band noise bank (precomputed constants, see scripts/e1/make_noise_bands.py)
 
 struct NoiseBank {
   var bands: Int
