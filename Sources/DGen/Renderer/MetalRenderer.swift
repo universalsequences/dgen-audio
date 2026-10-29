@@ -462,10 +462,18 @@ public class MetalRenderer: Renderer, UOpEmitter {
     let threadCount: Int?
   }
 
+  private var staticRegionSplitDisabled: Bool {
+    ProcessInfo.processInfo.environment["DGEN_NO_STATIC_REGION_SPLIT"] != nil
+  }
+
   private func splitStaticParallelRanges(_ scheduleItem: ScheduleItem, ctx: IRContext)
     -> [SplitScheduleItem]
   {
-    guard scheduleItem.temporality == .static_, scheduleItem.frameOrder == .sequential else {
+    // Static blocks run once (no frame loop), so their frame order does not matter here:
+    // a .parallel static block dispatched as staticThreads(1) is just as serial.
+    guard scheduleItem.temporality == .static_,
+      scheduleItem.frameOrder == .sequential || !staticRegionSplitDisabled
+    else {
       return [SplitScheduleItem(item: scheduleItem, threadCount: nil)]
     }
 
@@ -535,6 +543,21 @@ public class MetalRenderer: Renderer, UOpEmitter {
     let hasParallel = segments.contains { $0.parallelCount != nil }
     guard hasParallel else {
       return [SplitScheduleItem(item: scheduleItem, threadCount: nil)]
+    }
+
+    // A .parallel block addresses cross-kernel globals and frameIndex by thread index (= frame),
+    // which a per-region N-thread kernel would reinterpret as the element index. Split those
+    // blocks only when they use neither.
+    if scheduleItem.frameOrder == .parallel {
+      let deps = analyzeDependencies(scheduleItem: scheduleItem, ctx: ctx)
+      let usesGlobals = (deps.inputs + deps.outputs).contains { $0 != memoryVarID }
+      let usesFrameIndex = ops.contains {
+        if case .frameIndex = $0.op { return true }
+        return false
+      }
+      if usesGlobals || usesFrameIndex {
+        return [SplitScheduleItem(item: scheduleItem, threadCount: nil)]
+      }
     }
 
     // Safety guard: do not split if a later segment reads a non-global temp
@@ -1434,7 +1457,11 @@ public class MetalRenderer: Renderer, UOpEmitter {
     case .cos(let a): return emitAssign(uop, "metal::cos(\(g(a)))", ctx)
     case .tan(let a): return emitAssign(uop, "metal::tan(\(g(a)))", ctx)
     case .atan(let a): return emitAssign(uop, "metal::atan(\(g(a)))", ctx)
-    case .tanh(let a): return emitAssign(uop, "metal::tanh(\(g(a)))", ctx)
+    // The runtime compiles with fastMathEnabled, under which metal::tanh
+    // evaluates via exp and returns NaN for x >~ 44 (0 at 44). Clamp first:
+    // tanh(+-15) already rounds to +-1 in float, and the AD rule
+    // 1 - tanh^2 is 0 there either way.
+    case .tanh(let a): return emitAssign(uop, "metal::tanh(metal::clamp(\(g(a)), -15.0f, 15.0f))", ctx)
     case .exp(let a): return emitAssign(uop, "metal::exp(\(g(a)))", ctx)
     case .log(let a): return emitAssign(uop, "metal::log(\(g(a)))", ctx)
     case .log10(let a): return emitAssign(uop, "metal::log10(\(g(a)))", ctx)

@@ -25,7 +25,7 @@ public class Tensor: LazyValue {
   private var _nodeId: NodeID
 
   /// The graph this tensor belongs to
-  public let graph: LazyGraph
+  public private(set) var graph: LazyGraph
 
   /// Shape of the tensor
   public let shape: Shape
@@ -46,6 +46,18 @@ public class Tensor: LazyValue {
 
   /// Computed property for nodeId
   public var nodeId: NodeID {
+    if graphId >= 0, graphId != graph.id {
+      // The graph was cleared since this tensor's node was created. Data-backed
+      // tensors are re-created in the new graph; a derived tensor (op/view result
+      // with no data of its own) cannot be, and its stale node ID would silently
+      // alias an unrelated node of the rebuilt graph.
+      refresh()
+      if graphId != graph.id {
+        fatalError(
+          "DGenLazy: a derived Tensor (shape \(shape)) from before clearComputationGraph()/backward() "
+            + "was used in a rebuilt graph. Rebuild it each step, or build it from data.")
+      }
+    }
     return _nodeId
   }
 
@@ -108,6 +120,9 @@ public class Tensor: LazyValue {
     let graph = LazyGraphContext.current
     if let data = getData() {
       if graph.id != graphId {
+        // Data-backed tensors follow the current graph, including one created after a
+        // LazyGraphContext.reset(): ops and reads then all go through the same graph.
+        self.graph = graph
         graphId = graph.id
         let (nodeId, tensorId) = graph.createTensor(shape: shape, data: data)
         self._nodeId = nodeId
@@ -162,6 +177,7 @@ public class Tensor: LazyValue {
     self.tensorId = tensorId
     self.grad = nil
     self._data = data  // Store if provided (for parameters)
+    self.graphId = nodeId >= 0 ? graph.id : -1
   }
 
   /// TensorOps conformance: view-only initializer

@@ -13,7 +13,7 @@ import Foundation
 /// - Returns: UOps for exactly one region.
 private func emitRegion(
   _ region: EmissionRegion, ctx: IRContext, g: Graph,
-  parallelElemIdx: Lazy? = nil
+  parallelElemIdx: Lazy? = nil, splittableRange: Bool = false
 ) throws -> [UOp] {
   var uops: [UOp] = []
 
@@ -78,9 +78,13 @@ private func emitRegion(
         uops.append(contentsOf: gate.ops)
       }
 
+      // splittableRange: a parallel range instead of a plain loop, so the Metal renderer's
+      // splitStaticParallelRanges can give the region its own thread-parallel kernel
+      // (kernel boundaries order the regions). Unsplit, it still renders as a loop.
+      let asRange = splittableRange && !region.isConvOnly && gatedLatch == nil
       if !region.isConvOnly {
         let beginLoop = UOp(
-          op: .beginForLoop(elemVar, .constant(0, Float(elementCount))),
+          op: asRange ? .beginParallelRange(elementCount, 1) : .beginForLoop(elemVar, .constant(0, Float(elementCount))),
           value: elemVar
         )
         uops.append(beginLoop)
@@ -98,7 +102,7 @@ private func emitRegion(
       }
 
       if !region.isConvOnly {
-        let endLoop = UOp(op: .endLoop, value: .empty)
+        let endLoop = asRange ? UOp(op: .endParallelRange, value: ctx.useVariable(src: nil)) : UOp(op: .endLoop, value: .empty)
         uops.append(endLoop)
       }
 
@@ -166,8 +170,9 @@ public func emitScalarBlockWithShapeTransitions(
   let skipRegions = detectFusableReduces(
     block: block, g: g, transitions: transitions,
     blockOutbound: blockOutbound, outbound: &outbound, ctx: ctx)
-  detectInlineableMulReduceNodes(block: block, g: g, ctx: ctx)
+  outbound.formUnion(detectInlineableMulReduceNodes(block: block, g: g, ctx: ctx))
   detectInlineableExpandAxisReduceNodes(block: block, g: g, ctx: ctx)
+  outbound.formUnion(findInBlockViewReadCells(block: block, g: g))
   outbound.formUnion(ctx.fusedSumOperandCells)
   ctx.outboundTensorCells = outbound
   ctx.clearTensorRegisters()
@@ -249,10 +254,16 @@ public func emitScalarBlockWithShapeTransitions(
     }
   }
 
-  // Fallback: sequential element loops per region.
+  // Fallback: sequential element loops per region. A static Metal block runs as ONE thread
+  // (staticThreads(1)), so its element loops would execute serially on the GPU (seconds for a
+  // few million elements). Emit them as parallel ranges instead: splitStaticParallelRanges then
+  // dispatches each region as its own N-thread kernel, and falls back to the loop form when the
+  // block cannot be split safely.
+  let splittable = backend == .metal && block.temporality == .static_
+    && ProcessInfo.processInfo.environment["DGEN_NO_STATIC_REGION_SPLIT"] == nil
   var uops: [UOp] = []
   for region in regions {
-    uops += try emitRegion(region, ctx: ctx, g: g)
+    uops += try emitRegion(region, ctx: ctx, g: g, splittableRange: splittable)
   }
   return uops
 }

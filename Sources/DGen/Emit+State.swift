@@ -87,17 +87,28 @@ extension LazyOp {
         // Frame-aware: sum across all frames (each at frameIdx * tensorSize + elemIdx).
         // Each parallel lane owns one elemIdx, so reduce locally first, then do a single
         // accumulate to avoid frameCount atomics per element.
+        // A view (matmul's backward hands a weight its gradient as a transpose
+        // of the per-frame [N,K] product tape) must map each element through
+        // its transform chain; reading the base flat would return it transposed.
         let tensorSizeInt = b.intConstant(tensorSize)
-        b.parallelRange(size) { elemIdx in
-          let elemIdxInt = b.cast(elemIdx, to: .int)
+        func sumFrames(at baseIdx: Expr) -> Expr {
           let localSum = b.float(0.0)
           b.loop(frameCount) { frameIdx in
-            let frameIdxInt = b.cast(frameIdx, to: .int)
-            let readPos = frameIdxInt * tensorSizeInt + elemIdxInt
-            let val = b.memoryRead(tensor.cellId, readPos)
-            localSum.accumulate(val)
+            let readPos = b.cast(frameIdx, to: .int) * tensorSizeInt + baseIdx
+            localSum.accumulate(b.memoryRead(tensor.cellId, readPos))
           }
-          _ = b.memoryWrite(cellId, elemIdxInt, localSum.value)
+          return localSum.value
+        }
+        b.parallelRange(size) { elemIdx in
+          let elemIdxInt = b.cast(elemIdx, to: .int)
+          // The view->base mapping depends only on the element: emit it once,
+          // outside the frame loop (a padded-out element skips the loop: 0).
+          let sum = tensor.transforms.isEmpty
+            ? sumFrames(at: elemIdxInt)
+            : b.tensorRead(tensor, indices: b.flatToMultiIndex(elemIdxInt, shape)) { baseIdx in
+              sumFrames(at: b.cast(baseIdx, to: .int))
+            }
+          _ = b.memoryWrite(cellId, elemIdxInt, sum)
         }
       } else if !tensor.transforms.isEmpty {
         // Use tensorRead to walk the transform chain

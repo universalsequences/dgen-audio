@@ -163,6 +163,31 @@ func findNodesAsInboundDependencies(
   return needed.sorted()  // Stable ordering
 }
 
+/// Tensor cells produced in this block that a node of the same block reads through
+/// a view (shrink / expand / pad / reshape / transpose ... of the producer's tensor).
+///
+/// A view read goes through `tensorRead`, which maps the consumer's element index to
+/// a *different* base element and loads it from memory; the register cache that
+/// `tstore`/`tload` keep for in-block values only holds the producer's current
+/// element. If such a producer is not outbound by liveness its store is elided and the
+/// view reads an untouched (or reused) allocation. E.g. on the C backend
+/// `(t * log(x).shrink([(0, B), (0, 1)]).expand([B, K])).sum(axis: 1)` read the
+/// clock phasor's frame buffer instead of `log(x)` (lane 1 got 0.125 for log 10).
+/// These cells must be materialised.
+func findInBlockViewReadCells(block: Block, g: Graph) -> Set<CellID> {
+  var producedPlain = Set<CellID>()
+  var viewed = Set<CellID>()
+  for nodeId in block.nodes {
+    guard let tensorId = g.nodeToTensor[nodeId], let tensor = g.tensors[tensorId] else { continue }
+    if tensor.transforms.isEmpty {
+      if let node = g.nodes[nodeId], case .tensor = node.shape { producedPlain.insert(tensor.cellId) }
+    } else {
+      viewed.insert(tensor.cellId)
+    }
+  }
+  return producedPlain.intersection(viewed)
+}
+
 /// Compute which tensor cells in this block need to be written to memory because
 /// they're used by later blocks. Cells only used within this block stay in registers.
 ///

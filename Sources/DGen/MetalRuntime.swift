@@ -5,6 +5,14 @@ import Foundation
 import Metal
 
 public class MetalCompiledKernel: CompiledKernelRuntime {
+  /// Commit a run's kernels in command buffers of at most this many kernels (0: one
+  /// command buffer for the whole run). Buffers on one queue execute in order, so results
+  /// are identical; shorter buffers let the window server interleave, so a long training
+  /// step is not killed by the GPU watchdog ("Impacting Interactivity") on a Mac that also
+  /// drives a display. DGEN_METAL_KERNELS_PER_COMMAND_BUFFER overrides the default.
+  public static var kernelsPerCommandBuffer: Int =
+    Int(ProcessInfo.processInfo.environment["DGEN_METAL_KERNELS_PER_COMMAND_BUFFER"] ?? "") ?? 0
+
   public let kernels: [CompiledKernel]
   public let cellAllocations: CellAllocations
   private let device: MTLDevice
@@ -229,6 +237,18 @@ public class MetalCompiledKernel: CompiledKernelRuntime {
     for bufferName in allBufferNames {
       // Memory buffer size comes from getMemorySize(), others need maxFrameCount
       let elementCount = getElementCount(bufferName)
+      // Emitted kernels index buffers with 32-bit `int` arithmetic
+      // (`memory[base + frame * width + i]`). Past Int32.max elements the
+      // offsets wrap and kernels silently read/write the wrong cells.
+      if elementCount > Int(Int32.max) {
+        throw NSError(
+          domain: "MetalError", code: 5,
+          userInfo: [
+            NSLocalizedDescriptionKey:
+              "Buffer \(bufferName) needs \(elementCount) floats, beyond the 32-bit index range of "
+              + "emitted kernels (\(Int32.max)); reduce frames, batch or materialized tensors"
+          ])
+      }
 
       let bufferSize = elementCount * MemoryLayout<Float>.size
       guard let buffer = device.makeBuffer(length: bufferSize, options: .storageModeShared)
@@ -282,10 +302,22 @@ public class MetalCompiledKernel: CompiledKernelRuntime {
     }
   }
 
+  /// Why the last `run` did not execute every kernel (a command buffer that failed on the
+  /// GPU -- e.g. a timeout or an out-of-memory fault -- or an encoder that could not be
+  /// made), or nil. Metal reports these only through the command buffer, so without this
+  /// check a failed run leaves zeroed buffers that read back as valid results.
+  public private(set) var lastRunError: String?
+
   public func run(
     outputs: UnsafeMutablePointer<Float>, inputs: UnsafePointer<Float>, frameCount: Int,
     volumeScale: Float = 1.0
   ) {
+    lastRunError = nil
+    func checkCompleted(_ cb: MTLCommandBuffer) {
+      if cb.status == .error, lastRunError == nil {
+        lastRunError = "Metal command buffer failed: \(cb.error?.localizedDescription ?? "unknown error")"
+      }
+    }
     precondition(
       frameCount <= maxFrameCount,
       "frameCount (\(frameCount)) exceeds maxFrameCount (\(maxFrameCount))"
@@ -296,7 +328,10 @@ public class MetalCompiledKernel: CompiledKernelRuntime {
       frameCountPtr[0] = UInt32(frameCount)
     }
 
-    guard var commandBuffer = commandQueue.makeCommandBuffer() else { return }
+    guard var commandBuffer = commandQueue.makeCommandBuffer() else {
+      lastRunError = "Metal could not make a command buffer"
+      return
+    }
 
     // Execute kernels in sequence
     // In non-debug mode, reuse a single encoder to reduce CPU overhead
@@ -304,13 +339,30 @@ public class MetalCompiledKernel: CompiledKernelRuntime {
     if !debugGradients {
       sharedEncoder = commandBuffer.makeComputeCommandEncoder()
     }
+    let splitEvery = debugGradients ? 0 : Self.kernelsPerCommandBuffer
+    var committed: [MTLCommandBuffer] = []
     for (index, kernel) in kernels.enumerated() {
+      if splitEvery > 0, index > 0, index % splitEvery == 0, let enc = sharedEncoder {
+        enc.endEncoding()
+        commandBuffer.commit()
+        committed.append(commandBuffer)
+        guard let cb = commandQueue.makeCommandBuffer(), let next = cb.makeComputeCommandEncoder() else {
+          lastRunError = "Metal could not make a command buffer"
+          sharedEncoder = nil
+          break
+        }
+        commandBuffer = cb
+        sharedEncoder = next
+      }
       // Pick encoder: shared if available (non-debug), otherwise one per kernel
       let computeEncoder: MTLComputeCommandEncoder
       if let enc = sharedEncoder {
         computeEncoder = enc
       } else {
-        guard let enc = commandBuffer.makeComputeCommandEncoder() else { continue }
+        guard let enc = commandBuffer.makeComputeCommandEncoder() else {
+          lastRunError = lastRunError ?? "Metal could not make a compute encoder for \(kernel.name)"
+          continue
+        }
         computeEncoder = enc
       }
 
@@ -324,6 +376,7 @@ public class MetalCompiledKernel: CompiledKernelRuntime {
         // Execute this kernel now so shared-memory buffers are visible for debug
         commandBuffer.commit()
         commandBuffer.waitUntilCompleted()
+        checkCompleted(commandBuffer)
         if let cb = commandQueue.makeCommandBuffer() { commandBuffer = cb }
       }
     }
@@ -336,6 +389,8 @@ public class MetalCompiledKernel: CompiledKernelRuntime {
     if !debugGradients {
       commandBuffer.commit()
       commandBuffer.waitUntilCompleted()
+      for cb in committed { checkCompleted(cb) }
+      checkCompleted(commandBuffer)
     }
     firstDebug = false
 

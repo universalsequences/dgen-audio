@@ -20,9 +20,12 @@ public protocol LazyRuntime: AnyObject {
     func memoryPointer() -> UnsafeMutablePointer<Float>?
     func outputsPointer() -> UnsafeMutablePointer<Float>?
     func profileKernels(frameCount: Int) -> [(index: Int, name: String, dispatchInfo: String, gpuMs: Double)]
+    /// Why the last runNoCopy did not complete, or nil.
+    var lastRunError: String? { get }
 }
 
 extension CLazyRuntime {
+    public var lastRunError: String? { nil }
     public func profileKernels(frameCount: Int) -> [(index: Int, name: String, dispatchInfo: String, gpuMs: Double)] { [] }
 }
 
@@ -160,7 +163,13 @@ extension LazyGraph {
 
         // Fast path: reuse full compilation cache when graph topology is unchanged.
         // CompilationResult.graph is a reference type, so cached results see current tensor data.
-        if let cached = fullCompilationCache, cached.fingerprint == compileFingerprint {
+        // Not for SignalTensor/Tensor realize(): their readback resolves the
+        // node's tensor via graph.nodeToTensor / frameAwareCells, which
+        // clearComputationGraph() wipes and only a real compile repopulates, so
+        // a cache hit read the wrong (non-frame-aware) tensor.
+        if graph.materializeNodes.isEmpty, let cached = fullCompilationCache,
+          cached.fingerprint == compileFingerprint
+        {
             compilationCache = cached.result
             runtimeCache = cached.runtime
             isDirty = false
@@ -298,7 +307,7 @@ extension LazyGraph {
     }
 
     /// Run the compiled graph
-    func run(context: ExecutionContext, preserveState: Bool) {
+    func run(context: ExecutionContext, preserveState: Bool) throws {
         if !preserveState {
             context.runtime.zeroAllBuffers()
             injectTensorData(context: context)
@@ -308,6 +317,9 @@ extension LazyGraph {
         context.runtime.runNoCopy(frameCount: context.frameCount)
         lastExecutionTiming.executionMS =
             (CFAbsoluteTimeGetCurrent() - executionStart) * 1000
+        if let message = context.runtime.lastRunError {
+            throw NSError(domain: "MetalError", code: 6, userInfo: [NSLocalizedDescriptionKey: message])
+        }
     }
 
     /// Read output buffer
@@ -531,7 +543,7 @@ extension Tensor {
 
         // Compile and run
         let context = try graph.compile(frameCount: frameCount)
-        graph.run(context: context, preserveState: false)
+        try graph.run(context: context, preserveState: false)
 
         // Read tensor data from memory
         // Look up tensorId from nodeToTensor (created during compilation by allocateTensorOutputs)
@@ -572,7 +584,7 @@ extension Signal {
 
         // Compile and run
         let context = try graph.compile(frameCount: frames)
-        graph.run(context: context, preserveState: preserveState)
+        try graph.run(context: context, preserveState: preserveState)
 
         // Read outputs
         return graph.readOutputs(context: context)
@@ -604,7 +616,7 @@ extension SignalTensor {
 
         // Compile and run
         let context = try graph.compile(frameCount: frames)
-        graph.run(context: context, preserveState: preserveState)
+        try graph.run(context: context, preserveState: preserveState)
 
         // Read tensor data from memory
         // Look up tensorId from nodeToTensor (created during compilation)

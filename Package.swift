@@ -13,6 +13,8 @@ let package = Package(
         .executable(name: "TrainKick808", targets: ["TrainKick808"]),
         .executable(name: "SynthID", targets: ["SynthID"]),
         .executable(name: "ModalDrum", targets: ["ModalDrum"]),
+        .executable(name: "ModalSnareAD", targets: ["ModalSnareAD"]),
+        .executable(name: "ModalKickAD", targets: ["ModalKickAD"]),
         .executable(name: "DGenLisp", targets: ["DGenLisp"]),
         .library(name: "DGen", targets: ["DGen"]),
         .library(name: "DGenLazy", targets: ["DGenLazy"]),
@@ -75,6 +77,18 @@ let package = Package(
             name: "ModalDrum",
             dependencies: ["DGenLazy"],
             path: "Examples/ModalDrum",
+            exclude: ["README.md", "scripts"]
+        ),
+        .executableTarget(
+            name: "ModalSnareAD",
+            dependencies: ["DGenLazy", "DGen"],
+            path: "Examples/ModalSnareAD",
+            exclude: ["README.md", "scripts"]
+        ),
+        .executableTarget(
+            name: "ModalKickAD",
+            dependencies: ["DGenLazy", "DGen"],
+            path: "Examples/ModalKickAD",
             exclude: ["README.md", "scripts"]
         ),
         .executableTarget(

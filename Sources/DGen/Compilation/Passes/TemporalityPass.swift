@@ -52,7 +52,12 @@ extension TemporalityPass {
       .overlapAdd(_, _, _, _, _),
       // Per-sample scalar gradient output: sums hop-window tape entries for
       // every frame, so it must never be promoted to hop-rate scheduling.
-      .bufferViewGradRead(_, _):
+      .bufferViewGradRead(_, _),
+      // Per-frame gradient tape writes (slot = frame index), reduced over all
+      // frames by their *GradReduce. With frame-invariant inputs (a static loss
+      // peeked into a Signal) the block would otherwise be .static_, run once
+      // and fill only slot 0, so the reduce summed one frame plus stale slots.
+      .peekGradWrite, .sampleGradWrite, .selectRowGradWrite:
       return true
     default:
       return false

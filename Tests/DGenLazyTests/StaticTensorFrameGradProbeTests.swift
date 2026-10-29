@@ -5,14 +5,12 @@ import XCTest
 /// Gradients of a *static* `Tensor.param` whose derived tensor is multiplied
 /// elementwise into a frame-varying SignalTensor (no sampleRow in between).
 ///
-/// Direct product, pad, and matmul-derived tensors differentiate correctly.
-/// A static `tensorFFT` chain does NOT: the frame-varying adjoint comes back
-/// with wrong magnitudes (deterministically — the C backend produces the exact
-/// same wrong values as Metal, so it is a backward-graph construction defect,
-/// not a GPU race). Found while building the R5 learned reverb, which now maps
-/// IR taps to their spectrum with a constant DFT matmul instead (see
-/// `LearnedReverb.swift`). The two FFT cases below pin the defect as expected
-/// failures until the static-FFT adjoint path is fixed.
+/// Direct product, pad, matmul-derived and static `tensorFFT` chains all
+/// differentiate correctly. The FFT cases were expected failures (R5 finding:
+/// wrong frame-varying adjoint magnitudes, identical on C and Metal) until the
+/// fix that made frame-aware reads of VIEW tensors (axis reductions,
+/// expandAxis, tensorAccumulate) walk their transform chain instead of
+/// indexing base storage flat.
 final class StaticTensorFrameGradProbeTests: XCTestCase {
   private let frameCount = 64
   private let N = 8
@@ -74,12 +72,6 @@ final class StaticTensorFrameGradProbeTests: XCTestCase {
   }
 
   func testFFTProductGradient() throws {
-#if canImport(Darwin)
-    XCTExpectFailure("static tensorFFT chain mis-propagates frame-varying adjoints (R5 finding)")
-#else
-    // swift-corelibs-xctest has no XCTExpectFailure; skip this known-failing probe.
-    throw XCTSkip("static tensorFFT chain mis-propagates frame-varying adjoints (R5 finding)")
-#endif
     let n = N
     let half = N / 2
     try runCase("fft") { h in
@@ -89,12 +81,6 @@ final class StaticTensorFrameGradProbeTests: XCTestCase {
   }
 
   func testFFTProductGradientCBackend() throws {
-#if canImport(Darwin)
-    XCTExpectFailure("static tensorFFT chain mis-propagates frame-varying adjoints (R5 finding)")
-#else
-    // swift-corelibs-xctest has no XCTExpectFailure; skip this known-failing probe.
-    throw XCTSkip("static tensorFFT chain mis-propagates frame-varying adjoints (R5 finding)")
-#endif
     DGenConfig.backend = .c
     defer { DGenConfig.backend = .metal }
     let n = N
