@@ -19,6 +19,8 @@ enum AnalyzeKicksCommand {
           --max-modes K       modal slots incl. the fundamental (default 24)
           --no-second-drop    fit a single pitch-drop term
           --no-mode-drop      keep G = 0 for every non-fundamental mode
+          --no-stabilize      keep every matrix-pencil mode (no stabilisation check)
+          --stability F,D     stabilisation tolerances: relative frequency, relative decay
           --noise-order 2|4   band-pass order of each noise band (default 2, SPEC §3.1)
           --independent-noise one white per noise band (default: one shared white, SPEC §3.1)
           --check-length N    zero-pad length for the check metrics (default 32768)
@@ -59,6 +61,15 @@ enum AnalyzeKicksCommand {
             case "--max-modes": opts.maxModes = Int(number(value()))
             case "--no-second-drop": opts.secondDrop = false
             case "--no-mode-drop": opts.modeDropTest = false
+            case "--no-stabilize": opts.stabilize = false
+            case "--stability": // relF,relD
+                let v = value().split(separator: ",").map { number(String($0)) }
+                guard v.count == 2 else {
+                    fputs("--stability takes relF,relD\n", stderr)
+                    exit(2)
+                }
+                opts.stabilityRelF = v[0]
+                opts.stabilityRelD = v[1]
             case "--independent-noise": opts.sharedNoiseWhite = false
             case "--noise-order":
                 let v = Int(number(value()))

@@ -23,6 +23,9 @@ public struct KickAnalysisOptions: Codable {
     public var secondDrop = true
     public var modeDropTest = true
     public var varproRefine = true
+    public var stabilize = true           // keep only matrix-pencil modes stable across segment/pencil variants
+    public var stabilityRelF = 0.03
+    public var stabilityRelD = 0.8
     public var modeDropRatio = 2.0
     public var defaultRise = 0.0007
     public var sharedNoiseWhite = true    // SPEC §3.1: one white for all bands
@@ -174,7 +177,7 @@ public enum KickAnalyzer {
         var cands: [ModeEstimate] = []
         if let seg = regionSegment(r0, sr: sr, band: o.lowRegion, decim: o.lowDecimation, from: t1,
                                    to: min(tEnd, t1 + o.lowSegmentSeconds)) {
-            var lows = MatrixPencil.stableModes(seg.x, sampleRate: seg.fs).filter {
+            var lows = modesOf(seg, o).filter {
                 $0.frequency >= o.lowRegion[0] * 0.9 && $0.frequency <= o.lowRegion[1] * 1.1 && $0.decay >= o.minDecayLow
             }
             if o.varproRefine { lows = MatrixPencil.refine(seg.x, sampleRate: seg.fs, modes: lows, minDecay: o.minDecayLow) }
@@ -188,7 +191,7 @@ public enum KickAnalyzer {
         let midFrom = onset + 0.003
         if let seg = regionSegment(r0, sr: sr, band: o.midRegion, decim: o.midDecimation, from: midFrom,
                                    to: min(tEnd, midFrom + o.midSegmentSeconds)) {
-            var mids = MatrixPencil.stableModes(seg.x, sampleRate: seg.fs).filter {
+            var mids = modesOf(seg, o).filter {
                 $0.frequency >= o.midRegion[0] * 0.95 && $0.frequency <= o.midRegion[1] * 1.05 && $0.decay >= o.minDecayMid
             }
             if o.varproRefine { mids = MatrixPencil.refine(seg.x, sampleRate: seg.fs, modes: mids, minDecay: o.minDecayMid) }
@@ -249,6 +252,11 @@ public enum KickAnalyzer {
         var x: [Double]
         var fs: Double
         var t0: Double
+    }
+
+    static func modesOf(_ seg: Segment, _ o: KickAnalysisOptions) -> [DampedSinusoid] {
+        o.stabilize ? MatrixPencil.stableModes(seg.x, sampleRate: seg.fs, relF: o.stabilityRelF, relD: o.stabilityRelD)
+            : MatrixPencil.estimate(seg.x, sampleRate: seg.fs).modes
     }
 
     /// Band-limit (zero phase), decimate, and cut [from, to).
