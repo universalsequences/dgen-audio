@@ -448,6 +448,36 @@ extension LispEvaluator {
     return out
   }
 
+  // MARK: declick
+
+  /// `(declick Y TRIGGER)`: a retrigger cuts the previous hit; carry its last output sample and
+  /// let it fall over ~1 ms so the cut does not click. Identity under a dataset context (one hit
+  /// per row; the carry would feed the output back through a history).
+  func evalDeclick(_ args: [ASTNode]) throws -> EvalResult {
+    guard args.count == 2 else {
+      throw LispError.invalidArgument("declick requires (declick SIGNAL TRIGGER)")
+    }
+    if dataset != nil { return try evaluateAST(args[0]) }
+    macroExpansionCounter += 1
+    let p = "__declick_\(macroExpansionCounter)_"
+    definitions[p + "y"] = try evaluateAST(args[0])
+    definitions[p + "trig"] = try evaluateAST(args[1])
+    let source = """
+      (make-history \(p)prev)
+      (make-history \(p)last)
+      (make-history \(p)carry)
+      (def \(p)high (gt \(p)trig 0.5))
+      (def \(p)edge (* \(p)high (lte (read-history \(p)prev) 0.5)))
+      (write-history \(p)prev \(p)high)
+      (def \(p)c (gswitch \(p)edge (read-history \(p)last) (* (read-history \(p)carry) (exp (/ -1000 samplerate)))))
+      (write-history \(p)carry \(p)c)
+      (def \(p)out (+ \(p)y \(p)c))
+      (write-history \(p)last \(p)out)
+      """
+    for node in try parseSource(source) { _ = try evaluateAST(node) }
+    return definitions[p + "out"]!
+  }
+
   // MARK: one-shot lowering of hit-clock latches
 
   /// Under a dataset context, `latch`/`event-hold`/`event-latch` of a static value is the value.

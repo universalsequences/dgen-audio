@@ -967,6 +967,8 @@ class LispEvaluator {
       return try evalRowOut(regularArgs)
     case "hit-time":
       return try evalHitTime(regularArgs, attributes: attributePairs)
+    case "declick":
+      return try evalDeclick(regularArgs)
     // DEPRECATED hidden alias of `tensor` (undocumented; kept for old sources only).
     case "wavetable":
       return try evalWavetable(regularArgs, attributes: attributePairs, mutable: false)
@@ -2166,6 +2168,11 @@ class LispEvaluator {
 
     let name = attrValue(attributes, "@name")
     let modulatorSlot = try parseOptionalPositiveIntAttribute(attributes, "@modulator")
+    // Dataset training reads the audio output only; host-facing amp/modulator outputs of the
+    // instrument are skipped.
+    if dataset != nil && (modulatorSlot != nil || parseBoolAttr(attributes, "@amp")) {
+      return .none
+    }
     if let modulatorSlot,
       outputs.contains(where: { $0.modulatorSlot == modulatorSlot })
         || tensorOutputs.contains(where: { $0.modulatorSlot == modulatorSlot })
