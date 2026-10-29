@@ -127,6 +127,21 @@ final class DatasetFormsTests: XCTestCase {
     guard case .tensor? = ok.definitions["x"] else { return XCTFail("one-shot event-hold of a tensor is the tensor") }
   }
 
+  func testTrainingValueSelectsByContext() throws {
+    let compile = LispEvaluator(sourceDirectory: tempDir)
+    try compile.evaluate(nodes: parseSource("(def g (training-value 1 0.5))"))
+    guard case .float(let c)? = compile.definitions["g"] else { return XCTFail("expected a constant") }
+    XCTAssertEqual(c, 0.5)
+    let train = LispEvaluator(sourceDirectory: tempDir)
+    train.dataset = DatasetContext(
+      rows: 1, frames: frames, sampleRate: sr, rowMode: .decode,
+      learnable: { _, shape, _, _ in Tensor.param(shape, data: [Float](repeating: 0, count: shape.reduce(1, *))) },
+      latentRows: { _, dim in Tensor.param([1, dim], data: [Float](repeating: 0, count: dim)) })
+    try train.evaluate(nodes: parseSource("(def g (training-value 1 0.5))"))
+    guard case .float(let t)? = train.definitions["g"] else { return XCTFail("expected a constant") }
+    XCTAssertEqual(t, 1)
+  }
+
   func testRowSegmentSquashRoundTrip() {
     let segs = [
       RowSegment(name: "a", offset: 0, width: 1, squash: .log, lo: 20, hi: 8000),

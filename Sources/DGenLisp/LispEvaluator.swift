@@ -969,6 +969,8 @@ class LispEvaluator {
       return try evalHitTime(regularArgs, attributes: attributePairs)
     case "declick":
       return try evalDeclick(regularArgs)
+    case "training-value":
+      return try evalTrainingValue(regularArgs)
     // DEPRECATED hidden alias of `tensor` (undocumented; kept for old sources only).
     case "wavetable":
       return try evalWavetable(regularArgs, attributes: attributePairs, mutable: false)

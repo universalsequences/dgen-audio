@@ -448,6 +448,17 @@ extension LispEvaluator {
     return out
   }
 
+  // MARK: training-value
+
+  /// `(training-value TRAIN INSTRUMENT)`: TRAIN under a dataset context, INSTRUMENT in a compile.
+  /// For deployment-only constants (an output trim the decoder must not learn back).
+  func evalTrainingValue(_ args: [ASTNode]) throws -> EvalResult {
+    guard args.count == 2 else {
+      throw LispError.invalidArgument("training-value requires (training-value TRAIN INSTRUMENT)")
+    }
+    return try evaluateAST(dataset != nil ? args[0] : args[1])
+  }
+
   // MARK: declick
 
   /// `(declick Y TRIGGER)`: a retrigger cuts the previous hit; carry its last output sample and
