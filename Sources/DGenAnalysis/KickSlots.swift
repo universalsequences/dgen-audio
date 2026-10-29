@@ -337,7 +337,7 @@ public enum KickRowsV3 {
     ("sh_in", 1, 0.05, 20), ("sh_odd", 1, 0, 1), ("sh_even", 1, -1, 1), ("bk_amt", 1, 0.000001, 2),
     ("c_pos", 1, 0.05, 4), ("c_neg", 1, 0.3, 1.5), ("c_off", 1, -0.3, 0.3), ("c_mix", 1, 0, 1),
     ("rl_hz", 1, 300, 20000), ("rl_mix", 1, 0, 1),
-    ("end", 1, 0.02, 1.2), ("fade", 1, 0.0002, 0.2), ("gain", 1, 0.05, 20),
+    ("t0", 1, -0.002, 0.008), ("end", 1, 0.02, 1.2), ("fade", 1, 0.0002, 0.2), ("gain", 1, 0.05, 20),
     ("nl", 16, 0.0000001, 4), ("nm", 16, 0, 1), ("nd1", 16, 0.0002, 0.5), ("nd2", 16, 0.002, 6),
     ("nrise", 1, 0.00001, 0.05),
     ("cr_lvl", 1, 0.000001, 4), ("cr_rate", 1, 1, 4000), ("cr_col", 4, 0.001, 10), ("cr_dec", 1, 0.05, 20),
@@ -353,6 +353,8 @@ public enum KickRowsV3 {
     "sh_in": [1], "sh_odd": [0.02], "sh_even": [0], "bk_amt": [silent],
     "c_pos": [4], "c_neg": [1], "c_off": [0], "c_mix": [0.5], "rl_hz": [18000], "rl_mix": [0.05],
     "gain": [1],
+    // onset delay: analysis parameters are referenced to t = 0 (prepared sample 0); the refine moves it
+    "t0": [0],
   ]
 
   public static func row(_ s: KickAnalysis, template: KickSlotTemplate, assignment a: KickSlotAssignment,
