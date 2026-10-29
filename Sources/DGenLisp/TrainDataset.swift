@@ -36,6 +36,11 @@ struct TrainDatasetOptions {
   var anchor: Float = 0
   var codeL2: Float = 1e-3
   var windows = [64, 128, 256, 512, 1024, 2048, 4096]
+  /// metric: the acceptance metrics on CPU (MetricLoss), gradient injected as Σ y·g;
+  /// dgen: in-graph batched MR-STFT (windows ≤ 2048 on Metal).
+  var loss = "metric"
+  var bandWeight: Double = 0.3
+  var mrWeight: Double = 1
   var linWeight: Float = 1
   var logWeight: Float = 1
   var checkpointEvery = 50
@@ -73,6 +78,9 @@ struct TrainDatasetOptions {
       case "--anchor": o.anchor = Float(try value()) ?? o.anchor
       case "--code-l2": o.codeL2 = Float(try value()) ?? o.codeL2
       case "--windows": o.windows = try value().split(separator: ",").compactMap { Int($0) }
+      case "--loss": o.loss = try value()
+      case "--band-weight": o.bandWeight = Double(try value()) ?? o.bandWeight
+      case "--mr-weight": o.mrWeight = Double(try value()) ?? o.mrWeight
       case "--lin-weight": o.linWeight = Float(try value()) ?? o.linWeight
       case "--log-weight": o.logWeight = Float(try value()) ?? o.logWeight
       case "--checkpoint-every": o.checkpointEvery = Int(try value()) ?? o.checkpointEvery
@@ -591,6 +599,7 @@ final class DatasetTrainer {
     // Persistent data tensors must exist before the first step: one created mid-step registers
     // in a different order on later steps, shifting memory offsets and missing the kernel cache.
     _ = targetTable
+    _ = gTable
     log("[train-dataset] \(N) targets @ \(Int(sampleRate)) Hz, \(o.frames) frames; layouts \(layouts.keys.sorted()); learnable \(learnables.map { "\($0.name)\($0.shape)" }); tables \(tables.map { "\($0.name)[\($0.dim)]" }); rows \(paramRows.map(\.name))")
     LazyGraphContext.current.clearComputationGraph()
   }
@@ -738,7 +747,21 @@ final class DatasetTrainer {
       DGenConfig.kernelOutputPath = "\(dump)/step\(step)"
     }
     let te = Date()
-    let la = try audioLoss(try output(ev)).backward(frames: o.frames).reduce(0, +)
+    var la: Float
+    if o.loss == "metric" {
+      // forward render, CPU loss + dL/dy, then backward of Σ y·g in a fresh voice graph
+      let flat = try output(ev).realize(frames: o.frames)
+      let (loss, g) = metricGradient(flat)
+      la = loss
+      LazyGraphContext.current.clearComputationGraph()
+      for leaf in latchLeaves { leaf.grad = nil }
+      gTable.updateDataLazily(g)
+      let (ev2, _) = try evaluate(mode: rowMode, latch: .leaves(latchLeaves))
+      let playhead = floor(seconds() * sampleRate + 0.5)
+      _ = try (try output(ev2) * gTable.sampleRow(playhead)).sum().backward(frames: o.frames)
+    } else {
+      la = try audioLoss(try output(ev)).backward(frames: o.frames).reduce(0, +)
+    }
     DGenConfig.kernelOutputPath = nil
     logTiming(String(format: "voice backward %.0f ms wall", Date().timeIntervalSince(te) * 1000))
     let grads = latchLeaves.map { l in l.grad?.getData() ?? [Float](repeating: 0, count: l.shape.reduce(1, *)) }
@@ -761,6 +784,33 @@ final class DatasetTrainer {
     let staticFrames = 64
     let ls = try staticToSignal(reg, frames: staticFrames).backward(frames: staticFrames).reduce(0, +)
     return (la, ls)
+  }
+
+  /// [frames, N] time-major dL/dy for the injected surrogate (persistent data tensor).
+  lazy var gTable: Tensor = Tensor([Float](repeating: 0, count: o.frames * N)).reshape([o.frames, N])
+
+  /// CPU metric loss of a [frames × N] interleaved render: (mean loss, time-major gradient of
+  /// the mean).
+  var lastMetric: (band: [Double], mr: [Double]) = ([], [])
+  func metricGradient(_ flat: [Float]) -> (Float, [Float]) {
+    let ml = MetricLoss(windows: o.windows, bandWeight: o.bandWeight, mrWeight: o.mrWeight)
+    var results = [MetricLoss.Result?](repeating: nil, count: N)
+    let lock = NSLock()
+    DispatchQueue.concurrentPerform(iterations: N) { r in
+      var y = [Float](repeating: 0, count: o.frames)
+      for f in 0..<o.frames { y[f] = flat[f * N + r] }
+      let res = ml.lossAndGradient(y, targets[r])
+      lock.lock(); results[r] = res; lock.unlock()
+    }
+    var g = [Float](repeating: 0, count: o.frames * N)
+    var total = 0.0
+    for r in 0..<N {
+      let res = results[r]!
+      total += res.loss
+      for f in 0..<o.frames { g[f * N + r] = res.grad[f] / Float(N) }
+    }
+    lastMetric = (results.map { $0!.band }, results.map { $0!.mr })
+    return (Float(total / Double(N)), g)
   }
 
   /// Realises several static tensors in one compile (flattened, padded and summed into one).
@@ -840,25 +890,34 @@ final class DatasetTrainer {
     let leaf = Tensor(u).reshape([N, L.width])
     let (ev, _) = try evaluate(mode: .leaf(leaf))
     let flat = try output(ev).realize(frames: o.frames)
-    var scores: [String: Double] = [:]
-    for (r, n) in names.enumerated() {
-      var y = [Float](repeating: 0, count: o.frames)
-      for f in 0..<o.frames { y[f] = flat[f * N + r] }
-      try MiniWav.write(url: run.appendingPathComponent("renders/\(n).wav"), samples: y,
-                        sampleRate: Int(sampleRate))
-      let scorer = try TrainSpectralScorer(target: targets[r], windows: o.windows.filter { $0 <= o.frames },
-                                           epsilon: 1e-3)
-      scores[n] = Double(y.allSatisfy(\.isFinite) ? scorer.score(y) : .infinity)
+    var rowsOut: [String: Any] = [:]
+    var bands: [Double] = [], mrs: [Double] = []
+    let renders = names.indices.map { r in (0..<o.frames).map { flat[$0 * N + r] } }
+    var sc = [(Double, Double)](repeating: (0, 0), count: N)
+    DispatchQueue.concurrentPerform(iterations: N) { r in
+      let y = renders[r]
+      sc[r] = y.allSatisfy(\.isFinite)
+        ? MetricLoss.scores(y, targets[r], windows: [64, 128, 256, 512, 1024, 2048, 4096])
+        : (.infinity, .infinity)
     }
-    let sorted = scores.values.sorted()
+    for (r, n) in names.enumerated() {
+      try MiniWav.write(url: run.appendingPathComponent("renders/\(n).wav"), samples: renders[r],
+                        sampleRate: Int(sampleRate))
+      rowsOut[n] = ["band": sc[r].0, "mr": sc[r].1]
+      bands.append(sc[r].0); mrs.append(sc[r].1)
+    }
+    func q(_ v: [Double], _ p: Double) -> Double {
+      let s = v.sorted(); return s[min(s.count - 1, Int((Double(s.count - 1) * p).rounded()))]
+    }
     let summary: [String: Any] = [
-      "stage": o.stage, "steps": o.steps, "mr_median": sorted[sorted.count / 2],
-      "mr_mean": sorted.reduce(0, +) / Double(sorted.count), "scores": scores,
+      "stage": o.stage, "steps": o.steps,
+      "band_median": q(bands, 0.5), "band_p90": q(bands, 0.9),
+      "mr_median": q(mrs, 0.5), "mr_p90": q(mrs, 0.9), "scores": rowsOut,
     ]
     try JSONSerialization.data(withJSONObject: summary, options: [.prettyPrinted, .sortedKeys])
       .write(to: run.appendingPathComponent("summary-\(o.stage).json"))
-    log(String(format: "[train-dataset] %@ done: MR median %.4f mean %.4f", o.stage,
-               summary["mr_median"] as! Double, summary["mr_mean"] as! Double))
+    log(String(format: "[train-dataset] %@ done: band median %.3f p90 %.3f, MR median %.4f p90 %.4f",
+               o.stage, q(bands, 0.5), q(bands, 0.9), q(mrs, 0.5), q(mrs, 0.9)))
     return summary
   }
 }
