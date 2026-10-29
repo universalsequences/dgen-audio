@@ -706,6 +706,10 @@ final class DatasetTrainer {
     let leafName = "row:" + pr.name
     let leaf = store.leaf(leafName, [N, L.width]) { u0 }
     let w = columnWeights(L)
+    if let seg = ProcessInfo.processInfo.environment["DGENLISP_FDCHECK"] {
+      try fdcheck(leaf: leaf, layout: L, row: pr.name, segments: seg.split(separator: ",").map(String.init))
+      throw TrainProtocolError("fdcheck-only run (DGENLISP_FDCHECK)")
+    }
     try loop({ step in
       let r = try latchStep(step, rowMode: .leaf(leaf), row: pr.name, anchorOn: leaf)
       // frozen columns: zero their gradient
@@ -718,11 +722,36 @@ final class DatasetTrainer {
     return try finish()
   }
 
+  /// Central finite differences of the refine loss vs the latch-step gradient, for a few rows of
+  /// each named segment (u space). Prints one line per probe.
+  func fdcheck(leaf: Tensor, layout L: RowLayout, row: String, segments: [String]) throws {
+    let base = leaf.getData()!
+    func lossAt(_ u: [Float]) throws -> Float {
+      leaf.updateDataLazily(u)
+      zeroGrads()
+      return try latchStep(0, rowMode: .leaf(leaf), row: row, anchorOn: leaf).0
+    }
+    _ = try lossAt(base)
+    let g = leaf.grad?.getData() ?? []
+    let h = Float(ProcessInfo.processInfo.environment["DGENLISP_FD_H"].flatMap(Double.init) ?? 1e-2)
+    for name in segments {
+      guard let s = L.segment(name) else { log("[fd] no segment \(name)"); continue }
+      for r in [0, N / 2, N - 1] {
+        let i = r * L.width + s.offset
+        var up = base, dn = base
+        up[i] += h; dn[i] -= h
+        let fd = (try lossAt(up) - lossAt(dn)) / (2 * h)
+        log(String(format: "[fd] %@ row %d: fd %.6g ad %.6g ratio %.4f", name, r, fd, g[i], g[i] != 0 ? fd / g[i] : .nan))
+      }
+    }
+    leaf.updateDataLazily(base)
+  }
+
   func pretrain() throws -> [String: Any] {
     guard let pr = paramRows.first, rowsU[pr.name] != nil else {
       throw TrainProtocolError("pretrain needs a param-row and --rows")
     }
-    let staticFrames = 64
+    let staticFrames = 1
     try loop({ step in
       LazyGraphContext.current.clearComputationGraph()
       var S: Tensor? = nil
@@ -854,7 +883,7 @@ final class DatasetTrainer {
       let z = store.leaves["z:" + t.name]!
       reg = reg + (z * z).sum() * (o.codeL2 / Float(N * t.dim))
     }
-    let staticFrames = 64
+    let staticFrames = 1
     let ls = try staticToSignal(reg, frames: staticFrames).backward(frames: staticFrames).reduce(0, +)
     return (la, ls)
   }

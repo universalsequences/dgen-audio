@@ -422,6 +422,10 @@ class LispEvaluator {
   // MARK: - Atom evaluation
 
   private func evaluateAtom(_ value: String) throws -> EvalResult {
+    if (value.lowercased() == "samplerate" || value.lowercased() == "sample-rate"), let dataset {
+      // Training renders at one known rate: a constant keeps sample-rate-scaled per-hit values static.
+      return .float(dataset.sampleRate)
+    }
     if value.lowercased() == "samplerate" || value.lowercased() == "sample-rate" {
       return .signal(Signal.hostSampleRate())
     }
@@ -561,7 +565,12 @@ class LispEvaluator {
     guard let shapeStr = attrValue(attrs, "@shape") else {
       throw LispError.invalidArgument("\(form) requires @shape [d1,d2,...]")
     }
-    let shape = parseShape(shapeStr)
+    // `rows` in a shape is the dataset row count (DatasetForms): 1 in a compile, B in training,
+    // so per-row recursive state ([rows 1]) is written once for both.
+    let rows = dataset?.rows ?? 1
+    let shape = shapeStr.trimmingCharacters(in: CharacterSet(charactersIn: "[]"))
+      .split(whereSeparator: { $0 == "," || $0.isWhitespace })
+      .compactMap { $0 == "rows" ? rows : Int($0) }
     let hop = attrValue(attrs, "@hop").flatMap { Int($0) }
     let data = attrValue(attrs, "@data").map { parseFloatList($0) }
     tensorHistoryBindings[name] = TensorHistory(shape: shape, hop: hop, data: data)
