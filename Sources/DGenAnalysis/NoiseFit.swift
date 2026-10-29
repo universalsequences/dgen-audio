@@ -61,7 +61,7 @@ public enum NoiseFit {
         public var eventRiseDB = 6.0
         /// an event is admitted when the dB RMS of the band-power fit falls by at least this share
         public var eventMinGain = 0.03
-        public var onsetEventMinGain = 0.06
+        public var onsetEventMinGain = 0.10
         public init() {}
     }
 

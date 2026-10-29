@@ -321,7 +321,8 @@ public enum KickAnalyzer {
         var crackle: CrackleParams? = nil
         if o.v3 {
             // crackle first: its impulses are gated out of the hiss/event measurement
-            let cr = Crackle.fit(residual: resid, sr: sr, onset: onset, end: gate.E - gate.Fd)
+            let cr = Crackle.fit(residual: resid, sr: sr, onset: onset, end: gate.E - gate.Fd,
+                                 fundamental: modes[0].params)
             crackle = cr.params
             nopt.sampleMask = cr.mask
             nopt.maxEvents = o.maxEvents

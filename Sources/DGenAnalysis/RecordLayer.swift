@@ -53,6 +53,8 @@ public struct CrackleParams: Codable, Equatable {
     public var eligibleSeconds: Double? = nil
     /// level that would match the counted clicks' energy in expectation (diagnostic)
     public var levelFromEnergy: Double? = nil
+    /// clicks rejected as phase-locked to the fundamental
+    public var phaseLocked: Int? = nil
     public init(level: Double, rate: Double, colour: [Double], decay: Double, present: Bool, detected: Int,
                 scannedSeconds: Double, threshold: Double, clickTimes: [Double]? = nil, clickPeaks: [Double]? = nil) {
         self.level = level; self.rate = rate; self.colour = colour; self.decay = decay; self.present = present
@@ -142,10 +144,12 @@ public enum Crackle {
         public var scaleWindow = 0.01
         /// scan from onset + this (the attack's own transients and strikes live before it)
         public var startAfterOnset = 0.03
+        public var endMargin = 0.01
         public var minSeparation = 0.001
         public var maskBefore = 0.0005
         public var maskAfter = 0.0015
         public var minClicks = 3
+        public var minQuietClicks = 2
         public var minRate = 3.0
         public init() {}
     }
@@ -153,21 +157,24 @@ public enum Crackle {
     /// Detect crackle impulses in the residual and estimate (rate, colour, level).
     ///
     /// Model identity: θ* = the median over the scan of the local threshold (threshold · robust σ of
-    /// the high-passed residual). Clicks with peak >= θ* are the generator's impulses: rate = their
-    /// count over the time they were detectable (Σ_t min(1, (θ*/θ(t))²) under the Pareto tail where
-    /// the local threshold θ(t) exceeds θ*), and the level puts
-    /// the generator's unit impulse (a = 1) at peak θ* after the same high-pass, so its Pareto tail
-    /// (P(a > x) = 1/x²) reproduces the peak distribution above θ*; weaker crackle is buried in the
+    /// the high-passed residual). Clicks with peak >= θ* are the generator's impulses and the lowest
+    /// of them, s, its unit peak: rate = their count over the time they were detectable
+    /// (Σ_t min(1, (s/θ(t))²) under the Pareto tail where the local threshold θ(t) exceeds s), and
+    /// the level puts
+    /// the generator's unit impulse (a = 1) at peak s after the same high-pass, so its Pareto tail
+    /// (P(a > x) = 1/x²) reproduces the peak distribution above s; weaker crackle is buried in the
     /// hiss either way. Colour: a 4-weight fit of |Σ c_k H_k|² to the clicks' average power spectrum
     /// (minus nearby non-click spectra), in dB.
     /// Returns a sample mask (0 on the clicks, tapered) to gate them out of the hiss measurement.
     public static func fit(residual r: [Double], sr: Double, onset: Double, end: Double,
+                           fundamental: ModeParams? = nil,
                            options o: FitOptions = FitOptions()) -> (params: CrackleParams, mask: [Double])
     {
         let n = r.count
         var mask = [Double](repeating: 1, count: n)
         let i0 = Int((onset + o.startAfterOnset) * sr)
-        let i1 = min(n, Int(end * sr))
+        // stop short of the end: a chopped sample (or a residual step there) rings through the high-pass
+        let i1 = min(n, Int((end - o.endMargin) * sr))
         guard i1 - i0 > Int(0.02 * sr) else { return (silent(), mask) }
         let hp = FFT.bandGain(lo: o.highpassHz, hi: 0, taper: 0.25)
         let y = FFT.spectralFilter(r, sampleRate: sr, analytic: false, gain: hp).re
@@ -200,20 +207,55 @@ public enum Crackle {
             i += 1
         }
         let scanned = Double(i1 - i0) / sr
-        guard clicks.count >= o.minClicks else { return (silent(scanned: scanned), mask) }
+        // clicks phase-locked to the fundamental (once or twice per cycle: the record's clipping /
+        // the kick's own wave edges) are not crackle: Rayleigh test on the slot-0 phase at the
+        // clicks, drop those within ±60° of the mean phase when the lock is strong
+        var lockedOut = 0
+        if let f0 = fundamental, clicks.count >= 4 {
+            for order in [1.0, 2.0] {
+                let ph = clicks.map { order * (f0.phaseLaw(Double($0) / sr) + f0.phi) }
+                let c = ph.reduce(0) { $0 + cos($1) } / Double(ph.count)
+                let sn = ph.reduce(0) { $0 + sin($1) } / Double(ph.count)
+                guard (c * c + sn * sn).squareRoot() > 0.5 else { continue }
+                let mean = atan2(sn, c)
+                let before = clicks.count
+                clicks = clicks.indices.filter { abs(remainder(ph[$0] - mean, 2 * Double.pi)) > Double.pi / 3 }
+                    .map { clicks[$0] }
+                lockedOut += before - clicks.count
+                if clicks.count < 4 { break }
+            }
+        }
+        guard clicks.count >= o.minClicks else {
+            var p = silent(scanned: scanned)
+            p.phaseLocked = lockedOut
+            return (p, mask)
+        }
         let peaks = clicks.map { abs(y[$0]) }
-        // common absolute threshold θ* = median of the local thresholds: clicks above θ* are counted
-        // where the local threshold is below it (the quieter part of the scan, where crackle is heard)
+        // common absolute threshold θ* = median of the local thresholds. A record's crackle is
+        // stationary, so it must show in the quiet half of the scan (local threshold <= θ*), where
+        // it is easiest to see: clicks only in the loud early part are the attack's own transients.
+        // The generator's unit peak s is the lowest quiet-half click (>= θ*): = θ* when crackle
+        // continues under the hiss, higher when it all stands clear of it.
         let thGrid = sig.map { o.threshold * $0 }
         let thStar = thGrid.sorted()[thGrid.count / 2]
-        // impulses with peak >= θ* are detectable at t when also >= θ(t): under the Pareto tail
-        // a fraction min(1, (θ*/θ(t))²) of them
+        let quiet = clicks.indices.filter { o.threshold * sigma(clicks[$0]) <= thStar }
+        guard quiet.count >= o.minQuietClicks else {
+            var p = silent(scanned: scanned)
+            p.phaseLocked = lockedOut
+            p.detected = clicks.count
+            return (p, mask)
+        }
+        let sUnit = max(thStar, quiet.map { peaks[$0] }.min()!)
+        let above = clicks.indices.filter { peaks[$0] >= sUnit }
+        guard above.count >= o.minClicks else { return (silent(scanned: scanned), mask) }
+        // impulses with peak >= s are detectable at t when also >= θ(t): under the Pareto tail
+        // a fraction min(1, (s/θ(t))²) of them
         var eligible = 0.0
-        for th in thGrid { eligible += min(1, (thStar / th) * (thStar / th)) }
+        for th in thGrid { eligible += min(1, (sUnit / th) * (sUnit / th)) }
         eligible *= Double(step) / sr
-        let counted = clicks.indices.filter { peaks[$0] >= thStar }
+        let counted = above
         let rate = Double(counted.count) / max(eligible, 1e-3)
-        guard counted.count >= o.minClicks, rate >= o.minRate else { return (silent(scanned: scanned), mask) }
+        guard rate >= o.minRate else { return (silent(scanned: scanned), mask) }
         // click energy (noise-floor corrected) and spectra
         let wb = Int(o.maskBefore * sr), wa = Int(o.maskAfter * sr)
         var eClicks = 0.0
@@ -276,12 +318,12 @@ public enum Crackle {
         var colour = fit.x.map { exp($0) }
         let cmax = colour.max() ?? 1
         colour = colour.map { min(max($0 / cmax, 0.001), 1) }
-        // level: the generator's unit impulse (a = 1) peaks at θ* after the same high-pass, so its
-        // Pareto tail reproduces the counted clicks' peak distribution above θ*. (The energy-matched
+        // level: the generator's unit impulse (a = 1) peaks at s after the same high-pass, so its
+        // Pareto tail reproduces the counted clicks' peak distribution above s. (The energy-matched
         // level is kept as a diagnostic: the heavy tail makes the measured energy unreliable.)
         let hcol = impulseResponse(colour: colour, sampleRate: sr, count: 4096)
         let hpk = FFT.spectralFilter(hcol, sampleRate: sr, analytic: false, gain: hp).re.map { abs($0) }.max() ?? 1
-        let level = thStar / max(hpk, 1e-12)
+        let level = sUnit / max(hpk, 1e-12)
         let Pmeas = eClicks / Double(i1 - i0)
         let G = powerGain(colour: colour, sampleRate: sr, weight: hp)
         let energyLevel = (Pmeas / max(rate / sr * meanSquareAmplitude * G, 1e-30)).squareRoot()
@@ -300,6 +342,7 @@ public enum Crackle {
                                    threshold: o.threshold,
                                    clickTimes: clicks.map { Double($0) / sr }, clickPeaks: peaks)
         params.counted = counted.count
+        params.phaseLocked = lockedOut
         params.eligibleSeconds = eligible
         params.levelFromEnergy = energyLevel
         return (params, mask)
