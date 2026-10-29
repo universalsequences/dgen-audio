@@ -927,8 +927,7 @@ final class DatasetTrainer {
         : (.infinity, .infinity)
     }
     for (r, n) in names.enumerated() {
-      try MiniWav.write(url: run.appendingPathComponent("renders/\(n).wav"), samples: renders[r],
-                        sampleRate: Int(sampleRate))
+      try FloatWav.write(run.appendingPathComponent("renders/\(n).wav"), renders[r], sampleRate: Int(sampleRate))
       rowsOut[n] = ["band": sc[r].0, "mr": sc[r].1]
       bands.append(sc[r].0); mrs.append(sc[r].1)
     }
@@ -979,5 +978,20 @@ struct SplitMix64 {
   mutating func gaussian() -> Float {
     let u1 = max(uniform(), 1e-7), u2 = uniform()
     return (-2 * Foundation.log(u1)).squareRoot() * Foundation.cos(2 * Float.pi * u2)
+  }
+}
+
+/// 32-bit float mono WAV (renders keep levels above full scale; MiniWav clamps to 16-bit).
+enum FloatWav {
+  static func write(_ url: URL, _ samples: [Float], sampleRate: Int) throws {
+    var d = Data()
+    func u32(_ v: UInt32) { withUnsafeBytes(of: v.littleEndian) { d.append(contentsOf: $0) } }
+    func u16(_ v: UInt16) { withUnsafeBytes(of: v.littleEndian) { d.append(contentsOf: $0) } }
+    d.append(contentsOf: Array("RIFF".utf8)); u32(UInt32(36 + samples.count * 4))
+    d.append(contentsOf: Array("WAVEfmt ".utf8)); u32(16); u16(3); u16(1)
+    u32(UInt32(sampleRate)); u32(UInt32(sampleRate * 4)); u16(4); u16(32)
+    d.append(contentsOf: Array("data".utf8)); u32(UInt32(samples.count * 4))
+    for x in samples { withUnsafeBytes(of: x.bitPattern.littleEndian) { d.append(contentsOf: $0) } }
+    try d.write(to: url, options: .atomic)
   }
 }
