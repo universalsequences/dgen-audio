@@ -1,6 +1,7 @@
 // DGenLisp - Lisp-to-Dylib Compiler CLI
 //
 // Usage: dgenlisp compile [<file.lisp>] [options]
+//        dgenlisp analyze-kicks --dataset DIR -o analysis.json (see AnalyzeKicksCommand)
 //   -o, --output <dir>       Output directory (default: .)
 //   --name <name>            Output name (default: patch)
 //   --sample-rate <rate>     Sample rate (default: 44100)
@@ -45,6 +46,10 @@ if CommandLine.arguments.count > 1 && CommandLine.arguments[1] == "metric-score"
         i += 2
     }
     exit(0)
+}
+// Per-sample kick analysis (DGenAnalysis); owns its own arguments.
+if CommandLine.arguments.count > 1 && CommandLine.arguments[1] == "analyze-kicks" {
+    AnalyzeKicksCommand.run(arguments: Array(CommandLine.arguments.dropFirst(2)))
 }
 // Hidden render helper spawned by the trainer (realize() must not share a
 // process with backward()).
