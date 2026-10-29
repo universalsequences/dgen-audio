@@ -2043,6 +2043,26 @@ class LispEvaluator {
       return value
     }
 
+    // Dataset training fixes every scalar param at its default: a constant, so knob-scaled
+    // per-hit values stay static (latchable) and no Signal.param outlives the evaluation.
+    if dataset != nil {
+      let value = EvalResult.float(defaultVal)
+      params.append(ParamInfo(
+        name: name, canonicalName: identity.canonicalName, cellId: nil,
+        defaultValue: defaultVal, min: minVal, max: maxVal,
+        unit: unit, hidden: hidden, group: group, env: env, role: role,
+        generatedKind: generatedKind, generatedFor: generatedFor,
+        modulationMode: modulationMode, modulationDepthMin: modulationDepthMin,
+        modulationDepthMax: modulationDepthMax,
+        modulationActiveParamName: modulationActiveParamName,
+        modulationResolvedSymbolName: modulationResolvedSymbolName,
+        generatedModulatorSlot: generatedModulatorSlot,
+        options: paramOptions,
+        extraAttributes: extraAttributes))
+      paramValues[identity.canonicalName] = value
+      return value
+    }
+
     let graph = LazyGraphContext.current
     let signal: Signal
     if reusesRegisteredParameters,
@@ -3001,9 +3021,22 @@ class LispEvaluator {
     if let shape = tensorShape(of: val) {
       try checkAxis("sum-axis", axis: axis, shape: shape)
     }
+    // `@keepdims true` keeps the reduced axis as size 1 ([B,K] -> [B,1]), so a row-batched
+    // reduction still broadcasts against other [B,1] row values.
+    let keep = parseBoolAttr(attributes, "@keepdims")
+    func kept(_ shape: [Int]) -> [Int] {
+      var s = shape
+      let a = axis < 0 ? axis + s.count + 1 : axis
+      s.insert(1, at: min(max(a, 0), s.count))
+      return s
+    }
     switch val {
-    case .tensor(let t): return .tensor(t.sum(axis: axis))
-    case .signalTensor(let st): return .signalTensor(st.sum(axis: axis))
+    case .tensor(let t):
+      let r = t.sum(axis: axis)
+      return .tensor(keep ? r.reshape(kept(r.shape)) : r)
+    case .signalTensor(let st):
+      let r = st.sum(axis: axis)
+      return .signalTensor(keep ? r.reshape(kept(r.shape)) : r)
     default: throw LispError.typeError("sum-axis: argument must be tensor or signalTensor")
     }
   }

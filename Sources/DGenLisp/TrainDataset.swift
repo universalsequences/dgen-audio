@@ -446,7 +446,9 @@ final class DatasetTrainer {
 
   /// Evaluates the training patch with a dataset context; returns the evaluator.
   @discardableResult
-  func evaluate(mode: DatasetContext.RowMode) throws -> (LispEvaluator, DatasetContext) {
+  func evaluate(mode: DatasetContext.RowMode, latch: DatasetContext.LatchMode = .identity) throws
+    -> (LispEvaluator, DatasetContext)
+  {
     let ctx = DatasetContext(
       rows: N, frames: o.frames, sampleRate: sampleRate, rowMode: mode,
       learnable: { [self] name, shape, fileData, initKind in
@@ -456,6 +458,7 @@ final class DatasetTrainer {
       latentRows: { [self] name, dim in
         store.leaf("z:" + name, [N, dim]) { initCodes(dim) }
       })
+    ctx.latchMode = latch
     let ev = LispEvaluator(sourceDirectory: patchDir)
     ev.dataset = ctx
     do {
@@ -585,6 +588,9 @@ final class DatasetTrainer {
       guard let pr = paramRows.first else { throw TrainProtocolError("--rows given but the patch has no param-row") }
       rowsU[pr.name] = u
     }
+    // Persistent data tensors must exist before the first step: one created mid-step registers
+    // in a different order on later steps, shifting memory offsets and missing the kernel cache.
+    _ = targetTable
     log("[train-dataset] \(N) targets @ \(Int(sampleRate)) Hz, \(o.frames) frames; layouts \(layouts.keys.sorted()); learnable \(learnables.map { "\($0.name)\($0.shape)" }); tables \(tables.map { "\($0.name)[\($0.dim)]" }); rows \(paramRows.map(\.name))")
     LazyGraphContext.current.clearComputationGraph()
   }
@@ -654,20 +660,12 @@ final class DatasetTrainer {
     let leaf = store.leaf(leafName, [N, L.width]) { u0 }
     let w = columnWeights(L)
     try loop({ step in
-      LazyGraphContext.current.clearComputationGraph()
-      let (ev, _) = try evaluate(mode: .leaf(leaf))
-      var loss = audioLoss(try output(ev))
-      if o.anchor > 0, let a = anchorLoss(leaf, row: pr.name) {
-        loss = loss + staticToSignal(a, frames: o.frames) * o.anchor
-      }
-      let te = Date()
-      let v = try loss.backward(frames: o.frames).reduce(0, +)
-      logTiming(String(format: "refine backward %.0f ms wall", Date().timeIntervalSince(te) * 1000))
+      let r = try latchStep(step, rowMode: .leaf(leaf), row: pr.name, anchorOn: leaf)
       // frozen columns: zero their gradient
       if w.contains(0), let g = leaf.grad?.getData() {
         leaf.grad = Tensor(zip(g.indices, g).map { i, x in w[i % L.width] > 0 ? x : 0 }).reshape([N, L.width])
       }
-      return (v, 0)
+      return r
     }, trainable: { [leafName] })
     try export()
     return try finish()
@@ -695,43 +693,93 @@ final class DatasetTrainer {
   }
 
   func audio() throws -> [String: Any] {
-    guard let pr = paramRows.first, let L = layouts[pr.layout] else {
-      throw TrainProtocolError("audio needs a param-row")
-    }
-    let staticFrames = 64
-    let uLeaf = Tensor.param([N, L.width], data: [Float](repeating: 0, count: N * L.width))
-    let gU = Tensor([Float](repeating: 0, count: N * L.width))
-    let w = columnWeights(L)
+    guard let pr = paramRows.first else { throw TrainProtocolError("audio needs a param-row") }
     try loop({ step in
-      // (1) U = decoder(codes)
-      LazyGraphContext.current.clearComputationGraph()
-      let (_, c1) = try evaluate(mode: .capture)
-      guard let u = c1.captured[pr.name] else { throw TrainProtocolError("param-row was not reached") }
-      let uValues = try realizeStatic(u, count: N * L.width)
-      // (2) audio backward to the leaf
-      LazyGraphContext.current.clearComputationGraph()
-      uLeaf.updateDataLazily(uValues)
-      uLeaf.grad = nil
-      let (ev, _) = try evaluate(mode: .leaf(uLeaf))
-      let la = try audioLoss(try output(ev)).backward(frames: o.frames).reduce(0, +)
-      var g = uLeaf.grad?.getData() ?? [Float](repeating: 0, count: N * L.width)
-      for i in g.indices where w[i % L.width] == 0 { g[i] = 0 }
-      // (3) decoder backward of Σ U·g (+ anchor, code prior)
-      LazyGraphContext.current.clearComputationGraph()
-      gU.updateDataLazily(g)
-      let (_, c3) = try evaluate(mode: .capture)
-      let u3 = c3.captured[pr.name]!
-      var reg = (u3 * gU.reshape([N, L.width])).sum()
-      if o.anchor > 0, let a = anchorLoss(u3, row: pr.name) { reg = reg + a * o.anchor }
-      for t in tables where o.codeL2 > 0 {
-        let z = store.leaves["z:" + t.name]!
-        reg = reg + (z * z).sum() * (o.codeL2 / Float(N * t.dim))
-      }
-      let ls = try staticToSignal(reg, frames: staticFrames).backward(frames: staticFrames).reduce(0, +)
-      return (la, ls)
+      try latchStep(step, rowMode: .decode, row: pr.name, anchorOn: nil)
     }, trainable: { store.order.filter { !$0.hasPrefix("row:") } })
     try export()
     return try finish()
+  }
+
+  // MARK: latch-boundary step
+
+  /// Persistent voice-side leaves (one per static latch) and their gradient tensors.
+  var latchLeaves: [Tensor] = []
+  var latchGrads: [Tensor] = []
+
+  /// One gradient of (audio loss + static terms) w.r.t. the static side (row leaf, or decoder
+  /// weights and codes), cut at the latches:
+  ///   1. static pass: realise every latched value;
+  ///   2. voice pass: render from leaves holding those values, audio loss backward → dL/dleaf
+  ///      (already summed over frames);
+  ///   3. static pass: backward of Σ latched·dL/dleaf (+ anchor, code prior).
+  func latchStep(_ step: Int, rowMode: DatasetContext.RowMode, row: String, anchorOn: Tensor?)
+    throws -> (Float, Float)
+  {
+    // 1
+    LazyGraphContext.current.clearComputationGraph()
+    if ProcessInfo.processInfo.environment["DGENLISP_LIVE_TENSORS"] != nil {
+      let live = LazyGraphContext.current.liveTensorSummary
+      log("[live] \(live.count) tensors (\(live.filter(\.data).count) with data), signals: \(LazyGraphContext.current.liveSignalCount)")
+    }
+    let (_, c1) = try evaluate(mode: rowMode, latch: .capture)
+    let values = try realizeAll(c1.latched)
+    if latchLeaves.count != values.count {
+      guard latchLeaves.isEmpty else { throw TrainProtocolError("latch count changed between steps") }
+      latchLeaves = zip(c1.latched, values).map { Tensor.param($0.shape, data: $1) }
+      latchGrads = c1.latched.map { Tensor([Float](repeating: 0, count: $0.shape.reduce(1, *))).reshape($0.shape) }
+      log("[train-dataset] \(values.count) latch leaves, \(values.reduce(0) { $0 + $1.count }) values")
+    }
+    // 2
+    LazyGraphContext.current.clearComputationGraph()
+    for (leaf, v) in zip(latchLeaves, values) { leaf.updateDataLazily(v); leaf.grad = nil }
+    let (ev, _) = try evaluate(mode: rowMode, latch: .leaves(latchLeaves))
+    if let dump = ProcessInfo.processInfo.environment["DGENLISP_KERNEL_DUMP"] {
+      DGenConfig.kernelOutputPath = "\(dump)/step\(step)"
+    }
+    let te = Date()
+    let la = try audioLoss(try output(ev)).backward(frames: o.frames).reduce(0, +)
+    DGenConfig.kernelOutputPath = nil
+    logTiming(String(format: "voice backward %.0f ms wall", Date().timeIntervalSince(te) * 1000))
+    let grads = latchLeaves.map { l in l.grad?.getData() ?? [Float](repeating: 0, count: l.shape.reduce(1, *)) }
+    // 3
+    LazyGraphContext.current.clearComputationGraph()
+    for (g, v) in zip(latchGrads, grads) { g.updateDataLazily(v) }
+    for l in latchLeaves { l.grad = nil }
+    let (_, c3) = try evaluate(mode: rowMode, latch: .capture)
+    guard c3.latched.count == latchGrads.count else { throw TrainProtocolError("latch count changed in pass 3") }
+    var reg = Tensor([0.0]).sum()
+    for (x, g) in zip(c3.latched, latchGrads) { reg = reg + (x * g).sum() }
+    if o.anchor > 0 {
+      let u = anchorOn ?? c3.captured[row]
+      if let u, let a = anchorLoss(u, row: row) { reg = reg + a * o.anchor }
+    }
+    for t in tables where o.codeL2 > 0 && anchorOn == nil {
+      let z = store.leaves["z:" + t.name]!
+      reg = reg + (z * z).sum() * (o.codeL2 / Float(N * t.dim))
+    }
+    let staticFrames = 64
+    let ls = try staticToSignal(reg, frames: staticFrames).backward(frames: staticFrames).reduce(0, +)
+    return (la, ls)
+  }
+
+  /// Realises several static tensors in one compile (flattened, padded and summed into one).
+  func realizeAll(_ ts: [Tensor]) throws -> [[Float]] {
+    let counts = ts.map { $0.shape.reduce(1, *) }
+    let total = counts.reduce(0, +)
+    guard total > 0 else { return ts.map { _ in [] } }
+    var packed: Tensor? = nil
+    var off = 0
+    for (t, n) in zip(ts, counts) {
+      let p = t.reshape([n]).pad([(off, total - off - n)])
+      packed = packed.map { $0 + p } ?? p
+      off += n
+    }
+    let flat = try realizeStatic(packed!, count: total)
+    var out: [[Float]] = []
+    off = 0
+    for n in counts { out.append(Array(flat[off..<(off + n)])); off += n }
+    return out
   }
 
   /// Realises a static tensor's values (one frame).

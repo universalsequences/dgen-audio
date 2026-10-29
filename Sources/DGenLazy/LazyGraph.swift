@@ -104,6 +104,14 @@ public class LazyGraph {
   internal var tensors: [WeakRef<Tensor>] = []
   internal var signals: [WeakRef<Signal>] = []
 
+  /// Debug: tracked signals still alive.
+  public var liveSignalCount: Int { signals.filter { $0.value != nil }.count }
+
+  /// Debug: (shape, has data) of every tracked tensor that is still alive.
+  public var liveTensorSummary: [(shape: Shape, data: Bool)] {
+    tensors.compactMap { $0.value.map { ($0.shape, $0.getData() != nil) } }
+  }
+
   /// Forward nodes whose gradients are intentionally unsupported. `runBackward`
   /// checks whether any marked node is an ancestor of the requested loss.
   internal var unsupportedGradientNodes: [NodeID: String] = [:]

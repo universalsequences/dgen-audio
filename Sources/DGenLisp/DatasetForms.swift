@@ -111,6 +111,25 @@ final class DatasetContext {
     case leaf(Tensor)
   }
 
+  /// What one-shot latches do (§ one-shot lowering). Latches are the instrument's
+  /// static/per-sample boundary, so the trainer cuts the graph there: the voice is rendered from
+  /// leaves holding the latched values (gradients arrive already summed over frames), and the
+  /// static side is backpropagated separately. Backpropagating a per-frame adjoint through the
+  /// static ops instead tapes [frames, B, P] per use.
+  enum LatchMode {
+    /// Return the latched value itself.
+    case identity
+    /// Record each static latched tensor (in evaluation order) and return it.
+    case capture
+    /// Return the k-th leaf for the k-th static latched tensor.
+    case leaves([Tensor])
+  }
+
+  var latchMode: LatchMode = .identity
+  /// Static latched tensors in evaluation order (`.capture`).
+  var latched: [Tensor] = []
+  var latchIndex = 0
+
   /// B: rows in this evaluation.
   let rows: Int
   /// Frames rendered (the `hit-time` ramp never wraps inside them).
@@ -439,7 +458,23 @@ extension LispEvaluator {
     }
     let value = try evaluateAST(args[0])
     switch value {
-    case .tensor, .float: return value
+    case .tensor(let t):
+      guard let dataset else { return value }
+      let k = dataset.latchIndex
+      dataset.latchIndex += 1
+      switch dataset.latchMode {
+      case .identity: return value
+      case .capture:
+        dataset.latched.append(t)
+        return value
+      case .leaves(let leaves):
+        guard k < leaves.count, leaves[k].shape == t.shape else {
+          throw LispError.invalidArgument(
+            "\(op): latch \(k) has shape \(t.shape) but the trainer's leaf does not match")
+        }
+        return .tensor(leaves[k])
+      }
+    case .float: return value
     case .signal(let s) where s.data != nil: return value
     default:
       throw LispError.invalidArgument(
