@@ -689,7 +689,11 @@ final class DatasetTrainer {
     for step in startStep..<o.steps {
       let ts = Date()
       zeroGrads()
-      let (la, ls) = try body(step)
+      // A command-line tool never drains its autorelease pool: the Metal objects a step creates
+      // (a fresh runtime whenever the kernel hash misses the cache) leaked ~4 GB per step.
+      var stepResult: Result<(Float, Float), Error> = .failure(TrainProtocolError("step not run"))
+      autoreleasepool { stepResult = Result { try body(step) } }
+      let (la, ls) = try stepResult.get()
       guard la.isFinite, ls.isFinite else {
         throw TrainProtocolError("loss diverged at step \(step) (audio \(la), static \(ls))")
       }
