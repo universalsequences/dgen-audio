@@ -17,6 +17,9 @@ struct MetricLoss {
   let windows: [Int]
   let bandWeight: Double
   let mrWeight: Double
+  var waveWeight: Double = 0
+  var waveCutoff: Double = 600
+  var sampleRate: Double = 44100
   static let eps = 1e-3
 
   // MARK: transforms
@@ -38,6 +41,12 @@ struct MetricLoss {
       fwd.transform(inputReal: re, inputImaginary: [Double](repeating: 0, count: w),
                     outputReal: &oR, outputImaginary: &oI)
       return (oR, oI)
+    }
+    /// Unnormalised inverse DFT (real part) of a full spectrum.
+    func adjointFull(_ gR: [Double], _ gI: [Double]) -> [Double] {
+      var oR = [Double](repeating: 0, count: w), oI = [Double](repeating: 0, count: w)
+      inv.transform(inputReal: gR, inputImaginary: gI, outputReal: &oR, outputImaginary: &oI)
+      return oR
     }
     /// Re(Σ_k G_k e^{+2πikm/w}) for G given on k = 0…w/2 (zero above).
     func adjoint(_ gR: [Double], _ gI: [Double]) -> [Double] {
@@ -212,6 +221,37 @@ struct MetricLoss {
     return (score, Array(gpad[(W / 2)...]))
   }
 
+  // MARK: low-band waveform
+
+  /// Phase-aware low-band fit: sum((LP y - LP t)^2) / sum((LP t)^2) with a zero-phase FFT low-pass
+  /// (brick-wall at `cutoff`, raised-cosine edge one octave wide). LP is linear and self-adjoint,
+  /// so the gradient is 2 LP(LP y - LP t) / sum((LP t)^2).
+  static func lowWave(_ y: [Double], _ t: [Double], cutoff: Double, sampleRate: Double) -> (Double, [Double]) {
+    let n = min(y.count, t.count)
+    var m = 1
+    while m < 2 * n { m <<= 1 }
+    let d = dft(m)
+    let mask: [Double] = (0..<m).map { k in
+      let f = Double(min(k, m - k)) * sampleRate / Double(m)
+      if f <= cutoff { return 1 }
+      if f >= 2 * cutoff { return 0 }
+      return 0.5 * (1 + cos(Double.pi * (f - cutoff) / cutoff))
+    }
+    func lp(_ x: [Double]) -> [Double] {
+      var pad = [Double](repeating: 0, count: m)
+      for i in 0..<n { pad[i] = x[i] }
+      let (r, im) = d.forward(pad)
+      let gr = (0..<m).map { r[$0] * mask[$0] }, gi = (0..<m).map { im[$0] * mask[$0] }
+      return Array(d.adjointFull(gr, gi).prefix(n)).map { $0 / Double(m) }
+    }
+    let ly = lp(y), lt = lp(t)
+    let e = max(lt.reduce(0) { $0 + $1 * $1 }, 1e-12)
+    let diff = zip(ly, lt).map { $0 - $1 }
+    let loss = diff.reduce(0) { $0 + $1 * $1 } / e
+    let g = lp(diff).map { 2 * $0 / e }
+    return (loss, g)
+  }
+
   // MARK: combined
 
   struct Result {
@@ -219,16 +259,21 @@ struct MetricLoss {
     var mr: Double
     var loss: Double
     var grad: [Float]
+    var wave: Double = 0
   }
 
   func lossAndGradient(_ y: [Float], _ t: [Float]) -> Result {
     let yd = y.map(Double.init), td = t.map(Double.init)
     let (b, gb) = bandWeight > 0 ? MetricLoss.band(yd, td) : (0, [Double](repeating: 0, count: y.count))
     let (m, gm) = mrWeight > 0 ? MetricLoss.mr(yd, td, windows: windows) : (0, [Double](repeating: 0, count: y.count))
+    let (w, gw) = waveWeight > 0
+      ? MetricLoss.lowWave(yd, td, cutoff: waveCutoff, sampleRate: sampleRate)
+      : (0, [Double](repeating: 0, count: y.count))
     var g = [Float](repeating: 0, count: y.count)
     for i in 0..<min(gb.count, g.count) { g[i] += Float(bandWeight * gb[i]) }
     for i in 0..<min(gm.count, g.count) { g[i] += Float(mrWeight * gm[i]) }
-    return Result(band: b, mr: m, loss: bandWeight * b + mrWeight * m, grad: g)
+    for i in 0..<min(gw.count, g.count) { g[i] += Float(waveWeight * gw[i]) }
+    return Result(band: b, mr: m, loss: bandWeight * b + mrWeight * m + waveWeight * w, grad: g, wave: w)
   }
 
   /// Scores only (both terms), for evaluation.

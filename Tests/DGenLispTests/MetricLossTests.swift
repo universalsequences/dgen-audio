@@ -31,6 +31,12 @@ final class MetricLossTests: XCTestCase {
     check({ MetricLoss.mr($0, t, windows: [64, 256, 1024]) }, y, probes: [5, 300, 1500, 2900, 4000], h: 1e-6, tol: 2e-2)
   }
 
+  func testLowWaveGradientMatchesFiniteDifferences() {
+    let n = 4096
+    let y = signal(n, seed: 5, f: 60, decay: 0.08), t = signal(n, seed: 6, f: 55, decay: 0.1)
+    check({ MetricLoss.lowWave($0, t, cutoff: 600, sampleRate: 44100) }, y, probes: [3, 900, 2048, 4000], h: 1e-6, tol: 1e-2)
+  }
+
   func testBandGradientMatchesFiniteDifferences() {
     let n = 8192
     let y = signal(n, seed: 3, f: 60, decay: 0.08), t = signal(n, seed: 4, f: 55, decay: 0.1)

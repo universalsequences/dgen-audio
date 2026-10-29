@@ -44,6 +44,9 @@ struct TrainDatasetOptions {
   /// dgen: in-graph batched MR-STFT (windows ≤ 2048 on Metal).
   var loss = "metric"
   var bandWeight: Double = 0.3
+  /// Low-band waveform loss (phase-aware), weight and cutoff (Hz).
+  var waveWeight: Double = 0
+  var waveCutoff: Double = 600
   var mrWeight: Double = 1
   var linWeight: Float = 1
   var logWeight: Float = 1
@@ -88,6 +91,8 @@ struct TrainDatasetOptions {
       case "--windows": o.windows = try value().split(separator: ",").compactMap { Int($0) }
       case "--loss": o.loss = try value()
       case "--band-weight": o.bandWeight = Double(try value()) ?? o.bandWeight
+      case "--wave-weight": o.waveWeight = Double(try value()) ?? o.waveWeight
+      case "--wave-cutoff": o.waveCutoff = Double(try value()) ?? o.waveCutoff
       case "--mr-weight": o.mrWeight = Double(try value()) ?? o.mrWeight
       case "--lin-weight": o.linWeight = Float(try value()) ?? o.linWeight
       case "--log-weight": o.logWeight = Float(try value()) ?? o.logWeight
@@ -895,7 +900,8 @@ final class DatasetTrainer {
   /// the mean).
   var lastMetric: (band: [Double], mr: [Double]) = ([], [])
   func metricGradient(_ flat: [Float]) -> (Float, [Float]) {
-    let ml = MetricLoss(windows: o.windows, bandWeight: o.bandWeight, mrWeight: o.mrWeight)
+    let ml = MetricLoss(windows: o.windows, bandWeight: o.bandWeight, mrWeight: o.mrWeight,
+                        waveWeight: o.waveWeight, waveCutoff: o.waveCutoff, sampleRate: Double(sampleRate))
     var results = [MetricLoss.Result?](repeating: nil, count: N)
     let lock = NSLock()
     DispatchQueue.concurrentPerform(iterations: N) { r in
@@ -996,15 +1002,20 @@ final class DatasetTrainer {
     var bands: [Double] = [], mrs: [Double] = []
     let renders = names.indices.map { r in (0..<o.frames).map { flat[$0 * N + r] } }
     var sc = [(Double, Double)](repeating: (0, 0), count: N)
+    var lowSNR = [Double](repeating: 0, count: N)
     DispatchQueue.concurrentPerform(iterations: N) { r in
       let y = renders[r]
-      sc[r] = o.stage == "render" ? (0, 0) : y.allSatisfy(\.isFinite)
+      guard o.stage != "render" else { return }
+      sc[r] = y.allSatisfy(\.isFinite)
         ? MetricLoss.scores(y, targets[r], windows: [64, 128, 256, 512, 1024, 2048, 4096])
         : (.infinity, .infinity)
+      let w = MetricLoss.lowWave(y.map(Double.init), targets[r].map(Double.init), cutoff: o.waveCutoff,
+                                 sampleRate: Double(sampleRate)).0
+      lowSNR[r] = -10 * Foundation.log10(max(w, 1e-12))
     }
     for (r, n) in names.enumerated() {
       try FloatWav.write(run.appendingPathComponent("renders/\(n).wav"), renders[r], sampleRate: Int(sampleRate))
-      rowsOut[n] = ["band": sc[r].0, "mr": sc[r].1]
+      rowsOut[n] = ["band": sc[r].0, "mr": sc[r].1, "low_snr_db": lowSNR[r]]
       bands.append(sc[r].0); mrs.append(sc[r].1)
     }
     func q(_ v: [Double], _ p: Double) -> Double {
@@ -1014,11 +1025,12 @@ final class DatasetTrainer {
       "stage": o.stage, "steps": o.steps,
       "band_median": q(bands, 0.5), "band_p90": q(bands, 0.9),
       "mr_median": q(mrs, 0.5), "mr_p90": q(mrs, 0.9), "scores": rowsOut,
+      "low_snr_median_db": q(lowSNR, 0.5), "low_snr_p10_db": q(lowSNR, 0.1),
     ]
     try JSONSerialization.data(withJSONObject: summary, options: [.prettyPrinted, .sortedKeys])
       .write(to: run.appendingPathComponent("summary-\(o.stage).json"))
-    log(String(format: "[train-dataset] %@ done: band median %.3f p90 %.3f, MR median %.4f p90 %.4f",
-               o.stage, q(bands, 0.5), q(bands, 0.9), q(mrs, 0.5), q(mrs, 0.9)))
+    log(String(format: "[train-dataset] %@ done: band median %.3f p90 %.3f, MR median %.4f p90 %.4f, low-band SNR median %.1f dB p10 %.1f dB",
+               o.stage, q(bands, 0.5), q(bands, 0.9), q(mrs, 0.5), q(mrs, 0.9), q(lowSNR, 0.5), q(lowSNR, 0.1)))
     return summary
   }
 }
