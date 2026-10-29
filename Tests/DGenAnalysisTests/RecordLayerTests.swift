@@ -132,6 +132,6 @@ final class RecordLayerTests: XCTestCase {
         }
         XCTAssertEqual(KickRowsV3.effectiveBox("g")!.0, 0.08, accuracy: 1e-12)
         XCTAssertEqual(KickRowsV3.effectiveBox("td")!.0, 0.001 * pow(500, 0.01), accuracy: 1e-12)
-        XCTAssertEqual(KickRowsV3.layout.reduce(0) { $0 + $1.1 }, 250, "voice3 row width")
+        XCTAssertEqual(KickRowsV3.layout.reduce(0) { $0 + $1.1 }, 251, "voice3 row width (with the onset delay t0)")
     }
 }
