@@ -22,6 +22,10 @@ enum AnalyzeKicksCommand {
           --relative-weight F relative-error weighting floor for slot 0 / joint LS (default 0 = plain LS)
           --no-fundamental-tail  no second (slower-decay) mode on the fundamental's law
           --no-stabilize      keep every matrix-pencil mode (no stabilisation check)
+          --no-rescue         do not re-admit stabilisation-rejected modes / slot-0 harmonics
+          --v3                voice v3 analysis: strike sines, crackle, noise events (implies 4th order)
+          --strikes N         strike sines (v3, default 4)
+          --max-events N      noise events (v3, default 2)
           --stability F,D     stabilisation tolerances: relative frequency, relative decay
           --noise-order 2|4   band-pass order of each noise band (default 2, SPEC §3.1)
           --independent-noise one white per noise band (default: one shared white, SPEC §3.1)
@@ -64,6 +68,10 @@ enum AnalyzeKicksCommand {
             case "--no-second-drop": opts.secondDrop = false
             case "--no-mode-drop": opts.modeDropTest = false
             case "--no-stabilize": opts.stabilize = false
+            case "--v3": opts.v3 = true
+            case "--no-rescue": opts.rescueModes = false
+            case "--strikes": opts.strikeCount = Int(number(value()))
+            case "--max-events": opts.maxEvents = Int(number(value()))
             case "--no-fundamental-tail": opts.fundamentalTail = false
             case "--fundamental-tail-gain": opts.fundamentalTailGain = number(value())
             case "--relative-weight": opts.relativeWeightFloor = number(value())
@@ -95,6 +103,7 @@ enum AnalyzeKicksCommand {
             }
             i += 1
         }
+        if opts.v3 { opts.noiseSections = 2 }
         guard let ds = dataset, let out = output else {
             fputs(usage() + "\n", stderr)
             exit(2)

@@ -108,6 +108,10 @@ public struct KickVoiceParams: Codable, Equatable {
     public var sharedWhite: Bool
     /// cascaded band-pass sections per noise band (1 = 2nd order, SPEC §3.1)
     public var noiseSections: Int
+    /// v3: noise events on the same band signals (coefficient N_b(t) + Σ_e env_e(t) col_eb)
+    public var events: [NoiseEventParams] = []
+    /// v3: crackle, added after the clipper (it is the record, not the recorded drum)
+    public var crackle: CrackleParams? = nil
     public init(modes: [ModeParams], noiseBands: [NoiseBandParams], rn: Double, gate: GateParams,
                 chain: ChainParams = ChainParams(), sharedWhite: Bool = true, noiseSections: Int = 1) {
         self.modes = modes; self.noiseBands = noiseBands; self.rn = rn; self.gate = gate; self.chain = chain
@@ -135,14 +139,21 @@ public enum KickVoice {
     /// Noise part Σ N_b band_b with the deterministic band signals.
     public static func renderNoise(_ bands: [NoiseBandParams], rn: Double, count n: Int, sampleRate sr: Double,
                                    seed: UInt64 = NoiseBands.defaultSeed, sharedWhite: Bool = true,
-                                   sections: Int = 1) -> [Double] {
+                                   sections: Int = 1, events: [NoiseEventParams] = []) -> [Double] {
         var y = [Double](repeating: 0, count: n)
         if bands.isEmpty { return y }
         let white = NoiseBands.white(count: n, seed: seed)
-        for (k, b) in bands.enumerated() where b.L != 0 {
+        let evEnv = events.map { e in (0..<n).map { e.envelope(Double($0) / sr) } }
+        for (k, b) in bands.enumerated() {
+            let evUsed = events.indices.contains { k < events[$0].colour.count && events[$0].colour[k] != 0 && events[$0].level != 0 }
+            if b.L == 0 && !evUsed { continue }
             let w = sharedWhite ? white : NoiseBands.white(count: n, seed: seed &+ UInt64(k + 1) &* 0x2545F4914F6CDD1D)
             let s = NoiseBands.bandSignal(white: w, lo: b.lo, hi: b.hi, sampleRate: sr, sections: sections)
-            for i in 0..<n { y[i] += b.envelope(Double(i) / sr, rn: rn) * s[i] }
+            for i in 0..<n {
+                var c = b.envelope(Double(i) / sr, rn: rn)
+                for (e, ev) in events.enumerated() where k < ev.colour.count { c += evEnv[e][i] * ev.colour[k] }
+                y[i] += c * s[i]
+            }
         }
         return y
     }
@@ -152,12 +163,13 @@ public enum KickVoice {
         var x = renderModes(p.modes, count: n, sampleRate: sr)
         if includeNoise {
             let nz = renderNoise(p.noiseBands, rn: p.rn, count: n, sampleRate: sr, seed: seed,
-                                 sharedWhite: p.sharedWhite, sections: p.noiseSections)
+                                 sharedWhite: p.sharedWhite, sections: p.noiseSections, events: p.events)
             for i in 0..<n { x[i] += nz[i] }
         }
+        let cr = includeNoise ? p.crackle.map { Crackle.render($0, count: n, sampleRate: sr, seed: seed ^ 0xC4AC) } : nil
         for i in 0..<n {
             let t = Double(i) / sr
-            x[i] = p.chain.level * p.gate.value(t) * p.chain.clip(x[i])
+            x[i] = p.chain.level * p.gate.value(t) * (p.chain.clip(x[i]) + (cr?[i] ?? 0))
         }
         return x
     }
