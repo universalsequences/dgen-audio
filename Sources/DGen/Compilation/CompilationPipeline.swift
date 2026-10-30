@@ -351,6 +351,10 @@ public struct CompilationPipeline {
         graph: graph,
         enableBufferReuse: options.enableBufferReuse)
     }
+    if ProcessInfo.processInfo.environment["DGEN_DEBUG_CELLS"] != nil {
+      let top = graph.cellAllocationSizes.sorted { $0.value > $1.value }.prefix(12)
+      print("[cells] total slots \(cellAllocations.totalMemorySlots), \(graph.cellAllocationSizes.count) cells, sum \(graph.cellAllocationSizes.values.reduce(0, +)); top: \(top.map { "\($0.key):\($0.value)" })")
+    }
     // Collect precomputed tensor data (e.g. FFT twiddle factors, Hann window) for injection
     cellAllocations.tensorInitData = collectTensorInitData(
       graph: graph, cellAllocations: cellAllocations)

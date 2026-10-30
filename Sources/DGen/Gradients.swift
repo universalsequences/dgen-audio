@@ -101,7 +101,7 @@ extension Graph {
     }
 
     // Walk in reverse topological order
-    let reverseOrder = reverseTopologicalOrder(
+    let (reverseOrder, relevantHistoryCells, cutTargets) = reverseTopologicalOrder(
       from: [loss] + historyWriteRoots, targets: targets)
     for nodeId in reverseOrder {
       guard let upstreamGrad = grads[nodeId],
@@ -133,13 +133,23 @@ extension Graph {
       }
     }
 
+    // A target whose only routes to the loss run through zero-derivative inputs is cut from the
+    // walk; its gradient is still defined (zero), so callers reading it see zeros, not nothing.
+    for target in cutTargets.sorted() where grads[target] == nil {
+      grads[target] = zeroGradient(self, matching: target)
+    }
+
     // BPTT: Create carry cell writes for historyRead nodes.
     // historyRead has no graph inputs, so it's pruned from reverseTopologicalOrder
     // and its backward never runs. But the gradient w.r.t. historyRead's output
     // (accumulated in grads[]) is the temporal carry that should be written to the
-    // carry cell for the previous frame to read.
+    // carry cell for the previous frame to read. A history whose written value no target
+    // reaches carries no gradient: its read may still pick up a gradient from an on-path
+    // consumer, but no backward ever reads that carry, so it is skipped.
     for (nodeId, node) in nodes {
-      if case .historyRead(let cellId) = node.op, let gradNodeId = grads[nodeId] {
+      if case .historyRead(let cellId) = node.op, relevantHistoryCells.contains(cellId),
+        let gradNodeId = grads[nodeId]
+      {
         let carryCell = getGradCarryCell(for: cellId)
         let zero = n(.seq, [gradNodeId, n(.constant(0.0), [])])
         let writeNode = n(.memoryWrite(carryCell), [zero, gradNodeId])
@@ -155,30 +165,65 @@ extension Graph {
     gradientSideEffects.append(nodeId)
   }
 
-  /// Compute reverse topological order from loss, only including nodes on paths to targets.
-  private func reverseTopologicalOrder(from roots: [NodeID], targets: Set<NodeID>) -> [NodeID] {
-    // First, find which nodes are on paths to targets
+  /// Compute reverse topological order from loss, only including nodes on paths to targets,
+  /// the history cells whose state depends on a target, and the targets cut from the walk.
+  ///
+  /// A node is on a target path when a target reaches it through inputs with a nonzero
+  /// derivative (`LazyOp.hasZeroDerivative`). A historyRead counts as a target when its cell is
+  /// relevant: some write to the cell stores an on-path value. Its accumulated gradient is then
+  /// the BPTT temporal carry, and writes whose input is a historyRead (biquad x/y state chaining)
+  /// must stay in the walk or the recursion silently truncates (docs/BIQUAD_BPTT_GRADIENT_BUG.md).
+  /// A history no target reaches (a filter over noise with fixed coefficients) holds a constant
+  /// w.r.t. every target, so its reverse-time adjoint is skipped: it is exactly zero, and it is a
+  /// frame-sequential backward block. Relevance can enter a recurrence through a read that sorts
+  /// before its write, so it is iterated to a fixed point; it only grows, so at most one pass per
+  /// history cell plus one.
+  ///
+  /// `cutTargets` are reached targets that no gradient can reach: every route from the roots
+  /// crosses a zero-derivative input (e.g. a param read only through `floor` or a comparison).
+  private func reverseTopologicalOrder(from roots: [NodeID], targets: Set<NodeID>)
+    -> (order: [NodeID], relevantHistoryCells: Set<CellID>, cutTargets: Set<NodeID>)
+  {
+    let topo = topologicalOrder(from: roots)
+    var relevantCells = Set<CellID>()
     var onTargetPath: [NodeID: Bool] = [:]
-
-    for nodeId in topologicalOrder(from: roots) {
-      guard let node = nodes[nodeId] else { continue }
-      // historyRead counts as a target: its accumulated gradient is the BPTT
-      // temporal carry. Without this, historyWrite nodes whose input is a
-      // historyRead (e.g. biquad's x/y state chaining) are pruned, their
-      // backward never consumes the carry cell, and the temporal gradient
-      // recursion silently truncates (docs/BIQUAD_BPTT_GRADIENT_BUG.md).
-      let isHistoryRead: Bool
-      if case .historyRead = node.op { isHistoryRead = true } else { isHistoryRead = false }
-      let isTarget = targets.contains(nodeId) || isHistoryRead
-      let hasTargetDescendant = node.inputs.contains { onTargetPath[$0] == true }
-      onTargetPath[nodeId] = isTarget || hasTargetDescendant
+    var changed = true
+    while changed {
+      changed = false
+      for nodeId in topo {
+        guard let node = nodes[nodeId], onTargetPath[nodeId] != true else { continue }
+        var on = targets.contains(nodeId)
+        if case .historyRead(let cell) = node.op, relevantCells.contains(cell) { on = true }
+        if !on {
+          on = node.inputs.indices.contains { i in
+            !node.op.hasZeroDerivative(input: i) && onTargetPath[node.inputs[i]] == true
+          }
+        }
+        onTargetPath[nodeId] = on
+        guard on else { continue }
+        switch node.op {
+        case .historyWrite(let cell), .historyReadWrite(let cell):
+          if relevantCells.insert(cell).inserted { changed = true }
+        default:
+          break
+        }
+      }
     }
-
-    // Now collect nodes in topological order, filtering to target paths
-    let topo = topologicalOrder(from: roots).filter { onTargetPath[$0] == true }
-
-    // Return reversed
-    return topo.reversed()
+    // Nodes a gradient can reach from the roots: down on-path nodes, over nonzero-derivative
+    // edges. A reached target outside this set has an identically zero gradient.
+    var live = Set<NodeID>()
+    var stack = roots.filter { onTargetPath[$0] == true }
+    while let nodeId = stack.popLast() {
+      guard live.insert(nodeId).inserted, let node = nodes[nodeId] else { continue }
+      for (i, input) in node.inputs.enumerated()
+      where !node.op.hasZeroDerivative(input: i) && onTargetPath[input] == true {
+        stack.append(input)
+      }
+    }
+    let cutTargets = targets.filter { onTargetPath[$0] != nil && !live.contains($0) }
+    var order = topo.filter { onTargetPath[$0] == true }
+    order.reverse()
+    return (order, relevantCells, cutTargets)
   }
 
   /// Standard topological sort from one or more root nodes.
@@ -279,6 +324,24 @@ extension LazyOp {
 
   /// Returns gradient NodeIDs for each input (nil = no gradient / non-differentiable).
   /// This builds NEW nodes in the graph rather than emitting IR directly.
+  /// Whether input `i`'s derivative is identically zero: `backward` below returns a zero for it
+  /// (`zeroGradient` or a constant 0). The reverse walk uses this to prune; keep the two in step
+  /// when a backward rule changes.
+  func hasZeroDerivative(input i: Int) -> Bool {
+    switch self {
+    case .gt, .gte, .lt, .lte, .eq, .and, .or, .xor, .sign, .floor, .ceil, .round:
+      return true
+    case .gswitch, .selector:
+      return i == 0
+    case .mod, .latch:
+      return i == 1
+    case .modulatedParam:
+      return i > 0
+    default:
+      return false
+    }
+  }
+
   func backward(graph g: Graph, node: Node, gradOutput: NodeID) -> [NodeID?] {
     switch self {
 

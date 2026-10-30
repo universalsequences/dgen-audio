@@ -31,12 +31,11 @@ extension Graph {
                 let gradCell = alloc(vectorWidth: size)
                 tensorGradCells[nodeId] = gradCell
                 result[nodeId] = gradCell
-                // Vector-width BPTT reorders backward blocks; buffer-reuse
-                // liveness can otherwise alias grad accumulation cells onto
-                // live forward tensors (recurring aliasing bug class).
-                if !tensorGradCarryCells.isEmpty {
-                    persistentCells.insert(gradCell)
-                }
+                // The host reads grad cells after the run, so no later block
+                // may take their memory: buffer-reuse liveness only sees the
+                // kernels. (Guarding this on BPTT carries alone let a graph
+                // without tensor histories alias leaf grads onto each other.)
+                persistentCells.insert(gradCell)
 
                 let accumOp = n(.tensorAccumulate(gradCell), [gradNode])
                 addGradientSideEffect(accumOp)
@@ -75,11 +74,8 @@ extension Graph {
             // Allocate gradient accumulation cell (scalar = 1 cell)
             let gradCell = alloc()
             result[nodeId] = gradCell
-            // See setupTensorGradients: protect grad cells from buffer-reuse
-            // aliasing when vector-width BPTT reorders backward blocks.
-            if !tensorGradCarryCells.isEmpty {
-                persistentCells.insert(gradCell)
-            }
+            // See setupTensorGradients: the host reads grad cells after the run.
+            persistentCells.insert(gradCell)
 
             // Atomic accumulation for per-frame gradients
             // memoryAccumulate(cell) takes (offset, value) - offset=0 for scalar

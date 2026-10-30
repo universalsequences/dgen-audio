@@ -80,7 +80,10 @@ public class LazyGraph {
   /// baked constant changing every step) eventually aborts the process.
   internal var runtimeCacheByKernelHash: [UInt64: LazyRuntime] = [:]
   internal var runtimeCacheInsertionOrder: [UInt64] = []
-  internal static let runtimeCacheLimit = 8
+  /// Cached runtimes per graph (LRU by insertion). Each holds its Metal buffers, which can be
+  /// gigabytes for a long training render: a trainer whose kernel hash changes every step should
+  /// keep this small.
+  public static var runtimeCacheLimit = 8
 
   internal func cacheRuntime(_ runtime: LazyRuntime, forKernelHash hash: UInt64) {
     if runtimeCacheByKernelHash[hash] == nil {
@@ -103,6 +106,14 @@ public class LazyGraph {
 
   internal var tensors: [WeakRef<Tensor>] = []
   internal var signals: [WeakRef<Signal>] = []
+
+  /// Debug: tracked signals still alive.
+  public var liveSignalCount: Int { signals.filter { $0.value != nil }.count }
+
+  /// Debug: (shape, has data) of every tracked tensor that is still alive.
+  public var liveTensorSummary: [(shape: Shape, data: Bool)] {
+    tensors.compactMap { $0.value.map { ($0.shape, $0.getData() != nil) } }
+  }
 
   /// Forward nodes whose gradients are intentionally unsupported. `runBackward`
   /// checks whether any marked node is an ancestor of the requested loss.

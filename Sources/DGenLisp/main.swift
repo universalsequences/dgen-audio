@@ -1,6 +1,7 @@
 // DGenLisp - Lisp-to-Dylib Compiler CLI
 //
 // Usage: dgenlisp compile [<file.lisp>] [options]
+//        dgenlisp analyze-kicks --dataset DIR -o analysis.json (see AnalyzeKicksCommand)
 //   -o, --output <dir>       Output directory (default: .)
 //   --name <name>            Output name (default: patch)
 //   --sample-rate <rate>     Sample rate (default: 44100)
@@ -27,6 +28,32 @@ if CommandLine.arguments.count > 1 && CommandLine.arguments[1] == "train" {
         arguments: Array(CommandLine.arguments.dropFirst(2)),
         realTrainer: RealTrainer.run
     )
+}
+// Dataset training of row-batched patches (TrainDataset.swift); never returns.
+if CommandLine.arguments.count > 1 && CommandLine.arguments[1] == "train-dataset" {
+    TrainDatasetCommand.run(arguments: Array(CommandLine.arguments.dropFirst(2)))
+}
+// Hidden: band / MR-STFT scores of WAV pairs (MetricLoss.swift), for parity with the Python
+// reference metrics. `metric-score target.wav render.wav [...pairs]`
+if CommandLine.arguments.count > 1 && CommandLine.arguments[1] == "metric-score" {
+    let files = Array(CommandLine.arguments.dropFirst(2))
+    var i = 0
+    while i + 1 < files.count {
+        let t = try AudioFile.load(url: URL(fileURLWithPath: files[i]), mono: true).samples
+        let y = try AudioFile.load(url: URL(fileURLWithPath: files[i + 1]), mono: true).samples
+        let s = MetricLoss.scores(y, t, windows: [64, 128, 256, 512, 1024, 2048, 4096])
+        print(String(format: "%@ band %.6f mr %.6f", files[i + 1], s.band, s.mr))
+        i += 2
+    }
+    exit(0)
+}
+// Per-sample kick analysis (DGenAnalysis); owns its own arguments.
+if CommandLine.arguments.count > 1 && CommandLine.arguments[1] == "analyze-kicks" {
+    AnalyzeKicksCommand.run(arguments: Array(CommandLine.arguments.dropFirst(2)))
+}
+// Slot correspondence: analysis -> voice rows (KickRowsCommand.swift).
+if CommandLine.arguments.count > 1 && CommandLine.arguments[1] == "kick-rows" {
+    KickRowsCommand.run(arguments: Array(CommandLine.arguments.dropFirst(2)))
 }
 // Hidden render helper spawned by the trainer (realize() must not share a
 // process with backward()).

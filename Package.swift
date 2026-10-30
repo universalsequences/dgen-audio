@@ -18,6 +18,7 @@ let package = Package(
         .executable(name: "DGenLisp", targets: ["DGenLisp"]),
         .library(name: "DGen", targets: ["DGen"]),
         .library(name: "DGenLazy", targets: ["DGenLazy"]),
+        .library(name: "DGenAnalysis", targets: ["DGenAnalysis"]),
     ],
     dependencies: [
         .package(url: "https://github.com/apple/swift-crypto", from: "3.0.0")
@@ -93,8 +94,15 @@ let package = Package(
         ),
         .executableTarget(
             name: "DGenLisp",
-            dependencies: ["DGenLazy", "DGenTrainProtocol"],
+            dependencies: ["DGenLazy", "DGenTrainProtocol", "DGenAnalysis"],
             path: "Sources/DGenLisp"
+        ),
+        .target(
+            name: "DGenAnalysis",
+            path: "Sources/DGenAnalysis",
+            // numeric code: debug (-Onone) is ~60x slower, which would push the
+            // analysis tests far past their time budget
+            swiftSettings: [.unsafeFlags(["-O"], .when(configuration: .debug))]
         ),
         .target(
             name: "DGenTrainProtocol",
@@ -123,6 +131,11 @@ let package = Package(
             name: "DGenLispTests",
             dependencies: ["DGenLisp", "DGenLazy", "DGenTrainProtocol"],
             path: "Tests/DGenLispTests"
+        ),
+        .testTarget(
+            name: "DGenAnalysisTests",
+            dependencies: ["DGenAnalysis"],
+            path: "Tests/DGenAnalysisTests"
         ),
         .testTarget(
             name: "DGenTrainProtocolTests",
