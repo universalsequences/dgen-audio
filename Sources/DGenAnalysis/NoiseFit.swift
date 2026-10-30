@@ -62,6 +62,12 @@ public enum NoiseFit {
         /// an event is admitted when the dB RMS of the band-power fit falls by at least this share
         public var eventMinGain = 0.03
         public var onsetEventMinGain = 0.10
+        /// snare: a stationary per-band floor H_b (record hiss) beside the decaying two-stage
+        /// envelope (the wires): N_b = (L[m e^{-t/d1} + (1-m) e^{-t/d2}] + H_b)(1 - e^{-t/r_n})
+        public var floorTerm = false
+        /// upper bound of the slow decay d2 (s); with floorTerm a short cap keeps stationary noise
+        /// out of the wire envelope
+        public var maxSlowDecay = 3.0
         public init() {}
     }
 
@@ -219,22 +225,33 @@ public enum NoiseFit {
         let fitIdx = frames.indices.filter { ft[$0] >= onset * 0.5 }
         // 3. per-band fits
         var rn = 0.0005
+        let ps = options.floorTerm ? 5 : 4  // per-band parameter stride: [ln L, m, d1, d2(, ln H)]
         @inline(__always) func env(_ p: [Double], _ o: Int, _ t: Double, _ rn: Double) -> Double {
             let L = exp(p[o]), m = p[o + 1], d1 = p[o + 2], d2 = p[o + 3]
-            return L * (m * exp(-t / d1) + (1 - m) * exp(-t / d2)) * (1 - exp(-t / rn))
+            let h = ps == 5 ? exp(p[o + 4]) : 0
+            return (L * (m * exp(-t / d1) + (1 - m) * exp(-t / d2)) + h) * (1 - exp(-t / rn))
         }
         var params: [Double] = []
         // L may sit at most 20 dB below the noise floor (no dead bands)
-        let lo4 = [0.5 * log(floorN) - 2.3, 0.0, 0.0005, 0.004], hi4 = [log(10.0), 1.0, 0.04, 3.0]
+        let lnLo = 0.5 * log(floorN) - 2.3
+        var lo4 = [lnLo, 0.0, 0.0005, 0.004], hi4 = [log(10.0), 1.0, 0.04, options.maxSlowDecay]
+        if ps == 5 { lo4.append(lnLo - 2.3); hi4.append(log(10.0)) }
         for b in 0..<nb {
             let tr = n2[b]
             let early = fitIdx.filter { ft[$0] < onset + 0.012 }.map { tr[$0] }.max() ?? 0
             let L0 = max(early, floorN * 10).squareRoot()
-            var best: [Double] = [log(L0), 0.7, 0.004, 0.08]
+            // floor start: the 20th percentile of the track's last 40% (the stationary part)
+            var hx: [Double] = []
+            if ps == 5 {
+                let late = fitIdx.filter { ft[$0] > onset + 0.6 * (ft[fitIdx.last!] - onset) }.map { tr[$0] }.sorted()
+                let h0 = late.isEmpty ? floorN : late[Int(0.2 * Double(late.count - 1))]
+                hx = [min(max(0.5 * log(max(h0, floorN)), lo4[4] + 0.1), hi4[4] - 0.1)]
+            }
+            var best: [Double] = [log(L0), 0.7, 0.004, 0.08] + hx
             var bestC = Double.infinity
             for d1i in [0.002, 0.008] {
                 for d2i in [0.04, 0.2] {
-                    let f = LinAlg.levenbergMarquardt(x0: [log(L0 * 1.3), 0.7, d1i, d2i], lower: lo4, upper: hi4,
+                    let f = LinAlg.levenbergMarquardt(x0: [log(L0 * 1.3), 0.7, d1i, d2i] + hx, lower: lo4, upper: hi4,
                                                       maxIter: 60) { p in
                         fitIdx.map { i in
                             let v = env(p, 0, ft[i], rn)
@@ -252,11 +269,11 @@ public enum NoiseFit {
         // 4. joint refine incl. r_n (and v3 noise events) against e_a in dB, exact mixing model.
         //    Parameter vector: [ln L, m, d1, d2] x nb, r_n, then per event
         //    [t, ln level, ln decay, ln rise, ln colour x nb].
-        let ev0 = 4 * nb + 1, evW = 4 + nb
+        let ev0 = ps * nb + 1, evW = 4 + nb
         func residualE(_ p: [Double]) -> [Double] {
-            let rnv = p[4 * nb]
+            let rnv = p[ps * nb]
             let nev = (p.count - ev0) / evW
-            var out = [Double](repeating: 0, count: fitIdx.count * na + 4 * (nb - 1) + nev * (nb - 1))
+            var out = [Double](repeating: 0, count: fitIdx.count * na + ps * (nb - 1) + nev * (nb - 1))
             var N = [Double](repeating: 0, count: nb)
             let evs: [(t: Double, L: Double, d: Double, r: Double, c: [Double])] = (0..<nev).map { k in
                 let o = ev0 + k * evW
@@ -265,7 +282,7 @@ public enum NoiseFit {
             var o = 0
             for i in fitIdx {
                 let t = ft[i]
-                for b in 0..<nb { N[b] = env(p, 4 * b, t, rnv) }
+                for b in 0..<nb { N[b] = env(p, ps * b, t, rnv) }
                 for ev in evs where t > ev.t {
                     let d = t - ev.t
                     let g = ev.L * (1 - exp(-d / ev.r)) * exp(-d / ev.d)
@@ -292,11 +309,12 @@ public enum NoiseFit {
             // makes the overlapping-band unmixing well posed
             let w = options.smoothness * Double(fitIdx.count * na).squareRoot() / Double(nb)
             for b in 0..<(nb - 1) {
-                let p0 = 4 * b, p1 = 4 * b + 4
+                let p0 = ps * b, p1 = ps * b + ps
                 out[o] = w * 8.686 * (p[p0] - p[p1]); o += 1
                 out[o] = w * 4 * (p[p0 + 1] - p[p1 + 1]); o += 1
                 out[o] = w * 2 * log(p[p0 + 2] / p[p1 + 2]); o += 1
                 out[o] = w * 2 * log(p[p0 + 3] / p[p1 + 3]); o += 1
+                if ps == 5 { out[o] = w * 8.686 * (p[p0 + 4] - p[p1 + 4]); o += 1 }
             }
             for k in 0..<nev {
                 let c0 = ev0 + k * evW + 4
@@ -388,7 +406,7 @@ public enum NoiseFit {
                 var ex = [Double](repeating: 0, count: nb)
                 for b in 0..<nb {
                     for fi in win {
-                        let m = env(full, 4 * b, ft[fi], full[4 * nb])
+                        let m = env(full, ps * b, ft[fi], full[ps * nb])
                         ex[b] = max(ex[b], max(0, n2[b][fi] - m * m).squareRoot())
                     }
                 }
@@ -404,7 +422,7 @@ public enum NoiseFit {
                 // an onset event (e.g. a hat on the hit): coloured like the hiss's fast stage above 2 kHz
                 let fast = (0..<nb).map { b -> Double in
                     let fc = (edges[b] * edges[b + 1]).squareRoot()
-                    return fc >= 2000 ? exp(full[4 * b]) * max(full[4 * b + 1], 0.05) : 0
+                    return fc >= 2000 ? exp(full[ps * b]) * max(full[ps * b + 1], 0.05) : 0
                 }
                 let L0 = max(fast.max() ?? 0, exp(lnFloorL + 1))
                 let col = fast.map { log(min(max($0 / L0, 1e-3), 1)) }
@@ -424,16 +442,17 @@ public enum NoiseFit {
             }
             events.sort { $0.t < $1.t }
         }
-        rn = full[4 * nb]
+        rn = full[ps * nb]
         let rms = dataRMS(full)
         var bands: [NoiseBandParams] = []
         for b in 0..<nb {
-            var m = full[4 * b + 1], d1 = full[4 * b + 2], d2 = full[4 * b + 3]
+            var m = full[ps * b + 1], d1 = full[ps * b + 2], d2 = full[ps * b + 3]
             if d1 > d2 {
                 swap(&d1, &d2)
                 m = 1 - m
             }
-            bands.append(NoiseBandParams(lo: edges[b], hi: edges[b + 1], L: exp(full[4 * b]), m: m, d1: d1, d2: d2))
+            bands.append(NoiseBandParams(lo: edges[b], hi: edges[b + 1], L: exp(full[ps * b]), m: m, d1: d1, d2: d2,
+                                         H: ps == 5 ? exp(full[ps * b + 4]) : nil))
         }
         var result = NoiseFitResult(bands: bands, rn: rn, fitRMSdB: rms, sharedWhite: options.sharedWhite,
                                     sections: options.sections, trackT: options.keepTracks ? ft : nil,

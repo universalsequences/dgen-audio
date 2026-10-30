@@ -62,12 +62,14 @@ public struct NoiseBandParams: Codable, Equatable {
     public var m: Double
     public var d1: Double
     public var d2: Double
-    public init(lo: Double, hi: Double, L: Double, m: Double, d1: Double, d2: Double) {
-        self.lo = lo; self.hi = hi; self.L = L; self.m = m; self.d1 = d1; self.d2 = d2
+    /// snare analysis: stationary floor (record hiss) under the decaying (wire) envelope; nil = 0
+    public var H: Double? = nil
+    public init(lo: Double, hi: Double, L: Double, m: Double, d1: Double, d2: Double, H: Double? = nil) {
+        self.lo = lo; self.hi = hi; self.L = L; self.m = m; self.d1 = d1; self.d2 = d2; self.H = H
     }
     @inline(__always) public func envelope(_ t: Double, rn: Double) -> Double {
         let rise = rn > 0 ? 1 - exp(-t / rn) : 1
-        return L * (m * exp(-t / d1) + (1 - m) * exp(-t / d2)) * rise
+        return (L * (m * exp(-t / d1) + (1 - m) * exp(-t / d2)) + (H ?? 0)) * rise
     }
 }
 

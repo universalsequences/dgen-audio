@@ -3,6 +3,7 @@
 //
 //   dgenlisp kick-rows --analysis analysis.json --slots 8 -o rows.json [--template-out t.json]
 //   dgenlisp kick-rows --layout v3 --slots 12 --analysis analysis.json -o rows_v3.json   (voice3.lisp)
+//   dgenlisp kick-rows --layout snare1 --slots 24 --analysis analysis.json -o rows.json  (snare1.lisp; also `drum-rows`)
 
 import DGenAnalysis
 import Foundation
@@ -33,24 +34,29 @@ enum KickRowsCommand {
       i += 1
     }
     guard let analysisPath, let output else {
-      fputs("Usage: dgenlisp kick-rows [--layout v2|v3] --analysis analysis.json --slots K -o rows.json\n", stderr)
+      fputs("Usage: dgenlisp kick-rows [--layout v2|v3|snare1] --analysis analysis.json --slots K -o rows.json\n", stderr)
       exit(2)
     }
     do {
       let data = try Data(contentsOf: URL(fileURLWithPath: analysisPath))
       let ds = try JSONDecoder().decode(DatasetAnalysis.self, from: data)
-      guard layout == "v2" || layout == "v3" else {
-        fputs("kick-rows: --layout must be v2 or v3\n", stderr)
+      guard ["v2", "v3", "snare1"].contains(layout) else {
+        fputs("kick-rows: --layout must be v2, v3 or snare1\n", stderr)
         exit(2)
       }
-      let v3 = layout == "v3"
+      let snare = layout == "snare1"
+      let v3 = layout == "v3" || snare
       let template = KickSlotTemplate.estimate(ds.samples, slots: slots, energyWeighted: energyWeighted)
       let strikeTemplate = KickSlotTemplate.estimateStrikes(ds.samples, perRegion: 2)
       var rows: [String: Any] = [:]
       var report: [[String: Any]] = []
       for s in ds.samples {
         let a = v3 ? KickSlots.assignV3(s, template: template) : KickSlots.assign(s, template: template)
-        if v3 {
+        if snare {
+          rows[s.name] = SnareRows.row(s, slots: slots, template: template, assignment: a,
+                                       strikeTemplate: strikeTemplate,
+                                       strikeSlots: KickSlots.assignStrikes(s, template: strikeTemplate))
+        } else if v3 {
           rows[s.name] = KickRowsV3.row(s, template: template, assignment: a, strikeTemplate: strikeTemplate,
                                         strikeSlots: KickSlots.assignStrikes(s, template: strikeTemplate))
         } else {
@@ -69,7 +75,7 @@ enum KickRowsCommand {
         }
         report.append(rep)
       }
-      var out: [String: Any] = ["layout": "kick", "rows": rows,
+      var out: [String: Any] = ["layout": snare ? "snare" : "kick", "rows": rows,
                                 "roles": template.roles.map { ["f": $0.frequency, "decay": $0.decay] },
                                 "assignment": report]
       if v3 { out["strike_roles"] = strikeTemplate.roles.map { ["f": $0.frequency, "decay": $0.decay] } }

@@ -48,11 +48,11 @@ if CommandLine.arguments.count > 1 && CommandLine.arguments[1] == "metric-score"
     exit(0)
 }
 // Per-sample kick analysis (DGenAnalysis); owns its own arguments.
-if CommandLine.arguments.count > 1 && CommandLine.arguments[1] == "analyze-kicks" {
+if CommandLine.arguments.count > 1 && ["analyze-kicks", "analyze-drums"].contains(CommandLine.arguments[1]) {
     AnalyzeKicksCommand.run(arguments: Array(CommandLine.arguments.dropFirst(2)))
 }
 // Slot correspondence: analysis -> voice rows (KickRowsCommand.swift).
-if CommandLine.arguments.count > 1 && CommandLine.arguments[1] == "kick-rows" {
+if CommandLine.arguments.count > 1 && ["kick-rows", "drum-rows"].contains(CommandLine.arguments[1]) {
     KickRowsCommand.run(arguments: Array(CommandLine.arguments.dropFirst(2)))
 }
 // Hidden render helper spawned by the trainer (realize() must not share a

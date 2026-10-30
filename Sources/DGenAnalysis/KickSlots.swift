@@ -318,7 +318,7 @@ public enum KickRowsV3 {
 
   /// A glide (g, T) below the effective minimum depth: play it as (gMin, tMin) and return the
   /// phase correction that keeps the settled phase (2π F (g T - gMin tMin)).
-  static func glideFloor(F: Double, g: Double, T: Double, gMin: Double, tMin: Double) -> (Double, Double, Double) {
+  public static func glideFloor(F: Double, g: Double, T: Double, gMin: Double, tMin: Double) -> (Double, Double, Double) {
     guard g < gMin else { return (g, T, 0) }
     return (gMin, tMin, 2 * Double.pi * F * (g * T - gMin * tMin))
   }

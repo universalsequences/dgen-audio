@@ -48,7 +48,47 @@ public struct KickAnalysisOptions: Codable {
     public var noiseSections = 1          // 1 = 2nd-order bands (SPEC §3.1), 2 = 4th order
     public var checkLength = 32768
     public var noiseSeed: UInt64 = NoiseBands.defaultSeed
+    // drum kinds (optional so analysis.json files written before them still decode; nil = kick)
+    /// "kick" | "snare"
+    public var kind: String? = nil
+    /// low-pass of the pitch-drop IF track (nil = PitchDrop default, 400 Hz)
+    public var dropLowpassHz: Double? = nil
+    /// every mode follows slot 0's glide law (G, T): one head tension glide (snare membranes)
+    public var sharedGlide: Bool? = nil
+    /// noise bands: a stationary floor (record hiss) beside the decaying envelope (wires)
+    public var noiseFloorTerm: Bool? = nil
+    /// noise bands: cap on the slow decay d2 (nil = 3 s)
+    public var noiseMaxSlowDecay: Double? = nil
+    /// cap on slot 0's glide depth G (nil = PitchDrop's 20): a snare's IF track in the first ms is
+    /// the stick/wire snap, and an uncapped law reads it as a 4x drop
+    public var maxGlide: Double? = nil
     public init() {}
+
+    /// Snare preset (`analyze-drums --kind snare`): membrane modes up to 7 kHz from shorter
+    /// segments, one shared head glide, a single pitch drop, the v3 layers (strikes, crackle,
+    /// events, 4th-order bands), and the noise split into decaying wires + a stationary hiss floor.
+    public static func snare() -> KickAnalysisOptions {
+        var o = KickAnalysisOptions()
+        o.kind = "snare"
+        o.maxModes = 40
+        o.lowRegion = [60, 1500]
+        o.midRegion = [1500, 7000]
+        o.lowSegmentSeconds = 0.2
+        o.midSegmentSeconds = 0.08
+        o.minDecayLow = 0.005
+        o.minDecayMid = 0.002
+        o.fundamentalExclusion = 0.04
+        o.secondDrop = false
+        o.modeDropTest = false
+        o.dropLowpassHz = 700
+        o.sharedGlide = true
+        o.maxGlide = 0.25
+        o.v3 = true
+        o.noiseSections = 2
+        o.noiseFloorTerm = true
+        o.noiseMaxSlowDecay = 1.5
+        return o
+    }
 }
 
 public struct ModeEstimate: Codable {
@@ -149,6 +189,7 @@ public enum KickAnalyzer {
         // pitch drop
         var dopt = PitchDrop.Options()
         dopt.allowSecondDrop = o.secondDrop
+        if let lp = o.dropLowpassHz { dopt.lowpassHz = lp }
         var track: IFTrack? = nil
         var drop = PitchDrop.fit(x, sr: sr, onset: onset, end: tEnd, options: dopt, track: &track)
         debug.ifTrack = track
@@ -197,13 +238,16 @@ public enum KickAnalyzer {
             let strong = tr.t.indices.filter { tr.w[$0] > 0.1 * wmax }
             if let fmax = strong.map({ tr.f[$0] }).max() { fCap = min(fCap, 1.15 * fmax) }
         }
+        if let gm = o.maxGlide, drop.G > gm { drop.G = gm }
         var slot0 = fitSlot0(x, sr: sr, drop: drop, onset: onset, tEnd: tEnd, fRange: fRange, fCap: fCap,
                              tailDecay: dropTail?.decay, allowSecond: o.secondDrop,
-                             relativeFloor: o.relativeWeightFloor, debug: &debug)
+                             relativeFloor: o.relativeWeightFloor, analyticHi: o.dropLowpassHz ?? 400,
+                             maxGlide: o.maxGlide ?? 20, debug: &debug)
         // two-stage decay of the fundamental: a second mode on the same law
         var slot0Tail: ModeEstimate? = nil
         if o.fundamentalTail, let two = fitSlot0TwoStage(x, sr: sr, slot0: slot0, onset: onset, tEnd: tEnd,
-                                                                   tailGain: o.fundamentalTailGain) {
+                                                                   tailGain: o.fundamentalTailGain,
+                                                                   analyticHi: o.dropLowpassHz ?? 400) {
             slot0 = two.0
             slot0Tail = two.1
         }
@@ -280,6 +324,15 @@ public enum KickAnalyzer {
             modes = rescue(modes, raw: rawLow, x: x, count: nFit, sr: sr, options: o, weights: lsW)
         }
 
+        // snare: one head glide; every mode adopts slot 0's (G, T) (the joint LS re-fits phases)
+        if o.sharedGlide == true {
+            for k in modes.indices.dropFirst() where modes[k].region != "fundamental-tail" {
+                modes[k].G = modes[0].G
+                modes[k].T = modes[0].T
+            }
+            modes = jointAmplitudes(modes, x: x, count: nFit, sr: sr, weights: lsW)
+        }
+
         // v3: strike sines on the early residual (modes with D at the floor are attack transients:
         // the strikes take them over), then a joint LS of every sinusoid
         var strikes: [ModeEstimate]? = nil
@@ -318,6 +371,8 @@ public enum KickAnalyzer {
         var nopt = NoiseFit.Options()
         nopt.sharedWhite = o.sharedNoiseWhite
         nopt.sections = o.noiseSections
+        nopt.floorTerm = o.noiseFloorTerm ?? false
+        if let d = o.noiseMaxSlowDecay { nopt.maxSlowDecay = d }
         var crackle: CrackleParams? = nil
         if o.v3 {
             // crackle first: its impulses are gated out of the hiss/event measurement
@@ -475,11 +530,12 @@ public enum KickAnalyzer {
     /// parameters, two re-referencing passes. A = |c|, φ = arg(i c).
     static func fitSlot0(_ x: [Double], sr: Double, drop: PitchDropFit, onset: Double, tEnd: Double,
                          fRange: [Double], fCap: Double, tailDecay: Double?, allowSecond: Bool,
-                         relativeFloor: Double = 0, debug: inout KickDebug) -> ModeEstimate
+                         relativeFloor: Double = 0, analyticHi: Double = 400, maxGlide: Double = 20,
+                         debug: inout KickDebug) -> ModeEstimate
     {
-        let z = PitchDrop.analytic(x, sr: sr, lo: 25, hi: 400)
+        let z = PitchDrop.analytic(x, sr: sr, lo: 25, hi: analyticHi)
         let a = fitSlot0Core(x, z: z, sr: sr, drop: drop, onset: onset, tEnd: tEnd, fRange: fRange, fCap: fCap,
-                             tailDecay: tailDecay, relativeFloor: relativeFloor, debug: &debug)
+                             tailDecay: tailDecay, relativeFloor: relativeFloor, maxGlide: maxGlide, debug: &debug)
         guard allowSecond && !drop.secondDrop && a.G > 0.1 else { return a }
         // the phase-sensitive fit can see a fast initial drop the IF fit missed:
         // try a second term and keep it if the low-band residual falls >= 10%
@@ -488,7 +544,7 @@ public enum KickAnalyzer {
         d2.F = a.F; d2.G = a.G * 0.7; d2.T = a.T * 1.3; d2.G2 = a.G * 0.5; d2.T2 = max(0.0008, a.T * 0.2)
         var dbg2 = KickDebug()
         let b = fitSlot0Core(x, z: z, sr: sr, drop: d2, onset: onset, tEnd: tEnd, fRange: fRange, fCap: fCap,
-                             tailDecay: tailDecay, relativeFloor: relativeFloor, debug: &dbg2)
+                             tailDecay: tailDecay, relativeFloor: relativeFloor, maxGlide: maxGlide, debug: &dbg2)
         guard b.G2 > 0 else { return a }
         let i0 = Int(onset * sr), i1 = min(x.count, Int(tEnd * sr))
         func lowResidual(_ m: ModeEstimate) -> Double {
@@ -512,10 +568,10 @@ public enum KickAnalyzer {
     /// mode with the same law and phase) when the dB RMS falls by >= 15%
     /// vs. the single-stage envelope.
     static func fitSlot0TwoStage(_ x: [Double], sr: Double, slot0: ModeEstimate, onset: Double, tEnd: Double,
-                                 tailGain: Double)
+                                 tailGain: Double, analyticHi: Double = 400)
         -> (ModeEstimate, ModeEstimate)?
     {
-        let z = PitchDrop.analytic(x, sr: sr, lo: 25, hi: 400)
+        let z = PitchDrop.analytic(x, sr: sr, lo: 25, hi: analyticHi)
         let n = x.count
         var law = slot0.params
         law.A = 1
@@ -578,7 +634,7 @@ public enum KickAnalyzer {
 
     static func fitSlot0Core(_ x: [Double], z: PitchDrop.Analytic, sr: Double, drop: PitchDropFit, onset: Double,
                              tEnd: Double, fRange: [Double], fCap: Double, tailDecay: Double?,
-                             relativeFloor: Double = 0, debug: inout KickDebug) -> ModeEstimate
+                             relativeFloor: Double = 0, maxGlide: Double = 20, debug: inout KickDebug) -> ModeEstimate
     {
         let second = drop.secondDrop
         let n = x.count
@@ -644,7 +700,10 @@ public enum KickAnalyzer {
             var lo = (second ? PitchDrop.lo5 : PitchDrop.lo3) + [0.003, 0.0001]
             var hi = (second ? PitchDrop.hi5 : PitchDrop.hi3) + [5.0, 0.01]
             lo[0] = max(lo[0], fRange[0])
-            hi[0] = min(hi[0], fRange[1])
+            hi[0] = maxGlide < 20 ? max(lo[0] * 1.001, fRange[1]) : min(hi[0], fRange[1])
+            hi[1] = min(hi[1], maxGlide)
+            if second { hi[3] = min(hi[3], maxGlide) }
+            for k in [1] + (second ? [3] : []) { lawP[k] = min(lawP[k], 0.999 * hi[k]) }
             let fit = LinAlg.levenbergMarquardt(x0: lawP + [D, R], lower: lo, upper: hi, maxIter: 60) { q in
                 project(Array(q[0..<np]), D: q[np], R: q[np + 1]).res
             }
@@ -665,7 +724,8 @@ public enum KickAnalyzer {
                 single.G = lawP[1] + lawP[3]
                 single.T = (lawP[1] * lawP[2] + lawP[3] * lawP[4]) / max(lawP[1] + lawP[3], 1e-9)
                 return fitSlot0Core(x, z: z, sr: sr, drop: single, onset: onset, tEnd: tEnd, fRange: fRange,
-                                    fCap: fCap, tailDecay: tailDecay, relativeFloor: relativeFloor, debug: &debug)
+                                    fCap: fCap, tailDecay: tailDecay, relativeFloor: relativeFloor, maxGlide: maxGlide,
+                                    debug: &debug)
             }
         }
         debug.slot0Envelope = IFTrack(t: ts, f: ts.indices.map { (ur[$0] * ur[$0] + ui[$0] * ui[$0]).squareRoot() },
