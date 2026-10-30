@@ -1,6 +1,7 @@
-// `dgenlisp analyze-kicks`: thin CLI over DGenAnalysis.KickDataset.
+// `dgenlisp analyze-kicks` / `analyze-drums`: thin CLI over DGenAnalysis.KickDataset.
 //
 //   dgenlisp analyze-kicks --dataset DIR -o analysis.json
+//   dgenlisp analyze-drums --kind snare --dataset DIR -o analysis.json   (KickAnalysisOptions.snare())
 //       [--noise-bands N] [--noise-lo HZ] [--noise-hi HZ] [--max-modes K]
 //       [--no-second-drop] [--no-mode-drop] [--independent-noise] [--noise-order 2|4]
 //       [--check-length N]
@@ -12,7 +13,8 @@ import Foundation
 enum AnalyzeKicksCommand {
     static func usage() -> String {
         """
-        Usage: dgenlisp analyze-kicks --dataset DIR -o analysis.json [options]
+        Usage: dgenlisp analyze-kicks|analyze-drums --dataset DIR -o analysis.json [options]
+          --kind kick|snare   option preset (default kick); later options override it
           --noise-bands N     noise bands (default 16)
           --noise-lo HZ       lowest band edge (default 40)
           --noise-hi HZ       highest band edge (default 16000)
@@ -37,6 +39,15 @@ enum AnalyzeKicksCommand {
 
     static func run(arguments: [String]) -> Never {
         var opts = KickAnalysisOptions()
+        if let k = arguments.firstIndex(of: "--kind"), k + 1 < arguments.count {
+            switch arguments[k + 1] {
+            case "kick": break
+            case "snare": opts = KickAnalysisOptions.snare()
+            default:
+                fputs("--kind must be kick or snare\n", stderr)
+                exit(2)
+            }
+        }
         var dataset: String? = nil
         var output: String? = nil
         var resynth: String? = nil
@@ -59,6 +70,7 @@ enum AnalyzeKicksCommand {
         }
         while i < arguments.count {
             switch arguments[i] {
+            case "--kind": _ = value()
             case "--dataset": dataset = value()
             case "-o", "--output": output = value()
             case "--noise-bands": opts.noiseBandCount = Int(number(value()))
