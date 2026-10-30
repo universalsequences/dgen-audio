@@ -21,7 +21,7 @@ public enum SnareRows {
   /// (name, width, lo, hi) of snare1.lisp's `row-layout snare`, in order (raw segments: nil range).
   public static func layout(slots k: Int) -> [(String, Int, Double?, Double?)] {
     [
-      ("f", k, 30, 16000), ("amp", k, 0.000001, 20), ("dec", k, 0.001, 4), ("rise", k, 0.00001, 0.05),
+      ("f", k, 30, 16000), ("amp", k, 0.000001, 20), ("dec", k, 0.001, 4), ("rise", 1, 0.00001, 0.05),
       ("ph", k, nil, nil),
       ("g", 1, 0, 1), ("td", 1, 0.0005, 0.2), ("tamp", 1, 0.000001, 4), ("tdec", 1, 0.005, 4),
       ("xf", 4, 100, 16000), ("xg", 4, 0, 4), ("xtd", 4, 0.0003, 0.05), ("xamp", 4, 0.000001, 4),
@@ -69,16 +69,18 @@ public enum SnareRows {
   {
     precondition(template.roles.count == k - 1, "template has \(template.roles.count) roles, need \(k - 1)")
     var r = neutral
-    var f = [Double](), amp = [Double](), dec = [Double](), rise = [Double](), ph = [Double]()
-    func push(_ m: ModeEstimate) { f.append(m.F); amp.append(m.A); dec.append(m.D); rise.append(m.R); ph.append(m.phi) }
+    var f = [Double](), amp = [Double](), dec = [Double](), ph = [Double]()
+    func push(_ m: ModeEstimate) { f.append(m.F); amp.append(m.A); dec.append(m.D); ph.append(m.phi) }
     let m0 = s.modes[0]
     push(m0)
     for (i, role) in template.roles.enumerated() {
       if let j = a.roleModes[i] { push(s.modes[j]) } else {
-        f.append(role.frequency); amp.append(silent); dec.append(role.decay); rise.append(0.0007); ph.append(0)
+        f.append(role.frequency); amp.append(silent); dec.append(role.decay); ph.append(0)
       }
     }
-    r["f"] = f; r["amp"] = amp; r["dec"] = dec; r["rise"] = rise; r["ph"] = ph
+    // one attack for the head (slot 0's): per-mode rises cost a per-sample exp each and the analysis
+    // leaves nearly all of them at its default
+    r["f"] = f; r["amp"] = amp; r["dec"] = dec; r["rise"] = [m0.R]; r["ph"] = ph
     let tail = s.modes.first { $0.region == "fundamental-tail" }
     r["tamp"] = [tail?.A ?? silent]; r["tdec"] = [tail?.D ?? 0.3]
     // shared glide; below the effective minimum depth every mode's settled phase is corrected

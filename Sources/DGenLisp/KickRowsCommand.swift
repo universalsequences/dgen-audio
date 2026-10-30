@@ -3,7 +3,7 @@
 //
 //   dgenlisp kick-rows --analysis analysis.json --slots 8 -o rows.json [--template-out t.json]
 //   dgenlisp kick-rows --layout v3 --slots 12 --analysis analysis.json -o rows_v3.json   (voice3.lisp)
-//   dgenlisp kick-rows --layout snare1 --slots 24 --analysis analysis.json -o rows.json  (snare1.lisp; also `drum-rows`)
+//   dgenlisp kick-rows --layout snare1 --slots 16 --analysis analysis.json -o rows.json  (snare1.lisp; also `drum-rows`)
 
 import DGenAnalysis
 import Foundation
