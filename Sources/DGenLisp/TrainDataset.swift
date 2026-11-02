@@ -47,6 +47,9 @@ struct TrainDatasetOptions {
   /// Low-band waveform loss (phase-aware), weight and cutoff (Hz).
   var waveWeight: Double = 0
   var waveCutoff: Double = 600
+  /// Band-loss gradient weight for bands at or above hfFrom Hz (the score stays unweighted).
+  var hfWeight: Double = 1
+  var hfFrom: Double = 4000
   var mrWeight: Double = 1
   var linWeight: Float = 1
   var logWeight: Float = 1
@@ -92,6 +95,8 @@ struct TrainDatasetOptions {
       case "--loss": o.loss = try value()
       case "--band-weight": o.bandWeight = Double(try value()) ?? o.bandWeight
       case "--wave-weight": o.waveWeight = Double(try value()) ?? o.waveWeight
+      case "--hf-weight": o.hfWeight = Double(try value()) ?? o.hfWeight
+      case "--hf-from": o.hfFrom = Double(try value()) ?? o.hfFrom
       case "--wave-cutoff": o.waveCutoff = Double(try value()) ?? o.waveCutoff
       case "--mr-weight": o.mrWeight = Double(try value()) ?? o.mrWeight
       case "--lin-weight": o.linWeight = Float(try value()) ?? o.linWeight
@@ -908,7 +913,8 @@ final class DatasetTrainer {
   var lastMetric: (band: [Double], mr: [Double]) = ([], [])
   func metricGradient(_ flat: [Float]) -> (Float, [Float]) {
     let ml = MetricLoss(windows: o.windows, bandWeight: o.bandWeight, mrWeight: o.mrWeight,
-                        waveWeight: o.waveWeight, waveCutoff: o.waveCutoff, sampleRate: Double(sampleRate))
+                        waveWeight: o.waveWeight, waveCutoff: o.waveCutoff, sampleRate: Double(sampleRate),
+                        hfWeight: o.hfWeight, hfFrom: o.hfFrom)
     var results = [MetricLoss.Result?](repeating: nil, count: N)
     let lock = NSLock()
     DispatchQueue.concurrentPerform(iterations: N) { r in
