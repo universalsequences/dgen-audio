@@ -20,6 +20,10 @@ struct MetricLoss {
   var waveWeight: Double = 0
   var waveCutoff: Double = 600
   var sampleRate: Double = 44100
+  /// Weight on the band term's gradient for bands starting at or above `hfFrom` Hz (1 = the plain
+  /// metric). The returned score stays unweighted, so reports compare across weights.
+  var hfWeight: Double = 1
+  var hfFrom: Double = 4000
   static let eps = 1e-3
 
   // MARK: transforms
@@ -172,7 +176,16 @@ struct MetricLoss {
     return (D, E, Es, sp, starts)
   }
 
-  static func band(_ y: [Double], _ t: [Double], floorDB: Double = 70) -> (Double, [Double]) {
+  /// Per-band gradient weights: `hfWeight` for bands whose lowest bin is at or above `hfFrom` Hz.
+  /// A short high stroke (a ride hit a 16th after a snare) is a few dB in a few of the 32 bands;
+  /// weighting them up stops the fit from ignoring it.
+  static func bandWeights(hfWeight: Double, hfFrom: Double) -> [Double] {
+    let binHz = 48000 / Double(bandW)
+    return bandMatrix.rows.map { Double($0.first ?? 0) * binHz >= hfFrom ? hfWeight : 1 }
+  }
+
+  static func band(_ y: [Double], _ t: [Double], floorDB: Double = 70,
+                   weights: [Double]? = nil) -> (Double, [Double]) {
     let n = min(y.count, t.count)
     let Y = bandEnvDB(Array(y[0..<n]))
     let T = bandEnvDB(Array(t[0..<n]))
@@ -181,13 +194,14 @@ struct MetricLoss {
     let norm = 1.0 / Double(J * nbands)
     var score = 0.0
     var gEs = [[Double]](repeating: [Double](repeating: 0, count: nbands), count: J)
+    let wb = weights ?? [Double](repeating: 1, count: nbands)
     for j in 0..<J {
       for b in 0..<nbands {
         let p = max(Y.D[j][b], lo), q = max(T.D[j][b], lo)
         score += abs(p - q) * norm
         guard Y.D[j][b] > lo, p != q else { continue }
         let s = p > q ? 1.0 : -1.0
-        gEs[j][b] = s * norm * 10 / (log(10.0) * (Y.Es[j][b] + 1e-12))
+        gEs[j][b] = wb[b] * s * norm * 10 / (log(10.0) * (Y.Es[j][b] + 1e-12))
       }
     }
     // smoothing transpose: Es[j] uses E[j+1], E[j], E[j-1], E[j-2]
@@ -264,7 +278,8 @@ struct MetricLoss {
 
   func lossAndGradient(_ y: [Float], _ t: [Float]) -> Result {
     let yd = y.map(Double.init), td = t.map(Double.init)
-    let (b, gb) = bandWeight > 0 ? MetricLoss.band(yd, td) : (0, [Double](repeating: 0, count: y.count))
+    let wb = hfWeight == 1 ? nil : MetricLoss.bandWeights(hfWeight: hfWeight, hfFrom: hfFrom)
+    let (b, gb) = bandWeight > 0 ? MetricLoss.band(yd, td, weights: wb) : (0, [Double](repeating: 0, count: y.count))
     let (m, gm) = mrWeight > 0 ? MetricLoss.mr(yd, td, windows: windows) : (0, [Double](repeating: 0, count: y.count))
     let (w, gw) = waveWeight > 0
       ? MetricLoss.lowWave(yd, td, cutoff: waveCutoff, sampleRate: sampleRate)

@@ -42,4 +42,24 @@ final class MetricLossTests: XCTestCase {
     let y = signal(n, seed: 3, f: 60, decay: 0.08), t = signal(n, seed: 4, f: 55, decay: 0.1)
     check({ MetricLoss.band($0, t) }, y, probes: [10, 700, 2500, 5000, 8000], h: 1e-6, tol: 2e-2)
   }
+
+  /// --hf-weight: the score stays the plain metric; the gradient is the low bands' part plus W x the
+  /// high bands' part (bands whose lowest bin is at or above hfFrom).
+  func testBandHFWeightScalesOnlyHighBandGradient() {
+    let n = 8192
+    let y = signal(n, seed: 7, f: 60, decay: 0.08), t = signal(n, seed: 8, f: 55, decay: 0.1)
+    let w = MetricLoss.bandWeights(hfWeight: 3, hfFrom: 4000)
+    let high = w.map { $0 == 3 ? 1.0 : 0 }, low = w.map { $0 == 3 ? 0 : 1.0 }
+    XCTAssertTrue(high.contains(1) && low.contains(1), "4 kHz splits the bands")
+    let (s0, g0) = MetricLoss.band(y, t)
+    let (sw, gw) = MetricLoss.band(y, t, weights: w)
+    let (_, gl) = MetricLoss.band(y, t, weights: low), (_, gh) = MetricLoss.band(y, t, weights: high)
+    XCTAssertEqual(s0, sw)
+    XCTAssertEqual(MetricLoss.band(y, t, weights: MetricLoss.bandWeights(hfWeight: 1, hfFrom: 4000)).1, g0)
+    let scale = gw.map(abs).max()!
+    XCTAssertGreaterThan(gh.map(abs).max()!, 0)
+    for i in 0..<n {
+      XCTAssertEqual(gw[i], gl[i] + 3 * gh[i], accuracy: 1e-9 * scale)
+    }
+  }
 }
