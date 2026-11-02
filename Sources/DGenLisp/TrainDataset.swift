@@ -419,9 +419,11 @@ final class DatasetTrainer {
     DGenGradientConfig.detachPhasorFrequency = false
     LazyGraphContext.preserveCompilationCaches = true
     LazyGraphContext.collectExecutionTiming = timing
-    // Three passes per step (static capture, voice, static backward); runtimes beyond that hold
-    // multi-GB buffers and got the process killed after ~150 steps on a 32 GB machine.
-    LazyGraph.runtimeCacheLimit = 3
+    // One runtime per pass of a step: static capture, voice forward, voice backward, static
+    // backward. With fewer, the passes evict each other and every pass rebuilds its runtime --
+    // compiling, allocating and zeroing gigabytes of buffers (3x slower per step, and twice the
+    // peak memory). DGENLISP_RUNTIME_CACHE overrides it.
+    LazyGraph.runtimeCacheLimit = Int(ProcessInfo.processInfo.environment["DGENLISP_RUNTIME_CACHE"] ?? "") ?? 4
   }
 
   let timing = ProcessInfo.processInfo.environment["DGENLISP_TRAIN_TIMING"] == "1"
@@ -911,16 +913,28 @@ final class DatasetTrainer {
   /// CPU metric loss of a [frames × N] interleaved render: (mean loss, time-major gradient of
   /// the mean).
   var lastMetric: (band: [Double], mr: [Double]) = ([], [])
+  /// Each target's loss spectra, computed once (the targets do not change between steps).
+  lazy var metricTargets: [MetricLoss.Target] = {
+    var out = [MetricLoss.Target?](repeating: nil, count: N)
+    let lock = NSLock()
+    DispatchQueue.concurrentPerform(iterations: N) { r in
+      let t = MetricLoss.target(targets[r].map(Double.init), windows: o.windows)
+      lock.lock(); out[r] = t; lock.unlock()
+    }
+    return out.map { $0! }
+  }()
+
   func metricGradient(_ flat: [Float]) -> (Float, [Float]) {
     let ml = MetricLoss(windows: o.windows, bandWeight: o.bandWeight, mrWeight: o.mrWeight,
                         waveWeight: o.waveWeight, waveCutoff: o.waveCutoff, sampleRate: Double(sampleRate),
                         hfWeight: o.hfWeight, hfFrom: o.hfFrom)
     var results = [MetricLoss.Result?](repeating: nil, count: N)
     let lock = NSLock()
+    let cached = metricTargets
     DispatchQueue.concurrentPerform(iterations: N) { r in
       var y = [Float](repeating: 0, count: o.frames)
       for f in 0..<o.frames { y[f] = flat[f * N + r] }
-      let res = ml.lossAndGradient(y, targets[r])
+      let res = ml.lossAndGradient(y, targets[r], target: cached[r])
       lock.lock(); results[r] = res; lock.unlock()
     }
     var g = [Float](repeating: 0, count: o.frames * N)

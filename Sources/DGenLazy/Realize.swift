@@ -163,22 +163,39 @@ extension LazyGraph {
 
         // Fast path: reuse full compilation cache when graph topology is unchanged.
         // CompilationResult.graph is a reference type, so cached results see current tensor data.
-        // Not for SignalTensor/Tensor realize(): their readback resolves the
-        // node's tensor via graph.nodeToTensor / frameAwareCells, which
-        // clearComputationGraph() wipes and only a real compile repopulates, so
-        // a cache hit read the wrong (non-frame-aware) tensor.
-        if graph.materializeNodes.isEmpty, let cached = fullCompilationCache,
-          cached.fingerprint == compileFingerprint
-        {
-            compilationCache = cached.result
-            runtimeCache = cached.runtime
-            isDirty = false
-            lastExecutionTiming.fullCompilationCacheHit = true
-            lastExecutionTiming.runtimeCacheHit = true
-            if timingEnabled {
-                lastExecutionTiming.kernelSourceHashes = [kernelSourceHash(cached.result.kernels)]
+        // A SignalTensor/Tensor realize() resolves its readback through graph.nodeToTensor /
+        // frameAwareCells / tensors, which clearComputationGraph() wipes and only a real
+        // compile repopulates: its cache entry keeps them (Readback) and a hit restores them.
+        // The graph's structure before compiling (compile may annotate it): the key a later
+        // rebuild of the same graph is looked up by.
+        let structure: UInt64? = structuralHash()
+        if let h = structure, let cached = fullCompilationCaches[compileFingerprint] {
+            if cached.structure == h, graph.materializeNodes.isEmpty || cached.readback != nil {
+                if let rb = cached.readback {
+                    // what compile added or allocated; this step's tensor data stays
+                    for (k, v) in rb.nodeToTensor { graph.nodeToTensor[k] = v }
+                    for (k, v) in rb.frameAwareCells { graph.frameAwareCells[k] = v }
+                    for (k, v) in rb.tensors {
+                        if var cur = graph.tensors[k] {
+                            cur.cellId = v.cellId
+                            cur.isLazy = v.isLazy
+                            graph.tensors[k] = cur
+                        } else {
+                            graph.tensors[k] = v
+                        }
+                    }
+                }
+                fullCompilationCache = (fingerprint: compileFingerprint, result: cached.result, runtime: cached.runtime)
+                compilationCache = cached.result
+                runtimeCache = cached.runtime
+                isDirty = false
+                lastExecutionTiming.fullCompilationCacheHit = true
+                lastExecutionTiming.runtimeCacheHit = true
+                if timingEnabled {
+                    lastExecutionTiming.kernelSourceHashes = [kernelSourceHash(cached.result.kernels)]
+                }
+                return ExecutionContext(compilationResult: cached.result, runtime: cached.runtime, frameCount: frameCount)
             }
-            return ExecutionContext(compilationResult: cached.result, runtime: cached.runtime, frameCount: frameCount)
         }
 
         // Compile the graph
@@ -229,6 +246,11 @@ extension LazyGraph {
         }
 
         fullCompilationCache = (fingerprint: compileFingerprint, result: result, runtime: runtime)
+        if let structure {
+            let readback = graph.materializeNodes.isEmpty ? nil
+                : Readback(nodeToTensor: graph.nodeToTensor, tensors: graph.tensors, frameAwareCells: graph.frameAwareCells)
+            cacheFullCompilation(compileFingerprint, structure: structure, result: result, runtime: runtime, readback: readback)
+        }
         compilationCache = result
         runtimeCache = runtime
         isDirty = false

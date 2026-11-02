@@ -115,10 +115,30 @@ struct MetricLoss {
     return s
   }
 
+  // MARK: target cache
+
+  /// A target's spectra, which every step's loss compares against: its MR-STFT frames per window
+  /// and its band envelope. A trainer's targets never change, so it computes these once per
+  /// sample instead of every step (a third of the MR transforms and half the band ones).
+  struct Target {
+    let n: Int
+    let mr: [Int: Spectra]
+    let band: (D: [[Double]], E: [[Double]], Es: [[Double]], sp: Spectra, starts: [Int])
+  }
+
+  static func target(_ t: [Double], windows: [Int]) -> Target {
+    let n = t.count
+    var mr: [Int: Spectra] = [:]
+    for w in windows where w <= n {
+      mr[w] = spectra(t, w: w, starts: Array(stride(from: 0, through: n - w, by: w / 4)))
+    }
+    return Target(n: n, mr: mr, band: bandEnvDB(t))
+  }
+
   // MARK: MR-STFT
 
   /// MR score and its gradient w.r.t. y.
-  static func mr(_ y: [Double], _ t: [Double], windows: [Int]) -> (Double, [Double]) {
+  static func mr(_ y: [Double], _ t: [Double], windows: [Int], target: Target? = nil) -> (Double, [Double]) {
     let n = min(y.count, t.count)
     var grad = [Double](repeating: 0, count: n)
     var total = 0.0
@@ -128,7 +148,7 @@ struct MetricLoss {
       let starts = Array(stride(from: 0, through: n - w, by: hop))
       let nb = w / 2 + 1
       let sy = spectra(y, w: w, starts: starts)
-      let stt = spectra(t, w: w, starts: starts)
+      let stt = target?.n == n ? (target?.mr[w] ?? spectra(t, w: w, starts: starts)) : spectra(t, w: w, starts: starts)
       let norm = 1.0 / Double(starts.count * nb) / Double(ws.count)
       let d = dft(w)
       let e2 = eps * eps
@@ -185,10 +205,10 @@ struct MetricLoss {
   }
 
   static func band(_ y: [Double], _ t: [Double], floorDB: Double = 70,
-                   weights: [Double]? = nil) -> (Double, [Double]) {
+                   weights: [Double]? = nil, target: Target? = nil) -> (Double, [Double]) {
     let n = min(y.count, t.count)
     let Y = bandEnvDB(Array(y[0..<n]))
-    let T = bandEnvDB(Array(t[0..<n]))
+    let T = target?.n == n ? target!.band : bandEnvDB(Array(t[0..<n]))
     let lo = (T.D.flatMap { $0 }.max() ?? 0) - floorDB
     let J = Y.D.count, nbands = bandMatrix.count
     let norm = 1.0 / Double(J * nbands)
@@ -276,11 +296,11 @@ struct MetricLoss {
     var wave: Double = 0
   }
 
-  func lossAndGradient(_ y: [Float], _ t: [Float]) -> Result {
+  func lossAndGradient(_ y: [Float], _ t: [Float], target: Target? = nil) -> Result {
     let yd = y.map(Double.init), td = t.map(Double.init)
     let wb = hfWeight == 1 ? nil : MetricLoss.bandWeights(hfWeight: hfWeight, hfFrom: hfFrom)
-    let (b, gb) = bandWeight > 0 ? MetricLoss.band(yd, td, weights: wb) : (0, [Double](repeating: 0, count: y.count))
-    let (m, gm) = mrWeight > 0 ? MetricLoss.mr(yd, td, windows: windows) : (0, [Double](repeating: 0, count: y.count))
+    let (b, gb) = bandWeight > 0 ? MetricLoss.band(yd, td, weights: wb, target: target) : (0, [Double](repeating: 0, count: y.count))
+    let (m, gm) = mrWeight > 0 ? MetricLoss.mr(yd, td, windows: windows, target: target) : (0, [Double](repeating: 0, count: y.count))
     let (w, gw) = waveWeight > 0
       ? MetricLoss.lowWave(yd, td, cutoff: waveCutoff, sampleRate: sampleRate)
       : (0, [Double](repeating: 0, count: y.count))

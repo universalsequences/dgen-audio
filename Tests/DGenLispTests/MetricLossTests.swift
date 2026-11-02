@@ -62,4 +62,18 @@ final class MetricLossTests: XCTestCase {
       XCTAssertEqual(gw[i], gl[i] + 3 * gh[i], accuracy: 1e-9 * scale)
     }
   }
+
+  /// A trainer's cached target spectra give the same score and gradient as computing them per call.
+  func testCachedTargetMatchesUncached() {
+    let n = 8192
+    let y = signal(n, seed: 9, f: 60, decay: 0.08), t = signal(n, seed: 10, f: 55, decay: 0.1)
+    let tg = MetricLoss.target(t, windows: [64, 256, 1024])
+    let (b0, gb0) = MetricLoss.band(y, t), (b1, gb1) = MetricLoss.band(y, t, target: tg)
+    let (m0, gm0) = MetricLoss.mr(y, t, windows: [64, 256, 1024])
+    let (m1, gm1) = MetricLoss.mr(y, t, windows: [64, 256, 1024], target: tg)
+    XCTAssertEqual(b0, b1)
+    XCTAssertEqual(m0, m1)
+    XCTAssertEqual(gb0, gb1)
+    XCTAssertEqual(gm0, gm1)
+  }
 }
