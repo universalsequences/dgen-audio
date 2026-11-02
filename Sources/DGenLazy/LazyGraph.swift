@@ -104,6 +104,51 @@ public class LazyGraph {
   /// Skips both DGen compilation and runtime creation when topology is unchanged across epochs.
   internal var fullCompilationCache: (fingerprint: String, result: CompilationResult, runtime: LazyRuntime)?
 
+  /// Every recent full compilation by fingerprint (at most `runtimeCacheLimit`), each with a
+  /// structural hash of the graph it was compiled from. A trainer alternates several graphs per
+  /// step (static capture, voice backward, static backward): with only the one entry above,
+  /// each pass evicted the previous and every pass recompiled.
+  internal var fullCompilationCaches: [String: (structure: UInt64, result: CompilationResult, runtime: LazyRuntime,
+                                                readback: Readback?)] = [:]
+  /// What a realize() reads back through after compiling (compile fills these in): restored on a
+  /// cache hit so a cached realize reads the same tensors a fresh compile would.
+  internal struct Readback {
+    let nodeToTensor: [NodeID: TensorID]
+    let tensors: [TensorID: DGen.Tensor]
+    let frameAwareCells: [CellID: (tensorSize: Int, frameCount: Int)]
+  }
+  internal var fullCompilationCacheOrder: [String] = []
+
+  internal func cacheFullCompilation(_ fingerprint: String, structure: UInt64, result: CompilationResult,
+                                     runtime: LazyRuntime, readback: Readback?) {
+    if fullCompilationCaches[fingerprint] == nil {
+      fullCompilationCacheOrder.append(fingerprint)
+      while fullCompilationCacheOrder.count > Self.runtimeCacheLimit {
+        fullCompilationCaches.removeValue(forKey: fullCompilationCacheOrder.removeFirst())
+      }
+    }
+    fullCompilationCaches[fingerprint] = (structure, result, runtime, readback)
+  }
+
+  /// FNV-1a over every node's id, op and inputs, in id order: two graphs with the same counts
+  /// and constants (the fingerprint) but different wiring get different hashes.
+  internal func structuralHash() -> UInt64 {
+    var h: UInt64 = 14695981039346656037
+    func mix(_ x: UInt64) { h ^= x; h &*= 1099511628211 }
+    for id in graph.nodes.keys.sorted() {
+      let node = graph.nodes[id]!
+      mix(UInt64(bitPattern: Int64(id)))
+      for b in String(describing: node.op).utf8 { mix(UInt64(b)) }
+      for i in node.inputs { mix(UInt64(bitPattern: Int64(i))) }
+      mix(0xFF)
+      for i in node.temporalDependencies { mix(UInt64(bitPattern: Int64(i))) }
+      mix(0xFE)
+    }
+    // the nodes a realize() reads back (their tensors are materialized)
+    for id in graph.materializeNodes.sorted() { mix(UInt64(bitPattern: Int64(id))) }
+    return h
+  }
+
   internal var tensors: [WeakRef<Tensor>] = []
   internal var signals: [WeakRef<Signal>] = []
 

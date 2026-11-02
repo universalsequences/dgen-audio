@@ -286,19 +286,32 @@ public class MetalCompiledKernel: CompiledKernelRuntime {
 
   /// Zero all GPU buffers (for deterministic training reset)
   public func zeroAllBuffers() {
-    for (name, buffer) in bufferPool {
-      // Skip frameCount - it's not a float buffer
-      if name == "frameCount" { continue }
-      memset(buffer.contents(), 0, buffer.length)
-    }
+    // Skip frameCount - it's not a float buffer
+    zeroOnGPU(bufferPool.filter { $0.key != "frameCount" }.map(\.value))
   }
 
   /// Zero only transient buffers (outputs, inputs), preserving memory state.
   /// Used in "retain" mode where GPU memory persists across kernel executions.
   public func zeroTransientBuffers() {
-    for (name, buffer) in bufferPool {
-      if name == "frameCount" || name == "memory" { continue }
-      memset(buffer.contents(), 0, buffer.length)
+    zeroOnGPU(bufferPool.filter { $0.key != "frameCount" && $0.key != "memory" }.map(\.value))
+  }
+
+  /// Zero buffers with one blit fill on the GPU, waiting for it so the CPU may write into them
+  /// afterwards. A training render's buffers are gigabytes: a CPU memset of them took as long
+  /// as the render itself. Small totals stay on the CPU (a command buffer costs more).
+  private func zeroOnGPU(_ buffers: [MTLBuffer]) {
+    let total = buffers.reduce(0) { $0 + $1.length }
+    guard total >= 1 << 22, let cb = commandQueue.makeCommandBuffer(), let blit = cb.makeBlitCommandEncoder()
+    else {
+      for b in buffers { memset(b.contents(), 0, b.length) }
+      return
+    }
+    for b in buffers { blit.fill(buffer: b, range: 0..<b.length, value: 0) }
+    blit.endEncoding()
+    cb.commit()
+    cb.waitUntilCompleted()
+    if cb.status == .error {
+      for b in buffers { memset(b.contents(), 0, b.length) }
     }
   }
 
@@ -627,13 +640,10 @@ public class MetalCompiledKernel: CompiledKernelRuntime {
   }
 
   public func cleanup() {
-    for (name, buffer) in bufferPool {
-      if name == "frameCount" {
-        let intContents = buffer.contents().assumingMemoryBound(to: Int32.self)
-        intContents[0] = 0
-      } else {
-        memset(buffer.contents(), 0, buffer.length)
-      }
+    // Only the frame count is reset: zeroing buffers that are about to be released cost a full
+    // pass over gigabytes of training buffers.
+    if let buffer = bufferPool["frameCount"] {
+      buffer.contents().assumingMemoryBound(to: Int32.self)[0] = 0
     }
 
     functions.removeAll()
