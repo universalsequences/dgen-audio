@@ -34,6 +34,39 @@ extension GraphPrepPasses {
     return (currentId, viewNodeIds, hasTranspose, nearest2DShape)
   }
 
+  /// True when a traced view chain (nodes listed consumer-first, as `traceViewChain` returns
+  /// them) is physically the source itself or a 2-D transpose of it, so the GEMM may read the
+  /// source's raw memory. Only reshapes and 2-D transposes qualify, and a reshape above a
+  /// transpose may only add or drop size-1 dims. Any other view (shrink, pad, asStrided —
+  /// e.g. an im2col window view —, expand, repeat) reads elements the raw source does not
+  /// lay out, so the matmul must stay on the generic path that reads through the views.
+  private static func isPlainViewChain(_ viewIds: [NodeID], graph: Graph) -> Bool {
+    var transposed = false
+    for id in viewIds.reversed() {
+      guard let node = graph.nodes[id] else { return false }
+      switch node.op {
+      case .reshape:
+        guard transposed else { continue }
+        guard let inId = node.inputs.first, let inNode = graph.nodes[inId],
+          case .tensor(let inShape) = inNode.shape, case .tensor(let outShape) = node.shape,
+          inShape.filter({ $0 != 1 }) == outShape.filter({ $0 != 1 })
+        else { return false }
+      case .transpose(let perm):
+        guard let inId = node.inputs.first, let inNode = graph.nodes[inId],
+          case .tensor(let inShape) = inNode.shape
+        else { return false }
+        // A permutation of a tensor with at most two non-unit dims that swaps them
+        let nonUnit = inShape.indices.filter { inShape[$0] != 1 }
+        let permutedNonUnit = perm.filter { inShape[$0] != 1 }
+        guard nonUnit.count <= 2 else { return false }
+        if permutedNonUnit != nonUnit { transposed.toggle() }
+      default:
+        return false
+      }
+    }
+    return true
+  }
+
   /// Determine if a GEMM input needs a transposed load by comparing source shape
   /// against expected layout, using view chain transpose info to disambiguate square matrices.
   private static func needsTranspose(
@@ -194,6 +227,9 @@ extension GraphPrepPasses {
           from: mulNode.inputs[leftInputIdx], graph: graph)
         let (rightSource, rightViewIds, rightHasTranspose, _) = traceViewChain(
           from: mulNode.inputs[rightInputIdx], graph: graph)
+        guard isPlainViewChain(leftViewIds, graph: graph),
+          isPlainViewChain(rightViewIds, graph: graph)
+        else { continue }
 
         // DGen's matmul always transposes B once before reshaping: bTransposed = transpose(b).
         // So if the view chain has an ODD number of transposes, B is physically [K,N] → transB=false.
@@ -289,6 +325,7 @@ extension GraphPrepPasses {
     let otherIdx = 1 - expandIdx
     let (otherSource, otherViewIds, otherHasTranspose, otherNearest2D) = traceViewChain(
       from: mulNode.inputs[otherIdx], graph: graph)
+    guard isPlainViewChain(otherViewIds, graph: graph) else { return nil }
 
     // Use the traced source's shape if 2D, otherwise fall back to the nearest 2D shape in the chain
     let otherSrcShape: [Int]

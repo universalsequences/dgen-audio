@@ -697,15 +697,29 @@ extension LazyOp {
       }
       return [g.n(.reshape(origShape), [gradOutput])]
 
-    case .asStrided(_, _):
-      // asStrided gradient: reshape back to original shape
-      // (The strided view is used for pool/im2col, gradient flows back to original layout)
+    case .asStrided(let outShape, let strides):
+      // Scatter-add: every window element accumulates its grad into the input position it
+      // read, overlaps summing. Built from views + adds for pool-shaped views (`pool`,
+      // `windows`); any other strided view on a gradient path is a hard error.
       guard let inputNode = g.nodes[node.inputs[0]],
         case .tensor(let origShape) = inputNode.shape
       else {
         return [gradOutput]
       }
-      return [g.n(.reshape(origShape), [gradOutput])]
+      if let tid = g.nodeToTensor[node.id], let t = g.tensors[tid],
+        case .asStrided(_, _, let offset, _)? = t.transforms.last, offset != 0
+      {
+        fatalError("asStrided backward: offset \(offset) views are not differentiable")
+      }
+      guard
+        let grad = g.poolViewGradient(
+          gradOutput, inputShape: origShape, outShape: outShape, strides: strides)
+      else {
+        fatalError(
+          "asStrided backward: only pool-shaped views ([...batch, o..., k...] over a row-major "
+            + "input) are differentiable; got shape \(outShape) strides \(strides) over \(origShape)")
+      }
+      return [grad]
 
     case .transpose(let perm):
       // Inverse permutation for gradient
@@ -1660,6 +1674,91 @@ extension LazyOp {
     }
 
     return result
+  }
+}
+
+// MARK: - Strided-window (pool) backward
+
+extension Graph {
+  /// Input gradient of a pool-shaped strided view, composed from views and adds.
+  ///
+  /// A pool view of a row-major input [...batch, n₀, …] is [...batch, o₀, …, k₀, …] with
+  /// strides [R_batch…, R₀·s₀, …, R₀, …] (R = the input's row-major strides). Along each
+  /// spatial axis, window offset j of window t read input position j + s·t, so
+  ///   grad_x = Σⱼ pad(dilate_s(G[…, :, j, …]), (j, rest))
+  /// with dilate = pad + reshape (the trailing zeros shrunk off). Non-overlapping axes
+  /// (s == k) are a reshape. Returns nil when the view is not pool-shaped.
+  func poolViewGradient(
+    _ gradOutput: NodeID, inputShape: [Int], outShape: [Int], strides: [Int]
+  ) -> NodeID? {
+    let r = inputShape.count
+    let S = outShape.count - r
+    guard S >= 0, strides.count == outShape.count else { return nil }
+    let R = Tensor.computeRowMajorStrides(inputShape)
+    let batch = r - S
+    for d in 0..<batch where outShape[d] != inputShape[d] || (strides[d] != R[d] && outShape[d] > 1) {
+      return nil
+    }
+    if S == 0 { return gradOutput }
+    var steps: [(o: Int, k: Int, s: Int, n: Int)] = []
+    for i in 0..<S {
+      let n = inputShape[batch + i], o = outShape[batch + i], k = outShape[batch + S + i]
+      let rs = R[batch + i]
+      guard strides[batch + S + i] == rs || k == 1 else { return nil }
+      let s: Int
+      if o == 1 {
+        s = k  // a single window: any stride, treat as non-overlapping
+      } else {
+        guard strides[batch + i] % rs == 0, strides[batch + i] / rs >= 1 else { return nil }
+        s = strides[batch + i] / rs
+      }
+      guard (o - 1) * s + k <= n else { return nil }
+      steps.append((o, k, s, n))
+    }
+    // [...batch, o₀…, k₀…] → [...batch, o₀, k₀, o₁, k₁, …]
+    var x = gradOutput
+    var shape = outShape
+    if S > 1 {
+      let perm = Array(0..<batch) + (0..<S).flatMap { [batch + $0, batch + S + $0] }
+      x = try! transpose(x, axes: perm)
+      shape = perm.map { outShape[$0] }
+    }
+    for (i, st) in steps.enumerated() {
+      let a = batch + i  // [.., o, k, ..] at (a, a+1); replaced by [.., n, ..]
+      let pre = Array(shape[..<a]), post = Array(shape[(a + 2)...])
+      func ranges(_ axis: Int, _ rng: (Int, Int), _ dims: Int) -> [(Int, Int)?] {
+        (0..<dims).map { $0 == axis ? rng : nil }
+      }
+      func pads(_ axis: Int, _ p: (Int, Int), _ dims: Int) -> [(Int, Int)] {
+        (0..<dims).map { $0 == axis ? p : (0, 0) }
+      }
+      var acc: NodeID
+      if st.s == st.k {
+        acc = try! reshape(x, to: pre + [st.o * st.k] + post)
+        if st.o * st.k < st.n {
+          acc = try! pad(acc, padding: pads(a, (0, st.n - st.o * st.k), shape.count - 1))
+        }
+      } else {
+        let span = (st.o - 1) * st.s + 1
+        var sum: NodeID? = nil
+        for j in 0..<st.k {
+          var xj = try! shrink(x, ranges: ranges(a + 1, (j, j + 1), shape.count))  // [.., o, 1, ..]
+          if st.s > 1 {
+            xj = try! pad(xj, padding: pads(a + 1, (0, st.s - 1), shape.count))  // [.., o, s, ..]
+          }
+          xj = try! reshape(xj, to: pre + [st.o * st.s] + post)
+          if span < st.o * st.s {
+            xj = try! shrink(xj, ranges: ranges(a, (0, span), shape.count - 1))
+          }
+          xj = try! pad(xj, padding: pads(a, (j, st.n - j - span), shape.count - 1))
+          sum = sum.map { n(.add, [$0, xj]) } ?? xj
+        }
+        acc = sum!
+      }
+      x = acc
+      shape = pre + [st.n] + post
+    }
+    return x
   }
 }
 

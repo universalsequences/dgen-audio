@@ -13,6 +13,9 @@
 //   (param-row U @layout NAME)                      decoder/voice split point (see DatasetContext)
 //   (row-out Y)                                     compile: Y's single element as a signal;
 //                                                   train: the [B] lane signal the losses read
+//   (row-data @name N @shape [a b] X)               compile: X ([1, a·b]); train: a [B, a·b]
+//                                                   data tensor the trainer fills per step
+//   (latent-out Z)                                  marks an encoder's [B, D] output
 //   (hit-time TRIG [@max S])                        seconds since TRIG's last rising edge
 //                                                   (S before the first one); train: a
 //                                                   frame-parallel ramp from frame 0
@@ -85,6 +88,11 @@ struct LearnableTensorInfo: Equatable {
   let initKind: String
 }
 
+struct RowDataInfo: Equatable {
+  let name: String
+  let shape: [Int]
+}
+
 struct LatentTableInfo: Equatable {
   let name: String
   let dim: Int
@@ -142,6 +150,10 @@ final class DatasetContext {
   let learnable: (String, [Int], [Float]?, String) throws -> Tensor
   /// name, dim → [B, D] code rows.
   let latentRows: (String, Int) throws -> Tensor
+  /// name, per-row shape → [B, prod(shape)] non-learnable data rows (`row-data`).
+  var rowData: ((String, [Int]) throws -> Tensor)? = nil
+  /// `latent-out` values in evaluation order.
+  var latentOut: [Tensor] = []
 
   init(
     rows: Int, frames: Int, sampleRate: Float, rowMode: RowMode,
@@ -189,6 +201,72 @@ extension LispEvaluator {
       throw LispError.invalidArgument(
         "latent-table \(name) default must be [1, \(dim)], got \(tensorShape(of: value) ?? [])")
     }
+    return value
+  }
+
+  // MARK: row-data / latent-out
+
+  /// `(row-data @name N @shape [a b …] X)`: per-row input data. Under a dataset context the
+  /// trainer's [B, a·b·…] tensor (X is not evaluated); in a compile X itself, flattened to
+  /// [1, a·b·…].
+  func evalRowData(_ args: [ASTNode], attributes: [(name: String, value: String)]) throws
+    -> EvalResult
+  {
+    let name = attrValue(attributes, "@name").map(unquote) ?? "data"
+    guard let shapeText = attrValue(attributes, "@shape") else {
+      throw LispError.invalidArgument("row-data requires @shape [..]: (row-data @name N @shape [a b] X)")
+    }
+    let shape = parseShape(shapeText)
+    let width = shape.reduce(1, *)
+    guard !shape.isEmpty, width > 0 else {
+      throw LispError.invalidArgument("row-data \(name): @shape must be non-empty and positive")
+    }
+    if !rowDataInfo.contains(where: { $0.name == name }) {
+      rowDataInfo.append(RowDataInfo(name: name, shape: shape))
+    }
+    if let dataset {
+      guard let feed = dataset.rowData else {
+        throw LispError.invalidArgument("row-data \(name): this trainer does not supply row data")
+      }
+      let t = try feed(name, shape)
+      guard t.shape == [dataset.rows, width] else {
+        throw LispError.invalidArgument(
+          "row-data \(name): trainer supplied \(t.shape), expected [\(dataset.rows), \(width)]")
+      }
+      return .tensor(t)
+    }
+    guard args.count == 1 else {
+      throw LispError.invalidArgument("row-data \(name) needs one expression for compiles")
+    }
+    let value = try evaluateAST(args[0])
+    guard let inShape = tensorShape(of: value), inShape.reduce(1, *) == width else {
+      throw LispError.invalidArgument(
+        "row-data \(name): expression has shape \(tensorShape(of: value) ?? []), expected \(width) elements")
+    }
+    switch value {
+    case .tensor(let t): return .tensor(t.reshape([1, width]))
+    case .signalTensor(let t): return .signalTensor(t.reshape([1, width]))
+    default: throw LispError.typeError("row-data \(name): expression must be a tensor")
+    }
+  }
+
+  /// `(latent-out Z)`: marks an encoder patch's [B, D] code output (identity).
+  func evalLatentOut(_ args: [ASTNode]) throws -> EvalResult {
+    guard args.count == 1 else { throw LispError.invalidArgument("latent-out requires 1 argument") }
+    let value = try evaluateAST(args[0])
+    guard let shape = tensorShape(of: value), shape.count == 2 else {
+      throw LispError.invalidArgument("latent-out: expected [B, D], got \(tensorShape(of: value) ?? [])")
+    }
+    if let dataset {
+      guard case .tensor(let z) = value else {
+        throw LispError.invalidArgument("latent-out: under training the code must be static (a tensor)")
+      }
+      guard shape[0] == dataset.rows else {
+        throw LispError.invalidArgument("latent-out: expected \(dataset.rows) rows, got \(shape)")
+      }
+      dataset.latentOut.append(z)
+    }
+    latentOutShapes.append(shape)
     return value
   }
 
