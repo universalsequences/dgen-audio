@@ -37,10 +37,20 @@ extension GraphPrepPasses {
   /// True when a traced view chain (nodes listed consumer-first, as `traceViewChain` returns
   /// them) is physically the source itself or a 2-D transpose of it, so the GEMM may read the
   /// source's raw memory. Only reshapes and 2-D transposes qualify, and a reshape above a
-  /// transpose may only add or drop size-1 dims. Any other view (shrink, pad, asStrided —
-  /// e.g. an im2col window view —, expand, repeat) reads elements the raw source does not
-  /// lay out, so the matmul must stay on the generic path that reads through the views.
-  private static func isPlainViewChain(_ viewIds: [NodeID], graph: Graph) -> Bool {
+  /// transpose may only add or drop size-1 dims. Any other view (shrink, pad, expand) reads
+  /// elements the raw source does not lay out, so the matmul must stay on the generic path
+  /// that reads through the views.
+  ///
+  /// `source` is the node the chain bottoms out at. `traceViewChain` only walks `isViewOnly`
+  /// ops, so it can stop at an `asStrided` (e.g. an im2col window view) or `repeatView` node;
+  /// those own no memory either (`isMemorylessView`), and a GEMM reading one would read its
+  /// base tensor's raw memory, so they are rejected here. This is deliberately blanket: a
+  /// non-overlapping offset-0 window over contiguous memory is layout-identical to a reshape
+  /// and could take the GEMM, but no current caller needs that.
+  private static func isPlainViewChain(
+    _ viewIds: [NodeID], source: NodeID, graph: Graph
+  ) -> Bool {
+    guard let sourceOp = graph.nodes[source]?.op, !sourceOp.isMemorylessView else { return false }
     var transposed = false
     for id in viewIds.reversed() {
       guard let node = graph.nodes[id] else { return false }
@@ -227,8 +237,8 @@ extension GraphPrepPasses {
           from: mulNode.inputs[leftInputIdx], graph: graph)
         let (rightSource, rightViewIds, rightHasTranspose, _) = traceViewChain(
           from: mulNode.inputs[rightInputIdx], graph: graph)
-        guard isPlainViewChain(leftViewIds, graph: graph),
-          isPlainViewChain(rightViewIds, graph: graph)
+        guard isPlainViewChain(leftViewIds, source: leftSource, graph: graph),
+          isPlainViewChain(rightViewIds, source: rightSource, graph: graph)
         else { continue }
 
         // DGen's matmul always transposes B once before reshaping: bTransposed = transpose(b).
@@ -313,7 +323,7 @@ extension GraphPrepPasses {
     // transpose(reshape(...)) adjoint of a matmul's right operand, flowing into the matmul
     // that produced that operand: x @ (n @ c)) is not laid out as its logical [r, c] shape,
     // and reading it raw gave wrong gradients. Leave such patterns to the generic path.
-    if expandSourceNode.op.isViewOnly { return nil }
+    if expandSourceNode.op.isMemorylessView { return nil }
 
     // The expand axis must not be the reduce axis (they'd cancel out)
     let remaining = [0, 1, 2].filter { $0 != expandAxisPos }
@@ -325,7 +335,7 @@ extension GraphPrepPasses {
     let otherIdx = 1 - expandIdx
     let (otherSource, otherViewIds, otherHasTranspose, otherNearest2D) = traceViewChain(
       from: mulNode.inputs[otherIdx], graph: graph)
-    guard isPlainViewChain(otherViewIds, graph: graph) else { return nil }
+    guard isPlainViewChain(otherViewIds, source: otherSource, graph: graph) else { return nil }
 
     // Use the traced source's shape if 2D, otherwise fall back to the nearest 2D shape in the chain
     let otherSrcShape: [Int]

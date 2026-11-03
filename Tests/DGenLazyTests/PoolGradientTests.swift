@@ -148,4 +148,82 @@ extension PoolGradientTests {
     let y = cols.matmul(Tensor([Float](repeating: 1, count: 6)).reshape([6, 1]))
     XCTAssertEqual(try y.realize(), [21, 27, 33])
   }
+
+  // MARK: - GEMM rewrite over a bare window / repeat view
+  //
+  // `asStrided` and `repeatView` are not `isViewOnly`, so the GEMM pass's view-chain trace
+  // stops at them and used to treat them as the data source, reading the un-windowed base
+  // tensor's raw memory. Without a transpose in between nothing else rejected the rewrite.
+
+  /// Reference single-channel conv: y[t, c] = sum_j x[t*s + j] * w[j, c].
+  private func conv1dRef(_ x: [Float], k: Int, s: Int, w: [Float], cout: Int) -> [Float] {
+    let t = (x.count - k) / s + 1
+    var y = [Float](repeating: 0, count: t * cout)
+    for i in 0..<t {
+      for c in 0..<cout {
+        for j in 0..<k { y[i * cout + c] += x[i * s + j] * w[j * cout + c] }
+      }
+    }
+    return y
+  }
+
+  /// Integer-valued signal [n] and weights [k, cout], so float results compare exactly.
+  private func windowFixture(n: Int, k: Int, cout: Int) -> (x: [Float], w: [Float]) {
+    ((0..<n).map { Float(($0 * 7) % 11) - 5 }, (0..<(k * cout)).map { Float(($0 * 3) % 5) - 2 })
+  }
+
+  /// `x.pool(...).matmul(w)` with no transpose: the window view is the GEMM operand itself.
+  private func checkWindowMatmul(
+    n: Int, k: Int, s: Int, cout: Int, file: StaticString = #filePath, line: UInt = #line
+  ) throws {
+    LazyGraphContext.reset()
+    let (xd, wd) = windowFixture(n: n, k: k, cout: cout)
+    let y = Tensor(xd).pool(kernel: [k], stride: [s]).matmul(Tensor(wd).reshape([k, cout]))
+    XCTAssertEqual(try y.realize(), conv1dRef(xd, k: k, s: s, w: wd, cout: cout),
+                   "n=\(n) k=\(k) s=\(s) cout=\(cout)", file: file, line: line)
+  }
+
+  func testMatmulOfBareWindowViewSmall() throws {
+    try checkWindowMatmul(n: 10, k: 3, s: 1, cout: 2)  // [8, 3] @ [3, 2] (gemmSmall)
+  }
+
+  func testMatmulOfBareWindowViewAligned() throws {
+    try checkWindowMatmul(n: 71, k: 8, s: 1, cout: 8)  // [64, 8] @ [8, 8] (8-aligned gemm)
+  }
+
+  func testMatmulOfBareWindowViewStrided() throws {
+    try checkWindowMatmul(n: 133, k: 8, s: 2, cout: 16)  // [64, 8] @ [8, 16], stride 2
+  }
+
+  /// The window view as the right operand: w [cout, k] @ windowsᵀ.
+  func testMatmulWithBareWindowViewOnRight() throws {
+    LazyGraphContext.reset()
+    let n = 10, k = 3, cout = 2
+    let (xd, wd) = windowFixture(n: n, k: k, cout: cout)
+    // wT [cout, k] @ cols [k, T]; cols = windowsᵀ, so the result is the conv's transpose.
+    let wT = Tensor(wd).reshape([k, cout]).transpose([1, 0])
+    let cols = Tensor(xd).pool(kernel: [k], stride: [1]).transpose([1, 0])
+    let y = try wT.matmul(cols).realize()
+    let ref = conv1dRef(xd, k: k, s: 1, w: wd, cout: cout)  // [T, cout]
+    let t = n - k + 1
+    XCTAssertEqual(y, (0..<(cout * t)).map { ref[($0 % t) * cout + $0 / t] })
+  }
+
+  /// Gradients of a single-channel conv built as a bare window matmul (the backward GEMM
+  /// pattern reads the window view as its non-expanded operand).
+  func testBareWindowMatmulGrads() throws {
+    try check(leaves: [([12], values(12, seed: 5)), ([3, 4], values(12, seed: 6))]) { p in
+      (tanh(p[0].pool(kernel: [3], stride: [1]).matmul(p[1])) * Tensor(values(40, seed: 7))
+        .reshape([10, 4])).sum()
+    }
+  }
+
+  /// matmul whose operand is a `repeat` (tiled) view, also not `isViewOnly`.
+  func testMatmulOfRepeatView() throws {
+    LazyGraphContext.reset()
+    let x = Tensor([1, 2, 3, 4, 5, 6]).reshape([2, 3])
+    let w = Tensor([1, 0, 0, 1, 1, 1]).reshape([3, 2])
+    let y = x.repeat([2, 1]).matmul(w)  // [4, 3] @ [3, 2]
+    XCTAssertEqual(try y.realize(), [4, 5, 10, 11, 4, 5, 10, 11])
+  }
 }
