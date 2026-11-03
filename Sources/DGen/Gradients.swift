@@ -1680,85 +1680,159 @@ extension LazyOp {
 // MARK: - Strided-window (pool) backward
 
 extension Graph {
-  /// Input gradient of a pool-shaped strided view, composed from views and adds.
+  /// Input gradient of a "pool view": a strided view that reads overlapping (or tiled)
+  /// windows of its input without copying it. Built only from shrink / pad / reshape / add,
+  /// since the graph has no scatter op. Returns nil when the view is not pool-shaped.
   ///
-  /// A pool view of a row-major input [...batch, n₀, …] is [...batch, o₀, …, k₀, …] with
-  /// strides [R_batch…, R₀·s₀, …, R₀, …] (R = the input's row-major strides). Along each
-  /// spatial axis, window offset j of window t read input position j + s·t, so
-  ///   grad_x = Σⱼ pad(dilate_s(G[…, :, j, …]), (j, rest))
-  /// with dilate = pad + reshape (the trailing zeros shrunk off). Non-overlapping axes
-  /// (s == k) are a reshape. Returns nil when the view is not pool-shaped.
+  /// Worked example (1-D, the numbers used in the comments below):
+  ///
+  ///     x = [10 20 30 40 50 60 70]          n = 7 input positions
+  ///     kernel k = 3, stride s = 2          → o = 3 windows
+  ///
+  ///     view W (shape [o, k] = [3, 3])      W[t][j] = x[s·t + j]
+  ///       t=0: [10 20 30]                   t = which window
+  ///       t=1: [30 40 50]                   j = position inside the window
+  ///       t=2: [50 60 70]
+  ///
+  /// Every read of x[p] sends its gradient back to p, and reads of the same p add up:
+  ///
+  ///     G (incoming grad, [3, 3]) = [[1 2 3] [4 5 6] [7 8 9]]
+  ///     grad_x = [1, 2, 3+4, 5, 6+7, 8, 9] = [1 2 7 5 13 8 9]
+  ///
+  /// Column j of G came from positions j, j+s, j+2s, …, so per column we "spread it out by
+  /// the stride, then shift it right by j", and sum the columns:
+  ///
+  ///     j=0  [1 4 7] → [1 0 4 0 7] → [1 0 4 0 7 0 0]
+  ///     j=1  [2 5 8] → [2 0 5 0 8] → [0 2 0 5 0 8 0]
+  ///     j=2  [3 6 9] → [3 0 6 0 9] → [0 0 3 0 6 0 9]
+  ///                                  ───────────────
+  ///                            sum = [1 2 7 5 13 8 9]
+  ///
+  /// Shapes in general. The view has three groups of axes, in this order:
+  ///   - batch axes: leading input axes the windows don't touch (e.g. channels), passed
+  ///     through unchanged;
+  ///   - S "which window" axes o₀, o₁, … (one per windowed input axis);
+  ///   - S "inside the window" axes k₀, k₁, … (same count).
+  /// 1-D audio [channels, n] → view [channels, o, k]. A 2-D image [H, W] with 2×2 windows
+  /// → view [o₀, o₁, 2, 2]. The input's windowed axes have sizes n₀, n₁, ….
   func poolViewGradient(
     _ gradOutput: NodeID, inputShape: [Int], outShape: [Int], strides: [Int]
   ) -> NodeID? {
+    // ── 1. Split the view's axes into batch / which-window / inside-window. ──
     let r = inputShape.count
-    let S = outShape.count - r
+    let S = outShape.count - r  // number of windowed axes: the view has S extra axes
     guard S >= 0, strides.count == outShape.count else { return nil }
-    let R = Tensor.computeRowMajorStrides(inputShape)
-    let batch = r - S
-    for d in 0..<batch where outShape[d] != inputShape[d] || (strides[d] != R[d] && outShape[d] > 1) {
+    let batch = r - S  // leading axes that aren't windowed
+
+    // `strides` are measured in the input's own row-major layout. inputStrides[d] is how far
+    // one step along input axis d moves in that layout (example: [1] for a 1-D input).
+    let inputStrides = Tensor.computeRowMajorStrides(inputShape)
+
+    // Batch axes must be untouched: same size as the input, same stride.
+    for d in 0..<batch
+    where outShape[d] != inputShape[d] || (strides[d] != inputStrides[d] && outShape[d] > 1) {
       return nil
     }
-    if S == 0 { return gradOutput }
+    if S == 0 { return gradOutput }  // no windows at all: the view is the input itself
+
+    // ── 2. Read (o, k, s, n) for each windowed axis, and check it really is windows. ──
+    // Example: o = 3 windows, k = 3 per window, stride s = 2, n = 7 input positions.
     var steps: [(o: Int, k: Int, s: Int, n: Int)] = []
     for i in 0..<S {
-      let n = inputShape[batch + i], o = outShape[batch + i], k = outShape[batch + S + i]
-      let rs = R[batch + i]
-      guard strides[batch + S + i] == rs || k == 1 else { return nil }
+      let n = inputShape[batch + i]
+      let o = outShape[batch + i]  // which-window axis i
+      let k = outShape[batch + S + i]  // inside-window axis i
+      let unit = inputStrides[batch + i]  // one input step along this axis
+
+      // Inside a window we must walk the input one step at a time (W[t][j] → W[t][j+1]
+      // is x[p] → x[p+1]).
+      guard strides[batch + S + i] == unit || k == 1 else { return nil }
+
+      // Between windows we must jump a whole number of steps: that number is the stride s.
+      // (Example: view strides [2, 1] → s = 2 / 1 = 2.)
       let s: Int
       if o == 1 {
-        s = k  // a single window: any stride, treat as non-overlapping
+        s = k  // a single window: its stride is irrelevant, treat it as non-overlapping
       } else {
-        guard strides[batch + i] % rs == 0, strides[batch + i] / rs >= 1 else { return nil }
-        s = strides[batch + i] / rs
+        guard strides[batch + i] % unit == 0, strides[batch + i] / unit >= 1 else { return nil }
+        s = strides[batch + i] / unit
       }
+      // The last window must end inside the input: it starts at (o-1)·s and is k long.
       guard (o - 1) * s + k <= n else { return nil }
       steps.append((o, k, s, n))
     }
-    // [...batch, o₀…, k₀…] → [...batch, o₀, k₀, o₁, k₁, …]
-    var x = gradOutput
+
+    // ── 3. Pair each axis's (which-window, inside-window) axes side by side. ──
+    // [...batch, o₀, o₁, k₀, k₁] → [...batch, o₀, k₀, o₁, k₁], so step 4 can treat one
+    // windowed axis at a time as an adjacent [o, k] pair. 1-D views are already [o, k].
+    var grad = gradOutput
     var shape = outShape
     if S > 1 {
       let perm = Array(0..<batch) + (0..<S).flatMap { [batch + $0, batch + S + $0] }
-      x = try! transpose(x, axes: perm)
+      grad = try! transpose(grad, axes: perm)
       shape = perm.map { outShape[$0] }
     }
+
+    // ── 4. For each windowed axis, turn its [o, k] pair back into the input length n. ──
+    // After axis i is done, the pair at position `a` is replaced by a single axis of size n,
+    // so the next pair sits at a + 1 and later axes don't move.
     for (i, st) in steps.enumerated() {
-      let a = batch + i  // [.., o, k, ..] at (a, a+1); replaced by [.., n, ..]
-      let pre = Array(shape[..<a]), post = Array(shape[(a + 2)...])
-      func ranges(_ axis: Int, _ rng: (Int, Int), _ dims: Int) -> [(Int, Int)?] {
-        (0..<dims).map { $0 == axis ? rng : nil }
+      let a = batch + i  // position of this axis's o; its k is at a + 1
+      let before = Array(shape[..<a])  // axes left of the pair (batch + finished axes)
+      let after = Array(shape[(a + 2)...])  // axes right of the pair (not yet processed)
+      let rankAfter = shape.count - 1  // rank once [o, k] has merged into one axis
+
+      // shrink / pad arguments that only touch one axis
+      func onlyAxis(_ axis: Int, range: (Int, Int), rank: Int) -> [(Int, Int)?] {
+        (0..<rank).map { $0 == axis ? range : nil }
       }
-      func pads(_ axis: Int, _ p: (Int, Int), _ dims: Int) -> [(Int, Int)] {
-        (0..<dims).map { $0 == axis ? p : (0, 0) }
+      func onlyAxis(_ axis: Int, pad: (Int, Int), rank: Int) -> [(Int, Int)] {
+        (0..<rank).map { $0 == axis ? pad : (0, 0) }
       }
-      var acc: NodeID
+
+      var axisGrad: NodeID
       if st.s == st.k {
-        acc = try! reshape(x, to: pre + [st.o * st.k] + post)
+        // Non-overlapping windows (s == k): every input position is read at most once, so
+        // the gradient is just G laid flat, plus zeros for any tail no window reached.
+        //   e.g. n=7, k=s=3: [[1 2 3] [4 5 6]] → [1 2 3 4 5 6] → [1 2 3 4 5 6 0]
+        axisGrad = try! reshape(grad, to: before + [st.o * st.k] + after)
         if st.o * st.k < st.n {
-          acc = try! pad(acc, padding: pads(a, (0, st.n - st.o * st.k), shape.count - 1))
+          axisGrad = try! pad(
+            axisGrad, padding: onlyAxis(a, pad: (0, st.n - st.o * st.k), rank: rankAfter))
         }
       } else {
-        let span = (st.o - 1) * st.s + 1
+        // Overlapping (or gapped) windows: build one length-n row per column j and add.
+        // `span` = how far column j reaches once spread out: from j to j + (o-1)·s.
+        let span = (st.o - 1) * st.s + 1  // example: (3-1)·2 + 1 = 5
         var sum: NodeID? = nil
         for j in 0..<st.k {
-          var xj = try! shrink(x, ranges: ranges(a + 1, (j, j + 1), shape.count))  // [.., o, 1, ..]
+          // (a) Take column j: every window's j-th element.       j=1: [2 5 8]
+          var col = try! shrink(grad, ranges: onlyAxis(a + 1, range: (j, j + 1), rank: shape.count))
+
+          // (b) Put s-1 zeros after each value, then flatten.      [2 0 5 0 8 0]
+          //     [o, 1] → pad → [o, s] → reshape → [o·s]
           if st.s > 1 {
-            xj = try! pad(xj, padding: pads(a + 1, (0, st.s - 1), shape.count))  // [.., o, s, ..]
+            col = try! pad(col, padding: onlyAxis(a + 1, pad: (0, st.s - 1), rank: shape.count))
           }
-          xj = try! reshape(xj, to: pre + [st.o * st.s] + post)
+          col = try! reshape(col, to: before + [st.o * st.s] + after)
+
+          // (c) Drop the zeros after the last value (keep `span`).   [2 0 5 0 8]
           if span < st.o * st.s {
-            xj = try! shrink(xj, ranges: ranges(a, (0, span), shape.count - 1))
+            col = try! shrink(col, ranges: onlyAxis(a, range: (0, span), rank: rankAfter))
           }
-          xj = try! pad(xj, padding: pads(a, (j, st.n - j - span), shape.count - 1))
-          sum = sum.map { n(.add, [$0, xj]) } ?? xj
+
+          // (d) Shift right by j and fill out to length n.           [0 2 0 5 0 8 0]
+          col = try! pad(col, padding: onlyAxis(a, pad: (j, st.n - j - span), rank: rankAfter))
+
+          // (e) Add the columns together.     j=0 + j=1 + j=2 = [1 2 7 5 13 8 9]
+          sum = sum.map { n(.add, [$0, col]) } ?? col
         }
-        acc = sum!
+        axisGrad = sum!
       }
-      x = acc
-      shape = pre + [st.n] + post
+      grad = axisGrad
+      shape = before + [st.n] + after
     }
-    return x
+    return grad
   }
 }
 
