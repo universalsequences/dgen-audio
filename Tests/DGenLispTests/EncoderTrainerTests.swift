@@ -239,4 +239,136 @@ final class EncoderTrainerTests: XCTestCase {
     XCTAssertFalse(FileManager.default.fileExists(atPath: job.appendingPathComponent("export/w.json").path),
                    "the frozen decoder is not re-exported by the encode stage")
   }
+
+  /// `--stage audio --fit-codes`: codes for new targets against a frozen voice. Targets are
+  /// renders of known codes; the fit starts 0.3 off and must come back while w and b stay put.
+  func testFitCodesMovesOnlyCodes() throws {
+    _ = try json(["shape": [2, 3], "data": w.map(Double.init)], "w.json")
+    _ = try json(["shape": [1, 3], "data": b.map(Double.init)], "b.json")
+    let voiceURL = try write(voice, "voice.lisp")
+    let voiceRun = tempDir.appendingPathComponent("voice-run")
+    try FileManager.default.createDirectory(
+      at: voiceRun.appendingPathComponent("ckpt"), withIntermediateDirectories: true)
+    let ck: [String: Any] = [
+      "version": 1, "stage": "audio", "step": 1,
+      "leaves": ["w:w": ["shape": [2, 3], "data": w.map(Double.init)],
+                 "w:b": ["shape": [1, 3], "data": b.map(Double.init)],
+                 "z:codes": ["shape": [1, 2], "data": [9.0, 9.0]]],
+    ]
+    try JSONSerialization.data(withJSONObject: ck).write(
+      to: voiceRun.appendingPathComponent("ckpt/step-000001.json"))
+
+    let truth: [[Double]] = [[-0.8, 0.4], [0.5, -0.6], [0.9, 0.9], [-0.3, -1.0]]
+    let names = truth.indices.map { "k\($0)" }
+    let zURL = try json(["names": names, "z": truth, "sample_rate": sr], "z.json")
+    let targets = tempDir.appendingPathComponent("targets")
+    _ = try DatasetTrainer(try TrainDatasetOptions.parse([
+      "--stage", "render", "--patch", voiceURL.path, "--job-dir", targets.path, "--z-rows", zURL.path,
+      "--init-from", voiceRun.path, "--frames", "4096",
+    ])).train()
+
+    // starting codes, listed in a different order than the targets: matched by name
+    let start = truth.map { [$0[0] + 0.3, $0[1] - 0.3] }
+    let startURL = try json(["names": Array(names.reversed()), "z": Array(start.reversed())], "start.json")
+    let job = tempDir.appendingPathComponent("fit")
+    _ = try DatasetTrainer(try TrainDatasetOptions.parse([
+      "--stage", "audio", "--fit-codes", "--patch", voiceURL.path,
+      "--dataset", targets.appendingPathComponent("renders").path, "--z-rows", startURL.path,
+      "--init-from", voiceRun.path, "--job-dir", job.path, "--frames", "4096",
+      "--steps", "120", "--lr", "0.05", "--report-every", "20", "--checkpoint-every", "1000", "--no-render",
+    ])).train()
+
+    let codes = try JSONSerialization.jsonObject(
+      with: Data(contentsOf: job.appendingPathComponent("export/codes.json"))) as! [String: Any]
+    let fitNames = codes["names"] as! [String]
+    let fit = (codes["codes"] as! [[NSNumber]]).map { $0.map(\.doubleValue) }
+    func err(_ z: [[Double]]) -> Double {
+      zip(fitNames, z).map { n, c in
+        let t = truth[names.firstIndex(of: n)!]
+        return (c[0] - t[0]) * (c[0] - t[0]) + (c[1] - t[1]) * (c[1] - t[1])
+      }.reduce(0, +)
+    }
+    let startErr = err(fitNames.map { start[names.firstIndex(of: $0)!] })
+    XCTAssertLessThan(err(fit), 0.25 * startErr, "codes \(fit)")
+    for (file, want) in [("w.json", w), ("b.json", b)] {
+      let o = try JSONSerialization.jsonObject(
+        with: Data(contentsOf: job.appendingPathComponent("export/\(file)"))) as! [String: Any]
+      XCTAssertEqual((o["data"] as! [NSNumber]).map(\.floatValue), want, "\(file) moved")
+    }
+
+    XCTAssertThrowsError(try TrainDatasetOptions.parse([
+      "--stage", "refine", "--fit-codes", "--patch", voiceURL.path, "--dataset", "x", "--job-dir", "y",
+      "--init-from", voiceRun.path,
+    ]))
+  }
+
+  /// `--stage encode --amortized`: no codes, no trained voice. The encoder and a FRESH decoder
+  /// learn U(enc(x)) ≈ the rows together; the held-out rows (by name) generalise, and the run
+  /// exports the decoder and the encoder's codes.
+  func testAmortizedTrainsEncoderAndDecoderOnRows() throws {
+    _ = try json(["shape": [2, 3], "data": w.map(Double.init)], "w.json")
+    _ = try json(["shape": [1, 3], "data": b.map(Double.init)], "b.json")
+    let voiceURL = try write(voice, "voice.lisp")
+    let encURL = try write(encoder, "encoder.lisp")
+    let voiceRun = tempDir.appendingPathComponent("voice-run")
+    try FileManager.default.createDirectory(
+      at: voiceRun.appendingPathComponent("ckpt"), withIntermediateDirectories: true)
+    let ck: [String: Any] = [
+      "version": 1, "stage": "audio", "step": 1,
+      "leaves": ["w:w": ["shape": [2, 3], "data": w.map(Double.init)],
+                 "w:b": ["shape": [1, 3], "data": b.map(Double.init)]],
+    ]
+    try JSONSerialization.data(withJSONObject: ck).write(
+      to: voiceRun.appendingPathComponent("ckpt/step-000001.json"))
+
+    // targets: a grid of codes rendered by the true decoder; their rows u = z w + b
+    var z: [[Double]] = []
+    for i in 0..<6 { for j in 0..<6 { z.append([-1.5 + 0.6 * Double(i), -1.5 + 0.6 * Double(j)]) } }
+    let names = z.indices.map { String(format: "h%02d", $0) }
+    let zURL = try json(["names": names, "z": z, "sample_rate": sr], "z.json")
+    let synth = tempDir.appendingPathComponent("synth")
+    _ = try DatasetTrainer(try TrainDatasetOptions.parse([
+      "--stage", "render", "--patch", voiceURL.path, "--job-dir", synth.path, "--z-rows", zURL.path,
+      "--init-from", voiceRun.path, "--frames", "8192",
+    ])).train()
+    let probe = LispEvaluator(sourceDirectory: tempDir)
+    try probe.evaluate(nodes: DatasetTrainer.declarationsOnly(parseSource(voice)))
+    let L = try XCTUnwrap(probe.rowLayouts["v"])
+    var u: [Float] = []
+    for c in z {
+      let z0 = Float(c[0]), z1 = Float(c[1])
+      for k in 0..<3 { u.append(z0 * w[k] + z1 * w[3 + k] + b[k]) }
+    }
+    let rowsURL = tempDir.appendingPathComponent("rows.json")
+    try DatasetRows.write(rowsURL, layout: L, names: names, u: u)
+    // the decoder starts fresh: no weight files beside the voice
+    for f in ["w.json", "b.json"] { try FileManager.default.removeItem(at: tempDir.appendingPathComponent(f)) }
+
+    let val = ["h07", "h14", "h21", "h28"]
+    let job = tempDir.appendingPathComponent("am")
+    let summary = try DatasetTrainer(try TrainDatasetOptions.parse([
+      "--stage", "encode", "--amortized", "--patch", voiceURL.path, "--encoder", encURL.path,
+      "--dataset", synth.appendingPathComponent("renders").path, "--rows", rowsURL.path,
+      "--val-names", val.joined(separator: ","), "--job-dir", job.path, "--frames", "8192",
+      "--feat-window", "512", "--feat-hop", "128", "--feat-bands", "24", "--feat-seconds", "0.5",
+      "--steps", "1200", "--lr", "5e-3", "--batch", "16", "--clip", "5", "--path", "0.1",
+      "--report-every", "100", "--checkpoint-every", "1000",
+    ])).train()
+    XCTAssertEqual(summary["amortized"] as? Bool, true)
+    // u spans ~±2 per column (variance ≈ 1): held-out rows decoded from their encoder codes
+    XCTAssertLessThan(try XCTUnwrap(summary["val_u_mse"] as? Double), 0.1)
+    XCTAssertTrue((summary["val_mr_median"] as? Double)?.isFinite == true)
+    let codes = try JSONSerialization.jsonObject(
+      with: Data(contentsOf: job.appendingPathComponent("export/codes.json"))) as! [String: Any]
+    XCTAssertEqual((codes["names"] as? [String])?.count, 36)
+    XCTAssertEqual((codes["val"] as? [String]).map(Set.init), Set(val))
+    for f in ["w.json", "b.json", "enc_c1.json", "encoded.json"] {
+      XCTAssertTrue(FileManager.default.fileExists(atPath: job.appendingPathComponent("export/\(f)").path), f)
+    }
+
+    XCTAssertThrowsError(try TrainDatasetOptions.parse([
+      "--stage", "encode", "--amortized", "--patch", voiceURL.path, "--encoder", encURL.path,
+      "--dataset", "x", "--job-dir", "y", "--rows", rowsURL.path, "--codes", zURL.path,
+    ]), "--amortized takes no --codes")
+  }
 }

@@ -188,7 +188,9 @@ struct EncoderFeatureStats {
 /// Host-side training augmentation of one prepared hit (§3): gain, onset jitter, pitch
 /// (resampling), spectral tilt, additive noise. Deterministic given the RNG.
 enum EncoderAugment {
-  static func apply(_ x: [Float], sampleRate: Float, rng: inout SplitMix64) -> (audio: [Float], tiltDB: Float) {
+  static func apply(_ x: [Float], sampleRate: Float, noise addNoise: Bool = true, rng: inout SplitMix64)
+    -> (audio: [Float], tiltDB: Float)
+  {
     func u(_ lo: Float, _ hi: Float) -> Float { lo + (hi - lo) * rng.uniform() }
     let gain = Foundation.pow(10, u(-6, 6) / 20)
     let jitter = Int((u(-0.003, 0.003) * sampleRate).rounded())
@@ -204,7 +206,7 @@ enum EncoderAugment {
       let f = p - Float(k)
       y[i] = (x[k] * (1 - f) + x[k + 1] * f) * gain
     }
-    for i in 0..<n { y[i] += noise * rng.gaussian() }
+    if addNoise { for i in 0..<n { y[i] += noise * rng.gaussian() } }
     return (y, tilt)
   }
 

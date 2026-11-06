@@ -15,6 +15,8 @@
 //   encode    an --encoder patch (features → z, `row-data` → `latent-out`) bound into the
 //             frozen voice's latent-table; supervised on --codes (code MSE + decoded-param
 //             term), minibatched, with a held-out --val split (EncoderTrainer.swift).
+//             With --amortized the encoder defines the codes instead: encoder and decoder train
+//             jointly on --rows (no --codes).
 //   render    decode and render --z-rows; writes renders/labels.json beside the WAVs.
 //
 // Everything the run produces goes under --job-dir: ckpt/ (resumable: leaves + Adam moments +
@@ -69,7 +71,12 @@ struct TrainDatasetOptions {
   var pitchHz: Double = 261.6255653
   var noRender = false
   /// `--stage render`: z rows to decode and render, {"names": [...], "z": [[...], ...]}.
+  /// `--fit-codes`: optional starting codes, matched to the dataset's targets by name.
   var zRows: String?
+  /// `--stage audio --fit-codes`: label new targets with codes for a trained voice. The
+  /// --init-from decoder weights stay frozen; only a fresh code table (one row per target,
+  /// from --z-rows or the default init) is trained.
+  var fitCodes = false
   /// Per-leaf gradient-norm clip (0: off) and decoupled weight decay (0: off).
   var clip: Float = 0
   var weightDecay: Float = 0
@@ -82,6 +89,12 @@ struct TrainDatasetOptions {
   var features: String?
   var batch = 32
   var val = 10
+  /// Held-out rows by name (instead of a seeded --val shuffle of the first dataset).
+  var valNames: [String] = []
+  /// Amortized latent: the encoder DEFINES the codes. Encoder and decoder train jointly so that
+  /// U(enc(x)) matches the --rows targets (+ --path, --code-l2 on the encoder's codes); no
+  /// --codes labels, and --init-from is optional (it warm-starts whichever weights it has).
+  var amortized = false
   /// Leaf-name prefixes that train (default: the encoder's own leaves).
   var trainOnly: [String] = []
   /// Decoded-param term weight: ‖U(enc(x)) − U(z)‖².
@@ -89,6 +102,22 @@ struct TrainDatasetOptions {
   /// Prior: squared distance from each predicted code to the nearest training code.
   var prior: Float = 0
   var augment = false
+  /// --augment without the additive white noise (it teaches the encoder to ignore hiss level).
+  var augNoise = true
+  /// --audio-loss: grade the encoder on sound -- its code is decoded by the frozen voice,
+  /// rendered, and scored with the metric loss against the batch's targets (+ code-weight ·
+  /// code MSE to the --codes labels).
+  var audioLoss = false
+  var codeWeight: Float = 1
+  /// Per-band feature normalisation from a file (e.g. the warm-start encoder's
+  /// export/feat_stats.json) instead of refitting it on the training rows.
+  var featStats: String?
+  /// --aux-features: per-row encoder input vectors ({names, features}).
+  var auxFeatures: String?
+  /// --low-weight: under --audio-loss, anchor the decoded low end (every mode whose --rows
+  /// frequency is below 250 Hz: pitch curve, level, decay) to the row (the MR loss barely hears
+  /// 40-60 Hz, so sound grading alone lets the low modes drift out of tune).
+  var lowWeight: Float = 0
   var featWindow = 1024
   var featHop = 256
   var featBands = 64
@@ -138,6 +167,7 @@ struct TrainDatasetOptions {
       case "--pitch-hz": o.pitchHz = Double(try value()) ?? o.pitchHz
       case "--no-render": o.noRender = true
       case "--z-rows": o.zRows = try value()
+      case "--fit-codes": o.fitCodes = true
       case "--clip": o.clip = Float(try value()) ?? o.clip
       case "--weight-decay": o.weightDecay = Float(try value()) ?? o.weightDecay
       case "--encoder": o.encoder = try value()
@@ -148,10 +178,18 @@ struct TrainDatasetOptions {
         guard v == "host-logmel" else { throw TrainProtocolError("--features-from: only host-logmel") }
       case "--batch": o.batch = Int(try value()) ?? o.batch
       case "--val": o.val = Int(try value()) ?? o.val
+      case "--val-names": o.valNames = try value().split(separator: ",").map(String.init)
+      case "--amortized": o.amortized = true
       case "--train-only": o.trainOnly = try value().split(separator: ",").map(String.init)
       case "--u-weight": o.uWeight = Float(try value()) ?? o.uWeight
       case "--prior": o.prior = Float(try value()) ?? o.prior
       case "--augment": o.augment = true
+      case "--no-aug-noise": o.augNoise = false
+      case "--audio-loss": o.audioLoss = true
+      case "--code-weight": o.codeWeight = Float(try value()) ?? o.codeWeight
+      case "--feat-stats": o.featStats = try value()
+      case "--aux-features": o.auxFeatures = try value()
+      case "--low-weight": o.lowWeight = Float(try value()) ?? o.lowWeight
       case "--feat-window": o.featWindow = Int(try value()) ?? o.featWindow
       case "--feat-hop": o.featHop = Int(try value()) ?? o.featHop
       case "--feat-bands": o.featBands = Int(try value()) ?? o.featBands
@@ -163,16 +201,32 @@ struct TrainDatasetOptions {
     guard ["refine", "pretrain", "audio", "render", "encode"].contains(o.stage) else {
       throw TrainProtocolError("--stage must be refine, pretrain, audio, render or encode")
     }
-    if o.stage == "encode" {
+    if o.amortized {
+      guard o.stage == "encode", o.encoder != nil, o.rows != nil, o.codes.isEmpty else {
+        throw TrainProtocolError("--amortized needs --stage encode, --encoder and --rows (and no --codes: the encoder makes them)")
+      }
+    } else if o.stage == "encode" {
       guard o.encoder != nil, o.initFrom != nil, !o.codes.isEmpty else {
         throw TrainProtocolError("--stage encode requires --encoder, --codes and --init-from (the trained voice)")
       }
+    }
+    if o.audioLoss {
+      guard o.stage == "encode", !o.amortized, o.loss == "metric" else {
+        throw TrainProtocolError("--audio-loss needs --stage encode with a frozen voice (no --amortized) and --loss metric")
+      }
+    }
+    if o.stage == "encode" {
       let dirs = o.dataset.split(separator: ",").count
-      guard o.codes.count == dirs else {
+      guard o.codes.isEmpty || o.codes.count == dirs else {
         throw TrainProtocolError("--codes needs one file per --dataset directory (\(dirs))")
       }
       guard o.features == nil || !o.augment else {
         throw TrainProtocolError("--augment needs audio; it cannot be used with --features")
+      }
+    }
+    if o.fitCodes {
+      guard o.stage == "audio", o.initFrom != nil else {
+        throw TrainProtocolError("--fit-codes needs --stage audio and --init-from (the trained voice)")
       }
     }
     if o.stage == "render" {
@@ -475,7 +529,7 @@ final class DatasetTrainer {
       try FileManager.default.createDirectory(
         at: run.appendingPathComponent(sub), withIntermediateDirectories: true)
     }
-    if let zPath = o.zRows {
+    if let zPath = o.zRows, o.stage == "render" {
       let j = try JSONSerialization.jsonObject(with: Data(contentsOf: URL(fileURLWithPath: zPath))) as! [String: Any]
       let z = (j["z"] as? [[NSNumber]] ?? []).map { $0.map(\.floatValue) }
       names = j["names"] as? [String] ?? z.indices.map { String(format: "z%03d", $0) }
@@ -496,6 +550,16 @@ final class DatasetTrainer {
       names = allNames
       targets = allTargets
       sampleRate = rate!
+      if let zPath = o.zRows, o.fitCodes {
+        let j = try JSONSerialization.jsonObject(with: Data(contentsOf: URL(fileURLWithPath: zPath))) as! [String: Any]
+        let byName = Dictionary(zip(j["names"] as? [String] ?? [],
+                                    (j["z"] as? [[NSNumber]] ?? []).map { $0.map(\.floatValue) }),
+                                uniquingKeysWith: { a, _ in a })
+        zPreset = try names.flatMap { n -> [Float] in
+          guard let z = byName[n] else { throw TrainProtocolError("--z-rows has no code for target \(n)") }
+          return z
+        }
+      }
     }
     if let e = o.encoder {
       let url = URL(fileURLWithPath: e)
@@ -725,9 +789,9 @@ final class DatasetTrainer {
       let ck = url.pathExtension == "json" ? url : DatasetCheckpoint.latest(in: url)
       guard let ck else { throw TrainProtocolError("--init-from \(initFrom): no checkpoint") }
       store.preset = try DatasetCheckpoint.load(ck).leaves
-      if zPreset != nil {
-        // render: the code table is the requested z rows (whatever the table is called),
-        // whatever the run trained -- latentRows initialises the leaf from zPreset
+      if zPreset != nil || o.fitCodes {
+        // render / fit-codes: the code table is new (the requested z rows, or one fresh row
+        // per target), whatever the run trained -- latentRows initialises the leaf
         for key in store.preset.keys where key.hasPrefix("z:") { store.preset[key] = nil }
       }
       log("[train-dataset] init from \(ck.path) (\(store.preset.count) leaves)")
@@ -932,7 +996,9 @@ final class DatasetTrainer {
     guard let pr = paramRows.first else { throw TrainProtocolError("audio needs a param-row") }
     try loop({ step in
       try latchStep(step, rowMode: .decode, row: pr.name, anchorOn: nil)
-    }, trainable: { store.order.filter { !$0.hasPrefix("row:") } })
+    }, trainable: { [o] in
+      store.order.filter { o.fitCodes ? $0.hasPrefix("z:") : !$0.hasPrefix("row:") }
+    })
     try export()
     return try finish()
   }
@@ -1055,7 +1121,10 @@ final class DatasetTrainer {
     return out.map { $0! }
   }()
 
-  func metricGradient(_ flat: [Float]) -> (Float, [Float]) {
+  /// `rows`: the target of each rendered column (default: column r is target r).
+  func metricGradient(_ flat: [Float], rows: [Int]? = nil) -> (Float, [Float]) {
+    let rows = rows ?? Array(0..<N)
+    let N = rows.count
     let ml = MetricLoss(windows: o.windows, bandWeight: o.bandWeight, mrWeight: o.mrWeight,
                         waveWeight: o.waveWeight, waveCutoff: o.waveCutoff, sampleRate: Double(sampleRate),
                         hfWeight: o.hfWeight, hfFrom: o.hfFrom)
@@ -1065,7 +1134,7 @@ final class DatasetTrainer {
     DispatchQueue.concurrentPerform(iterations: N) { r in
       var y = [Float](repeating: 0, count: o.frames)
       for f in 0..<o.frames { y[f] = flat[f * N + r] }
-      let res = ml.lossAndGradient(y, targets[r], target: cached[r])
+      let res = ml.lossAndGradient(y, targets[rows[r]], target: cached[rows[r]])
       lock.lock(); results[r] = res; lock.unlock()
     }
     var g = [Float](repeating: 0, count: o.frames * N)
