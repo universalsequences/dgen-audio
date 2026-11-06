@@ -40,6 +40,8 @@ import DGenTrainProtocol
 import Foundation
 
 struct EncoderState {
+  /// Steps run (DGENLISP_TRAIN_PROFILE profiles step 2).
+  var profileStep = 0
   var extractor: EncoderFeatureExtractor? = nil
   var config: EncoderFeatureConfig { extractor!.config }
   /// Per-row feature width.
@@ -459,6 +461,14 @@ extension DatasetTrainer {
     return ((d2 * -1).max(axis: 1) * -1).sum() * (o.prior / Float(B))
   }
 
+  /// Per-kernel GPU times of the last compiled voice graph; sources under DGENLISP_TRAIN_KERNEL_DUMP.
+  func profileVoice(_ tag: String) {
+    LazyGraphContext.current.profileGPU(frames: o.frames)
+    if let d = ProcessInfo.processInfo.environment["DGENLISP_TRAIN_KERNEL_DUMP"] {
+      LazyGraphContext.current.dumpKernelSources(to: d + "/" + tag)
+    }
+  }
+
   /// --audio-loss step: the latch-boundary step of `latchStep`, for a minibatch whose codes come
   /// from the encoder (decoder frozen):
   ///   1. static pass: encoder → decoder → realise every latched value of the B rows;
@@ -473,9 +483,20 @@ extension DatasetTrainer {
       zHat = z
       return z
     }
+    // DGENLISP_TRAIN_TIMING=1: wall time per phase, plus dgen's compile/runtime/exec split.
+    // DGENLISP_TRAIN_PROFILE=1: per-kernel GPU times of the voice forward and backward at step 2
+    // (and their sources under DGENLISP_TRAIN_KERNEL_DUMP).
+    var tp = Date()
+    func lap(_ what: String) {
+      guard timing else { return }
+      logTiming(String(format: "%@ %.1f ms wall", what, Date().timeIntervalSince(tp) * 1000)); tp = Date()
+    }
+    let profile = profiling && enc.profileStep == 2
+    enc.profileStep += 1
     // 1
     let (_, c1) = try evaluate(mode: .decode, latch: .capture, rows: B, latent: encoded)
     let values = try realizeAll(c1.latched)
+    lap("p1 capture (enc+dec fwd)")
     if enc.latchLeaves.isEmpty {
       enc.latchLeaves = zip(c1.latched, values).map { Tensor.param($0.shape, data: $1) }
       enc.latchGrads = c1.latched.map { Tensor([Float](repeating: 0, count: $0.shape.reduce(1, *))).reshape($0.shape) }
@@ -486,15 +507,20 @@ extension DatasetTrainer {
     let zeros: (String, Int) throws -> Tensor = { _, d in Tensor([Float](repeating: 0, count: B * d)).reshape([B, d]) }
     LazyGraphContext.current.clearComputationGraph()
     for (leaf, v) in zip(enc.latchLeaves, values) { leaf.updateDataLazily(v); leaf.grad = nil }
-    let (ev, _) = try evaluate(mode: .decode, latch: .leaves(enc.latchLeaves), rows: B, latent: zeros)
+    let (ev, _) = try buildVoice { try evaluate(mode: .decode, latch: .leaves(enc.latchLeaves), rows: B, latent: zeros) }
+    lap("p2 graph build")
     let flat = try output(ev, rows: B).realize(frames: o.frames)
+    lap("p2 voice forward render")
+    if profile { profileVoice("fwd") }
     let (la, g) = metricGradient(flat, rows: rows)
+    lap("p2 CPU metric loss+grad")
     LazyGraphContext.current.clearComputationGraph()
     for leaf in enc.latchLeaves { leaf.grad = nil }
     enc.gBatch!.updateDataLazily(g)
-    let (ev2, _) = try evaluate(mode: .decode, latch: .leaves(enc.latchLeaves), rows: B, latent: zeros)
-    let playhead = floor(seconds() * sampleRate + 0.5)
-    _ = try (try output(ev2, rows: B) * enc.gBatch!.sampleRow(playhead)).sum().backward(frames: o.frames)
+    let (ev2, _) = try buildVoice { try evaluate(mode: .decode, latch: .leaves(enc.latchLeaves), rows: B, latent: zeros) }
+    _ = try (try output(ev2, rows: B) * enc.gBatch!.sampleRow(playhead())).sum().backward(frames: o.frames)
+    lap("p2b voice backward (re-render + BPTT)")
+    if profile { profileVoice("bwd") }
     let grads = enc.latchLeaves.map { l in l.grad?.getData() ?? [Float](repeating: 0, count: l.shape.reduce(1, *)) }
     // 3
     LazyGraphContext.current.clearComputationGraph()
@@ -518,6 +544,7 @@ extension DatasetTrainer {
     if let p = priorLoss(z) { reg = reg + p }
     if let p = try lowEndLoss(c3.captured, rows: rows) { reg = reg + p }
     let ls = try staticToSignal(reg, frames: 1).backward(frames: 1).reduce(0, +)
+    lap("p3 enc+dec fwd+bwd")
     return (la, ls)
   }
 

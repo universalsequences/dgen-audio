@@ -86,6 +86,9 @@ public struct CompilationPipeline {
     /// Drop pure scalar nodes that no output or side effect can reach.
     /// `DGEN_NO_DCE=1` disables it for A/B measurement.
     public let eliminateDeadCode: Bool
+    /// Give axis reduces their own blocks (`determineTensorBlocks`); applied on Metal only, where
+    /// it was measured. DGEN_NO_SPLIT_AXIS_REDUCE=1 restores the fused form.
+    public let splitAxisReduces: Bool
 
     public init(
       frameCount: Int = 128,
@@ -96,7 +99,8 @@ public struct CompilationPipeline {
       voiceCellId: Int? = nil,
       enableBufferReuse: Bool = false,
       gemmStrategy: GEMMStrategy = .registerTiled,
-      eliminateDeadCode: Bool = ProcessInfo.processInfo.environment["DGEN_NO_DCE"] != "1"
+      eliminateDeadCode: Bool = ProcessInfo.processInfo.environment["DGEN_NO_DCE"] != "1",
+      splitAxisReduces: Bool = ProcessInfo.processInfo.environment["DGEN_NO_SPLIT_AXIS_REDUCE"] != "1"
     ) {
       self.frameCount = frameCount
       self.debug = debug
@@ -107,6 +111,7 @@ public struct CompilationPipeline {
       self.enableBufferReuse = enableBufferReuse
       self.gemmStrategy = gemmStrategy
       self.eliminateDeadCode = eliminateDeadCode
+      self.splitAxisReduces = splitAxisReduces
     }
   }
 
@@ -246,7 +251,7 @@ public struct CompilationPipeline {
       ? sortedNodes : sortedNodes.filter { !hoistedSet.contains($0) }
     var finalBlocks = buildInitialBlocks(
       graph: graph, sortedNodes: loopNodes, scalarNodeSet: finalScalarSet, context: context,
-      hopBasedNodes: peelHopNodes,
+      hopBasedNodes: peelHopNodes, splitAxisReduces: options.splitAxisReduces && backend == .metal,
       timings: &timings)
     finalBlocks = try gatePlan.split(blocks: finalBlocks, graph: graph)
     if backend == .c {
@@ -267,7 +272,8 @@ public struct CompilationPipeline {
       staticBlock.nodes = hoisted
       // Hoisted tensors still need ordinary shape/reduction boundaries and
       // their own element iterators. Keep these blocks outside frame loops.
-      let staticBlocks = determineTensorBlocks([staticBlock], graph, context)
+      let staticBlocks = determineTensorBlocks(
+        [staticBlock], graph, context, splitAxisReduces: options.splitAxisReduces && backend == .metal)
       finalBlocks.insert(contentsOf: staticBlocks, at: 0)
       if options.debug {
         print("[static-hoist] hoisted \(hoisted.count) frame-invariant nodes")
@@ -542,7 +548,7 @@ public struct CompilationPipeline {
   /// Builds executable blocks before temporality-aware rewrites.
   private static func buildInitialBlocks(
     graph: Graph, sortedNodes: [NodeID], scalarNodeSet: Set<NodeID>, context: IRContext,
-    hopBasedNodes: [NodeID: (Int, NodeID)],
+    hopBasedNodes: [NodeID: (Int, NodeID)], splitAxisReduces: Bool,
     timings: inout PipelineTimings
   ) -> [Block] {
     let blocks = timings.measure("determineBlocks") {
@@ -559,7 +565,8 @@ public struct CompilationPipeline {
     }
 
     let separatedBlocks = timings.measure("tensorBlocks") {
-      determineTensorBlocks(fusedBlocks, graph, context, hopBasedNodes: hopBasedNodes)
+      determineTensorBlocks(
+        fusedBlocks, graph, context, hopBasedNodes: hopBasedNodes, splitAxisReduces: splitAxisReduces)
     }
 
     var finalBlocks = separatedBlocks.compactMap { $0 }

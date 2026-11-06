@@ -42,6 +42,19 @@ public class Tensor: LazyValue {
   /// Private data storage - survives graph clears for parameters
   private var _data: [Float]?
 
+  /// The data is a literal of the program and never updated: a run-invariant input
+  /// (`markConstantData`, `Graph.constantTensors`).
+  public private(set) var isConstantData = false
+
+  /// Declares this tensor's data a program literal that is never updated, so subgraphs built
+  /// from it can be cached across runs (`RunInvariantCache`). Do not call on a tensor whose data
+  /// changes (parameters, per-step inputs).
+  public func markConstantData() {
+    precondition(!requiresGrad, "a learnable tensor is not constant data")
+    isConstantData = true
+    if let tensorId { graph.graph.constantTensors.insert(tensorId) }
+  }
+
   private var graphId: Int = -1
 
   /// Computed property for nodeId
@@ -127,6 +140,7 @@ public class Tensor: LazyValue {
         let (nodeId, tensorId) = graph.createTensor(shape: shape, data: data)
         self._nodeId = nodeId
         self.tensorId = tensorId
+        if isConstantData, let tensorId { graph.graph.constantTensors.insert(tensorId) }
       }
     }
   }
@@ -149,6 +163,7 @@ public class Tensor: LazyValue {
   /// Update the tensor's data for the next forward pass
   /// Used by optimizers to apply parameter updates
   public func updateDataLazily(_ newData: [Float]) {
+    precondition(!isConstantData, "updateDataLazily on a tensor marked constant data")
     var clamped = newData
     if let lo = minBound {
       clamped = clamped.map { Swift.max($0, lo) }

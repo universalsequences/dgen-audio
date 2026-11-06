@@ -493,6 +493,16 @@ enum DatasetCheckpoint {
 // MARK: - Trainer
 
 final class DatasetTrainer {
+  /// The voice's run-invariant frontier (e.g. noise through fixed filters), rendered once and read
+  /// back every step instead of re-rendered (`RunInvariantCache`). DGEN_NO_INVARIANT_CACHE=1 off.
+  let invariantCache = RunInvariantCache()
+  let cacheInvariant = ProcessInfo.processInfo.environment["DGEN_NO_INVARIANT_CACHE"] != "1"
+  /// Builds a voice graph, substituting its cached run-invariant frontier.
+  func buildVoice<T>(_ build: () throws -> T) throws -> T {
+    guard cacheInvariant else { return try build() }
+    return try invariantCache.build(frames: o.frames, frameIndex: playhead, build)
+  }
+
   let o: TrainDatasetOptions
   let run: URL
   let names: [String]
@@ -721,14 +731,18 @@ final class DatasetTrainer {
     return Tensor(data).reshape([o.frames, N])
   }()
 
+  let profiling = ProcessInfo.processInfo.environment["DGENLISP_TRAIN_PROFILE"] == "1"
+
+  /// The frame number as an integer-valued signal: the row index into per-frame tables.
+  func playhead() -> Signal { floor(seconds() * sampleRate + 0.5) }
+
   func seconds() -> Signal {
     let n = Float(o.frames)
     return Signal.phasor(Tensor([sampleRate / (2 * n)])).sum() * (2 * n / sampleRate)
   }
 
   func audioLoss(_ y: SignalTensor) -> Signal {
-    let playhead = floor(seconds() * sampleRate + 0.5)
-    let t = targetTable.sampleRow(playhead)
+    let t = targetTable.sampleRow(playhead())
     var loss = Signal.constant(0)
     let ws = o.windows.filter { $0 <= o.frames }
     let scale = 1 / Float(max(ws.count, 1))
@@ -1075,8 +1089,7 @@ final class DatasetTrainer {
       for leaf in latchLeaves { leaf.grad = nil }
       gTable.updateDataLazily(g)
       let (ev2, _) = try evaluate(mode: rowMode, latch: .leaves(latchLeaves))
-      let playhead = floor(seconds() * sampleRate + 0.5)
-      _ = try (try output(ev2) * gTable.sampleRow(playhead)).sum().backward(frames: o.frames)
+      _ = try (try output(ev2) * gTable.sampleRow(playhead())).sum().backward(frames: o.frames)
     } else {
       la = try audioLoss(try output(ev)).backward(frames: o.frames).reduce(0, +)
     }
@@ -1115,7 +1128,8 @@ final class DatasetTrainer {
     var out = [MetricLoss.Target?](repeating: nil, count: N)
     let lock = NSLock()
     DispatchQueue.concurrentPerform(iterations: N) { r in
-      let t = MetricLoss.target(targets[r].map(Double.init), windows: o.windows)
+      let t = MetricLoss.target(targets[r].map(Double.init), windows: o.windows,
+                                waveCutoff: o.waveWeight > 0 ? Double(o.waveCutoff) : nil, sampleRate: Double(sampleRate))
       lock.lock(); out[r] = t; lock.unlock()
     }
     return out.map { $0! }

@@ -2291,7 +2291,11 @@ class LispEvaluator {
         throw LispError.invalidArgument(
           "tensor @data has \(data.count) values, expected \(shape.reduce(1, *))")
       }
-      return .tensor(makeTensor(shape: shape, data: data, mutable: false))
+      let t = makeTensor(shape: shape, data: data, mutable: false)
+      // A literal of the program: subgraphs built from it can be cached across runs. Rank > 2
+      // literals come back from makeTensor as parameters (requiresGrad), so they are not constant.
+      if !t.requiresGrad { t.markConstantData() }
+      return .tensor(t)
     }
     if attrValue(attributes, "@file") != nil || attrValue(attributes, "@shape") != nil {
       return try evalWavetable(args, attributes: attributes, mutable: false)
