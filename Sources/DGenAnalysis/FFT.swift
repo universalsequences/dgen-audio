@@ -1,8 +1,8 @@
-// Portable radix-2 complex FFT and the spectral helpers the analysis needs
-// (real spectra, analytic signal, zero-phase FFT filtering). No Accelerate:
-// the analysis must build anywhere dgen builds, and the sizes involved
-// (<= 65536 points, a few hundred transforms per sample) are small.
+// Complex FFT and the spectral helpers the analysis needs (real spectra, analytic signal,
+// zero-phase FFT filtering). The transform is vDSP on Apple platforms (DGenAnalysisC dgen_fft);
+// elsewhere, and for sizes vDSP does not take, the portable radix-2 reference below.
 
+import DGenAnalysisC
 import Foundation
 
 public enum FFT {
@@ -37,6 +37,15 @@ public enum FFT {
         let n = re.count
         precondition(n == im.count && n > 0 && (n & (n - 1)) == 0, "FFT size must be a power of two")
         if n == 1 { return }
+        let done = re.withUnsafeMutableBufferPointer { rp in im.withUnsafeMutableBufferPointer { ip in
+            dgen_fft(rp.baseAddress, ip.baseAddress, Int32(n), inverse ? 1 : 0) == 0 } }
+        if done { return }
+        transformReference(&re, &im, inverse: inverse)
+    }
+
+    /// The portable radix-2 transform (non-Apple builds, sizes vDSP does not take).
+    static func transformReference(_ re: inout [Double], _ im: inout [Double], inverse: Bool = false) {
+        let n = re.count
         // bit reversal
         var j = 0
         for i in 1..<n {
@@ -109,10 +118,7 @@ public enum FFT {
         gain: (Double) -> Double
     ) -> (re: [Double], im: [Double]) {
         let n = nextPow2(max(2, 2 * x.count))
-        var re = [Double](repeating: 0, count: n)
-        var im = [Double](repeating: 0, count: n)
-        for i in 0..<x.count { re[i] = x[i] }
-        transform(&re, &im)
+        var (re, im) = forwardCached(x, n: n)
         let df = sampleRate / Double(n)
         for k in 0..<n {
             let kk = k <= n / 2 ? k : k - n
@@ -126,6 +132,20 @@ public enum FFT {
         }
         transform(&re, &im, inverse: true)
         return (Array(re[0..<x.count]), Array(im[0..<x.count]))
+    }
+
+    /// The forward transform of x zero-padded to n, remembered per thread for the last input
+    /// (band-filter banks transform the same signal once per band).
+    final class ForwardCache { var x: [Double] = []; var n = 0; var re: [Double] = []; var im: [Double] = [] }
+    static func forwardCached(_ x: [Double], n: Int) -> ([Double], [Double]) {
+        let c = threadLocal("dgen.fft.forward") { ForwardCache() }
+        if c.n == n && c.x == x { return (c.re, c.im) }
+        var re = [Double](repeating: 0, count: n)
+        var im = [Double](repeating: 0, count: n)
+        for i in 0..<x.count { re[i] = x[i] }
+        transform(&re, &im)
+        c.x = x; c.n = n; c.re = re; c.im = im
+        return (re, im)
     }
 
     /// Zero-phase filter of a complex signal with a gain symmetric in |f|.

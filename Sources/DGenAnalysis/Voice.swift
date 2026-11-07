@@ -15,6 +15,7 @@
 //   clip(x)  = mix · c tanh(drive x / c) / drive + (1 - mix) x
 //   gate(t)  = 1 - smoothstep((t - E + Fd) / Fd)
 
+import DGenAnalysisC
 import Foundation
 
 public struct ModeParams: Codable, Equatable {
@@ -126,13 +127,10 @@ public enum KickVoice {
     /// Modal part only (no gate, no chain).
     public static func renderModes(_ modes: [ModeParams], count n: Int, sampleRate sr: Double) -> [Double] {
         var y = [Double](repeating: 0, count: n)
-        for m in modes {
-            if m.A == 0 { continue }
-            for i in 0..<n {
-                let t = Double(i) / sr
-                let e = m.envelope(t)
-                if e == 0 { continue }
-                y[i] += e * sin(m.phaseLaw(t) + m.phi)
+        y.withUnsafeMutableBufferPointer { Y in
+            for m in modes where m.A != 0 {
+                var p = DGenModeParams(F: m.F, G: m.G, T: m.T, D: m.D, R: m.R, G2: m.G2, T2: m.T2)
+                dgen_mode_add(&p, m.A, m.phi, Int32(n), sr, Y.baseAddress)
             }
         }
         return y
