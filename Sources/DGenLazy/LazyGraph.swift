@@ -260,6 +260,8 @@ public class LazyGraph {
     graph.tensors.removeAll()
     graph.nodeToTensor.removeAll()
     graph.cellToTensor.removeAll()
+    // tensor IDs restart too: a stale entry would mark an unrelated tensor constant
+    graph.constantTensors.removeAll()
 
     // 3. Clear lazy cell state (will be recreated for new tensors)
     graph.lazyCells.removeAll()

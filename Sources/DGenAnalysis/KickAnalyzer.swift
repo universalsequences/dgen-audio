@@ -3,6 +3,7 @@
 // Every parameter is expressed in the SPEC §3.1 voice terms (Voice.swift)
 // with t = 0 at sample 0 of the prepared target.
 
+import DGenAnalysisC
 import Foundation
 
 public struct KickAnalysisOptions: Codable {
@@ -452,16 +453,31 @@ public enum KickAnalyzer {
 
     /// Unit-amplitude cos/sin columns of a mode: env(t)/A · {cos, sin}(phaseLaw).
     static func columns(_ m: ModeEstimate, count n: Int, sr: Double) -> ([Double], [Double]) {
-        var p = m.params
-        p.A = 1
         var c = [Double](repeating: 0, count: n), s = c
-        for i in 0..<n {
-            let t = Double(i) / sr
-            let e = p.envelope(t), th = p.phaseLaw(t)
-            c[i] = e * cos(th)
-            s[i] = e * sin(th)
-        }
+        var p = DGenModeParams(F: m.F, G: m.G, T: m.T, D: m.D, R: m.R, G2: m.G2, T2: m.T2)
+        c.withUnsafeMutableBufferPointer { C in s.withUnsafeMutableBufferPointer { S in
+            dgen_mode_columns(&p, Int32(n), sr, C.baseAddress, S.baseAddress)
+        }}
         return (c, s)
+    }
+
+    /// Unit-amplitude (cos, sin) columns of a mode, cached per thread: the joint fits re-solve the
+    /// same modes many times (rescue / drop-test trials change one mode at a time).
+    struct ColumnKey: Hashable { let F, G, T, D, R, G2, T2, sr: Double; let n: Int }
+    final class ColumnCache {
+        var map: [ColumnKey: ([Double], [Double])] = [:]
+        var order: [ColumnKey] = []
+        static let capacity = 16
+    }
+    static func columnsCached(_ m: ModeEstimate, count n: Int, sr: Double) -> ([Double], [Double]) {
+        let key = ColumnKey(F: m.F, G: m.G, T: m.T, D: m.D, R: m.R, G2: m.G2, T2: m.T2, sr: sr, n: n)
+        let cache = threadLocal("dgen.columns") { ColumnCache() }
+        if let hit = cache.map[key] { return hit }
+        let v = columns(m, count: n, sr: sr)
+        cache.map[key] = v
+        cache.order.append(key)
+        if cache.order.count > ColumnCache.capacity { cache.map[cache.order.removeFirst()] = nil }
+        return v
     }
 
     /// Solve all modes' (A, φ) jointly: x ≈ Σ a_k c_k + b_k s_k on [0, n).
@@ -471,39 +487,39 @@ public enum KickAnalyzer {
                                 weights: [Double]? = nil,
                                 sse: UnsafeMutablePointer<Double>? = nil) -> [ModeEstimate]
     {
-        let cols = modes.map { columns($0, count: n, sr: sr) }
         let k = modes.count
-        // normal equations (2k x 2k), small ridge for collinear pairs
-        var basis: [[Double]] = []
-        for (c, s) in cols { basis.append(c); basis.append(s) }
-        var x = x0
-        if let w = weights {
-            for i in 0..<n { x[i] *= w[i] }
-            for c in basis.indices { for i in 0..<n { basis[c][i] *= w[i] } }
-        }
         let m = 2 * k
-        var G = [[Double]](repeating: [Double](repeating: 0, count: m), count: m)
-        var rhs = [Double](repeating: 0, count: m)
-        for a in 0..<m {
-            basis[a].withUnsafeBufferPointer { pa in
-                x.withUnsafeBufferPointer { px in
-                    var r = 0.0
-                    for i in 0..<n { r += pa[i] * px[i] }
-                    rhs[a] = r
-                }
-                for b in a..<m {
-                    basis[b].withUnsafeBufferPointer { pb in
-                        var g = 0.0
-                        for i in 0..<n { g += pa[i] * pb[i] }
-                        G[a][b] = g
-                        G[b][a] = g
+        // basis rows (cos, sin per mode), weighted; Gram matrix and rhs by BLAS
+        var B = [Double](repeating: 0, count: m * n)
+        var x = Array(x0.prefix(n))
+        if x.count < n { x += [Double](repeating: 0, count: n - x.count) }
+        B.withUnsafeMutableBufferPointer { Bb in
+            for (j, mode) in modes.enumerated() {
+                let (c, s) = columnsCached(mode, count: n, sr: sr)
+                let rc = Bb.baseAddress! + (2 * j) * n, rs = rc + n
+                c.withUnsafeBufferPointer { C in s.withUnsafeBufferPointer { S in
+                    if let w = weights {
+                        for i in 0..<n { rc[i] = C[i] * w[i]; rs[i] = S[i] * w[i] }
+                    } else {
+                        for i in 0..<n { rc[i] = C[i]; rs[i] = S[i] }
                     }
-                }
+                }}
             }
         }
-        let tr = (0..<m).reduce(0.0) { $0 + G[$1][$1] } / Double(max(m, 1))
-        for a in 0..<m { G[a][a] += 1e-9 * tr }
-        let coef = LinAlg.leastSquares(G, rhs)
+        if let w = weights { for i in 0..<n { x[i] *= w[i] } }
+        var Gf = [Double](repeating: 0, count: m * m)
+        var rhs = [Double](repeating: 0, count: m)
+        if m > 0 {
+            B.withUnsafeBufferPointer { Bb in x.withUnsafeBufferPointer { X in
+                Gf.withUnsafeMutableBufferPointer { G in rhs.withUnsafeMutableBufferPointer { R in
+                    dgen_gram(Bb.baseAddress, Int32(m), Int32(n), X.baseAddress, G.baseAddress, R.baseAddress)
+                }}
+            }}
+        }
+        // normal equations, small ridge for collinear pairs
+        let tr = (0..<m).reduce(0.0) { $0 + Gf[$1 * m + $1] } / Double(max(m, 1))
+        for a in 0..<m { Gf[a * m + a] += 1e-9 * tr }
+        let coef = LinAlg.leastSquares(flat: Gf, rows: m, cols: m, rhs)
         var out = modes
         for j in 0..<k {
             let a = coef[2 * j], b = coef[2 * j + 1]  // a cos + b sin = A sin(θ + φ)
@@ -512,13 +528,9 @@ public enum KickAnalyzer {
             out[j].energy = out[j].A * out[j].A * out[j].D / 4
         }
         if let p = sse {
-            var e = 0.0
-            for i in 0..<n {
-                var y = 0.0
-                for c in 0..<m { y += coef[c] * basis[c][i] }
-                e += (x[i] - y) * (x[i] - y)
-            }
-            p.pointee = e
+            p.pointee = B.withUnsafeBufferPointer { Bb in coef.withUnsafeBufferPointer { Cf in x.withUnsafeBufferPointer { X in
+                dgen_lsq_sse(Bb.baseAddress, Int32(m), Int32(n), Cf.baseAddress, X.baseAddress)
+            }}}
         }
         return out
     }

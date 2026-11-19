@@ -404,6 +404,17 @@ public enum LazyOp {
     }
   }
 
+  /// Ops whose output aliases their input's memory: the `isViewOnly` ops plus `asStrided`
+  /// (pool/im2col windows) and `repeatView` (tiling), which emit index math but no storage.
+  /// A pass that reads a node's raw memory (e.g. the GEMM rewrite) must not treat one of
+  /// these as a data source.
+  public var isMemorylessView: Bool {
+    switch self {
+    case .asStrided, .repeatView: return true
+    default: return isViewOnly
+    }
+  }
+
   /// Inherently scalar stateful ops with single-cell state.
   /// These must not receive a tensorIndex (which would cause indexed memory
   /// access on single-cell state, corrupting adjacent memory).

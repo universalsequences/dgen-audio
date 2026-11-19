@@ -98,7 +98,16 @@ let package = Package(
             path: "Sources/DGenLisp"
         ),
         .target(
+            name: "DGenAnalysisC",
+            path: "Sources/DGenAnalysisC",
+            publicHeadersPath: "include",
+            // no FMA contraction: the kernels must round exactly like the Swift reference
+            cSettings: [.unsafeFlags(["-O3", "-ffp-contract=off"]), .define("ACCELERATE_NEW_LAPACK")],
+            linkerSettings: [.linkedFramework("Accelerate", .when(platforms: [.macOS]))]
+        ),
+        .target(
             name: "DGenAnalysis",
+            dependencies: ["DGenAnalysisC"],
             path: "Sources/DGenAnalysis",
             // numeric code: debug (-Onone) is ~60x slower, which would push the
             // analysis tests far past their time budget

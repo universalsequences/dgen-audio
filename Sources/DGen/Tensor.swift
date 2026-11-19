@@ -283,10 +283,19 @@ public struct Tensor {
         }
 
       case .asStrided(let outputShape, let strides, let offset, _):
-        // Replace shape/strides/offset directly
+        // asStrided strides address the INPUT's logical row-major layout (as `pool` builds
+        // them, and as the chain walker reads them). Over a contiguous view that is the
+        // current memory layout, so absorb it; over a non-contiguous one (e.g. a transpose)
+        // push a view boundary, exactly like a reshape.
+        let view = ComposedView(shape: currentShape, strides: currentStrides, offset: currentOffset)
+        if view.isContiguous {
+          currentOffset += offset
+        } else {
+          views.append(view)
+          currentOffset = offset
+        }
         currentShape = outputShape
         currentStrides = strides
-        currentOffset = offset
 
       case .pad, .repeatTile, .slidingWindow(_, _, _):
         // Non-composable: fall back to chain walker

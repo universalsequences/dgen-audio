@@ -19,6 +19,7 @@
 //   4. joint LM over all bands + shared r_n against e_a(t) in dB with the
 //      exact (quadratic) model.
 
+import DGenAnalysisC
 import Foundation
 
 public struct NoiseFitResult: Codable {
@@ -138,6 +139,16 @@ public enum NoiseFit {
         }
         return t
     }
+
+    /// How the joint refine is computed (env DGEN_NOISEFIT, read once): `swift` the Swift reference;
+    /// `fd` the C kernel with LM's finite-difference Jacobian (bit-identical to swift); `analytic`
+    /// (default) the C kernel with the analytic Jacobian (equivalent fits, ~1e-6-level differences).
+    enum Mode: String { case swift, fd, analytic }
+    static let mode: Mode = {
+        let v = ProcessInfo.processInfo.environment["DGEN_NOISEFIT"] ?? "analytic"
+        guard let m = Mode(rawValue: v) else { fatalError("DGEN_NOISEFIT must be swift, fd or analytic (got \(v))") }
+        return m
+    }()
 
     public static func fit(residual r: [Double], sr: Double, onset: Double, end: Double, edges: [Double],
                            options: Options = Options()) -> NoiseFitResult
@@ -270,6 +281,12 @@ public enum NoiseFit {
         //    Parameter vector: [ln L, m, d1, d2] x nb, r_n, then per event
         //    [t, ln level, ln decay, ln rise, ln colour x nb].
         let ev0 = ps * nb + 1, evW = 4 + nb
+        // residualE's constants: the target band powers in dB, and K flattened [a][b][c]
+        let eDB = (0..<na).map { a in fitIdx.map { 10 * log10(e[a][$0] + floorE) } }
+        let Kf: [Double] = options.sharedWhite ? K.flatMap { $0.flatMap { $0 } } : []
+        let Mf: [Double] = M.flatMap { $0 }
+        // smoothness weight across neighbouring bands
+        let wSmooth = options.smoothness * Double(fitIdx.count * na).squareRoot() / Double(nb)
         func residualE(_ p: [Double]) -> [Double] {
             let rnv = p[ps * nb]
             let nev = (p.count - ev0) / evW
@@ -279,35 +296,48 @@ public enum NoiseFit {
                 let o = ev0 + k * evW
                 return (p[o], exp(p[o + 1]), exp(p[o + 2]), exp(p[o + 3]), (0..<nb).map { exp(p[o + 4 + $0]) })
             }
+            // per band: L, m, d1, d2, h (env's terms that do not depend on t)
+            let Lb = (0..<nb).map { exp(p[ps * $0]) }
+            let hb = (0..<nb).map { ps == 5 ? exp(p[ps * $0 + 4]) : 0 }
             var o = 0
-            for i in fitIdx {
-                let t = ft[i]
-                for b in 0..<nb { N[b] = env(p, ps * b, t, rnv) }
-                for ev in evs where t > ev.t {
-                    let d = t - ev.t
-                    let g = ev.L * (1 - exp(-d / ev.r)) * exp(-d / ev.d)
-                    for b in 0..<nb { N[b] += g * ev.c[b] }
-                }
-                for a in 0..<na {
-                    var s = 0.0
-                    if options.sharedWhite {
-                        let Ka = K[a]
-                        for b in 0..<nb {
-                            var t = 0.0
-                            let row = Ka[b]
-                            for c in 0..<nb { t += row[c] * N[c] }
-                            s += N[b] * t
-                        }
-                    } else {
-                        for b in 0..<nb { s += M[a][b] * N[b] * N[b] }
+            out.withUnsafeMutableBufferPointer { O in
+            N.withUnsafeMutableBufferPointer { Nb in
+            p.withUnsafeBufferPointer { P in
+            Kf.withUnsafeBufferPointer { KF in
+            Mf.withUnsafeBufferPointer { MF in
+                for (ii, i) in fitIdx.enumerated() {
+                    let t = ft[i]
+                    let rise = 1 - exp(-t / rnv)
+                    for b in 0..<nb {
+                        let q = ps * b, m = P[q + 1]
+                        Nb[b] = (Lb[b] * (m * exp(-t / P[q + 2]) + (1 - m) * exp(-t / P[q + 3])) + hb[b]) * rise
                     }
-                    out[o] = 10 * log10(max(s, 0) + floorE) - 10 * log10(e[a][i] + floorE)
-                    o += 1
+                    for ev in evs where t > ev.t {
+                        let d = t - ev.t
+                        let g = ev.L * (1 - exp(-d / ev.r)) * exp(-d / ev.d)
+                        for b in 0..<nb { Nb[b] += g * ev.c[b] }
+                    }
+                    for a in 0..<na {
+                        var s = 0.0
+                        if options.sharedWhite {
+                            let Ka = KF.baseAddress! + a * nb * nb
+                            for b in 0..<nb {
+                                var t = 0.0
+                                let row = Ka + b * nb
+                                for c in 0..<nb { t += row[c] * Nb[c] }
+                                s += Nb[b] * t
+                            }
+                        } else {
+                            for b in 0..<nb { s += MF[a * nb + b] * Nb[b] * Nb[b] }
+                        }
+                        O[o] = 10 * log10(max(s, 0) + floorE) - eDB[a][ii]
+                        o += 1
+                    }
                 }
-            }
+            }}}}}
             // smoothness across neighbouring bands (dB of L, log of times, m):
             // makes the overlapping-band unmixing well posed
-            let w = options.smoothness * Double(fitIdx.count * na).squareRoot() / Double(nb)
+            let w = wSmooth
             for b in 0..<(nb - 1) {
                 let p0 = ps * b, p1 = ps * b + ps
                 out[o] = w * 8.686 * (p[p0] - p[p1]); o += 1
@@ -322,8 +352,48 @@ public enum NoiseFit {
             }
             return out
         }
+        // the same model in C (NoiseFitKernel.c): residuals of several parameter vectors per call
+        // (SIMD lanes), and the analytic Jacobian
+        let ftFit = fitIdx.map { ft[$0] }
+        let eDBf = eDB.flatMap { $0 }
+        func withProblem<R>(_ body: (inout DGenNFProblem) -> R) -> R {
+            ftFit.withUnsafeBufferPointer { FT in eDBf.withUnsafeBufferPointer { ED in
+                Kf.withUnsafeBufferPointer { KF in Mf.withUnsafeBufferPointer { MF in
+                    var pr = DGenNFProblem(nb: Int32(nb), na: Int32(na), ps: Int32(ps), nfit: Int32(fitIdx.count),
+                                           sharedWhite: options.sharedWhite ? 1 : 0, ev0: Int32(ev0), evW: Int32(evW),
+                                           ft: FT.baseAddress, eDB: ED.baseAddress, K: KF.baseAddress, M: MF.baseAddress,
+                                           floorE: floorE, w: wSmooth)
+                    return body(&pr)
+                }}
+            }}
+        }
+        func residualBatch(_ flat: [Double], _ count: Int) -> [Double] {
+            let np = flat.count / count
+            return withProblem { pr in
+                var out = [Double](repeating: 0, count: Int(dgen_nf_residual_count(&pr, Int32(np))) * count)
+                flat.withUnsafeBufferPointer { P in out.withUnsafeMutableBufferPointer { O in
+                    dgen_nf_residual_batch(&pr, P.baseAddress, Int32(count), Int32(np), O.baseAddress)
+                }}
+                return out
+            }
+        }
+        func jacobianC(_ p: [Double]) -> (r: [Double], J: [Double]) {
+            let np = p.count
+            return withProblem { pr in
+                let nout = Int(dgen_nf_residual_count(&pr, Int32(np)))
+                var r = [Double](repeating: 0, count: nout), J = [Double](repeating: 0, count: nout * np)
+                p.withUnsafeBufferPointer { P in r.withUnsafeMutableBufferPointer { R in J.withUnsafeMutableBufferPointer { JJ in
+                    dgen_nf_jacobian(&pr, P.baseAddress, Int32(np), R.baseAddress, JJ.baseAddress)
+                }}}
+                return (r, J)
+            }
+        }
+        let useC = Self.mode != .swift
+        let jacArg: (([Double]) -> (r: [Double], J: [Double]))? = Self.mode == .analytic ? jacobianC : nil
+        func residualFast(_ p: [Double]) -> [Double] { useC ? residualBatch(p, 1) : residualE(p) }
+        let batchArg: (([Double], Int) -> [Double])? = useC ? residualBatch : nil
         func dataRMS(_ p: [Double]) -> Double {
-            let res = residualE(p).prefix(fitIdx.count * na)
+            let res = residualFast(p).prefix(fitIdx.count * na)
             return (res.reduce(0) { $0 + $1 * $1 } / Double(max(res.count, 1))).squareRoot()
         }
         var hissLo = [Double](), hissHi = [Double]()
@@ -336,7 +406,7 @@ public enum NoiseFit {
         var full = params + [rn]
         if options.jointRefine {
             let f = LinAlg.levenbergMarquardt(x0: full, lower: hissLo, upper: hissHi, maxIter: options.jointIterations,
-                                              residuals: residualE)
+                                              residuals: residualFast, batchResiduals: batchArg, jacobian: jacArg)
             full = f.x
         }
         // v3 noise events: secondary onsets first, then an onset event; each admitted only when the
@@ -381,7 +451,7 @@ public enum NoiseFit {
             func tryEvent(_ init0: [Double], lo: [Double], hi: [Double], kind: String, minGain: Double) {
                 let x0 = full + init0
                 let f = LinAlg.levenbergMarquardt(x0: x0, lower: hissLo + evLo + lo, upper: hissHi + evHi + hi,
-                                                  maxIter: options.jointIterations, residuals: residualE)
+                                                  maxIter: options.jointIterations, residuals: residualFast, batchResiduals: batchArg, jacobian: jacArg)
                 let r2 = dataRMS(f.x)
                 let gain = 1 - r2 / max(rms, 1e-9)
                 if ProcessInfo.processInfo.environment["DGEN_ANALYSIS_TRACE"] != nil {

@@ -25,6 +25,41 @@ final class MetricLossTests: XCTestCase {
     }
   }
 
+  /// The real FFT's forward, adjoint and filter against direct O(w²) sums.
+  func testRealFFTMatchesNaiveDFT() {
+    for w in [8, 64, 256] {
+      let d = MetricLoss.dft(w)
+      let x = signal(w, seed: 3, f: 1234, decay: 0.01)
+      let (re, im) = d.forward(x)
+      for k in 0...(w / 2) {
+        var r = 0.0, i = 0.0
+        for m in 0..<w { let a = -2 * Double.pi * Double(k * m) / Double(w); r += x[m] * cos(a); i += x[m] * sin(a) }
+        XCTAssertEqual(re[k], r, accuracy: 1e-9, "w \(w) bin \(k) re")
+        XCTAssertEqual(im[k], i, accuracy: 1e-9, "w \(w) bin \(k) im")
+      }
+      let gR = (0...(w / 2)).map { sin(Double($0) * 0.7) }, gI = (0...(w / 2)).map { cos(Double($0) * 1.3) }
+      let back = d.adjoint(gR, gI)
+      for m in 0..<w {
+        var s = 0.0
+        for k in 0...(w / 2) { let a = 2 * Double.pi * Double(k * m) / Double(w); s += gR[k] * cos(a) - gI[k] * sin(a) }
+        XCTAssertEqual(back[m], s, accuracy: 1e-9, "w \(w) adjoint \(m)")
+      }
+      let gain = (0...(w / 2)).map { $0 < w / 8 ? 1.0 : 0.25 }
+      let fx = d.filter(x, gain: gain)
+      for m in 0..<w {
+        var s = 0.0
+        for k in 0..<w {
+          let g = gain[min(k, w - k)]
+          var r = 0.0, i = 0.0
+          for q in 0..<w { let a = -2 * Double.pi * Double(k * q) / Double(w); r += x[q] * cos(a); i += x[q] * sin(a) }
+          let a = 2 * Double.pi * Double(k * m) / Double(w)
+          s += g * (r * cos(a) - i * sin(a))
+        }
+        XCTAssertEqual(fx[m], s / Double(w), accuracy: 1e-9, "w \(w) filter \(m)")
+      }
+    }
+  }
+
   func testMRGradientMatchesFiniteDifferences() {
     let n = 4096
     let y = signal(n, seed: 1, f: 60, decay: 0.08), t = signal(n, seed: 2, f: 55, decay: 0.1)
@@ -67,7 +102,7 @@ final class MetricLossTests: XCTestCase {
   func testCachedTargetMatchesUncached() {
     let n = 8192
     let y = signal(n, seed: 9, f: 60, decay: 0.08), t = signal(n, seed: 10, f: 55, decay: 0.1)
-    let tg = MetricLoss.target(t, windows: [64, 256, 1024])
+    let tg = MetricLoss.target(t, windows: [64, 256, 1024], sampleRate: 44100)
     let (b0, gb0) = MetricLoss.band(y, t), (b1, gb1) = MetricLoss.band(y, t, target: tg)
     let (m0, gm0) = MetricLoss.mr(y, t, windows: [64, 256, 1024])
     let (m1, gm1) = MetricLoss.mr(y, t, windows: [64, 256, 1024], target: tg)

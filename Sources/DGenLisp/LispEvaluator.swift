@@ -224,6 +224,9 @@ class LispEvaluator {
   var learnableTensors: [LearnableTensorInfo] = []
   var latentTables: [LatentTableInfo] = []
   var paramRows: [ParamRowInfo] = []
+  var rowDataInfo: [RowDataInfo] = []
+  /// Shapes of `latent-out` values, in evaluation order.
+  var latentOutShapes: [[Int]] = []
 
   // MARK: Binding shapes (for hosts that draw the patch)
   //
@@ -980,6 +983,10 @@ class LispEvaluator {
       return try evalDeclick(regularArgs)
     case "training-value":
       return try evalTrainingValue(regularArgs)
+    case "row-data":
+      return try evalRowData(regularArgs, attributes: attributePairs)
+    case "latent-out":
+      return try evalLatentOut(regularArgs)
     // DEPRECATED hidden alias of `tensor` (undocumented; kept for old sources only).
     case "wavetable":
       return try evalWavetable(regularArgs, attributes: attributePairs, mutable: false)
@@ -1040,6 +1047,8 @@ class LispEvaluator {
       return try evalConv1d(regularArgs)
     case "windows":
       return try evalWindows(regularArgs, attributes: attributePairs)
+    case "windows1d":
+      return try evalWindows1D(regularArgs, attributes: attributePairs)
 
     // Reductions
     case "sum":
@@ -2282,7 +2291,11 @@ class LispEvaluator {
         throw LispError.invalidArgument(
           "tensor @data has \(data.count) values, expected \(shape.reduce(1, *))")
       }
-      return .tensor(makeTensor(shape: shape, data: data, mutable: false))
+      let t = makeTensor(shape: shape, data: data, mutable: false)
+      // A literal of the program: subgraphs built from it can be cached across runs. Rank > 2
+      // literals come back from makeTensor as parameters (requiresGrad), so they are not constant.
+      if !t.requiresGrad { t.markConstantData() }
+      return .tensor(t)
     }
     if attrValue(attributes, "@file") != nil || attrValue(attributes, "@shape") != nil {
       return try evalWavetable(args, attributes: attributes, mutable: false)
@@ -2459,7 +2472,25 @@ class LispEvaluator {
     guard let shapeStr = attrValue(attributes, "@shape") else {
       throw LispError.invalidArgument("reshape requires @shape attribute")
     }
-    let shape = parseShape(shapeStr)
+    var shape = parseShape(shapeStr)
+    // One -1 entry is inferred from the element count (batch-agnostic patches: [-1 64 90]).
+    if let inShape = tensorShape(of: val) {
+      let total = inShape.reduce(1, *)
+      let holes = shape.indices.filter { shape[$0] == -1 }
+      guard holes.count <= 1, shape.allSatisfy({ $0 > 0 || $0 == -1 }) else {
+        throw LispError.invalidArgument("reshape: @shape \(shape) may contain at most one -1 and no other non-positive sizes")
+      }
+      if let h = holes.first {
+        let known = shape.filter { $0 != -1 }.reduce(1, *)
+        guard known > 0, total % known == 0 else {
+          throw LispError.invalidArgument("reshape: cannot infer -1 in \(shape) from \(inShape)")
+        }
+        shape[h] = total / known
+      }
+      guard shape.reduce(1, *) == total else {
+        throw LispError.invalidArgument("reshape: \(inShape) (\(total) elements) cannot become \(shape)")
+      }
+    }
 
     switch val {
     case .tensor(let t): return .tensor(t.reshape(shape))
@@ -2963,6 +2994,34 @@ class LispEvaluator {
     case .tensor(let t): return .tensor(t.windows(shape))
     case .signalTensor(let st): return .signalTensor(st.windows(shape))
     default: throw LispError.typeError("windows: argument must be tensor or signalTensor")
+    }
+  }
+
+  /// `(windows1d X @size k [@stride s])`: strided sliding windows over the last axis,
+  /// [..., n] → [..., (n − k)/s + 1, k] (a zero-copy im2col view, differentiable). Stride
+  /// defaults to 1.
+  private func evalWindows1D(_ args: [ASTNode], attributes: [(name: String, value: String)]) throws
+    -> EvalResult
+  {
+    guard args.count == 1 else {
+      throw LispError.invalidArgument("windows1d requires 1 argument: (windows1d X @size k [@stride s])")
+    }
+    guard let k = attrValue(attributes, "@size").flatMap(Int.init), k > 0 else {
+      throw LispError.invalidArgument("windows1d requires @size k (k > 0)")
+    }
+    let s = attrValue(attributes, "@stride").flatMap(Int.init) ?? 1
+    guard s > 0 else { throw LispError.invalidArgument("windows1d: @stride must be > 0") }
+    let val = try evaluateAST(args[0])
+    guard let inShape = tensorShape(of: val), let n = inShape.last else {
+      throw LispError.typeError("windows1d: argument must be tensor or signalTensor")
+    }
+    guard n >= k else {
+      throw LispError.invalidArgument("windows1d: @size \(k) is larger than the last axis (\(n))")
+    }
+    switch val {
+    case .tensor(let t): return .tensor(t.pool(kernel: [k], stride: [s]))
+    case .signalTensor(let st): return .signalTensor(st.pool(kernel: [k], stride: [s]))
+    default: throw LispError.typeError("windows1d: argument must be tensor or signalTensor")
     }
   }
 
@@ -3702,7 +3761,7 @@ class LispEvaluator {
     return value
   }
 
-  private func parseShape(_ str: String) -> [Int] {
+  func parseShape(_ str: String) -> [Int] {
     // Parse "[2,3]", "[2 3]", "2,3", or "2 3"
     let cleaned = str.trimmingCharacters(in: CharacterSet(charactersIn: "[]"))
     return

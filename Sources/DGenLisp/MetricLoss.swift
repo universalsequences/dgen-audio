@@ -28,38 +28,100 @@ struct MetricLoss {
 
   // MARK: transforms
 
-  /// Complex DFT of length w (forward or inverse, unnormalised) on split real/imag arrays.
+  /// Real FFT of length w (a power of two), double precision (vDSP zrip). Callers only ever
+  /// transform real signals and use bins 0...w/2, so this does half the work of a complex DFT.
+  /// Thread-safe: the setup is shared read-only, buffers are per call.
   final class DFT {
     let w: Int
-    private let fwd: vDSP.DFT<Double>
-    private let inv: vDSP.DFT<Double>
+    let nb: Int
     let hann: [Double]
+    private let log2n: vDSP_Length
+    private let setup: FFTSetupD
     init(_ w: Int) {
+      precondition(w >= 4 && w & (w - 1) == 0, "MetricLoss FFT length must be a power of two")
       self.w = w
-      fwd = vDSP.DFT(count: w, direction: .forward, transformType: .complexComplex, ofType: Double.self)!
-      inv = vDSP.DFT(count: w, direction: .inverse, transformType: .complexComplex, ofType: Double.self)!
+      nb = w / 2 + 1
+      log2n = vDSP_Length(w.trailingZeroBitCount)
+      setup = vDSP_create_fftsetupD(log2n, FFTRadix(kFFTRadix2))!
       hann = (0..<w).map { 0.5 * (1 - cos(2 * Double.pi * Double($0) / Double(w))) }
     }
-    func forward(_ re: [Double]) -> (re: [Double], im: [Double]) {
-      var oR = [Double](repeating: 0, count: w), oI = [Double](repeating: 0, count: w)
-      fwd.transform(inputReal: re, inputImaginary: [Double](repeating: 0, count: w),
-                    outputReal: &oR, outputImaginary: &oI)
-      return (oR, oI)
+    deinit { vDSP_destroy_fftsetupD(setup) }
+
+    /// Packed in-place real FFT of x (length w) into (pr, pi) of length w/2 each.
+    private func packedForward(_ x: UnsafePointer<Double>, _ pr: inout [Double], _ pi: inout [Double]) {
+      pr.withUnsafeMutableBufferPointer { r in
+        pi.withUnsafeMutableBufferPointer { i in
+          var sc = DSPDoubleSplitComplex(realp: r.baseAddress!, imagp: i.baseAddress!)
+          x.withMemoryRebound(to: DSPDoubleComplex.self, capacity: w / 2) { vDSP_ctozD($0, 2, &sc, 1, vDSP_Length(w / 2)) }
+          vDSP_fft_zripD(setup, &sc, 1, log2n, FFTDirection(kFFTDirection_Forward))
+        }
+      }
     }
-    /// Unnormalised inverse DFT (real part) of a full spectrum.
-    func adjointFull(_ gR: [Double], _ gI: [Double]) -> [Double] {
-      var oR = [Double](repeating: 0, count: w), oI = [Double](repeating: 0, count: w)
-      inv.transform(inputReal: gR, inputImaginary: gI, outputReal: &oR, outputImaginary: &oI)
-      return oR
+    /// Unnormalised inverse of a packed Hermitian spectrum: Σ_{k<w} H_k e^{+2πikm/w}.
+    private func packedInverse(_ pr: inout [Double], _ pi: inout [Double]) -> [Double] {
+      var out = [Double](repeating: 0, count: w)
+      pr.withUnsafeMutableBufferPointer { r in
+        pi.withUnsafeMutableBufferPointer { i in
+          var sc = DSPDoubleSplitComplex(realp: r.baseAddress!, imagp: i.baseAddress!)
+          vDSP_fft_zripD(setup, &sc, 1, log2n, FFTDirection(kFFTDirection_Inverse))
+          out.withUnsafeMutableBufferPointer { o in
+            o.baseAddress!.withMemoryRebound(to: DSPDoubleComplex.self, capacity: w / 2) { vDSP_ztocD(&sc, 1, $0, 2, vDSP_Length(w / 2)) }
+          }
+        }
+      }
+      return out
     }
-    /// Re(Σ_k G_k e^{+2πikm/w}) for G given on k = 0…w/2 (zero above).
+
+    /// DFT bins 0...w/2 of the real frame x (e^{-2πikm/w}, unnormalised).
+    func forward(_ x: [Double]) -> (re: [Double], im: [Double]) {
+      var pr = [Double](repeating: 0, count: w / 2), pi = pr
+      x.withUnsafeBufferPointer { packedForward($0.baseAddress!, &pr, &pi) }
+      // zrip scales by 2 and packs bin w/2's real part into pi[0]
+      var re = [Double](repeating: 0, count: nb), im = [Double](repeating: 0, count: nb)
+      re[0] = pr[0] * 0.5
+      re[w / 2] = pi[0] * 0.5
+      for k in 1..<(w / 2) { re[k] = pr[k] * 0.5; im[k] = pi[k] * 0.5 }
+      return (re, im)
+    }
+    /// Re(Σ_{k=0}^{w/2} G_k e^{+2πikm/w}) for G given on k = 0…w/2 (zero above).
     func adjoint(_ gR: [Double], _ gI: [Double]) -> [Double] {
-      var iR = [Double](repeating: 0, count: w), iI = [Double](repeating: 0, count: w)
-      for k in 0..<gR.count { iR[k] = gR[k]; iI[k] = gI[k] }
-      var oR = [Double](repeating: 0, count: w), oI = [Double](repeating: 0, count: w)
-      inv.transform(inputReal: iR, inputImaginary: iI, outputReal: &oR, outputImaginary: &oI)
-      return oR
+      precondition(gR.count == gI.count && gR.count <= nb, "adjoint takes bins 0...w/2")
+      // As a Hermitian inverse: bins 1..w/2-1 appear twice there (k and w-k), so halve them.
+      var pr = [Double](repeating: 0, count: w / 2), pi = pr
+      pr[0] = gR[0]
+      pi[0] = gR.count > w / 2 ? gR[w / 2] : 0
+      for k in 1..<min(gR.count, w / 2) { pr[k] = gR[k] * 0.5; pi[k] = gI[k] * 0.5 }
+      return packedInverse(&pr, &pi)
     }
+    /// Zero-phase filter by a real, symmetric gain over bins 0...w/2: IDFT(DFT(x)·gain), / w.
+    func filter(_ x: [Double], gain: [Double]) -> [Double] {
+      precondition(x.count == w && gain.count == nb, "filter takes w samples and w/2+1 gains")
+      var pr = [Double](repeating: 0, count: w / 2), pi = pr
+      x.withUnsafeBufferPointer { packedForward($0.baseAddress!, &pr, &pi) }
+      pr[0] *= gain[0]
+      pi[0] *= gain[w / 2]
+      for k in 1..<(w / 2) { pr[k] *= gain[k]; pi[k] *= gain[k] }
+      // packed forward is 2·X, the inverse of a packed X is w·x: divide by 2w
+      var out = packedInverse(&pr, &pi)
+      vDSP.multiply(1 / Double(2 * w), out, result: &out)
+      return out
+    }
+  }
+
+  private static var gainCache: [String: [Double]] = [:]
+  /// Brick-wall at `cutoff`, raised-cosine edge one octave wide, over bins 0...m/2.
+  static func lowPassGain(m: Int, cutoff: Double, sampleRate: Double) -> [Double] {
+    let key = "\(m)|\(cutoff)|\(sampleRate)"
+    lock.lock(); defer { lock.unlock() }
+    if let g = gainCache[key] { return g }
+    let g: [Double] = (0...(m / 2)).map { k in
+      let f = Double(k) * sampleRate / Double(m)
+      if f <= cutoff { return 1 }
+      if f >= 2 * cutoff { return 0 }
+      return 0.5 * (1 + cos(Double.pi * (f - cutoff) / cutoff))
+    }
+    gainCache[key] = g
+    return g
   }
 
   private static var cache: [Int: DFT] = [:]
@@ -101,7 +163,7 @@ struct MetricLoss {
 
   static func spectra(_ x: [Double], w: Int, starts: [Int]) -> Spectra {
     let d = dft(w)
-    let nb = w / 2 + 1
+    let nb = d.nb
     var s = Spectra(P: [], re: [], im: [])
     s.P.reserveCapacity(starts.count)
     for st in starts {
@@ -124,15 +186,19 @@ struct MetricLoss {
     let n: Int
     let mr: [Int: Spectra]
     let band: (D: [[Double]], E: [[Double]], Es: [[Double]], sp: Spectra, starts: [Int])
+    /// The target through `lowWave`'s low-pass (when a wave cutoff was given).
+    var low: (cutoff: Double, sampleRate: Double, values: [Double])? = nil
   }
 
-  static func target(_ t: [Double], windows: [Int]) -> Target {
+  static func target(_ t: [Double], windows: [Int], waveCutoff: Double? = nil, sampleRate: Double) -> Target {
     let n = t.count
     var mr: [Int: Spectra] = [:]
     for w in windows where w <= n {
       mr[w] = spectra(t, w: w, starts: Array(stride(from: 0, through: n - w, by: w / 4)))
     }
-    return Target(n: n, mr: mr, band: bandEnvDB(t))
+    var tg = Target(n: n, mr: mr, band: bandEnvDB(t))
+    if let c = waveCutoff { tg.low = (c, sampleRate, lowPass(n: n, cutoff: c, sampleRate: sampleRate)(t)) }
+    return tg
   }
 
   // MARK: MR-STFT
@@ -146,11 +212,11 @@ struct MetricLoss {
     for w in ws {
       let hop = w / 4
       let starts = Array(stride(from: 0, through: n - w, by: hop))
-      let nb = w / 2 + 1
+      let d = dft(w)
+      let nb = d.nb
       let sy = spectra(y, w: w, starts: starts)
       let stt = target?.n == n ? (target?.mr[w] ?? spectra(t, w: w, starts: starts)) : spectra(t, w: w, starts: starts)
       let norm = 1.0 / Double(starts.count * nb) / Double(ws.count)
-      let d = dft(w)
       let e2 = eps * eps
       for (j, st) in starts.enumerated() {
         var gR = [Double](repeating: 0, count: nb), gI = [Double](repeating: 0, count: nb)
@@ -235,7 +301,7 @@ struct MetricLoss {
     }
     let W = bandW
     let d = dft(W)
-    let nb = W / 2 + 1
+    let nb = d.nb
     var gpad = [Double](repeating: 0, count: n + W / 2)
     let rows = bandMatrix.rows
     for (j, st) in Y.starts.enumerated() {
@@ -260,30 +326,36 @@ struct MetricLoss {
   /// Phase-aware low-band fit: sum((LP y - LP t)^2) / sum((LP t)^2) with a zero-phase FFT low-pass
   /// (brick-wall at `cutoff`, raised-cosine edge one octave wide). LP is linear and self-adjoint,
   /// so the gradient is 2 LP(LP y - LP t) / sum((LP t)^2).
-  static func lowWave(_ y: [Double], _ t: [Double], cutoff: Double, sampleRate: Double) -> (Double, [Double]) {
+  static func lowWave(_ y: [Double], _ t: [Double], cutoff: Double, sampleRate: Double,
+                      target: Target? = nil) -> (Double, [Double]) {
     let n = min(y.count, t.count)
-    var m = 1
-    while m < 2 * n { m <<= 1 }
-    let d = dft(m)
-    let mask: [Double] = (0..<m).map { k in
-      let f = Double(min(k, m - k)) * sampleRate / Double(m)
-      if f <= cutoff { return 1 }
-      if f >= 2 * cutoff { return 0 }
-      return 0.5 * (1 + cos(Double.pi * (f - cutoff) / cutoff))
+    let lp = lowPass(n: n, cutoff: cutoff, sampleRate: sampleRate)
+    let lt: [Double]
+    if let low = target?.low, low.cutoff == cutoff, low.sampleRate == sampleRate, low.values.count == n {
+      lt = low.values
+    } else {
+      lt = lp(t)
     }
-    func lp(_ x: [Double]) -> [Double] {
-      var pad = [Double](repeating: 0, count: m)
-      for i in 0..<n { pad[i] = x[i] }
-      let (r, im) = d.forward(pad)
-      let gr = (0..<m).map { r[$0] * mask[$0] }, gi = (0..<m).map { im[$0] * mask[$0] }
-      return Array(d.adjointFull(gr, gi).prefix(n)).map { $0 / Double(m) }
-    }
-    let ly = lp(y), lt = lp(t)
+    let ly = lp(y)
     let e = max(lt.reduce(0) { $0 + $1 * $1 }, 1e-12)
     let diff = zip(ly, lt).map { $0 - $1 }
     let loss = diff.reduce(0) { $0 + $1 * $1 } / e
     let g = lp(diff).map { 2 * $0 / e }
     return (loss, g)
+  }
+
+  /// The zero-phase low-pass `lowWave` uses for signals of length n (padded to a power of two ≥ 2n).
+  /// The gain table depends only on (n, cutoff, sampleRate): built once, cached.
+  static func lowPass(n: Int, cutoff: Double, sampleRate: Double) -> ([Double]) -> [Double] {
+    var m = 1
+    while m < 2 * n { m <<= 1 }
+    let d = dft(m)
+    let gain = lowPassGain(m: m, cutoff: cutoff, sampleRate: sampleRate)
+    return { x in
+      var pad = [Double](repeating: 0, count: m)
+      for i in 0..<min(n, x.count) { pad[i] = x[i] }
+      return Array(d.filter(pad, gain: gain).prefix(n))
+    }
   }
 
   // MARK: combined
@@ -302,7 +374,7 @@ struct MetricLoss {
     let (b, gb) = bandWeight > 0 ? MetricLoss.band(yd, td, weights: wb, target: target) : (0, [Double](repeating: 0, count: y.count))
     let (m, gm) = mrWeight > 0 ? MetricLoss.mr(yd, td, windows: windows, target: target) : (0, [Double](repeating: 0, count: y.count))
     let (w, gw) = waveWeight > 0
-      ? MetricLoss.lowWave(yd, td, cutoff: waveCutoff, sampleRate: sampleRate)
+      ? MetricLoss.lowWave(yd, td, cutoff: waveCutoff, sampleRate: sampleRate, target: target)
       : (0, [Double](repeating: 0, count: y.count))
     var g = [Float](repeating: 0, count: y.count)
     for i in 0..<min(gb.count, g.count) { g[i] += Float(bandWeight * gb[i]) }

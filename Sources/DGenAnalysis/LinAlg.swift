@@ -4,7 +4,17 @@
 // Levenberg-Marquardt. Row-major [[Double]] throughout; sizes are small
 // (<= a few hundred), so clarity wins over blocking.
 
+import DGenAnalysisC
 import Foundation
+
+/// A per-thread instance of T under `key` (analysis caches: each kick runs on one worker thread).
+func threadLocal<T: AnyObject>(_ key: String, _ make: () -> T) -> T {
+    let td = Thread.current.threadDictionary
+    if let v = td[key] as? T { return v }
+    let v = make()
+    td[key] = v
+    return v
+}
 
 public enum LinAlg {
     // MARK: symmetric eigen (cyclic Jacobi)
@@ -12,6 +22,25 @@ public enum LinAlg {
     /// Eigen-decomposition of a symmetric matrix. Returns eigenvalues sorted
     /// descending and the matching eigenvectors as columns of `vectors`.
     public static func symmetricEigen(_ a0: [[Double]], maxSweeps: Int = 60)
+        -> (values: [Double], vectors: [[Double]])
+    {
+        symmetricEigen(flat: a0.flatMap { $0 }, n: a0.count, maxSweeps: maxSweeps)
+    }
+
+    /// symmetricEigen on a row-major n×n matrix: LAPACK dsyevd, or the Jacobi sweeps where LAPACK is
+    /// unavailable (non-Apple builds) or fails.
+    static func symmetricEigen(flat: [Double], n: Int, maxSweeps: Int = 60) -> (values: [Double], vectors: [[Double]]) {
+        if n > 0 {
+            var vals = [Double](repeating: 0, count: n), vecs = [Double](repeating: 0, count: n * n)
+            let info = flat.withUnsafeBufferPointer { F in vals.withUnsafeMutableBufferPointer { V in
+                vecs.withUnsafeMutableBufferPointer { E in dgen_sym_eigen(F.baseAddress, Int32(n), V.baseAddress, E.baseAddress) } } }
+            if info == 0 { return (vals, (0..<n).map { Array(vecs[($0 * n)..<(($0 + 1) * n)]) }) }
+        }
+        return jacobiEigen((0..<n).map { Array(flat[($0 * n)..<(($0 + 1) * n)]) }, maxSweeps: maxSweeps)
+    }
+
+    /// Cyclic Jacobi sweeps (the portable fallback of symmetricEigen).
+    static func jacobiEigen(_ a0: [[Double]], maxSweeps: Int = 60)
         -> (values: [Double], vectors: [[Double]])
     {
         let n = a0.count
@@ -62,60 +91,74 @@ public enum LinAlg {
     // MARK: least squares
 
     /// min ||A x - b||^2 + ridge ||x||^2 via Householder QR. A is m x n.
+    /// Least squares on a row-major m×n matrix (LAPACK QR; see dgen_lstsq).
+    static func leastSquares(flat A: [Double], rows m: Int, cols n: Int, _ b: [Double], ridge: Double = 0) -> [Double] {
+        var x = [Double](repeating: 0, count: n)
+        if n == 0 { return x }
+        let info = A.withUnsafeBufferPointer { F in b.withUnsafeBufferPointer { B in x.withUnsafeMutableBufferPointer { X in
+            dgen_lstsq(F.baseAddress, Int32(m), Int32(n), B.baseAddress, ridge, X.baseAddress)
+        }}}
+        assert(info == 0, "dgen_lstsq failed (\(info))")
+        return x
+    }
+
     public static func leastSquares(_ A: [[Double]], _ b: [Double], ridge: Double = 0) -> [Double] {
-        var a = A
-        var y = b
         let n = A.first?.count ?? 0
         if n == 0 { return [] }
-        if ridge > 0 {
-            let r = sqrt(ridge)
-            for j in 0..<n {
-                var row = [Double](repeating: 0, count: n)
-                row[j] = r
-                a.append(row)
-                y.append(0)
-            }
-        }
-        let m = a.count
-        // column scaling for conditioning
+        return leastSquares(flat: A.flatMap { $0 }, rows: A.count, cols: n, b, ridge: ridge)
+    }
+
+    /// Householder QR least squares on a column-major m×n matrix `a` (destroyed) and `y` (destroyed),
+    /// in Swift: LM's step solve on the reference paths (DGEN_NOISEFIT=swift / fd keep the original
+    /// operation order, so those runs reproduce the pre-C analysis bit for bit).
+    public static func leastSquaresColumnMajor(_ a: inout [Double], _ y: inout [Double], m: Int, n: Int) -> [Double] {
         var scale = [Double](repeating: 1, count: n)
-        for j in 0..<n {
-            var s = 0.0
-            for i in 0..<m { s += a[i][j] * a[i][j] }
-            scale[j] = s > 0 ? 1 / sqrt(s) : 1
-            for i in 0..<m { a[i][j] *= scale[j] }
-        }
-        let kmax = min(m, n)
-        for k in 0..<kmax {
-            var norm = 0.0
-            for i in k..<m { norm += a[i][k] * a[i][k] }
-            norm = sqrt(norm)
-            if norm == 0 { continue }
-            let alpha = a[k][k] > 0 ? -norm : norm
-            var v = [Double](repeating: 0, count: m - k)
-            for i in k..<m { v[i - k] = a[i][k] }
-            v[0] -= alpha
-            var vn = 0.0
-            for x in v { vn += x * x }
-            if vn == 0 { continue }
-            for j in k..<n {
-                var d = 0.0
-                for i in k..<m { d += v[i - k] * a[i][j] }
-                let f = 2 * d / vn
-                for i in k..<m { a[i][j] -= f * v[i - k] }
-            }
-            var d = 0.0
-            for i in k..<m { d += v[i - k] * y[i] }
-            let f = 2 * d / vn
-            for i in k..<m { y[i] -= f * v[i - k] }
-        }
         var x = [Double](repeating: 0, count: n)
-        let rmax = abs(a[0][0])
-        for k in stride(from: kmax - 1, through: 0, by: -1) {
-            var s = y[k]
-            for j in (k + 1)..<max(k + 1, n) { s -= a[k][j] * x[j] }
-            x[k] = abs(a[k][k]) > 1e-13 * rmax ? s / a[k][k] : 0
-        }
+        var v = [Double](repeating: 0, count: m)
+        a.withUnsafeMutableBufferPointer { A in
+        y.withUnsafeMutableBufferPointer { Y in
+        v.withUnsafeMutableBufferPointer { V in
+            // column scaling for conditioning
+            for j in 0..<n {
+                let c = A.baseAddress! + j * m
+                var s = 0.0
+                for i in 0..<m { s += c[i] * c[i] }
+                scale[j] = s > 0 ? 1 / sqrt(s) : 1
+                let sc = scale[j]
+                for i in 0..<m { c[i] *= sc }
+            }
+            let kmax = min(m, n)
+            for k in 0..<kmax {
+                let ck = A.baseAddress! + k * m
+                var norm = 0.0
+                for i in k..<m { norm += ck[i] * ck[i] }
+                norm = sqrt(norm)
+                if norm == 0 { continue }
+                let alpha = ck[k] > 0 ? -norm : norm
+                for i in k..<m { V[i - k] = ck[i] }
+                V[0] -= alpha
+                var vn = 0.0
+                for i in 0..<(m - k) { vn += V[i] * V[i] }
+                if vn == 0 { continue }
+                for j in k..<n {
+                    let cj = A.baseAddress! + j * m
+                    var d = 0.0
+                    for i in k..<m { d += V[i - k] * cj[i] }
+                    let f = 2 * d / vn
+                    for i in k..<m { cj[i] -= f * V[i - k] }
+                }
+                var d = 0.0
+                for i in k..<m { d += V[i - k] * Y[i] }
+                let f = 2 * d / vn
+                for i in k..<m { Y[i] -= f * V[i - k] }
+            }
+            let rmax = abs(A[0])
+            for k in stride(from: kmax - 1, through: 0, by: -1) {
+                var s = Y[k]
+                for j in (k + 1)..<max(k + 1, n) { s -= A[j * m + k] * x[j] }
+                x[k] = abs(A[k * m + k]) > 1e-13 * rmax ? s / A[k * m + k] : 0
+            }
+        }}}
         for j in 0..<n { x[j] *= scale[j] }
         return x
     }
@@ -422,7 +465,9 @@ public enum LinAlg {
     /// difference) Jacobian; the step is projected onto the box.
     public static func levenbergMarquardt(
         x0: [Double], lower: [Double], upper: [Double], maxIter: Int = 100,
-        relStep: Double = 1e-6, residuals: ([Double]) -> [Double]
+        relStep: Double = 1e-6, residuals: ([Double]) -> [Double],
+        batchResiduals: ((_ flat: [Double], _ count: Int) -> [Double])? = nil,
+        jacobian: ((_ x: [Double]) -> (r: [Double], J: [Double]))? = nil
     ) -> LMResult {
         let n = x0.count
         func clampv(_ v: [Double]) -> [Double] {
@@ -436,31 +481,80 @@ public enum LinAlg {
         while it < maxIter {
             it += 1
             let m = r.count
-            // Jacobian
-            var J = [[Double]](repeating: [Double](repeating: 0, count: n), count: m)
+            var JtJ = [Double](repeating: 0, count: n * n)
+            var Jtr = [Double](repeating: 0, count: n)
+            if let jacobian {
+                // analytic Jacobian: normal equations by BLAS
+                let (_, J) = jacobian(x)
+                J.withUnsafeBufferPointer { Jb in r.withUnsafeBufferPointer { R in
+                    JtJ.withUnsafeMutableBufferPointer { G in Jtr.withUnsafeMutableBufferPointer { g in
+                        dgen_normal_equations(Jb.baseAddress, R.baseAddress, Int32(m), Int32(n), G.baseAddress, g.baseAddress)
+                    }}
+                }}
+            } else {
+            // Jacobian (row-major flat m×n), by forward differences; with batchResiduals the n
+            // perturbed points are evaluated in one call
+            var J = [Double](repeating: 0, count: m * n)
+            var hs = [Double](repeating: 0, count: n)
             for j in 0..<n {
                 var h = relStep * max(abs(x[j]), 1e-3 * max(abs(upper[j] - lower[j]), 1e-12))
                 if x[j] + h > upper[j] { h = -h }
-                var xp = x
-                xp[j] += h
-                let rp = residuals(xp)
-                for i in 0..<m { J[i][j] = (rp[i] - r[i]) / h }
+                hs[j] = h
             }
-            var JtJ = [[Double]](repeating: [Double](repeating: 0, count: n), count: n)
-            var Jtr = [Double](repeating: 0, count: n)
-            for i in 0..<m {
-                let row = J[i]
-                for a in 0..<n where row[a] != 0 {
-                    Jtr[a] += row[a] * r[i]
-                    for b in a..<n { JtJ[a][b] += row[a] * row[b] }
+            if let batchResiduals {
+                var flat = [Double](repeating: 0, count: n * n)
+                for j in 0..<n {
+                    for k in 0..<n { flat[j * n + k] = x[k] }
+                    flat[j * n + j] = x[j] + hs[j]
+                }
+                let rp = batchResiduals(flat, n)
+                J.withUnsafeMutableBufferPointer { Jb in
+                    rp.withUnsafeBufferPointer { R in r.withUnsafeBufferPointer { R0 in
+                        for j in 0..<n { for i in 0..<m { Jb[i * n + j] = (R[j * m + i] - R0[i]) / hs[j] } }
+                    }}
+                }
+            } else {
+                var xp = x
+                for j in 0..<n {
+                    xp[j] = x[j] + hs[j]
+                    let rp = residuals(xp)
+                    xp[j] = x[j]
+                    J.withUnsafeMutableBufferPointer { Jb in
+                        rp.withUnsafeBufferPointer { R in r.withUnsafeBufferPointer { R0 in
+                            for i in 0..<m { Jb[i * n + j] = (R[i] - R0[i]) / hs[j] }
+                        }}
+                    }
                 }
             }
-            for a in 0..<n { for b in 0..<a { JtJ[a][b] = JtJ[b][a] } }
+            J.withUnsafeBufferPointer { Jb in JtJ.withUnsafeMutableBufferPointer { G in Jtr.withUnsafeMutableBufferPointer { g in
+                r.withUnsafeBufferPointer { R in
+                    for i in 0..<m {
+                        let row = Jb.baseAddress! + i * n
+                        for a in 0..<n where row[a] != 0 {
+                            g[a] += row[a] * R[i]
+                            for b in a..<n { G[a * n + b] += row[a] * row[b] }
+                        }
+                    }
+                }
+                for a in 0..<n { for b in 0..<a { G[a * n + b] = G[b * n + a] } }
+            }}}
+            }
             var improved = false
             for _ in 0..<12 {
+                // column-major copy of JtJ + λ·diag (JtJ is symmetric, so row- and column-major agree)
                 var Aug = JtJ
-                for a in 0..<n { Aug[a][a] += lambda * max(JtJ[a][a], 1e-12) }
-                let delta = leastSquares(Aug, Jtr.map { -$0 })
+                for a in 0..<n { Aug[a * n + a] += lambda * max(JtJ[a * n + a], 1e-12) }
+                var rhs = Jtr.map { -$0 }
+                var delta: [Double]
+                if jacobian != nil {
+                    // Cholesky (the damped normal matrix is SPD); QR if it is not
+                    var b = rhs
+                    let ok = Aug.withUnsafeBufferPointer { A in b.withUnsafeMutableBufferPointer { B in
+                        dgen_cholesky_solve(A.baseAddress, Int32(n), B.baseAddress) == 0 } }
+                    delta = ok ? b : leastSquaresColumnMajor(&Aug, &rhs, m: n, n: n)
+                } else {
+                    delta = leastSquaresColumnMajor(&Aug, &rhs, m: n, n: n)
+                }
                 let xn = clampv((0..<n).map { x[$0] + delta[$0] })
                 let rn = residuals(xn)
                 let cn = 0.5 * rn.reduce(0) { $0 + $1 * $1 }

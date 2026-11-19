@@ -12,6 +12,12 @@
 //   audio     decoder + codes against the targets, two-pass: (1) U = decoder(codes) realised;
 //             (2) the voice renders from a leaf U, audio loss backprops to dL/dU; (3) the
 //             decoder graph backprops Σ U·dL/dU (+ anchor) to codes and weights.
+//   encode    an --encoder patch (features → z, `row-data` → `latent-out`) bound into the
+//             frozen voice's latent-table; supervised on --codes (code MSE + decoded-param
+//             term), minibatched, with a held-out --val split (EncoderTrainer.swift).
+//             With --amortized the encoder defines the codes instead: encoder and decoder train
+//             jointly on --rows (no --codes).
+//   render    decode and render --z-rows; writes renders/labels.json beside the WAVs.
 //
 // Everything the run produces goes under --job-dir: ckpt/ (resumable: leaves + Adam moments +
 // step), export/ (the patch's @file tensors, codes.json, rows.json, decoder_layout.json),
@@ -35,6 +41,20 @@ struct TrainDatasetOptions {
   var frames = 32768
   var anchor: Float = 0
   var codeL2: Float = 1e-3
+  /// `--stage pretrain --z-rows Z --code-anchor W`: start the codes at Z (e.g. an embedding of
+  /// each target's measured traits) and pull them back toward it, W · mean ‖z − Z‖², in place of
+  /// --code-l2. Keeps similar-sounding targets' codes close, so the latent space is searchable,
+  /// mappable and predictable from the audio.
+  var codeAnchor: Float = 0
+  /// `--freeze-code-from K`: code columns K… get no updates (any stage that trains codes). With
+  /// --z-rows they hold measured values, e.g. a kick's ln F0 that the voice multiplies in while
+  /// the decoder reads only columns 0..<K: pitch from analysis, still interpolated by morphing.
+  var freezeCodeFrom: Int?
+  /// `--stage pretrain --code-noise S`: during training steps, each code's learned columns (those
+  /// below --freeze-code-from) get fresh N(0, S²) noise, so the decoder must make a neighbourhood of
+  /// every code decode right, not just the point (VAE-style smoothing). Exports and renders use the
+  /// clean codes.
+  var codeNoise: Float = 0
   /// Path regulariser weight (pretrain): in-between latents decode near the straight line
   /// between the two ends' decoded rows (u space).
   var path: Float = 0
@@ -58,13 +78,68 @@ struct TrainDatasetOptions {
   var evalEvery = 0
   var seed: UInt64 = 1
   var initFiles = false
-  /// Comma-separated segment names whose columns do not move (refine: the leaf columns;
-  /// audio: their gradient is zeroed before the decoder pass).
+  /// Comma-separated segment names. refine: those leaf columns do not move (their gradient
+  /// is zeroed). pretrain/audio: the columns are only dropped from the anchor term; the audio
+  /// gradient still reaches them through the decoder.
   var freeze: Set<String> = []
   var pitchHz: Double = 261.6255653
   var noRender = false
   /// `--stage render`: z rows to decode and render, {"names": [...], "z": [[...], ...]}.
+  /// `--fit-codes`: optional starting codes, matched to the dataset's targets by name.
   var zRows: String?
+  /// `--stage audio --fit-codes`: label new targets with codes for a trained voice. The
+  /// --init-from decoder weights stay frozen; only a fresh code table (one row per target,
+  /// from --z-rows or the default init) is trained.
+  var fitCodes = false
+  /// Per-leaf gradient-norm clip (0: off) and decoupled weight decay (0: off).
+  var clip: Float = 0
+  var weightDecay: Float = 0
+
+  // encode (EncoderTrainer.swift)
+  var encoder: String?
+  /// Comma-separated codes files ({names, codes, dim}), one per --dataset directory.
+  var codes: [String] = []
+  /// Precomputed raw features {names, shape: [bands, frames], data: [[...]]} instead of host log-mel.
+  var features: String?
+  var batch = 32
+  var val = 10
+  /// Held-out rows by name (instead of a seeded --val shuffle of the first dataset).
+  var valNames: [String] = []
+  /// Amortized latent: the encoder DEFINES the codes. Encoder and decoder train jointly so that
+  /// U(enc(x)) matches the --rows targets (+ --path, --code-l2 on the encoder's codes); no
+  /// --codes labels, and --init-from is optional (it warm-starts whichever weights it has).
+  var amortized = false
+  /// Leaf-name prefixes that train (default: the encoder's own leaves).
+  var trainOnly: [String] = []
+  /// Decoded-param term weight: ‖U(enc(x)) − U(z)‖².
+  var uWeight: Float = 1
+  /// Prior: squared distance from each predicted code to the nearest training code.
+  var prior: Float = 0
+  var augment = false
+  /// --augment without the additive white noise (it teaches the encoder to ignore hiss level).
+  var augNoise = true
+  /// --audio-loss: grade the encoder on sound -- its code is decoded by the frozen voice,
+  /// rendered, and scored with the metric loss against the batch's targets (+ code-weight ·
+  /// code MSE to the --codes labels).
+  var audioLoss = false
+  var codeWeight: Float = 1
+  /// Per-band feature normalisation from a file (e.g. the warm-start encoder's
+  /// export/feat_stats.json) instead of refitting it on the training rows.
+  var featStats: String?
+  /// --aux-features: per-row encoder input vectors ({names, features}).
+  var auxFeatures: String?
+  /// --row-extra: more per-row vectors ({names, features}) appended RAW (not z-scored) to the aux
+  /// row data (or, without --aux-features, as all of it), e.g. analysis values the encoder passes
+  /// straight through into its code.
+  var rowExtra: String?
+  /// --low-weight: under --audio-loss, anchor the decoded low end (every mode whose --rows
+  /// frequency is below 250 Hz: pitch curve, level, decay) to the row (the MR loss barely hears
+  /// 40-60 Hz, so sound grading alone lets the low modes drift out of tune).
+  var lowWeight: Float = 0
+  var featWindow = 1024
+  var featHop = 256
+  var featBands = 64
+  var featSeconds: Float = 0.5
 
   static func parse(_ args: [String]) throws -> TrainDatasetOptions {
     var o = TrainDatasetOptions()
@@ -89,6 +164,9 @@ struct TrainDatasetOptions {
       case "--frames": o.frames = Int(try value()) ?? o.frames
       case "--anchor": o.anchor = Float(try value()) ?? o.anchor
       case "--code-l2": o.codeL2 = Float(try value()) ?? o.codeL2
+      case "--code-anchor": o.codeAnchor = Float(try value()) ?? o.codeAnchor
+      case "--freeze-code-from": o.freezeCodeFrom = Int(try value())
+      case "--code-noise": o.codeNoise = Float(try value()) ?? o.codeNoise
       case "--path": o.path = Float(try value()) ?? o.path
       case "--path-pairs": o.pathPairs = Int(try value()) ?? o.pathPairs
       case "--windows": o.windows = try value().split(separator: ",").compactMap { Int($0) }
@@ -110,12 +188,74 @@ struct TrainDatasetOptions {
       case "--pitch-hz": o.pitchHz = Double(try value()) ?? o.pitchHz
       case "--no-render": o.noRender = true
       case "--z-rows": o.zRows = try value()
+      case "--fit-codes": o.fitCodes = true
+      case "--clip": o.clip = Float(try value()) ?? o.clip
+      case "--weight-decay": o.weightDecay = Float(try value()) ?? o.weightDecay
+      case "--encoder": o.encoder = try value()
+      case "--codes": o.codes = try value().split(separator: ",").map(String.init)
+      case "--features": o.features = try value()
+      case "--features-from":
+        let v = try value()
+        guard v == "host-logmel" else { throw TrainProtocolError("--features-from: only host-logmel") }
+      case "--batch": o.batch = Int(try value()) ?? o.batch
+      case "--val": o.val = Int(try value()) ?? o.val
+      case "--val-names": o.valNames = try value().split(separator: ",").map(String.init)
+      case "--amortized": o.amortized = true
+      case "--train-only": o.trainOnly = try value().split(separator: ",").map(String.init)
+      case "--u-weight": o.uWeight = Float(try value()) ?? o.uWeight
+      case "--prior": o.prior = Float(try value()) ?? o.prior
+      case "--augment": o.augment = true
+      case "--no-aug-noise": o.augNoise = false
+      case "--audio-loss": o.audioLoss = true
+      case "--code-weight": o.codeWeight = Float(try value()) ?? o.codeWeight
+      case "--feat-stats": o.featStats = try value()
+      case "--aux-features": o.auxFeatures = try value()
+      case "--row-extra": o.rowExtra = try value()
+      case "--low-weight": o.lowWeight = Float(try value()) ?? o.lowWeight
+      case "--feat-window": o.featWindow = Int(try value()) ?? o.featWindow
+      case "--feat-hop": o.featHop = Int(try value()) ?? o.featHop
+      case "--feat-bands": o.featBands = Int(try value()) ?? o.featBands
+      case "--feat-seconds": o.featSeconds = Float(try value()) ?? o.featSeconds
       default: throw TrainProtocolError("unknown train-dataset option \(a)")
       }
       i += 1
     }
-    guard ["refine", "pretrain", "audio", "render"].contains(o.stage) else {
-      throw TrainProtocolError("--stage must be refine, pretrain, audio or render")
+    guard ["refine", "pretrain", "audio", "render", "encode"].contains(o.stage) else {
+      throw TrainProtocolError("--stage must be refine, pretrain, audio, render or encode")
+    }
+    if o.amortized {
+      guard o.stage == "encode", o.encoder != nil, o.rows != nil, o.codes.isEmpty else {
+        throw TrainProtocolError("--amortized needs --stage encode, --encoder and --rows (and no --codes: the encoder makes them)")
+      }
+    } else if o.stage == "encode" {
+      guard o.encoder != nil, o.initFrom != nil, !o.codes.isEmpty else {
+        throw TrainProtocolError("--stage encode requires --encoder, --codes and --init-from (the trained voice)")
+      }
+    }
+    if o.audioLoss {
+      guard o.stage == "encode", !o.amortized, o.loss == "metric" else {
+        throw TrainProtocolError("--audio-loss needs --stage encode with a frozen voice (no --amortized) and --loss metric")
+      }
+    }
+    if o.stage == "encode" {
+      let dirs = o.dataset.split(separator: ",").count
+      guard o.codes.isEmpty || o.codes.count == dirs else {
+        throw TrainProtocolError("--codes needs one file per --dataset directory (\(dirs))")
+      }
+      guard o.features == nil || !o.augment else {
+        throw TrainProtocolError("--augment needs audio; it cannot be used with --features")
+      }
+    }
+    if o.codeAnchor > 0, o.stage != "pretrain" || o.zRows == nil {
+      throw TrainProtocolError("--code-anchor needs --stage pretrain and --z-rows (the anchor codes)")
+    }
+    if o.freezeCodeFrom != nil, o.zRows == nil {
+      throw TrainProtocolError("--freeze-code-from needs --z-rows (the frozen columns' values)")
+    }
+    if o.fitCodes {
+      guard o.stage == "audio", o.initFrom != nil else {
+        throw TrainProtocolError("--fit-codes needs --stage audio and --init-from (the trained voice)")
+      }
     }
     if o.stage == "render" {
       guard !o.patch.isEmpty, !o.jobDir.isEmpty, o.zRows != nil, o.initFrom != nil else {
@@ -232,6 +372,37 @@ struct DatasetRows {
   }
 }
 
+// MARK: - Codes file
+
+/// `{"names": [...], "codes": [[...], ...], "dim": D, "table": NAME}`: export/<table>.json,
+/// renders/labels.json and export/encoded.json share it (`--codes` reads any of them).
+enum DatasetCodes {
+  static func write(_ url: URL, names: [String], codes: [[Float]], table: String,
+                    extra: [String: Any] = [:]) throws {
+    var d: [String: Any] = [
+      "names": names, "codes": codes.map { $0.map(Double.init) }, "dim": codes.first?.count ?? 0,
+      "table": table,
+    ]
+    for (k, v) in extra { d[k] = v }
+    try JSONSerialization.data(withJSONObject: d, options: [.prettyPrinted]).write(to: url)
+  }
+
+  static func load(_ path: String) throws -> (names: [String], codes: [[Float]], dim: Int) {
+    let j = try JSONSerialization.jsonObject(with: Data(contentsOf: URL(fileURLWithPath: path)))
+    guard let d = j as? [String: Any], let n = d["names"] as? [String],
+      let c = d["codes"] as? [[NSNumber]]
+    else { throw TrainProtocolError("codes file \(path): expected {names, codes, dim}") }
+    let codes = c.map { $0.map(\.floatValue) }
+    return (n, codes, (d["dim"] as? NSNumber)?.intValue ?? codes.first?.count ?? 0)
+  }
+}
+
+/// `{"shape": [...], "data": [...]}`, the @file tensor format.
+func writeTensorJSON(_ shape: [Int], _ data: [Float], to url: URL) throws {
+  let d: [String: Any] = ["shape": shape, "data": data.map(Double.init)]
+  try JSONSerialization.data(withJSONObject: d).write(to: url)
+}
+
 // MARK: - Leaves and optimiser state
 
 /// Trainer-owned learnable tensors, by name ("w:<tensor>", "z:<table>", "row:<param-row>").
@@ -263,14 +434,16 @@ struct AdamMoments {
   var v: [String: [Float]] = [:]
   var t = 0
 
+  /// `clip`: per-leaf gradient L2-norm ceiling (0: off; non-finite entries count as 0).
+  /// `weightDecay`: decoupled (AdamW) decay, x ← x − lr·wd·x.
   mutating func step(_ store: LeafStore, names: [String], grads: [String: [Float]], lr: Float,
-                     clip: Float = 0) {
+                     clip: Float = 0, weightDecay: Float = 0) {
     t += 1
     let b1: Float = 0.9, b2: Float = 0.999, eps: Float = 1e-8
     let c1 = 1 - Foundation.pow(b1, Float(t)), c2 = 1 - Foundation.pow(b2, Float(t))
     for name in names {
       guard let g0 = grads[name], let x = store.leaves[name]?.getData() else { continue }
-      var g = g0
+      var g = g0.map { $0.isFinite ? $0 : 0 }
       if clip > 0 {
         let norm = g.reduce(Float(0)) { $0 + $1 * $1 }.squareRoot()
         if norm > clip { g = g.map { $0 * clip / norm } }
@@ -279,10 +452,10 @@ struct AdamMoments {
       var vv = v[name] ?? [Float](repeating: 0, count: g.count)
       var y = x
       for i in 0..<g.count {
-        let gi = g[i].isFinite ? g[i] : 0
+        let gi = g[i]
         mm[i] = b1 * mm[i] + (1 - b1) * gi
         vv[i] = b2 * vv[i] + (1 - b2) * gi * gi
-        y[i] = x[i] - lr * (mm[i] / c1) / ((vv[i] / c2).squareRoot() + eps)
+        y[i] = x[i] - lr * (mm[i] / c1) / ((vv[i] / c2).squareRoot() + eps) - lr * weightDecay * x[i]
       }
       m[name] = mm
       v[name] = vv
@@ -348,6 +521,16 @@ enum DatasetCheckpoint {
 // MARK: - Trainer
 
 final class DatasetTrainer {
+  /// The voice's run-invariant frontier (e.g. noise through fixed filters), rendered once and read
+  /// back every step instead of re-rendered (`RunInvariantCache`). DGEN_NO_INVARIANT_CACHE=1 off.
+  let invariantCache = RunInvariantCache()
+  let cacheInvariant = ProcessInfo.processInfo.environment["DGEN_NO_INVARIANT_CACHE"] != "1"
+  /// Builds a voice graph, substituting its cached run-invariant frontier.
+  func buildVoice<T>(_ build: () throws -> T) throws -> T {
+    guard cacheInvariant else { return try build() }
+    return try invariantCache.build(frames: o.frames, frameIndex: playhead, build)
+  }
+
   let o: TrainDatasetOptions
   let run: URL
   let names: [String]
@@ -355,11 +538,19 @@ final class DatasetTrainer {
   let sampleRate: Float
   let nodes: [ASTNode]
   let patchDir: URL
+  /// Row ranges of each --dataset directory (encode: several sources).
+  var groups: [Range<Int>] = []
+  /// The --encoder patch (encode), and state EncoderTrainer.swift keeps.
+  var encoderNodes: [ASTNode] = []
+  var encoderDir: URL? = nil
+  var enc = EncoderState()
   let store = LeafStore()
   var adam = AdamMoments()
   var startStep = 0
   var zPreset: [Float]? = nil
   var rng: SplitMix64
+  /// True only while a pretrain step builds its graph: --code-noise applies then.
+  var codeNoiseOn = false
 
   // discovered on the plan evaluation
   var layouts: [String: RowLayout] = [:]
@@ -378,7 +569,7 @@ final class DatasetTrainer {
       try FileManager.default.createDirectory(
         at: run.appendingPathComponent(sub), withIntermediateDirectories: true)
     }
-    if let zPath = o.zRows {
+    if let zPath = o.zRows, o.stage == "render" {
       let j = try JSONSerialization.jsonObject(with: Data(contentsOf: URL(fileURLWithPath: zPath))) as! [String: Any]
       let z = (j["z"] as? [[NSNumber]] ?? []).map { $0.map(\.floatValue) }
       names = j["names"] as? [String] ?? z.indices.map { String(format: "z%03d", $0) }
@@ -386,10 +577,34 @@ final class DatasetTrainer {
       targets = names.map { _ in [Float](repeating: 0, count: o.frames) }
       sampleRate = (j["sample_rate"] as? NSNumber)?.floatValue ?? 44100
     } else {
-      let (t, sr) = try DatasetTargets.load(dir: o.dataset, frames: o.frames)
-      names = t.map(\.name)
-      targets = t.map(\.samples)
-      sampleRate = sr
+      var allNames: [String] = [], allTargets: [[Float]] = [], rate: Float? = nil
+      let dirs = o.stage == "encode" ? o.dataset.split(separator: ",").map(String.init) : [o.dataset]
+      for dir in dirs {
+        let (t, sr) = try DatasetTargets.load(dir: dir, frames: o.frames)
+        if let rate, rate != sr { throw TrainProtocolError("datasets mix sample rates (\(rate) vs \(sr) in \(dir))") }
+        rate = sr
+        groups.append(allNames.count..<(allNames.count + t.count))
+        allNames += t.map(\.name)
+        allTargets += t.map(\.samples)
+      }
+      names = allNames
+      targets = allTargets
+      sampleRate = rate!
+      if let zPath = o.zRows, o.fitCodes || o.codeAnchor > 0 || o.freezeCodeFrom != nil {
+        let j = try JSONSerialization.jsonObject(with: Data(contentsOf: URL(fileURLWithPath: zPath))) as! [String: Any]
+        let byName = Dictionary(zip(j["names"] as? [String] ?? [],
+                                    (j["z"] as? [[NSNumber]] ?? []).map { $0.map(\.floatValue) }),
+                                uniquingKeysWith: { a, _ in a })
+        zPreset = try names.flatMap { n -> [Float] in
+          guard let z = byName[n] else { throw TrainProtocolError("--z-rows has no code for target \(n)") }
+          return z
+        }
+      }
+    }
+    if let e = o.encoder {
+      let url = URL(fileURLWithPath: e)
+      encoderDir = url.deletingLastPathComponent()
+      encoderNodes = try parseSource(try String(contentsOf: url, encoding: .utf8))
     }
     let patchURL = URL(fileURLWithPath: o.patch)
     patchDir = patchURL.deletingLastPathComponent()
@@ -402,7 +617,7 @@ final class DatasetTrainer {
       throw TrainProtocolError("inlets outside the excitation convention: \(driven.undriven.joined(separator: ", "))")
     }
     nodes = driven.nodes
-    for (n, x) in zip(names, targets) where o.stage != "render" {
+    for (n, x) in zip(names, targets) where o.stage != "render" && o.stage != "encode" {
       try MiniWav.write(url: run.appendingPathComponent("targets/\(n).wav"), samples: x,
                         sampleRate: Int(sampleRate))
     }
@@ -447,7 +662,8 @@ final class DatasetTrainer {
     case "zeros": return [Float](repeating: 0, count: n)
     case "small": return gaussian(n, 0.01)
     default:
-      let fanIn = info.shape.count > 1 ? info.shape[0] : 1
+      // fan-in: every axis but the last (a [k, cin, cout] kernel reads k·cin inputs)
+      let fanIn = info.shape.count > 1 ? info.shape.dropLast().reduce(1, *) : 1
       let fanOut = info.shape.last ?? 1
       let a = (6 / Float(fanIn + fanOut)).squareRoot()
       return (0..<n).map { _ in (rng.uniform() * 2 - 1) * a }
@@ -494,21 +710,33 @@ final class DatasetTrainer {
   // MARK: evaluation
 
   /// Evaluates the training patch with a dataset context; returns the evaluator.
+  /// `rows`/`latent` override the row count and the code rows (the encoder's output, or fixed
+  /// codes); by default the rows are the targets and the codes the trainer's `z:` leaf.
   @discardableResult
   func evaluate(mode: DatasetContext.RowMode, latch: DatasetContext.LatchMode = .identity,
-                pathSelect: Tensor? = nil) throws
+                pathSelect: Tensor? = nil, rows: Int? = nil,
+                latent: ((String, Int) throws -> Tensor)? = nil) throws
     -> (LispEvaluator, DatasetContext)
   {
     // pathSelect [M, N]: M extra rows decoded at S @ codes (the code rows come first)
     let M = pathSelect?.shape[0] ?? 0
     let ctx = DatasetContext(
-      rows: N + M, frames: o.frames, sampleRate: sampleRate, rowMode: mode,
+      rows: rows ?? (N + M), frames: o.frames, sampleRate: sampleRate, rowMode: mode,
       learnable: { [self] name, shape, fileData, initKind in
         let info = LearnableTensorInfo(name: name, shape: shape, file: nil, initKind: initKind)
         return store.leaf("w:" + name, shape) { initData(info, fileData: fileData) }
       },
       latentRows: { [self] name, dim in
-        let z = store.leaf("z:" + name, [N, dim]) { initCodes(dim) }
+        if let latent { return try latent(name, dim) }
+        if let zPreset, zPreset.count != N * dim {
+          throw TrainProtocolError("--z-rows: \(zPreset.count / max(N, 1)) values per row; latent-table \(name) has @dim \(dim)")
+        }
+        var z = store.leaf("z:" + name, [N, dim]) { zPreset ?? initCodes(dim) }
+        if codeNoiseOn, o.codeNoise > 0 {
+          let k = min(o.freezeCodeFrom ?? dim, dim)
+          let noise = (0..<(N * dim)).map { i in i % dim < k ? rng.gaussian() * o.codeNoise : 0 }
+          z = z + Tensor(noise).reshape([N, dim])
+        }
         guard let S = pathSelect else { return z }
         return z.pad([(0, M), (0, 0)]) + S.matmul(z).pad([(N, 0), (0, 0)])
       })
@@ -524,10 +752,11 @@ final class DatasetTrainer {
     return (ev, ctx)
   }
 
-  func output(_ ev: LispEvaluator) throws -> SignalTensor {
+  func output(_ ev: LispEvaluator, rows: Int? = nil) throws -> SignalTensor {
+    let n = rows ?? N
     guard let out = (ev.tensorOutputs.first { $0.channel == 0 } ?? ev.tensorOutputs.first)?.signal
     else { throw TrainProtocolError("patch has no row-out output; end the voice with (out (row-out y) 1)") }
-    guard out.shape == [N] else { throw TrainProtocolError("row-out gave \(out.shape), expected [\(N)]") }
+    guard out.shape == [n] else { throw TrainProtocolError("row-out gave \(out.shape), expected [\(n)]") }
     return out
   }
 
@@ -537,14 +766,18 @@ final class DatasetTrainer {
     return Tensor(data).reshape([o.frames, N])
   }()
 
+  let profiling = ProcessInfo.processInfo.environment["DGENLISP_TRAIN_PROFILE"] == "1"
+
+  /// The frame number as an integer-valued signal: the row index into per-frame tables.
+  func playhead() -> Signal { floor(seconds() * sampleRate + 0.5) }
+
   func seconds() -> Signal {
     let n = Float(o.frames)
     return Signal.phasor(Tensor([sampleRate / (2 * n)])).sum() * (2 * n / sampleRate)
   }
 
   func audioLoss(_ y: SignalTensor) -> Signal {
-    let playhead = floor(seconds() * sampleRate + 0.5)
-    let t = targetTable.sampleRow(playhead)
+    let t = targetTable.sampleRow(playhead())
     var loss = Signal.constant(0)
     let ws = o.windows.filter { $0 <= o.frames }
     let scale = 1 / Float(max(ws.count, 1))
@@ -590,6 +823,13 @@ final class DatasetTrainer {
   func grads(_ names: [String]) -> [String: [Float]] {
     var g: [String: [Float]] = [:]
     for n in names { if let d = store.leaves[n]?.grad?.getData() { g[n] = d } }
+    if let k = o.freezeCodeFrom {
+      for n in names where n.hasPrefix("z:") {
+        guard var d = g[n], let dim = store.leaves[n]?.shape.last, k < dim else { continue }
+        for r in 0..<(d.count / dim) { for c in k..<dim { d[r * dim + c] = 0 } }
+        g[n] = d
+      }
+    }
     return g
   }
 
@@ -605,10 +845,10 @@ final class DatasetTrainer {
       let ck = url.pathExtension == "json" ? url : DatasetCheckpoint.latest(in: url)
       guard let ck else { throw TrainProtocolError("--init-from \(initFrom): no checkpoint") }
       store.preset = try DatasetCheckpoint.load(ck).leaves
-      if let zPreset {
-        // render: the code table is the requested z rows, whatever the run trained
+      if zPreset != nil || o.fitCodes {
+        // render / fit-codes: the code table is new (the requested z rows, or one fresh row
+        // per target), whatever the run trained -- latentRows initialises the leaf
         for key in store.preset.keys where key.hasPrefix("z:") { store.preset[key] = nil }
-        store.preset["z:codes"] = zPreset
       }
       log("[train-dataset] init from \(ck.path) (\(store.preset.count) leaves)")
     }
@@ -637,8 +877,15 @@ final class DatasetTrainer {
       }
       rowsU["row"] = try rows.uMatrix(L, names: names)
     }
-    let mode: DatasetContext.RowMode = .decode
-    let (ev, _) = try evaluate(mode: mode)
+    let ev: LispEvaluator
+    if o.stage == "encode" {
+      // decoder-only discovery on one row of zero codes: no code leaves, no voice graph
+      ev = try evaluate(mode: .capture, rows: 1, latent: { _, dim in
+        Tensor([Float](repeating: 0, count: dim)).reshape([1, dim])
+      }).0
+    } else {
+      ev = try evaluate(mode: .decode).0
+    }
     learnables = ev.learnableTensors
     tables = ev.latentTables
     paramRows = ev.paramRows
@@ -649,8 +896,10 @@ final class DatasetTrainer {
     }
     // Persistent data tensors must exist before the first step: one created mid-step registers
     // in a different order on later steps, shifting memory offsets and missing the kernel cache.
-    _ = targetTable
-    _ = gTable
+    if o.stage != "encode" {
+      _ = targetTable
+      _ = gTable
+    }
     if o.path > 0 { _ = pathSelect.tensor }
     log("[train-dataset] \(N) targets @ \(Int(sampleRate)) Hz, \(o.frames) frames; layouts \(layouts.keys.sorted()); learnable \(learnables.map { "\($0.name)\($0.shape)" }); tables \(tables.map { "\($0.name)[\($0.dim)]" }); rows \(paramRows.map(\.name))")
     LazyGraphContext.current.clearComputationGraph()
@@ -673,6 +922,7 @@ final class DatasetTrainer {
     case "render": return try finish()
     case "refine": return try refine()
     case "pretrain": return try pretrain()
+    case "encode": return try encode()
     default: return try audio()
     }
   }
@@ -705,7 +955,8 @@ final class DatasetTrainer {
         throw TrainProtocolError("loss diverged at step \(step) (audio \(la), static \(ls))")
       }
       let names = trainable()
-      adam.step(store, names: names, grads: grads(names), lr: lrAt(step))
+      adam.step(store, names: names, grads: grads(names), lr: lrAt(step), clip: o.clip,
+                weightDecay: o.weightDecay)
       let dt = Date().timeIntervalSince(ts)
       csv += "\(step),\(la),\(ls),\(dt)\n"
       if step % o.reportEvery == 0 || step == o.steps - 1 {
@@ -775,6 +1026,8 @@ final class DatasetTrainer {
       LazyGraphContext.current.clearComputationGraph()
       var S: Tensor? = nil
       if o.path > 0 { S = pathSelect.updated(self) }
+      codeNoiseOn = true
+      defer { codeNoiseOn = false }
       let (_, ctx) = try evaluate(mode: .capture, pathSelect: S)
       guard let uAll = ctx.captured[pr.name] else { throw TrainProtocolError("param-row was not reached") }
       let P = uAll.shape[1]
@@ -786,9 +1039,14 @@ final class DatasetTrainer {
         let d = mid - S.matmul(u)
         reg = reg + (d * d).sum() * (o.path / Float(M * P))
       }
-      for t in tables where o.codeL2 > 0 {
-        let z = store.leaves["z:" + t.name]!
-        reg = reg + (z * z).sum() * (o.codeL2 / Float(N * t.dim))
+      for t in tables where o.codeL2 > 0 || o.codeAnchor > 0 {
+        guard let z = store.leaves["z:" + t.name] else { continue }
+        if o.codeAnchor > 0, let zPreset {
+          let d = z - Tensor(zPreset).reshape([N, t.dim])
+          reg = reg + (d * d).sum() * (o.codeAnchor / Float(N * t.dim))
+        } else {
+          reg = reg + (z * z).sum() * (o.codeL2 / Float(N * t.dim))
+        }
       }
       let v = try staticToSignal(reg, frames: staticFrames).backward(frames: staticFrames).reduce(0, +)
       return (0, v)
@@ -801,7 +1059,9 @@ final class DatasetTrainer {
     guard let pr = paramRows.first else { throw TrainProtocolError("audio needs a param-row") }
     try loop({ step in
       try latchStep(step, rowMode: .decode, row: pr.name, anchorOn: nil)
-    }, trainable: { store.order.filter { !$0.hasPrefix("row:") } })
+    }, trainable: { [o] in
+      store.order.filter { o.fitCodes ? $0.hasPrefix("z:") : !$0.hasPrefix("row:") }
+    })
     try export()
     return try finish()
   }
@@ -847,6 +1107,7 @@ final class DatasetTrainer {
     throws -> (Float, Float)
   {
     // 1
+    let tPhase0 = Date()
     LazyGraphContext.current.clearComputationGraph()
     if ProcessInfo.processInfo.environment["DGENLISP_LIVE_TENSORS"] != nil {
       let live = LazyGraphContext.current.liveTensorSummary
@@ -869,23 +1130,37 @@ final class DatasetTrainer {
     }
     let te = Date()
     var la: Float
+    var tFwd = 0.0, tLoss = 0.0
     if o.loss == "metric" {
       // forward render, CPU loss + dL/dy, then backward of Σ y·g in a fresh voice graph
       let flat = try output(ev).realize(frames: o.frames)
+      tFwd = Date().timeIntervalSince(te)
+      let tl = Date()
       let (loss, g) = metricGradient(flat)
+      tLoss = Date().timeIntervalSince(tl)
       la = loss
       LazyGraphContext.current.clearComputationGraph()
       for leaf in latchLeaves { leaf.grad = nil }
       gTable.updateDataLazily(g)
       let (ev2, _) = try evaluate(mode: rowMode, latch: .leaves(latchLeaves))
-      let playhead = floor(seconds() * sampleRate + 0.5)
-      _ = try (try output(ev2) * gTable.sampleRow(playhead)).sum().backward(frames: o.frames)
+      _ = try (try output(ev2) * gTable.sampleRow(playhead())).sum().backward(frames: o.frames)
     } else {
       la = try audioLoss(try output(ev)).backward(frames: o.frames).reduce(0, +)
     }
     DGenConfig.kernelOutputPath = nil
     logTiming(String(format: "voice backward %.0f ms wall", Date().timeIntervalSince(te) * 1000))
+    if profiling && step == 2 { LazyGraphContext.current.profileGPU(frames: o.frames) }   // per-kernel GPU times of the backward runtime
+    let tVoice = Date().timeIntervalSince(te), tStatic1 = te.timeIntervalSince(tPhase0)
+    let tg = Date()
     let grads = latchLeaves.map { l in l.grad?.getData() ?? [Float](repeating: 0, count: l.shape.reduce(1, *)) }
+    let tGrads = Date().timeIntervalSince(tg)
+    let tp3 = Date()
+    defer {
+      if timing {
+        log(String(format: "[phase] static capture + voice graph build %.0f ms | forward render %.0f ms | cpu loss %.0f ms | backward (2nd render + reverse) %.0f ms | grad readback %.0f ms | static backward %.0f ms",
+                   tStatic1 * 1000, tFwd * 1000, tLoss * 1000, (tVoice - tFwd - tLoss) * 1000, tGrads * 1000, Date().timeIntervalSince(tp3) * 1000))
+      }
+    }
     // 3
     LazyGraphContext.current.clearComputationGraph()
     for (g, v) in zip(latchGrads, grads) { g.updateDataLazily(v) }
@@ -899,7 +1174,7 @@ final class DatasetTrainer {
       if let u, let a = anchorLoss(u, row: row) { reg = reg + a * o.anchor }
     }
     for t in tables where o.codeL2 > 0 && anchorOn == nil {
-      let z = store.leaves["z:" + t.name]!
+      guard let z = store.leaves["z:" + t.name] else { continue }
       reg = reg + (z * z).sum() * (o.codeL2 / Float(N * t.dim))
     }
     let staticFrames = 1
@@ -913,28 +1188,36 @@ final class DatasetTrainer {
   /// CPU metric loss of a [frames × N] interleaved render: (mean loss, time-major gradient of
   /// the mean).
   var lastMetric: (band: [Double], mr: [Double]) = ([], [])
+  /// Above this many targets metricGradient computes target spectra per call instead of caching all.
+  static let metricCacheLimit = 2048
   /// Each target's loss spectra, computed once (the targets do not change between steps).
   lazy var metricTargets: [MetricLoss.Target] = {
     var out = [MetricLoss.Target?](repeating: nil, count: N)
     let lock = NSLock()
     DispatchQueue.concurrentPerform(iterations: N) { r in
-      let t = MetricLoss.target(targets[r].map(Double.init), windows: o.windows)
+      let t = MetricLoss.target(targets[r].map(Double.init), windows: o.windows,
+                                waveCutoff: o.waveWeight > 0 ? Double(o.waveCutoff) : nil, sampleRate: Double(sampleRate))
       lock.lock(); out[r] = t; lock.unlock()
     }
     return out.map { $0! }
   }()
 
-  func metricGradient(_ flat: [Float]) -> (Float, [Float]) {
+  /// `rows`: the target of each rendered column (default: column r is target r).
+  func metricGradient(_ flat: [Float], rows: [Int]? = nil) -> (Float, [Float]) {
+    let rows = rows ?? Array(0..<N)
+    let N = rows.count
     let ml = MetricLoss(windows: o.windows, bandWeight: o.bandWeight, mrWeight: o.mrWeight,
                         waveWeight: o.waveWeight, waveCutoff: o.waveCutoff, sampleRate: Double(sampleRate),
                         hfWeight: o.hfWeight, hfFrom: o.hfFrom)
     var results = [MetricLoss.Result?](repeating: nil, count: N)
     let lock = NSLock()
-    let cached = metricTargets
+    // Large datasets: computing every target's spectra up front costs a few MB per target (~25 GB at
+    // 6.6k targets), so each minibatch computes its own targets' spectra instead of using the cache.
+    let cached: [MetricLoss.Target]? = self.N <= Self.metricCacheLimit ? metricTargets : nil
     DispatchQueue.concurrentPerform(iterations: N) { r in
       var y = [Float](repeating: 0, count: o.frames)
       for f in 0..<o.frames { y[f] = flat[f * N + r] }
-      let res = ml.lossAndGradient(y, targets[r], target: cached[r])
+      let res = ml.lossAndGradient(y, targets[rows[r]], target: cached?[rows[r]])
       lock.lock(); results[r] = res; lock.unlock()
     }
     var g = [Float](repeating: 0, count: o.frames * N)
@@ -988,21 +1271,12 @@ final class DatasetTrainer {
 
   func export() throws {
     let ex = run.appendingPathComponent("export")
-    func writeTensor(_ shape: [Int], _ data: [Float], to url: URL) throws {
-      let d: [String: Any] = ["shape": shape, "data": data.map(Double.init)]
-      try JSONSerialization.data(withJSONObject: d).write(to: url)
-    }
-    for info in learnables {
-      guard let t = store.leaves["w:" + info.name] else { continue }
-      let file = info.file.map { URL(fileURLWithPath: $0).lastPathComponent } ?? "\(info.name).json"
-      try writeTensor(info.shape, t.getData() ?? [], to: ex.appendingPathComponent(file))
-    }
+    try exportLearnables(learnables)
     for t in tables {
       guard let z = store.leaves["z:" + t.name]?.getData() else { continue }
-      let codes = (0..<N).map { r in (0..<t.dim).map { Double(z[r * t.dim + $0]) } }
-      let d: [String: Any] = ["names": names, "codes": codes, "dim": t.dim]
-      try JSONSerialization.data(withJSONObject: d, options: [.prettyPrinted]).write(
-        to: ex.appendingPathComponent("\(t.name).json"))
+      try DatasetCodes.write(ex.appendingPathComponent("\(t.name).json"), names: names,
+                             codes: (0..<N).map { Array(z[($0 * t.dim)..<(($0 + 1) * t.dim)]) },
+                             table: t.name)
     }
     for (name, L) in layouts {
       let segs = L.segments.map {
@@ -1015,6 +1289,16 @@ final class DatasetTrainer {
     }
     if let (L, _, u) = try currentRows() {
       try DatasetRows.write(ex.appendingPathComponent("rows.json"), layout: L, names: names, u: u)
+    }
+  }
+
+  /// Writes each learnable leaf to export/ under its @file name (else NAME.json).
+  func exportLearnables(_ infos: [LearnableTensorInfo]) throws {
+    let ex = run.appendingPathComponent("export")
+    for info in infos {
+      guard let t = store.leaves["w:" + info.name] else { continue }
+      let file = info.file.map { URL(fileURLWithPath: $0).lastPathComponent } ?? "\(info.name).json"
+      try writeTensorJSON(info.shape, t.getData() ?? [], to: ex.appendingPathComponent(file))
     }
   }
 
@@ -1039,6 +1323,12 @@ final class DatasetTrainer {
       let w = MetricLoss.lowWave(y.map(Double.init), targets[r].map(Double.init), cutoff: o.waveCutoff,
                                  sampleRate: Double(sampleRate)).0
       lowSNR[r] = -10 * Foundation.log10(max(w, 1e-12))
+    }
+    if o.stage == "render", let t = tables.first, let z = store.leaves["z:" + t.name]?.getData() {
+      // labels beside the WAVs, in the codes.json format (`--codes` for an encode stage)
+      try DatasetCodes.write(run.appendingPathComponent("renders/labels.json"), names: names,
+                             codes: (0..<N).map { Array(z[($0 * t.dim)..<(($0 + 1) * t.dim)]) },
+                             table: t.name)
     }
     for (r, n) in names.enumerated() {
       try FloatWav.write(run.appendingPathComponent("renders/\(n).wav"), renders[r], sampleRate: Int(sampleRate))
@@ -1090,6 +1380,10 @@ struct SplitMix64 {
     return z ^ (z >> 31)
   }
   mutating func uniform() -> Float { Float(next() >> 40) / Float(1 << 24) }
+  /// Fisher–Yates.
+  mutating func shuffle<T>(_ a: inout [T]) {
+    for i in stride(from: a.count - 1, to: 0, by: -1) { a.swapAt(i, Int(next() % UInt64(i + 1))) }
+  }
   mutating func gaussian() -> Float {
     let u1 = max(uniform(), 1e-7), u2 = uniform()
     return (-2 * Foundation.log(u1)).squareRoot() * Foundation.cos(2 * Float.pi * u2)

@@ -4,6 +4,7 @@
 // (eigenvectors of YᵀY); poles = eig(pinv(V1) V2). Amplitudes and phases by
 // a joint real least-squares fit over all retained poles.
 
+import DGenAnalysisC
 import Foundation
 
 public struct DampedSinusoid: Codable {
@@ -37,18 +38,11 @@ public enum MatrixPencil {
         let rows = N - L
         let cols = L + 1
         // C = YᵀY with Y[i][j] = x[i + j]
-        var C = [[Double]](repeating: [Double](repeating: 0, count: cols), count: cols)
-        x.withUnsafeBufferPointer { xp in
-            for a in 0..<cols {
-                for b in a..<cols {
-                    var s = 0.0
-                    for i in 0..<rows { s += xp[i + a] * xp[i + b] }
-                    C[a][b] = s
-                    C[b][a] = s
-                }
-            }
-        }
-        let (vals, vecs) = LinAlg.symmetricEigen(C)
+        var Cf = [Double](repeating: 0, count: cols * cols)
+        x.withUnsafeBufferPointer { xp in Cf.withUnsafeMutableBufferPointer { cp in
+            dgen_hankel_gram(xp.baseAddress, Int32(rows), Int32(cols), cp.baseAddress)
+        }}
+        let (vals, vecs) = LinAlg.symmetricEigen(flat: Cf, n: cols)
         let sv = vals.map { sqrt(max($0, 0)) }
         let smax = sv.first ?? 0
         guard smax > 0 else { return Result(modes: [], singularValues: sv, order: 0) }
@@ -106,13 +100,20 @@ public enum MatrixPencil {
         let N = x.count
         let nc = 2 * osc.count + real.count
         if nc == 0 { return [] }
+        let ridge = 1e-10 * x.reduce(0) { $0 + $1 * $1 }
+        if real.isEmpty {
+            let c = dampedFit(x, osc: osc, ridge: ridge, residual: false).coef
+            return (0..<osc.count).map { (c[2 * $0], c[2 * $0 + 1]) }
+        }
         var A = [[Double]](repeating: [Double](repeating: 0, count: nc), count: N)
+        var cb = [Double](repeating: 0, count: N), sb = cb
         for (k, o) in osc.enumerated() {
-            let lr = log(o.r)
+            cb.withUnsafeMutableBufferPointer { C in sb.withUnsafeMutableBufferPointer { S in
+                dgen_damped_columns(log(o.r), o.w, Int32(N), C.baseAddress, S.baseAddress)
+            }}
             for n in 0..<N {
-                let e = exp(lr * Double(n))
-                A[n][2 * k] = e * cos(o.w * Double(n))
-                A[n][2 * k + 1] = e * sin(o.w * Double(n))
+                A[n][2 * k] = cb[n]
+                A[n][2 * k + 1] = sb[n]
             }
         }
         for (j, p) in real.enumerated() {
@@ -123,8 +124,24 @@ public enum MatrixPencil {
                 if abs(v) > 1e6 { v = 1e6 * (v > 0 ? 1 : -1) }
             }
         }
-        let c = LinAlg.leastSquares(A, x, ridge: 1e-10 * x.reduce(0) { $0 + $1 * $1 })
+        let c = LinAlg.leastSquares(A, x, ridge: ridge)
         return (0..<osc.count).map { (c[2 * $0], c[2 * $0 + 1]) }
+    }
+
+    /// Joint (cos, sin) amplitudes of damped sinusoids on x by least squares (basis built once, vForce
+    /// + LAPACK), and optionally the residual x − fit.
+    static func dampedFit(_ x: [Double], osc: [(r: Double, w: Double)], ridge: Double, residual: Bool)
+        -> (coef: [Double], r: [Double])
+    {
+        let lr = osc.map { log($0.r) }, w = osc.map(\.w)
+        var coef = [Double](repeating: 0, count: 2 * osc.count)
+        var r = residual ? [Double](repeating: 0, count: x.count) : []
+        let info = x.withUnsafeBufferPointer { X in coef.withUnsafeMutableBufferPointer { C in r.withUnsafeMutableBufferPointer { R in
+            dgen_damped_fit(X.baseAddress, Int32(x.count), lr, w, Int32(osc.count), ridge, C.baseAddress,
+                            residual ? R.baseAddress : nil)
+        }}}
+        assert(info == 0, "dgen_damped_fit failed (\(info))")
+        return (coef, r)
     }
 
     /// Stabilisation: modes of the full-segment estimate that reappear (|ΔF|
@@ -169,25 +186,12 @@ public enum MatrixPencil {
             }
             return out
         }
-        func residual(_ p: [Double]) -> [Double] {
-            let ps = poles(p)
-            let amps = fitAmplitudes(x, osc: ps)
-            var r = x
-            for (j, o) in ps.enumerated() {
-                let (a, b) = amps[j]
-                let lr = log(o.r)
-                for n in 0..<x.count {
-                    let e = exp(lr * Double(n))
-                    r[n] -= e * (a * cos(o.w * Double(n)) + b * sin(o.w * Double(n)))
-                }
-            }
-            return r
-        }
+        let ridge = 1e-10 * x.reduce(0) { $0 + $1 * $1 }
+        func residual(_ p: [Double]) -> [Double] { dampedFit(x, osc: poles(p), ridge: ridge, residual: true).r }
         let fit = LinAlg.levenbergMarquardt(x0: p0, lower: lo, upper: hi, maxIter: 30, residuals: residual)
-        let ps = poles(fit.x)
-        let amps = fitAmplitudes(x, osc: ps)
+        let coef = dampedFit(x, osc: poles(fit.x), ridge: ridge, residual: false).coef
         return (0..<k).map { j in
-            let (a, b) = amps[j]
+            let a = coef[2 * j], b = coef[2 * j + 1]
             return DampedSinusoid(frequency: fit.x[2 * j], decay: exp(fit.x[2 * j + 1]),
                                   amplitude: (a * a + b * b).squareRoot(), phase: atan2(a, b))
         }

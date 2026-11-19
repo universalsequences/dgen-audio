@@ -85,6 +85,23 @@ extension TensorOps {
     return Self(_view: nodeId, graph: graph, shape: indices.shape, requiresGrad: requiresGrad)
   }
 
+  /// Strided sliding windows over the trailing axes (zero-copy im2col view).
+  /// [...batch, n₀, n₁, …] → [...batch, o₀, o₁, …, k₀, k₁, …] with oᵢ = (nᵢ − kᵢ)/sᵢ + 1.
+  /// Stride defaults to the kernel (non-overlapping). Differentiable: the backward
+  /// scatter-adds overlapping windows back into the input.
+  public func pool(kernel: [Int], stride: [Int]? = nil) -> Self {
+    let nodeId = try! graph.graph.pool(self.nodeId, kernelSize: kernel, stride: stride)
+    let s = stride ?? kernel
+    let batch = shape.count - kernel.count
+    var outShape: [Int] = Array(shape.prefix(batch))
+    for i in 0..<kernel.count {
+      let n: Int = shape[batch + i]
+      outShape.append((n - kernel[i]) / s[i] + 1)
+    }
+    outShape.append(contentsOf: kernel)
+    return Self(_view: nodeId, graph: graph, shape: outShape, requiresGrad: requiresGrad)
+  }
+
   /// Extract sliding windows (im2col) for convolution.
   /// Transforms [H, W] -> [outH, outW, kH, kW].
   public func windows(_ kernelShape: Shape) -> Self {
@@ -98,8 +115,8 @@ extension TensorOps {
     let outH = H - kH + 1
     let outW = W - kW + 1
 
-    let inputTensor = try! graph.graph.getTensor(self.nodeId)
-    let inStrides = inputTensor.strides
+    // asStrided strides address the input's logical row-major layout (see composeTransforms)
+    let inStrides = DGen.Tensor.computeRowMajorStrides(shape)
 
     let outStrides = [
       inStrides[inStrides.count - 2],

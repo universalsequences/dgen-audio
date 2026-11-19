@@ -119,4 +119,13 @@ public enum KickDataset {
                                                                   nan: "nan")
         return try enc.encode(d)
     }
+
+    /// Reads what `encode` writes: non-finite values (e.g. a drop tail that never decays) are
+    /// the strings "inf" / "-inf" / "nan".
+    public static func decode(_ data: Data) throws -> DatasetAnalysis {
+        let dec = JSONDecoder()
+        dec.nonConformingFloatDecodingStrategy = .convertFromString(positiveInfinity: "inf", negativeInfinity: "-inf",
+                                                                    nan: "nan")
+        return try dec.decode(DatasetAnalysis.self, from: data)
+    }
 }

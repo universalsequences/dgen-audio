@@ -33,6 +33,20 @@ enum DeadCodeEliminationPass {
     }
   }
 
+  /// Nodes a graph-side map points at: they stay live regardless of their op or consumers.
+  static func sideMapRoots(_ graph: Graph) -> [NodeID] {
+    var roots: [NodeID] = []
+    roots.append(contentsOf: graph.materializeNodes)
+    roots.append(contentsOf: graph.gradientSideEffects)
+    roots.append(contentsOf: graph.nodeHopRate.values.map { $0.1 })
+    roots.append(contentsOf: graph.nodePositionDep.values)
+    roots.append(contentsOf: graph.tensorGradCells.keys)
+    roots.append(contentsOf: graph.simdOptimizedConv2Ds)
+    roots.append(contentsOf: graph.conv2dMaskCells.keys)
+    if let last = graph.lastForwardNodeId { roots.append(last) }
+    return roots
+  }
+
   /// Deletes unreachable pure scalar nodes in place and returns them so the
   /// caller can restore them once compilation is done: a lazy graph outlives a
   /// single compile, and a value nothing reads today may be consumed by nodes
@@ -51,15 +65,7 @@ enum DeadCodeEliminationPass {
         roots.append(id)
       }
     }
-    // Anything a graph-side map points at stays live regardless of its op.
-    roots.append(contentsOf: graph.materializeNodes)
-    roots.append(contentsOf: graph.gradientSideEffects)
-    roots.append(contentsOf: graph.nodeHopRate.values.map { $0.1 })
-    roots.append(contentsOf: graph.nodePositionDep.values)
-    roots.append(contentsOf: graph.tensorGradCells.keys)
-    roots.append(contentsOf: graph.simdOptimizedConv2Ds)
-    roots.append(contentsOf: graph.conv2dMaskCells.keys)
-    if let last = graph.lastForwardNodeId { roots.append(last) }
+    roots.append(contentsOf: sideMapRoots(graph))
 
     var live = Set<NodeID>()
     var stack = roots

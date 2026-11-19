@@ -22,4 +22,17 @@ final class KickSlotsTests: XCTestCase {
       XCTAssertEqual(got, best, accuracy: 1e-9)
     }
   }
+
+    /// analyze-kicks writes non-finite values (a drop tail that never decays) as "inf"; kick-rows
+    /// must read its own analysis back.
+    func testAnalysisJSONRoundTripsNonFiniteValues() throws {
+        let d = DatasetAnalysis(conventions: [:], options: KickAnalysisOptions(), noiseEdges: [40, 16000],
+                                samples: [], summary: ["inf": .infinity, "ninf": -.infinity, "x": 1.5])
+        let data = try KickDataset.encode(d)
+        XCTAssertTrue(String(decoding: data, as: UTF8.self).contains("\"inf\""))
+        let back = try KickDataset.decode(data)
+        XCTAssertEqual(back.summary["inf"], .infinity)
+        XCTAssertEqual(back.summary["ninf"], -.infinity)
+        XCTAssertEqual(back.summary["x"], 1.5)
+    }
 }

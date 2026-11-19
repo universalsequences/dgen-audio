@@ -1385,7 +1385,7 @@ private func normalizeTensorLoopMetadata(_ block: inout Block, graph: Graph) {
 
 /// Groups non-scalar blocks by tensor shape while preserving special-case execution constraints.
 private func groupRegularTensorBlock(
-  _ block: Block, graph: Graph, ctx: IRContext
+  _ block: Block, graph: Graph, ctx: IRContext, splitAxisReduces: Bool
 ) -> [Block] {
   var grouped: [Block] = []
   var currentBlock = makeTensorGroupingBlock(from: block)
@@ -1491,9 +1491,13 @@ private func groupRegularTensorBlock(
         currentHasNonHopTensor = false
       }
       if shape != currentShape {
-        // Axis reduces and concat-by-padding transitions stay in-region even when shape changes.
+        // Axis reduces and concat-by-padding transitions stay in-region even when shape changes,
+        // unless `splitAxisReduces`: then a reduce starts its own block, so its producer runs
+        // one thread per element instead of one thread per frame looping over every region's
+        // elements (on Metal that loop is uncoalesced and ~10x slower; see
+        // `determineTensorBlocks`).
         if let previousShape = currentShape,
-          isAxisReduceOp(node.op)
+          (isAxisReduceOp(node.op) && !splitAxisReduces)
             || isConcatByPaddingFusionTransition(
               nodeId: nodeId, graph: graph, currentShape: previousShape)
         {
@@ -1733,9 +1737,14 @@ private func determineSequentialBlockParts(
   return determined
 }
 
+/// `splitAxisReduces`: give each axis reduce (sumAxis, …) its own block instead of fusing it
+/// into its producer's. The fused form runs one thread per frame that loops over every region's
+/// elements; split, each region runs one thread per (frame, element). Metal training renders of
+/// a batched voice (per-mode sums over [rows, modes] every frame) run their backward ~1.7x
+/// faster split, at the cost of materializing the pre-reduce tensor.
 func determineTensorBlocks(
   _ blocks: [Block], _ graph: Graph, _ ctx: IRContext,
-  hopBasedNodes: [NodeID: (Int, NodeID)] = [:]
+  hopBasedNodes: [NodeID: (Int, NodeID)] = [:], splitAxisReduces: Bool = false
 ) -> [Block] {
   var determined: [Block] = []
 
@@ -1743,7 +1752,8 @@ func determineTensorBlocks(
     if block.frameOrder == .sequential {
       for (part, peeled) in peelHopTensorRuns(block, graph: graph, hopBasedNodes: hopBasedNodes) {
         if peeled {
-          determined.append(contentsOf: groupRegularTensorBlock(part, graph: graph, ctx: ctx))
+          determined.append(contentsOf: groupRegularTensorBlock(
+            part, graph: graph, ctx: ctx, splitAxisReduces: splitAxisReduces))
         } else {
           determined.append(
             contentsOf: determineSequentialBlockParts(
@@ -1752,7 +1762,8 @@ func determineTensorBlocks(
       }
       continue
     }
-    determined.append(contentsOf: groupRegularTensorBlock(block, graph: graph, ctx: ctx))
+    determined.append(contentsOf: groupRegularTensorBlock(
+      block, graph: graph, ctx: ctx, splitAxisReduces: splitAxisReduces))
   }
 
   return determined

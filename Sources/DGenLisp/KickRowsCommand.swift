@@ -39,7 +39,7 @@ enum KickRowsCommand {
     }
     do {
       let data = try Data(contentsOf: URL(fileURLWithPath: analysisPath))
-      let ds = try JSONDecoder().decode(DatasetAnalysis.self, from: data)
+      let ds = try KickDataset.decode(data)
       guard ["v2", "v3", "snare1"].contains(layout) else {
         fputs("kick-rows: --layout must be v2, v3 or snare1\n", stderr)
         exit(2)

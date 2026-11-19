@@ -166,7 +166,9 @@ extension UOpBlockFinalization {
         return GraphPrepPasses.MetalGemmStaged.dispatchMode(
           M: M, N: N, blockM: blockM, blockN: blockN, blockK: blockK, depth: chunkCount)
       case .gemmSmall(let M, let N, _, _, _):
-        return .perFrameScaled(M * N)
+        // A static matmul (e.g. a decoder that runs once per hit) needs M·N threads once,
+        // not M·N per frame: frame scaling recomputed the same result frameCount times.
+        return block.temporality == .static_ ? .staticThreads(M * N) : .perFrameScaled(M * N)
       default: continue
       }
     }

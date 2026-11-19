@@ -46,6 +46,9 @@ open class Graph {
     /// Stored tensors written by poke. Their accesses are per-frame state, not
     /// immutable table lookups or frame-parallel scratch-memory operations.
     public var mutableTensorCells: Set<CellID> = []
+    /// Tensors whose data is a literal of the program (never updated): the only tensor inputs a
+    /// run-invariant subgraph may read (`runInvariantAnalysis`).
+    public var constantTensors: Set<TensorID> = []
 
     public func mutableTensorReadCell(_ node: Node) -> CellID? {
         guard case .peek = node.op, let source = node.inputs.first,
