@@ -41,6 +41,20 @@ struct TrainDatasetOptions {
   var frames = 32768
   var anchor: Float = 0
   var codeL2: Float = 1e-3
+  /// `--stage pretrain --z-rows Z --code-anchor W`: start the codes at Z (e.g. an embedding of
+  /// each target's measured traits) and pull them back toward it, W · mean ‖z − Z‖², in place of
+  /// --code-l2. Keeps similar-sounding targets' codes close, so the latent space is searchable,
+  /// mappable and predictable from the audio.
+  var codeAnchor: Float = 0
+  /// `--freeze-code-from K`: code columns K… get no updates (any stage that trains codes). With
+  /// --z-rows they hold measured values, e.g. a kick's ln F0 that the voice multiplies in while
+  /// the decoder reads only columns 0..<K: pitch from analysis, still interpolated by morphing.
+  var freezeCodeFrom: Int?
+  /// `--stage pretrain --code-noise S`: during training steps, each code's learned columns (those
+  /// below --freeze-code-from) get fresh N(0, S²) noise, so the decoder must make a neighbourhood of
+  /// every code decode right, not just the point (VAE-style smoothing). Exports and renders use the
+  /// clean codes.
+  var codeNoise: Float = 0
   /// Path regulariser weight (pretrain): in-between latents decode near the straight line
   /// between the two ends' decoded rows (u space).
   var path: Float = 0
@@ -114,6 +128,10 @@ struct TrainDatasetOptions {
   var featStats: String?
   /// --aux-features: per-row encoder input vectors ({names, features}).
   var auxFeatures: String?
+  /// --row-extra: more per-row vectors ({names, features}) appended RAW (not z-scored) to the aux
+  /// row data (or, without --aux-features, as all of it), e.g. analysis values the encoder passes
+  /// straight through into its code.
+  var rowExtra: String?
   /// --low-weight: under --audio-loss, anchor the decoded low end (every mode whose --rows
   /// frequency is below 250 Hz: pitch curve, level, decay) to the row (the MR loss barely hears
   /// 40-60 Hz, so sound grading alone lets the low modes drift out of tune).
@@ -146,6 +164,9 @@ struct TrainDatasetOptions {
       case "--frames": o.frames = Int(try value()) ?? o.frames
       case "--anchor": o.anchor = Float(try value()) ?? o.anchor
       case "--code-l2": o.codeL2 = Float(try value()) ?? o.codeL2
+      case "--code-anchor": o.codeAnchor = Float(try value()) ?? o.codeAnchor
+      case "--freeze-code-from": o.freezeCodeFrom = Int(try value())
+      case "--code-noise": o.codeNoise = Float(try value()) ?? o.codeNoise
       case "--path": o.path = Float(try value()) ?? o.path
       case "--path-pairs": o.pathPairs = Int(try value()) ?? o.pathPairs
       case "--windows": o.windows = try value().split(separator: ",").compactMap { Int($0) }
@@ -189,6 +210,7 @@ struct TrainDatasetOptions {
       case "--code-weight": o.codeWeight = Float(try value()) ?? o.codeWeight
       case "--feat-stats": o.featStats = try value()
       case "--aux-features": o.auxFeatures = try value()
+      case "--row-extra": o.rowExtra = try value()
       case "--low-weight": o.lowWeight = Float(try value()) ?? o.lowWeight
       case "--feat-window": o.featWindow = Int(try value()) ?? o.featWindow
       case "--feat-hop": o.featHop = Int(try value()) ?? o.featHop
@@ -223,6 +245,12 @@ struct TrainDatasetOptions {
       guard o.features == nil || !o.augment else {
         throw TrainProtocolError("--augment needs audio; it cannot be used with --features")
       }
+    }
+    if o.codeAnchor > 0, o.stage != "pretrain" || o.zRows == nil {
+      throw TrainProtocolError("--code-anchor needs --stage pretrain and --z-rows (the anchor codes)")
+    }
+    if o.freezeCodeFrom != nil, o.zRows == nil {
+      throw TrainProtocolError("--freeze-code-from needs --z-rows (the frozen columns' values)")
     }
     if o.fitCodes {
       guard o.stage == "audio", o.initFrom != nil else {
@@ -521,6 +549,8 @@ final class DatasetTrainer {
   var startStep = 0
   var zPreset: [Float]? = nil
   var rng: SplitMix64
+  /// True only while a pretrain step builds its graph: --code-noise applies then.
+  var codeNoiseOn = false
 
   // discovered on the plan evaluation
   var layouts: [String: RowLayout] = [:]
@@ -560,7 +590,7 @@ final class DatasetTrainer {
       names = allNames
       targets = allTargets
       sampleRate = rate!
-      if let zPath = o.zRows, o.fitCodes {
+      if let zPath = o.zRows, o.fitCodes || o.codeAnchor > 0 || o.freezeCodeFrom != nil {
         let j = try JSONSerialization.jsonObject(with: Data(contentsOf: URL(fileURLWithPath: zPath))) as! [String: Any]
         let byName = Dictionary(zip(j["names"] as? [String] ?? [],
                                     (j["z"] as? [[NSNumber]] ?? []).map { $0.map(\.floatValue) }),
@@ -701,7 +731,12 @@ final class DatasetTrainer {
         if let zPreset, zPreset.count != N * dim {
           throw TrainProtocolError("--z-rows: \(zPreset.count / max(N, 1)) values per row; latent-table \(name) has @dim \(dim)")
         }
-        let z = store.leaf("z:" + name, [N, dim]) { zPreset ?? initCodes(dim) }
+        var z = store.leaf("z:" + name, [N, dim]) { zPreset ?? initCodes(dim) }
+        if codeNoiseOn, o.codeNoise > 0 {
+          let k = min(o.freezeCodeFrom ?? dim, dim)
+          let noise = (0..<(N * dim)).map { i in i % dim < k ? rng.gaussian() * o.codeNoise : 0 }
+          z = z + Tensor(noise).reshape([N, dim])
+        }
         guard let S = pathSelect else { return z }
         return z.pad([(0, M), (0, 0)]) + S.matmul(z).pad([(N, 0), (0, 0)])
       })
@@ -788,6 +823,13 @@ final class DatasetTrainer {
   func grads(_ names: [String]) -> [String: [Float]] {
     var g: [String: [Float]] = [:]
     for n in names { if let d = store.leaves[n]?.grad?.getData() { g[n] = d } }
+    if let k = o.freezeCodeFrom {
+      for n in names where n.hasPrefix("z:") {
+        guard var d = g[n], let dim = store.leaves[n]?.shape.last, k < dim else { continue }
+        for r in 0..<(d.count / dim) { for c in k..<dim { d[r * dim + c] = 0 } }
+        g[n] = d
+      }
+    }
     return g
   }
 
@@ -984,6 +1026,8 @@ final class DatasetTrainer {
       LazyGraphContext.current.clearComputationGraph()
       var S: Tensor? = nil
       if o.path > 0 { S = pathSelect.updated(self) }
+      codeNoiseOn = true
+      defer { codeNoiseOn = false }
       let (_, ctx) = try evaluate(mode: .capture, pathSelect: S)
       guard let uAll = ctx.captured[pr.name] else { throw TrainProtocolError("param-row was not reached") }
       let P = uAll.shape[1]
@@ -995,9 +1039,14 @@ final class DatasetTrainer {
         let d = mid - S.matmul(u)
         reg = reg + (d * d).sum() * (o.path / Float(M * P))
       }
-      for t in tables where o.codeL2 > 0 {
+      for t in tables where o.codeL2 > 0 || o.codeAnchor > 0 {
         guard let z = store.leaves["z:" + t.name] else { continue }
-        reg = reg + (z * z).sum() * (o.codeL2 / Float(N * t.dim))
+        if o.codeAnchor > 0, let zPreset {
+          let d = z - Tensor(zPreset).reshape([N, t.dim])
+          reg = reg + (d * d).sum() * (o.codeAnchor / Float(N * t.dim))
+        } else {
+          reg = reg + (z * z).sum() * (o.codeL2 / Float(N * t.dim))
+        }
       }
       let v = try staticToSignal(reg, frames: staticFrames).backward(frames: staticFrames).reduce(0, +)
       return (0, v)
@@ -1058,6 +1107,7 @@ final class DatasetTrainer {
     throws -> (Float, Float)
   {
     // 1
+    let tPhase0 = Date()
     LazyGraphContext.current.clearComputationGraph()
     if ProcessInfo.processInfo.environment["DGENLISP_LIVE_TENSORS"] != nil {
       let live = LazyGraphContext.current.liveTensorSummary
@@ -1080,10 +1130,14 @@ final class DatasetTrainer {
     }
     let te = Date()
     var la: Float
+    var tFwd = 0.0, tLoss = 0.0
     if o.loss == "metric" {
       // forward render, CPU loss + dL/dy, then backward of Σ y·g in a fresh voice graph
       let flat = try output(ev).realize(frames: o.frames)
+      tFwd = Date().timeIntervalSince(te)
+      let tl = Date()
       let (loss, g) = metricGradient(flat)
+      tLoss = Date().timeIntervalSince(tl)
       la = loss
       LazyGraphContext.current.clearComputationGraph()
       for leaf in latchLeaves { leaf.grad = nil }
@@ -1095,7 +1149,18 @@ final class DatasetTrainer {
     }
     DGenConfig.kernelOutputPath = nil
     logTiming(String(format: "voice backward %.0f ms wall", Date().timeIntervalSince(te) * 1000))
+    if profiling && step == 2 { LazyGraphContext.current.profileGPU(frames: o.frames) }   // per-kernel GPU times of the backward runtime
+    let tVoice = Date().timeIntervalSince(te), tStatic1 = te.timeIntervalSince(tPhase0)
+    let tg = Date()
     let grads = latchLeaves.map { l in l.grad?.getData() ?? [Float](repeating: 0, count: l.shape.reduce(1, *)) }
+    let tGrads = Date().timeIntervalSince(tg)
+    let tp3 = Date()
+    defer {
+      if timing {
+        log(String(format: "[phase] static capture + voice graph build %.0f ms | forward render %.0f ms | cpu loss %.0f ms | backward (2nd render + reverse) %.0f ms | grad readback %.0f ms | static backward %.0f ms",
+                   tStatic1 * 1000, tFwd * 1000, tLoss * 1000, (tVoice - tFwd - tLoss) * 1000, tGrads * 1000, Date().timeIntervalSince(tp3) * 1000))
+      }
+    }
     // 3
     LazyGraphContext.current.clearComputationGraph()
     for (g, v) in zip(latchGrads, grads) { g.updateDataLazily(v) }
@@ -1123,6 +1188,8 @@ final class DatasetTrainer {
   /// CPU metric loss of a [frames × N] interleaved render: (mean loss, time-major gradient of
   /// the mean).
   var lastMetric: (band: [Double], mr: [Double]) = ([], [])
+  /// Above this many targets metricGradient computes target spectra per call instead of caching all.
+  static let metricCacheLimit = 2048
   /// Each target's loss spectra, computed once (the targets do not change between steps).
   lazy var metricTargets: [MetricLoss.Target] = {
     var out = [MetricLoss.Target?](repeating: nil, count: N)
@@ -1144,11 +1211,13 @@ final class DatasetTrainer {
                         hfWeight: o.hfWeight, hfFrom: o.hfFrom)
     var results = [MetricLoss.Result?](repeating: nil, count: N)
     let lock = NSLock()
-    let cached = metricTargets
+    // Large datasets: computing every target's spectra up front costs a few MB per target (~25 GB at
+    // 6.6k targets), so each minibatch computes its own targets' spectra instead of using the cache.
+    let cached: [MetricLoss.Target]? = self.N <= Self.metricCacheLimit ? metricTargets : nil
     DispatchQueue.concurrentPerform(iterations: N) { r in
       var y = [Float](repeating: 0, count: o.frames)
       for f in 0..<o.frames { y[f] = flat[f * N + r] }
-      let res = ml.lossAndGradient(y, targets[rows[r]], target: cached[rows[r]])
+      let res = ml.lossAndGradient(y, targets[rows[r]], target: cached?[rows[r]])
       lock.lock(); results[r] = res; lock.unlock()
     }
     var g = [Float](repeating: 0, count: o.frames * N)

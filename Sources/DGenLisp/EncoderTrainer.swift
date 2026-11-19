@@ -207,15 +207,8 @@ extension DatasetTrainer {
       guard !o.augment else {
         throw TrainProtocolError("--aux-features describe the un-augmented audio; drop --augment")
       }
-      guard let d = try JSONSerialization.jsonObject(with: Data(contentsOf: URL(fileURLWithPath: path))) as? [String: Any],
-        let an = d["names"] as? [String], let av = d["features"] as? [[NSNumber]], an.count == av.count
-      else { throw TrainProtocolError("--aux-features \(path): expected {names, features: [[Float]]}") }
-      let by = Dictionary(zip(an, av.map { $0.map(\.floatValue) }), uniquingKeysWith: { a, _ in a })
-      let A = av.first?.count ?? 0
-      let rawAux = try names.map { n -> [Float] in
-        guard let v = by[n], v.count == A, A > 0 else { throw TrainProtocolError("--aux-features \(path): no \(A)-vector for \(n)") }
-        return v
-      }
+      let rawAux = try Self.loadRowVectors(path, names: names, flag: "--aux-features")
+      let A = rawAux.first?.count ?? 0
       // z-score each dimension with the training rows
       var mean = [Float](repeating: 0, count: A), sd = mean
       for r in enc.trainIdx { for j in 0..<A { mean[j] += rawAux[r][j] } }
@@ -225,6 +218,12 @@ extension DatasetTrainer {
       enc.aux = rawAux.map { v in (0..<A).map { (v[$0] - mean[$0]) / sd[$0] } }
       try JSONSerialization.data(withJSONObject: ["mean": mean.map(Double.init), "std": sd.map(Double.init)])
         .write(to: run.appendingPathComponent("export/aux_stats.json"))
+      if let path = o.rowExtra {
+        let extra = try Self.loadRowVectors(path, names: names, flag: "--row-extra")
+        enc.aux = zip(enc.aux, extra).map { $0 + $1 }
+      }
+    } else if let path = o.rowExtra {
+      enc.aux = try Self.loadRowVectors(path, names: names, flag: "--row-extra")
     }
 
     if o.amortized {
@@ -316,6 +315,19 @@ extension DatasetTrainer {
     try writeTensorJSON([cfg.bins, cfg.bands], enc.extractor!.melFilters,
                         to: ex.appendingPathComponent("mel_filters.json"))
     log("[encode]\(o.amortized ? " amortized:" : "") \(enc.trainIdx.count) train rows in \(enc.groupTrain.count) source(s), \(K) val; features [\(cfg.bands), \(cfg.frames)] = \(enc.W); D \(enc.D), P \(enc.P); batch \(B)")
+  }
+
+  /// A {names, features: [[Float]]} file's vector for each of `names` (all the same width).
+  static func loadRowVectors(_ path: String, names: [String], flag: String) throws -> [[Float]] {
+    guard let d = try JSONSerialization.jsonObject(with: Data(contentsOf: URL(fileURLWithPath: path))) as? [String: Any],
+      let an = d["names"] as? [String], let av = d["features"] as? [[NSNumber]], an.count == av.count
+    else { throw TrainProtocolError("\(flag) \(path): expected {names, features: [[Float]]}") }
+    let by = Dictionary(zip(an, av.map { $0.map(\.floatValue) }), uniquingKeysWith: { a, _ in a })
+    let A = av.first?.count ?? 0
+    return try names.map { n -> [Float] in
+      guard let v = by[n], v.count == A, A > 0 else { throw TrainProtocolError("\(flag) \(path): no \(A)-vector for \(n)") }
+      return v
+    }
   }
 
   // MARK: encoder evaluation
@@ -627,7 +639,12 @@ extension DatasetTrainer {
     guard let u = ctx.captured[pr.name] else { throw TrainProtocolError("param-row was not reached") }
     let flat = try realizeStatic(u, count: K * enc.P)
     let target = enc.valIdx.flatMap { enc.uTargets[$0] }
-    return zip(flat, target).reduce(0.0) { $0 + Double(($1.0 - $1.1) * ($1.0 - $1.1)) } / Double(flat.count)
+    // weighted like the training loss (columns the loss ignores, e.g. --freeze segments, count 0)
+    let w = columnWeights(layouts[pr.layout]!)
+    let active = Double(max(1, w.filter { $0 > 0 }.count))
+    var sum = 0.0
+    for (i, (a, b)) in zip(flat, target).enumerated() { sum += Double(w[i % enc.P] * (a - b) * (a - b)) }
+    return sum / (Double(K) * active)
   }
 
   /// The encoder's codes for the held-out rows.
