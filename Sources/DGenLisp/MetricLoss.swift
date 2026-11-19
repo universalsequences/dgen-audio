@@ -10,7 +10,11 @@
 // `lossAndGradient` returns both scores and d(wBand·band + wMR·mr)/dy. The trainer injects the
 // gradient into the voice graph as Σ y·g, so any loss computed here trains exactly.
 
+#if canImport(Accelerate)
 import Accelerate
+#else
+import DGenLazy  // portable vDSP stand-ins (PortableAccelerate.swift)
+#endif
 import Foundation
 
 struct MetricLoss {

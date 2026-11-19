@@ -28,6 +28,15 @@ import DGenLazy
 import DGenTrainProtocol
 import Foundation
 
+#if !canImport(Darwin)
+  /// `autoreleasepool` is an Objective-C runtime facility with no equivalent
+  /// (and nothing to drain) off Apple platforms; run the body directly.
+  @inline(__always)
+  private func autoreleasepool<Result>(invoking body: () throws -> Result) rethrows -> Result {
+    try body()
+  }
+#endif
+
 struct TrainDatasetOptions {
   var patch = ""
   var dataset = ""

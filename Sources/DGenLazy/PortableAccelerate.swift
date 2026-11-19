@@ -28,6 +28,7 @@
   public typealias FFTRadix = Int32
   public typealias FFTDirection = Int32
   public typealias FFTSetup = OpaquePointer
+  public typealias FFTSetupD = OpaquePointer
   public typealias vDSP_DFT_Setup = OpaquePointer
 
   public let kFFTRadix2: Int = 0
@@ -49,6 +50,24 @@
     public var realp: UnsafeMutablePointer<Float>
     public var imagp: UnsafeMutablePointer<Float>
     public init(realp: UnsafeMutablePointer<Float>, imagp: UnsafeMutablePointer<Float>) {
+      self.realp = realp
+      self.imagp = imagp
+    }
+  }
+
+  public struct DSPDoubleComplex {
+    public var real: Double
+    public var imag: Double
+    public init(real: Double = 0, imag: Double = 0) {
+      self.real = real
+      self.imag = imag
+    }
+  }
+
+  public struct DSPDoubleSplitComplex {
+    public var realp: UnsafeMutablePointer<Double>
+    public var imagp: UnsafeMutablePointer<Double>
+    public init(realp: UnsafeMutablePointer<Double>, imagp: UnsafeMutablePointer<Double>) {
       self.realp = realp
       self.imagp = imagp
     }
@@ -159,7 +178,7 @@
     }
   }
 
-  // MARK: - vDSP_create_fftsetup / vDSP_fft_zrip
+  // MARK: - vDSP_create_fftsetup / vDSP_fft_zrip (and the D variants)
 
   private final class PortableFFTSetup {
     let log2n: vDSP_Length
@@ -174,6 +193,14 @@
   public func vDSP_destroy_fftsetup(_ setup: FFTSetup?) {
     guard let setup = setup else { return }
     Unmanaged<PortableFFTSetup>.fromOpaque(UnsafeRawPointer(setup)).release()
+  }
+
+  public func vDSP_create_fftsetupD(_ log2n: vDSP_Length, _ radix: FFTRadix) -> FFTSetupD? {
+    vDSP_create_fftsetup(log2n, radix)
+  }
+
+  public func vDSP_destroy_fftsetupD(_ setup: FFTSetupD?) {
+    vDSP_destroy_fftsetup(setup)
   }
 
   /// Interleaved -> split copy. `IC` is a stride in Float units over the
@@ -194,6 +221,40 @@
     }
   }
 
+  /// Double-precision vDSP_ctoz; same stride conventions.
+  public func vDSP_ctozD(
+    _ input: UnsafePointer<DSPDoubleComplex>,
+    _ IC: vDSP_Stride,
+    _ output: UnsafePointer<DSPDoubleSplitComplex>,
+    _ IZ: vDSP_Stride,
+    _ n: vDSP_Length
+  ) {
+    let doubles = UnsafeRawPointer(input).assumingMemoryBound(to: Double.self)
+    let split = output.pointee
+    for i in 0..<Int(n) {
+      split.realp[i * IZ] = doubles[i * IC]
+      split.imagp[i * IZ] = doubles[i * IC + 1]
+    }
+  }
+
+  /// Split -> interleaved copy, the inverse of vDSP_ctozD. `IZ` strides the
+  /// split input in complex elements; `IC` strides the interleaved output in
+  /// Double units.
+  public func vDSP_ztocD(
+    _ input: UnsafePointer<DSPDoubleSplitComplex>,
+    _ IZ: vDSP_Stride,
+    _ output: UnsafeMutablePointer<DSPDoubleComplex>,
+    _ IC: vDSP_Stride,
+    _ n: vDSP_Length
+  ) {
+    let doubles = UnsafeMutableRawPointer(output).assumingMemoryBound(to: Double.self)
+    let split = input.pointee
+    for i in 0..<Int(n) {
+      doubles[i * IC] = split.realp[i * IZ]
+      doubles[i * IC + 1] = split.imagp[i * IZ]
+    }
+  }
+
   /// Packed real forward/inverse FFT, matching vDSP_fft_zrip.
   ///
   /// Forward: input is a length-N real signal packed as realp[k] = x[2k],
@@ -208,11 +269,34 @@
     _ direction: FFTDirection
   ) {
     precondition(stride == 1, "portable vDSP_fft_zrip supports unit stride only")
+    let split = ioData.pointee
+    portableZrip(split.realp, split.imagp, log2n, inverse: direction != FFTDirection(FFT_FORWARD))
+  }
+
+  /// Double-precision vDSP_fft_zrip; same packing and scaling.
+  public func vDSP_fft_zripD(
+    _ setup: FFTSetupD,
+    _ ioData: UnsafePointer<DSPDoubleSplitComplex>,
+    _ stride: vDSP_Stride,
+    _ log2n: vDSP_Length,
+    _ direction: FFTDirection
+  ) {
+    precondition(stride == 1, "portable vDSP_fft_zripD supports unit stride only")
+    let split = ioData.pointee
+    portableZrip(split.realp, split.imagp, log2n, inverse: direction != FFTDirection(FFT_FORWARD))
+  }
+
+  /// Shared body of vDSP_fft_zrip / vDSP_fft_zripD. Computes in Double either
+  /// way, so the Float path's numbers are unchanged.
+  private func portableZrip<T: BinaryFloatingPoint>(
+    _ realp: UnsafeMutablePointer<T>,
+    _ imagp: UnsafeMutablePointer<T>,
+    _ log2n: vDSP_Length,
+    inverse: Bool
+  ) {
     let n = 1 << Int(log2n)
     guard n >= 2 else { return }
     let half = n / 2
-    let split = ioData.pointee
-    let inverse = direction != FFTDirection(FFT_FORWARD)
 
     var re = [Double](repeating: 0, count: n)
     var im = [Double](repeating: 0, count: n)
@@ -220,32 +304,32 @@
     if !inverse {
       // Rebuild the full real signal from its even/odd split packing.
       for k in 0..<half {
-        re[2 * k] = Double(split.realp[k])
-        re[2 * k + 1] = Double(split.imagp[k])
+        re[2 * k] = Double(realp[k])
+        re[2 * k + 1] = Double(imagp[k])
       }
       re.withUnsafeMutableBufferPointer { rp in
         im.withUnsafeMutableBufferPointer { ip in
           portableFFT(rp.baseAddress!, ip.baseAddress!, n, inverse: false)
         }
       }
-      split.realp[0] = Float(2.0 * re[0])
-      split.imagp[0] = Float(2.0 * re[half])
+      realp[0] = T(2.0 * re[0])
+      imagp[0] = T(2.0 * re[half])
       for k in 1..<half {
-        split.realp[k] = Float(2.0 * re[k])
-        split.imagp[k] = Float(2.0 * im[k])
+        realp[k] = T(2.0 * re[k])
+        imagp[k] = T(2.0 * im[k])
       }
     } else {
       // Packed half-spectrum -> full Hermitian spectrum, then inverse FFT.
       // vDSP applies no normalization here: a forward+inverse round trip comes
       // back scaled by 2*N (hence Apple's canonical 1/(2*N) rescale), which is
       // exactly the unnormalized inverse transform of the packed input.
-      re[0] = Double(split.realp[0])
+      re[0] = Double(realp[0])
       im[0] = 0
-      re[half] = Double(split.imagp[0])
+      re[half] = Double(imagp[0])
       im[half] = 0
       for k in 1..<half {
-        let xr = Double(split.realp[k])
-        let xi = Double(split.imagp[k])
+        let xr = Double(realp[k])
+        let xi = Double(imagp[k])
         re[k] = xr
         im[k] = xi
         re[n - k] = xr
@@ -257,8 +341,8 @@
         }
       }
       for k in 0..<half {
-        split.realp[k] = Float(re[2 * k])
-        split.imagp[k] = Float(re[2 * k + 1])
+        realp[k] = T(re[2 * k])
+        imagp[k] = T(re[2 * k + 1])
       }
     }
   }
@@ -385,6 +469,46 @@
       sum += a[i * ia] * b[i * ib]
     }
     result.pointee = sum
+  }
+
+  /// Row-major matrix multiply, matching vDSP_mmul: C[M x N] = A[M x P] * B[P x N].
+  public func vDSP_mmul(
+    _ a: UnsafePointer<Float>,
+    _ ia: vDSP_Stride,
+    _ b: UnsafePointer<Float>,
+    _ ib: vDSP_Stride,
+    _ c: UnsafeMutablePointer<Float>,
+    _ ic: vDSP_Stride,
+    _ m: vDSP_Length,
+    _ n: vDSP_Length,
+    _ p: vDSP_Length
+  ) {
+    let M = Int(m), N = Int(n), P = Int(p)
+    for i in 0..<M {
+      for j in 0..<N {
+        var sum: Float = 0
+        for k in 0..<P {
+          sum += a[(i * P + k) * ia] * b[(k * N + j) * ib]
+        }
+        c[(i * N + j) * ic] = sum
+      }
+    }
+  }
+
+  // MARK: - vDSP namespace (the Swift overlay's array API)
+
+  public enum vDSP {
+    /// Elementwise product of two equal-length vectors.
+    public static func multiply(_ a: [Float], _ b: [Float], result: inout [Float]) {
+      precondition(a.count == b.count && result.count == a.count, "vDSP.multiply length mismatch")
+      for i in 0..<a.count { result[i] = a[i] * b[i] }
+    }
+
+    /// Scalar times vector.
+    public static func multiply(_ scalar: Double, _ vector: [Double], result: inout [Double]) {
+      precondition(result.count == vector.count, "vDSP.multiply length mismatch")
+      for i in 0..<vector.count { result[i] = scalar * vector[i] }
+    }
   }
 
 #endif  // !canImport(Accelerate)
