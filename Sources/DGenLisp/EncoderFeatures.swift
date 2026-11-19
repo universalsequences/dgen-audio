@@ -10,7 +10,11 @@
 //
 // Output layout is [bands, frames] row-major (channels first, time last), flattened per row.
 
+#if canImport(Accelerate)
 import Accelerate
+#else
+import DGenLazy  // portable vDSP stand-ins (PortableAccelerate.swift)
+#endif
 import DGenTrainProtocol
 import Foundation
 
