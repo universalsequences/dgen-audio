@@ -91,7 +91,7 @@ private func classify(_ op: Op) -> OpClass {
     return .transcendental
 
   // vDSP-backed partitioned spectral MAC: opaque, heavy arithmetic.
-  case .partitionedSpectralMACCall:
+  case .partitionedSpectralMACCall, .matVecCall:
     return .arithmetic
   }
 }

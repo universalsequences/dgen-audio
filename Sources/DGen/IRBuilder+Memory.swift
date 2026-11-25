@@ -198,6 +198,12 @@ extension IRBuilder {
     return gswitch(isTick, value, zero)
   }
 
+  /// 1 on frames where a read of this frame-aware cell is defined, 0 where a
+  /// hop-scattered read yields zero (`scatterMaskedRead` of the constant 1).
+  public func frameAwareReadGate(cellId: CellID, frameIdx: Expr) -> Expr {
+    return scatterMaskedRead(cellId: cellId, frameIdx: frameIdx, value: constant(1.0))
+  }
+
   /// Read from a frame-aware tensor using the current thread's frame index.
   /// Accesses `memory[cellId + frameIdx * tensorSize + elemIdx]`.
   /// Used for tensors that need per-frame storage to enable cross-block parallelism.

@@ -64,6 +64,10 @@ func remapVectorMemorySlots(
         }
         registerCell(cellId, vectorWidth: memoryWidth)
       }
+      // A kernel call addresses its cells as plain scalar-layout arrays.
+      for cellId in uop.op.kernelCallCellIds {
+        registerCell(cellId, vectorWidth: 1)
+      }
     }
   }
 
@@ -185,6 +189,11 @@ func remapVectorMemorySlots(
           }
           // Regions may move independent setup before a hop island, so source
           // block order need not be execution order.
+          let group = blockGroup[blockIndex]
+          cellFirstUse[cellId] = min(cellFirstUse[cellId] ?? group, group)
+          cellLastUse[cellId] = max(cellLastUse[cellId] ?? group, group)
+        }
+        for cellId in uop.op.kernelCallCellIds {
           let group = blockGroup[blockIndex]
           cellFirstUse[cellId] = min(cellFirstUse[cellId] ?? group, group)
           cellLastUse[cellId] = max(cellLastUse[cellId] ?? group, group)
