@@ -148,6 +148,19 @@ public enum Op {
     irReCell: CellID, irImCell: CellID,
     reOutCell: CellID, imOutCell: CellID)
 
+  // Dense matrix product y[M, N] = x[M, K] @ W[K, N] over raw row-major memory
+  // (C backend only). Replaces the per-output-element strided reduction the
+  // generic `matmul` lowering emits: the kernel walks W row by row (contiguous)
+  // and accumulates into y, so the compiler vectorizes it. Offsets are element
+  // offsets into each cell (frame-aware bases); `gate` zeroes y when it is 0
+  // (hop-scatter semantics of a frame-aware x).
+  case matVecCall(
+    M: Int, K: Int, N: Int,
+    xCell: CellID, xOffset: Lazy,
+    wCell: CellID, wOffset: Lazy,
+    yCell: CellID, yOffset: Lazy,
+    gate: Lazy)
+
   // Threadgroup shared memory (on-chip SRAM for FFT scratch)
   case threadgroupArrayDecl(scratchId: Int, size: Int)  // declare threadgroup float scratch_N[size]
   case threadgroupRead(scratchId: Int, Lazy)    // read scratch_N[offset]
@@ -172,6 +185,16 @@ public enum Op {
     default:
       return nil
     }
+  }
+
+  /// Cells a `matVecCall` reads or writes (not covered by `memoryCellId`,
+  /// which names the single cell of a plain memory op).
+  /// Memory layout and buffer-reuse liveness must count these as uses.
+  public var kernelCallCellIds: [CellID] {
+    if case .matVecCall(_, _, _, let xCell, _, let wCell, _, let yCell, _, _) = self {
+      return [xCell, wCell, yCell]
+    }
+    return []
   }
 
   /// Returns a new Op with Lazy inputs remapped. Used for BPTT to redirect
@@ -244,6 +267,10 @@ public enum Op {
     case .simdgroupStore(let src, let c, let o, let s): return .simdgroupStore(r(src), c, r(o), s)
     case .simdgroupMultiplyAccumulate(let a, let b, let acc):
       return .simdgroupMultiplyAccumulate(r(a), r(b), r(acc))
+    case .matVecCall(let M, let K, let N, let xc, let xo, let wc, let wo, let yc, let yo, let gate):
+      return .matVecCall(
+        M: M, K: K, N: N, xCell: xc, xOffset: r(xo), wCell: wc, wOffset: r(wo),
+        yCell: yc, yOffset: r(yo), gate: r(gate))
     case .threadgroupRead(let id, let offset): return .threadgroupRead(scratchId: id, r(offset))
     case .threadgroupWrite(let id, let offset, let value):
       return .threadgroupWrite(scratchId: id, r(offset), r(value))
@@ -278,6 +305,15 @@ public enum Op {
         ringReCell: nRRe, ringImCell: nRIm,
         irReCell: nIRe, irImCell: nIIm,
         reOutCell: nORe, imOutCell: nOIm)
+    }
+    if case .matVecCall(let M, let K, let N, let xc, let xo, let wc, let wo, let yc, let yo, let gate) = self {
+      let nx = remapping[xc] ?? xc
+      let nw = remapping[wc] ?? wc
+      let ny = remapping[yc] ?? yc
+      if nx == xc && nw == wc && ny == yc { return nil }
+      return .matVecCall(
+        M: M, K: K, N: N, xCell: nx, xOffset: xo, wCell: nw, wOffset: wo,
+        yCell: ny, yOffset: yo, gate: gate)
     }
     guard let cellId = memoryCellId, let newCellId = remapping[cellId] else {
       return nil

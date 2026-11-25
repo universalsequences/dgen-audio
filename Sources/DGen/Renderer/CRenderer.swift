@@ -673,6 +673,36 @@ public class CRenderer: Renderer {
           return boolmask_to_float(m);
       }
 
+      // y[M, N] = x[M, K] @ W[K, N], row-major, non-overlapping. Four rows of W
+      // per pass, so each y element is loaded and stored once per four
+      // multiply-adds; the j loops are contiguous and vectorize. The sum order
+      // differs from the per-element reduction this replaces (results agree to
+      // rounding, not bit for bit); an order-preserving variant measured 1.7x
+      // slower and matched the old binaries no better, since clang had already
+      // reassociated that reduction.
+      static void dgen_matvec_f32(
+          const float *restrict x, const float *restrict w, float *restrict y,
+          int M, int K, int N) {
+        for (int m = 0; m < M; ++m, x += K, y += N) {
+          for (int j = 0; j < N; ++j) y[j] = 0.0f;
+          int k = 0;
+          for (; k + 4 <= K; k += 4) {
+            const float x0 = x[k], x1 = x[k + 1], x2 = x[k + 2], x3 = x[k + 3];
+            const float *restrict w0 = w + (long)k * N;
+            const float *restrict w1 = w0 + N;
+            const float *restrict w2 = w1 + N;
+            const float *restrict w3 = w2 + N;
+            for (int j = 0; j < N; ++j)
+              y[j] += x0 * w0[j] + x1 * w1[j] + x2 * w2[j] + x3 * w3[j];
+          }
+          for (; k < K; ++k) {
+            const float xk = x[k];
+            const float *restrict wk = w + (long)k * N;
+            for (int j = 0; j < N; ++j) y[j] += xk * wk[j];
+          }
+        }
+      }
+
       static inline float32x4_t simd_xor_f32(float32x4_t a, float32x4_t b) {
           uint32x4_t a_nz = mask_nz_f32(a);
           uint32x4_t b_nz = mask_nz_f32(b);
@@ -1711,6 +1741,21 @@ public class CRenderer: Renderer {
                 \(N)u);
             }
           }
+        }
+        """
+
+    case .matVecCall(
+      let M, let K, let N, let xCell, let xOffset, let wCell, let wOffset, let yCell, let yOffset,
+      let gate):
+      let xo = emitScalarLazy(xOffset, ctx: ctx)
+      let wo = emitScalarLazy(wOffset, ctx: ctx)
+      let yo = emitScalarLazy(yOffset, ctx: ctx)
+      let gateExpr = emitScalarLazy(gate, ctx: ctx)
+      return """
+        if (\(gateExpr) != 0.0f) {
+          dgen_matvec_f32(&memory[\(xCell) + (int)\(xo)], &memory[\(wCell) + (int)\(wo)], &memory[\(yCell) + (int)\(yo)], \(M), \(K), \(N));
+        } else {
+          for (int _mv = 0; _mv < \(M * N); ++_mv) memory[\(yCell) + (int)\(yo) + _mv] = 0.0f;
         }
         """
 

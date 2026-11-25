@@ -78,6 +78,10 @@ public class IRContext {
   /// Tensor compute nodes that should not emit code because their work is inlined
   /// into downstream reductions.
   public var skippedTensorComputeNodes: Set<NodeID> = []
+  /// sumAxis nodes whose whole output was already written by a `matVecCall`
+  /// emitted ahead of their region's element loop (C backend matmul fast path);
+  /// their per-element emission is a no-op.
+  public var matVecPrecomputedNodes: Set<NodeID> = []
 
   /// Cross-block fused `(sum (* a b))` plans, keyed by the `sum` node.
   /// Populated by SumOfMulFusionPass after tensor materialization; `.sum`

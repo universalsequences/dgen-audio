@@ -213,6 +213,13 @@ private struct BlockAccess {
       writesCells.insert(cell)
       recordRead(offset)
       recordRead(value)
+    case .matVecCall(_, _, _, let xCell, let xOffset, let wCell, let wOffset, let yCell, let yOffset, let gate):
+      readsCells.formUnion([xCell, wCell])
+      writesCells.insert(yCell)
+      recordRead(xOffset)
+      recordRead(wOffset)
+      recordRead(yOffset)
+      recordRead(gate)
     case .acceleratedFFTCall(_, let reCell, let imCell, _):
       readsCells.insert(reCell)
       readsCells.insert(imCell)

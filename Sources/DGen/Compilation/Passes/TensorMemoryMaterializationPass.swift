@@ -187,15 +187,42 @@ extension TensorMemoryMaterializationPass {
   ) -> Set<CellID> {
     var owner: [CellID: Int] = [:]
     var excluded: Set<CellID> = []
+    var hopCells: [CellID: NodeID] = [:]
     // Materialized views may be observed by the host without a scheduled reader.
     for (nodeId, tensorId) in graph.nodeToTensor {
       guard let tensor = graph.tensors[tensorId] else { continue }
       if tensor.materialize || !tensor.transforms.isEmpty
-        || graph.materializeNodes.contains(nodeId) || hopBasedNodes[nodeId] != nil {
+        || graph.materializeNodes.contains(nodeId) {
         excluded.insert(tensor.cellId)
       }
+      // A hop/event-rate tensor reads as zero between its ticks (scatter), which
+      // only per-frame storage can give a reader on another clock. It may be
+      // frame local only when every reference sits in a block that runs on
+      // the tensor's own clock (checked per reference below).
+      // Only event clocks qualify: a fixed-hop chain keeps its hop-sliced
+      // storage (its consumers include frame-rate latches and overlap-add
+      // machinery that address the slots directly).
+      if let (hop, clock) = hopBasedNodes[nodeId] {
+        if hop == 1, graph.eventClockNodes.contains(clock) {
+          hopCells[tensor.cellId] = clock
+        } else {
+          excluded.insert(tensor.cellId)
+        }
+      }
     }
-    for block in blocks {
+    // A lone sequential frame-based (or event-clocked) block is one loop of its own: a
+    // tensor that only its nodes touch is written and read within one frame,
+    // exactly like a tensor private to a sequential frame group. Each such
+    // block gets a private (negative) group id.
+    let loneBlocks = ProcessInfo.processInfo.environment["DGEN_NO_FRAME_LOCAL_BLOCKS"] == nil
+    let hopLocal = ProcessInfo.processInfo.environment["DGEN_NO_FRAME_LOCAL_HOP"] == nil
+    for (blockIndex, block) in blocks.enumerated() {
+      var blockClock: NodeID? = nil
+      if case .hopBased(_, let clock) = block.temporality { blockClock = clock }
+      let loneGroup: Int? =
+        loneBlocks && block.frameOrder == .sequential
+          && (block.temporality == .frameBased || (hopLocal && blockClock != nil))
+        ? -(blockIndex + 1) : nil
       for nodeId in block.nodes {
         guard let node = graph.nodes[nodeId] else { continue }
         for reference in [nodeId] + node.inputs + node.temporalDependencies {
@@ -203,7 +230,14 @@ extension TensorMemoryMaterializationPass {
             let tensor = graph.tensors[tensorId]
           else { continue }
           let cell = tensor.cellId
-          guard let group = block.sequentialFrameGroup else { excluded.insert(cell); continue }
+          if let cellClock = hopCells[cell], !(loneBlocks && hopLocal && blockClock == cellClock) {
+            excluded.insert(cell)
+            continue
+          }
+          guard let group = block.sequentialFrameGroup ?? loneGroup else {
+            excluded.insert(cell)
+            continue
+          }
           if let previous = owner[cell], previous != group { excluded.insert(cell) }
           owner[cell] = group
         }

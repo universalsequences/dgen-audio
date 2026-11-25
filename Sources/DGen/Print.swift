@@ -222,6 +222,8 @@ extension UOp {
         case let .acceleratedFFTCall(log2N, reCell, imCell, inverse):
             let dir = inverse ? "inverse" : "forward"
             opStr = "\(ANSI.magenta)acceleratedFFTCall\(ANSI.reset)(log2N=\(log2N), re=\(reCell), im=\(imCell), \(dir))"
+        case let .matVecCall(M, K, N, xCell, _, wCell, _, yCell, _, _):
+            opStr = "\(ANSI.magenta)matVecCall\(ANSI.reset)(M=\(M), K=\(K), N=\(N), x=\(xCell), w=\(wCell), y=\(yCell))"
         case let .partitionedSpectralMACCall(K, N, pIdx, rRe, rIm, iRe, iIm, oRe, oIm):
             opStr = "\(ANSI.magenta)partitionedSpectralMACCall\(ANSI.reset)(K=\(K), N=\(N), pIdx=\(pIdx), ring=[\(rRe),\(rIm)], ir=[\(iRe),\(iIm)], out=[\(oRe),\(oIm)])"
         }

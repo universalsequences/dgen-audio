@@ -13,7 +13,7 @@ import Foundation
 /// - Returns: UOps for exactly one region.
 private func emitRegion(
   _ region: EmissionRegion, ctx: IRContext, g: Graph,
-  parallelElemIdx: Lazy? = nil, splittableRange: Bool = false
+  parallelElemIdx: Lazy? = nil, splittableRange: Bool = false, allowMatVec: Bool = false
 ) throws -> [UOp] {
   var uops: [UOp] = []
 
@@ -82,6 +82,21 @@ private func emitRegion(
       // splitStaticParallelRanges can give the region its own thread-parallel kernel
       // (kernel boundaries order the regions). Unsplit, it still renders as a loop.
       let asRange = splittableRange && !region.isConvOnly && gatedLatch == nil
+
+      // Matmul fast path (C backend): a `sumAxis(mul(x, W))` in matmul form is
+      // computed for every output element by one dense kernel call ahead of the
+      // element loop, which then only runs the region's other nodes.
+      var precomputed = Set<NodeID>()
+      if allowMatVec, !region.isConvOnly, gatedLatch == nil {
+        for nodeId in activeTensorNodes {
+          guard let plan = planMatVec(nodeId: nodeId, region: region, ctx: ctx, g: g) else {
+            continue
+          }
+          uops.append(contentsOf: emitMatVec(plan, nodeId: nodeId, ctx: ctx, g: g))
+          precomputed.insert(nodeId)
+        }
+      }
+
       if !region.isConvOnly {
         let beginLoop = UOp(
           op: asRange ? .beginParallelRange(elementCount, 1) : .beginForLoop(elemVar, .constant(0, Float(elementCount))),
@@ -89,6 +104,9 @@ private func emitRegion(
         )
         uops.append(beginLoop)
       }
+
+      ctx.matVecPrecomputedNodes.formUnion(precomputed)
+      defer { ctx.matVecPrecomputedNodes.subtract(precomputed) }
 
       for nodeId in activeTensorNodes {
         ctx.tensorIndices[nodeId] = elemVar
@@ -119,6 +137,112 @@ private func emitRegion(
 
   ctx.clearTensorRegisters()
   return uops
+}
+
+/// A `sumAxis(mul(x, W), axis: 2)` in the exact form `Graph.matmul` builds:
+/// x is a reshape of contiguous [M, K] storage, W a 2-D transpose (plus
+/// reshapes) of contiguous [K, N] storage, the output plain [M, N] storage.
+private struct MatVecPlan {
+  let M: Int
+  let K: Int
+  let N: Int
+  let x: Tensor
+  let w: Tensor
+  let outCell: CellID
+}
+
+private func planMatVec(
+  nodeId: NodeID, region: EmissionRegion, ctx: IRContext, g: Graph
+) -> MatVecPlan? {
+  guard let node = g.nodes[nodeId], case .sumAxis(let axis) = node.op, axis == 2,
+    let inId = node.inputs.first,
+    case .tensor(let inShape)? = g.nodes[inId]?.shape, inShape.count == 3,
+    case .tensor(let outShape) = node.shape, outShape == [inShape[0], inShape[1]],
+    let inTensor = g.nodeToTensor[inId].flatMap({ g.tensors[$0] }),
+    case .mul(let a, let b)? = ctx.inlineReduceSources[inTensor.cellId],
+    let outTensor = g.nodeToTensor[nodeId].flatMap({ g.tensors[$0] }),
+    outTensor.transforms.isEmpty
+  else { return nil }
+  let (M, N, K) = (inShape[0], inShape[1], inShape[2])
+  // Small products stay on the generic path (no call overhead, nothing to gain).
+  guard K >= 8, N >= 8 else { return nil }
+
+  func onlyReshapes(_ transforms: ArraySlice<ViewTransform>) -> Bool {
+    transforms.allSatisfy {
+      if case .reshape = $0 { return true }
+      return false
+    }
+  }
+  func isX(_ t: Tensor) -> Bool {
+    t.shape == [M, 1, K] && onlyReshapes(t.transforms[...])
+      && t.baseSize == M * K
+  }
+  func isW(_ t: Tensor) -> Bool {
+    guard t.shape == [1, N, K], t.baseSize == K * N,
+      let tIdx = t.transforms.firstIndex(where: {
+        if case .reshape = $0 { return false }
+        return true
+      }),
+      case .transpose(let axes, let inputShape) = t.transforms[tIdx],
+      axes == [1, 0], inputShape == [K, N]
+    else { return false }
+    return onlyReshapes(t.transforms[..<tIdx]) && onlyReshapes(t.transforms[(tIdx + 1)...])
+  }
+  let x: Tensor
+  let w: Tensor
+  if isX(a), isW(b) {
+    (x, w) = (a, b)
+  } else if isX(b), isW(a) {
+    (x, w) = (b, a)
+  } else {
+    return nil
+  }
+  // Operands must be materialized storage: not themselves fused away, not
+  // hop-scattered weights, and not produced inside this region's element loop
+  // (the kernel runs before that loop).
+  guard ctx.inlineReduceSources[x.cellId] == nil, ctx.inlineReduceSources[w.cellId] == nil,
+    ctx.inlineReduceSources[outTensor.cellId] == nil,
+    !g.frameAwareCellScatter.contains(w.cellId),
+    x.cellId != outTensor.cellId, w.cellId != outTensor.cellId, x.cellId != w.cellId
+  else { return nil }
+  for other in region.tensorNodes where other != nodeId {
+    guard let otherNode = g.nodes[other], !otherNode.op.isViewOnly,
+      let cell = g.nodeToTensor[other].flatMap({ g.tensors[$0] })?.cellId
+    else { continue }
+    if cell == x.cellId || cell == w.cellId { return nil }
+  }
+  return MatVecPlan(M: M, K: K, N: N, x: x, w: w, outCell: outTensor.cellId)
+}
+
+private func emitMatVec(_ plan: MatVecPlan, nodeId: NodeID, ctx: IRContext, g: Graph) -> [UOp] {
+  let b = IRBuilder(ctx: ctx, nodeId: nodeId)
+  let frameIdx = b.currentFrameIndex()
+  func base(_ cell: CellID, size: Int) -> Expr {
+    guard ctx.frameAwareTensorCells.contains(cell) else { return b.intConstant(0) }
+    let tensorSize = g.frameAwareCells[cell]?.tensorSize ?? size
+    return b.cast(b.frameAwareBase(cellId: cell, frameIdx: frameIdx, tensorSize: tensorSize), to: .int)
+  }
+  let xOffset = base(plan.x.cellId, size: plan.M * plan.K)
+  let wOffset = base(plan.w.cellId, size: plan.K * plan.N)
+  let yOffset = base(plan.outCell, size: plan.M * plan.N)
+  let gate =
+    ctx.frameAwareTensorCells.contains(plan.x.cellId)
+    ? b.frameAwareReadGate(cellId: plan.x.cellId, frameIdx: frameIdx)
+    : b.constant(1.0)
+  b.ops.append(
+    UOp(
+      op: .matVecCall(
+        M: plan.M, K: plan.K, N: plan.N,
+        xCell: plan.x.cellId, xOffset: xOffset.lazy,
+        wCell: plan.w.cellId, wOffset: wOffset.lazy,
+        yCell: plan.outCell, yOffset: yOffset.lazy,
+        gate: gate.lazy),
+      value: .empty))
+  return b.ops.map {
+    var typed = $0
+    typed.vectorWidth = 1
+    return typed
+  }
 }
 
 /// Returns the (latch node, scalar cond Lazy) when a region's element loop can be
@@ -261,9 +385,12 @@ public func emitScalarBlockWithShapeTransitions(
   // block cannot be split safely.
   let splittable = backend == .metal && block.temporality == .static_
     && ProcessInfo.processInfo.environment["DGEN_NO_STATIC_REGION_SPLIT"] == nil
+  let allowMatVec =
+    backend == .c && ProcessInfo.processInfo.environment["DGEN_NO_MATVEC"] == nil
   var uops: [UOp] = []
   for region in regions {
-    uops += try emitRegion(region, ctx: ctx, g: g, splittableRange: splittable)
+    uops += try emitRegion(
+      region, ctx: ctx, g: g, splittableRange: splittable, allowMatVec: allowMatVec)
   }
   return uops
 }

@@ -262,6 +262,10 @@ extension LazyOp {
         throw DGenError.tensorError(op: "sumAxis", reason: "invalid input")
       }
 
+      // The region emitter already wrote every output element with one
+      // matVecCall ahead of the element loop; consumers read the output cell.
+      if ctx.matVecPrecomputedNodes.contains(nodeId) { return }
+
       // Check if input/output cells are frame-aware
       let inIsFrameAware = ctx.frameAwareTensorCells.contains(inTensor.cellId)
       let outIsFrameAware = ctx.frameAwareTensorCells.contains(outCell)
